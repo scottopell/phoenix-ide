@@ -4,7 +4,7 @@ import { buildFileSearchProjection } from '../viewer-find';
 
 /** Plain <pre> body for large source-like payloads that bypass rich rendering. */
 export function TextViewerBody({ content, findQuery, activeFindOccurrence }: ViewerBodyProps) {
-  const hasActiveQuery = (findQuery ?? '').length > 0;
+  const hasActiveQuery = (findQuery ?? '').length > 0 && activeFindOccurrence !== null && activeFindOccurrence !== undefined;
   const findProjection = useMemo(
     () => (hasActiveQuery ? buildFileSearchProjection(content, findQuery ?? '') : { sources: [], matches: [] }),
     [content, findQuery, hasActiveQuery],
@@ -25,7 +25,7 @@ export function TextViewerBody({ content, findQuery, activeFindOccurrence }: Vie
   }, [activeFindOccurrence, findProjection.matches, findProjection.sources, hasActiveQuery]);
 
   return (
-    <div className="viewer-text" data-testid="viewer-large-text-fallback">
+    <div className="viewer-text" data-testid="viewer-large-text-fallback" tabIndex={0}>
       <pre className="viewer-large-text-pre">
         {!hasActiveQuery || !lineFragments ? content : lineFragments.map(({ lineNumber, fragments }) => (
           <span key={lineNumber} data-find-line={lineNumber}>

@@ -5,6 +5,7 @@ interface UseViewerFindKeyboardShortcutOptions {
   scopeId: string;
   onOpen: () => void;
   enabled?: boolean;
+  allowWhenNoActiveScope?: boolean;
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -15,14 +16,20 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || element.isContentEditable;
 }
 
-export function useViewerFindKeyboardShortcut({ scopeId, onOpen, enabled = true }: UseViewerFindKeyboardShortcutOptions) {
+export function useViewerFindKeyboardShortcut({
+  scopeId,
+  onOpen,
+  enabled = true,
+  allowWhenNoActiveScope = false,
+}: UseViewerFindKeyboardShortcutOptions) {
   const { activeScope } = useFocusScope();
 
   useEffect(() => {
     if (!enabled) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'f') return;
-      if (activeScope !== scopeId) return;
+      const ownsShortcut = activeScope === scopeId || (allowWhenNoActiveScope && activeScope === null);
+      if (!ownsShortcut) return;
       if (isEditableTarget(event.target)) return;
       event.preventDefault();
       onOpen();
@@ -30,5 +37,5 @@ export function useViewerFindKeyboardShortcut({ scopeId, onOpen, enabled = true 
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeScope, enabled, onOpen, scopeId]);
+  }, [activeScope, allowWhenNoActiveScope, enabled, onOpen, scopeId]);
 }

@@ -1,8 +1,9 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
+import { FocusScopeProvider } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -16,7 +17,7 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
   const store = new ConversationStore();
   return (
     <ConversationContext.Provider value={store}>
-      {ui}
+      <FocusScopeProvider>{ui}</FocusScopeProvider>
     </ConversationContext.Provider>
   );
 }
@@ -192,6 +193,39 @@ describe('latest assistant expansion in compact mode', () => {
 });
 
 describe('MessageList', () => {
+  it('claims find only while open, refocuses on repeat, and closes from transcript body', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find"
+      />,
+    ));
+
+    const transcript = screen.getByTestId('mock-virtuoso');
+    transcript.focus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    expect(input).toHaveFocus();
+
+    transcript.focus();
+    expect(transcript).toHaveFocus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    await waitFor(() => expect(input).toHaveFocus());
+
+    transcript.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+    await waitFor(() => expect(transcript).toHaveFocus());
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    window.dispatchEvent(escape);
+    expect(escape.defaultPrevented).toBe(false);
+  });
+
   it('renders skill invocations as inline slash-command user messages with attachments', () => {
     const skillMessage = {
       ...makeMessage(7, 'skill'),
@@ -1562,3 +1596,5 @@ describe('handleTotalListHeightChanged', () => {
     expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
   });
 });
+
+

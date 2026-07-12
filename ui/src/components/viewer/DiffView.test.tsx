@@ -87,10 +87,17 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     const scrollIntoView = vi.fn();
     if (commitLine) commitLine.scrollIntoView = scrollIntoView;
 
+    expect(commitLine?.querySelectorAll('[data-find-occurrence]').length).toBe(1);
+    expect(commitLine).toHaveClass('viewer-find-row-match', 'viewer-find-row-match--active');
+
     fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
     expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    expect(commitLine).toHaveClass('viewer-find-row-match');
+    expect(commitLine).not.toHaveClass('viewer-find-row-match--active');
+
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(commitLine).toHaveClass('viewer-find-row-match', 'viewer-find-row-match--active');
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' });
   });
 
@@ -142,6 +149,25 @@ describe('DiffView (Pierre CodeView wiring)', () => {
 
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
     expect(codeViewMockState.lastUnsafeCss).toBe('');
+  });
+
+  it('restores diff find focus to the actual opener when closed from body Escape', async () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    const bodyLine = screen.getByTestId('mock-line-el-committed:foo.txt');
+    const findButton = screen.getByRole('button', { name: 'Find in diff' });
+    bodyLine.tabIndex = 0;
+    bodyLine.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(bodyLine).toHaveFocus();
   });
 
   it('lets find Escape close the find bar before the shell closes the viewer', () => {

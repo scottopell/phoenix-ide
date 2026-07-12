@@ -59,6 +59,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
   const lastScrollTopRef = useRef(0);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
 
@@ -234,7 +235,6 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     || largeFallback;
   const findSourceText = findEligible ? content : '';
   const find = useViewerFind({ text: findSourceText });
-  useViewerFindKeyboardShortcut({ scopeId: 'file-viewer', onOpen: find.open, enabled: findEligible });
   const findProjection = useMemo<FileSearchProjection>(
     () => (findEligible ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
     [findEligible, findSourceText, find.query],
@@ -252,8 +252,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     highlightedLine: notes.highlightedLine,
     onAnnotate: notes.startAnnotate,
     registerLineRef,
-    findQuery: find.query,
-    activeFindOccurrence: find.activeIndex,
+    findQuery: find.isOpen ? find.query : '',
+    activeFindOccurrence: find.isOpen ? find.activeIndex : null,
   };
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
 
@@ -268,10 +268,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     matchEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, [activeFindMatch, find.activeIndex, find.isOpen, usePierreCode]);
 
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    find.open();
+  }, [find]);
+
   const closeFind = useCallback(() => {
     find.close();
-    queueMicrotask(() => findButtonRef.current?.focus());
+    const restoreTarget = findPreviousFocusRef.current;
+    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
   }, [find]);
+
+  useViewerFindKeyboardShortcut({ scopeId: 'file-viewer', onOpen: openFind, enabled: findEligible });
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
@@ -302,7 +310,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           ref={findButtonRef}
           type="button"
           className="viewer-shell-btn"
-          onClick={find.open}
+          onClick={openFind}
           aria-label="Find in file"
           title="Find in file"
         >

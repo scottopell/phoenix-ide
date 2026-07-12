@@ -207,6 +207,33 @@ describe('buildConversationSearchProjection', () => {
     expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
   });
 
+  it('indexes full-density non-think tool details while compact still excludes them', () => {
+    const units: RenderUnit[] = [
+      {
+        kind: 'agent_turn',
+        key: 'a1',
+        isFirstInTurn: true,
+        agent: agentMsg('a1', [
+          { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'bash ls', input: { script: 'secret alpha payload' } },
+        ]),
+        toolResultsByUseId: new Map([
+          ['tool-1', toolMsg('t1', 'tool-1', { result: 'hidden alpha result' })],
+        ]),
+      },
+    ];
+
+    const fullInputProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'full' });
+    expect(fullInputProjection.matches).toHaveLength(1);
+    expect(fullInputProjection.matches[0]?.target.sourceId).toContain('tool-use-input-0');
+
+    const fullResultProjection = buildConversationSearchProjection(units, 'hidden alpha result', { density: 'full' });
+    expect(fullResultProjection.matches).toHaveLength(1);
+    expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-result-0');
+
+    const compactProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
+    expect(compactProjection.matches).toHaveLength(0);
+  });
+
   it('keeps force-expanded latest compact text searchable past the first line', () => {
     const message = agentMsg('a1', [{ type: 'text', text: 'first line\nvisible second line alpha' }]);
     message.display_data = { forceExpandedText: true };
@@ -256,6 +283,8 @@ describe('buildConversationSearchProjection', () => {
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-name-1', 'search'],
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
+      ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
+      ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'pending inspect alpha path\ncompleted summarize beta path done'],
     ]);
     expect(projection.matches.map((match) => match.target.unitKind)).toEqual([
@@ -265,6 +294,8 @@ describe('buildConversationSearchProjection', () => {
       'pending_user',
       'skill',
       'system',
+      'agent_turn',
+      'agent_turn',
       'agent_turn',
       'agent_turn',
       'sub_agent_status',

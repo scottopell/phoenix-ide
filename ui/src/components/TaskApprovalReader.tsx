@@ -274,16 +274,12 @@ export function TaskApprovalReader({
 
   const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
   const find = useViewerFind({ text: plan });
-  useViewerFindKeyboardShortcut({ scopeId: 'task-approval', onOpen: find.open });
-  const findProjection = useMemo(
-    () => buildBlockSearchProjection(findablePlanBlocks, find.query),
-    [findablePlanBlocks, find.query]
-  );
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const blockRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   // Focus note input when dialog opens
   useEffect(() => {
@@ -323,37 +319,6 @@ export function TaskApprovalReader({
     setNoteInput('');
   }, [annotatingLine, noteInput]);
 
-  // Block Escape from closing — note/dialog/discard/find each get precedence, but
-  // the approval reader itself still cannot be dismissed by Escape.
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        if (annotatingLine) {
-          setAnnotatingLine(null);
-          return;
-        }
-        if (discardConfirmOpen) {
-          setDiscardConfirmOpen(false);
-          return;
-        }
-        if (find.isOpen) {
-          find.close();
-          queueMicrotask(() => findButtonRef.current?.focus());
-          return;
-        }
-        return;
-      }
-      if (annotatingLine && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        handleAddNote();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown, true);
-    return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, discardConfirmOpen, find, handleAddNote]);
-
   const handleLongPress = useCallback(
     (lineNumber: number, lineContent: string) => {
       setAnnotatingLine({ lineNumber, lineContent });
@@ -380,10 +345,52 @@ export function TaskApprovalReader({
     setShowNotesPanel(false);
   }, []);
 
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    find.open();
+  }, [find]);
+
   const closeFind = useCallback(() => {
     find.close();
-    queueMicrotask(() => findButtonRef.current?.focus());
+    const restoreTarget = findPreviousFocusRef.current;
+    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
   }, [find]);
+
+  // Block Escape from closing — note/dialog/discard/find each get precedence, but
+  // the approval reader itself still cannot be dismissed by Escape.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (annotatingLine) {
+          setAnnotatingLine(null);
+          return;
+        }
+        if (discardConfirmOpen) {
+          setDiscardConfirmOpen(false);
+          return;
+        }
+        if (find.isOpen) {
+          closeFind();
+          return;
+        }
+        return;
+      }
+      if (annotatingLine && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        handleAddNote();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [annotatingLine, closeFind, discardConfirmOpen, find.isOpen, handleAddNote]);
+
+  useViewerFindKeyboardShortcut({ scopeId: 'task-approval', onOpen: openFind });
+  const findProjection = useMemo(
+    () => (find.isOpen ? buildBlockSearchProjection(findablePlanBlocks, find.query) : { sources: [], matches: [] }),
+    [find.isOpen, findablePlanBlocks, find.query]
+  );
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
@@ -608,7 +615,7 @@ export function TaskApprovalReader({
           <button
             ref={findButtonRef}
             className="task-approval-badge"
-            onClick={find.open}
+            onClick={openFind}
             aria-label="Find in task approval"
             title="Find in task approval"
           >

@@ -180,6 +180,49 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-find-occurrence]')).toBeNull();
   });
 
+  it('restores large-text find focus to the body opener instead of the toolbar', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    const largeTextBody = screen.getByTestId('viewer-large-text-fallback');
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    largeTextBody.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(largeTextBody).toHaveFocus();
+  });
+
+  it('clears large-text fallback marks when closing find from the toolbar', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(document.querySelectorAll('[data-find-occurrence]').length).toBe(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
+  });
+
   it('highlights and counts exact occurrences in large text fallback DOM source', async () => {
     renderViewer({
       ...textCommon,

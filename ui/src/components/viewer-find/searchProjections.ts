@@ -344,7 +344,7 @@ export function buildConversationSearchProjection(
         }
         break;
       case 'agent_turn':
-        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId)) {
+        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density)) {
           addConversationSource(
             sources,
             unitIndex,
@@ -488,6 +488,7 @@ function toolResultText(result: Message | undefined): string {
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
+  density: 'full' | 'compact',
 ): Array<{ role: string; text: string; forceExpanded?: boolean }> {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const forceExpandedText = (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
@@ -500,7 +501,7 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
-      if (block.name === 'think') {
+      if (densityToolDetailsVisible(block.name, density)) {
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
         out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
       }
@@ -508,6 +509,11 @@ function agentTurnSources(
     }
   });
   return out;
+}
+
+function densityToolDetailsVisible(toolName: string | undefined, density: 'full' | 'compact'): boolean {
+  if (toolName === 'think') return true;
+  return density === 'full';
 }
 
 function containsMermaidFence(text: string): boolean {

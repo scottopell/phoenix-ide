@@ -211,4 +211,17 @@ describe('TaskApprovalReader shared find integration', () => {
     expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).not.toBeInTheDocument();
     expect(screen.getByText('Review task')).toBeInTheDocument();
   });
+
+  it('clears task-plan marks when find closes', async () => {
+    renderTaskApprovalReader('# Plan\n\nbanana');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'ana' } });
+    await waitFor(() => expect(document.querySelectorAll('mark').length).toBe(2));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('mark')).toBeNull();
+  });
 });

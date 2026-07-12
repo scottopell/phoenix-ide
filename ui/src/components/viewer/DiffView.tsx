@@ -77,15 +77,28 @@ export function DiffView({
   useRegisterFocusScope('diff-viewer');
   const notes = useDiffReviewNotes(onSendNotes);
   const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
+  const findButtonRef = useRef<HTMLButtonElement>(null);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
   const find = useViewerFind({ text: '' });
+
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    find.open();
+  }, [find]);
+
+  const closeFind = useCallback(() => {
+    find.close();
+    const restoreTarget = findPreviousFocusRef.current;
+    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
+  }, [find]);
+
+  useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: openFind });
   const findProjection = useMemo(
     () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog),
     [commitLog, committedDiff, uncommittedDiff, find.query],
   );
-  useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: find.open });
-
   const activeFindIndex = findProjection.matches.length === 0
     ? -1
     : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
@@ -164,7 +177,7 @@ export function DiffView({
   return (
     <ViewerShell
       closeOnEscape={!find.isOpen}
-      onInnerEscape={find.close}
+      onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title={
@@ -177,7 +190,8 @@ export function DiffView({
           <button
             className="viewer-shell-btn"
             type="button"
-            onClick={find.open}
+            ref={findButtonRef}
+            onClick={openFind}
             aria-label="Find in diff"
             title="Find in diff"
           >
@@ -202,7 +216,7 @@ export function DiffView({
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
-          onClose={find.close}
+          onClose={closeFind}
           autoFocus
         />
       ) : undefined}
@@ -244,7 +258,14 @@ export function DiffView({
           </div>
         ) : (
           <>
-            {commitLog.trim() && <CommitLogSection commitLog={commitLog} />}
+            {commitLog.trim() && (
+              <CommitLogSection
+                commitLog={commitLog}
+                matches={findProjection.matches}
+                activeMatchIndex={activeFindIndex}
+                findOpen={find.isOpen}
+              />
+            )}
             <DiffSummaryBar
               comparator={comparator}
               committedDiff={committedDiff}
@@ -273,19 +294,81 @@ export function DiffView({
   );
 }
 
-function CommitLogSection({ commitLog }: { commitLog: string }) {
+function CommitLogSection({
+  commitLog,
+  matches,
+  activeMatchIndex,
+  findOpen,
+}: {
+  commitLog: string;
+  matches: readonly { target: DiffSearchMatchTarget; start: number; end: number }[];
+  activeMatchIndex: number;
+  findOpen: boolean;
+}) {
+  const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+  matches.forEach((match, occurrenceIndex) => {
+    if (match.target.kind !== 'commit-log-line') return;
+    const lineNumber = Number.parseInt(match.target.itemId.replace('commit-log:', ''), 10);
+    if (Number.isNaN(lineNumber)) return;
+    const lineMatches = matchesByLine.get(lineNumber) ?? [];
+    lineMatches.push({ start: match.start, end: match.end, occurrenceIndex });
+    matchesByLine.set(lineNumber, lineMatches);
+  });
+
   return (
     <section className="diff-section">
       <h3 className="diff-section-title">Commits</h3>
       <div className="diff-pre diff-pre-log">
-        {commitLog.split('\n').map((line, i) => (
-          <div id={`commit-log:${i}`} key={i} className="diff-line">
-            {line || ' '}
-          </div>
-        ))}
+        {commitLog.split('\n').map((line, i) => {
+          const lineMatches = findOpen ? matchesByLine.get(i) ?? [] : [];
+          const isActive = lineMatches.some((match) => match.occurrenceIndex === activeMatchIndex);
+          const hasMatch = lineMatches.length > 0;
+          return (
+            <div
+              id={`commit-log:${i}`}
+              key={i}
+              className={[
+                'diff-line',
+                hasMatch && 'viewer-find-row-match',
+                isActive && 'viewer-find-row-match--active',
+              ].filter(Boolean).join(' ')}
+            >
+              {lineMatches.length === 0 ? (line || ' ') : renderCommitLogFindFragments(line, lineMatches, activeMatchIndex)}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
+}
+
+function renderCommitLogFindFragments(
+  text: string,
+  matches: readonly { start: number; end: number; occurrenceIndex: number }[],
+  activeOccurrence: number,
+): React.ReactNode[] {
+  if (matches.length === 0) return [text || ' '];
+  const fragments: React.ReactNode[] = [];
+  let cursor = 0;
+  matches.forEach((match) => {
+    const start = Math.max(match.start, cursor);
+    const end = Math.max(match.end, start);
+    if (start > cursor) fragments.push(text.slice(cursor, start));
+    if (end > start) {
+      fragments.push(
+        <mark
+          key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
+          className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
+          data-find-occurrence={match.occurrenceIndex}
+        >
+          {text.slice(start, end)}
+        </mark>,
+      );
+    }
+    cursor = Math.max(cursor, end);
+  });
+  if (cursor < text.length) fragments.push(text.slice(cursor));
+  return fragments.length > 0 ? fragments : [' '];
 }
 
 interface DiffSummaryBarProps {

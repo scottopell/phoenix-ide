@@ -1,7 +1,7 @@
 import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
 import { useDensity } from '../hooks/useDensity';
 import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
-import { useFocusScope, useRegisterFocusScope } from '../hooks/useFocusScope';
+import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -326,10 +326,11 @@ function MessageListImpl({
   targetMessageId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
-  useRegisterFocusScope(findScopeId);
   const { activeScope } = useFocusScope();
+  const { pushScope, popScope } = useFocusScopeCommands();
   const { density } = useDensity();
   const [findOpen, setFindOpen] = useState(false);
+  const [findFocusVersion, setFindFocusVersion] = useState(0);
   const [findQuery, setFindQuery] = useState('');
   const [findActiveIndex, setFindActiveIndex] = useState(0);
   const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
@@ -384,12 +385,37 @@ function MessageListImpl({
   const openFind = useCallback(() => {
     findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setFindOpen(true);
+    setFindFocusVersion((version) => version + 1);
   }, []);
   const closeFind = useCallback(() => {
     setFindOpen(false);
     requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
   }, []);
-  useViewerFindKeyboardShortcut({ scopeId: findScopeId, onOpen: openFind });
+
+  useEffect(() => {
+    if (!findOpen) return undefined;
+    pushScope(findScopeId);
+    return () => popScope(findScopeId);
+  }, [findOpen, findScopeId, popScope, pushScope]);
+  useViewerFindKeyboardShortcut({
+    scopeId: findScopeId,
+    onOpen: openFind,
+    allowWhenNoActiveScope: true,
+  });
+  useEffect(() => {
+    if (!findOpen) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const target = event.target as HTMLElement | null;
+      const isBodyFindInput = target instanceof HTMLElement && target.dataset['viewerFindInput'] === 'true';
+      if (isBodyFindInput) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeFind();
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [closeFind, findOpen]);
   const findConversationRef = useRef(conversationId);
   useEffect(() => {
     if (findConversationRef.current === conversationId) return;
@@ -822,13 +848,14 @@ function MessageListImpl({
         <>
           {slug && <OpenFindStreamingBuffer slug={slug} onChange={setFindStreamingBuffer} />}
           <FindBar
-          query={findQuery}
-          activeIndex={normalizedFindIndex}
-          matchCount={findMatches.length}
-          onQueryChange={changeFindQuery}
-          onNext={nextFindMatch}
-          onPrevious={previousFindMatch}
-          onClose={closeFind}
+            query={findQuery}
+            activeIndex={normalizedFindIndex}
+            matchCount={findMatches.length}
+            focusVersion={findFocusVersion}
+            onQueryChange={changeFindQuery}
+            onNext={nextFindMatch}
+            onPrevious={previousFindMatch}
+            onClose={closeFind}
           />
         </>
       )}

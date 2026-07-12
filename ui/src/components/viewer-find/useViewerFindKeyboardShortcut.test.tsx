@@ -15,7 +15,20 @@ function InactiveScopeHarness({ scopeId, onOpen }: { scopeId: string; onOpen: ()
   return <div>inactive</div>;
 }
 
+function EmptyScopeHarness({ onOpen }: { onOpen: () => void }) {
+  useViewerFindKeyboardShortcut({ scopeId: 'transcript', onOpen, allowWhenNoActiveScope: true });
+  return <div>transcript</div>;
+}
+
 describe('useViewerFindKeyboardShortcut', () => {
+  it('can claim the shortcut without permanently occupying the scope stack', () => {
+    const onOpen = vi.fn();
+    render(<FocusScopeProvider><EmptyScopeHarness onOpen={onOpen} /></FocusScopeProvider>);
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true }));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
   it('opens only for the active focus scope', () => {
     const onOpen = vi.fn();
     render(
