@@ -15,8 +15,12 @@ use "../projects/projects.allium" as projects
 -- Types
 ------------------------------------------------------------
 
-enum CreationProtocolAuthority { legacy_creation | engine_creation | shadow_creation }
 enum CreationMode { direct | managed | branch }
+enum CreationVariant { seeded_empty | initial_turn }
+enum CreationRejectReason { invalid_creation_intent | profile_unavailable }
+enum CreationFailureReason { retry_exhausted | permanent_effect_failure }
+enum CreationManualReason { foreign_resource | indeterminate_external_state | compensation_ownership_conflict | cleanup_deadline_exceeded }
+enum CreationLifecycleKind { cancel | delete }
 enum RepositoryKind { non_git | git }
 enum CreationEffectKind {
     resolve_repository | reserve_worktree | materialize_or_adopt_worktree
@@ -26,7 +30,6 @@ enum CreationEffectKind {
     | remove_finalized_attachments | remove_conversation_metadata
 }
 enum CreationOutcome { provisioning | ready | cancelled | deleted | failed | manual_resolution }
-enum ResourceOwnership { absent | owned | foreign | indeterminate }
 enum ReconciliationResult { absent | matching | foreign | indeterminate }
 enum CreationShadowComparisonKind {
     acceptance | intent_binding | effect_plan | observation | receipt | readiness | projection
@@ -39,7 +42,8 @@ value CreationIntent {
     requested_directory: String
     requested_branch: String? when mode = branch
     desired_base_branch: String? when mode = managed
-    initial_message: String
+    variant: CreationVariant
+    initial_message: String? when variant = initial_turn
     attachments: List<String>
 }
 
@@ -48,7 +52,9 @@ value CreationProfileBinding {
     snapshot_codec: dwf/CodecRef
     event_codec: dwf/CodecRef
     effect_codec: dwf/CodecRef
-    protocol_authority: CreationProtocolAuthority
+    protocol_authority: dwf/SemanticAuthority
+    execution_mode: dwf/ExecutionMode
+    protocol_selection: dwf/ProfileProtocolSelection
 }
 
 value RepositoryResolution {
@@ -59,17 +65,16 @@ value RepositoryResolution {
     project_main_ref: String? when kind = git
 }
 
-value WorktreeReservationIntent {
-    conversation_id: String
-    repository_root: String
-    path: projects/WorktreePath
-    branch_name: String
-    base_branch: String
+value CreationManualResolutionIntent {
+    effect_kind: CreationEffectKind
+    reason: CreationManualReason
 }
 
 value CreationProtocolProjection {
     conversation_id: String
-    authority: CreationProtocolAuthority
+    authority: dwf/SemanticAuthority
+    execution_mode: dwf/ExecutionMode
+    protocol_selection: dwf/ProfileProtocolSelection
     state: CreationProtocolState
     mode: CreationMode
     working_directory: String?
@@ -80,7 +85,7 @@ value CreationProtocolProjection {
     initial_message_expanded: Boolean
     runtime_bootstrapped: Boolean
     first_llm_dispatched: Boolean
-    failure_code: String?
+    failure_code: CreationFailureReason?
 }
 
 ------------------------------------------------------------
@@ -96,12 +101,21 @@ actor CreationResolutionOperator {}
 actor CreationProtocolMirror {}
 actor CreationProfileRegistry {}
 
+entity CreationAcceptanceRecord {
+    conversation_id: String
+    accepted: Boolean
+    reject_reason: CreationRejectReason? when accepted = false
+    committed_at: Timestamp
+}
+
 entity CreationWorkflowBinding {
     conversation_id: String
     workflow: dwf/Workflow
     intent: CreationIntent
     profile_binding: CreationProfileBinding
-    authority: CreationProtocolAuthority
+    authority: dwf/SemanticAuthority
+    execution_mode: dwf/ExecutionMode
+    protocol_selection: dwf/ProfileProtocolSelection
     outcome: CreationOutcome
     conversation: bedrock/Conversation?
     repository_resolution: RepositoryResolution?
@@ -132,6 +146,7 @@ entity PhysicalRepositoryLock {
 }
 
 entity CreationShadowParity {
+    -- Internal diagnostic only; never exposed as conversation state or API output.
     binding: CreationWorkflowBinding
     authoritative_conversation_id: String
     kind: CreationShadowComparisonKind
@@ -139,6 +154,9 @@ entity CreationShadowParity {
     actual: CreationProtocolProjection
     compared_at: Timestamp
     equal: Boolean
+    severity: dwf/DivergenceSeverity
+    required_action: dwf/DivergenceAction
+    resolved_at: Timestamp?
 }
 
 config {
@@ -164,7 +182,10 @@ config {
 -- next_conversation_id(), creation_profile_ref(), creation_snapshot_codec()
 -- creation_event_codec(), creation_effect_codec(), creation_profile_registered()
 -- structurally_valid_intent(intent), normalized_intent(intent)
--- shell_for(intent), profile_binding_for(authority), initial_creation_plan(binding)
+-- shell_for(intent), profile_binding_for(authority, execution_mode), initial_creation_plan(binding)
+-- creation_effect_kind(effect): CreationEffectKind
+-- creation_mode_projection(mode): bedrock/ConversationMode
+-- initial_turn_effects(binding), seeded_empty_effects(binding), effect_is_declared(binding, kind)
 -- shell_intent_and_workflow_committed_atomically(binding)
 -- acceptance_returned_after_commit(binding), effect_of(binding, kind)
 -- dependency_exists(binding, successor_kind, predecessor_kind)
@@ -185,8 +206,10 @@ config {
 -- compensation_dependency_exists(binding, successor_kind, predecessor_kind)
 -- all_compensations_terminal(binding), cancellation_deadline(binding), deletion_deadline(binding)
 -- legacy_projection(conversation_id), engine_projection(binding)
--- shadow_projection_has_no_external_effects(binding), parity_compared_for_every_authoritative_fact(binding)
--- protocol_authority_for_new_creation(), authority_is_immutable(binding)
+-- shadow_projection_is_internal_diagnostic_only(binding), parity_compared_for_every_authoritative_fact(binding)
+-- creation_divergence_severity(kind), creation_divergence_action(kind)
+-- unresolved_blocking_creation_divergence_exists(), mixed_authority_creation_semantics_are_equal()
+-- creation_protocol_selection(), authority_is_immutable(binding)
 -- no_authoritative_creation_work(profile), no_creation_acceptance_owed(profile)
 
 ------------------------------------------------------------
@@ -197,17 +220,20 @@ rule ShellFirstDurableAcceptance {
     when: ConversationCreationRequested(requester, raw_intent)
     requires: structurally_valid_intent(raw_intent)
     requires: creation_profile_registered()
-    requires: protocol_authority_for_new_creation() = engine_creation
+    requires: creation_protocol_selection().authority = engine_protocol
+    requires: creation_protocol_selection().accepting = true
 
     let intent = normalized_intent(raw_intent)
-    let profile_binding = profile_binding_for(engine_creation)
+    let profile_binding = profile_binding_for(engine_protocol, authoritative)
     let binding = CreationWorkflowBinding{conversation_id: intent.conversation_id}
 
     ensures: CreationWorkflowBinding.created(
         conversation_id: intent.conversation_id,
         intent: intent,
         profile_binding: profile_binding,
-        authority: engine_creation,
+        authority: engine_protocol,
+        execution_mode: authoritative,
+        protocol_selection: creation_protocol_selection(),
         outcome: provisioning,
         accepted_at: now()
     )
@@ -215,7 +241,10 @@ rule ShellFirstDurableAcceptance {
     ensures: initial_creation_plan(binding)
     ensures: shell_intent_and_workflow_committed_atomically(binding)
     ensures: acceptance_returned_after_commit(binding)
-    ensures: ConversationCreationAccepted(intent.conversation_id)
+    ensures: CreationAcceptanceRecord.created(
+        conversation_id: intent.conversation_id, accepted: true, committed_at: now()
+    )
+    ensures: CreationProfileAcceptanceSucceeded(intent.conversation_id)
 
     @guidance
         -- The shell, normalized intent, typed profile binding, workflow snapshot,
@@ -227,23 +256,24 @@ rule ShellFirstDurableAcceptance {
 rule InvalidIntentRejectedBeforeShell {
     when: ConversationCreationRequested(requester, raw_intent)
     requires: not structurally_valid_intent(raw_intent)
-    ensures: ConversationCreationRejected("invalid_creation_intent")
+    ensures: CreationAcceptanceRecord.created(
+        conversation_id: raw_intent.conversation_id, accepted: false,
+        reject_reason: invalid_creation_intent, committed_at: now()
+    )
+    ensures: CreationProfileAcceptanceRejected(invalid_creation_intent)
     ensures: not CreationWorkflowBinding.created(conversation_id: raw_intent.conversation_id)
 }
 
-rule RequiredCreationDagDeclared {
+rule InitialTurnCreationDagDeclared {
     when: InitialCreationPlanEvaluated(reducer, binding)
     requires: binding.outcome = provisioning
+    requires: binding.intent.variant = initial_turn
 
-    ensures: required_effect(binding, resolve_repository)
-    ensures: required_effect(binding, reserve_worktree)
-    ensures: required_effect(binding, materialize_or_adopt_worktree)
-    ensures: required_effect(binding, finalize_attachments)
-    ensures: required_effect(binding, commit_metadata)
-    ensures: required_effect(binding, expand_initial_message)
-    ensures: required_effect(binding, bootstrap_runtime)
-    ensures: required_effect(binding, dispatch_first_llm)
-
+    ensures: initial_turn_effects(binding) = {
+        resolve_repository, reserve_worktree, materialize_or_adopt_worktree,
+        finalize_attachments, commit_metadata, expand_initial_message,
+        bootstrap_runtime, dispatch_first_llm
+    }
     ensures: dependency_exists(binding, reserve_worktree, resolve_repository)
     ensures: dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
@@ -253,19 +283,36 @@ rule RequiredCreationDagDeclared {
     ensures: dependency_exists(binding, bootstrap_runtime, expand_initial_message)
     ensures: dependency_exists(binding, dispatch_first_llm, bootstrap_runtime)
     ensures: no_other_creation_dependencies(binding)
-    ensures: readiness_members(binding) = {
-        resolve_repository, reserve_worktree, materialize_or_adopt_worktree,
-        finalize_attachments, commit_metadata, expand_initial_message,
-        bootstrap_runtime, dispatch_first_llm
-    }
+    ensures: readiness_members(binding) = initial_turn_effects(binding)
 }
 
-rule DirectCreationSkipsWorktreeByTypedReceipt {
-    when: RepositoryResolutionAccepted(reducer, binding, receipt)
+rule SeededEmptyCreationDagOmitsTurnRuntimeWork {
+    when: InitialCreationPlanEvaluated(reducer, binding)
+    requires: binding.outcome = provisioning
+    requires: binding.intent.variant = seeded_empty
+
+    ensures: seeded_empty_effects(binding) = {
+        resolve_repository, reserve_worktree, materialize_or_adopt_worktree,
+        finalize_attachments, commit_metadata
+    }
+    ensures: not effect_is_declared(binding, expand_initial_message)
+    ensures: not effect_is_declared(binding, bootstrap_runtime)
+    ensures: not effect_is_declared(binding, dispatch_first_llm)
+    ensures: dependency_exists(binding, reserve_worktree, resolve_repository)
+    ensures: dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
+    ensures: dependency_exists(binding, commit_metadata, materialize_or_adopt_worktree)
+    ensures: dependency_exists(binding, commit_metadata, finalize_attachments)
+    ensures: no_other_creation_dependencies(binding)
+    ensures: readiness_members(binding) = seeded_empty_effects(binding)
+}
+
+rule DirectCreationOmitsInapplicableWorktreeEffects {
+    when: InitialCreationPlanEvaluated(reducer, binding)
     requires: binding.intent.mode = direct
-    ensures: receipt_records_absence(effect_of(binding, reserve_worktree), receipt)
-    ensures: receipt_records_absence(effect_of(binding, materialize_or_adopt_worktree), receipt)
-    ensures: not PhysicalRepositoryLock.created(holder_effect: effect_of(binding, materialize_or_adopt_worktree))
+    ensures: not effect_is_declared(binding, reserve_worktree)
+    ensures: not effect_is_declared(binding, materialize_or_adopt_worktree)
+    ensures: not PhysicalRepositoryLock.created(repository_root: binding.intent.requested_directory)
 }
 
 rule RepositoryResolutionPreservesProjectSemantics {
@@ -333,32 +380,38 @@ rule InterruptedEffectObservesBeforeReplay {
 }
 
 rule ObservationAdoptsMatchingResult {
-    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation)
+    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
     requires: reconciliation_result(effect, observation) = matching
     ensures: receipt_adopts_observed_resource(effect, observation)
 }
 
 rule ObservationPermitsAbsentResourceExecution {
-    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation)
+    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
     requires: reconciliation_result(effect, observation) = absent
     requires: effect.ambiguity_policy in {observable_reconciliation, external_idempotency, safe_repeatability}
     ensures: CreationEffectExecutionPermitted(effect)
 }
 
 rule ForeignResourceRequiresManualResolution {
-    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation)
+    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
     requires: reconciliation_result(effect, observation) = foreign
     ensures: ForeignResourceConflictRecorded(binding, effect, foreign_resource_evidence(effect, observation))
-    ensures: CreationManualResolutionRequested(binding, effect, "foreign_resource")
+    ensures: CreationManualResolutionRequested(binding, effect, foreign_resource)
+    ensures: CreationManualResolutionIntent{
+        effect_kind: creation_effect_kind(effect), reason: foreign_resource
+    }
     ensures: binding.outcome = manual_resolution
     ensures: not CreationEffectExecutionPermitted(effect)
     ensures: not ForeignResourceMutated(effect)
 }
 
 rule IndeterminateResourceRequiresManualResolution {
-    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation)
+    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
     requires: reconciliation_result(effect, observation) = indeterminate
-    ensures: CreationManualResolutionRequested(binding, effect, "indeterminate_external_state")
+    ensures: CreationManualResolutionRequested(binding, effect, indeterminate_external_state)
+    ensures: CreationManualResolutionIntent{
+        effect_kind: creation_effect_kind(effect), reason: indeterminate_external_state
+    }
     ensures: binding.outcome = manual_resolution
     ensures: not CreationEffectExecutionPermitted(effect)
 }
@@ -378,14 +431,14 @@ rule RetryBudgetOrDeadlineFailsProvisioning {
     requires: attempt_count(effect) >= config.max_attempts
         or now() >= effect_deadline(binding, creation_effect_kind(effect))
     ensures: binding.outcome = failed
-    ensures: CreationFailureProjected(binding, "creation_retry_exhausted")
+    ensures: CreationFailureProjected(binding, retry_exhausted)
 }
 
 rule PermanentFailureFailsWithoutRetry {
     when: CreationEffectFailed(adapter, binding, effect, evidence)
     requires: permanent_failure(evidence)
     ensures: binding.outcome = failed
-    ensures: CreationFailureProjected(binding, "creation_permanent_failure")
+    ensures: CreationFailureProjected(binding, permanent_effect_failure)
     ensures: not CreationRetryScheduled(effect, retry_deadline(effect))
 }
 
@@ -466,14 +519,14 @@ rule DeletionBumpsGenerationHidesShellAndDeclaresCompensationDag {
 rule CompensationNeverDeletesForeignResource {
     when: CreationCompensationObservationInterpreted(adapter, binding, effect, observation)
     requires: reconciliation_result(effect, observation) in {foreign, indeterminate}
-    ensures: CreationManualResolutionRequested(binding, effect, "compensation_ownership_conflict")
+    ensures: CreationManualResolutionRequested(binding, effect, compensation_ownership_conflict)
     ensures: not ForeignResourceMutated(effect)
 }
 
 rule CompensationDeadlineEscalatesWithoutFalseCompletion {
     when: CreationCompensationDeadlineReached(manager, binding, lifecycle_kind)
-    requires: lifecycle_kind = "cancel" and now() >= cancellation_deadline(binding)
-        or lifecycle_kind = "delete" and now() >= deletion_deadline(binding)
+    requires: lifecycle_kind = cancel and now() >= cancellation_deadline(binding)
+        or lifecycle_kind = delete and now() >= deletion_deadline(binding)
     requires: not all_compensations_terminal(binding)
     ensures: CreationCleanupRequiresManualResolution(binding)
     ensures: binding.outcome = manual_resolution
@@ -486,7 +539,7 @@ rule CompensationDeadlineEscalatesWithoutFalseCompletion {
 
 rule LegacyAuthorityRemainsExclusive {
     when: LegacyCreationFactCommitted(mirror, conversation_id)
-    requires: legacy_projection(conversation_id).authority = legacy_creation
+    requires: legacy_projection(conversation_id).authority = legacy_protocol
     ensures: LegacyCreationProtocolActsAuthoritatively(conversation_id)
     ensures: EngineCreationProtocolDoesNotActAuthoritatively(conversation_id)
     ensures: authority_is_immutable(conversation_id)
@@ -494,7 +547,8 @@ rule LegacyAuthorityRemainsExclusive {
 
 rule EngineAuthorityRemainsExclusive {
     when: EngineCreationFactCommitted(mirror, binding)
-    requires: binding.authority = engine_creation
+    requires: binding.authority = engine_protocol
+    requires: binding.execution_mode = authoritative
     ensures: EngineCreationProtocolActsAuthoritatively(binding.conversation_id)
     ensures: LegacyCreationProtocolDoesNotActAuthoritatively(binding.conversation_id)
     ensures: authority_is_immutable(binding)
@@ -502,7 +556,7 @@ rule EngineAuthorityRemainsExclusive {
 
 rule ShadowCreationProjectsParityWithoutExternalEffects {
     when: CreationShadowComparisonRequested(mirror, binding, authoritative_conversation_id, kind)
-    requires: binding.authority = shadow_creation
+    requires: binding.execution_mode = shadow
     let expected = legacy_projection(authoritative_conversation_id)
     let actual = engine_projection(binding)
     ensures: CreationShadowParity.created(
@@ -512,9 +566,28 @@ rule ShadowCreationProjectsParityWithoutExternalEffects {
         expected: expected,
         actual: actual,
         compared_at: now(),
-        equal: expected = actual
+        equal: expected = actual,
+        severity: creation_divergence_severity(kind),
+        required_action: creation_divergence_action(kind),
+        resolved_at: null
     )
-    ensures: shadow_projection_has_no_external_effects(binding)
+    ensures: shadow_projection_is_internal_diagnostic_only(binding)
+    ensures: binding.workflow.execution_mode = shadow
+}
+
+rule CreationParityGateBlocksCutoverOnUnresolvedBlockingDivergence {
+    when: CreationParityGateEvaluated(mirror)
+    requires: unresolved_blocking_creation_divergence_exists()
+    ensures: CreationParityGateOutcome(blocked)
+    ensures: not CreationAuthorityCutoverPermitted()
+}
+
+rule CreationParityGatePermitsCutoverOnlyWithSemanticParity {
+    when: CreationParityGateEvaluated(mirror)
+    requires: not unresolved_blocking_creation_divergence_exists()
+    requires: mixed_authority_creation_semantics_are_equal()
+    ensures: CreationParityGateOutcome(open)
+    ensures: CreationAuthorityCutoverPermitted()
 }
 
 rule ProtocolDrainStopsNewAcceptanceButPreservesExecutors {
@@ -557,7 +630,7 @@ surface CreationEffectSurface {
         WorktreeReconciliationObserved(adapter, binding, effect, observation)
         CreationEffectPolicyEvaluated(binding, effect)
         CreationEffectAuthorityReplaced(adapter, binding, effect, authority)
-        CreationEffectObservationInterpreted(adapter, binding, effect, observation)
+        CreationEffectObservationInterpreted(adapter, binding, effect, observation, result: ReconciliationResult)
         CreationEffectFailed(adapter, binding, effect, evidence)
         CreationCompensationObservationInterpreted(adapter, binding, effect, observation)
 }
@@ -568,7 +641,7 @@ surface CreationLifecycleSurface {
     provides:
         CreationCancellationRequested(manager, binding)
         CreationDeletionRequested(manager, binding)
-        CreationCompensationDeadlineReached(manager, binding, lifecycle_kind)
+        CreationCompensationDeadlineReached(manager, binding, lifecycle_kind: CreationLifecycleKind)
 }
 
 surface CreationProtocolSurface {
@@ -577,6 +650,7 @@ surface CreationProtocolSurface {
         LegacyCreationFactCommitted(mirror, conversation_id)
         EngineCreationFactCommitted(mirror, binding)
         CreationShadowComparisonRequested(mirror, binding, authoritative_conversation_id, kind)
+        CreationParityGateEvaluated(mirror)
 }
 
 surface CreationProfileRegistrationSurface {
@@ -613,8 +687,8 @@ invariant RetriesAndClaimsAreBounded {
     every_creation_effect_has_at_most_config_max_attempts_and_no_attempt_begins_after_its_durable_deadline
 }
 
-invariant ReadyMeansFirstDispatchDurablyAccepted {
-    every_ready_creation_has_all_required_receipts_a_satisfied_readiness_barrier_and_one_first_llm_dispatch
+invariant ReadyMeansVariantSpecificDagDurablyAccepted {
+    every_ready_creation_has_all_variant_required_receipts_and_a_satisfied_readiness_barrier_and_only_initial_turn_has_one_first_llm_dispatch
 }
 
 invariant LifecycleRevokesOldAuthorityBeforeCompensation {
@@ -626,15 +700,19 @@ invariant CompensationTouchesOnlyOwnedResources {
 }
 
 invariant OneCreationProtocolAuthority {
-    every_creation_is_forever_owned_by_exactly_one_of_legacy_creation_or_engine_creation
+    every_creation_has_exactly_one_semantic_authority_independent_of_execution_mode
 }
 
 invariant ShadowCreationHasNoExternalAuthority {
-    every_shadow_creation_can_reduce_and_project_but_cannot_claim_execute_publish_dispatch_or_compensate
+    every_shadow_execution_mode_can_reduce_only_internal_diagnostics_and_cannot_claim_execute_publish_dispatch_or_compensate
 }
 
 invariant ShadowParityCoversAuthoritativeFacts {
     parity_compared_for_every_authoritative_fact
+}
+
+invariant CreationCutoverRequiresProfileParity {
+    creation_authority_cutover_requires_no_unresolved_blocking_divergence_and_mixed_authority_semantic_parity
 }
 
 invariant DrainPreservesAcceptedWork {

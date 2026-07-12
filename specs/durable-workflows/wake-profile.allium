@@ -14,7 +14,6 @@ use "../tmux-integration/tmux-integration.allium" as tmux
 -- Types
 ------------------------------------------------------------
 
-enum WakeProtocolAuthority { legacy_wake | engine_wake | shadow_wake }
 enum WakeHandleKind { bash | tmux_window }
 enum WakeTerminalCause { fired | expired | cancelled | forgotten }
 enum WakeCancellationReason { explicit_cancel }
@@ -22,6 +21,8 @@ enum WakeForgottenReason { handle_missing | runtime_unrecoverable_after_restart 
 enum BashTerminalStatus { exited | killed | kill_pending_kernel }
 enum TmuxTerminalStatus { exit_marker_observed | window_killed }
 enum WakeAcceptanceStatus { owed | accepted | suppressed }
+enum WakeObligationSuppressionReason { lifecycle_terminal | superseded }
+enum WakeRegistrationFenceStatus { open | closed }
 enum LifecycleFenceStatus { open | closed }
 enum WakeShadowComparisonKind {
     registration | observation | terminal_receipt | inbox | acceptance | lifecycle
@@ -129,7 +130,8 @@ value WakeAcceptancePayload {
 
 value WakeProtocolProjection {
     contract_id: String
-    authority: WakeProtocolAuthority
+    authority: dwf/SemanticAuthority
+    execution_mode: dwf/ExecutionMode
     registration: WakeRegistrationReceipt
     terminal: WakeTerminalPayload?
     inbox_item_id: String?
@@ -148,6 +150,17 @@ actor WakeContinuationManager {}
 actor WakeLifecycleManager {}
 actor WakeProtocolMirror {}
 
+entity WakeConversationRegistrationFence {
+    conversation: bedrock/Conversation
+    status: WakeRegistrationFenceStatus
+    version: Integer
+
+    transitions status {
+        open -> closed
+        closed -> open
+    }
+}
+
 entity WakeWorkflowBinding {
     contract_id: String
     workflow: dwf/Workflow
@@ -155,7 +168,10 @@ entity WakeWorkflowBinding {
     registration_scope: WorkScopeIdentity
     resource: WakeResourceIdentity
     expires_at: Timestamp
-    authority: WakeProtocolAuthority
+    authority: dwf/SemanticAuthority
+    execution_mode: dwf/ExecutionMode
+    protocol_selection: dwf/ProfileProtocolSelection
+    registration_fence_version: Integer
     observe_effect: dwf/Effect
     lifecycle_fence: LifecycleFenceStatus
 
@@ -182,7 +198,7 @@ entity WakeRuntimeObligation {
     status: WakeAcceptanceStatus
     created_at: Timestamp
     accepted_at: Timestamp? when status = accepted
-    terminal_reason: String? when status = suppressed
+    terminal_reason: WakeObligationSuppressionReason? when status = suppressed
 
     transitions status {
         owed -> accepted
@@ -192,6 +208,7 @@ entity WakeRuntimeObligation {
 }
 
 entity WakeShadowParity {
+    -- Internal diagnostic only; never exposed through agent or product surfaces.
     binding: WakeWorkflowBinding
     authoritative_contract_id: String
     kind: WakeShadowComparisonKind
@@ -199,6 +216,9 @@ entity WakeShadowParity {
     actual: WakeProtocolProjection
     compared_at: Timestamp
     equal: Boolean
+    severity: dwf/DivergenceSeverity
+    required_action: dwf/DivergenceAction
+    resolved_at: Timestamp?
 }
 
 config {
@@ -240,10 +260,13 @@ config {
 -- resource_scope_stable(predecessor, successor), exact_single_successor(predecessor, successor)
 -- transfer_is_atomic(predecessor, successor), predecessor_history_unchanged(predecessor)
 -- lifecycle_action_is_destructive(action), pending_wake_count(conversation)
+-- registration_fence_version(conversation), registration_and_lifecycle_share_cas(conversation, version)
 -- lifecycle_fence_serializes_with_registration(conversation)
--- protocol_authority_for_new_registration(), authority_is_immutable(binding)
+-- wake_protocol_selection(), authority_is_immutable(binding)
 -- legacy_projection(contract_id), engine_projection(binding)
--- shadow_projection_has_no_execution_authority(binding)
+-- shadow_projection_is_internal_diagnostic_only(binding)
+-- wake_divergence_severity(kind), wake_divergence_action(kind)
+-- unresolved_blocking_wake_divergence_exists(), mixed_authority_wake_semantics_are_equal()
 -- parity_compared_for_every_authoritative_fact(binding)
 
 ------------------------------------------------------------
@@ -257,12 +280,14 @@ rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     requires: resource.kind in {bash, tmux_window}
     requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
     requires: resource_identity_is_stable(resource)
-    requires: protocol_authority_for_new_registration() = engine_wake
+    requires: wake_protocol_selection().authority = engine_protocol
+    requires: wake_protocol_selection().accepting = true
     requires: not conversation.archived
     requires: not conversation.is_terminal
 
     let contract_id = next_contract_id()
     let scope = stable_scope_identity(resolve_work_scope(conversation))
+    let fence_version = registration_fence_version(conversation)
     let expires_at = now() + requested_max_wait_seconds
     let intent = WakeRegistrationIntent{
         contract_id: contract_id, conversation_id: conversation.id,
@@ -278,9 +303,13 @@ rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     ensures: WakeWorkflowBinding.created(
         contract_id: contract_id, conversation: conversation,
         registration_scope: scope, resource: resource, expires_at: expires_at,
-        authority: engine_wake, observe_effect: observe, lifecycle_fence: open
+        authority: engine_protocol, execution_mode: authoritative,
+        protocol_selection: wake_protocol_selection(), registration_fence_version: fence_version,
+        observe_effect: observe, lifecycle_fence: open
     )
     ensures: registration_transition_for(intent, observe)
+    ensures: registration_and_lifecycle_share_cas(conversation, fence_version)
+    ensures: WakeConversationRegistrationFence{conversation: conversation}.version = fence_version + 1
     ensures: workflow_and_effect_created_atomically(WakeWorkflowBinding{contract_id: contract_id})
     ensures: receipt_returned_after_commit(WakeWorkflowBinding{contract_id: contract_id})
     ensures: WakeRegistrationSucceeded(WakeRegistrationReceipt{
@@ -351,7 +380,7 @@ rule DeadlineScheduleForgetsUnevaluableResource {
 }
 
 rule CancellationScheduleArbitratesAndCompensates {
-    when: WakeCancellationRequested(conversation, binding)
+    when: WakeCancellationRequested(agent, conversation, binding)
     requires: binding.conversation = conversation
     requires: binding.observe_effect.status not in {receipted, invalidated}
     requires: cancellation_winner(binding) = explicit_cancel
@@ -366,7 +395,7 @@ rule CancellationScheduleArbitratesAndCompensates {
 }
 
 rule LosingCancellationIsIdempotent {
-    when: WakeCancellationRequested(conversation, binding)
+    when: WakeCancellationRequested(agent, conversation, binding)
     requires: terminal_winner(binding) != explicit_cancel
     ensures: WakeCancellationOutcome(already_terminal)
     ensures: no_resume_scheduled_only_for_cancel(binding)
@@ -459,7 +488,10 @@ rule LifecycleScheduleClosesFenceWhenNoPendingWake {
     when: DestructiveLifecycleRequested(manager, conversation, action)
     requires: lifecycle_action_is_destructive(action)
     requires: pending_wake_count(conversation) = 0
+    let fence_version = registration_fence_version(conversation)
     ensures: WakeLifecycleFenceClosed(conversation)
+    ensures: registration_and_lifecycle_share_cas(conversation, fence_version)
+    ensures: WakeConversationRegistrationFence{conversation: conversation}.version = fence_version + 1
     ensures: lifecycle_fence_serializes_with_registration(conversation)
     ensures: DestructiveLifecycleMayProceed(conversation, action)
 }
@@ -474,7 +506,7 @@ rule LifecycleScheduleRejectsWhileWakePending {
 
 rule LegacyProtocolRemainsAuthoritativeForStampedContract {
     when: LegacyWakeFactCommitted(mirror, contract_id)
-    requires: legacy_projection(contract_id).authority = legacy_wake
+    requires: legacy_projection(contract_id).authority = legacy_protocol
     ensures: LegacyWakeProtocolActsAuthoritatively(contract_id)
     ensures: EngineWakeProtocolDoesNotActAuthoritatively(contract_id)
     ensures: authority_is_immutable(contract_id)
@@ -482,7 +514,8 @@ rule LegacyProtocolRemainsAuthoritativeForStampedContract {
 
 rule EngineProtocolRemainsAuthoritativeForStampedWorkflow {
     when: EngineWakeFactCommitted(mirror, binding)
-    requires: binding.authority = engine_wake
+    requires: binding.authority = engine_protocol
+    requires: binding.execution_mode = authoritative
     ensures: EngineWakeProtocolActsAuthoritatively(binding.contract_id)
     ensures: LegacyWakeProtocolDoesNotActAuthoritatively(binding.contract_id)
     ensures: authority_is_immutable(binding)
@@ -490,15 +523,33 @@ rule EngineProtocolRemainsAuthoritativeForStampedWorkflow {
 
 rule ShadowScheduleComparesWithoutAuthority {
     when: WakeShadowComparisonRequested(mirror, binding, authoritative_contract_id, kind)
-    requires: binding.authority = shadow_wake
+    requires: binding.execution_mode = shadow
     let expected = legacy_projection(authoritative_contract_id)
     let actual = engine_projection(binding)
     ensures: WakeShadowParity.created(
         binding: binding, authoritative_contract_id: authoritative_contract_id,
         kind: kind, expected: expected, actual: actual,
-        compared_at: now(), equal: expected = actual
+        compared_at: now(), equal: expected = actual,
+        severity: wake_divergence_severity(kind), required_action: wake_divergence_action(kind),
+        resolved_at: null
     )
-    ensures: shadow_projection_has_no_execution_authority(binding)
+    ensures: shadow_projection_is_internal_diagnostic_only(binding)
+    ensures: binding.workflow.execution_mode = shadow
+}
+
+rule WakeParityGateBlocksCutoverOnUnresolvedBlockingDivergence {
+    when: WakeParityGateEvaluated(mirror)
+    requires: unresolved_blocking_wake_divergence_exists()
+    ensures: WakeParityGateOutcome(blocked)
+    ensures: not WakeAuthorityCutoverPermitted()
+}
+
+rule WakeParityGatePermitsCutoverOnlyWithSemanticParity {
+    when: WakeParityGateEvaluated(mirror)
+    requires: not unresolved_blocking_wake_divergence_exists()
+    requires: mixed_authority_wake_semantics_are_equal()
+    ensures: WakeParityGateOutcome(open)
+    ensures: WakeAuthorityCutoverPermitted()
 }
 
 ------------------------------------------------------------
@@ -539,7 +590,7 @@ surface WakeCancellationSurface {
     facing agent: WakeAgent
     context conversation: bedrock/Conversation
     provides:
-        WakeCancellationRequested(conversation, binding)
+        WakeCancellationRequested(agent, conversation, binding)
 }
 
 surface WakeContinuationSurface {
@@ -561,6 +612,7 @@ surface WakeProtocolParitySurface {
         LegacyWakeFactCommitted(mirror, contract_id)
         EngineWakeFactCommitted(mirror, binding)
         WakeShadowComparisonRequested(mirror, binding, authoritative_contract_id, kind)
+        WakeParityGateEvaluated(mirror)
 }
 
 ------------------------------------------------------------
@@ -616,9 +668,13 @@ invariant LifecycleFenceSerializesWithRegistration {
 }
 
 invariant OneWakeProtocolAuthority {
-    every_contract_is_forever_owned_by_exactly_one_of_legacy_wake_or_engine_wake_and_shadow_wake_never_executes
+    every_contract_has_exactly_one_semantic_authority_and_shadow_execution_mode_never_executes
 }
 
 invariant ShadowParityCoversAuthoritativeFacts {
     parity_compared_for_every_authoritative_fact
+}
+
+invariant WakeCutoverRequiresProfileParity {
+    wake_authority_cutover_requires_no_unresolved_blocking_divergence_and_mixed_authority_semantic_parity
 }
