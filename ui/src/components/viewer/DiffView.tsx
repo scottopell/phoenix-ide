@@ -94,7 +94,11 @@ export function DiffView({
     queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
   }, [find]);
 
-  useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: openFind });
+  useViewerFindKeyboardShortcut({
+    scopeId: 'diff-viewer',
+    onOpen: openFind,
+    dialogOpen: notes.annotating !== null,
+  });
   const findProjection = useMemo(
     () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog),
     [commitLog, committedDiff, uncommittedDiff, find.query],

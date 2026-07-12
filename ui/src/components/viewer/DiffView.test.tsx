@@ -197,6 +197,15 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('does not open find behind an annotation dialog', () => {
+    renderDiff(COMMITTED, '');
+    fireEvent.click(screen.getByTestId('mock-line-click-committed:foo.txt'));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Cancel' }), { key: 'f', metaKey: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
   it('adds a line note via the gutter affordance and surfaces it in the badge, panel, and inline annotation', () => {
     renderDiff();
     addNoteViaGutter('looks good');
