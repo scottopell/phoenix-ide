@@ -239,8 +239,11 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     () => (findEligible ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
     [findEligible, findSourceText, find.query],
   );
-  const activeFindMatch = find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
-  const findMatchTargets = useMemo(() => findProjection.matches.map((match) => match.target), [findProjection.matches]);
+  const activeFindMatch = find.isOpen && find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
+  const findMatchTargets = useMemo(
+    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
+    [find.isOpen, findProjection.matches],
+  );
 
   const modifiedLines = patchContext?.modifiedLines ?? EMPTY_SET;
   const bodyProps: ViewerBodyProps = {
@@ -377,6 +380,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       query={find.query}
       activeIndex={find.activeIndex}
       matchCount={findEligible ? find.matchCount : 0}
+      focusVersion={find.focusVersion}
       onQueryChange={handleFindQueryChange}
       onNext={handleFindNext}
       onPrevious={handleFindPrevious}
@@ -389,6 +393,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const shell = (
     <ViewerShell
       closeOnEscape={!find.isOpen}
+      onInnerEscape={closeFind}
       mode={viewerMode}
       ariaLabel={`File viewer: ${title}`}
       title={title}

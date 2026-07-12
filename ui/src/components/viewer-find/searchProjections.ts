@@ -49,7 +49,7 @@ export interface DiffSearchMatchTarget {
 }
 
 export interface DiffSearchSource extends SearchableSource<DiffSearchMatchTarget> {
-  kind: 'file-header' | 'line';
+  kind: 'commit-log' | 'file-header' | 'line';
   section: DiffSection;
   filePath: string;
   itemId: string;
@@ -130,6 +130,7 @@ export function buildDiffSearchProjection(
   committedDiff: string | null | undefined,
   uncommittedDiff: string | null | undefined,
   query: string,
+  commitLog: string | null | undefined = '',
 ): DiffSearchProjection {
   const sources: DiffSearchSource[] = [];
   let order = 0;
@@ -137,6 +138,27 @@ export function buildDiffSearchProjection(
     ['committed', committedDiff],
     ['uncommitted', uncommittedDiff],
   ];
+
+  const commitLogLines = (commitLog ?? '').split('\n');
+  for (let lineIndex = 0; lineIndex < commitLogLines.length; lineIndex += 1) {
+    sources.push({
+      id: `commit-log:${lineIndex}`,
+      kind: 'commit-log',
+      section: 'committed',
+      filePath: '',
+      itemId: `commit-log:${lineIndex}`,
+      order: order++,
+      text: commitLogLines[lineIndex] ?? '',
+      target: {
+        kind: 'diff-file-header',
+        section: 'committed',
+        filePath: '',
+        itemId: `commit-log:${lineIndex}`,
+        startColumn: 0,
+        endColumn: 0,
+      },
+    });
+  }
 
   for (const [section, rawDiff] of sections) {
     const built = buildSectionItems(section, rawDiff);
@@ -323,7 +345,14 @@ export function buildConversationSearchProjection(
         break;
       case 'agent_turn':
         for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId)) {
-          addConversationSource(sources, unitIndex, unit.kind, unit.key, source.role, visibleConversationText(source.text, density));
+          addConversationSource(
+            sources,
+            unitIndex,
+            unit.kind,
+            unit.key,
+            source.role,
+            visibleConversationText(source.text, density, { forceExpanded: source.forceExpanded }),
+          );
         }
         break;
       case 'streaming_agent':
@@ -418,7 +447,12 @@ function isHiddenSystemMessage(message: Message): boolean {
   return displayData?.hidden === true;
 }
 
-function visibleConversationText(text: string, density: 'full' | 'compact'): string {
+function visibleConversationText(
+  text: string,
+  density: 'full' | 'compact',
+  options: { forceExpanded?: boolean | undefined } = {},
+): string {
+  if (options.forceExpanded) return text;
   if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
   return firstLineSummary(text);
 }
@@ -434,6 +468,7 @@ function firstLineSummary(text: string, maxLen = 140): string {
 }
 
 function shouldCollapseCompactText(text: string): boolean {
+  if (containsMermaidFence(text)) return false;
   const nonEmptyLines = text.split('\n').filter((line) => line.trim());
   const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
   const fullFlat = text.replace(/\s+/g, ' ').trim();
@@ -453,23 +488,30 @@ function toolResultText(result: Message | undefined): string {
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
-): Array<{ role: string; text: string }> {
+): Array<{ role: string; text: string; forceExpanded?: boolean }> {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const out: Array<{ role: string; text: string }> = [];
+  const forceExpandedText = (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
+  const out: Array<{ role: string; text: string; forceExpanded?: boolean }> = [];
   blocks.forEach((block, index) => {
     if (block.type === 'text') {
-      out.push({ role: `agent-text-${index}`, text: block.text ?? '' });
+      out.push({ role: `agent-text-${index}`, text: block.text ?? '', forceExpanded: forceExpandedText });
       return;
     }
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
-      out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-      out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
+      if (block.name === 'think') {
+        out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
+        out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
+      }
       return;
     }
   });
   return out;
+}
+
+function containsMermaidFence(text: string): boolean {
+  return /```\s*mermaid\b/i.test(text);
 }
 
 function stableJson(value: unknown): string {

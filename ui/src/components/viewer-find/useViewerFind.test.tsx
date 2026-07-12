@@ -47,6 +47,27 @@ describe('useViewerFind', () => {
     expect(screen.getByTestId('active').textContent).toBe('0');
   });
 
+  it('bumps focusVersion when reopening an already-open find bar', () => {
+    let api: ReturnType<typeof useViewerFind> | null = null;
+
+    render(<Harness text="alpha beta alpha" onReady={(next) => { api = next; }} />);
+
+    expect(screen.getByTestId('count').textContent).toBe('0');
+    const initialFocusVersion = api!.focusVersion;
+
+    act(() => {
+      api!.open();
+    });
+    const openedFocusVersion = api!.focusVersion;
+
+    act(() => {
+      api!.open();
+    });
+
+    expect(openedFocusVersion).toBeGreaterThan(initialFocusVersion);
+    expect(api!.focusVersion).toBeGreaterThan(openedFocusVersion);
+  });
+
   it('notifies adapters when an open search has an active match', () => {
     const onNavigate = vi.fn();
     let api: ReturnType<typeof useViewerFind> | null = null;

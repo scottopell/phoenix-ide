@@ -79,10 +79,9 @@ export function DiffView({
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
   const find = useViewerFind({ text: '' });
-  const findSearchActive = find.isOpen || find.query.length > 0;
   const findProjection = useMemo(
-    () => (findSearchActive ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query) : { sources: [], matches: [] }),
-    [committedDiff, uncommittedDiff, find.query, findSearchActive],
+    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog),
+    [commitLog, committedDiff, uncommittedDiff, find.query],
   );
   useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: find.open });
 
@@ -117,29 +116,29 @@ export function DiffView({
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
-    const nextProjection = buildDiffSearchProjection(committedDiff, uncommittedDiff, query);
+    const nextProjection = buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog);
     const target = nextProjection.matches[0]?.target;
     if (target) codeViewRef.current?.scrollToFindTarget(target);
-  }, [find, committedDiff, uncommittedDiff]);
+  }, [find, commitLog, committedDiff, uncommittedDiff]);
 
   const handleFindNext = useCallback(() => {
     find.nextMatch();
-    const nextIndex = find.matchCount === 0
+    const nextIndex = findProjection.matches.length === 0
       ? -1
       : find.activeIndex < 0
         ? 0
-        : (find.activeIndex + 1) % find.matchCount;
+        : (find.activeIndex + 1) % findProjection.matches.length;
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
     if (target) codeViewRef.current?.scrollToFindTarget(target);
   }, [find, findProjection.matches]);
 
   const handleFindPrevious = useCallback(() => {
     find.previousMatch();
-    const nextIndex = find.matchCount === 0
+    const nextIndex = findProjection.matches.length === 0
       ? -1
       : find.activeIndex < 0
-        ? Math.max(find.matchCount - 1, 0)
-        : (find.activeIndex - 1 + find.matchCount) % find.matchCount;
+        ? Math.max(findProjection.matches.length - 1, 0)
+        : (find.activeIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
     if (target) codeViewRef.current?.scrollToFindTarget(target);
   }, [find, findProjection.matches]);
@@ -151,6 +150,7 @@ export function DiffView({
   return (
     <ViewerShell
       closeOnEscape={!find.isOpen}
+      onInnerEscape={find.close}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title={
@@ -162,6 +162,7 @@ export function DiffView({
         <>
           <button
             className="viewer-shell-btn"
+            type="button"
             onClick={find.open}
             aria-label="Find in diff"
             title="Find in diff"
@@ -182,7 +183,8 @@ export function DiffView({
         <FindBar
           query={find.query}
           activeIndex={find.activeIndex}
-          matchCount={find.matchCount}
+          matchCount={findProjection.matches.length}
+          focusVersion={find.focusVersion}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}

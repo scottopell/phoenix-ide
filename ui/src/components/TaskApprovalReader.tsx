@@ -217,14 +217,16 @@ function renderFindFragments(
   const fragments: React.ReactNode[] = [];
   let cursor = 0;
   matches.forEach((match) => {
-    if (match.start > cursor) fragments.push(text.slice(cursor, match.start));
+    const start = Math.max(match.start, cursor);
+    if (start > cursor) fragments.push(text.slice(cursor, start));
+    if (match.end <= start) return;
     fragments.push(
       <mark
         key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
         className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
         data-find-occurrence={match.occurrenceIndex}
       >
-        {text.slice(match.start, match.end)}
+        {text.slice(start, match.end)}
       </mark>
     );
     cursor = match.end;

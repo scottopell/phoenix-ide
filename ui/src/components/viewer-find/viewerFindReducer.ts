@@ -2,6 +2,7 @@ export interface ViewerFindState {
   isOpen: boolean;
   query: string;
   activeIndex: number;
+  focusVersion: number;
 }
 
 export type ViewerFindAction =
@@ -17,6 +18,7 @@ export const initialViewerFindState: ViewerFindState = {
   isOpen: false,
   query: '',
   activeIndex: -1,
+  focusVersion: 0,
 };
 
 function normalizeActiveIndex(index: number, matchCount: number): number {
@@ -35,7 +37,9 @@ function wrapIndex(index: number, matchCount: number): number {
 export function viewerFindReducer(state: ViewerFindState, action: ViewerFindAction): ViewerFindState {
   switch (action.type) {
     case 'open':
-      return state.isOpen ? state : { ...state, isOpen: true };
+      return state.isOpen
+        ? { ...state, focusVersion: state.focusVersion + 1 }
+        : { ...state, isOpen: true, focusVersion: state.focusVersion + 1 };
     case 'close':
       return state.isOpen ? { ...state, isOpen: false } : state;
     case 'toggle':

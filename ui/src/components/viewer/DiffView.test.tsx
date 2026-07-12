@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, within, act } from '@testing-library/react';
+import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DiffView } from './DiffView';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
@@ -62,6 +62,36 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(container.querySelector('.diff-viewer-body .phoenix-diff-codeview')).toBeTruthy();
   });
 
+  it('counts and navigates visible commit-log matches in diff find', async () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog="abc123 add hello context"
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    expect(screen.getByText('0 of 2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
+      type: 'item',
+      id: 'commit-log:0',
+      align: 'start',
+      behavior: 'smooth',
+    });
+  });
+
   it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
@@ -94,6 +124,21 @@ describe('DiffView (Pierre CodeView wiring)', () => {
 
     fireEvent.change(input, { target: { value: 'bar' } });
     fireEvent.keyDown(input, { key: 'Escape' });
+    expect(codeViewMockState.lastUnsafeCss).toBe('');
+  });
+
+  it('lets shell Escape close an open find bar after focus returns to the viewer body', async () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    const bodyLine = screen.getByTestId('mock-line-el-committed:foo.txt');
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
     expect(codeViewMockState.lastUnsafeCss).toBe('');
   });
 

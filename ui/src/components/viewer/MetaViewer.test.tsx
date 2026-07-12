@@ -132,6 +132,25 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.viewer-text')).toBeNull();
   });
 
+  it('reopens find by refocusing the existing bar after body focus leaves the input', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    const bodyLine = document.querySelector('[data-line="1"]') as HTMLElement;
+    bodyLine.focus();
+    expect(bodyLine).toHaveFocus();
+
+    fireEvent.click(findButton);
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveFocus());
+    expect((screen.getByRole('textbox', { name: 'Find in viewer' }) as HTMLInputElement).value).toBe('alpha');
+  });
+
   it('opens shared find for Pierre-backed files and restores focus to the opener on Escape', async () => {
     renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
 
@@ -145,6 +164,20 @@ describe('MetaViewer payload routing', () => {
 
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
     expect(findButton).toHaveFocus();
+  });
+
+  it('clears Pierre file decorations when shell Escape closes an open find bar after body focus', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    const bodyLine = document.querySelector('[data-line="1"]') as HTMLElement;
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
   });
 
   it('highlights and counts exact occurrences in large text fallback DOM source', async () => {

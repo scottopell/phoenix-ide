@@ -10,6 +10,7 @@ export interface FindBarProps {
   onPrevious: () => void;
   onClose: () => void;
   autoFocus?: boolean;
+  focusVersion?: number;
 }
 
 export function FindBar({
@@ -21,6 +22,7 @@ export function FindBar({
   onPrevious,
   onClose,
   autoFocus = true,
+  focusVersion = 0,
 }: FindBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const labelId = useId();
@@ -30,7 +32,7 @@ export function FindBar({
     if (!autoFocus) return;
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, [autoFocus]);
+  }, [autoFocus, focusVersion]);
 
   const statusText = matchCount === 0 ? '0 results' : `${activeIndex + 1} of ${matchCount}`;
 

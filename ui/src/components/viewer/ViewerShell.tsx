@@ -8,6 +8,9 @@ interface ViewerShellProps {
   /** When false, shell-level Escape handling stands down so an inner surface
    *  (for example viewer find) can consume Escape first. */
   closeOnEscape?: boolean | undefined;
+  /** Called when Escape should dismiss inner viewer chrome (for example an open
+   *  find bar) before the shell itself closes. */
+  onInnerEscape?: (() => void) | undefined;
   /** When true, suppresses the close button's default mousedown focus transfer so
    *  nested affordances can restore focus to their own opener instead. */
   suppressCloseButtonFocus?: boolean | undefined;
@@ -83,6 +86,7 @@ export function ViewerShell({
   confirm,
   bodyScroll = 'shell',
   closeOnEscape = true,
+  onInnerEscape,
   suppressCloseButtonFocus = false,
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
@@ -92,15 +96,20 @@ export function ViewerShell({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      // If a dialog/confirm is rendered, or the caller temporarily disables
-      // shell Escape handling, let the inner surface own Esc first.
-      if (dialog || confirm || !closeOnEscape) return;
+      // If a dialog/confirm is rendered, let the inner surface own Esc first.
+      if (dialog || confirm) return;
+      if (!closeOnEscape) {
+        if (!onInnerEscape) return;
+        e.stopPropagation();
+        onInnerEscape();
+        return;
+      }
       e.stopPropagation();
       onClose();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, dialog, confirm, closeOnEscape]);
+  }, [onClose, dialog, confirm, closeOnEscape, onInnerEscape]);
 
   const modal = mode !== 'inline';
   const className = mode === 'inline'

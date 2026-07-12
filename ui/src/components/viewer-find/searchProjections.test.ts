@@ -153,6 +153,12 @@ describe('buildDiffSearchProjection', () => {
     ]);
   });
 
+  it('includes visible commit-log lines in diff search results', () => {
+    const projection = buildDiffSearchProjection(COMMITTED, '', 'hello', 'abc123 hello\ndef456');
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.matches[0]?.target.itemId).toBe('commit-log:0');
+  });
+
   it('keeps changed lines side-aware', () => {
     const projection = buildDiffSearchProjection(COMMITTED, UNCOMMITTED, 'before');
     expect(projection.matches.map((match) => match.target)).toEqual([
@@ -171,6 +177,51 @@ describe('buildDiffSearchProjection', () => {
 });
 
 describe('buildConversationSearchProjection', () => {
+  it('keeps visible compact mermaid text searchable and excludes compact-hidden non-think tool details', () => {
+    const units: RenderUnit[] = [
+      {
+        kind: 'agent_turn',
+        key: 'a1',
+        isFirstInTurn: true,
+        agent: agentMsg('a1', [
+          { type: 'text', text: '```mermaid\nflowchart TD\nNode A --> Node B\n```' },
+          { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'bash ls', input: { script: 'secret alpha payload' } },
+          { type: 'tool_use', id: 'tool-2', name: 'think', display: 'think aloud', input: { thought: 'visible alpha thought' } },
+        ]),
+        toolResultsByUseId: new Map([
+          ['tool-1', toolMsg('t1', 'tool-1', { result: 'hidden alpha result' })],
+          ['tool-2', toolMsg('t2', 'tool-2', { result: 'visible alpha result' })],
+        ]),
+      },
+    ];
+
+    const mermaidProjection = buildConversationSearchProjection(units, 'Node B', { density: 'compact' });
+    expect(mermaidProjection.matches).toHaveLength(1);
+    expect(mermaidProjection.matches[0]?.target.sourceId).toContain('agent-text-0');
+
+    const hiddenToolProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
+    expect(hiddenToolProjection.matches).toHaveLength(0);
+
+    const thinkProjection = buildConversationSearchProjection(units, 'visible alpha result', { density: 'compact' });
+    expect(thinkProjection.matches).toHaveLength(1);
+    expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
+  });
+
+  it('keeps force-expanded latest compact text searchable past the first line', () => {
+    const message = agentMsg('a1', [{ type: 'text', text: 'first line\nvisible second line alpha' }]);
+    message.display_data = { forceExpandedText: true };
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'a1',
+      isFirstInTurn: true,
+      agent: message,
+      toolResultsByUseId: new Map(),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'visible second line alpha', { density: 'compact' });
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.matches[0]?.target.sourceId).toContain('agent-text-0');
+  });
   it('projects canonical typed content across available render units exhaustively', () => {
     const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
       type: 'awaiting_sub_agents',
@@ -205,8 +256,6 @@ describe('buildConversationSearchProjection', () => {
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-name-1', 'search'],
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
-      ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
-      ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'pending inspect alpha path\ncompleted summarize beta path done'],
     ]);
     expect(projection.matches.map((match) => match.target.unitKind)).toEqual([
@@ -216,8 +265,6 @@ describe('buildConversationSearchProjection', () => {
       'pending_user',
       'skill',
       'system',
-      'agent_turn',
-      'agent_turn',
       'agent_turn',
       'agent_turn',
       'sub_agent_status',
