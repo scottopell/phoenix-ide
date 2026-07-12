@@ -14,8 +14,9 @@ use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite};
 
@@ -459,12 +460,67 @@ impl ResponsesStreamAccumulator {
 type CodexSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+const CODEX_WS_MAX_SESSIONS: usize = 32;
+const CODEX_WS_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(not(test))]
+const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Default)]
 pub(crate) struct CodexWsSessions {
-    /// The outer mutex protects only entry creation. Each cache cohort has its
-    /// own mutex so requests for that cohort are serialized for the lifetime of
-    /// its connection without blocking unrelated conversations.
-    by_cache_key: HashMap<String, Arc<Mutex<CodexWsSession>>>,
+    /// The outer mutex protects entry creation and bounded eviction. Each cache
+    /// cohort has its own mutex, so unrelated conversations remain concurrent.
+    by_cache_key: HashMap<String, Arc<CodexWsSessionEntry>>,
+}
+
+#[derive(Debug)]
+struct CodexWsSessionEntry {
+    session: Mutex<CodexWsSession>,
+    /// Set synchronously before an attempt touches a socket. A dropped future
+    /// cannot run async cleanup, so its Drop guard leaves this marker set for
+    /// the next acquisition to discard the potentially misaligned socket.
+    dirty: AtomicBool,
+    last_used: std::sync::Mutex<Instant>,
+}
+
+impl Default for CodexWsSessionEntry {
+    fn default() -> Self {
+        Self {
+            session: Mutex::new(CodexWsSession::default()),
+            dirty: AtomicBool::new(false),
+            last_used: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+}
+
+struct AttemptMarker {
+    entry: Arc<CodexWsSessionEntry>,
+    finished: bool,
+}
+
+impl AttemptMarker {
+    fn begin(entry: Arc<CodexWsSessionEntry>) -> Self {
+        entry.dirty.store(true, Ordering::Release);
+        Self {
+            entry,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) {
+        self.entry.dirty.store(false, Ordering::Release);
+        self.finished = true;
+    }
+}
+
+impl Drop for AttemptMarker {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Intentionally synchronous: cancellation can occur at every await.
+            self.entry.dirty.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -473,7 +529,29 @@ struct CodexWsSession {
     response_id: Option<String>,
     compatibility: Option<serde_json::Value>,
     prefix: Vec<serde_json::Value>,
-    auth_identity: Option<[u8; 32]>,
+    connection_identity: Option<[u8; 32]>,
+}
+
+fn reset_ws_session(session: &mut CodexWsSession) {
+    session.socket = None;
+    session.response_id = None;
+    session.compatibility = None;
+    session.prefix.clear();
+}
+
+#[derive(Debug)]
+enum CodexWsError {
+    Fallback(LlmError),
+    Backend(LlmError),
+}
+
+impl CodexWsError {
+    fn fallback(error: LlmError) -> Self {
+        Self::Fallback(error)
+    }
+    fn backend(error: LlmError) -> Self {
+        Self::Backend(error)
+    }
 }
 
 fn websocket_url(http_url: &str) -> Result<String, LlmError> {
@@ -549,6 +627,60 @@ fn continuation_suffix(
         .flatten()
 }
 
+fn connection_identity(api_key: &str, custom_headers: &[(String, String)]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut canonical = custom_headers
+        .iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("authorization") && !name.eq_ignore_ascii_case("openai-beta")
+        })
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect::<Vec<_>>();
+    canonical.sort_unstable();
+    let mut hash = Sha256::new();
+    hash.update(api_key.as_bytes());
+    for (name, value) in canonical {
+        hash.update([0]);
+        hash.update(name.as_bytes());
+        hash.update([0]);
+        hash.update(value.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+fn parse_codex_rate_limits(value: &serde_json::Value) -> Option<QuotaDetails> {
+    [
+        value.get("rate_limits"),
+        value.get("rateLimits"),
+        value.get("snapshot"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|snapshot| serde_json::from_value(snapshot.clone()).ok())
+}
+
+fn evict_ws_sessions(pool: &mut CodexWsSessions, now: Instant) {
+    pool.by_cache_key.retain(|_, entry| {
+        Arc::strong_count(entry) > 1
+            || now.duration_since(*entry.last_used.lock().expect("last_used mutex poisoned"))
+                < CODEX_WS_IDLE_TTL
+    });
+    while pool.by_cache_key.len() >= CODEX_WS_MAX_SESSIONS {
+        let oldest = pool
+            .by_cache_key
+            .iter()
+            .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, entry)| *entry.last_used.lock().expect("last_used mutex poisoned"))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            pool.by_cache_key.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn complete_codex_websocket(
     http_url: &str,
@@ -558,35 +690,44 @@ async fn complete_codex_websocket(
     full_request: &ResponsesBackendRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
     sessions: &Arc<Mutex<CodexWsSessions>>,
-) -> Result<LlmResponse, LlmError> {
+) -> Result<LlmResponse, CodexWsError> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use sha2::{Digest, Sha256};
-
-    let (compatibility, full_input) = continuation_parts(full_request)?;
-    let auth_identity: [u8; 32] = Sha256::digest(api_key.as_bytes()).into();
-    let session = {
+    let (compatibility, full_input) =
+        continuation_parts(full_request).map_err(CodexWsError::backend)?;
+    let identity = connection_identity(api_key, custom_headers);
+    let entry = {
         let mut guard = sessions.lock().await;
+        evict_ws_sessions(&mut guard, Instant::now());
+        if !guard.by_cache_key.contains_key(cache_key)
+            && guard.by_cache_key.len() >= CODEX_WS_MAX_SESSIONS
+        {
+            return Err(CodexWsError::fallback(LlmError::network(
+                "Codex WebSocket session capacity reached",
+            )));
+        }
         guard
             .by_cache_key
             .entry(cache_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(CodexWsSession::default())))
+            .or_insert_with(|| Arc::new(CodexWsSessionEntry::default()))
             .clone()
     };
-    // One in-flight response.create per connection. Holding this lock through
-    // the terminal event also makes continuation metadata and socket state an
-    // atomic unit.
-    let mut session = session.lock().await;
-    if session.auth_identity != Some(auth_identity) {
-        session.socket = None;
-        session.response_id = None;
-        session.compatibility = None;
-        session.prefix.clear();
-        session.auth_identity = Some(auth_identity);
+    let mut session = entry.session.lock().await;
+    *entry.last_used.lock().expect("last_used mutex poisoned") = Instant::now();
+    if entry.dirty.swap(false, Ordering::AcqRel) {
+        reset_ws_session(&mut session);
     }
+    if session.connection_identity != Some(identity) {
+        reset_ws_session(&mut session);
+        session.connection_identity = Some(identity);
+    }
+    let attempt = AttemptMarker::begin(entry.clone());
 
-    let mut wire = serde_json::to_value(full_request)
-        .map_err(|e| LlmError::invalid_request(format!("serialize WebSocket request: {e}")))?;
+    let mut wire = serde_json::to_value(full_request).map_err(|e| {
+        CodexWsError::backend(LlmError::invalid_request(format!(
+            "serialize WebSocket request: {e}"
+        )))
+    })?;
     let full_payload_bytes = serde_json::to_vec(&wire).map_or(0, |bytes| bytes.len());
     let incremental = if let Some((previous_response_id, suffix)) =
         continuation_suffix(&session, &compatibility, &full_input)
@@ -607,22 +748,28 @@ async fn complete_codex_websocket(
         sent_payload_bytes,
         "sending Codex Responses WebSocket request"
     );
-    let envelope = serde_json::json!({"type": "response.create", "response": wire});
+    let mut envelope = wire;
+    envelope["type"] = serde_json::Value::String("response.create".to_string());
 
     // Buffer WebSocket emissions until a terminal success. If the socket fails,
     // the HTTP fallback starts from a clean public stream and cannot duplicate
     // speculative deltas already observed on the failed transport.
     let (buffer_tx, mut buffer_rx) = tokio::sync::broadcast::channel(1024);
 
-    let mut upgrade = websocket_url(http_url)?
+    let mut upgrade = websocket_url(http_url)
+        .map_err(CodexWsError::backend)?
         .into_client_request()
-        .map_err(|e| LlmError::network(format!("WebSocket request: {e}")))?;
+        .map_err(|e| {
+            CodexWsError::fallback(LlmError::network(format!("WebSocket request: {e}")))
+        })?;
     let headers = upgrade.headers_mut();
     headers.insert(
         "Authorization",
-        format!("Bearer {api_key}")
-            .parse()
-            .map_err(|e| LlmError::invalid_request(format!("authorization header: {e}")))?,
+        format!("Bearer {api_key}").parse().map_err(|e| {
+            CodexWsError::backend(LlmError::invalid_request(format!(
+                "authorization header: {e}"
+            )))
+        })?,
     );
     headers.insert(
         "OpenAI-Beta",
@@ -635,31 +782,51 @@ async fn complete_codex_websocket(
         "true".parse().expect("static header"),
     );
     for (name, value) in custom_headers {
-        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| LlmError::invalid_request(format!("WebSocket header name: {e}")))?;
-        let value = tungstenite::http::HeaderValue::from_str(value)
-            .map_err(|e| LlmError::invalid_request(format!("WebSocket header value: {e}")))?;
+        if name.eq_ignore_ascii_case("openai-beta") || name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            CodexWsError::backend(LlmError::invalid_request(format!(
+                "WebSocket header name: {e}"
+            )))
+        })?;
+        let value = tungstenite::http::HeaderValue::from_str(value).map_err(|e| {
+            CodexWsError::backend(LlmError::invalid_request(format!(
+                "WebSocket header value: {e}"
+            )))
+        })?;
         headers.insert(name, value);
     }
 
     let result = async {
         if session.socket.is_none() {
-            let (socket, _) = connect_async(upgrade)
-                .await
-                .map_err(|e| LlmError::network(format!("WebSocket connect: {e}")))?;
+            let (socket, _) = connect_async(upgrade).await.map_err(|e| {
+                CodexWsError::fallback(LlmError::network(format!("WebSocket connect: {e}")))
+            })?;
             session.socket = Some(socket);
         }
         let socket = session.socket.as_mut().expect("socket initialized");
         socket
             .send(tungstenite::Message::Text(envelope.to_string().into()))
             .await
-            .map_err(|e| LlmError::network(format!("WebSocket send: {e}")))?;
+            .map_err(|e| {
+                CodexWsError::fallback(LlmError::network(format!("WebSocket send: {e}")))
+            })?;
         let mut acc = ResponsesStreamAccumulator::new();
         let mut response_id = None;
         let mut server_output = Vec::new();
-        while let Some(message) = socket.next().await {
-            let message =
-                message.map_err(|e| LlmError::network(format!("WebSocket stream: {e}")))?;
+        loop {
+            let message = tokio::time::timeout(CODEX_WS_FRAME_TIMEOUT, socket.next())
+                .await
+                .map_err(|_| CodexWsError::fallback(LlmError::network("WebSocket frame timeout")))?
+                .ok_or_else(|| {
+                    CodexWsError::fallback(LlmError::network(
+                        "WebSocket closed before terminal event",
+                    ))
+                })?
+                .map_err(|e| {
+                    CodexWsError::fallback(LlmError::network(format!("WebSocket stream: {e}")))
+                })?;
             let text = match message {
                 tungstenite::Message::Text(text) => text,
                 tungstenite::Message::Close(_) => break,
@@ -668,13 +835,23 @@ async fn complete_codex_websocket(
                 | tungstenite::Message::Pong(_)
                 | tungstenite::Message::Frame(_) => continue,
             };
-            let value: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| LlmError::invalid_response(format!("WebSocket event JSON: {e}")))?;
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                CodexWsError::fallback(LlmError::invalid_response(format!(
+                    "WebSocket event JSON: {e}"
+                )))
+            })?;
             let event_type = value
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            acc.process_event(event_type, &text, &buffer_tx)?;
+            if event_type == "codex.rate_limits" {
+                if let Some(snapshot) = parse_codex_rate_limits(&value) {
+                    let _ = buffer_tx.send(super::TokenChunk::RateLimitSnapshot(snapshot));
+                }
+                continue;
+            }
+            acc.process_event(event_type, &text, &buffer_tx)
+                .map_err(CodexWsError::backend)?;
             if event_type == "response.completed" {
                 response_id = value
                     .pointer("/response/id")
@@ -690,10 +867,13 @@ async fn complete_codex_websocket(
                 break;
             }
         }
-        let id = response_id
-            .ok_or_else(|| LlmError::invalid_response("WebSocket completed without response id"))?;
-        let response = acc.into_response()?;
-        Ok::<_, LlmError>((response, id, server_output))
+        let id = response_id.ok_or_else(|| {
+            CodexWsError::fallback(LlmError::invalid_response(
+                "WebSocket completed without response id",
+            ))
+        })?;
+        let response = acc.into_response().map_err(CodexWsError::backend)?;
+        Ok::<_, CodexWsError>((response, id, server_output))
     }
     .await;
 
@@ -708,16 +888,15 @@ async fn complete_codex_websocket(
             session.response_id = Some(response_id);
             session.compatibility = Some(compatibility);
             session.prefix = prefix;
+            attempt.finish();
             Ok(response)
         }
         Err(error) => {
             // A protocol or transport failure poisons the stream. Reconnect on
             // the next request and require a full create; never continue from
             // metadata whose terminal response was not observed.
-            session.socket = None;
-            session.response_id = None;
-            session.compatibility = None;
-            session.prefix.clear();
+            reset_ws_session(&mut session);
+            attempt.finish();
             Err(error)
         }
     }
@@ -756,9 +935,9 @@ pub async fn complete_streaming(
             .await
             {
                 Ok(response) => return Ok(response),
-                Err(error) if !error.kind.is_auto_retryable() => return Err(error),
-                Err(error) => tracing::warn!(error = %error.message,
-                    "Codex WebSocket failed; reset continuation and falling back once to full HTTP/SSE"),
+                Err(CodexWsError::Backend(error)) => return Err(error),
+                Err(CodexWsError::Fallback(error)) => tracing::warn!(error = %error.message,
+                    "Codex WebSocket transport/protocol failed; falling back once to full HTTP/SSE"),
             }
         }
     }
@@ -1660,6 +1839,7 @@ mod tests {
     use crate::models::{ModelBackend, ModelSource};
     use crate::types::MessageRole;
     use axum::extract::{ws::Message as AxumWsMessage, State, WebSocketUpgrade};
+    use axum::http::HeaderMap as AxumHeaderMap;
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
     use axum::Router;
@@ -1670,15 +1850,24 @@ mod tests {
         connections: Arc<AtomicUsize>,
         http_requests: Arc<AtomicUsize>,
         ws_requests: Arc<Mutex<Vec<(usize, serde_json::Value)>>>,
+        ws_headers: Arc<Mutex<Vec<AxumHeaderMap>>>,
     }
 
-    async fn mock_ws(ws: WebSocketUpgrade, State(state): State<MockResponsesState>) -> Response {
+    async fn mock_ws(
+        ws: WebSocketUpgrade,
+        headers: AxumHeaderMap,
+        State(state): State<MockResponsesState>,
+    ) -> Response {
+        state.ws_headers.lock().await.push(headers);
         let connection = state.connections.fetch_add(1, Ordering::SeqCst);
         ws.on_upgrade(move |mut socket| async move {
             while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 state.ws_requests.lock().await.push((connection, request.clone()));
-                let marker = request["response"]["input"].to_string();
+                assert_eq!(request["type"], "response.create");
+                assert!(request.get("response").is_none());
+                assert!(request["model"].is_string());
+                let marker = request["input"].to_string();
                 if marker.contains("ws-fail") {
                     socket
                         .send(AxumWsMessage::Text(
@@ -1688,6 +1877,24 @@ mod tests {
                         .await
                         .unwrap();
                     return;
+                }
+                if marker.contains("stall") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+                if marker.contains("rate-error") {
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"error", "code":"rate_limit_exceeded", "message":"slow down"
+                    }).to_string())).await.unwrap();
+                    continue;
+                }
+                if marker.contains("rate-snapshot") {
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"codex.rate_limits",
+                        "rate_limits":{"plan_type":"plus","resets_at":null,"limit_id":"codex","limit_name":null,
+                        "primary":{"used_percent":42.0,"window_minutes":60,"resets_at":1_700_000_000},
+                        "secondary":null,"credits":null,"promo_message":null}
+                    }).to_string())).await.unwrap();
                 }
                 if marker.contains("terminal") {
                     socket
@@ -1804,23 +2011,16 @@ mod tests {
         .unwrap();
         let requests = state.ws_requests.lock().await.clone();
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
-        assert!(requests[0].1["response"]
-            .get("previous_response_id")
-            .is_none());
-        assert_eq!(requests[1].1["response"]["previous_response_id"], "resp-1");
-        assert_eq!(
-            requests[1].1["response"]["input"].as_array().unwrap().len(),
-            1
-        );
+        assert!(requests[0].1.get("previous_response_id").is_none());
+        assert_eq!(requests[1].1["previous_response_id"], "resp-1");
+        assert_eq!(requests[1].1["input"].as_array().unwrap().len(), 1);
 
         // A non-prefix request is a full create, but the healthy transport is retained.
         call(request_with(&[("changed", MessageRole::User)]))
             .await
             .unwrap();
         let requests = state.ws_requests.lock().await.clone();
-        assert!(requests[2].1["response"]
-            .get("previous_response_id")
-            .is_none());
+        assert!(requests[2].1.get("previous_response_id").is_none());
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
         // A cache-relevant property change also sends a full create on the same
@@ -1829,9 +2029,7 @@ mod tests {
         property_changed.max_tokens = Some(42);
         call(property_changed).await.unwrap();
         let requests = state.ws_requests.lock().await.clone();
-        assert!(requests[3].1["response"]
-            .get("previous_response_id")
-            .is_none());
+        assert!(requests[3].1.get("previous_response_id").is_none());
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
         // A failed socket may have produced speculative deltas internally. Exactly
@@ -1853,6 +2051,169 @@ mod tests {
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_preserves_beta_headers_forwards_quota_and_does_not_fallback_backend_errors()
+    {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(32);
+        let headers = vec![
+            ("OpenAI-Beta".into(), "responses=experimental".into()),
+            ("chatgpt-account-id".into(), "workspace-a".into()),
+            ("originator".into(), "phoenix-ide".into()),
+        ];
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers,
+            &BTreeMap::new(),
+            &request_with(&[("rate-snapshot", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        let snapshot = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|chunk| match chunk {
+                super::super::TokenChunk::RateLimitSnapshot(snapshot) => Some(snapshot),
+                super::super::TokenChunk::Text(_) => None,
+            })
+            .expect("rate-limit snapshot");
+        assert!((snapshot.primary.unwrap().used_percent - 42.0).abs() < f64::EPSILON);
+        let received = state.ws_headers.lock().await;
+        assert_eq!(
+            received[0]["openai-beta"],
+            "responses_websockets=2026-02-06"
+        );
+        assert_eq!(received[0]["chatgpt-account-id"], "workspace-a");
+        assert_eq!(received[0]["originator"], "phoenix-ide");
+        drop(received);
+
+        let error = complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers,
+            &BTreeMap::new(),
+            &request_with(&[("rate-error", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::RateLimit);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_frame_timeout_falls_back_and_header_identity_reconnects() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let headers_a = vec![("chatgpt-account-id".into(), "a".into())];
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers_a,
+            &BTreeMap::new(),
+            &request_with(&[("stall", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        let headers_b = vec![("ChatGPT-Account-ID".into(), "b".into())];
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers_b,
+            &BTreeMap::new(),
+            &request_with(&[("healthy", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_cancelled_attempt_is_dropped_before_reuse() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let task = tokio::spawn({
+            let (url, sessions, tx) = (url.clone(), sessions.clone(), tx.clone());
+            async move {
+                complete_streaming(
+                    &codex_spec(),
+                    "secret",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request_with(&[("stall", MessageRole::User)]),
+                    &tx,
+                    true,
+                    Some(&sessions),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.ws_requests.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request_with(&[("healthy", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn websocket_pool_evicts_idle_and_oldest_capacity_entries_without_credentials() {
+        let mut pool = CodexWsSessions::default();
+        let now = Instant::now();
+        for i in 0..CODEX_WS_MAX_SESSIONS {
+            let entry = Arc::new(CodexWsSessionEntry::default());
+            *entry.last_used.lock().unwrap() =
+                now.checked_sub(Duration::from_secs(i as u64)).unwrap();
+            pool.by_cache_key.insert(format!("cohort-{i}"), entry);
+        }
+        evict_ws_sessions(&mut pool, now);
+        assert_eq!(pool.by_cache_key.len(), CODEX_WS_MAX_SESSIONS - 1);
+        assert!(!pool
+            .by_cache_key
+            .contains_key(&format!("cohort-{}", CODEX_WS_MAX_SESSIONS - 1)));
+        let idle = Arc::new(CodexWsSessionEntry::default());
+        *idle.last_used.lock().unwrap() = now.checked_sub(CODEX_WS_IDLE_TTL).unwrap();
+        pool.by_cache_key.insert("idle".into(), idle);
+        evict_ws_sessions(&mut pool, now);
+        assert!(!pool.by_cache_key.contains_key("idle"));
     }
 
     fn ws_session(

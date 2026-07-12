@@ -66,7 +66,7 @@ enum ResponsesEndpointSource { base_url_override | provider_default }
 -- non-terminal state. `done` is reached by response.completed; `failed`
 -- by an `error` event, response.failed, or response.incomplete.
 enum ResponsesStreamStatus { accumulating | done | failed }
-enum CodexWebSocketDisposition { full | incremental | http_fallback }
+enum CodexWebSocketDisposition { full | incremental | http_fallback | backend_error }
 
 -- Where a translated wire content part sits. Both surfaces draw from the
 -- same accepted-discriminant set — that shared set is exactly what the
@@ -201,7 +201,10 @@ entity CodexWebSocketSession {
     cache_key: String
     response_id: String
     compatibility_fingerprint: String
+    connection_identity: String
     prefix: String
+    idle_for: Duration
+    dirty: Boolean
 }
 
 entity CodexWebSocketAttempt {
@@ -264,23 +267,52 @@ rule CodexWebSocketContinuationSelected {
         -- terminal event replaces the session prefix with full input plus exact
         -- server output. Auth/model/property/compaction or non-prefix changes do
         -- not reuse the old response id.
+        -- A codex.rate_limits frame is parsed into a quota snapshot and emitted
+        -- as TokenChunk::RateLimitSnapshot only with the successful buffered turn.
 }
 
 rule CodexWebSocketFailureFallsBackOnce {
-    when: CodexWebSocketAttemptFails(cache_key)
+    when: CodexWebSocketAttemptFails(cache_key, failure_kind)
 
     ensures:
         CodexWebSocketSession.deleted(cache_key: cache_key)
-        CodexWebSocketAttempt.created(
-            disposition: http_fallback,
-            emitted_before_success: false,
-            beta_header: "responses_websockets=2026-02-06"
-        )
+        if failure_kind in { connect, transport, protocol, frame_timeout }:
+            CodexWebSocketAttempt.created(
+                disposition: http_fallback,
+                emitted_before_success: false,
+                beta_header: "responses_websockets=2026-02-06"
+            )
+        else:
+            CodexWebSocketAttempt.created(
+                disposition: backend_error,
+                emitted_before_success: false,
+                beta_header: "responses_websockets=2026-02-06"
+            )
 
     @guidance
         -- WebSocket token chunks remain private until response.completed.
-        -- Failure discards them and issues exactly one full HTTP/SSE request,
-        -- preventing both omitted history and duplicate public token emission.
+        -- Transport/protocol failure discards them and issues exactly one full
+        -- HTTP/SSE request. Rate limits and every backend model error return to
+        -- the caller without replay, preserving executor backoff and semantics.
+        -- Each frame read has a terminal timeout, so an accepted half-open
+        -- connection cannot retain its session lock indefinitely.
+}
+
+rule CodexWebSocketPoolBoundedAndCancellationSafe {
+    when: AcquireCodexWebSocket(cache_key, connection_headers)
+
+    ensures:
+        -- The connection identity is a one-way hash over the bearer credential
+        -- and canonical case-insensitive connection-affecting custom headers,
+        -- including chatgpt-account-id. Raw credentials are never retained.
+        -- OpenAI-Beta is fixed to the WebSocket capability value; other custom
+        -- headers survive the handshake.
+        -- Idle sessions are evicted and sockets dropped; at capacity, the
+        -- least-recently-used idle session is evicted before insertion.
+        -- An attempt marks its entry dirty synchronously before socket use.
+        -- Cancellation leaves it dirty; the next lock holder drops the socket
+        -- before reuse. Terminal success or handled failure clears the marker.
+        true
 }
 
 rule CodexResponsesLitePrefixTranslated {
