@@ -2611,8 +2611,13 @@ impl RuntimeManager {
                 agent_catalog.clone(),
             )
         } else {
-            use crate::db::{ConvMode, ConversationKind};
-            let registry = if conv.kind == ConversationKind::Coordinator {
+            use crate::db::ConvMode;
+            let is_coordinator = self
+                .db
+                .is_coordinator_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let registry = if is_coordinator {
                 ToolRegistry::coordinator()
             } else {
                 match conv.conv_mode {

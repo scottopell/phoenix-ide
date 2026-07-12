@@ -1387,7 +1387,6 @@ mod tests {
             transcript_generation: 1,
             model: None,
             project_id: None,
-            kind: crate::db::ConversationKind::Standard,
             conv_mode: ConvMode::Work {
                 branch_name: NonEmptyString::new(format!("branch-{id}")).unwrap(),
                 worktree_path: NonEmptyString::new(path.to_string()).unwrap(),

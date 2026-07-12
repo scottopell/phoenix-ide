@@ -783,7 +783,6 @@ mod tests {
             transcript_generation: 1,
             model: None,
             project_id: Some("proj-1".to_string()),
-            kind: crate::db::ConversationKind::Standard,
             conv_mode: ConvMode::Work {
                 branch_name: NonEmptyString::new("task-24696-gate").unwrap(),
                 worktree_path: NonEmptyString::new("/tmp/wt/gate").unwrap(),

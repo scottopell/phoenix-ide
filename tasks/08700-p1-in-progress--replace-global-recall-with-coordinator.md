@@ -50,17 +50,17 @@ The transcript and composer should reuse the ordinary conversation experience ra
 
 7. **Verify boundaries and regressions.** Cover singleton creation under concurrency, persistence/resume, runtime streaming, Coordinator-only global tools, absence from normal work lists, deterministic fleet grouping, compact/expanded UI behavior, citations/reference resolution, removal of Recall APIs, and schema migration. Run codegen where wire types change and run `./dev.py check`.
 
-## Checkpoint after commit `97974b6e`
+## Implementation snapshot
 
-This task is **not complete**. The first implementation pass landed a useful foundation but stopped at the most important backend integration boundary.
+This task is **not complete**. Commits `97974b6e` and the subsequent singleton-relation correction establish the Coordinator foundation but stop at the most important backend integration boundary.
 
 ### Done
 
-- Added a persisted `ConversationKind` separate from `ConvMode`, with `standard` and `coordinator` variants.
-- Added migration 041 with a partial unique index enforcing at most one Coordinator row and removal of the unreleased `global_recall_sessions` / `global_recall_messages` tables.
+- Added a normalized singleton `coordinator` relation whose checked primary key permits exactly one row and whose unique foreign key identifies an ordinary conversation as the Coordinator. Ordinary conversations carry no Coordinator discriminator or redundant `standard` value.
+- Added migration 041 creating that singleton relation and removing the unreleased `global_recall_sessions` / `global_recall_messages` tables.
 - Added `GET`/`POST /api/global/coordinator` to atomically resolve or create the singleton Coordinator conversation.
 - Routed the Coordinator through the standard conversation record, state machine, persistence, SSE transcript, and composer path.
-- Added a Coordinator-specific runtime registry selected from typed conversation identity rather than title, project nullability, or `ConvMode`.
+- Added a Coordinator-specific runtime registry selected by membership in the singleton relation rather than title, project nullability, or `ConvMode`.
 - Kept the Coordinator out of the ordinary conversation list and deterministic open-work projection.
 - Replaced the Recall session UI/API client with a Coordinator page and renamed the navigation entry.
 - Embedded the existing `ConversationPage` under `/global/:slug` so the normal transcript/composer remains on the same page as the fleet snapshot.
@@ -79,9 +79,9 @@ This task is **not complete**. The first implementation pass landed a useful fou
 - `api/global_recall.rs` still contains the dead Recall session structs, handlers, locks, persistence functions, synchronous LLM loop, inline tool dispatcher, and associated tests. Routes and frontend callers are gone, but the backend implementation has not been deleted or cleanly separated into reusable fleet/history services.
 - Coordinator-specific system guidance has not been added to the normal runtime prompt.
 - The in-page reuse mounts route-aware `ConversationPage` under `/global/:slug`. This is functional reuse rather than a clean shared conversation-surface extraction and needs browser QA for layout/provider/route assumptions.
-- Singleton enforcement has a database unique index and conflict-tolerant creation, but concurrency behavior and endpoint idempotence lack dedicated tests.
+- Singleton identity and repeated get-or-create behavior are schema- and DB-tested, but concurrent callers and endpoint idempotence still lack dedicated tests.
 - Migration 041, normal-list exclusion, open-work exclusion, standard runtime resume/streaming, removed Recall routes, and Coordinator tool isolation lack focused regression tests.
-- A full `./dev.py check` has not passed. The last run reached test compilation and failed on missing `ConversationKind` fields in fixtures; those fixture compile errors were then fixed and `cargo test --no-run` passed, but the complete check was not rerun afterward.
+- A full `./dev.py check` has not passed for this implementation snapshot. Targeted compile/tests must be rerun after the singleton-relation correction, followed by the complete check.
 - The task was deliberately returned to `in-progress`; do not mark it done until the global tools are integrated, dead Recall code is removed, focused tests exist, browser QA is complete, and `./dev.py check` passes.
 
 ### Recommended continuation sequence

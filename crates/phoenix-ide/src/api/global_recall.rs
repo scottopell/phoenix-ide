@@ -286,9 +286,14 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
         .list_all_conversations()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let coordinator_id = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let conversations: Vec<_> = conversations
         .into_iter()
-        .filter(|conversation| conversation.kind == crate::db::ConversationKind::Standard)
+        .filter(|conversation| Some(&conversation.id) != coordinator_id.as_ref())
         .collect();
     let projects = state
         .db
@@ -1757,7 +1762,6 @@ mod tests {
             archived: false,
             model: None,
             project_id: Some("project-1".to_string()),
-            kind: crate::db::ConversationKind::Standard,
             conv_mode: ConvMode::Direct,
             desired_base_branch: None,
             message_count: 0,

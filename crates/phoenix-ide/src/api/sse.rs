@@ -366,7 +366,6 @@ mod tests {
             transcript_generation: 1,
             model: Some("claude-sonnet-4-5".to_string()),
             project_id: None,
-            kind: crate::db::ConversationKind::Standard,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,

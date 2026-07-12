@@ -631,7 +631,6 @@ mod tests {
             transcript_generation: 1,
             model: Some("mock".to_string()),
             project_id: None,
-            kind: crate::db::ConversationKind::Standard,
             conv_mode: ConvMode::Direct,
             desired_base_branch: None,
             message_count: 0,

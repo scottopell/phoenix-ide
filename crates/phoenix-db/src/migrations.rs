@@ -2839,10 +2839,11 @@ mod tests {
 }
 
 const MIGRATION_041: &str = r#"
-ALTER TABLE conversations ADD COLUMN conversation_kind TEXT NOT NULL DEFAULT 'standard'
-    CHECK (conversation_kind IN ('standard', 'coordinator'));
-CREATE UNIQUE INDEX idx_conversations_single_coordinator
-    ON conversations(conversation_kind) WHERE conversation_kind = 'coordinator';
+CREATE TABLE coordinator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE RESTRICT
+);
 DROP TABLE IF EXISTS global_recall_messages;
 DROP TABLE IF EXISTS global_recall_sessions;
 "#;

@@ -2381,7 +2381,6 @@ impl Database {
             archived: false,
             model: model.map(String::from),
             project_id: project_id.map(String::from),
-            kind: schema::ConversationKind::Standard,
             conv_mode: conv_mode.clone(),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
@@ -2403,35 +2402,56 @@ impl Database {
         cwd: &str,
         model: Option<&str>,
     ) -> DbResult<Conversation> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let idle = serde_json::to_string(&ConvState::Idle).unwrap();
-        sqlx::query(
-            "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, conversation_kind)
-             VALUES (?1, 'coordinator', 'Coordinator', ?2, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, 'phoenix-native', 'explore', 'coordinator')
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(id)
-        .bind(cwd)
-        .bind(idle)
-        .bind(now)
-        .bind(model)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
 
-        sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
-                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c WHERE c.conversation_kind = 'coordinator'",
+        let conversation_id = if let Some(id) = existing {
+            id
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            let idle = serde_json::to_string(&ConvState::Idle).unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
+                 VALUES (?1, 'coordinator', 'Coordinator', ?2, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, 'phoenix-native', 'explore')",
+            )
+            .bind(&id)
+            .bind(cwd)
+            .bind(idle)
+            .bind(now)
+            .bind(model)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO coordinator (singleton, conversation_id) VALUES (1, ?1)")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            id
+        };
+        tx.commit().await?;
+        self.get_conversation(&conversation_id).await
+    }
+
+    /// Return the Coordinator conversation id when the singleton has been created.
+    pub async fn coordinator_conversation_id(&self) -> DbResult<Option<String>> {
+        sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(DbError::Sqlx)
+    }
+
+    /// Whether this conversation is the singleton Coordinator.
+    pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM coordinator WHERE singleton = 1 AND conversation_id = ?1",
         )
-        .try_map(parse_conversation_row)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(DbError::Sqlx)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
     }
 
     /// Get conversation by ID
@@ -2443,7 +2463,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2471,7 +2491,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2499,12 +2519,12 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
-             WHERE c.archived = 0 AND c.user_initiated = 1 AND c.conversation_kind = 'standard'
+             WHERE c.archived = 0 AND c.user_initiated = 1
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -2608,7 +2628,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2634,7 +2654,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2656,7 +2676,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2833,7 +2853,6 @@ impl Database {
             archived: false,
             model: model.map(String::from),
             project_id: None,
-            kind: schema::ConversationKind::Standard,
             conv_mode: conv_mode.clone(),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
@@ -4211,7 +4230,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -4527,7 +4546,6 @@ impl Database {
             transcript_generation: 1,
             model: parent.model,
             project_id: parent.project_id,
-            kind: schema::ConversationKind::Standard,
             conv_mode: work_mode,
             desired_base_branch: parent.desired_base_branch,
             message_count: 1,
@@ -4724,7 +4742,6 @@ impl Database {
             transcript_generation: 1,
             model: parent.model,
             project_id: parent.project_id,
-            kind: schema::ConversationKind::Standard,
             conv_mode: parent.conv_mode,
             desired_base_branch: parent.desired_base_branch,
             message_count: 0,
@@ -4802,7 +4819,7 @@ impl Database {
             )
             SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                   c.project_id, c.conversation_kind, c.desired_base_branch,
+                   c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -5691,7 +5708,7 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
-                    c.project_id, c.conversation_kind, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -7263,10 +7280,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         project_id: row
             .try_get::<Option<String>, _>("project_id")
             .unwrap_or(None),
-        kind: match row.try_get::<String, _>("conversation_kind").as_deref() {
-            Ok("coordinator") => schema::ConversationKind::Coordinator,
-            _ => schema::ConversationKind::Standard,
-        },
         conv_mode,
         desired_base_branch,
         message_count: row.try_get("message_count")?,
@@ -10948,6 +10961,34 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn coordinator_relation_is_singleton_and_keeps_conversation_shape_ordinary() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let first = db
+            .get_or_create_coordinator("/tmp/coordinator", Some("test-model"))
+            .await
+            .unwrap();
+        let second = db
+            .get_or_create_coordinator("/tmp/ignored", Some("other-model"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            db.coordinator_conversation_id().await.unwrap().as_deref(),
+            Some(first.id.as_str())
+        );
+        assert!(db.is_coordinator_conversation(&first.id).await.unwrap());
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(!columns.iter().any(|column| column == "conversation_kind"));
     }
 
     /// The clear watermark write is structurally monotonic: a value below the
