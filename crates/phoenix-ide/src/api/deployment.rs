@@ -1155,21 +1155,22 @@ fn totals_from_observations(
 fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
     let mut cpu_total = 0.0_f32;
     let mut cpu_seen = false;
-    let mut memory_total: u64 = 0;
-    let mut memory_seen = false;
+    let memory_bytes = if processes.is_empty() {
+        None
+    } else {
+        processes.iter().try_fold(0_u64, |total, row| {
+            row.memory_bytes.map(|memory| total.saturating_add(memory))
+        })
+    };
     for row in processes {
         if let Some(cpu) = row.cpu_percent {
             cpu_total += cpu;
             cpu_seen = true;
         }
-        if let Some(memory) = row.memory_bytes {
-            memory_total = memory_total.saturating_add(memory);
-            memory_seen = true;
-        }
     }
     ManagedResourceTotals {
         cpu_percent: cpu_seen.then_some(cpu_total),
-        memory_bytes: memory_seen.then_some(memory_total),
+        memory_bytes,
         process_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
         deduplicated_pid_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
     }
@@ -1704,6 +1705,69 @@ mod tests {
         assert!(category.totals.cpu_percent.is_none());
         assert!(category.totals.memory_bytes.is_none());
         assert!(category.processes.is_empty());
+    }
+
+    #[test]
+    fn totals_require_memory_for_every_process() {
+        let complete = ManagedProcessRow {
+            name: "api".to_string(),
+            category: ManagedResourceCategoryKind::Api,
+            pid: 1,
+            cpu_percent: Some(1.0),
+            memory_bytes: Some(1024),
+            thread_count: None,
+            cpu_time_seconds: None,
+        };
+        let missing = ManagedProcessRow {
+            name: "bash".to_string(),
+            category: ManagedResourceCategoryKind::Bash,
+            pid: 2,
+            cpu_percent: Some(2.0),
+            memory_bytes: None,
+            thread_count: None,
+            cpu_time_seconds: None,
+        };
+
+        assert_eq!(
+            totals_from_rows(std::slice::from_ref(&complete)).memory_bytes,
+            Some(1024)
+        );
+        assert_eq!(totals_from_rows(&[complete, missing]).memory_bytes, None);
+    }
+
+    #[test]
+    fn managed_total_requires_memory_for_every_deduplicated_process() {
+        let expected_pids = BTreeSet::from([1, 2]);
+        let observations = BTreeMap::from([
+            (
+                1,
+                ProcessObservation {
+                    pid: 1,
+                    name: "api".to_string(),
+                    cpu_percent: Some(1.0),
+                    memory_bytes: Some(1024),
+                    thread_count: None,
+                    cpu_time_seconds: None,
+                },
+            ),
+            (
+                2,
+                ProcessObservation {
+                    pid: 2,
+                    name: "bash".to_string(),
+                    cpu_percent: Some(2.0),
+                    memory_bytes: None,
+                    thread_count: None,
+                    cpu_time_seconds: None,
+                },
+            ),
+        ]);
+
+        let totals = totals_from_observations(&expected_pids, &observations);
+
+        assert_eq!(totals.memory_bytes, None);
+        assert_eq!(totals.process_count, 2);
+        assert_eq!(totals.deduplicated_pid_count, 2);
     }
 
     #[test]
