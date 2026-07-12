@@ -343,6 +343,8 @@ export function buildBlockSearchProjection(
 export interface ConversationProjectionOptions {
   density?: 'full' | 'compact';
   streamingBuffer?: StreamingBuffer | null;
+  systemPrompt?: string | null;
+  systemPromptExpanded?: boolean;
 }
 
 export function buildConversationSearchProjection(
@@ -352,6 +354,10 @@ export function buildConversationSearchProjection(
 ): ConversationSearchProjection {
   const density = options.density ?? 'full';
   const sources: ConversationSearchSource[] = [];
+  if (options.systemPromptExpanded && options.systemPrompt) {
+    addConversationSource(sources, -1, 'system', 'system-prompt-header', 'system-prompt', options.systemPrompt);
+  }
+
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
       case 'user':
@@ -361,7 +367,7 @@ export function buildConversationSearchProjection(
         addConversationSource(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageText(unit.message));
         break;
       case 'skill':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', userMessageText(unit.message));
+        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageText(unit.message));
         break;
       case 'system':
         if (!isHiddenSystemMessage(unit.message)) {
@@ -391,8 +397,8 @@ export function buildConversationSearchProjection(
           unit.key,
           'sub-agent-status',
           [
-            ...unit.state.pending.map((agent) => `pending ${agent.task}`),
             ...unit.state.completed_results.map((agent) => `completed ${agent.task} ${subAgentOutcomeText(agent.outcome)}`),
+            ...unit.state.pending.map((agent) => `pending ${agent.task}`),
           ].join('\n'),
         );
         break;
@@ -456,6 +462,31 @@ function userMessageText(message: Message): string {
   const content = message.content as { text?: string; files?: Array<{ original_name?: string }> };
   const parts: string[] = [];
   if (typeof content.text === 'string' && content.text.length > 0) parts.push(content.text);
+  for (const file of content.files ?? []) {
+    if (typeof file.original_name === 'string' && file.original_name.length > 0) parts.push(file.original_name);
+  }
+  return parts.join('\n');
+}
+
+function skillMessageText(message: Message): string {
+  const content = message.content as {
+    text?: string;
+    name?: string;
+    trigger?: string;
+    args?: string;
+    source?: string;
+    snippet?: string;
+    files?: Array<{ original_name?: string }>;
+  };
+  const parts: string[] = [];
+  const trigger = typeof content.trigger === 'string' && content.trigger.trim().length > 0
+    ? content.trigger.trim()
+    : [content.name ? `/${content.name}` : '', typeof content.args === 'string' ? content.args.trim() : '']
+      .filter((part) => part.length > 0)
+      .join(' ');
+  if (trigger.length > 0) parts.push(trigger);
+  if (typeof content.source === 'string' && content.source.length > 0) parts.push(content.source);
+  if (typeof content.snippet === 'string' && content.snippet.length > 0) parts.push(content.snippet);
   for (const file of content.files ?? []) {
     if (typeof file.original_name === 'string' && file.original_name.length > 0) parts.push(file.original_name);
   }

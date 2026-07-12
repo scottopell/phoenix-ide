@@ -420,5 +420,57 @@ describe('MetaViewer payload routing', () => {
     );
     expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
   });
+
+  it('closes file find when switching HTML source to preview', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('falls back to line reveal for markdown source matches without explicit marks', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: '# alpha heading\n\nBody text',
+    });
+
+    const line = document.querySelector('[data-line="1"]') as HTMLElement;
+    line.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha heading' } });
+
+    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+  });
+
+  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    const line = document.querySelector('[data-line="1"]') as HTMLElement;
+    line.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+  });
 });
 

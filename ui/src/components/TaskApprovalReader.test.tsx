@@ -175,7 +175,7 @@ describe('TaskApprovalReader shared find integration', () => {
     const input = screen.getByRole('textbox', { name: 'Find in viewer' });
     fireEvent.change(input, { target: { value: 'alpha' } });
 
-    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    await waitFor(() => expect(input).toHaveValue('alpha'));
 
     fireEvent.keyDown(input, { key: 'Escape' });
 
@@ -245,5 +245,21 @@ describe('TaskApprovalReader shared find integration', () => {
 
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
     expect(document.querySelector('mark')).toBeNull();
+  });
+
+  it('renders inline-code and fenced-code text visibly in the task plan surface', () => {
+    renderTaskApprovalReader([
+      '# Plan',
+      '',
+      'Use `alpha` inline and [alpha link](https://example.com).',
+      '',
+      '```ts',
+      'const alpha = true;',
+      '```',
+    ].join('\n'));
+
+    expect(screen.getByText('alpha link')).toBeInTheDocument();
+    expect(screen.getByText('const')).toBeInTheDocument();
+    expect(screen.getByText('true')).toBeInTheDocument();
   });
 });

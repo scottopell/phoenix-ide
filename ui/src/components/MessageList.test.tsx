@@ -1,7 +1,7 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
-import { FocusScopeProvider } from '../hooks/useFocusScope';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
@@ -20,6 +20,15 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
       <FocusScopeProvider>{ui}</FocusScopeProvider>
     </ConversationContext.Provider>
   );
+}
+
+function PushScopeOnMount({ scopeId, children }: { scopeId: string; children: React.ReactNode }) {
+  const { pushScope, popScope } = useFocusScopeCommands();
+  useLayoutEffect(() => {
+    pushScope(scopeId);
+    return () => popScope(scopeId);
+  }, [popScope, pushScope, scopeId]);
+  return <>{children}</>;
 }
 
 // Render counter for the AgentMessage mock. The mock is memo()d like the
@@ -44,7 +53,12 @@ vi.mock('./MessageComponents', async () => {
       agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
       return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
     }),
-    SubAgentStatus: () => null,
+    SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
+      <div data-testid="subagent-status-mock">
+        {stateData.completed_results.map((agent, index) => <div key={`completed-${index}`}>{`completed ${agent.task}`}</div>)}
+        {stateData.pending.map((agent, index) => <div key={`pending-${index}`}>{`pending ${agent.task}`}</div>)}
+      </div>
+    ),
     SkillCommandText: ({ text }: { text: string }) => {
       const [token = '', ...rest] = text.split(/\s+/);
       return (
@@ -256,6 +270,94 @@ describe('MessageList', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('searches expanded system prompt text when visible in the transcript header', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-system-prompt-find"
+        systemPrompt="alpha directive\nsecond line"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha directive' } });
+
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('renders overlay scope without opening transcript find shortcuts', () => {
+    render(withConvContext(
+      <PushScopeOnMount scopeId="overlay-scope">
+        <MessageList
+          messages={[makeMessage(1)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-escape-scope"
+        />
+      </PushScopeOnMount>,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
+  it('renders skill rows using the same visible trigger, source, and snippet fields users see', () => {
+    const skillMessage = {
+      ...makeMessage(7, 'skill'),
+      content: {
+        name: 'dogfood',
+        trigger: '/dogfood alpha --trace',
+        args: 'alpha --trace',
+        source: '/skills/dogfood/SKILL.md',
+        snippet: 'Alpha walkthrough',
+      },
+    } as unknown as Message;
+
+    render(withConvContext(
+      <MessageList
+        messages={[skillMessage]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-skill-find"
+      />,
+    ));
+
+    expect(screen.getByText('dogfood')).toBeInTheDocument();
+    expect(screen.getByText('alpha --trace')).toBeInTheDocument();
+  });
+
+  it('renders sub-agent rows in completed-then-pending order', () => {
+    const awaitingState: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [{ agent_id: 'p1', task: 'shared alpha pending' }],
+      completed_results: [{ agent_id: 'c1', task: 'shared alpha completed', outcome: { type: 'success', result: 'done' } }],
+    } as ConversationState;
+
+    render(withConvContext(
+      <MessageList
+        messages={[]}
+        pendingMessages={[]}
+        convState={awaitingState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-subagent-find"
+      />,
+    ));
+
+    const text = screen.getByTestId('subagent-status-mock').textContent;
+    expect(text?.indexOf('completed shared alpha completed')).toBeLessThan(text?.indexOf('pending shared alpha pending') ?? -1);
   });
 
   it('renders skill invocations as inline slash-command user messages with attachments', () => {

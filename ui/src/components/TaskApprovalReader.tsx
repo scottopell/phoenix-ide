@@ -273,7 +273,7 @@ export function TaskApprovalReader({
     : null;
 
   const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
-  const find = useViewerFind({ text: plan });
+  const find = useViewerFind({ text: '' });
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
@@ -468,6 +468,17 @@ export function TaskApprovalReader({
       matchesByLine.set(match.target.lineNumber, lineMatches);
     });
 
+    const findBlockRegistry = new Set<string>();
+    const registerFindableBlock = (lineNumber: number, text: string, blockId = `line:${lineNumber}`) => {
+      if (lineNumber <= 0) return blockId;
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      if (normalized.length === 0) return blockId;
+      if (findBlockRegistry.has(blockId)) return blockId;
+      findBlockRegistry.add(blockId);
+      nextFindableBlocks.push({ id: blockId, lineNumber, text: normalized });
+      return blockId;
+    };
+
     const annotatable = (Tag: React.ElementType) =>
       ({
         children,
@@ -490,17 +501,14 @@ export function TaskApprovalReader({
           .slice(startLine, endLine + 1)
           .join(' ')
           .slice(0, 200);
-        const blockId = `line:${ln}`;
         const lineText = rawLines[ln - 1] ?? '';
-        const lineMatches = matchesByLine.get(ln) ?? [];
         const childText = typeof children === 'string'
           ? children
           : Array.isArray(children) && children.every((child) => typeof child === 'string')
             ? children.join('')
             : null;
-        if (ln > 0 && childText !== null && childText.trim().length > 0) {
-          nextFindableBlocks.push({ id: blockId, lineNumber: ln, text: childText });
-        }
+        const blockId = registerFindableBlock(ln, childText ?? lineText);
+        const lineMatches = matchesByLine.get(ln) ?? [];
         const shouldDecorateChildren =
           lineMatches.length > 0
           && childText !== null
@@ -531,6 +539,7 @@ export function TaskApprovalReader({
         );
       };
 
+
     queueMicrotask(() => {
       setFindablePlanBlocks((prev) => {
         if (
@@ -560,15 +569,28 @@ export function TaskApprovalReader({
               inline,
               className,
               children,
+              node,
               ...props
             }: {
               inline?: boolean;
               className?: string;
               children?: React.ReactNode;
+              node?: {
+                position?: {
+                  start?: { line?: number };
+                };
+              };
               [key: string]: unknown;
             }) => {
               const match = /language-([^\s]+)/.exec(className || '');
               const language = match?.[1]?.toLowerCase();
+              const codeText = String(children).replace(/\n$/, '');
+              const lineNumber = node?.position?.start?.line ?? 0;
+              if (inline) {
+                registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:inline-code:${nextFindableBlocks.length}`);
+              } else {
+                registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:code-block`);
+              }
               if (!inline && language === 'mermaid') {
                 return <MermaidDiagram code={String(children)} />;
               }
@@ -579,7 +601,7 @@ export function TaskApprovalReader({
                   PreTag="div"
                   {...props}
                 >
-                  {String(children).replace(/\n$/, '')}
+                  {codeText}
                 </SyntaxHighlighter>
               ) : (
                 <code className={className} {...props}>
@@ -652,7 +674,7 @@ export function TaskApprovalReader({
         <FindBar
           query={find.query}
           activeIndex={find.activeIndex}
-          matchCount={find.matchCount}
+          matchCount={findProjection.matches.length}
           focusVersion={find.focusVersion}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}

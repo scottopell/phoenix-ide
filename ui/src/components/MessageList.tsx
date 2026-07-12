@@ -376,9 +376,14 @@ function MessageListImpl({
 
   const findProjection = useMemo(
     () => (findOpen || findQuery.length > 0
-      ? buildConversationSearchProjection(allUnits, findQuery, { density, streamingBuffer: findStreamingBuffer })
+      ? buildConversationSearchProjection(allUnits, findQuery, {
+          density,
+          streamingBuffer: findStreamingBuffer,
+          systemPrompt,
+          systemPromptExpanded,
+        })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer],
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer, systemPrompt, systemPromptExpanded],
   );
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
@@ -406,6 +411,7 @@ function MessageListImpl({
     if (!findOpen) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (activeScope !== findScopeId) return;
       const target = event.target as HTMLElement | null;
       const isBodyFindInput = target instanceof HTMLElement && target.dataset['viewerFindInput'] === 'true';
       if (isBodyFindInput) return;
@@ -415,7 +421,7 @@ function MessageListImpl({
     };
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [closeFind, findOpen]);
+  }, [activeScope, closeFind, findOpen, findScopeId]);
   const findConversationRef = useRef(conversationId);
   useEffect(() => {
     if (findConversationRef.current === conversationId) return;

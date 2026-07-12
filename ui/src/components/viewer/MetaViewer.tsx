@@ -264,7 +264,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     }
     const selector = `[data-find-occurrence="${find.activeIndex}"]`;
     const matchEl = contentRef.current?.querySelector<HTMLElement>(selector);
-    matchEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (matchEl) {
+      matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    const lineEl = lineRefs.current.get(activeFindMatch.lineNumber);
+    lineEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, [activeFindMatch, find.activeIndex, find.isOpen, usePierreCode]);
 
   const openFind = useCallback(() => {
@@ -284,6 +289,11 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     enabled: findEligible,
     dialogOpen: notes.annotating !== null,
   });
+
+  useEffect(() => {
+    if (findEligible || !find.isOpen) return;
+    find.close();
+  }, [find, find.isOpen, findEligible]);
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);

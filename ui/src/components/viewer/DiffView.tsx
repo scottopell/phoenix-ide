@@ -155,24 +155,24 @@ export function DiffView({
   const handleFindNext = useCallback(() => {
     const nextIndex = findProjection.matches.length === 0
       ? -1
-      : find.requestedActiveIndex < 0
+      : activeFindIndex < 0
         ? 0
-        : (find.requestedActiveIndex + 1) % findProjection.matches.length;
+        : (activeFindIndex + 1) % findProjection.matches.length;
     find.setActiveIndex(nextIndex);
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
     if (target) navigateFindTarget(target);
-  }, [find, findProjection.matches, navigateFindTarget]);
+  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
 
   const handleFindPrevious = useCallback(() => {
     const nextIndex = findProjection.matches.length === 0
       ? -1
-      : find.requestedActiveIndex < 0
+      : activeFindIndex < 0
         ? Math.max(findProjection.matches.length - 1, 0)
-        : (find.requestedActiveIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
     find.setActiveIndex(nextIndex);
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
     if (target) navigateFindTarget(target);
-  }, [find, findProjection.matches, navigateFindTarget]);
+  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
 
   if (!open) return null;
 

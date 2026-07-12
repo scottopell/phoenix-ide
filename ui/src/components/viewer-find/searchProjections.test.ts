@@ -275,6 +275,17 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.matches).toHaveLength(1);
     expect(projection.matches[0]?.target.sourceId).toContain('agent-text-0');
   });
+
+  it('includes expanded system prompt text in transcript projection', () => {
+    const projection = buildConversationSearchProjection([], 'alpha directive', {
+      systemPrompt: 'alpha directive\nsecondary line',
+      systemPromptExpanded: true,
+    });
+
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.sources[0]?.role).toBe('system-prompt');
+    expect(projection.sources[0]?.text).toBe('alpha directive\nsecondary line');
+  });
   it('projects canonical typed content across available render units exhaustively', () => {
     const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
       type: 'awaiting_sub_agents',
@@ -284,7 +295,21 @@ describe('buildConversationSearchProjection', () => {
     const units: RenderUnit[] = [
       { kind: 'user', key: 'u1', message: userMsg('u1', 'User alpha', [{ original_name: 'alpha.txt' }]) },
       { kind: 'pending_user', key: 'p1', message: queued('p1', 'Pending alpha', [{ original_name: 'queued-alpha.md', media_type: 'text/markdown', size_bytes: 12, stored_path: '/tmp/queued-alpha.md' }]) },
-      { kind: 'skill', key: 's1', message: skillMsg('s1', 'Skill alpha') },
+      {
+        kind: 'skill',
+        key: 's1',
+        message: {
+          ...skillMsg('s1', 'Skill alpha'),
+          content: {
+            name: 'dogfood',
+            trigger: '/dogfood alpha --trace',
+            args: 'alpha --trace',
+            source: '/skills/dogfood/SKILL.md',
+            snippet: 'Alpha walkthrough',
+            files: [{ original_name: 'alpha.txt' }],
+          },
+        },
+      },
       { kind: 'system', key: 'sys1', message: systemMsg('sys1', 'System alpha') },
       {
         kind: 'agent_turn',
@@ -304,20 +329,22 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.sources.map((source) => [source.unitKind, source.role, source.text])).toEqual([
       ['user', 'user-message', 'User alpha\nalpha.txt'],
       ['pending_user', 'pending-user-message', 'Pending alpha\nqueued-alpha.md'],
-      ['skill', 'skill-message', 'Skill alpha'],
+      ['skill', 'skill-message', '/dogfood alpha --trace\n/skills/dogfood/SKILL.md\nAlpha walkthrough\nalpha.txt'],
       ['system', 'system-message', 'System alpha'],
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-name-1', 'search'],
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
       ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
       ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
-      ['sub_agent_status', 'sub-agent-status', 'pending inspect alpha path\ncompleted summarize beta path done'],
+      ['sub_agent_status', 'sub-agent-status', 'completed summarize beta path done\npending inspect alpha path'],
     ]);
     expect(projection.matches.map((match) => match.target.unitKind)).toEqual([
       'user',
       'user',
       'pending_user',
       'pending_user',
+      'skill',
+      'skill',
       'skill',
       'system',
       'agent_turn',

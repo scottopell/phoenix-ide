@@ -101,6 +101,44 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' });
   });
 
+  it('wraps diff navigation from the clamped active match when results shrink', async () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={[
+            'diff --git a/foo.txt b/foo.txt',
+            'index 0000000..1111111 100644',
+            '--- a/foo.txt',
+            '+++ b/foo.txt',
+            '@@ -0,0 +1,3 @@',
+            '+alpha one',
+            '+alpha two',
+            '+alpha three',
+          ].join('\n')}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('3 of 3')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'three' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
   it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
