@@ -197,6 +197,56 @@ describe('history expansion reducer', () => {
     expect(next).toBe(state);
   });
 
+  it('invalidates stale deep-link work when the target changes', () => {
+    const currentView = view('a', 1);
+    let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: deepLinkRequest(currentView),
+    });
+    state = reduceHistoryExpansion(state, { type: 'target_changed', targetMessageId: 'm2' });
+
+    expect(state.activeRequest).toBeNull();
+    expect(reduceHistoryExpansion(state, {
+      type: 'history_loaded', requestToken: 1, view: currentView, targetPresent: true, commandToken: 101,
+    })).toBe(state);
+  });
+
+  it('clears a jump command for the previous target', () => {
+    const currentView = view('a', 1);
+    let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'loaded_target_requested', targetMessageId: 'm1', commandToken: 7,
+    });
+
+    state = reduceHistoryExpansion(state, { type: 'target_changed', targetMessageId: 'm2' });
+    expect(state.pendingCommand).toBeNull();
+  });
+
+  it('keeps manual expansion active when the deep-link target changes', () => {
+    const currentView = view('a', 1);
+    const state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: manualRequest(currentView),
+    });
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'target_changed', targetMessageId: 'm2',
+    })).toBe(state);
+  });
+
+  it('clears a request failure when the deep-link target changes', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, true),
+      failure: {
+        kind: 'request_failed' as const,
+        message: 'offline',
+        intent: { kind: 'deep_link' as const, targetMessageId: 'm1' },
+      },
+    };
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'target_changed', targetMessageId: 'm2',
+    }).failure).toBeNull();
+  });
+
   it('failure leaves tail coverage usable and cannot retry itself', () => {
     const currentView = view('a', 1);
     const request = deepLinkRequest(currentView);

@@ -97,12 +97,22 @@ export function reduceHistoryExpansion(
     case 'view_changed':
       return initialHistoryExpansionState(event.view, event.hasEarlierHistory);
 
-    case 'target_changed':
-      if (
-        state.failure?.kind === 'target_not_found'
-        && state.failure.targetMessageId !== event.targetMessageId
-      ) return { ...state, failure: null };
-      return state;
+    case 'target_changed': {
+      const staleRequest = state.activeRequest?.intent.kind === 'deep_link'
+        && state.activeRequest.intent.targetMessageId !== event.targetMessageId;
+      const staleCommand = state.pendingCommand?.kind === 'jump_to_message'
+        && state.pendingCommand.targetMessageId !== event.targetMessageId;
+      const staleFailure = state.failure?.kind === 'request_failed'
+        || (state.failure?.kind === 'target_not_found'
+          && state.failure.targetMessageId !== event.targetMessageId);
+      if (!staleRequest && !staleCommand && !staleFailure) return state;
+      return {
+        ...state,
+        activeRequest: staleRequest ? null : state.activeRequest,
+        pendingCommand: staleCommand ? null : state.pendingCommand,
+        failure: staleFailure ? null : state.failure,
+      };
+    }
 
     case 'loaded_target_requested':
       if (state.pendingCommand || state.failure) return state;

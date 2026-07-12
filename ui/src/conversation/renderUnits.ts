@@ -77,6 +77,22 @@ export interface HistoricalBuild {
   endsInAgentRun: boolean;
 }
 
+export function findHistoricalUnitIndexByMessageId(
+  historicalUnits: readonly HistoricalUnit[],
+  messageId: string,
+): number {
+  return historicalUnits.findIndex((unit) => {
+    if (unit.kind === 'agent_turn') {
+      if (unit.agent.message_id === messageId) return true;
+      return Array.from(unit.toolResultsByUseId.values())
+        .some((message) => message.message_id === messageId);
+    }
+    return 'message' in unit
+      && 'message_id' in unit.message
+      && unit.message.message_id === messageId;
+  });
+}
+
 export interface TailBuildInputs {
   convState: ConversationState;
   streamingHandle: StreamingHandle | null;

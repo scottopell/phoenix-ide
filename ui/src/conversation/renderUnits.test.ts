@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MockInstance } from 'vitest';
 import {
   buildRenderUnits,
+  findHistoricalUnitIndexByMessageId,
   SUB_AGENT_STATUS_KEY,
   type HistoricalUnit,
 } from './renderUnits';
@@ -231,6 +232,30 @@ describe('buildRenderUnits', () => {
       expect(u.toolResultsByUseId.get('use-1')?.message_id).toBe('t1');
       expect(u.toolResultsByUseId.get('use-2')?.message_id).toBe('t2');
       expect(u.toolResultsByUseId.get('use-3')?.message_id).toBe('t3');
+    });
+
+    it('resolves agent and tool-result message IDs to the containing render unit', () => {
+      const out = buildRenderUnits({
+        messages: [agentMsg('a1'), toolMsg('t1', 'use-1'), userMsg('u1', 'next')],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'a1')).toBe(0);
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 't1')).toBe(0);
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'u1')).toBe(1);
+    });
+
+    it('does not resolve an orphan tool message that has no render unit', () => {
+      const out = buildRenderUnits({
+        messages: [toolMsg('orphan', 'use-1'), userMsg('u1', 'next')],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'orphan')).toBe(-1);
     });
 
     it('logs and skips tool messages without tool_use_id', () => {

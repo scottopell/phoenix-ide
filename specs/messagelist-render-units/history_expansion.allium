@@ -91,12 +91,35 @@ rule ViewChangeInvalidatesOutstandingWork {
     ensures: view.failure = null
 }
 
-rule ChangedDeepLinkClearsOnlyItsStaleMissingTargetFailure {
+rule ChangedDeepLinkInvalidatesItsStaleRequest {
+    when: DeepLinkTargetChanged(view, target_message_id)
+    requires: view.active_request != null
+    requires: view.active_request.intent = deep_link
+    requires: view.active_request.message_id != target_message_id
+    ensures: view.active_request = null
+}
+
+rule ChangedDeepLinkInvalidatesItsStaleCommand {
+    when: DeepLinkTargetChanged(view, target_message_id)
+    requires: view.pending_command != null
+    requires: view.pending_command.kind = jump_to_message
+    requires: view.pending_command.message_id != target_message_id
+    ensures: view.pending_command = null
+}
+
+rule ChangedDeepLinkClearsStaleFailure {
     when: DeepLinkTargetChanged(view, target_message_id)
     requires: view.failure != null
-    requires: view.failure.kind = target_not_found
-    requires: view.failure.message != target_message_id
+    requires: view.failure.kind = request_failed
+        or view.failure.kind = target_not_found and view.failure.message != target_message_id
     ensures: view.failure = null
+}
+
+rule ChangedDeepLinkPreservesManualRequest {
+    when: DeepLinkTargetChanged(view, _)
+    requires: view.active_request != null
+    requires: view.active_request.intent = manual_expand
+    ensures: view.active_request = view.active_request
 }
 
 rule LoadedTargetCreatesNavigationCommandWithoutExpandingCoverage {

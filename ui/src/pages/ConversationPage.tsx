@@ -11,8 +11,13 @@ import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   initialHistoryExpansionState,
   reduceHistoryExpansion,
+  type HistoryIntent,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
+import {
+  buildHistoricalUnits,
+  findHistoricalUnitIndexByMessageId,
+} from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
@@ -838,15 +843,13 @@ function ConversationPageContent() {
     };
   }, [slug, navigate, dispatch, eventCursorRef]);
 
-  const loadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
+  const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
     const request = {
       token: ++historyRequestTokenRef.current,
       view: historyExpansion.view,
       snapshotStartedAtEventSeq: eventCursorRef.current,
-      intent: targetMessageId
-        ? { kind: 'deep_link' as const, targetMessageId }
-        : { kind: 'manual_expansion' as const, restore: restoreBasis ?? { kind: 'following_tail' as const } },
+      intent,
     };
     dispatchHistoryExpansion({ type: 'request_started', request });
     try {
@@ -889,7 +892,10 @@ function ConversationPageContent() {
         requestToken: request.token,
         view: request.view,
         targetPresent: request.intent.kind !== 'deep_link'
-          || result.messages.some((message) => message.message_id === request.intent.targetMessageId),
+          || findHistoricalUnitIndexByMessageId(
+            buildHistoricalUnits({ messages: result.messages, pendingMessages: [] }).historicalUnits,
+            request.intent.targetMessageId,
+          ) >= 0,
         commandToken: ++historyCommandTokenRef.current,
       });
       await cacheDB.putMessages(result.messages);
@@ -902,15 +908,26 @@ function ConversationPageContent() {
         message: err instanceof Error ? err.message : 'Failed to load earlier history',
       });
     }
-  }, [slug, conversationId, historyExpansion, targetMessageId, dispatch, eventCursorRef]);
+  }, [slug, conversationId, historyExpansion, dispatch, eventCursorRef]);
+
+  const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
+    void loadOlderMessagesForIntent({
+      kind: 'manual_expansion',
+      restore: restoreBasis ?? { kind: 'following_tail' },
+    });
+  }, [loadOlderMessagesForIntent]);
 
   useEffect(() => {
     dispatchHistoryExpansion({ type: 'target_changed', targetMessageId: targetMessageId ?? null });
   }, [targetMessageId]);
 
   const requestedLoadedTargetRef = useRef<string | null>(null);
+  const loadedHistoricalUnits = useMemo(
+    () => buildHistoricalUnits({ messages: atom.messages, pendingMessages }).historicalUnits,
+    [atom.messages, pendingMessages],
+  );
   const loadedTargetPresent = targetMessageId
-    ? atom.messages.some((message) => message.message_id === targetMessageId)
+    ? findHistoricalUnitIndexByMessageId(loadedHistoricalUnits, targetMessageId) >= 0
     : false;
   const loadedTargetRequestKey = targetMessageId
     ? `${historyExpansion.view.conversationId}:${historyExpansion.view.generation}:${historyExpansion.view.transcriptGeneration}:${targetMessageId}`
@@ -937,9 +954,9 @@ function ConversationPageContent() {
 
   useEffect(() => {
     if (targetMessageId && !loadedTargetPresent && historyExpansion.coverage === 'tail' && !historyExpansion.activeRequest && !historyExpansion.failure) {
-      void loadOlderMessages();
+      void loadOlderMessagesForIntent({ kind: 'deep_link', targetMessageId });
     }
-  }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessages]);
+  }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
 
   const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
     dispatchHistoryExpansion({

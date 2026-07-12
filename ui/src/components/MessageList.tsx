@@ -20,6 +20,7 @@ import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildHistoricalUnits,
+  findHistoricalUnitIndexByMessageId,
   buildTailUnits,
   type HistoricalUnit,
   type TailUnit,
@@ -814,13 +815,10 @@ function MessageListImpl({
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 
-  const findUnitIndexByMessageId = useCallback((messageId: string) => {
-    return historicalUnits.findIndex((unit) => {
-      if (unit.kind === 'agent_turn') return unit.agent.message_id === messageId;
-      if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id === messageId;
-      return false;
-    });
-  }, [historicalUnits]);
+  const findUnitIndexByMessageId = useCallback(
+    (messageId: string) => findHistoricalUnitIndexByMessageId(historicalUnits, messageId),
+    [historicalUnits],
+  );
 
   const scrollToMessageId = useCallback((messageId: string) => {
     const index = findUnitIndexByMessageId(messageId);
