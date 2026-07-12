@@ -955,6 +955,7 @@ function ConversationPageContent() {
     let cancelled = false;
 
     const confirmArchiveStatus = async () => {
+      const snapshotStartedAtEventSeq = eventCursorRef.current;
       try {
         const result = await getConversationMetaForRoute(slug);
         if (cancelled || result.conversation.id !== atomRef.current.conversationId) return;
@@ -970,8 +971,8 @@ function ConversationPageContent() {
               : { type: 'idle' },
           contextWindow: { used: result.context_window_size || 0 },
           transcriptGeneration: atomRef.current.transcriptGeneration ?? result.conversation.transcript_generation ?? 1,
-          eventCursorFloor: eventCursorRef.current,
-          snapshotStartedAtEventSeq: eventCursorRef.current,
+          eventCursorFloor: snapshotStartedAtEventSeq,
+          snapshotStartedAtEventSeq,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);
