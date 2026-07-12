@@ -348,7 +348,7 @@ describe('InputArea cancellation affordance', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it('keeps Stopping disabled and blocks sends while cancellation is pending', () => {
+  it('keeps Stopping disabled while allowing a queued follow-up during tool cancellation', () => {
     const onSend = vi.fn();
     render(
       <InputArea
@@ -368,9 +368,9 @@ describe('InputArea cancellation affordance', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Stopping...' })).toBeDisabled();
-    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Queue follow-up' })).toBeEnabled();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
-    expect(onSend).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith('do not send', [], []);
   });
 
   it('blocks sends while the first send is still optimistic', () => {
@@ -405,6 +405,9 @@ describe('InputArea cancellation affordance', () => {
     { type: 'context_exhausted', summary: 'Done' },
     { type: 'handed_off', successor_conv_id: 'next' },
     { type: 'terminal' },
+    { type: 'provisioning' },
+    { type: 'creation_failed' },
+    { type: 'creation_cancelled' },
   ] satisfies ConversationState[])('hides chat submission in $type', (convState) => {
     const onSend = vi.fn();
     renderInput({ cwd: 'conv-blocked', convState, draft: 'must not send', onSend });

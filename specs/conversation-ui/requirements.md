@@ -207,13 +207,15 @@ THE SYSTEM SHALL NOT show the activity indicator
 
 ### REQ-CONV-008: Cancellation
 
-WHEN agent is working
-THE SYSTEM SHALL show Cancel button instead of Send
+WHEN agent is working and cancellation is available
+THE SYSTEM SHALL show a Stop action
 AND enable user to cancel the current operation
+AND keep the follow-up Queue action available when the current state accepts steering messages
 
 WHEN cancellation is in progress
-THE SYSTEM SHALL show "Cancelling..." state
-AND disable further cancel attempts
+THE SYSTEM SHALL show "Stopping..." state
+AND disable further stop attempts
+AND keep the follow-up Queue action available when the cancellation state accepts steering messages
 
 **Rationale:** Users need escape hatch for runaway operations or mistakes.
 
