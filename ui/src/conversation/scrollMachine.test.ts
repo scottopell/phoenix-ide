@@ -273,6 +273,20 @@ describe('scrollMachine durable follow policy', () => {
     expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(true);
   });
 
+  it('does not mark a near-tail navigation jump as departed while it remains pinned', () => {
+    let state = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'upwardIntent',
+      snapshot: snap(1_000, 550, 400),
+    }).state;
+
+    expectLiveMode(state, 'navigating');
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(false);
+
+    const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+  });
+
   it('navigation ownership survives movement and later height growth without a tail snap', () => {
     let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
     result = reduceScrollMachine(result.state, {

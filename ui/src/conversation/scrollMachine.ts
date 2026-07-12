@@ -426,7 +426,11 @@ export function reduceScrollMachine(
           state: {
             ...state,
             geometry: event.snapshot ? updateGeometry(state.geometry, event.snapshot) : state.geometry,
-            follow: { ...state.follow, departedBottom: true },
+            follow: {
+              ...state.follow,
+              departedBottom: state.follow.departedBottom ||
+                (event.snapshot !== undefined && !snapshotIsPinned(event.snapshot)),
+            },
           },
           effects: [],
         };

@@ -99,7 +99,7 @@ surface ScrollPolicyAdapter {
         TouchMoved(policy)
         TouchEnded(policy, remaining_touches)
         TouchCancelled(policy, remaining_touches)
-        UpwardIntent(policy)
+        UpwardIntent(policy, snapshot)
         NavigationJumped(policy)
         TailContentAdvanced(policy)
         HeightChanged(policy, total_height, unit_count, cause)
@@ -238,22 +238,22 @@ rule ReadingOwnershipSurvivesDownwardGeometryChanges {
 }
 
 rule UpwardIntentFromLiveTakesReadingOwnership {
-    when: UpwardIntent(policy)
+    when: UpwardIntent(policy, _)
     requires: policy.lifecycle = live
     requires: policy.follow_mode != navigating
     ensures: policy.follow_mode = reading
 }
 
 rule NavigationUpwardMovementPreservesNavigationOwnership {
-    when: UpwardIntent(policy)
+    when: UpwardIntent(policy, snapshot)
     requires: policy.lifecycle = live
     requires: policy.follow_mode = navigating
     ensures: policy.follow_mode = navigating
-    ensures: policy.navigation_departed_bottom = true
+    ensures: policy.navigation_departed_bottom = policy.navigation_departed_bottom or not snapshot.at_bottom
 }
 
 rule UpwardIntentExitsMountRescueIntoReading {
-    when: UpwardIntent(policy)
+    when: UpwardIntent(policy, _)
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
     ensures: policy.follow_mode = reading
