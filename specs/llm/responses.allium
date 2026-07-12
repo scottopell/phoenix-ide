@@ -342,6 +342,9 @@ rule CodexResponsesLitePrefixTranslated {
         -- instructions and tools are absent. The request retains store=false
         -- and prompt_cache_key. Direct-platform requests and pre-GPT-5.6 Codex
         -- requests retain the platform-shaped translation.
+        -- Every WebSocket response.create also carries the Responses Lite
+        -- selector in client_metadata; the upgrade header alone is insufficient
+        -- because one connection carries multiple independent creates.
 }
 
 -- A message carrying at least one image is translated to a Responses API

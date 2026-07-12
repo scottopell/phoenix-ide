@@ -815,6 +815,12 @@ async fn complete_codex_websocket(
             "serialize WebSocket request: {e}"
         )))
     })?;
+    // Responses Lite is selected per create, not only at WebSocket upgrade.
+    // Match upstream codex-rs client metadata so every full or incremental
+    // request on a reused connection carries its own parsing contract.
+    wire["client_metadata"] = serde_json::json!({
+        "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+    });
     let full_payload_bytes = serde_json::to_vec(&wire).map_or(0, |bytes| bytes.len());
     let incremental = if let Some((previous_response_id, suffix)) =
         continuation_suffix(&session, &compatibility, &full_input)
@@ -1989,6 +1995,11 @@ mod tests {
                 assert_eq!(request["type"], "response.create");
                 assert!(request.get("response").is_none());
                 assert!(request["model"].is_string());
+                assert_eq!(
+                    request["client_metadata"]
+                        ["ws_request_header_x_openai_internal_codex_responses_lite"],
+                    "true"
+                );
                 let marker = request["input"].to_string();
                 if marker.contains("ws-fail") {
                     socket
@@ -2153,6 +2164,16 @@ mod tests {
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
         assert!(requests[0].1.get("previous_response_id").is_none());
         assert_eq!(requests[1].1["previous_response_id"], "resp-1");
+        assert_eq!(
+            requests[0].1["client_metadata"]
+                ["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
+        assert_eq!(
+            requests[1].1["client_metadata"]
+                ["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
         assert_eq!(requests[1].1["input"].as_array().unwrap().len(), 1);
 
         // A non-prefix request is a full create, but the healthy transport is retained.
