@@ -34,9 +34,6 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
         workflow_id: WorkflowId,
         handle: H,
     ) -> ExternalAcceptanceOutcome<H> {
-        if !selection.accepting || !selection.external_acceptance_enabled {
-            return ExternalAcceptanceOutcome::Unsupported;
-        }
         let key = ExternalAcceptanceKey {
             profile: selection.profile.clone(),
             authority_scope: authority_scope.to_owned(),
@@ -48,6 +45,9 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
             } else {
                 ExternalAcceptanceOutcome::Conflict
             };
+        }
+        if !selection.accepting || !selection.external_acceptance_enabled {
+            return ExternalAcceptanceOutcome::Unsupported;
         }
         let receipt = ExternalAcceptanceReceipt {
             idempotency_key: idempotency_key.to_owned(),

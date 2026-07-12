@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::types::{
-    BarrierId, BarrierMemberDecl, EffectDecl, EffectId, EffectRole, ReceiptFamily, TransitionPlan,
-    WorkflowProfile,
+    BarrierId, BarrierMemberDecl, EffectDecl, EffectId, EffectRole, Generation, ReceiptFamily,
+    TransitionPlan, WorkflowProfile,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,12 @@ pub enum PlanError {
         barrier_id: BarrierId,
         effect_id: EffectId,
     },
+    EffectGenerationMismatch {
+        effect_id: EffectId,
+        expected: Generation,
+        actual: Generation,
+    },
+    InvalidatesManualResolutionEffect(EffectId),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -36,6 +42,8 @@ pub enum EngineError {
     InvalidPlan(PlanError),
     #[error("protocol selection is not accepting new workflows")]
     ProtocolNotAccepting,
+    #[error("workflow profile does not match the selected protocol profile")]
+    ProfileProtocolMismatch,
     #[error("workflow binding is shadow-only and cannot execute")]
     ShadowCannotExecute,
     #[error("validated plan omitted barrier event for barrier {0:?}")]

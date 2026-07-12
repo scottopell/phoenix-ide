@@ -321,6 +321,7 @@ impl WorkflowProfile for WakeProfile {
     type Receipt = WakeTerminalPayload;
     type ReceiptReducerEvent = WakeTerminalPayload;
     type BarrierEvent = WakeBarrierEvent;
+    type OwedAcceptanceEvent = WakeTerminalPayload;
     type ManualPayload = WakeManualPayload;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
@@ -486,11 +487,28 @@ pub fn registration_decision(
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeCancellationOutcome {
+    Request(Box<CancellationRequest<WakeProfile>>),
+    AlreadyTerminal(WakeTerminalPayload),
+}
+
 #[must_use]
 pub fn cancellation_request(
     workflow: &WorkflowState<WakeProfile>,
     resolved_at: Timestamp,
-) -> CancellationRequest<WakeProfile> {
+) -> WakeCancellationOutcome {
+    if let Some(receipt) = workflow
+        .effects
+        .values()
+        .find(|effect| {
+            effect.declaration.kind == OBSERVE_HANDLE_KIND
+                && effect.declaration.generation == workflow.generation
+        })
+        .and_then(|effect| effect.receipt.as_ref())
+    {
+        return WakeCancellationOutcome::AlreadyTerminal(receipt.receipt.clone());
+    }
     let invalidations = workflow
         .effects
         .iter()
@@ -512,7 +530,7 @@ pub fn cancellation_request(
         WakeCancellationReason::ExplicitCancel,
         resolved_at,
     ));
-    CancellationRequest {
+    WakeCancellationOutcome::Request(Box::new(CancellationRequest {
         expected_workflow_version: workflow.version,
         next_snapshot,
         next_snapshot_codec: snapshot_codec(),
@@ -531,7 +549,7 @@ pub fn cancellation_request(
             invalidations: vec![],
             owed_acceptances: None,
         },
-    }
+    }))
 }
 
 #[must_use]
