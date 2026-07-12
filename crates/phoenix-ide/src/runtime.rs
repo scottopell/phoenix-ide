@@ -1480,6 +1480,7 @@ impl RuntimeManager {
         self.broadcast_work_scope_update(&request.work_scope).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn reconcile_work_scope_after_bash_terminal_inner(
         &self,
         request: &WorkScopeReconciliationRequest,
@@ -1516,27 +1517,60 @@ impl RuntimeManager {
                 .map_err(|err| err.to_string())?;
         }
 
-        let mut candidates = std::collections::BTreeSet::new();
+        let worktree_repo_identity =
+            phoenix_core::git::detect_git_repo_root(&worktree).and_then(|root| {
+                crate::runtime::pr_status_poll::github_repo_identifier(std::path::Path::new(&root))
+            });
+        let mut candidates = std::collections::BTreeMap::new();
         for branch in self
             .db()
             .list_work_scope_observed_branches(scope)
             .await
             .map_err(|err| err.to_string())?
         {
-            candidates.insert(branch.branch_name);
+            if worktree_repo_identity
+                .as_deref()
+                .is_none_or(|repo| repo == branch.repository_identity)
+            {
+                candidates.insert(
+                    (
+                        branch.repository_identity.clone(),
+                        branch.branch_name.clone(),
+                    ),
+                    phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                        repository_identity: branch.repository_identity,
+                        branch_name: branch.branch_name,
+                    },
+                );
+            }
         }
         if let Some(branch_name) = conv.conv_mode.branch_name() {
-            candidates.insert(branch_name.to_string());
+            if let Some(repository_identity) = worktree_repo_identity.clone() {
+                let branch_name = branch_name.to_string();
+                candidates.insert(
+                    (repository_identity.clone(), branch_name.clone()),
+                    phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                        repository_identity,
+                        branch_name,
+                    },
+                );
+            }
         }
 
         let refreshes = tokio::task::spawn_blocking({
             let worktree = worktree.clone();
-            let branches: Vec<String> = candidates.into_iter().collect();
+            let branches: Vec<_> = candidates.into_values().collect();
             move || {
                 branches
                     .into_iter()
-                    .map(|branch_name| {
-                        crate::api::pr_monitoring::get_pr_status_for_branch(&worktree, &branch_name)
+                    .map(|branch| {
+                        (
+                            branch.clone(),
+                            crate::api::pr_monitoring::get_pr_status_for_branch(
+                                &worktree,
+                                &branch.branch_name,
+                            ),
+                        )
                     })
                     .collect::<Vec<_>>()
             }
@@ -1546,7 +1580,12 @@ impl RuntimeManager {
 
         let observations: Vec<_> = refreshes
             .into_iter()
-            .flat_map(|refresh| refresh.observations)
+            .flat_map(|(branch, refresh)| {
+                refresh.observations.into_iter().filter(move |observation| {
+                    branch.repository_identity
+                        == format!("{}/{}", observation.repo_owner, observation.repo_name)
+                })
+            })
             .collect();
         if !observations.is_empty() {
             self.db()
@@ -1568,6 +1607,11 @@ impl RuntimeManager {
         Ok(())
     }
 
+    fn authoritative_worktree_scope_candidate_key(conv: &crate::db::Conversation) -> (u8, String) {
+        let inheritor_rank = u8::from(conv.continued_in_conv_id.is_some());
+        (inheritor_rank, conv.id.clone())
+    }
+
     async fn authoritative_conversation_for_scope(
         &self,
         work_scope: &WorkScope,
@@ -1584,21 +1628,22 @@ impl RuntimeManager {
                     })
             }
             WorkScope::Worktree(path) => {
-                let convs = self
+                let mut convs: Vec<_> = self
                     .db()
                     .get_work_conversations()
                     .await
-                    .map_err(|err| err.to_string())?;
-                if let Some(conv) = convs.iter().find(|conv| {
-                    conv.conv_mode.worktree_path() == Some(path.as_str())
-                        && !conv.state.is_terminal()
-                        && !conv.archived
-                }) {
+                    .map_err(|err| err.to_string())?
+                    .into_iter()
+                    .filter(|conv| conv.conv_mode.worktree_path() == Some(path.as_str()))
+                    .collect();
+                convs.sort_by_key(Self::authoritative_worktree_scope_candidate_key);
+                if let Some(conv) = convs
+                    .iter()
+                    .find(|conv| !conv.state.is_terminal() && !conv.archived)
+                {
                     return Ok(Some(conv.clone()));
                 }
-                Ok(convs
-                    .into_iter()
-                    .find(|conv| conv.conv_mode.worktree_path() == Some(path.as_str())))
+                Ok(convs.into_iter().next())
             }
             WorkScope::Global => Ok(None),
         }

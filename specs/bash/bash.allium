@@ -385,9 +385,6 @@ deferred BashTerminalEdgeWorkScopeReconciliation
 ------------------------------------------------------------
 -- Rules — Phoenix process-level setup
 ------------------------------------------------------------
-------------------------------------------------------------
--- Rules — Phoenix process-level setup
-------------------------------------------------------------
 
 -- REQ-BASH-007: Phoenix startup sets the subreaper bit so that double-forked
 -- daemons and other escapees reparent to Phoenix rather than init when the

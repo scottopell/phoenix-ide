@@ -889,8 +889,8 @@ fn capture_pr_auto_fix_context_for_pr_item(
         response: PrAutoFixContextResponse {
             artifact_path: rel_path,
             pr_number: artifact.pr.number,
-            repo_owner: String::new(),
-            repo_name: String::new(),
+            repo_owner: target.repo_owner.clone(),
+            repo_name: target.repo_name.clone(),
             message,
         },
         baseline,
