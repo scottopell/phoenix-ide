@@ -168,6 +168,8 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
 /// unavailable/error states without parsing shell command intent.
 #[must_use]
 pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
+    const MAX_ATTEMPTS: usize = 6;
+
     let repo_root = detect_git_repo_root(path);
     let Some(repository_identity) = repo_root else {
         return LocalGitHeadObservation::Unavailable {
@@ -176,19 +178,48 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
         };
     };
 
-    match git_capture(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Some(branch_name) if !branch_name.is_empty() => {
-            if let Some(head_oid) =
-                git_capture(path, &["rev-parse", "HEAD^{commit}"]).filter(|oid| !oid.is_empty())
+    let mut known_unborn_branch_name = None;
+    for _ in 0..MAX_ATTEMPTS {
+        if let Some(full_ref) =
+            git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).filter(|name| !name.is_empty())
+        {
+            let branch_name = full_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&full_ref)
+                .to_string();
+            known_unborn_branch_name = Some(branch_name.clone());
+            let ref_commit = git_capture(path, &["rev-parse", &format!("{full_ref}^{{commit}}")]);
+            if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).as_deref()
+                != Some(full_ref.as_str())
             {
+                continue;
+            }
+            if let Some(head_oid) = ref_commit.filter(|oid| !oid.is_empty()) {
                 return LocalGitHeadObservation::NamedBranch {
                     repository_identity,
                     branch_name,
                     head_oid,
                 };
             }
+            if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
+                return LocalGitHeadObservation::Unborn {
+                    repository_identity,
+                    branch_name: Some(branch_name),
+                };
+            }
+            continue;
         }
-        _ => {}
+
+        let first_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
+        let second_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
+        if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).is_none() {
+            if let Some(head_oid) = first_oid.filter(|oid| Some(oid) == second_oid.as_ref()) {
+                return LocalGitHeadObservation::Detached {
+                    repository_identity,
+                    head_oid,
+                };
+            }
+        }
     }
 
     if let Some(head_oid) = git_capture(path, &["rev-parse", "HEAD^{commit}"]) {
@@ -201,7 +232,8 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
     }
 
     let branch_name = git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|name| !name.is_empty() && name != "HEAD");
+        .filter(|name| !name.is_empty() && name != "HEAD")
+        .or(known_unborn_branch_name);
     let head_exists = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(path)
@@ -395,7 +427,7 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .into_owned(),
-                branch_name: None,
+                branch_name: Some("main".to_string()),
             }
         );
     }
@@ -412,5 +444,68 @@ mod tests {
                 error: "not a git repository".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn observe_local_git_head_preserves_known_unborn_branch_name() {
+        let repo = temp_dir();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unborn {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: Some("topic".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_eventually_reports_consistent_snapshot_during_checkout() {
+        let repo = init_repo();
+        commit_file(repo.path(), "base.txt", "base");
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        let feature_oid = commit_file(repo.path(), "feature.txt", "feature");
+        git(repo.path(), &["checkout", "main"]);
+        let main_oid = git_out(repo.path(), &["rev-parse", "HEAD^{commit}"]);
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                for _ in 0..200 {
+                    git(repo.path(), &["checkout", "feature"]);
+                    git(repo.path(), &["checkout", "main"]);
+                }
+            });
+
+            for _ in 0..200 {
+                match observe_local_git_head(repo.path()) {
+                    LocalGitHeadObservation::NamedBranch {
+                        branch_name,
+                        head_oid,
+                        ..
+                    } => {
+                        if branch_name == "main" {
+                            assert_eq!(head_oid, main_oid);
+                        } else if branch_name == "feature" {
+                            assert_eq!(head_oid, feature_oid);
+                        } else {
+                            panic!("unexpected branch snapshot: {branch_name} {head_oid}");
+                        }
+                    }
+                    LocalGitHeadObservation::Detached { head_oid, .. } => {
+                        assert!(head_oid == main_oid || head_oid == feature_oid);
+                    }
+                    LocalGitHeadObservation::Unborn { .. }
+                    | LocalGitHeadObservation::Unavailable { .. } => {}
+                }
+            }
+
+            handle.join().unwrap();
+        });
     }
 }
