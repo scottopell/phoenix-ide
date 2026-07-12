@@ -15,12 +15,60 @@ use std::path::Path;
 /// setup in tests cannot invoke an interactive signing agent.
 #[must_use]
 pub fn command() -> std::process::Command {
+    command_with_config(&[])
+}
+
+/// Construct a safe Git subprocess with additional process-level configuration.
+///
+/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries are
+/// appended, then `commit.gpgsign=false` is appended last so no inherited or
+/// caller-provided entry can re-enable interactive signing. Malformed inherited
+/// configuration is discarded as a unit rather than passed through to Git.
+#[must_use]
+pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
+    let inherited = inherited_config_count();
+
+    if inherited.is_none() {
+        clear_inherited_config(&mut command);
+    }
+
+    let mut index = inherited.unwrap_or(0);
+    for &(key, value) in config
+        .iter()
+        .chain(std::iter::once(&("commit.gpgsign", "false")))
+    {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        index += 1;
+    }
+    command.env("GIT_CONFIG_COUNT", index.to_string());
     command
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false");
-    command
+}
+
+fn inherited_config_count() -> Option<usize> {
+    let Some(raw_count) = std::env::var_os("GIT_CONFIG_COUNT") else {
+        return Some(0);
+    };
+    let count = raw_count.to_str()?.parse::<usize>().ok()?;
+    (0..count)
+        .all(|index| {
+            std::env::var_os(format!("GIT_CONFIG_KEY_{index}")).is_some()
+                && std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")).is_some()
+        })
+        .then_some(count)
+}
+
+fn clear_inherited_config(command: &mut std::process::Command) {
+    command.env_remove("GIT_CONFIG_COUNT");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(name);
+        }
+    }
 }
 
 /// Detect the git repository root for a given directory path.
@@ -95,6 +143,42 @@ fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod command_tests {
     use super::*;
+
+    #[test]
+    fn additional_config_is_preserved_and_signing_override_has_final_precedence() {
+        let command = command_with_config(&[("fetch.prune", "true"), ("commit.gpgsign", "true")]);
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let count = environment["GIT_CONFIG_COUNT"].parse::<usize>().unwrap();
+        assert!(count >= 3);
+        assert_eq!(
+            environment[format!("GIT_CONFIG_KEY_{}", count - 3).as_str()],
+            "fetch.prune"
+        );
+        assert_eq!(
+            environment[format!("GIT_CONFIG_VALUE_{}", count - 3).as_str()],
+            "true"
+        );
+        assert_eq!(
+            environment[format!("GIT_CONFIG_KEY_{}", count - 2).as_str()],
+            "commit.gpgsign"
+        );
+        assert_eq!(
+            environment[format!("GIT_CONFIG_VALUE_{}", count - 2).as_str()],
+            "true"
+        );
+        assert_eq!(
+            environment[format!("GIT_CONFIG_KEY_{}", count - 1).as_str()],
+            "commit.gpgsign"
+        );
+        assert_eq!(
+            environment[format!("GIT_CONFIG_VALUE_{}", count - 1).as_str()],
+            "false"
+        );
+    }
 
     #[test]
     fn command_disables_hostile_commit_signing_configuration() {

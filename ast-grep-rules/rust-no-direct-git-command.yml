@@ -8,10 +8,7 @@ message: |
   convert it with `tokio::process::Command::from(...)`.
 note: "Centralize Git subprocess configuration in crates/phoenix-core/src/git.rs"
 rule:
-  any:
-    - pattern: std::process::Command::new("git")
-    - pattern: tokio::process::Command::new("git")
-    - pattern: Command::new("git")
+  pattern: $COMMAND::new("git")
 ignores:
   - "**/phoenix-core/src/git.rs"
   # Cargo compiles build.rs before crate dependencies are available. This

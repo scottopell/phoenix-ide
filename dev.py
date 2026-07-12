@@ -3687,6 +3687,29 @@ def _make_reporter(pretty: bool, active: set, skipped: dict):
     return _PlainReporter()
 
 
+def _append_git_config_override(key, value, environ=None):
+    """Append a complete process-level Git config entry, resetting malformed input."""
+    env = os.environ if environ is None else environ
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        if count < 0:
+            raise ValueError
+        if any(
+            f"GIT_CONFIG_KEY_{index}" not in env or f"GIT_CONFIG_VALUE_{index}" not in env
+            for index in range(count)
+        ):
+            raise ValueError
+    except ValueError:
+        for name in list(env):
+            if name == "GIT_CONFIG_COUNT" or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                env.pop(name, None)
+        count = 0
+
+    env[f"GIT_CONFIG_KEY_{count}"] = key
+    env[f"GIT_CONFIG_VALUE_{count}"] = value
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+
+
 def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
     """Run lint, format check, tests, and task validation in parallel.
 
@@ -4344,10 +4367,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # signing agent. Add a process-only override without probing the signer
         # or modifying any Git config file. Append so caller-provided config
         # entries remain intact while this final entry takes precedence.
-        _git_config_count = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
-        os.environ[f"GIT_CONFIG_KEY_{_git_config_count}"] = "commit.gpgsign"
-        os.environ[f"GIT_CONFIG_VALUE_{_git_config_count}"] = "false"
-        os.environ["GIT_CONFIG_COUNT"] = str(_git_config_count + 1)
+        _append_git_config_override("commit.gpgsign", "false")
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:

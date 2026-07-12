@@ -93,16 +93,13 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 ///   `diff.dstPrefix=b/`: force standard `a/`/`b/` path prefixes. A user with
 ///   `diff.mnemonicPrefix=true` otherwise gets `c/`/`w/` on `git diff HEAD`,
 ///   which the UI diff parser rejects (it only recognises `a/`/`b/`).
-fn apply_git_base_config(cmd: &mut std::process::Command) {
-    cmd.env("GIT_CONFIG_COUNT", "5")
-        .env("GIT_CONFIG_KEY_1", "diff.noprefix")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .env("GIT_CONFIG_KEY_2", "diff.mnemonicPrefix")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .env("GIT_CONFIG_KEY_3", "diff.srcPrefix")
-        .env("GIT_CONFIG_VALUE_3", "a/")
-        .env("GIT_CONFIG_KEY_4", "diff.dstPrefix")
-        .env("GIT_CONFIG_VALUE_4", "b/");
+fn git_command() -> std::process::Command {
+    phoenix_core::git::command_with_config(&[
+        ("diff.noprefix", "false"),
+        ("diff.mnemonicPrefix", "false"),
+        ("diff.srcPrefix", "a/"),
+        ("diff.dstPrefix", "b/"),
+    ])
 }
 
 /// Like [`run_git`], but returns raw stdout bytes — no trimming, no UTF-8
@@ -110,9 +107,8 @@ fn apply_git_base_config(cmd: &mut std::process::Command) {
 /// `git cat-file -p <ref>:<path>`) where trailing whitespace is significant
 /// and binary detection needs the exact bytes.
 pub(crate) fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut cmd = phoenix_core::git::command();
+    let mut cmd = git_command();
     cmd.args(args).current_dir(cwd);
-    apply_git_base_config(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
@@ -128,14 +124,27 @@ pub(crate) fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String
 /// defaults. Used by [`capture_branch_diff`] to redirect index writes via
 /// `GIT_INDEX_FILE` so a read-only diff capture doesn't mutate the worktree's
 /// real index.
+fn validate_extra_env(extra_env: &[(&str, &str)]) -> Result<(), String> {
+    if let Some((key, _)) = extra_env.iter().find(|(key, _)| {
+        *key == "GIT_CONFIG_COUNT"
+            || key.starts_with("GIT_CONFIG_KEY_")
+            || key.starts_with("GIT_CONFIG_VALUE_")
+    }) {
+        return Err(format!(
+            "raw {key} override is not allowed; use phoenix_core::git::command_with_config"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_git_with_env(
     cwd: &Path,
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<String, String> {
-    let mut cmd = phoenix_core::git::command();
+    let mut cmd = git_command();
     cmd.args(args).current_dir(cwd);
-    apply_git_base_config(&mut cmd);
+    validate_extra_env(extra_env)?;
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }
@@ -174,12 +183,13 @@ pub(crate) fn run_git_capped(
     use std::io::Read;
     use std::process::Stdio;
 
-    let mut cmd = phoenix_core::git::command();
+    validate_extra_env(extra_env)?;
+
+    let mut cmd = git_command();
     cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_git_base_config(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }

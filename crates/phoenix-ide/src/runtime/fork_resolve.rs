@@ -1588,9 +1588,6 @@ mod tests {
         let out = phoenix_core::git::command()
             .args(args)
             .current_dir(repo)
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
             .output()
             .unwrap();
         assert!(

@@ -22,6 +22,39 @@ class CheckPlanTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
 
+    def test_git_config_override_composes_with_complete_inherited_entries(self):
+        env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "fetch.prune",
+            "GIT_CONFIG_VALUE_0": "true",
+        }
+
+        self.dev._append_git_config_override("commit.gpgsign", "false", env)
+
+        self.assertEqual("2", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("fetch.prune", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual("true", env["GIT_CONFIG_VALUE_0"])
+        self.assertEqual("commit.gpgsign", env["GIT_CONFIG_KEY_1"])
+        self.assertEqual("false", env["GIT_CONFIG_VALUE_1"])
+
+    def test_git_config_override_resets_malformed_inherited_entries(self):
+        for malformed in (
+            {"GIT_CONFIG_COUNT": "wat", "GIT_CONFIG_KEY_9": "stale"},
+            {"GIT_CONFIG_COUNT": "-1", "GIT_CONFIG_VALUE_9": "stale"},
+            {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "incomplete"},
+        ):
+            with self.subTest(malformed=malformed):
+                env = malformed.copy()
+                self.dev._append_git_config_override("commit.gpgsign", "false", env)
+                self.assertEqual(
+                    {
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "commit.gpgsign",
+                        "GIT_CONFIG_VALUE_0": "false",
+                    },
+                    env,
+                )
+
     def test_ci_lane_inventory_covers_every_devpy_lane_once(self):
         self.assertEqual([], self.dev._ci_lane_inventory_errors())
 

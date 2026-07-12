@@ -374,11 +374,6 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            // Disable commit signing — the host may set commit.gpgsign globally,
-            // which would fail in the sandbox without a signing key.
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
             .output()
             .unwrap();
         assert!(
