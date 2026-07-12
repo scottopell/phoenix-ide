@@ -22,6 +22,10 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [008](008_multi-pr-selection-uses-durable-branch-observations.md) | Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting | Accepted | REQ-PRA-000, REQ-PRA-000a, REQ-PRA-000b, REQ-PRA-000c, REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c |
 | [009](009_shared-demand-driven-resource-observations.md) | Native process metrics use shared demand-driven observation generations | Accepted | REQ-DEPLOY-007a, REQ-PINSP-004, REQ-PINSP-008, REQ-WSUI-006, REQ-WSUI-010 |
 | [010](010_launchd-deployment-uses-independent-transaction-helper.md) | launchd deployment uses an independent transaction helper | Accepted | REQ-LDD-001 through REQ-LDD-010 |
+| [011](013_durable-workflows-use-normalized-core-and-typed-profiles.md) | Durable workflows use an engine-owned normalized core and typed profiles | Accepted | REQ-DWF-001–003, REQ-DWF-013, REQ-DWF-015–016, wake and creation profiles |
+| [012](014_workflow-cas-and-leased-effect-authority.md) | Workflow transitions use CAS and every claimed effect uses leased authority | Accepted | REQ-DWF-004–012, REQ-DWF-018 |
+| [013](015_observation-receipt-and-runtime-acceptance-are-distinct.md) | Observation, receipt, and runtime acceptance are distinct durable facts | Accepted | REQ-DWF-001–002, REQ-DWF-007, REQ-DWF-012, REQ-DWF-017, profile acceptance |
+| [014](014_durable-workflow-boundaries-include-clients-and-adoption.md) | Durable-workflow boundaries include client acceptance and profile adoption | Accepted | REQ-DWF-013, REQ-DWF-019, REQ-DWF-022, REQ-DWF-029–032, creation acceptance, wake delivery |
 
 ## For agents: which decisions bind your task
 
@@ -42,6 +46,10 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, or rollback | 010 |
+| Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
+| Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015 |
+| Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014 |
+| Specifying observations, receipts, reducer delivery, or runtime acceptance | 015 |
 
 ## Decision dependencies
 
@@ -57,7 +65,12 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
-      └── ADR-010 (launchd deployment uses an independent transaction helper)
+      ├── ADR-010 (launchd deployment uses an independent transaction helper)
+      ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
+      │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
+      └── ADR-013 (Durable workflows use normalized core and typed profiles)
+          ├── ADR-014 (Workflow CAS and leased effect authority)
+          └── ADR-015 (Observation, receipt, and runtime acceptance are distinct)
 ```
 
 ## Conventions
