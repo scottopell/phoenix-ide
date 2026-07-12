@@ -939,10 +939,10 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.wheel(scroller, { deltaY: 10 });
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded');
 
     act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
 
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
@@ -1006,7 +1006,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
       act(() => vi.advanceTimersByTime(1600));
-      expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+      expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded');
 
       fireEvent.scroll(scroller);
       expect(onVisibleRangeChange).not.toHaveBeenCalled();
@@ -1110,6 +1110,30 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('history expansion feedback', () => {
+  it('renders deep-link failures after coverage becomes complete', () => {
+    render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          hasOlderMessages={false}
+          olderHistoryError="Message target-message was not found"
+        />,
+      ),
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Could not load earlier history: Message target-message was not found',
+    );
+    expect(screen.queryByRole('button', { name: /earlier history/i })).not.toBeInTheDocument();
   });
 });
 

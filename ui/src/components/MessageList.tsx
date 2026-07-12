@@ -86,7 +86,7 @@ interface MessageListProps {
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   historyScrollCommand?: HistoryScrollCommand | null | undefined;
-  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing') => void) | undefined;
+  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded') => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -518,6 +518,7 @@ function MessageListImpl({
   const tailFollowRafRef = useRef(0);
   const settleWatchTimerRef = useRef(0);
   const dispatchScrollEventRef = useRef<(event: ScrollEvent) => void>(() => {});
+  const cancelHistoryCommandRef = useRef<() => void>(() => {});
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -629,14 +630,7 @@ function MessageListImpl({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
-      const releaseBeforeInteraction = () => {
-        continuityRestoreInFlightRef.current = false;
-        continuityRestoreTokenRef.current = null;
-        if (historyAckTimeoutRef.current !== 0) {
-          clearTimeout(historyAckTimeoutRef.current);
-          historyAckTimeoutRef.current = 0;
-        }
-      };
+      const releaseBeforeInteraction = () => cancelHistoryCommandRef.current();
       const onPointerDown = () => {
         releaseBeforeInteraction();
         dispatchScrollEvent({ type: 'interactionStarted' });
@@ -875,13 +869,18 @@ function MessageListImpl({
     clearHistoryAckTimeout();
   }, [clearHistoryAckTimeout]);
 
-  const finishHistoryCommand = useCallback((token: number, result: 'applied' | 'target_missing') => {
+  const finishHistoryCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
     if (acknowledgedHistoryCommandRef.current === token) return;
     acknowledgedHistoryCommandRef.current = token;
     if (pendingHistoryAckRef.current?.token === token) pendingHistoryAckRef.current = null;
     if (continuityRestoreTokenRef.current === token) releaseContinuityRestoreSuppression();
     onHistoryScrollCommandHandled?.(token, result);
   }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression]);
+
+  cancelHistoryCommandRef.current = () => {
+    const token = continuityRestoreTokenRef.current;
+    if (token !== null) finishHistoryCommand(token, 'superseded');
+  };
 
   useEffect(() => {
     releaseContinuityRestoreSuppression();
@@ -924,7 +923,7 @@ function MessageListImpl({
       historyAckTimeoutRef.current = window.setTimeout(() => {
         if (continuityRestoreTokenRef.current !== historyScrollCommand.token) return;
         historyAckTimeoutRef.current = 0;
-        releaseContinuityRestoreSuppression();
+        finishHistoryCommand(historyScrollCommand.token, 'superseded');
       }, HISTORY_SCROLL_ACK_TIMEOUT_MS);
     }
   }, [clearHistoryAckTimeout, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, releaseContinuityRestoreSuppression, scrollToUnitIndex]);
@@ -1025,8 +1024,8 @@ function MessageListImpl({
         </>
       )}
       <section id="chat-view" className="view active">
-        {hasOlderMessages && onLoadOlderMessages && (
-          <div role={olderHistoryError ? 'alert' : undefined}>
+        {(hasOlderMessages && onLoadOlderMessages) && (
+          <div>
             <button
               type="button"
               className="btn-secondary"
@@ -1039,8 +1038,10 @@ function MessageListImpl({
                   ? 'Retry loading earlier history'
                   : 'Load earlier history'}
             </button>
-            {olderHistoryError && <span>Could not load earlier history: {olderHistoryError}</span>}
           </div>
+        )}
+        {olderHistoryError && (
+          <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
         <Virtuoso
           key={conversationId ?? '__empty__'}

@@ -70,12 +70,14 @@ vi.mock('../components/ConversationNavStack', () => ({
     onLoadOlderMessages,
     loadingOlderMessages,
     historyScrollCommand,
+    olderHistoryError,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
     onLoadOlderMessages?: () => void;
     loadingOlderMessages?: boolean;
     historyScrollCommand?: { kind: string; token: number } | null;
+    olderHistoryError?: string | null;
   }) => (
     <div>
       <div data-testid="message-history">
@@ -98,6 +100,7 @@ vi.mock('../components/ConversationNavStack', () => ({
       <div data-testid="history-scroll-command">
         {historyScrollCommand ? `${historyScrollCommand.kind}:${historyScrollCommand.token}` : 'none'}
       </div>
+      {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
     </div>
   ),
 }));
@@ -519,6 +522,7 @@ describe('ConversationPage archived read-only rendering', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Load older messages' }));
     await waitFor(() => expect(api.getConversationBySlug).toHaveBeenCalledWith(slug));
+    expect(await screen.findByTestId('history-loading')).toHaveTextContent('idle');
     expect(screen.queryByText('wrong conversation history')).not.toBeInTheDocument();
     expect(screen.getByText('keep this history visible')).toBeInTheDocument();
   });

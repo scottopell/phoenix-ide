@@ -850,7 +850,15 @@ function ConversationPageContent() {
         && currentView.transcriptGeneration === request.view.transcriptGeneration
         && authoritativeTranscriptGeneration === request.view.transcriptGeneration
         && responseTranscriptGeneration === request.view.transcriptGeneration;
-      if (!requestIsCurrent) return;
+      if (!requestIsCurrent) {
+        dispatchHistoryExpansion({
+          type: 'history_failed',
+          requestToken: request.token,
+          view: request.view,
+          message: 'Conversation changed while loading earlier history',
+        });
+        return;
+      }
       dispatch({
         type: 'merge_conversation_data',
         conversationId: request.view.conversationId,
@@ -912,7 +920,7 @@ function ConversationPageContent() {
     }
   }, [targetMessageId, historyExpansion, loadOlderMessages]);
 
-  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing') => {
+  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
     dispatchHistoryExpansion({
       type: 'command_acknowledged',
       commandToken: token,
