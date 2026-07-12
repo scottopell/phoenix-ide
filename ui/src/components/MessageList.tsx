@@ -497,9 +497,10 @@ function MessageListImpl({
       const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
       const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
       const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
-      const onWheel = (e: WheelEvent) => dispatchScrollEvent(
-        e.deltaY < 0 ? { type: 'upwardIntent' } : { type: 'interactionStarted' },
-      );
+      const onWheel = (e: WheelEvent) => {
+        dispatchScrollEvent({ type: 'interactionStarted' });
+        if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
+      };
       const onScroll = () => {
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;

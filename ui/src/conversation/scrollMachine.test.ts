@@ -204,11 +204,11 @@ describe('scrollMachine durable follow policy', () => {
     });
 
     expectLiveMode(result.state, 'navigating');
-    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.departedBottom).toBe(true);
+    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.phase).toBe('positioning');
     expect(result.effects).toEqual([]);
 
     result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
-    expectLiveMode(result.state, 'following');
+    expectLiveMode(result.state, 'navigating');
   });
 
   it('preserves a navigation jump while an initially empty list waits for content', () => {
@@ -248,21 +248,23 @@ describe('scrollMachine durable follow policy', () => {
     }).effects).toEqual([]);
   });
 
-  it('seeds navigation departure from current geometry and releases at bottom', () => {
+  it('keeps an off-bottom jump positioning until post-jump user interaction', () => {
     let state = reduceScrollMachine(liveFollowing(), {
       type: 'viewportPinnedChanged',
       atBottom: false,
     }).state;
     state = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
 
-    expectLiveMode(state, 'navigating');
-    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(true);
+    let result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
 
-    const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.phase).toBe('user-returning');
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'following');
   });
 
-  it('preserves navigation ownership through programmatic upward scroll events', () => {
+  it('preserves positioning through programmatic upward scroll events', () => {
     let state = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state;
     state = reduceScrollMachine(state, {
       type: 'upwardIntent',
@@ -270,7 +272,7 @@ describe('scrollMachine durable follow policy', () => {
     }).state;
 
     expectLiveMode(state, 'navigating');
-    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(true);
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.phase).toBe('positioning');
   });
 
   it('does not mark a near-tail navigation jump as departed while it remains pinned', () => {
@@ -281,7 +283,7 @@ describe('scrollMachine durable follow policy', () => {
     }).state;
 
     expectLiveMode(state, 'navigating');
-    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(false);
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.phase).toBe('positioning');
 
     const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'navigating');
@@ -302,6 +304,7 @@ describe('scrollMachine durable follow policy', () => {
 
     result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: false });
     expectLiveMode(result.state, 'navigating');
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
     result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'following');
     expect(result.effects).toEqual([]);
