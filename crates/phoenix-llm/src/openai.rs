@@ -453,6 +453,13 @@ impl ResponsesStreamAccumulator {
         Ok(())
     }
 
+    fn output_items_as_values(&self) -> Vec<serde_json::Value> {
+        self.output_items
+            .iter()
+            .filter_map(|item| serde_json::to_value(item).ok())
+            .collect()
+    }
+
     fn into_response(self) -> Result<LlmResponse, LlmError> {
         tracing::debug!(
             output_items = self.output_items.len(),
@@ -948,11 +955,11 @@ async fn complete_codex_websocket(
                     .pointer("/response/id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
-                server_output = value
-                    .pointer("/response/output")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
+                // The accumulator collects `response.output_item.done` items
+                // and also falls back to terminal `/response/output`. Derive
+                // continuation from that single authoritative collection so an
+                // omitted terminal output cannot make us resend prior output.
+                server_output = acc.output_items_as_values();
             }
             if acc.done {
                 break;
@@ -1901,25 +1908,25 @@ pub(crate) struct ResponsesApiResponse {
     pub(crate) usage: ResponsesApiUsage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ResponsesApiOutput {
     pub(crate) r#type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<Vec<ResponsesApiContent>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) call_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ResponsesApiContent {
     pub(crate) r#type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) refusal: Option<String>,
 }
 
@@ -2030,6 +2037,17 @@ mod tests {
                 }
                 let n = state.ws_requests.lock().await.len();
                 let answer = format!("answer-{n}");
+                if marker.contains("item-done-only") {
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"response.output_item.done",
+                        "item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}
+                    }).to_string())).await.unwrap();
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"response.completed",
+                        "response":{"id":format!("resp-{n}"),"usage":{"input_tokens":10,"output_tokens":1}}
+                    }).to_string())).await.unwrap();
+                    continue;
+                }
                 socket
                     .send(AxumWsMessage::Text(
                         serde_json::json!({
@@ -2181,6 +2199,48 @@ mod tests {
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_continuation_includes_item_done_output_when_terminal_omits_output() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let call = |request: LlmRequest| {
+            let (url, sessions, tx) = (url.clone(), sessions.clone(), tx.clone());
+            async move {
+                complete_streaming(
+                    &codex_spec(),
+                    "secret",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request,
+                    &tx,
+                    true,
+                    Some(&sessions),
+                )
+                .await
+            }
+        };
+
+        call(request_with(&[("item-done-only", MessageRole::User)]))
+            .await
+            .unwrap();
+        call(request_with(&[
+            ("item-done-only", MessageRole::User),
+            ("answer-1", MessageRole::Assistant),
+            ("genuinely-new", MessageRole::User),
+        ]))
+        .await
+        .unwrap();
+
+        let requests = state.ws_requests.lock().await;
+        assert_eq!(requests[1].1["previous_response_id"], "resp-1");
+        let suffix = requests[1].1["input"].as_array().unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert!(suffix[0].to_string().contains("genuinely-new"));
+        assert!(!suffix[0].to_string().contains("answer-1"));
     }
 
     #[tokio::test]
