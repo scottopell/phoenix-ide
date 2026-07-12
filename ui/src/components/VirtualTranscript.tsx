@@ -263,10 +263,9 @@ function VirtualTranscriptInner<T>(
     current.keys = resolveKeys(items, getKey);
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
-    current.initialTailPending = current.initialTailPending || initialTail;
     current.activeAnchor = anchor;
     current.layout = buildStoreLayout(current);
-    if (current.pinned || (initialTail && current.initialTailPending)) {
+    if (current.pinned || current.initialTailPending) {
       current.initialTailPending = false;
       setScrollerScrollTop(current, current.layout.totalExtent);
     } else {
@@ -274,7 +273,7 @@ function VirtualTranscriptInner<T>(
     }
     recompute(current);
     publish();
-  }, [estimatedExtent, getKey, initialTail, items, overscan, publish]);
+  }, [estimatedExtent, getKey, items, overscan, publish]);
 
   useLayoutEffect(() => {
     const current = storeRef.current;

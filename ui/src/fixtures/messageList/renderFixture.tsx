@@ -40,8 +40,7 @@ export function MessageListFixture({ scenario }: Props) {
   const isContinuityScenario = scenario.id === 'prefix-continuity-offset-bug';
 
   const measureAnchor = useCallback((messageId: string) => {
-    const scroller = document.querySelector<HTMLElement>('.message-list-fixture-shell [data-testid="virtuoso-scroller"]')
-      ?? document.querySelector<HTMLElement>('.message-list-fixture-shell [data-virtuoso-scroller="true"]');
+    const scroller = document.querySelector<HTMLElement>('.message-list-fixture-shell #messages');
     const marker = Array.from(document.querySelectorAll<HTMLElement>('[data-render-unit-key]'))
       .find((row) => row.textContent?.includes('Continuity marker 01'));
     if (!scroller || !marker) return null;

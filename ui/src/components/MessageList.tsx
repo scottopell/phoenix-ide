@@ -1,8 +1,26 @@
-import { memo, useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from 'react';
+import {
+  memo,
+  useState,
+  useRef,
+  useCallback,
+  useMemo,
+  useEffect,
+  useLayoutEffect,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
 import { useDensity } from '../hooks/useDensity';
-import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
+import {
+  FindBar,
+  buildConversationSearchProjection,
+  useViewerFindKeyboardShortcut,
+} from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
-import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
+import {
+  VirtualTranscript,
+  type VirtualTranscriptHandle,
+  type VirtualTranscriptRange,
+} from './VirtualTranscript';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -73,14 +91,14 @@ interface MessageListProps {
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   enableMessageSidepanel?: boolean | undefined;
-  /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
-   *  indices currently rendered. Fired (debounced by virtuoso) as the user
-   *  scrolls. The conversation nav uses it to highlight the active chapter. */
-  onVisibleRangeChange?: ((range: ListRange) => void) | undefined;
+  /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
+   *  indices currently rendered. Fired as the user scrolls. The conversation nav
+   *  uses it to highlight the active chapter. */
+  onVisibleRangeChange?: ((range: VirtualTranscriptRange) => void) | undefined;
   /** Conversation chapters derived from the SAME `historicalUnits` array this
-   *  list feeds to virtuoso. MessageList owns the build, so the chapter
-   *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
-   *  no second `buildRenderUnits` pass to drift against. */
+   *  list feeds to the virtual transcript. MessageList owns the build, so the
+   *  chapter `unitIndex` values are guaranteed to be in virtual transcript
+   *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
@@ -91,11 +109,11 @@ interface MessageListProps {
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
- *  `virtuosoRef`; the nav can't reach it directly because off-screen rows are
- *  unmounted (react-virtuoso), so a querySelector jump would miss them. */
+ *  virtual transcript ref; the nav can't reach it directly because off-screen
+ *  rows are unmounted, so a querySelector jump would miss them. */
 export interface MessageListHandle {
   /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
-   *  equals its virtuoso item index) into view and pulse it once mounted. */
+   *  equals its virtual transcript item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
   scrollToMessageId: (messageId: string) => boolean;
   captureHistoryRestoreBasis: () => RestoreBasis;
@@ -267,40 +285,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   );
 });
 
-// Per-conversation data the Virtuoso slot components need. Threaded through
-// virtuoso's `context` prop so the slot *component types* can stay stable —
-// see `VIRTUOSO_COMPONENTS`.
-interface MessageListContext {
-  systemPrompt: string | undefined;
-  systemPromptExpanded: boolean;
-  toggleSystemPrompt: () => void;
-  systemPromptRef: React.RefObject<HTMLPreElement>;
-}
-
-// Virtuoso slot component types are defined once at module scope so their
-// identity never changes across renders. A slot whose component *type* is
-// recreated per render (e.g. a closure built inside a render-time useMemo that
-// depends on system-prompt expansion) forces virtuoso to unmount/remount that
-// slot and recompute total list height — a visible scroll hitch. The
-// per-conversation data instead arrives via virtuoso's `context` prop, which
-// changes the slot's props without changing its type.
-function VirtuosoHeaderSlot({ context }: { context?: MessageListContext }) {
-  if (!context?.systemPrompt) return null;
-  return (
-    <SystemPromptHeader
-      systemPrompt={context.systemPrompt}
-      expanded={context.systemPromptExpanded}
-      onToggle={context.toggleSystemPrompt}
-      contentRef={context.systemPromptRef}
-    />
-  );
-}
-
-// Empty-state UI lives in virtuoso's `EmptyPlaceholder` slot rather than a
-// parallel branch, so that a systemPrompt (rendered as virtuoso's Header) stays
-// visible alongside the "Start a conversation" affordance for a freshly-opened
-// conversation with a system prompt and no messages yet.
-function VirtuosoEmptySlot() {
+function EmptyTranscriptState() {
   return (
     <div className="empty-state">
       <div className="empty-state-icon"><MessageSquareIcon /></div>
@@ -308,13 +293,6 @@ function VirtuosoEmptySlot() {
     </div>
   );
 }
-
-const VIRTUOSO_COMPONENTS: NonNullable<
-  VirtuosoProps<RenderUnit, MessageListContext>['components']
-> = {
-  Header: VirtuosoHeaderSlot,
-  EmptyPlaceholder: VirtuosoEmptySlot,
-};
 
 function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
   const buffer = useStreamingBuffer(slug);
@@ -359,7 +337,7 @@ function MessageListImpl({
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const firstVisibleUnitIndexRef = useRef(0);
   const continuityRestoreInFlightRef = useRef(false);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const transcriptRef = useRef<VirtualTranscriptHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
 
@@ -368,7 +346,7 @@ function MessageListImpl({
   // crates/phoenix-ide/src/state_machine/state.rs). Keying the streaming
   // unit by this value means the finalized `agent_turn` HistoricalUnit
   // arrives under the same render-unit key, and the transition is an
-  // in-place keyed update — virtuoso doesn't observe a key swap, the
+  // in-place keyed update — the virtual transcript doesn't observe a key swap, the
   // viewport doesn't drift. Symmetric to pending_user → user.
   const streamingRequestId = useStreamingRequestId(slug);
   const streamingHandle = useMemo(
@@ -494,8 +472,8 @@ function MessageListImpl({
   }, [findMatches.length, normalizedFindIndex]);
 
   // Chapters are derived here, not in a parent, so they share the exact
-  // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is
-  // therefore a valid `scrollToIndex` target with no second build to drift
+  // `historicalUnits` array the virtual transcript renders — a chapter's
+  // `unitIndex` is therefore a valid `scrollToIndex` target with no second build to drift
   // against. Reported up via callback for the nav strip above the list.
   const chapters = useMemo(
     () => buildConversationChapters(historicalUnits),
@@ -510,10 +488,6 @@ function MessageListImpl({
   const isEmpty = allUnits.length === 0;
   const activeToolUseId = activeToolUseIdFromState(convState);
 
-  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
-    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom });
-  }, []);
-
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
   const settleSnapRafRef = useRef(0);
   const tailFollowRafRef = useRef(0);
@@ -525,6 +499,14 @@ function MessageListImpl({
     const s = scrollerRef.current;
     return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
   }, []);
+
+  const handlePinnedStateChange = useCallback((pinned: boolean) => {
+    const snapshot = readScrollSnapshot();
+    const domAtBottom = snapshot
+      ? snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD
+      : pinned;
+    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned || domAtBottom });
+  }, [readScrollSnapshot]);
 
   const scheduleDomBottomWrite = useCallback(() => {
     if (settleSnapRafRef.current !== 0) return;
@@ -548,7 +530,7 @@ function MessageListImpl({
         machine.follow.kind !== 'navigating' &&
         !(machine.gesture.kind === 'touch' && machine.gesture.moved);
       if (authorized) {
-        virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+        transcriptRef.current?.scrollToTail();
       }
     });
   }, []);
@@ -580,7 +562,7 @@ function MessageListImpl({
     for (const effect of effects) {
       switch (effect.type) {
         case 'snapToLastIndex':
-          virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+          transcriptRef.current?.scrollToTail();
           break;
         case 'scheduleTailFollow':
           scheduleTailFollow(effect.conversationId);
@@ -748,8 +730,8 @@ function MessageListImpl({
     dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
-  // A navigation jump has one positioning owner: Virtuoso. The selected key
-  // remains pending until its virtualized row mounts, at which point the row
+  // A navigation jump has one positioning owner: VirtualTranscript. The selected
+  // key remains pending until its virtualized row mounts, at which point the row
   // ref applies presentation-only highlighting without moving the scroller.
   const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
@@ -807,11 +789,7 @@ function MessageListImpl({
     dispatchScrollEvent({ type: 'navigationJumped' });
     clearHighlight();
     pendingPulseRef.current = { conversationId, key: unit.key };
-    virtuosoRef.current?.scrollToIndex({
-      index: unitIndex,
-      align: 'start',
-      behavior: 'auto',
-    });
+    transcriptRef.current?.scrollToIndex(unitIndex, 'start');
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 
@@ -852,7 +830,7 @@ function MessageListImpl({
   const pendingHistoryAckRef = useRef<{ token: number; targetIndex: number } | null>(null);
   const continuityRestoreTokenRef = useRef<number | null>(null);
   const historyAckTimeoutRef = useRef(0);
-  const lastVisibleRangeRef = useRef<ListRange | null>(null);
+  const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
 
   const clearHistoryAckTimeout = useCallback(() => {
     if (historyAckTimeoutRef.current !== 0) {
@@ -910,7 +888,7 @@ function MessageListImpl({
       continuityRestoreInFlightRef.current = true;
       continuityRestoreTokenRef.current = historyScrollCommand.token;
       clearHistoryAckTimeout();
-      virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
+      transcriptRef.current?.scrollToIndex(index, 'start');
     }
     const lastVisibleRange = lastVisibleRangeRef.current;
     if (lastVisibleRange && index >= lastVisibleRange.startIndex && index <= lastVisibleRange.endIndex) {
@@ -944,7 +922,7 @@ function MessageListImpl({
       return () => timers.forEach(clearTimeout);
     }
     const unitMatch = match.target;
-    virtuosoRef.current?.scrollToIndex({ index: unitMatch.unitIndex, align: 'center', behavior: 'smooth' });
+    transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'center');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;
@@ -962,7 +940,8 @@ function MessageListImpl({
       .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
   }, [activeScope, findOpen, findScopeId]);
 
-  const handleRangeChanged = useCallback((range: ListRange) => {
+  const handleRangeChanged = useCallback((range: VirtualTranscriptRange | null) => {
+    if (!range) return;
     firstVisibleUnitIndexRef.current = range.startIndex;
     lastVisibleRangeRef.current = range;
     const pendingAck = pendingHistoryAckRef.current;
@@ -978,16 +957,9 @@ function MessageListImpl({
     setSystemPromptExpanded((v) => !v);
   }, []);
 
-  // Per-conversation data for the stable Virtuoso slot component types
-  // (`VIRTUOSO_COMPONENTS`). Only its *reference* changes when expansion
-  // toggles — the slot types do not, so no slot remount / list-height recompute.
-  const virtuosoContext = useMemo<MessageListContext>(
-    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt, systemPromptRef }),
-    [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
-  );
 
   const itemContent = useCallback(
-    (_index: number, unit: RenderUnit) => (
+    (unit: RenderUnit, _index: number) => (
       <div
         className="virtuoso-row"
         data-render-unit-key={unit.key}
@@ -1000,7 +972,7 @@ function MessageListImpl({
   );
 
   const computeItemKey = useCallback(
-    (_index: number, unit: RenderUnit) => unit.key,
+    (unit: RenderUnit, _index: number) => unit.key,
     [],
   );
 
@@ -1041,31 +1013,28 @@ function MessageListImpl({
         {olderHistoryError && (
           <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
-        <Virtuoso
+        <VirtualTranscript
           key={conversationId ?? '__empty__'}
-          ref={virtuosoRef}
+          ref={transcriptRef}
           scrollerRef={handleScrollerRef}
-          data={allUnits}
-          context={virtuosoContext}
-          itemContent={itemContent}
-          computeItemKey={computeItemKey}
-          followOutput={false}
-          atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
-          atBottomStateChange={handleAtBottomStateChange}
-          totalListHeightChanged={handleTotalListHeightChanged}
-          rangeChanged={handleRangeChanged}
-          // `'LAST'` is library-defined only when `data` has at least
-          // one item. When systemPrompt-only renders with empty data,
-          // omit this prop entirely — virtuoso's default (no initial
-          // index) is correct for that case. Index 0 would target a
-          // data item that doesn't exist (the Header slot is not a
-          // data item).
-          {...(allUnits.length > 0
-            ? { initialTopMostItemIndex: { index: 'LAST' as const, align: 'end' as const } }
-            : {})}
-          alignToBottom
-          increaseViewportBy={{ top: 600, bottom: 600 }}
-          components={VIRTUOSO_COMPONENTS}
+          items={allUnits}
+          renderItem={itemContent}
+          getKey={computeItemKey}
+          initialTail={allUnits.length > 0}
+          estimatedExtent={120}
+          overscan={600}
+          onPinnedChange={handlePinnedStateChange}
+          onTotalExtentChange={handleTotalListHeightChanged}
+          onRangeChange={handleRangeChanged}
+          header={systemPrompt ? (
+            <SystemPromptHeader
+              systemPrompt={systemPrompt}
+              expanded={systemPromptExpanded}
+              onToggle={toggleSystemPrompt}
+              contentRef={systemPromptRef}
+            />
+          ) : null}
+          empty={<EmptyTranscriptState />}
           className="message-virtuoso"
         />
       </section>

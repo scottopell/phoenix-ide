@@ -17,7 +17,7 @@
 // streaming work.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { Profiler, type ProfilerOnRenderCallback } from 'react';
+import { forwardRef, Profiler, type ProfilerOnRenderCallback } from 'react';
 import { act, render } from '@testing-library/react';
 import { MessageList } from './MessageList';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -37,33 +37,36 @@ vi.mock('./MessageComponents', () => ({
 }));
 vi.mock('./MessageContextMenu', () => ({ MessageContextMenu: () => null }));
 
-// Mock react-virtuoso as a passthrough. This test measures React commit
-// counts for the MessageListImpl boundary; virtuoso's internal scheduling
-// is irrelevant to the streaming-isolation invariant being verified.
-vi.mock('react-virtuoso', () => ({
-  Virtuoso: <T,>({
-    data,
-    itemContent,
-    components,
-    computeItemKey,
-  }: {
-    data: T[];
-    itemContent: (index: number, data: T) => React.ReactNode;
-    components?: { Header?: React.ComponentType };
-    computeItemKey?: (index: number, data: T) => React.Key;
-  }) => {
-    const Header = components?.Header;
-    return (
-      <div data-testid="mock-virtuoso">
-        {Header && <Header />}
-        {data.map((item, i) => {
-          const key = computeItemKey ? computeItemKey(i, item) : i;
-          return <div key={key}>{itemContent(i, item)}</div>;
+// Mock VirtualTranscript as a passthrough. This test measures React commit
+// counts for the MessageListImpl boundary; VirtualTranscript's internal
+// scheduling is irrelevant to the streaming-isolation invariant being verified.
+vi.mock('./VirtualTranscript', async () => {
+  const actual = await vi.importActual<typeof import('./VirtualTranscript')>('./VirtualTranscript');
+  return {
+    ...actual,
+    VirtualTranscript: forwardRef(<T,>({
+      items,
+      renderItem,
+      getKey,
+      header,
+      empty,
+    }: {
+      items: readonly T[];
+      renderItem: (item: T, index: number) => React.ReactNode;
+      getKey?: (item: T, index: number) => React.Key;
+      header?: React.ReactNode;
+      empty?: React.ReactNode;
+    }, _ref: React.ForwardedRef<unknown>) => (
+      <div data-testid="mock-virtual-transcript">
+        {header}
+        {items.length === 0 ? empty : items.map((item, i) => {
+          const key = getKey ? getKey(item, i) : i;
+          return <div key={key}>{renderItem(item, i)}</div>;
         })}
       </div>
-    );
-  },
-}));
+    )),
+  };
+});
 // Keep the markdown / syntax-highlighter cheap so per-token commits of
 // the real <StreamingMessage> are fast and don't dominate the test
 // budget. The commit COUNT is the assertion target, not timing.

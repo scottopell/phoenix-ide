@@ -311,13 +311,13 @@ export const messageListScenarios = [
   {
     id: 'scroll-policy-long',
     title: 'Scroll policy long conversation',
-    description: 'Long deterministic conversation with controls for real Virtuoso tail-follow QA.',
+    description: 'Long deterministic conversation with controls for real VirtualTranscript tail-follow QA.',
     theme: 'dark',
   },
   {
     id: 'prefix-continuity-offset-bug',
     title: 'Prefix continuity offset bug',
-    description: 'Interactive real-Virtuoso reproduction of identity-only restoration jumping within a tall row.',
+    description: 'Interactive real-VirtualTranscript reproduction of identity-only restoration jumping within a tall row.',
     theme: 'dark',
   },
   {

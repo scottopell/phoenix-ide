@@ -4,7 +4,7 @@ import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } f
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
-import type { ListRange } from 'react-virtuoso';
+import type { VirtualTranscriptRange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
@@ -82,89 +82,96 @@ vi.mock('./MessageContextMenu', () => ({
   MessageContextMenu: () => null,
 }));
 
-// Mock react-virtuoso as a passthrough that renders all items plus the
-// Header slot. Real virtualization is tested in-browser via agent-browser
-// smoke (acceptance criteria in tasks/60410). Unit tests focus on:
+// Mock VirtualTranscript as a passthrough that renders all items plus the
+// header. Real virtualization is covered by VirtualTranscript tests and render
+// fixtures. Unit tests focus on:
 //   - render-unit construction (buildRenderUnits)
 //   - per-unit component dispatch
 //   - keyed in-place reconciliation across the pending → sent transition
 //
-// The mock captures `totalListHeightChanged` and shares a `scrollToIndex`
-// mock so tests can exercise the manual auto-follow callback (see the
+// The mock captures `onTotalExtentChange` and shares scroll command mocks so
+// tests can exercise the manual auto-follow callback (see the
 // `handleTotalListHeightChanged` test group).
-const virtuosoMock = {
+const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
-  totalListHeightChanged: null as ((height: number) => void) | null,
-  atBottomStateChange: null as ((atBottom: boolean) => void) | null,
-  rangeChanged: null as ((range: ListRange) => void) | null,
+  scrollToTail: vi.fn(),
+  totalExtentChanged: null as ((height: number) => void) | null,
+  pinnedChanged: null as ((pinned: boolean) => void) | null,
+  rangeChanged: null as ((range: VirtualTranscriptRange | null) => void) | null,
   renderedIndices: null as Set<number> | null,
 };
 
 beforeEach(() => {
-  virtuosoMock.scrollToIndex = vi.fn();
-  virtuosoMock.totalListHeightChanged = null;
-  virtuosoMock.atBottomStateChange = null;
-  virtuosoMock.rangeChanged = null;
-  virtuosoMock.renderedIndices = null;
+  virtualTranscriptMock.scrollToIndex = vi.fn();
+  virtualTranscriptMock.scrollToTail = vi.fn();
+  virtualTranscriptMock.totalExtentChanged = null;
+  virtualTranscriptMock.pinnedChanged = null;
+  virtualTranscriptMock.rangeChanged = null;
+  virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
 });
 
-vi.mock('react-virtuoso', () => ({
-  Virtuoso: forwardRef(<T, C>({
-    data,
-    context,
-    itemContent,
-    components,
-    computeItemKey,
-    scrollerRef,
-    totalListHeightChanged,
-    atBottomStateChange,
-    rangeChanged,
-  }: {
-    data: T[];
-    context?: C;
-    itemContent: (index: number, data: T, context: C) => React.ReactNode;
-    // Mirror the real component's typing: slot components receive `context`.
-    components?: { Header?: React.ComponentType<{ context: C }> };
-    computeItemKey?: (index: number, data: T) => React.Key;
-    scrollerRef?: (ref: HTMLElement | Window | null) => void;
-    totalListHeightChanged?: (height: number) => void;
-    atBottomStateChange?: (atBottom: boolean) => void;
-    rangeChanged?: (range: ListRange) => void;
-  }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
-    const Header = components?.Header;
-    const containerRef = useRef<HTMLDivElement>(null);
-    if (totalListHeightChanged) {
-      virtuosoMock.totalListHeightChanged = totalListHeightChanged;
-    }
-    if (atBottomStateChange) {
-      virtuosoMock.atBottomStateChange = atBottomStateChange;
-    }
-    if (rangeChanged) {
-      virtuosoMock.rangeChanged = rangeChanged;
-    }
-    useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoMock.scrollToIndex }), []);
-    useLayoutEffect(() => {
-      scrollerRef?.(containerRef.current);
-      return () => scrollerRef?.(null);
-    }, [scrollerRef]);
-    return (
-      <div
-        data-testid="mock-virtuoso"
-        ref={containerRef}
-        style={{ overflowY: 'auto', height: '100%' }}
-      >
-        {Header && <Header context={context as C} />}
-        {data.map((item, i) => {
-          if (virtuosoMock.renderedIndices && !virtuosoMock.renderedIndices.has(i)) return null;
-          const key = computeItemKey ? computeItemKey(i, item) : i;
-          return <div key={key}>{itemContent(i, item, context as C)}</div>;
-        })}
-      </div>
-    );
-  }),
-}));
+vi.mock('./VirtualTranscript', async () => {
+  const actual = await vi.importActual<typeof import('./VirtualTranscript')>('./VirtualTranscript');
+  return {
+    ...actual,
+    VirtualTranscript: forwardRef(<T,>({
+      items,
+      renderItem,
+      getKey,
+      scrollerRef,
+      onTotalExtentChange,
+      onPinnedChange,
+      onRangeChange,
+      header,
+      empty,
+    }: {
+      items: readonly T[];
+      renderItem: (item: T, index: number) => React.ReactNode;
+      getKey?: (item: T, index: number) => React.Key;
+      scrollerRef?: (ref: HTMLDivElement | null) => void;
+      onTotalExtentChange?: (height: number) => void;
+      onPinnedChange?: (pinned: boolean) => void;
+      onRangeChange?: (range: VirtualTranscriptRange | null) => void;
+      header?: React.ReactNode;
+      empty?: React.ReactNode;
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end') => void; scrollToTail: () => void }>) => {
+      const containerRef = useRef<HTMLDivElement>(null);
+      if (onTotalExtentChange) {
+        virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
+      }
+      if (onPinnedChange) {
+        virtualTranscriptMock.pinnedChanged = onPinnedChange;
+      }
+      if (onRangeChange) {
+        virtualTranscriptMock.rangeChanged = onRangeChange;
+      }
+      useImperativeHandle(ref, () => ({
+        scrollToIndex: virtualTranscriptMock.scrollToIndex,
+        scrollToTail: virtualTranscriptMock.scrollToTail,
+      }), []);
+      useLayoutEffect(() => {
+        scrollerRef?.(containerRef.current);
+        return () => scrollerRef?.(null);
+      }, [scrollerRef]);
+      return (
+        <div
+          data-testid="mock-virtual-transcript"
+          ref={containerRef}
+          style={{ overflowY: 'auto', height: '100%' }}
+        >
+          {header}
+          {items.length === 0 ? empty : items.map((item, i) => {
+            if (virtualTranscriptMock.renderedIndices && !virtualTranscriptMock.renderedIndices.has(i)) return null;
+            const key = getKey ? getKey(item, i) : i;
+            return <div key={key}>{renderItem(item, i)}</div>;
+          })}
+        </div>
+      );
+    }),
+  };
+});
 
 function makeMessage(sequence_id: number, message_type: Message['message_type'] = 'user'): Message {
   const content = message_type === 'tool'
@@ -626,7 +633,7 @@ describe('MessageList', () => {
     expect(container.querySelectorAll('.message.agent')).toHaveLength(1);
   });
 
-  it('makes the stamped Virtuoso scroller the chat route scroll owner', async () => {
+  it('makes the stamped VirtualTranscript scroller the chat route scroll owner', async () => {
     const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
 
     const { container } = render(
@@ -648,7 +655,7 @@ describe('MessageList', () => {
 
     expect(mainArea).not.toBeNull();
     expect(messagesScroller).not.toBeNull();
-    expect(messagesScroller).toBe(container.querySelector('[data-testid="mock-virtuoso"]'));
+    expect(messagesScroller).toBe(container.querySelector('[data-testid="mock-virtual-transcript"]'));
     expect(mainArea).toHaveClass('chat-main-area');
     expect(appCss).toMatch(/#main-area\s*{[^}]*overflow:\s*hidden auto;/s);
     expect(appCss).toMatch(/#main-area\.chat-main-area\s*{[^}]*overflow:\s*hidden;/s);
@@ -662,7 +669,7 @@ describe('MessageList', () => {
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
     const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
     const tableBreakoutTableRule = appCss.match(/\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll\s*>\s*table\s*{([^}]*)}/s)?.[1];
-    const virtuosoRule = appCss.match(/\.message-virtuoso\s*{[^}]*}/s)?.[0];
+    const transcriptRule = appCss.match(/\.message-virtuoso\s*{[^}]*}/s)?.[0];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
@@ -673,14 +680,14 @@ describe('MessageList', () => {
     expect(tableBreakoutRule?.[2]).not.toMatch(/transform|position|left:/);
     expect(tableBreakoutTableRule).toMatch(/min-width:\s*min\(100%,\s*784px\)/);
     expect(tableBreakoutTableRule).toMatch(/margin-inline:\s*auto/);
-    expect(virtuosoRule).not.toMatch(/container-type/);
-    expect(virtuosoRule).not.toMatch(/overflow-x/);
+    expect(transcriptRule).not.toMatch(/container-type/);
+    expect(transcriptRule).not.toMatch(/overflow-x/);
   });
 
   it('renders a 100-message conversation without throwing', () => {
     // The deleted spacer-based windowing layer had a separate test that
     // asserted a bounded number of rendered units + presence of spacers.
-    // With virtuoso owning virtualization, that's a library concern;
+    // With VirtualTranscript owning virtualization, that's a library concern;
     // here we only assert MessageList builds + dispatches render units
     // for a representative payload size. Real windowing behavior is
     // verified by agent-browser smoke against running Phoenix.
@@ -702,7 +709,7 @@ describe('MessageList', () => {
     expect(container.querySelectorAll('[data-render-unit-key]').length).toBe(100);
   });
 
-  it('uses one Virtuoso-owned position command per chapter jump without delayed DOM correction', () => {
+  it('uses one VirtualTranscript-owned position command per chapter jump without delayed DOM correction', () => {
     vi.useFakeTimers();
     try {
       const historical = Array.from({ length: 2 }, (_, i) => makeMessage(i + 1, 'user'));
@@ -727,18 +734,18 @@ describe('MessageList', () => {
       const secondMessage = container.querySelector<HTMLElement>('[data-render-unit-key="msg-2"] .message')!;
 
       act(() => listRef.current?.scrollToUnitIndex(0));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 0, align: 'start', behavior: 'auto' });
+      expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(0, 'start');
       expect(firstMessage).toHaveClass('jump-highlight');
 
       act(() => listRef.current?.scrollToUnitIndex(1));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 1, align: 'start', behavior: 'auto' });
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+      expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(1, 'start');
+      expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
       expect(firstMessage).not.toHaveClass('jump-highlight');
       expect(secondMessage).toHaveClass('jump-highlight');
 
       act(() => vi.advanceTimersByTime(601));
       expect(scroller.scrollTop).toBe(100);
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+      expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
@@ -747,7 +754,7 @@ describe('MessageList', () => {
   it('highlights only the newest pending jump when virtualized rows mount late', () => {
     const historical = Array.from({ length: 3 }, (_, i) => makeMessage(i + 1, 'user'));
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
-    virtuosoMock.renderedIndices = new Set([0]);
+    virtualTranscriptMock.renderedIndices = new Set([0]);
     const renderList = () => withConvContext(
       <MessageList
         ref={listRef}
@@ -765,24 +772,24 @@ describe('MessageList', () => {
 
     act(() => listRef.current?.scrollToUnitIndex(1));
     act(() => listRef.current?.scrollToUnitIndex(2));
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
 
-    virtuosoMock.renderedIndices = new Set([0, 1]);
+    virtualTranscriptMock.renderedIndices = new Set([0, 1]);
     rerender(renderList());
     expect(container.querySelector('[data-render-unit-key="msg-2"] .message')).not.toHaveClass('jump-highlight');
 
-    virtuosoMock.renderedIndices = new Set([0, 1, 2]);
+    virtualTranscriptMock.renderedIndices = new Set([0, 1, 2]);
     rerender(renderList());
     expect(container.querySelector('[data-render-unit-key="msg-2"] .message')).not.toHaveClass('jump-highlight');
     expect(container.querySelector('[data-render-unit-key="msg-3"] .message')).toHaveClass('jump-highlight');
     expect(scroller.scrollTop).toBe(100);
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(2);
   });
 
   it('does not apply a pending highlight to a new conversation reusing the same row key', () => {
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
     const messages = [makeMessage(1, 'user')];
-    virtuosoMock.renderedIndices = new Set();
+    virtualTranscriptMock.renderedIndices = new Set();
     const renderList = (conversationId: string) => withConvContext(
       <MessageList
         ref={listRef}
@@ -797,14 +804,14 @@ describe('MessageList', () => {
     const { container, rerender } = render(renderList('conv-old'));
 
     act(() => listRef.current?.scrollToUnitIndex(0));
-    virtuosoMock.renderedIndices = new Set([0]);
+    virtualTranscriptMock.renderedIndices = new Set([0]);
     rerender(renderList('conv-new'));
 
     expect(container.querySelector('[data-render-unit-key="msg-1"] .message')).not.toHaveClass('jump-highlight');
   });
 
-  // Toggling the system prompt must not change the Virtuoso Header slot's
-  // component *type*, only its props. A type swap forces Virtuoso to
+  // Toggling the system prompt must not change the VirtualTranscript header's
+  // component *type*, only its props. A type swap forces VirtualTranscript to
   // unmount/remount the slot and recompute total list height — a visible
   // scroll hitch. We prove the absence of a remount by stamping a marker on
   // the live header node and asserting it survives the expand toggle.
@@ -863,18 +870,18 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       ),
     );
 
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledWith({ index: 1, align: 'start', behavior: 'auto' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 1 }));
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 1 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
@@ -897,18 +904,18 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     );
 
     const { rerender } = render(renderList());
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
 
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
 
     rerender(renderList(makeRestoreAfterPrefixExpansionCommand()));
 
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledWith({ index: 1, align: 'start', behavior: 'auto' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
@@ -941,7 +948,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded');
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
 
     fireEvent.scroll(scroller);
@@ -972,7 +979,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
 
     fireEvent.scroll(scroller);
@@ -1043,10 +1050,10 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
-    act(() => virtuosoMock.rangeChanged?.({ startIndex: 2, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 2, endIndex: 2 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied');
-    expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 2, align: 'start', behavior: 'auto' });
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start');
   });
 
   it('clears suppressed continuity on conversation change', () => {
@@ -1204,8 +1211,8 @@ describe('render-unit identity across state ticks', () => {
 });
 
 // Tests for the manual auto-follow callback (handleTotalListHeightChanged).
-// Virtuoso is mocked as a passthrough, so these tests call the captured
-// `totalListHeightChanged` callback directly and assert whether the shared
+// VirtualTranscript is mocked as a passthrough, so these tests call the captured
+// `totalExtentChanged` callback directly and assert whether the shared
 // `scrollToIndex` mock was called. This exercises the pin/no-pin logic,
 // first-non-empty snap, and viewport-shrink handling without a real
 // virtualization layer.
@@ -1240,17 +1247,17 @@ describe('handleTotalListHeightChanged', () => {
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
     // First call seeds the baseline via the conversation-switch handler
     // (lastSeenConvIdRef starts undefined) — no snap on initial mount
-    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
     // Engage (downward wheel) so the assertion exercises the pin branch,
     // not the pre-engagement settle rescue.
     fireEvent.wheel(scroller, { deltaY: 50 });
     // Clear so we only observe the re-snap
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
     // Second call: height grew, user was at bottom (oldFromBottom = 500 - 100 - 500 = -100 <= 100)
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
-    act(() => virtuosoMock.totalListHeightChanged?.(600));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 
   it('does NOT re-snap when scrolled up past threshold and height grows', () => {
@@ -1271,20 +1278,20 @@ describe('handleTotalListHeightChanged', () => {
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     // Seed baseline via the conversation-switch handler (no snap on mount)
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1000));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
     // The user got scrolled-up by scrolling — engagement releases the
     // pre-engagement settle rescue (which re-snaps unconditionally).
     fireEvent.wheel(scroller, { deltaY: -50 });
     // Clear so we only observe subsequent calls
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // User scrolled up: scrollTop = 0, but content is tall (prevHeight = 1000)
     // oldFromBottom = 1000 - 0 - 400 = 600 > 100 — well past the threshold.
     // Height grows further, but user is scrolled up, so no re-snap.
     setupScroller(scroller, { scrollHeight: 1200, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1200));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1200));
 
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
   });
 
   it('snaps to bottom on first non-empty update after mounting empty', () => {
@@ -1305,8 +1312,8 @@ describe('handleTotalListHeightChanged', () => {
     // No content yet — callback should not snap
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 0, scrollTop: 0, clientHeight: 500 });
-    act(() => virtuosoMock.totalListHeightChanged?.(0));
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(0));
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
     // Messages arrive
     rerender(
@@ -1324,8 +1331,8 @@ describe('handleTotalListHeightChanged', () => {
 
     // First non-empty height measurement — should snap
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 0, clientHeight: 500 });
-    act(() => virtuosoMock.totalListHeightChanged?.(600));
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 
   it('does NOT snap on delayed height delta after conversation switch (no scroll-yank)', () => {
@@ -1351,11 +1358,11 @@ describe('handleTotalListHeightChanged', () => {
     // viewport for a conversation that mounted with messages.
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(500));
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
     // Clear mock to track new calls
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // Switch to conversation B (also has messages)
     const historicalB = Array.from({ length: 3 }, (_, i) => makeMessage(i + 10, 'user'));
@@ -1372,15 +1379,15 @@ describe('handleTotalListHeightChanged', () => {
       ),
     );
 
-    // Virtuoso re-keys on the conversationId change: the mock mounts a
+    // VirtualTranscript re-keys on the conversationId change: the mock mounts a
     // FRESH scroller element, so re-query — the old `scroller` handle is
     // detached and mutating it would not affect what the component reads.
     const scrollerB = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scrollerB, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1000));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
     // The conversation-switch handler seeds the baseline; should NOT snap
     // because hasSeenContentRef is seeded true (B already has messages)
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     // The user scrolled up in B — engagement releases the settle rescue.
     fireEvent.wheel(scrollerB, { deltaY: -50 });
 
@@ -1388,9 +1395,9 @@ describe('handleTotalListHeightChanged', () => {
     // while the user is scrolled up in conversation B.
     // oldFromBottom = 1000 - 0 - 400 = 600 > 100
     setupScroller(scrollerB, { scrollHeight: 1100, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1100));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
     // Should NOT snap — user is scrolled up, this is not a first-content case
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
   });
 
   it('re-snaps to bottom on pre-engagement height deltas even when stranded far from bottom', async () => {
@@ -1409,14 +1416,14 @@ describe('handleTotalListHeightChanged', () => {
     );
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
-    // Mount stranding: virtuoso's initial LAST placement was computed
+    // Mount stranding: VirtualTranscript's initial tail placement was computed
     // against early estimates; a huge correction lands and the viewport is
     // left at the top. The user has not interacted yet.
     setupScroller(scroller, { scrollHeight: 48000, scrollTop: 0, clientHeight: 600 });
-    act(() => virtuosoMock.totalListHeightChanged?.(48000));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(48000));
 
     // The settle snap writes scrollTop directly (a DOM snap cannot be
-    // aborted by virtuoso's seek loop, unlike scrollToIndex). Record it.
+    // aborted by VirtualTranscript's measurement loop, unlike scrollToIndex). Record it.
     const written: number[] = [];
     Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 12000000 });
     Object.defineProperty(scroller, 'scrollTop', {
@@ -1425,8 +1432,8 @@ describe('handleTotalListHeightChanged', () => {
       set: (v: number) => written.push(v),
     });
     Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 600 });
-    act(() => virtuosoMock.totalListHeightChanged?.(12000000));
-    // The snap is deferred one frame so virtuoso's own compensation for
+    act(() => virtualTranscriptMock.totalExtentChanged?.(12000000));
+    // The snap is deferred one frame so VirtualTranscript's own compensation for
     // the triggering delta has already been applied.
     await act(() => new Promise((r) => requestAnimationFrame(() => r(undefined))));
 
@@ -1453,7 +1460,7 @@ describe('handleTotalListHeightChanged', () => {
       );
 
       const scroller = container.querySelector<HTMLElement>('#messages')!;
-      // Silent stranding: after the first (seeding) measurement, virtuoso's
+      // Silent stranding: after the first (seeding) measurement, VirtualTranscript's
       // placement leaves the viewport off the bottom WITHOUT emitting any
       // further height delta or scroll event. Only the settle watch can see
       // this.
@@ -1465,7 +1472,7 @@ describe('handleTotalListHeightChanged', () => {
         set: (v: number) => written.push(v),
       });
       Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 600 });
-      act(() => virtuosoMock.totalListHeightChanged?.(12000000));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(12000000));
 
       act(() => vi.advanceTimersByTime(500));
       expect(written).toContain(12000000);
@@ -1501,11 +1508,11 @@ describe('handleTotalListHeightChanged', () => {
       const scroller = container.querySelector<HTMLElement>('#messages')!;
       // Pinned mount; the seeding measurement starts the settle window.
       setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(1000));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
 
       // Settle window (3s) elapses without any user engagement.
       act(() => vi.advanceTimersByTime(3500));
-      virtuosoMock.scrollToIndex.mockClear();
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       // Scroll-only input: browser find-in-page (or PageUp on a focused
       // row) jumps the viewport up. Emits ONLY a scroll event — no
@@ -1524,11 +1531,11 @@ describe('handleTotalListHeightChanged', () => {
       // normal distance-based pin logic — the user is 500px up, so no snap
       // and no settle write.
       Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1100 });
-      act(() => virtuosoMock.totalListHeightChanged?.(1100));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
       act(() => vi.advanceTimersByTime(500));
 
       expect(written).toHaveLength(0);
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1578,10 +1585,10 @@ describe('handleTotalListHeightChanged', () => {
       );
       const scroller = container.querySelector<HTMLElement>('#messages')!;
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
       fireEvent.pointerDown(scroller);
       releaseFrame = null;
-      virtuosoMock.scrollToIndex.mockClear();
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       rerender(withConvContext(
         <MessageList
@@ -1598,7 +1605,7 @@ describe('handleTotalListHeightChanged', () => {
       transferOwnership(scroller, rerender);
       act(() => releaseFrame?.(performance.now()));
 
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       requestAnimationFrameSpy.mockRestore();
       cancelAnimationFrameSpy.mockRestore();
@@ -1627,23 +1634,23 @@ describe('handleTotalListHeightChanged', () => {
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(500));
-    virtuosoMock.scrollToIndex.mockClear();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // The user starts dragging up (still within the pin threshold) and
-    // virtuoso reports them off the bottom.
-    act(() => virtuosoMock.atBottomStateChange?.(false));
+    // VirtualTranscript reports them off the bottom.
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
     fireEvent.touchStart(scroller, { touches: [{}] });
     fireEvent.touchMove(scroller, { touches: [{}] });
 
     // Genuine tail growth (sub-agents phase) lands while the gesture
     // suppresses the snap. oldFromBottom = 500 - 100 - 400 = 0 (pinned).
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(600));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
     // The snap was suppressed, but the unread signal must not be swallowed:
     // this may be the last growth event before the phase ends.
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
   });
 
@@ -1664,19 +1671,19 @@ describe('handleTotalListHeightChanged', () => {
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1000));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
     // Any pointer interaction with the list counts as engagement.
     fireEvent.pointerDown(scroller);
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // Pointer interaction exits mount rescue into normal durable follow.
     // It does not claim reading ownership without upward movement.
     setupScroller(scroller, { scrollHeight: 1200, scrollTop: 0, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(1200));
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1200));
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 
-  it('follows a pinned user even when virtuoso model height disagrees with DOM scrollHeight', () => {
+  it('follows a pinned user even when VirtualTranscript model height disagrees with DOM scrollHeight', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(
       withConvContext(
@@ -1693,22 +1700,22 @@ describe('handleTotalListHeightChanged', () => {
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     // User is 32px from the DOM bottom (600 - 168 - 400) — pinned. But
-    // virtuoso's model total is 675: a +75 estimate bias, as accumulates on
+    // VirtualTranscript's model total is 675: a +75 estimate bias, as accumulates on
     // long conversations with many unmeasured rows. A model-based pin check
     // computes 675 - 168 - 400 = 107 > 100 and wrongly drops auto-follow.
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 168, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(675));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(675));
     // Engage (downward wheel: no upward-suppression armed) so the assertion
     // exercises the distance-based pin branch, not the settle rescue.
     fireEvent.wheel(scroller, { deltaY: 50 });
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // Tail content arrives: model 675 -> 775, DOM 600 -> 700.
     setupScroller(scroller, { scrollHeight: 700, scrollTop: 168, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(775));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(775));
 
     // DOM-units pin check: 600 - 168 - 400 = 32 <= 100 — followed.
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 
   it('does NOT re-snap while a touch gesture is active, and resumes after it ends', () => {
@@ -1731,8 +1738,8 @@ describe('handleTotalListHeightChanged', () => {
       const scroller = container.querySelector<HTMLElement>('#messages')!;
       // Seed baseline: user pinned at bottom
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       // Finger goes down and starts dragging up — still within the pin
       // threshold (oldFromBottom = 500 - 80 - 400 = 20) when a
@@ -1740,15 +1747,15 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchStart(scroller, { touches: [{}] });
       fireEvent.touchMove(scroller, { touches: [{}] });
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
       // Finger lift and elapsed time do not release durable reading ownership.
       fireEvent.touchEnd(scroller, { touches: [] });
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(700));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1776,8 +1783,8 @@ describe('handleTotalListHeightChanged', () => {
       // Establish the scroll-direction baseline at scrollTop=100 (the
       // detector compares against the last observed scrollTop).
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       // Momentum follows a real gesture: finger down + lift (engagement),
       // then the fling's upward scroll events with no finger down.
@@ -1791,14 +1798,14 @@ describe('handleTotalListHeightChanged', () => {
       // Height delta lands while still within the pin threshold
       // (oldFromBottom = 500 - 60 - 400 = 40) and within the window — no snap.
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 60, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
       // Elapsed time cannot reclaim the viewport from the user.
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(700));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1830,8 +1837,8 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1000);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
       fireEvent.touchStart(scroller, { touches: [{}] });
@@ -1839,9 +1846,9 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchEnd(scroller, { touches: [] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
       expect(container.querySelector('.jump-to-newest')).toBeNull();
     } finally {
       vi.useRealTimers();
@@ -1874,13 +1881,13 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1000);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.atBottomStateChange?.(true));
+      act(() => virtualTranscriptMock.pinnedChanged?.(true));
 
       vi.setSystemTime(1100);
       fireEvent.touchStart(scroller, { touches: [{}] });
@@ -1888,9 +1895,9 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchEnd(scroller, { touches: [] });
       vi.setSystemTime(1150);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
       expect(container.querySelector('.jump-to-newest')).toBeNull();
     } finally {
       vi.useRealTimers();
@@ -1924,8 +1931,8 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1000);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
       fireEvent.touchStart(scroller, { touches: [{}] });
@@ -1936,7 +1943,7 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.atBottomStateChange?.(false));
+      act(() => virtualTranscriptMock.pinnedChanged?.(false));
 
       vi.setSystemTime(1800);
       fireEvent.touchStart(scroller, { touches: [{}] });
@@ -1947,14 +1954,14 @@ describe('handleTotalListHeightChanged', () => {
 
       vi.setSystemTime(1900);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
       expect(container.querySelector('.jump-to-newest')).not.toBeNull();
 
       vi.setSystemTime(3101);
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(700));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1986,9 +1993,9 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1000);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      act(() => virtuosoMock.atBottomStateChange?.(false));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      act(() => virtualTranscriptMock.pinnedChanged?.(false));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
       fireEvent.touchStart(scroller, { touches: [{}] });
@@ -1998,9 +2005,9 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchEnd(scroller, { touches: [] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
       expect(container.querySelector('.jump-to-newest')).not.toBeNull();
     } finally {
       vi.useRealTimers();
@@ -2033,21 +2040,21 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(1000);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
       fireEvent.scroll(scroller);
-      act(() => virtuosoMock.totalListHeightChanged?.(500));
-      virtuosoMock.scrollToIndex.mockClear();
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
       fireEvent.touchStart(scroller, { touches: [{}] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
-      act(() => virtuosoMock.atBottomStateChange?.(true));
+      act(() => virtualTranscriptMock.pinnedChanged?.(true));
       vi.setSystemTime(1070);
       fireEvent.touchEnd(scroller, { touches: [] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
-      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -2071,16 +2078,16 @@ describe('handleTotalListHeightChanged', () => {
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(500));
-    virtuosoMock.scrollToIndex.mockClear();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     fireEvent.touchStart(scroller, { touches: [{}] });
     fireEvent.touchMove(scroller, { touches: [{}] });
     fireEvent.touchCancel(scroller, { touches: [] });
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(600));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
   });
 
@@ -2101,10 +2108,10 @@ describe('handleTotalListHeightChanged', () => {
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 500, scrollTop: 50, clientHeight: 400 });
-    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
     // Engage so the assertion exercises the pin branch, not the settle rescue.
     fireEvent.wheel(scroller, { deltaY: 50 });
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // scrollTop increases (downward) — e.g. our own snap or the user heading
     // to the bottom. Must NOT suppress auto-follow.
@@ -2113,8 +2120,8 @@ describe('handleTotalListHeightChanged', () => {
 
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
     // oldFromBottom = 500 - 100 - 400 = 0 (pinned)
-    act(() => virtuosoMock.totalListHeightChanged?.(600));
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {
@@ -2135,22 +2142,22 @@ describe('handleTotalListHeightChanged', () => {
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     // Seed baseline: user at bottom with tall viewport
     setupScroller(scroller, { scrollHeight: 800, scrollTop: 100, clientHeight: 700 });
-    act(() => virtuosoMock.totalListHeightChanged?.(800));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(800));
     // oldFromBottom = 800 - 100 - 700 = 0 (pinned)
     // Engage (downward wheel) so the assertion exercises the pin branch,
     // not the pre-engagement settle rescue.
     fireEvent.wheel(scroller, { deltaY: 50 });
 
     // Clear so we only observe subsequent calls
-    virtuosoMock.scrollToIndex.mockClear();
+    virtualTranscriptMock.scrollToTail.mockClear();
 
     // Viewport shrinks from 700 to 500 (200px shrink > 100px threshold)
     // Without viewport-shrink handling, oldFromBottom = 800 - 100 - 500 = 200 > 100
     // With shrink handling, uses prevClientHeight (700): oldFromBottom = 800 - 100 - 700 = 0 <= 100
     setupScroller(scroller, { scrollHeight: 800, scrollTop: 100, clientHeight: 500 });
-    act(() => virtuosoMock.totalListHeightChanged?.(800));
+    act(() => virtualTranscriptMock.totalExtentChanged?.(800));
 
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
   });
 });
 

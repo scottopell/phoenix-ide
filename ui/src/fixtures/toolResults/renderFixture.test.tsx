@@ -11,21 +11,6 @@ vi.mock('../../components/FilePathContextMenu', () => ({
   FilePathContextMenu: () => null,
 }));
 
-vi.mock('react-virtuoso', async () => {
-  const React = await import('react');
-  return {
-    Virtuoso: React.forwardRef<HTMLDivElement, { data: unknown[]; itemContent: (index: number, item: unknown) => React.ReactNode }>(
-      ({ data, itemContent }, ref) => (
-        <div ref={ref} data-testid="virtuoso-mock">
-          {data.map((item, index) => (
-            <div key={index}>{itemContent(index, item)}</div>
-          ))}
-        </div>
-      ),
-    ),
-  };
-});
-
 afterEach(() => {
   cleanup();
 });

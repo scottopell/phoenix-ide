@@ -1,5 +1,5 @@
 import { memo, useCallback, useRef, useState } from 'react';
-import type { ListRange } from 'react-virtuoso';
+import type { VirtualTranscriptRange } from './VirtualTranscript';
 import { MessageList, type MessageListHandle } from './MessageList';
 import { ConversationNav } from './ConversationNav';
 import { resolveActiveUnitIndex } from './conversationNavSpy';
@@ -33,7 +33,7 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     setChapters(next);
   }, []);
 
-  const handleVisibleRangeChange = useCallback((range: ListRange) => {
+  const handleVisibleRangeChange = useCallback((range: VirtualTranscriptRange) => {
     const next = resolveActiveUnitIndex(chaptersRef.current, range);
     setActiveUnitIndex((prev) => (prev === next ? prev : next));
   }, []);
