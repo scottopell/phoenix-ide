@@ -282,6 +282,19 @@ describe('TaskApprovalReader shared find integration', () => {
     expect(screen.getByText('2 of 2')).toBeInTheDocument();
   });
 
+  it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {
+    renderTaskApprovalReader('# Plan\n\nfoo  bar');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: '  b' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    const mark = document.querySelector('mark');
+    expect(mark).not.toBeNull();
+    expect(mark?.textContent).toBe('  b');
+    expect(screen.getByText((_, element) => element?.textContent === 'foo  bar')).toBeInTheDocument();
+  });
+
   it('renders only one notes badge when notes exist', () => {
     renderTaskApprovalReader('# Plan\n\nAdd the thing.');
 

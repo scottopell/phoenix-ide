@@ -484,11 +484,10 @@ export function TaskApprovalReader({
     const findBlockRegistry = new Set<string>();
     const registerFindableBlock = (lineNumber: number, text: string, blockId = `line:${lineNumber}`) => {
       if (lineNumber <= 0) return blockId;
-      const normalized = text.replace(/\s+/g, ' ').trim();
-      if (normalized.length === 0) return blockId;
+      if (text.length === 0) return blockId;
       if (findBlockRegistry.has(blockId)) return blockId;
       findBlockRegistry.add(blockId);
-      nextFindableBlocks.push({ id: blockId, lineNumber, text: normalized });
+      nextFindableBlocks.push({ id: blockId, lineNumber, text });
       return blockId;
     };
 

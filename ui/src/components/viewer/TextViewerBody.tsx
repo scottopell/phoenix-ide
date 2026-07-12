@@ -4,7 +4,7 @@ import { buildFileSearchProjection } from '../viewer-find';
 
 /** Plain <pre> body for large source-like payloads that bypass rich rendering. */
 export function TextViewerBody({ content, findQuery, activeFindOccurrence }: ViewerBodyProps) {
-  const hasActiveQuery = (findQuery ?? '').length > 0 && activeFindOccurrence !== null && activeFindOccurrence !== undefined;
+  const hasActiveQuery = (findQuery ?? '').length > 0 && (activeFindOccurrence ?? -1) >= 0;
   const findProjection = useMemo(
     () => (hasActiveQuery ? buildFileSearchProjection(content, findQuery ?? '') : { sources: [], matches: [] }),
     [content, findQuery, hasActiveQuery],

@@ -74,7 +74,7 @@ export function DiffView({
   inline = false,
   takeover = false,
 }: DiffViewProps) {
-  useRegisterFocusScope('diff-viewer');
+  useRegisterFocusScope(open ? 'diff-viewer' : null);
   const notes = useDiffReviewNotes(onSendNotes);
   const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
@@ -97,7 +97,7 @@ export function DiffView({
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
     onOpen: openFind,
-    dialogOpen: notes.annotating !== null,
+    dialogOpen: !open || notes.annotating !== null,
   });
   const findProjection = useMemo(
     () => (find.isOpen && find.query.length > 0

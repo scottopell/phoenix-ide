@@ -149,6 +149,25 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
+  it('does not register diff find shortcuts while a closed diff remains mounted', () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open={false}
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true, bubbles: true, cancelable: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
   it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 

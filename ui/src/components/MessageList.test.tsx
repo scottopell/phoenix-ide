@@ -315,6 +315,56 @@ describe('MessageList', () => {
     await waitFor(() => expect(header).toHaveClass('viewer-find-row-match--active'));
   });
 
+  it('does not re-scroll the active transcript match on unrelated streaming-buffer ticks', async () => {
+    const store = new ConversationStore();
+    const messages = [
+      { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha earlier match' }] },
+      { ...makeMessage(2, 'user'), content: { text: 'later row' } },
+    ] as Message[];
+
+    render(
+      <ConversationContext.Provider value={store}>
+        <FocusScopeProvider>
+          <MessageList
+            slug="conv-stream-find"
+            messages={messages}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-stream-find"
+          />
+        </FocusScopeProvider>
+      </ConversationContext.Provider>,
+    );
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+
+    const activeRow = document.querySelector('[data-render-unit-key="msg-1"]') as HTMLElement;
+    expect(activeRow).not.toBeNull();
+    activeRow.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    activeRow.scrollIntoView = vi.fn();
+
+    act(() => {
+      store.dispatch('conv-stream-find', {
+        type: 'sse_token',
+        sequenceId: 99,
+        requestId: 'req-1',
+        delta: 'token',
+      });
+    });
+
+    expect(activeRow.scrollIntoView).not.toHaveBeenCalled();
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
   it('does not build transcript matches while find is closed or queryless', async () => {
     render(withConvContext(
       <MessageList

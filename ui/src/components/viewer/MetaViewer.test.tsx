@@ -376,6 +376,24 @@ describe('MetaViewer payload routing', () => {
     expect(buildProjectionSpy).toHaveBeenCalledWith('alpha\nbeta', 'alpha');
   });
 
+  it('skips large-text line-fragment rendering when the active occurrence is negative', () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'missing' } });
+
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+    expect(document.querySelector('[data-find-line]')).toBeNull();
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
+  });
+
   it('keeps image payloads out of file find and does not show false counts', () => {
     renderViewer({
       ...common,
