@@ -226,6 +226,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_work_scope_active_pr_selection",
         sql: MIGRATION_042,
     },
+    Migration {
+        version: 43,
+        name: "normalize_pr_feedback_baselines_by_full_identity",
+        sql: MIGRATION_043,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -533,6 +538,40 @@ CREATE TABLE IF NOT EXISTS work_scope_active_pr_selection (
         OR (repo_owner IS NOT NULL AND repo_name IS NOT NULL AND pr_number IS NOT NULL)
     )
 );
+";
+
+const MIGRATION_043: &str = r"
+ALTER TABLE work_scope_pr_feedback_baselines RENAME TO work_scope_pr_feedback_baselines_old;
+
+CREATE TABLE work_scope_pr_feedback_baselines (
+    work_scope_id INTEGER NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    github_updated_at TEXT,
+    feedback_identities TEXT NOT NULL DEFAULT '[]',
+    feedback_fingerprints TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (work_scope_id, repo_owner, repo_name, pr_number)
+);
+
+INSERT INTO work_scope_pr_feedback_baselines (
+    work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at,
+    feedback_identities, feedback_fingerprints
+)
+SELECT b.work_scope_id, a.repo_owner, a.repo_name, b.pr_number, b.captured_at, b.github_updated_at,
+       b.feedback_identities, b.feedback_fingerprints
+FROM work_scope_pr_feedback_baselines_old b
+JOIN work_scope_pr_associations a
+  ON a.work_scope_id = b.work_scope_id AND a.pr_number = b.pr_number
+WHERE 1 = (
+    SELECT COUNT(*)
+    FROM work_scope_pr_associations candidate
+    WHERE candidate.work_scope_id = b.work_scope_id
+      AND candidate.pr_number = b.pr_number
+);
+
+DROP TABLE work_scope_pr_feedback_baselines_old;
 ";
 
 const MIGRATION_014: &str = r"

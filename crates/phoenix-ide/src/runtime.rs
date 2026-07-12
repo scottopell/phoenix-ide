@@ -1517,10 +1517,10 @@ impl RuntimeManager {
                 .map_err(|err| err.to_string())?;
         }
 
-        let worktree_repo_identity =
-            phoenix_core::git::detect_git_repo_root(&worktree).and_then(|root| {
-                crate::runtime::pr_status_poll::github_repo_identifier(std::path::Path::new(&root))
-            });
+        let worktree_repo_root = phoenix_core::git::detect_git_repo_root(&worktree);
+        let worktree_repo_identity = worktree_repo_root.as_deref().and_then(|root| {
+            crate::runtime::pr_status_poll::github_repo_identifier(std::path::Path::new(root))
+        });
         let mut candidates = std::collections::BTreeMap::new();
         for branch in self
             .db()
@@ -1528,17 +1528,21 @@ impl RuntimeManager {
             .await
             .map_err(|err| err.to_string())?
         {
-            if worktree_repo_identity
-                .as_deref()
-                .is_none_or(|repo| repo == branch.repository_identity)
+            let discovery_identity = if worktree_repo_root.as_deref()
+                == Some(branch.repository_identity.as_str())
             {
+                worktree_repo_identity.clone()
+            } else if worktree_repo_identity.as_deref() == Some(branch.repository_identity.as_str())
+            {
+                Some(branch.repository_identity.clone())
+            } else {
+                None
+            };
+            if let Some(repository_identity) = discovery_identity {
                 candidates.insert(
-                    (
-                        branch.repository_identity.clone(),
-                        branch.branch_name.clone(),
-                    ),
+                    (repository_identity.clone(), branch.branch_name.clone()),
                     phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
-                        repository_identity: branch.repository_identity,
+                        repository_identity,
                         branch_name: branch.branch_name,
                     },
                 );

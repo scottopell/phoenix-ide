@@ -255,6 +255,8 @@ pub struct WorkScopeObservedBranchUpsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrFeedbackBaseline {
     pub work_scope_id: i64,
+    pub repo_owner: String,
+    pub repo_name: String,
     pub pr_number: u64,
     pub captured_at: String,
     pub github_updated_at: Option<String>,
@@ -264,6 +266,8 @@ pub struct WorkScopePrFeedbackBaseline {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkScopePrFeedbackBaselineInput {
+    pub repo_owner: String,
+    pub repo_name: String,
     pub pr_number: u64,
     pub captured_at: String,
     pub github_updated_at: Option<String>,
@@ -901,6 +905,8 @@ impl Database {
     pub async fn update_work_scope_pr_feedback_status(
         &self,
         scope: &phoenix_core::work_scope::WorkScope,
+        repo_owner: &str,
+        repo_name: &str,
         pr_number: u64,
         status: PrFeedbackStatus,
     ) -> DbResult<()> {
@@ -910,10 +916,12 @@ impl Database {
         sqlx::query(
             "UPDATE work_scope_pr_associations
              SET feedback_status = ?1
-             WHERE work_scope_id = ?2 AND pr_number = ?3",
+             WHERE work_scope_id = ?2 AND repo_owner = ?3 AND repo_name = ?4 AND pr_number = ?5",
         )
         .bind(pr_feedback_status_db(status))
         .bind(work_scope_id)
+        .bind(repo_owner)
+        .bind(repo_name)
         .bind(pr_number.cast_signed())
         .execute(&self.pool)
         .await?;
@@ -941,15 +949,17 @@ impl Database {
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query(
             "INSERT INTO work_scope_pr_feedback_baselines (
-                work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(work_scope_id, pr_number) DO UPDATE SET
+                work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(work_scope_id, repo_owner, repo_name, pr_number) DO UPDATE SET
                 captured_at = excluded.captured_at,
                 github_updated_at = excluded.github_updated_at,
                 feedback_identities = excluded.feedback_identities,
                 feedback_fingerprints = excluded.feedback_fingerprints",
         )
         .bind(work_scope_id)
+        .bind(&baseline.repo_owner)
+        .bind(&baseline.repo_name)
         .bind(baseline.pr_number.cast_signed())
         .bind(&baseline.captured_at)
         .bind(&baseline.github_updated_at)
@@ -1357,7 +1367,7 @@ impl Database {
         let current_generation = persisted.as_ref().map_or(0, |row| row.inference_generation);
         let next_generation = persisted
             .as_ref()
-            .map_or(0, |row| row.inference_generation + 1);
+            .map_or(1, |row| row.inference_generation + 1);
         let now = Utc::now().to_rfc3339();
         let write = sqlx::query(
             "INSERT INTO work_scope_active_pr_selection (
@@ -1418,17 +1428,21 @@ impl Database {
     pub async fn work_scope_pr_feedback_baseline(
         &self,
         scope: &phoenix_core::work_scope::WorkScope,
+        repo_owner: &str,
+        repo_name: &str,
         pr_number: u64,
     ) -> DbResult<Option<WorkScopePrFeedbackBaseline>> {
         let Some(work_scope_id) = self.work_scope_id(scope).await? else {
             return Ok(None);
         };
         let row = sqlx::query(
-            "SELECT work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
              FROM work_scope_pr_feedback_baselines
-             WHERE work_scope_id = ?1 AND pr_number = ?2",
+             WHERE work_scope_id = ?1 AND repo_owner = ?2 AND repo_name = ?3 AND pr_number = ?4",
         )
         .bind(work_scope_id)
+        .bind(repo_owner)
+        .bind(repo_name)
         .bind(pr_number.cast_signed())
         .fetch_optional(&self.pool)
         .await?;
@@ -1441,6 +1455,8 @@ impl Database {
                 .map_err(|e| DbError::Serialization(e.to_string()))?;
             Ok(WorkScopePrFeedbackBaseline {
                 work_scope_id: row.get("work_scope_id"),
+                repo_owner: row.get("repo_owner"),
+                repo_name: row.get("repo_name"),
                 pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
                 captured_at: row.get("captured_at"),
                 github_updated_at: row.get("github_updated_at"),
@@ -9378,7 +9394,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(derived.inference_generation, 0);
+        assert_eq!(derived.inference_generation, 1);
         assert_eq!(derived.selection.as_ref().unwrap().pr.pr_number, 1);
 
         let pinned = writer
@@ -9392,7 +9408,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(pinned.inference_generation, 1);
+        assert_eq!(pinned.inference_generation, 2);
         assert_eq!(pinned.selection.as_ref().unwrap().pr.pr_number, 2);
         assert_eq!(
             pinned.selection.as_ref().unwrap().provenance,
@@ -9938,7 +9954,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.inference_generation, 0);
+        assert_eq!(first.inference_generation, 1);
 
         let winner = db_a
             .derive_active_work_scope_pr_selection(
@@ -9957,7 +9973,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(winner.selection.as_ref().unwrap().pr.pr_number, 2);
-        assert_eq!(winner.inference_generation, 1);
+        assert_eq!(winner.inference_generation, 2);
 
         let stale = db_b
             .derive_active_work_scope_pr_selection(
@@ -9976,14 +9992,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stale.selection.as_ref().unwrap().pr.pr_number, 2);
-        assert_eq!(stale.inference_generation, 1);
+        assert_eq!(stale.inference_generation, 2);
         let persisted = db_b
             .active_work_scope_pr_selection(&scope)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(persisted.selection.unwrap().pr.pr_number, 2);
-        assert_eq!(persisted.inference_generation, 1);
+        assert_eq!(persisted.inference_generation, 2);
     }
 
     #[tokio::test]
@@ -10122,7 +10138,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(derived.inference_generation, 0);
+        assert_eq!(derived.inference_generation, 1);
 
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -10152,7 +10168,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(advanced.inference_generation, 1);
+        assert_eq!(advanced.inference_generation, 2);
 
         let pinned = db
             .pin_active_work_scope_pr_selection(
@@ -10165,7 +10181,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(pinned.inference_generation, 2);
+        assert_eq!(pinned.inference_generation, 3);
         assert_eq!(
             pinned.selection.unwrap().provenance,
             phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned
@@ -10659,6 +10675,8 @@ mod tests {
         db.upsert_work_scope_pr_feedback_baseline(
             &scope,
             &WorkScopePrFeedbackBaselineInput {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
                 pr_number: 7,
                 captured_at: "2026-01-01T00:00:00Z".to_string(),
                 github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -10672,6 +10690,8 @@ mod tests {
         db.upsert_work_scope_pr_feedback_baseline(
             &scope,
             &WorkScopePrFeedbackBaselineInput {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
                 pr_number: 7,
                 captured_at: "2026-01-02T00:00:00Z".to_string(),
                 github_updated_at: Some("2026-01-02T00:00:00Z".to_string()),
@@ -10683,7 +10703,7 @@ mod tests {
         .unwrap();
 
         let baseline = db
-            .work_scope_pr_feedback_baseline(&scope, 7)
+            .work_scope_pr_feedback_baseline(&scope, "owner", "repo", 7)
             .await
             .unwrap()
             .unwrap();
@@ -10695,6 +10715,47 @@ mod tests {
         );
         assert_eq!(baseline.feedback_identities, vec!["c".to_string()]);
         assert_eq!(baseline.feedback_fingerprints, vec!["fc".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn work_scope_pr_feedback_baselines_are_keyed_by_full_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-baseline-identities".to_string(),
+        );
+
+        for repo_name in ["repo-a", "repo-b"] {
+            db.upsert_work_scope_pr_feedback_baseline(
+                &scope,
+                &WorkScopePrFeedbackBaselineInput {
+                    repo_owner: "owner".to_string(),
+                    repo_name: repo_name.to_string(),
+                    pr_number: 7,
+                    captured_at: format!(
+                        "2026-01-0{}T00:00:00Z",
+                        if repo_name == "repo-a" { 1 } else { 2 }
+                    ),
+                    github_updated_at: None,
+                    feedback_identities: vec![repo_name.to_string()],
+                    feedback_fingerprints: vec![format!("fp-{repo_name}")],
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let a = db
+            .work_scope_pr_feedback_baseline(&scope, "owner", "repo-a", 7)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = db
+            .work_scope_pr_feedback_baseline(&scope, "owner", "repo-b", 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.feedback_identities, vec!["repo-a".to_string()]);
+        assert_eq!(b.feedback_identities, vec!["repo-b".to_string()]);
     }
 
     #[tokio::test]

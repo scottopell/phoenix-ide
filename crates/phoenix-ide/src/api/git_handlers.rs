@@ -819,11 +819,43 @@ pub(crate) async fn get_conversation_pr_status(
         if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
             stale_primary_response_with_work_change(&active_pr, refresh)
         } else if refresh.response.number != Some(active_pr.pr_number) {
-            crate::api::pr_monitoring::persisted_primary_response(
-                &active_pr,
-                refresh.response.refresh,
-                true,
-            )
+            let active_refresh = tokio::task::spawn_blocking({
+                let cwd = cwd.clone();
+                let repo_owner = active_pr.repo_owner.clone();
+                let repo_name = active_pr.repo_name.clone();
+                let pr_number = active_pr.pr_number;
+                move || {
+                    crate::api::pr_monitoring::get_pr_status_for_pr(
+                        &cwd,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                    )
+                }
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+            if !active_refresh.observations.is_empty() {
+                db.upsert_work_scope_pr_observations(&work_scope, &active_refresh.observations)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            if active_refresh.response.refresh.state == crate::api::types::PrRefreshState::Fresh {
+                attach_pr_feedback_freshness(
+                    active_refresh.response,
+                    &db,
+                    &work_scope,
+                    &cwd,
+                    &active_pr,
+                )
+                .await?
+            } else {
+                crate::api::pr_monitoring::persisted_primary_response(
+                    &active_pr,
+                    active_refresh.response.refresh,
+                    true,
+                )
+            }
         } else {
             attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd, &active_pr)
                 .await?
@@ -840,6 +872,7 @@ pub(crate) async fn get_conversation_pr_status(
     Ok(Json(response))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn attach_pr_feedback_freshness(
     mut response: PrStatusResponse,
     db: &crate::db::Database,
@@ -862,7 +895,12 @@ async fn attach_pr_feedback_freshness(
         (active_pr.pr_number == pr_number).then_some(active_pr.feedback_status);
 
     let baseline = db
-        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+        .work_scope_pr_feedback_baseline(
+            work_scope,
+            &active_pr.repo_owner,
+            &active_pr.repo_name,
+            pr_number,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -894,6 +932,8 @@ async fn attach_pr_feedback_freshness(
                     if should_update_cache {
                         db.update_work_scope_pr_feedback_status(
                             work_scope,
+                            &active_pr.repo_owner,
+                            &active_pr.repo_name,
                             pr_number,
                             fetched_status,
                         )
@@ -932,9 +972,15 @@ async fn attach_pr_feedback_freshness(
             Ok(status) => {
                 response.feedback_status = Some(status);
                 if Some(status) != previous_feedback_status {
-                    db.update_work_scope_pr_feedback_status(work_scope, pr_number, status)
-                        .await
-                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    db.update_work_scope_pr_feedback_status(
+                        work_scope,
+                        &active_pr.repo_owner,
+                        &active_pr.repo_name,
+                        pr_number,
+                        status,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
                 }
             }
             Err(err) => {
@@ -1033,9 +1079,15 @@ pub(crate) async fn create_pr_auto_fix_context(
     }
 
     if let (Ok(response), Some(feedback_status)) = (&response, feedback_status) {
-        db.update_work_scope_pr_feedback_status(&work_scope, response.pr_number, feedback_status)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        db.update_work_scope_pr_feedback_status(
+            &work_scope,
+            &response.repo_owner,
+            &response.repo_name,
+            response.pr_number,
+            feedback_status,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
     Ok(Json(response?))
