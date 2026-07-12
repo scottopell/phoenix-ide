@@ -66,7 +66,7 @@ impl LeaseExpiry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProfileRef {
     pub profile_id: &'static str,
     pub protocol_version: u32,
@@ -195,6 +195,18 @@ pub enum SuppressionReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwedAcceptanceDisposition {
+    Owed,
+    Accepted {
+        transition: TransitionId,
+    },
+    Suppressed {
+        transition: TransitionId,
+        reason: SuppressionReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionStatus {
     Required,
     Resolved,
@@ -261,7 +273,36 @@ pub struct ProtocolSelection {
     pub authority: SemanticAuthority,
     pub accepting: bool,
     pub runtime_acceptance_enabled: bool,
+    pub external_acceptance_enabled: bool,
     pub selector: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExternalAcceptanceKey {
+    pub profile: ProfileRef,
+    pub authority_scope: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAcceptanceReceipt<H> {
+    pub idempotency_key: String,
+    pub workflow_id: WorkflowId,
+    pub handle: H,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAcceptanceBinding<H> {
+    pub intent_fingerprint: String,
+    pub receipt: ExternalAcceptanceReceipt<H>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAcceptanceOutcome<H> {
+    New(ExternalAcceptanceReceipt<H>),
+    Replay(ExternalAcceptanceReceipt<H>),
+    Conflict,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +529,7 @@ pub struct WorkflowTransition<E> {
     pub to_version: Version,
     pub generation: Generation,
     pub event: E,
+    pub event_codec: CodecRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,6 +601,14 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualResolutionCommit<P: WorkflowProfile> {
+    pub transition_codec: CodecRef,
+    pub transition_event: P::Event,
+    pub receipt: P::Receipt,
+    pub receipt_event: P::ReceiptReducerEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualResolutionOutcome<P: WorkflowProfile>
 where
     P::Observation: Clone + Eq,
@@ -589,8 +639,7 @@ pub struct OwedAcceptanceRecord<E> {
     pub reducer_inbox_id: ReducerInboxId,
     pub source_kind: &'static str,
     pub event: E,
-    pub status: AcceptanceStatus,
-    pub accepting_transition: Option<TransitionId>,
+    pub disposition: OwedAcceptanceDisposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
