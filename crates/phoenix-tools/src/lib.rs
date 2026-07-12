@@ -623,6 +623,16 @@ impl ToolRegistry {
         }
     }
 
+    /// Minimal read-only registry for the global Coordinator. Global fleet/history
+    /// capabilities are host-bound; filesystem, browser, shell, and lifecycle tools
+    /// are intentionally absent.
+    #[must_use]
+    pub fn coordinator() -> Self {
+        Self {
+            tools: vec![Arc::new(ThinkTool)],
+        }
+    }
+
     /// Create tool registry for Explore mode WITHOUT sandbox.
     ///
     /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no

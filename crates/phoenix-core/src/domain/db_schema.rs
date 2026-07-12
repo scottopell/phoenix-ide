@@ -415,6 +415,15 @@ pub struct ConversationCreationJob {
     pub error: Option<String>,
 }
 
+/// Product role of a persisted conversation, independent of filesystem/tool mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationKind {
+    #[default]
+    Standard,
+    Coordinator,
+}
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -436,6 +445,9 @@ pub struct Conversation {
     /// Project this conversation belongs to (None for legacy pre-project conversations)
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Product role; Coordinator is globally scoped and excluded from normal work lists.
+    #[serde(default)]
+    pub kind: ConversationKind,
     /// Conversation mode — determines tool availability. Default: Explore.
     #[serde(default)]
     pub conv_mode: ConvMode,
@@ -1930,6 +1942,7 @@ mod conversation_serde_tests {
             transcript_generation: 1,
             model: None,
             project_id: None,
+            kind: ConversationKind::Standard,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,

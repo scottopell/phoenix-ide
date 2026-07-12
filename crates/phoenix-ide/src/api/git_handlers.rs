@@ -1881,6 +1881,7 @@ mod tests {
             transcript_generation: 1,
             model: None,
             project_id: None,
+            kind: crate::db::ConversationKind::Standard,
             conv_mode,
             desired_base_branch: None,
             message_count: 0,

@@ -42,8 +42,8 @@ const SharePage = lazy(() =>
 const UsagePage = lazy(() =>
   import('./pages/UsagePage').then((m) => ({ default: m.UsagePage })),
 );
-const GlobalRecallPage = lazy(() =>
-  import('./pages/GlobalRecallPage').then((m) => ({ default: m.GlobalRecallPage })),
+const CoordinatorPage = lazy(() =>
+  import('./pages/CoordinatorPage').then((m) => ({ default: m.CoordinatorPage })),
 );
 const TerminalPage = lazy(() =>
   import('./pages/TerminalPage').then((m) => ({ default: m.TerminalPage })),
@@ -112,7 +112,8 @@ function AppRoutes() {
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
-                <Route path="/global" element={<GlobalRecallPage />} />
+                <Route path="/global" element={<CoordinatorPage />} />
+                <Route path="/global/:slug" element={<CoordinatorPage />} />
                 <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
               </Routes>
             </DesktopLayout>

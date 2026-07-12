@@ -1,30 +1,30 @@
-# Phoenix Global Recall
+# Phoenix Coordinator
 
 ## User Story
 
 As a Phoenix user, I often have several streams of work active across
 projects, continuation chains, and standalone conversations. When I return
 to Phoenix, I want one place that answers "what active work exists?" without
-asking an LLM to infer it from history. I also want a separate read-only
-analysis space where I can ask strategic questions across conversation
-history, produce handoff reports, and cite the source conversations that
-support the answer.
+asking an LLM to infer it from history. I also want a durable Coordinator
+conversation where I can ask for cross-conversation orientation, planning, and
+handoff help while still seeing the compact fleet snapshot beside it.
 
-Global Recall is not ambient memory for ordinary coding conversations. It is
-a deliberate global surface the user opens when they want cross-conversation
+The Coordinator is not ambient memory for ordinary coding conversations. It is
+a deliberate Phoenix-wide surface the user opens when they want global
 orientation or synthesis.
 
 ## Why the User Cares
 
 - **Orientation should be deterministic.** The user should not spend model
   tokens or trust an inference step just to see active work.
-- **Long-running work should not fragment recall.** A continuation chain
+- **Long-running work should not fragment identity.** A continuation chain
   represents one work item even though it spans multiple conversations.
-- **Synthesis needs provenance.** Cross-conversation answers are only useful
-  when the user can inspect the source conversations and messages.
-- **Global access should be deliberate.** Normal coding agents stay focused on
-  their scoped work; global-history tools are reserved for the Global Recall
-  surface.
+- **Synthesis should reuse the normal conversation experience.** The user
+  should get Phoenix's standard transcript, composer, continuation, and
+  persistence behavior rather than a parallel approximation.
+- **Global access should be deliberate and bounded.** Normal coding agents stay
+  focused on their scoped work; Phoenix-wide read tools are reserved for the
+  Coordinator.
 
 ## Transparency Contract
 
@@ -33,52 +33,44 @@ The user must be able to answer:
 1. Which project owns an open work item?
 2. Is the item a continuation chain or a standalone conversation?
 3. Which conversation is the current/latest source of truth for the item?
-4. Why does the item appear in the open-work list?
-5. Which source conversations or messages support a recall answer?
+4. Why does the item appear in the fleet list?
+5. Which source conversations or messages support a Coordinator answer?
 
 ## Requirements
 
 ### REQ-GR-001: View Active Work Without Model Inference
 
-WHEN a user opens the Global Recall surface
-THE SYSTEM SHALL present a deterministic Global Open Work view of active
-Phoenix work without requiring an LLM request
+WHEN a user opens the Coordinator surface
+THE SYSTEM SHALL present a deterministic fleet view of active Phoenix work
+without requiring an LLM request
 
 THE view SHALL group visible work by project
 
 THE view SHALL include work backed by continuation chains and standalone
 conversations
 
-**Rationale:** The user's first need is orientation. Deterministic projection
-makes the list explainable, cheap, and repeatable; model synthesis belongs in
-separate recall sessions, not in the basic "what is open?" answer.
-
 ---
 
 ### REQ-GR-002: Collapse Continuation Chains Into One Work Item
 
 WHEN conversations form a linear continuation chain
-THE SYSTEM SHALL represent the chain as one open work item identified by its
+THE SYSTEM SHALL represent the chain as one fleet item identified by its
 chain root
 
 THE SYSTEM SHALL expose the current/latest conversation for the chain
 
-THE SYSTEM SHALL NOT show non-leaf chain members as separate open work items
-when they are already represented by the chain item
+THE SYSTEM SHALL NOT show non-leaf chain members as separate fleet items when
+they are already represented by the chain item
 
 WHEN historical chain members are archived
 THE SYSTEM SHALL preserve the original chain root as the work-item identity if
 the latest conversation still has positive open-work evidence
 
-**Rationale:** A continuation chain is the user's unit of work. Listing every
-member separately creates clutter and makes old chain members look like
-independent active work.
-
 ---
 
 ### REQ-GR-003: Explain Why Work Appears
 
-WHEN an open work item is visible
+WHEN a fleet item is visible
 THE SYSTEM SHALL show deterministic signals that explain its inclusion or
 priority
 
@@ -99,14 +91,11 @@ and non-user-initiated current conversations
 IF a Work-mode task status is unavailable
 THE SYSTEM SHALL NOT treat recency alone as evidence that the work remains open
 
-**Rationale:** The user needs confidence that the global list is not magic.
-Explicit signals turn the projection into an auditable triage view.
-
 ---
 
 ### REQ-GR-004: Surface Work Identity Metadata
 
-WHEN metadata is available for an open work item
+WHEN metadata is available for a fleet item
 THE SYSTEM SHALL show the mode, task id, task title, task status, branch name,
 base branch, worktree path, current conversation, root conversation, and last
 update time
@@ -114,14 +103,11 @@ update time
 THE SYSTEM SHALL tolerate missing metadata without fabricating substitute
 values
 
-**Rationale:** Open work is actionable only when the user can recognize what it
-is connected to. Missing data should be visibly absent rather than guessed.
-
 ---
 
 ### REQ-GR-005: Provide Stable References and App-Local Links
 
-WHEN a work item, chain, conversation, or source message is displayed as a
+WHEN a fleet item, chain, conversation, or source message is displayed as a
 source
 THE SYSTEM SHALL provide an app-local navigation target or stable reference
 handle that can be copied or cited
@@ -137,53 +123,40 @@ archived status
 THE navigation targets SHALL be app-relative so deployment hostnames and
 browser gateways do not determine reference validity
 
-**Rationale:** Global Recall outputs need to be shareable inside Phoenix and
-robust across deployments. App-local links and typed handles keep citations
-portable within the product.
+---
+
+### REQ-GR-006: Provide One Durable Coordinator Identity
+
+WHEN a user opens the Coordinator surface
+THE SYSTEM SHALL resolve it to exactly one durable Coordinator conversation
+identity
+
+THE SYSTEM SHALL create that Coordinator conversation on demand when it does
+not yet exist
+
+THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or
+as a user-created member of the fleet list
 
 ---
 
-### REQ-GR-006: Create Saved Read-Only Recall Sessions
-
-WHEN a user creates a Global Recall session
-THE SYSTEM SHALL persist a separate saved analysis session owned by the Global
-Recall surface
-
-THE SYSTEM SHALL allow multiple Global Recall sessions to exist at the same
-time
-
-THE SYSTEM SHALL NOT present Global Recall sessions as ordinary project coding
-work
-
-**Rationale:** Strategic analysis often needs separate contexts: one handoff
-report, one prioritization pass, one investigation. These sessions should not
-pollute project work lists or coding-agent context.
-
----
-
-### REQ-GR-007: Restrict Global Tools to Global Recall Sessions
+### REQ-GR-007: Restrict Phoenix-wide Tools to the Coordinator
 
 WHILE a normal coding conversation is running
-THE SYSTEM SHALL NOT provide unrestricted global-history search or read tools
-by default
+THE SYSTEM SHALL NOT provide unrestricted Phoenix-wide history search or read
+tools by default
 
-WHILE a Global Recall session is answering a user question
+WHILE the Coordinator is answering a user question
 THE SYSTEM MAY provide read-only host-bound tools for global message search,
-paged conversation reads, deterministic open-work reads, and reference
-resolution
+paged conversation reads, deterministic fleet reads, and reference resolution
 
 THE SYSTEM SHALL NOT provide filesystem mutation, task approval, task drafting,
-or workspace-management tools to a Global Recall session
-
-**Rationale:** Global history is powerful and broad. Keeping it off ordinary
-coding agents prevents ambient-memory behavior, while read-only tools let the
-deliberate global surface answer cross-conversation questions safely.
+or workspace-management tools to the Coordinator
 
 ---
 
 ### REQ-GR-008: Answer With Source Citations
 
-WHEN a Global Recall session answers a question using conversation history
+WHEN the Coordinator answers a question using conversation history
 THE SYSTEM SHALL instruct the answering agent to cite source conversations or
 messages using app-local links or stable reference handles
 
@@ -191,21 +164,24 @@ THE SYSTEM SHALL expose enough source metadata through read-only tools for the
 agent to cite the conversation id, message id when available, role, timestamp,
 and excerpt or read content that supports the answer
 
-**Rationale:** Cross-conversation synthesis is easy to over-trust. Citations let
-the user verify claims, continue from the right conversation, or copy a handoff
-with traceable evidence.
-
 ---
 
 ### REQ-GR-009: Resolve Copied References
 
-WHEN a user or recall agent provides a supported Global Recall reference
+WHEN a user or the Coordinator provides a supported reference
 THE SYSTEM SHALL resolve it to its target kind, target id, app-local navigation
 target when available, title when available, and a concise summary
 
 IF the reference has unsupported syntax
 THE SYSTEM SHALL return a clear error instead of guessing silently
 
-**Rationale:** Copied handles become useful only if the product can turn them
-back into source material predictably. Explicit errors avoid confusing one
-conversation, chain, or work item for another.
+---
+
+### REQ-GR-010: Keep the Fleet Snapshot Visible on the Coordinator Surface
+
+WHEN a user opens `/global`
+THE SYSTEM SHALL keep the compact fleet snapshot visible within the Coordinator
+surface instead of replacing the page with a bare conversation redirect
+
+THE SYSTEM SHALL allow the user to expand a fleet row to inspect detailed
+signals and metadata without leaving the Coordinator surface

@@ -115,16 +115,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations", get(list_conversations))
         .route("/api/global/open-work", get(global_recall::open_work))
         .route(
-            "/api/global/recall/sessions",
-            get(global_recall::list_sessions).post(global_recall::create_session),
-        )
-        .route(
-            "/api/global/recall/sessions/:id",
-            get(global_recall::get_session),
-        )
-        .route(
-            "/api/global/recall/sessions/:id/ask",
-            post(global_recall::ask_session),
+            "/api/global/coordinator",
+            get(get_coordinator).post(get_coordinator),
         )
         .route(
             "/api/global/resolve",
@@ -814,6 +806,20 @@ async fn cached_pr_summaries_for_conversations(
         .into_iter()
         .map(|(key, pr)| (key, sidebar_cached_pr_summary(&pr)))
         .collect())
+}
+
+async fn get_coordinator(
+    State(state): State<AppState>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let cwd = state.runtime_env.home().to_string_lossy().into_owned();
+    let conversation = state
+        .db
+        .get_or_create_coordinator(&cwd, Some(state.llm_registry.default_model_id()))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ConversationResponse {
+        conversation: conversation_to_json(&state, &conversation, None),
+    }))
 }
 
 /// Serialize a conversation to JSON with `presentation_mode` included.

@@ -2611,32 +2611,36 @@ impl RuntimeManager {
                 agent_catalog.clone(),
             )
         } else {
-            use crate::db::ConvMode;
-            let registry = match conv.conv_mode {
-                ConvMode::Explore { .. } => ToolRegistry::explore(
-                    &context.tasks_dir_name,
-                    agent_catalog.to_vec(),
-                    ExploreToolPolicy::from_platform(&self.platform),
-                ),
-                ConvMode::Direct => {
-                    // Full tool suite for Direct mode. `propose_task` (the
-                    // fork proposal) is offered only when the working dir is
-                    // inside a git repo — a fork cuts from the repository's
-                    // default branch (REQ-PROJ-036).
-                    let registry = ToolRegistry::direct(agent_catalog.to_vec());
-                    if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
-                        registry.with_propose_task().with_commission_review()
-                    } else {
-                        registry
+            use crate::db::{ConvMode, ConversationKind};
+            let registry = if conv.kind == ConversationKind::Coordinator {
+                ToolRegistry::coordinator()
+            } else {
+                match conv.conv_mode {
+                    ConvMode::Explore { .. } => ToolRegistry::explore(
+                        &context.tasks_dir_name,
+                        agent_catalog.to_vec(),
+                        ExploreToolPolicy::from_platform(&self.platform),
+                    ),
+                    ConvMode::Direct => {
+                        // Full tool suite for Direct mode. `propose_task` (the
+                        // fork proposal) is offered only when the working dir is
+                        // inside a git repo — a fork cuts from the repository's
+                        // default branch (REQ-PROJ-036).
+                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
+                        if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
+                            registry.with_propose_task().with_commission_review()
+                        } else {
+                            registry
+                        }
                     }
-                }
-                ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                    // Full tool suite plus `propose_task` (non-blocking fork
-                    // proposal — REQ-PROJ-036). Work/Branch always sit on git
-                    // history, so the tool is always offered.
-                    ToolRegistry::direct(agent_catalog.to_vec())
-                        .with_propose_task()
-                        .with_commission_review()
+                    ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                        // Full tool suite plus `propose_task` (non-blocking fork
+                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
+                        // history, so the tool is always offered.
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                            .with_propose_task()
+                            .with_commission_review()
+                    }
                 }
             };
             ToolRegistryExecutor::with_mcp(

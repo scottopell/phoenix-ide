@@ -356,8 +356,8 @@ export function Sidebar({
         <button
           className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
           onClick={() => navigate('/global')}
-          title="Global Recall"
-          aria-label="Global Recall"
+          title="Coordinator"
+          aria-label="Coordinator"
         >
           ◎
         </button>
@@ -432,8 +432,8 @@ export function Sidebar({
         <button
           className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
           onClick={() => navigate('/global')}
-          title="Global Recall"
-          aria-label="Global Recall"
+          title="Coordinator"
+          aria-label="Coordinator"
         >
           ◎
         </button>

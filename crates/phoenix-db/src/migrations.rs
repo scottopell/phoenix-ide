@@ -216,6 +216,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_creation_cleanup_claims",
         sql: MIGRATION_040,
     },
+<<<<<<< HEAD
     Migration {
         version: 41,
         name: "create_work_scope_observed_branches",
@@ -231,6 +232,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_pr_feedback_baselines_by_full_identity",
         sql: MIGRATION_043,
     },
+||||||| parent of 97974b6e (feat: replace recall surface with coordinator foundation)
+=======
+    Migration {
+        version: 41,
+        name: "replace_global_recall_with_coordinator",
+        sql: MIGRATION_041,
+    },
+>>>>>>> 97974b6e (feat: replace recall surface with coordinator foundation)
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2828,3 +2837,12 @@ mod tests {
         );
     }
 }
+
+const MIGRATION_041: &str = r#"
+ALTER TABLE conversations ADD COLUMN conversation_kind TEXT NOT NULL DEFAULT 'standard'
+    CHECK (conversation_kind IN ('standard', 'coordinator'));
+CREATE UNIQUE INDEX idx_conversations_single_coordinator
+    ON conversations(conversation_kind) WHERE conversation_kind = 'coordinator';
+DROP TABLE IF EXISTS global_recall_messages;
+DROP TABLE IF EXISTS global_recall_sessions;
+"#;
