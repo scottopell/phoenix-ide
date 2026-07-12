@@ -13,8 +13,8 @@
 //
 // The emitted `unitIndex` is the position of the chapter's unit within the
 // SAME `historicalUnits` array the caller passed in — which is the array
-// MessageList feeds to virtuoso (followed by tail units). The nav strip
-// uses it directly as the virtuoso `scrollToIndex` target.
+// MessageList feeds to VirtualTranscript (followed by tail units). The nav strip
+// uses it directly as the VirtualTranscript `scrollToIndex` target.
 
 import type { HistoricalUnit } from './renderUnits';
 import { isSignificantText } from '../hooks/useDensity';
@@ -23,7 +23,7 @@ export type ChapterKind = 'prompt' | 'prose';
 
 export interface Chapter {
   /** Index of this chapter's unit within the `historicalUnits` array — i.e.
-   *  its virtuoso item index (tail units always follow historical units, so
+   *  its VirtualTranscript item index (tail units always follow historical units, so
    *  a historical unit's index is identical in both coordinate spaces). */
   unitIndex: number;
   kind: ChapterKind;
@@ -74,7 +74,7 @@ function firstSignificantProse(
 /**
  * Derive the conversation chapters from the already-built historical render
  * units. The `unitIndex` of each chapter is its position in `historicalUnits`,
- * which equals its virtuoso item index.
+ * which equals its VirtualTranscript item index.
  */
 export function buildConversationChapters(historicalUnits: HistoricalUnit[]): Chapter[] {
   const chapters: Chapter[] = [];

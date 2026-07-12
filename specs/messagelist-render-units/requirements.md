@@ -7,17 +7,17 @@ the render-unit type layer, the virtualized rendering boundary over that
 layer, and the streaming-view subscription path that preserves
 historical-list render isolation.
 
-It supersedes the raw-message virtualization model that the
-`isRenderableHistoricalMessage` patch in `MessageList.tsx` mitigated but
-did not structurally replace.
+It supersedes raw-message virtualization models that let persisted rows
+and rendered conversation units diverge.
 
-**Virtualization vendor:** Virtualization is delegated to
-`react-virtuoso` (REQ-MLRU-015). The hand-rolled bottom-anchored window,
-IntersectionObserver-driven boundary expansion, exact-scroll
-compensation, and measured-spacer-with-kind-fallback geometry layer
-(formerly REQ-MLRU-005, REQ-MLRU-006, REQ-MLRU-007, REQ-MLRU-008) are
-deprecated. The library is authoritative for windowing, scroll
-anchoring, and item-height measurement.
+**Virtualization authority:** Phoenix VirtualTranscript is the sole
+physical layout authority for windowing, scroll-anchor compensation,
+item-height measurement, and programmatic viewport positioning
+(REQ-MLRU-015; see `specs/virtual-transcript/`). The hand-rolled
+bottom-anchored window, IntersectionObserver-driven boundary expansion,
+exact-scroll compensation, and measured-spacer-with-kind-fallback
+geometry layer (formerly REQ-MLRU-005, REQ-MLRU-006, REQ-MLRU-007,
+REQ-MLRU-008) are deprecated.
 
 **No saved-scroll restore:** REQ-CONV-013 (per-conversation scroll
 memory) was deprecated. This spec accordingly does not specify, and
@@ -126,11 +126,11 @@ log at `debug` level — never higher; a backend invariant violation
 manifesting here is still a UI-side recoverable skip, not a render-
 time error)
 
-**Rationale:** Today's code keeps tool results in a `Map<string, Message>`
-built at the MessageList level and looked up during render. Moving the
-pairing to construction makes it structurally impossible to render an agent
-without its results attached. The agent component renders by `toolUseId`
-lookup against its own unit field; no parallel data source.
+**Rationale:** Keeping tool results in a `Map<string, Message>` built at
+the MessageList level and looked up during render creates a parallel data
+source. Moving the pairing to construction makes it structurally impossible
+to render an agent without its results attached. The agent component renders
+by `toolUseId` lookup against its own unit field; no parallel data source.
 
 ---
 
@@ -153,11 +153,10 @@ THE SYSTEM SHALL compute `isFirstInTurn` before the window applies
 SO THAT revealing older units on scroll-up cannot change the rendered
 header state of any already-visible unit
 
-**Rationale:** Today's `inAgentRun` let mutates during the render map call.
-The window cannot break grouping in the current code because the mutation
-sees the full list, but the invariant is enforced by convention, not
-structure. Moving the computation to construction makes it structurally
-impossible for the window to affect header rendering.
+**Rationale:** Computing turn grouping during a render map call enforces
+header suppression by convention rather than structure. Moving the
+computation to construction makes it structurally impossible for the window
+to affect header rendering.
 
 ---
 
@@ -189,37 +188,35 @@ REQ-MLRU-001.
 
 ### REQ-MLRU-005: Bottom-Anchored Initial Window
 
-**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso's
-`initialTopMostItemIndex` (set to `allUnits.length - 1`) plus
-`alignToBottom` provide bottom-pinned-on-mount; no per-conversation
-window-index state is computed by Phoenix code.
+**DEPRECATED:** Replaced by REQ-MLRU-015. VirtualTranscript provides
+bottom-pinned-on-mount; no per-conversation window-index state is computed
+outside the physical layout authority.
 
 ---
 
 ### REQ-MLRU-006: IntersectionObserver Boundary Expansion
 
-**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso owns boundary
-expansion internally via its own viewport-overscan logic. No sentinel
-DOM nodes or `IntersectionObserver` instances exist in MessageList.
+**DEPRECATED:** Replaced by REQ-MLRU-015. VirtualTranscript owns boundary
+expansion through bounded overscan. No sentinel DOM nodes or
+`IntersectionObserver` instances exist in MessageList.
 
 ---
 
 ### REQ-MLRU-007: Exact Scroll Compensation
 
-**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso applies its own
-scroll-anchor compensation in a `useLayoutEffect` between commit and
-paint when items above the viewport mount or unmount. Phoenix code
-does not capture `scrollHeight` or adjust `scrollTop`.
+**DEPRECATED:** Replaced by REQ-MLRU-015. VirtualTranscript owns
+scroll-anchor compensation when measured items above the viewport mount,
+unmount, or change extent. MessageList does not maintain a parallel height
+model or independently compensate `scrollTop`.
 
 ---
 
 ### REQ-MLRU-008: Measured Spacer Height with Kind-Estimate Fallback
 
-**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso measures items via
-its own internal `ResizeObserver` and maintains an in-memory height
-cache for the lifetime of the Virtuoso instance. No `KIND_ESTIMATES`
-table, no per-conversation height-cache Map, no spacer DOM elements
-exist in MessageList.
+**DEPRECATED:** Replaced by REQ-MLRU-015. VirtualTranscript measures items
+and maintains an in-memory extent model for the lifetime of the mounted
+conversation. No `KIND_ESTIMATES` table, no per-conversation height-cache
+Map, and no MessageList-owned spacer DOM elements exist.
 
 ---
 
@@ -318,8 +315,8 @@ heights to `sessionStorage` existed solely to make the first paint
 after navigation produce exact spacer geometry so that the
 unit-anchor restore (REQ-MLRU-009) could avoid reflow. Without saved-scroll restore, persistence has no consumer.
 
-Virtuoso owns its in-memory measurement cache for the lifetime of the
-mounted conversation. Phoenix does not persist a parallel height cache.
+VirtualTranscript owns its in-memory measurement cache for the lifetime of
+the mounted conversation. Phoenix does not persist a parallel height cache.
 
 ---
 
@@ -333,8 +330,8 @@ UNLESS user interaction transfers viewport ownership before convergence
 WHILE tail-follow intent belongs to the system
 WHEN the total list height changes for any reason, including streaming
 growth, delayed measurement, late layout, or viewport shrink
-THE SYSTEM SHALL preserve the tail by issuing exactly one Virtuoso
-scroll-to-last command
+THE SYSTEM SHALL preserve the tail by issuing exactly one VirtualTranscript
+scroll-to-tail command
 AND SHALL keep unread-tail state clear
 
 WHEN upward wheel or viewport movement, a moved touch, or a conversation-
@@ -355,7 +352,7 @@ THE SYSTEM SHALL restore tail-follow intent and clear unread state
 
 WHEN the user requests jump-to-newest
 THE SYSTEM SHALL enter a returning-to-tail mode and issue exactly one
-Virtuoso scroll-to-last command
+VirtualTranscript scroll-to-tail command
 AND SHALL remain in returning-to-tail mode until bottom geometry is
 confirmed
 
@@ -370,10 +367,10 @@ AND a bottom callback received during that moved touch SHALL NOT release
 user ownership
 AND touch end or cancellation SHALL preserve user ownership
 
-THE SYSTEM SHALL use Virtuoso's `atBottomStateChange` callback only as
+THE SYSTEM SHALL use VirtualTranscript pinned-state notification only as
 bottom geometry and explicit return-to-tail confirmation
-AND SHALL use `totalListHeightChanged` only as notification that layout
-height changed and a follow action may be required
+AND SHALL use VirtualTranscript total-extent notification only as
+notification that layout height changed and a follow action may be required
 AND SHALL NOT infer viewport ownership from height growth or proximity
 
 WHILE bounded mount rescue is active
@@ -388,10 +385,9 @@ conversation
 AND SHALL NOT restart it until conversation identity changes
 AND normal live follow SHALL NOT write the DOM scroll position directly
 
-WHEN the Virtuoso instance is first measured empty and content later
-arrives
-THE SYSTEM SHALL issue one Virtuoso scroll-to-last command and begin
-bounded mount rescue
+WHEN VirtualTranscript is first measured empty and content later arrives
+THE SYSTEM SHALL issue one VirtualTranscript scroll-to-tail command and
+begin bounded mount rescue
 
 WHEN conversation identity changes
 THE SYSTEM SHALL atomically reset follow intent, geometry baselines,
@@ -404,53 +400,45 @@ AND SHALL NOT both show and clear unread state.
 
 ---
 
-### REQ-MLRU-015: Virtuoso-Owned Virtualization
+### REQ-MLRU-015: VirtualTranscript-Owned Virtualization
 
 WHEN the message list renders
 THE SYSTEM SHALL pass the concatenation `[...historicalUnits, ...tailUnits]`
-as the `data` prop to a single `<Virtuoso>` instance from
-`react-virtuoso`
-AND render each item via `itemContent={(_, unit) => renderUnit(unit, ...)}`
-AND key each item via `computeItemKey={(_, unit) => unit.key}`
+as `items` to a single Phoenix `<VirtualTranscript>` instance
+AND render each item via `renderItem={(unit, index) => renderUnit(unit, ...)}`
+AND key each item via `getKey={(unit) => unit.key}`
 
-THE SYSTEM SHALL configure the Virtuoso instance with:
-- `followOutput={false}` — disable Virtuoso's built-in auto-scroll so
-  only the policy in REQ-MLRU-014 decides whether height changes preserve
-  the tail; running two follow mechanisms simultaneously is forbidden.
-- `initialTopMostItemIndex={allUnits.length - 1}` (or `0` when empty) —
-  bottom-pinned mount (replaces REQ-MLRU-005)
-- `alignToBottom` — when total content height is less than viewport
-  height, items pin to the bottom of the viewport rather than the top
-- `atBottomThreshold={100}` — match the prior pin-detection threshold
-- `atBottomStateChange={isAtBottom => …}` — reports bottom geometry and
+THE SYSTEM SHALL configure the VirtualTranscript instance with:
+- `initialTail={allUnits.length > 0}` — bottom-pinned mount (replaces
+  REQ-MLRU-005)
+- `estimatedExtent={120}` — bounded pre-measurement extent estimate
+- `overscan={600}` — bounded leading and trailing overscan distance
+- `onPinnedChange={handlePinnedStateChange}` — reports bottom geometry and
   confirms an explicit return to tail; it does not independently grant
   permission to move the viewport
-- `totalListHeightChanged={handleTotalListHeightChanged}` — reports list
-  height changes to the policy; durable follow mode, rather than a
+- `onTotalExtentChange={handleTotalListHeightChanged}` — reports layout
+  extent changes to the policy; durable follow mode, rather than a
   proximity calculation, decides whether to scroll
-- `increaseViewportBy={{ top: 600, bottom: 600 }}` — overscan distance
-  matching the prior 600-pixel sentinel rootMargin
-- `key={conversationId}` on the React element — force a fresh Virtuoso
-  instance per conversation, so no stale scroll/measurement state can
-  leak between conversations
+- `key={conversationId}` on the React element — force a fresh
+  VirtualTranscript instance per conversation, so no stale scroll,
+  measurement, or positioning state can leak between conversations
 
 WHEN the user is scrolled up and clicks the jump-to-newest button
-THE SYSTEM SHALL call the imperative
-`virtuosoRef.current.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })`
-AND clear the button visibility (via `atBottomStateChange` firing
-`true` after the scroll completes)
+THE SYSTEM SHALL call the imperative `transcriptRef.current.scrollToTail()`
+AND clear the button visibility after pinned geometry is confirmed
 
 WHEN a `systemPrompt` is provided
-THE SYSTEM SHALL render it via Virtuoso's `components={{ Header }}` slot
-so it scrolls with the message content and Virtuoso measures it as part
-of the scrollable region
+THE SYSTEM SHALL render it via VirtualTranscript's `header` slot so it
+scrolls with the message content and is measured as part of the scrollable
+region
 
 THE SYSTEM SHALL NOT capture, persist, or restore any per-conversation
-scroll position, height cache, or measurement state outside Virtuoso's
-own internal cache. Cross-conversation visits are first-render-fresh by
-design (REQ-CONV-013 stays deprecated).
+scroll position, height cache, or measurement state outside
+VirtualTranscript's internal layout model. Cross-conversation visits are
+first-render-fresh by design (REQ-CONV-013 stays deprecated).
 
-**Rationale:** A single virtualization owner avoids scroll-jump bugs
-caused by independent windowing, spacer, measurement, and compensation
-layers making incompatible geometry assumptions. Virtuoso encapsulates
-the windowing and anchor-compensation contract behind one library API.
+**Rationale:** A single Phoenix-owned physical layout authority avoids
+scroll-jump bugs caused by independent windowing, spacer, measurement, and
+compensation layers making incompatible geometry assumptions. The
+platform-neutral authority and web conformance requirements live in
+`specs/virtual-transcript/`.

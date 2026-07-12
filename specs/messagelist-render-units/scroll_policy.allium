@@ -3,7 +3,8 @@
 --
 -- Scope: durable tail-follow intent, explicit touch gesture state, unread
 -- policy, geometry observation, and bounded mount recovery. Browser and
--- Virtuoso scroll physics are outside this policy.
+-- VirtualTranscript physical scroll mechanics are outside this policy; see
+-- specs/virtual-transcript/.
 
 config {
     settle_window_ms: Integer = 3000

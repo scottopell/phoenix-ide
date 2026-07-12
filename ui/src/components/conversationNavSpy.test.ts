@@ -1,5 +1,5 @@
 // Unit tests for resolveActiveUnitIndex — the scroll-spy rule that maps
-// virtuoso's visible item range to the active chapter's unitIndex.
+// VirtualTranscript's visible item range to the active chapter's unitIndex.
 
 import { describe, it, expect } from 'vitest';
 import { resolveActiveUnitIndex } from './conversationNavSpy';

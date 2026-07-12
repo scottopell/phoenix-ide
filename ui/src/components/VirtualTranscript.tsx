@@ -191,7 +191,6 @@ function VirtualTranscriptInner<T>(
     header,
     empty,
     overscan = 0,
-    initialTail = true,
     estimatedExtent,
     className,
     scrollerRef,

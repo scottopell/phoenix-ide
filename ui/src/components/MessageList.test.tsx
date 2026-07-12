@@ -676,7 +676,7 @@ describe('MessageList', () => {
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
     const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
     const tableBreakoutTableRule = appCss.match(/\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll\s*>\s*table\s*{([^}]*)}/s)?.[1];
-    const transcriptRule = appCss.match(/\.message-virtuoso\s*{[^}]*}/s)?.[0];
+    const transcriptRule = appCss.match(/\.message-virtual-transcript\s*{[^}]*}/s)?.[0];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);

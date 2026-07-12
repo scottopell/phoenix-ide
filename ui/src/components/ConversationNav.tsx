@@ -11,7 +11,7 @@ const CHAPTER_TITLES: Record<Chapter['kind'], string> = {
 interface ConversationNavProps {
   /** Whole-conversation chapters (prompts + significant prose), in render
    *  order. Derived by `buildConversationChapters` from the same
-   *  `historicalUnits` array MessageList feeds to virtuoso. */
+   *  `historicalUnits` array MessageList feeds to VirtualTranscript. */
   chapters: Chapter[];
   /** `unitIndex` of the chapter currently in view (scroll-spy), or null when
    *  none is resolved. Applies the active pill styling. */

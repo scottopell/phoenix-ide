@@ -8,9 +8,9 @@
 // for the REQ-MLRU-* requirements this module implements.
 //
 // The transform is the only place that decides which messages render and
-// how they group into turns. The MessageList feeds virtuoso exactly
+// how they group into turns. The MessageList feeds VirtualTranscript exactly
 // `[...historicalUnits, ...tailUnits]` with no filtering inside the render
-// loop, so a historical unit's array index is also its virtuoso item index
+// loop, so a historical unit's array index is also its VirtualTranscript item index
 // (the conversation-nav strip relies on this to scrollToIndex by unit).
 
 import type {

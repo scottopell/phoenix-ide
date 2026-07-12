@@ -711,13 +711,13 @@ body.app-viewport-active #root {
   container-type: inline-size;
 }
 
-.message-virtuoso {
+.message-virtual-transcript {
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
 }
 
-.virtuoso-row {
+.virtual-transcript-row {
   max-width: 800px;
   margin: 0 auto;
   padding-bottom: 8px;

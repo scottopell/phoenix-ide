@@ -270,7 +270,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   contentRef,
 }: SystemPromptHeaderProps) {
   return (
-    <div className="virtuoso-row">
+    <div className="virtual-transcript-row">
       <div className={`system-prompt-block${expanded ? ' expanded' : ''}`}>
         <div className="system-prompt-header" onClick={onToggle}>
           <span className="system-prompt-label">System prompt</span>
@@ -970,7 +970,7 @@ function MessageListImpl({
   const itemContent = useCallback(
     (unit: RenderUnit, _index: number) => (
       <div
-        className="virtuoso-row"
+        className="virtual-transcript-row"
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
@@ -1044,7 +1044,7 @@ function MessageListImpl({
             />
           ) : null}
           empty={<EmptyTranscriptState />}
-          className="message-virtuoso"
+          className="message-virtual-transcript"
         />
       </section>
       {!isEmpty && hasUnreadTailContent && (

@@ -6,7 +6,7 @@
 // exclusion, unitIndex correctness (chapters past non-chapter units keep the
 // right index), pending-user handling, and label truncation. unitIndex
 // correctness is also checked end-to-end via buildRenderUnits so the chapter
-// indices are proven to line up with virtuoso's coordinate space.
+// indices are proven to line up with VirtualTranscript's coordinate space.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MockInstance } from 'vitest';
@@ -235,7 +235,7 @@ describe('chapter unitIndex matches buildRenderUnits coordinate space', () => {
     };
   }
 
-  it('chapter unitIndex indexes into the same historicalUnits virtuoso renders', () => {
+  it('chapter unitIndex indexes into the same historicalUnits VirtualTranscript renders', () => {
     const IDLE: ConversationState = { type: 'idle' };
     // user, agent (long prose + a tool_use), tool-result (folds INTO the agent
     // turn, does NOT add a unit), user. So historicalUnits = [user, agent, user]
