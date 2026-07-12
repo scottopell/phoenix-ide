@@ -1426,6 +1426,7 @@ CREATE TABLE IF NOT EXISTS workflow_effects (
     ambiguity_policy TEXT NOT NULL,
     intent_payload TEXT NOT NULL,
     status TEXT NOT NULL,
+    pending_reconciliation INTEGER NOT NULL DEFAULT 0,
     next_eligible_at TEXT,
     destructive_resource TEXT,
     UNIQUE (id, workflow_id, declared_workflow_version, generation),
@@ -1434,7 +1435,8 @@ CREATE TABLE IF NOT EXISTS workflow_effects (
         ON DELETE CASCADE,
     CHECK (role IN ('required', 'optional', 'compensation')),
     CHECK (ambiguity_policy IN ('observable_reconciliation', 'external_idempotency', 'safe_repeatability', 'manual_resolution')),
-    CHECK (status IN ('blocked', 'eligible', 'claimed', 'retry_wait', 'ambiguity_wait', 'receipted', 'invalidated'))
+    CHECK (status IN ('blocked', 'eligible', 'claimed', 'retry_wait', 'ambiguity_wait', 'receipted', 'invalidated')),
+    CHECK (pending_reconciliation IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS workflow_effect_dependencies (
@@ -3314,6 +3316,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_042_workflow_effect_pending_reconciliation_defaults_false() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT pending_reconciliation FROM workflow_effects WHERE id = 'eff'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_042_workflow_effect_pending_reconciliation_rejects_non_boolean_values() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        let bad_insert = sqlx::query(
+            "INSERT INTO workflow_effects \
+             (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, \
+              family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, \
+              status, pending_reconciliation, next_eligible_at, destructive_resource) \
+             VALUES ('eff-bad-pending', 'wf', 'tr', 1, 0, 'wake', 'register', 'intent', 1, 'required', \
+                     'observable_reconciliation', '{}', 'eligible', 2, NULL, NULL)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_insert.is_err());
     }
 
     #[tokio::test]

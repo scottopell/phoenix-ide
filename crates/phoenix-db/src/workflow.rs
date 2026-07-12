@@ -170,6 +170,83 @@ pub enum TransitionCommitOutcome {
     InvalidPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableClaimAuthority {
+    pub workflow_id: String,
+    pub declared_workflow_version: u64,
+    pub generation: u64,
+    pub effect_id: String,
+    pub claim_token: String,
+    pub worker_id: String,
+    pub lease_until: DateTime<Utc>,
+    pub issued_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAttemptRecord {
+    pub attempt_id: String,
+    pub effect_id: String,
+    pub workflow_id: String,
+    pub declared_workflow_version: u64,
+    pub generation: u64,
+    pub ordinal: u64,
+    pub claim: DurableClaimAuthority,
+    pub status: String,
+    pub begun_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimEffectResult {
+    Claimed {
+        authority: DurableClaimAuthority,
+        attempt: Box<DurableAttemptRecord>,
+    },
+    Ineligible,
+    Contended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewClaimResult {
+    Renewed { authority: DurableClaimAuthority },
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeOverExpiredClaimResult {
+    Claimed {
+        authority: DurableClaimAuthority,
+        attempt: Box<DurableAttemptRecord>,
+    },
+    Ineligible,
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableClaimRequest {
+    pub workflow_id: String,
+    pub effect_id: String,
+    pub claim_token: String,
+    pub worker_id: String,
+    pub lease_until: DateTime<Utc>,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableClaimRenewal {
+    pub authority: DurableClaimAuthority,
+    pub now: DateTime<Utc>,
+    pub lease_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableClaimTakeover {
+    pub authority: DurableClaimAuthority,
+    pub replacement_claim_token: String,
+    pub replacement_worker_id: String,
+    pub now: DateTime<Utc>,
+    pub lease_until: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowFailpoint {
     AfterWorkflowInsert,
@@ -449,8 +526,8 @@ impl WorkflowRepository {
                 "INSERT INTO workflow_effects \
                  (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, \
                   family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, \
-                  status, next_eligible_at, destructive_resource) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  status, pending_reconciliation, next_eligible_at, destructive_resource) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15)",
             )
             .bind(&effect.effect_id)
             .bind(&commit.workflow_id)
@@ -580,6 +657,299 @@ impl WorkflowRepository {
 
         tx.commit().await?;
         Ok(TransitionCommitOutcome::Committed)
+    }
+
+    /// Atomically claim one eligible effect exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction or row decoding fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the just-inserted claim row disappears before the same transaction reads it back.
+    pub async fn claim_effect(
+        &self,
+        request: &DurableClaimRequest,
+    ) -> WorkflowRepositoryResult<ClaimEffectResult> {
+        let mut tx = self.pool.begin().await?;
+
+        let insert_claim = sqlx::query(
+            "INSERT INTO workflow_claims \
+             (effect_id, workflow_id, declared_workflow_version, generation, claim_token, worker_id, lease_until, issued_at, revoked_at) \
+             SELECT e.id, e.workflow_id, e.declared_workflow_version, e.generation, ?1, ?2, ?3, ?4, NULL \
+             FROM workflow_effects e \
+             JOIN workflows w ON w.id = e.workflow_id \
+             LEFT JOIN workflow_claims c ON c.effect_id = e.id \
+             WHERE e.workflow_id = ?5 AND e.id = ?6 \
+               AND w.authority = 'engine_protocol' \
+               AND w.execution_mode = 'authoritative' \
+               AND w.status = 'active' \
+               AND e.status = 'eligible' \
+               AND e.pending_reconciliation = 0 \
+               AND e.generation = w.generation \
+               AND c.effect_id IS NULL",
+        )
+        .bind(&request.claim_token)
+        .bind(&request.worker_id)
+        .bind(request.lease_until.to_rfc3339())
+        .bind(request.now.to_rfc3339())
+        .bind(&request.workflow_id)
+        .bind(&request.effect_id)
+        .execute(&mut *tx)
+        .await;
+
+        match insert_claim {
+            Ok(done) if done.rows_affected() == 1 => {}
+            Ok(_) => {
+                tx.rollback().await?;
+                return Ok(ClaimEffectResult::Ineligible);
+            }
+            Err(err) if is_unique_constraint(&err) || is_busy_or_locked(&err) => {
+                tx.rollback().await?;
+                return Ok(ClaimEffectResult::Contended);
+            }
+            Err(err) => {
+                tx.rollback().await?;
+                return Err(err.into());
+            }
+        }
+
+        let authority = load_claim_authority(&mut tx, &request.workflow_id, &request.effect_id)
+            .await?
+            .expect("inserted claim must be readable");
+        let attempt = insert_attempt_for_claim(&mut tx, &authority).await?;
+
+        let updated = sqlx::query(
+            "UPDATE workflow_effects \
+             SET status = 'claimed' \
+             WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND status = 'eligible'",
+        )
+        .bind(&authority.effect_id)
+        .bind(&authority.workflow_id)
+        .bind(to_i64(
+            authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(ClaimEffectResult::Contended);
+        }
+
+        tx.commit().await?;
+        Ok(ClaimEffectResult::Claimed {
+            authority,
+            attempt: Box::new(attempt),
+        })
+    }
+
+    /// Renew an exact live claim authority while strictly extending its lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the update fails.
+    pub async fn renew_claim(
+        &self,
+        renewal: &DurableClaimRenewal,
+    ) -> WorkflowRepositoryResult<RenewClaimResult> {
+        if renewal.lease_until <= renewal.now
+            || renewal.lease_until <= renewal.authority.lease_until
+        {
+            return Ok(RenewClaimResult::StaleAuthority);
+        }
+
+        let updated = sqlx::query(
+            "UPDATE workflow_claims \
+             SET lease_until = ?1 \
+             WHERE effect_id = ?2 AND workflow_id = ?3 AND declared_workflow_version = ?4 \
+               AND generation = ?5 AND claim_token = ?6 AND worker_id = ?7 \
+               AND lease_until = ?8 AND issued_at = ?9 AND lease_until > ?10",
+        )
+        .bind(renewal.lease_until.to_rfc3339())
+        .bind(&renewal.authority.effect_id)
+        .bind(&renewal.authority.workflow_id)
+        .bind(to_i64(
+            renewal.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            renewal.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&renewal.authority.claim_token)
+        .bind(&renewal.authority.worker_id)
+        .bind(renewal.authority.lease_until.to_rfc3339())
+        .bind(renewal.authority.issued_at.to_rfc3339())
+        .bind(renewal.now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() != 1 {
+            return Ok(RenewClaimResult::StaleAuthority);
+        }
+
+        let mut authority = renewal.authority.clone();
+        authority.lease_until = renewal.lease_until;
+        Ok(RenewClaimResult::Renewed { authority })
+    }
+
+    /// Replace an expired exact claim authority with a fresh authority and new attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction or row decoding fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the just-updated claim row disappears before the same transaction reads it back.
+    #[allow(clippy::too_many_lines)]
+    pub async fn take_over_expired_claim(
+        &self,
+        takeover: &DurableClaimTakeover,
+    ) -> WorkflowRepositoryResult<TakeOverExpiredClaimResult> {
+        if takeover.lease_until <= takeover.now {
+            return Ok(TakeOverExpiredClaimResult::StaleAuthority);
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        let updated_claim = sqlx::query(
+            "UPDATE workflow_claims \
+             SET claim_token = ?1, worker_id = ?2, lease_until = ?3, issued_at = ?4, revoked_at = NULL \
+             WHERE effect_id = ?5 AND workflow_id = ?6 AND declared_workflow_version = ?7 \
+               AND generation = ?8 AND claim_token = ?9 AND worker_id = ?10 \
+               AND lease_until = ?11 AND issued_at = ?12 AND lease_until <= ?13 \
+               AND EXISTS (\
+                   SELECT 1 FROM workflow_effects e \
+                   JOIN workflows w ON w.id = e.workflow_id \
+                   WHERE e.id = workflow_claims.effect_id AND e.workflow_id = workflow_claims.workflow_id \
+                     AND e.declared_workflow_version = workflow_claims.declared_workflow_version \
+                     AND e.generation = workflow_claims.generation \
+                     AND w.authority = 'engine_protocol' \
+                     AND w.execution_mode = 'authoritative' \
+                     AND w.status = 'active' \
+                     AND e.status = 'claimed'\
+               )",
+        )
+        .bind(&takeover.replacement_claim_token)
+        .bind(&takeover.replacement_worker_id)
+        .bind(takeover.lease_until.to_rfc3339())
+        .bind(takeover.now.to_rfc3339())
+        .bind(&takeover.authority.effect_id)
+        .bind(&takeover.authority.workflow_id)
+        .bind(to_i64(
+            takeover.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            takeover.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&takeover.authority.claim_token)
+        .bind(&takeover.authority.worker_id)
+        .bind(takeover.authority.lease_until.to_rfc3339())
+        .bind(takeover.authority.issued_at.to_rfc3339())
+        .bind(takeover.now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        if updated_claim.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(TakeOverExpiredClaimResult::StaleAuthority);
+        }
+
+        let authority = load_claim_authority(
+            &mut tx,
+            &takeover.authority.workflow_id,
+            &takeover.authority.effect_id,
+        )
+        .await?
+        .expect("updated claim must be readable");
+
+        sqlx::query(
+            "UPDATE workflow_attempts \
+             SET status = 'authority_lost' \
+             WHERE effect_id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND claim_token = ?5 AND claim_worker_id = ?6 \
+               AND claim_lease_until = ?7 AND claim_issued_at = ?8 AND status = 'begun'",
+        )
+        .bind(&takeover.authority.effect_id)
+        .bind(&takeover.authority.workflow_id)
+        .bind(to_i64(
+            takeover.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            takeover.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&takeover.authority.claim_token)
+        .bind(&takeover.authority.worker_id)
+        .bind(takeover.authority.lease_until.to_rfc3339())
+        .bind(takeover.authority.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        let attempt = insert_attempt_for_claim(&mut tx, &authority).await?;
+
+        let updated_effect = sqlx::query(
+            "UPDATE workflow_effects \
+             SET status = 'claimed' \
+             WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND status = 'claimed'",
+        )
+        .bind(&authority.effect_id)
+        .bind(&authority.workflow_id)
+        .bind(to_i64(
+            authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if updated_effect.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(TakeOverExpiredClaimResult::Ineligible);
+        }
+
+        let flagged = sqlx::query(
+            "UPDATE workflow_effects \
+             SET pending_reconciliation = 1 \
+             WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND status = 'claimed' AND pending_reconciliation = 0",
+        )
+        .bind(&authority.effect_id)
+        .bind(&authority.workflow_id)
+        .bind(to_i64(
+            authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if flagged.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(TakeOverExpiredClaimResult::Ineligible);
+        }
+
+        tx.commit().await?;
+        Ok(TakeOverExpiredClaimResult::Claimed {
+            authority,
+            attempt: Box::new(attempt),
+        })
     }
 }
 
@@ -980,6 +1350,94 @@ async fn selection_supports_codec_and_executor(
     }
 
     Ok(true)
+}
+
+async fn load_claim_authority(
+    tx: &mut SqliteConnection,
+    workflow_id: &str,
+    effect_id: &str,
+) -> WorkflowRepositoryResult<Option<DurableClaimAuthority>> {
+    let row = sqlx::query(
+        "SELECT workflow_id, declared_workflow_version, generation, effect_id, claim_token, worker_id, lease_until, issued_at \
+         FROM workflow_claims WHERE workflow_id = ?1 AND effect_id = ?2",
+    )
+    .bind(workflow_id)
+    .bind(effect_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    Ok(row.map(|row| DurableClaimAuthority {
+        workflow_id: row.get("workflow_id"),
+        declared_workflow_version: row
+            .get::<i64, _>("declared_workflow_version")
+            .try_into()
+            .expect("declared workflow version fits u64"),
+        generation: row
+            .get::<i64, _>("generation")
+            .try_into()
+            .expect("generation fits u64"),
+        effect_id: row.get("effect_id"),
+        claim_token: row.get("claim_token"),
+        worker_id: row.get("worker_id"),
+        lease_until: DateTime::parse_from_rfc3339(&row.get::<String, _>("lease_until"))
+            .expect("claim lease_until is valid RFC3339")
+            .with_timezone(&Utc),
+        issued_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("issued_at"))
+            .expect("claim issued_at is valid RFC3339")
+            .with_timezone(&Utc),
+    }))
+}
+
+async fn insert_attempt_for_claim(
+    tx: &mut SqliteConnection,
+    authority: &DurableClaimAuthority,
+) -> WorkflowRepositoryResult<DurableAttemptRecord> {
+    let ordinal: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_attempts WHERE effect_id = ?1",
+    )
+    .bind(&authority.effect_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let begun_at = authority.issued_at;
+    let attempt_id = format!("attempt-{}", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO workflow_attempts \
+         (id, effect_id, workflow_id, declared_workflow_version, generation, claim_token, \
+          claim_worker_id, claim_lease_until, claim_issued_at, ordinal, status, begun_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'begun', ?11)",
+    )
+    .bind(&attempt_id)
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .bind(ordinal)
+    .bind(begun_at.to_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+
+    Ok(DurableAttemptRecord {
+        attempt_id,
+        effect_id: authority.effect_id.clone(),
+        workflow_id: authority.workflow_id.clone(),
+        declared_workflow_version: authority.declared_workflow_version,
+        generation: authority.generation,
+        ordinal: ordinal.try_into().expect("ordinal fits u64"),
+        claim: authority.clone(),
+        status: "begun".to_owned(),
+        begun_at,
+    })
 }
 
 fn validate_dependency_dag_acyclic(
@@ -1499,6 +1957,26 @@ mod tests {
         assert_no_orphan_workflows(&pool).await;
     }
 
+    fn claim_request(now: DateTime<Utc>, lease_until: DateTime<Utc>) -> DurableClaimRequest {
+        DurableClaimRequest {
+            workflow_id: "wf-1".to_owned(),
+            effect_id: "eff-1".to_owned(),
+            claim_token: "claim-1".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            lease_until,
+            now,
+        }
+    }
+
+    async fn seed_claimable_effect(repo: &WorkflowRepository) {
+        register_and_accept(repo).await;
+        let outcome = repo
+            .persist_transition_plan(&transition_commit())
+            .await
+            .unwrap();
+        assert_eq!(outcome, TransitionCommitOutcome::Committed);
+    }
+
     fn transition_commit() -> DurableWorkflowTransitionCommit {
         DurableWorkflowTransitionCommit {
             transition_id: "tr-1".to_owned(),
@@ -1588,6 +2066,223 @@ mod tests {
             .unwrap();
         let result = repo.accept_external_workflow(&acceptance()).await.unwrap();
         assert!(matches!(result, ExternalAcceptanceResult::New { .. }));
+    }
+
+    #[tokio::test]
+    async fn claim_effect_has_one_winner_under_competition() {
+        for _ in 0..10 {
+            let pool_a = file_backed_test_pool(2).await;
+            let repo_a = Arc::new(WorkflowRepository::new(pool_a.clone()));
+            seed_claimable_effect(&repo_a).await;
+
+            let db_path: String = sqlx::query("PRAGMA database_list")
+                .fetch_all(&pool_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|row| {
+                    let name: String = row.get(1);
+                    (name == "main").then(|| row.get::<String, _>(2))
+                })
+                .unwrap();
+            let opts = SqliteConnectOptions::from_str(&sqlite_file_url(Path::new(&db_path)))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_secs(5))
+                .foreign_keys(true);
+            let pool_b = SqlitePoolOptions::new()
+                .max_connections(2)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            let repo_b = Arc::new(WorkflowRepository::new(pool_b));
+
+            let now = Utc::now();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut req_b = claim_request(now, now + chrono::Duration::seconds(30));
+            req_b.claim_token = "claim-2".to_owned();
+            req_b.worker_id = "worker-2".to_owned();
+
+            let t1 = {
+                let repo = Arc::clone(&repo_a);
+                let barrier = Arc::clone(&barrier);
+                let req = claim_request(now, now + chrono::Duration::seconds(30));
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    repo.claim_effect(&req).await.unwrap()
+                })
+            };
+            let t2 = {
+                let repo = Arc::clone(&repo_b);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    repo.claim_effect(&req_b).await.unwrap()
+                })
+            };
+
+            let left = t1.await.unwrap();
+            let right = t2.await.unwrap();
+            match (left, right) {
+                (
+                    ClaimEffectResult::Claimed { authority, attempt },
+                    ClaimEffectResult::Contended | ClaimEffectResult::Ineligible,
+                )
+                | (
+                    ClaimEffectResult::Contended | ClaimEffectResult::Ineligible,
+                    ClaimEffectResult::Claimed { authority, attempt },
+                ) => {
+                    assert_eq!(authority.effect_id, "eff-1");
+                    assert_eq!(attempt.ordinal, 0);
+                }
+                other => panic!("expected one winner, got {other:?}"),
+            }
+
+            let claims: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'",
+            )
+            .fetch_one(&pool_a)
+            .await
+            .unwrap();
+            let attempts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workflow_attempts WHERE effect_id = 'eff-1'",
+            )
+            .fetch_one(&pool_a)
+            .await
+            .unwrap();
+            assert_eq!(claims, 1);
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn renew_rejects_shorten_and_takeover_rejects_pre_expiry() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, _) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let shortened = repo
+            .renew_claim(&DurableClaimRenewal {
+                authority: authority.clone(),
+                now: now + chrono::Duration::seconds(5),
+                lease_until: now + chrono::Duration::seconds(20),
+            })
+            .await
+            .unwrap();
+        assert_eq!(shortened, RenewClaimResult::StaleAuthority);
+
+        let pre_expiry = repo
+            .take_over_expired_claim(&DurableClaimTakeover {
+                authority: authority.clone(),
+                replacement_claim_token: "claim-2".to_owned(),
+                replacement_worker_id: "worker-2".to_owned(),
+                now: now + chrono::Duration::seconds(29),
+                lease_until: now + chrono::Duration::seconds(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(pre_expiry, TakeOverExpiredClaimResult::StaleAuthority);
+    }
+
+    #[tokio::test]
+    async fn takeover_allows_exact_expiry_and_old_authority_no_longer_matches() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let authority = match claim {
+            ClaimEffectResult::Claimed { authority, .. } => authority,
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let takeover_now = authority.lease_until;
+        let takeover = repo
+            .take_over_expired_claim(&DurableClaimTakeover {
+                authority: authority.clone(),
+                replacement_claim_token: "claim-2".to_owned(),
+                replacement_worker_id: "worker-2".to_owned(),
+                now: takeover_now,
+                lease_until: takeover_now + chrono::Duration::seconds(30),
+            })
+            .await
+            .unwrap();
+        let (replacement, attempt) = match takeover {
+            TakeOverExpiredClaimResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (TakeOverExpiredClaimResult::Ineligible
+            | TakeOverExpiredClaimResult::StaleAuthority) => {
+                panic!("expected takeover claim, got {other:?}")
+            }
+        };
+        assert_eq!(attempt.ordinal, 1);
+        assert_eq!(replacement.claim_token, "claim-2");
+
+        let renewed_old = repo
+            .renew_claim(&DurableClaimRenewal {
+                authority: authority.clone(),
+                now: takeover_now,
+                lease_until: takeover_now + chrono::Duration::seconds(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renewed_old, RenewClaimResult::StaleAuthority);
+
+        let current_claim = sqlx::query(
+            "SELECT claim_token, worker_id, lease_until FROM workflow_claims WHERE effect_id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(current_claim.get::<String, _>("claim_token"), "claim-2");
+        assert_eq!(current_claim.get::<String, _>("worker_id"), "worker-2");
+
+        let pending_reconciliation: i64 = sqlx::query_scalar(
+            "SELECT pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_reconciliation, 1);
+
+        let claim_after_takeover = repo
+            .claim_effect(&DurableClaimRequest {
+                workflow_id: "wf-1".to_owned(),
+                effect_id: "eff-1".to_owned(),
+                claim_token: "claim-3".to_owned(),
+                worker_id: "worker-3".to_owned(),
+                lease_until: takeover_now + chrono::Duration::seconds(90),
+                now: takeover_now + chrono::Duration::seconds(61),
+            })
+            .await
+            .unwrap();
+        assert_eq!(claim_after_takeover, ClaimEffectResult::Ineligible);
+
+        let last_attempt_status: String = sqlx::query_scalar(
+            "SELECT status FROM workflow_attempts WHERE effect_id = 'eff-1' AND ordinal = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(last_attempt_status, "authority_lost");
     }
 
     #[tokio::test]
