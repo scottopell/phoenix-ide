@@ -432,6 +432,26 @@ async fn wait_for_text_response(
     close_after_completion: bool,
 ) -> ToolOutput {
     let deadline = Instant::now() + timeout;
+    // Install terminal ownership before the cancellable readiness loop. The
+    // observer remains responsible for durable evidence and optional cleanup if
+    // the tool call is cancelled while waiting.
+    ensure_terminal_observer(
+        ctx,
+        config_path,
+        socket_path,
+        target,
+        &RunObservation {
+            captured_output: CapturedOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            exit_code: None,
+            readiness_seen: false,
+        },
+        close_after_completion,
+        run_id,
+    );
     loop {
         let observation = observe_window(config_path, socket_path, &target.window_id, Some(text))
             .await

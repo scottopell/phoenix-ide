@@ -258,6 +258,7 @@ pub struct TmuxTerminalEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DurableEvidenceStatus {
+    LiveRun,
     Exited,
     KillPending,
     Killed,
@@ -282,7 +283,7 @@ impl DurableTerminalEvidence {
         let status = match self.status {
             DurableEvidenceStatus::Exited => TmuxTerminalStatus::Exited,
             DurableEvidenceStatus::Killed => TmuxTerminalStatus::Killed,
-            DurableEvidenceStatus::KillPending => return None,
+            DurableEvidenceStatus::LiveRun | DurableEvidenceStatus::KillPending => return None,
         };
         Some(TmuxTerminalEvidence {
             observed_at: self.observed_at.into(),
@@ -733,7 +734,20 @@ impl TmuxRegistry {
             },
         );
         self.terminal_evidence.write().await.remove(&key);
-        self.remove_evidence_file(work_scope, window_id).await?;
+        let socket_path = entry.read().await.socket_path.clone();
+        let ownership = DurableTerminalEvidence {
+            version: TERMINAL_EVIDENCE_VERSION,
+            socket_identity: socket_path.to_string_lossy().into_owned(),
+            generation: generation.clone(),
+            window_id: window_id.to_string(),
+            observed_at: Utc::now(),
+            status: DurableEvidenceStatus::LiveRun,
+            exit_code: None,
+            duration_ms: 0,
+            tail: String::new(),
+        };
+        self.write_durable_evidence(work_scope, window_id, &ownership)
+            .await?;
         let id = TmuxWindowRunId(uuid::Uuid::new_v4().to_string());
         self.window_runs
             .lock()
@@ -2792,7 +2806,17 @@ mod tests {
             .unwrap();
         assert!(registry.evidence_path(&scope, "@1").exists());
         registry.register_window_start(&scope, "@1").await.unwrap();
-        assert!(!registry.evidence_path(&scope, "@1").exists());
+        let ownership: DurableTerminalEvidence = serde_json::from_slice(
+            &tokio::fs::read(registry.evidence_path(&scope, "@1"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ownership.status, DurableEvidenceStatus::LiveRun);
+        assert_eq!(
+            ownership.generation,
+            registry.current_generation(&scope).await.unwrap()
+        );
         assert!(!registry
             .terminal_evidence
             .read()

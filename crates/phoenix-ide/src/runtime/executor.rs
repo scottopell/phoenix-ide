@@ -2949,8 +2949,9 @@ where
             )
         });
         let effects_result = async {
-            if let Some(drain_event) =
-                self.maybe_drain_steering_queue(&old_state, is_error_dismissal)
+            if let Some(drain_event) = (!park_after_checkpoint)
+                .then(|| self.maybe_drain_steering_queue(&old_state, is_error_dismissal))
+                .flatten()
             {
                 self.run_effects_with_inline_drain(effects, drain_event, &mut generated_events)
                     .await?;

@@ -5377,12 +5377,33 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    /// Returns whether at least one pending contract belongs to the specified
-    /// conversation and registering tool round. This intentionally projects only
-    /// existence; terminal history and payloads are not decoded.
+    /// Returns whether lifecycle mutation is blocked by pending wake authority or delivery.
     ///
     /// # Errors
+    /// Returns an error if the lifecycle-obligation query fails.
+    pub async fn wake_lifecycle_blocked(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM wake_contracts
+                WHERE current_conversation_id = ?1 AND status = 'pending'
+                UNION ALL
+                SELECT 1 FROM wake_inbox
+                WHERE conversation_id = ?1 AND auto_resume = 1 AND consumed_at IS NULL
+                UNION ALL
+                SELECT 1 FROM wake_resume_outbox
+                WHERE conversation_id = ?1 AND status = 'pending'
+            )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
+    /// Returns whether at least one pending contract belongs to the specified
+    /// conversation and registering tool round.
     ///
+    /// # Errors
     /// Returns an error if the pending-registration query fails.
     pub async fn has_pending_wake_registration(
         &self,

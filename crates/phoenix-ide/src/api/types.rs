@@ -244,11 +244,15 @@ impl WakeStatusSnapshot {
             })
             .map(|contract| contract.expires_at)
             .min();
+        let lifecycle_blocked = db
+            .wake_lifecycle_blocked(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             conversation_id: conversation_id.to_string(),
             pending_count,
             soonest_expiry,
-            lifecycle_blocked: pending_count > 0,
+            lifecycle_blocked,
             contracts: contracts
                 .into_iter()
                 .map(WakeContractStatus::from)
