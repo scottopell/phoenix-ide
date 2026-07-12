@@ -312,6 +312,63 @@ including visible state, capabilities, cancellation and retry meaning, lifecycle
 guards, terminal outcomes, and operator explanations. Protocol identity MAY be
 shown diagnostically but SHALL NOT alter product meaning.
 
+### REQ-DWF-029: Externally Retryable Acceptance
+
+WHEN a profile permits acceptance requests to be retried across a client-server
+boundary
+THE profile SHALL require a client-supplied stable idempotency key, atomically
+bind that key to exactly one accepted workflow, and return a typed acceptance
+receipt that echoes the key and identifies the durable workflow or product handle
+the client can observe.
+
+A retry with the same profile, authority scope, and idempotency key SHALL return
+the same acceptance receipt without creating another workflow or repeating
+acceptance effects. A conflicting request that reuses the key for different
+intent SHALL be rejected. Profiles without an externally retryable acceptance
+boundary SHALL omit this capability rather than fabricate a key.
+
+### REQ-DWF-030: Cross-Client Projection Parity
+
+THE SYSTEM SHALL expose each supported client's user-action capabilities and
+user-visible workflow presentation from the same typed product-state and engine
+projection enforced by API and runtime actions. Supported clients SHALL NOT
+maintain an independent semantic policy for compose, cancel, retry, delete,
+resolve, lifecycle transition, or runtime start.
+
+Equivalent accepted intent SHALL produce equivalent visible state,
+presentation detail, capabilities, and terminal meaning on every supported
+client surface. A conversation holding pending wake obligations SHALL remain
+runtime-idle when otherwise idle and SHALL expose those obligations through
+presentation detail and capabilities rather than a fabricated busy state.
+
+### REQ-DWF-031: Independent Inbox Consumers
+
+WHEN a durable reducer-inbox observation is offered to an additional delivery
+consumer
+THE SYSTEM SHALL give that consumer an independent durable disposition or cursor
+without mutating, consuming, or serving as a second representation of reducer
+delivery or runtime acceptance state.
+
+A consumer retry or failure SHALL NOT block or duplicate reducer consumption,
+runtime acceptance, or another consumer's progress. Ephemeral notification
+transport SHALL NOT be the authority for whether the durable observation exists
+or remains owed to another consumer.
+
+### REQ-DWF-032: Durable-Workflow Adoption Boundary
+
+WHEN accepted intent can create externally observable work that spans a crash
+boundary and requires effect ambiguity handling, leased retry or takeover,
+cancellation or compensation arbitration, durable deadlines, owed reducer or
+runtime delivery, or protocol shadow and cutover
+THE SYSTEM SHALL model that work as a durable-workflow profile or extend an
+existing profile.
+
+Work that completes as one synchronous local transaction without durable owed
+work, external ambiguity, or independent retry authority SHALL remain outside
+the workflow engine. A new profile SHALL satisfy protocol admission before it
+can accept work; implementation effort alone SHALL NOT justify routing around
+the engine.
+
 ## Wake Profile
 
 ### REQ-DWF-WAKE-001: Registration Mapping
@@ -383,6 +440,10 @@ THE creation profile SHALL atomically persist the user-visible conversation shel
 creation intent, profile protocol authority, initial workflow transition, effect
 DAG, and barriers before filesystem, Git, attachment, runtime, or provider effects
 begin.
+
+Creation acceptance SHALL declare externally retryable acceptance. Its
+client-supplied idempotency key SHALL therefore be load-bearing under
+REQ-DWF-029 rather than incidental request metadata.
 
 ### REQ-DWF-CREATE-002: Creation Effect Mapping
 

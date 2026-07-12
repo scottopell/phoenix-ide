@@ -45,6 +45,7 @@ new acceptances.
 | REQ-DWF-020 divergence severity and operator action | Specified | Canonical eight-kind vocabulary; profile mappings; operator inventory and halt tests |
 | REQ-DWF-021 evidence-based wake/creation cutover | Specified | Required deterministic and production schedule classes; authorization audit |
 | REQ-DWF-022 mixed-authority semantic parity | Specified | Cross-protocol product projection and capability comparisons |
+| REQ-DWF-029–032 client acceptance, projection parity, independent consumers, adoption boundary | Specified | Idempotent acceptance campaigns; cross-client projection tests; consumer isolation; profile-admission review |
 | REQ-DWF-WAKE-001–005 wake profile | Specified | Bash/tmux registration-to-resume end-to-end campaigns |
 | REQ-DWF-CREATE-001–005 creation profile | Specified | Shell-first creation, Git/resource, cancel/delete campaigns |
 
@@ -54,6 +55,9 @@ new acceptances.
 - ADR-012 separates workflow-version serialization from leased effect authority.
 - ADR-013 separates observation, receipt, and runtime acceptance and permits the
   normalized owed-acceptance capability only for profiles that need it.
+- ADR-013 makes externally retryable acceptance a typed profile capability,
+  extends semantic projection parity across supported clients, isolates additional
+  inbox consumers, and defines the engine adoption perimeter.
 - ADR-007 remains historical authority for creation's fenced reconciliation.
 - ADR-009 and ADR-010 remain historical authority for wake registration,
   observations, and durable resume acceptance.

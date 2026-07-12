@@ -137,6 +137,22 @@ value ManualChoiceDeclaration {
     payload: String
 }
 
+value ExternalAcceptanceRequest {
+    profile: ProfileRef
+    authority_scope: String
+    idempotency_key: String
+    intent_fingerprint: String
+    snapshot_codec: CodecRef
+    snapshot_payload: String
+}
+
+value ExternalAcceptanceReceipt {
+    idempotency_key: String
+    workflow_id: String
+    handle_codec: CodecRef
+    handle_payload: String
+}
+
 value TransitionPlan {
     snapshot_codec: CodecRef
     snapshot_payload: String
@@ -178,6 +194,7 @@ entity ProfileProtocolSelection {
     authority: SemanticAuthority
     accepting: Boolean
     runtime_acceptance_enabled: Boolean
+    external_acceptance_enabled: Boolean
     registered_at: Timestamp
     drained_at: Timestamp? when accepting = false
 }
@@ -201,6 +218,23 @@ entity DrainProof {
     evidence: DrainProofEvidence
     complete: Boolean
     generated_at: Timestamp
+}
+
+entity ExternalAcceptanceBinding {
+    selection: ProfileProtocolSelection
+    authority_scope: String
+    idempotency_key: String
+    intent_fingerprint: String
+    workflow: Workflow
+    receipt: ExternalAcceptanceReceipt
+    accepted_at: Timestamp
+}
+
+entity InboxConsumerDisposition {
+    inbox: ReducerInbox
+    consumer_kind: String
+    status: DeliveryStatus
+    consumed_at: Timestamp? when status = consumed
 }
 
 entity Workflow {
@@ -415,6 +449,11 @@ entity ShadowDivergence {
 -- next_receipt_id(), next_reducer_inbox_id(), next_manual_resolution_id()
 -- next_shadow_divergence_id(), next_drain_proof_id(), opaque_claim_token()
 -- profile_registered(profile), profile_accepting_new_work(profile)
+-- profile_declares_external_acceptance(profile)
+-- external_acceptance_binding_exists(selection, authority_scope, idempotency_key)
+-- external_acceptance_binding(selection, authority_scope, idempotency_key)
+-- external_acceptance_receipt(request, workflow): ExternalAcceptanceReceipt
+-- accepted_workflow(), no_additional_workflow_created_for(binding)
 -- profile_has_lossless_decoder(profile, codec), profile_executor_available(profile)
 -- plan_codecs_supported(profile, plan), plan_is_complete(plan)
 -- plan_effect_ids_unique(plan), plan_barrier_ids_unique(plan)
@@ -442,6 +481,9 @@ entity ShadowDivergence {
 -- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
+-- consumer_is_independent_from_reducer_and_runtime(consumer), consumer_kind(consumer)
+-- disposition_consumed_at(status), reducer_inbox_delivery_unchanged(inbox)
+-- runtime_acceptance_unchanged(inbox)
 -- shadow_matches_authoritative_input(shadow, authoritative_workflow)
 -- shadow_has_no_execution_authority(workflow)
 -- drain_query_identity(selection), drain_query_version(selection)
@@ -464,6 +506,7 @@ rule RegisterProfileProtocol {
     ensures: ProfileProtocolSelection.created(
         profile: profile, authority: authority, accepting: false,
         runtime_acceptance_enabled: profile_declares_runtime_acceptance(profile),
+        external_acceptance_enabled: profile_declares_external_acceptance(profile),
         registered_at: now()
     )
     ensures: ProfileCodecsAndExecutorPersisted(profile, authority, codecs, executor)
@@ -538,6 +581,51 @@ rule AcceptWorkflow {
         accepted_at: now()
     )
     ensures: AcceptanceOutcome(accepted)
+}
+
+rule AcceptExternallyRetryableWorkflow {
+    when: ExternalWorkflowAcceptanceRequested(client, request)
+    let selection = accepting_selection_for(request.profile)
+    requires: selection.accepting = true
+    requires: selection.external_acceptance_enabled = true
+    requires: not external_acceptance_binding_exists(selection, request.authority_scope, request.idempotency_key)
+    requires: profile_has_lossless_decoder(request.profile, request.snapshot_codec)
+    ensures: Workflow.created(
+        id: next_workflow_id(), profile: request.profile,
+        authority: selection.authority, execution_mode: authoritative,
+        authoritative_workflow: null, protocol_selection: selection,
+        version: 0, generation: 0, status: active,
+        snapshot_codec: request.snapshot_codec,
+        snapshot_payload: request.snapshot_payload, accepted_at: now()
+    )
+    ensures: ExternalAcceptanceBinding.created(
+        selection: selection, authority_scope: request.authority_scope,
+        idempotency_key: request.idempotency_key,
+        intent_fingerprint: request.intent_fingerprint,
+        workflow: accepted_workflow(), receipt: external_acceptance_receipt(request, accepted_workflow()),
+        accepted_at: now()
+    )
+    ensures: ExternalAcceptanceOutcome(external_acceptance_receipt(request, accepted_workflow()))
+}
+
+rule ReplayExternallyRetryableAcceptance {
+    when: ExternalWorkflowAcceptanceRequested(client, request)
+    let selection = accepting_selection_for(request.profile)
+    let binding = external_acceptance_binding(selection, request.authority_scope, request.idempotency_key)
+    requires: binding != null
+    requires: binding.intent_fingerprint = request.intent_fingerprint
+    ensures: ExternalAcceptanceOutcome(binding.receipt)
+    ensures: no_additional_workflow_created_for(binding)
+}
+
+rule RejectConflictingExternalAcceptanceKey {
+    when: ExternalWorkflowAcceptanceRequested(client, request)
+    let selection = accepting_selection_for(request.profile)
+    let binding = external_acceptance_binding(selection, request.authority_scope, request.idempotency_key)
+    requires: binding != null
+    requires: binding.intent_fingerprint != request.intent_fingerprint
+    ensures: ExternalAcceptanceConflict(request.idempotency_key)
+    ensures: no_additional_workflow_created_for(binding)
 }
 
 rule RejectUnsupportedWorkflowCodec {
@@ -926,10 +1014,22 @@ rule RecordShadowDivergence {
 -- Surfaces
 ------------------------------------------------------------
 
+rule RecordIndependentInboxConsumerDisposition {
+    when: InboxConsumerDeliveryRecorded(consumer, inbox, status)
+    requires: consumer_is_independent_from_reducer_and_runtime(consumer)
+    ensures: InboxConsumerDisposition.created(
+        inbox: inbox, consumer_kind: consumer_kind(consumer), status: status,
+        consumed_at: disposition_consumed_at(status)
+    )
+    ensures: reducer_inbox_delivery_unchanged(inbox)
+    ensures: runtime_acceptance_unchanged(inbox)
+}
+
 surface WorkflowAcceptanceSurface {
     facing user: WorkflowClient
     provides:
         WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
+        ExternalWorkflowAcceptanceRequested(client, request)
 }
 
 surface ReducerCommitSurface {
@@ -939,6 +1039,13 @@ surface ReducerCommitSurface {
         ReducerPlanCommitRequested(reducer, workflow, decision)
         ReducerInboxAcceptanceRequested(reducer, inbox, decision)
             when inbox.workflow = workflow
+}
+
+surface InboxConsumerSurface {
+    facing user: WorkflowClient
+    context inbox: ReducerInbox
+    provides:
+        InboxConsumerDeliveryRecorded(consumer, inbox, status)
 }
 
 surface EffectClaimSurface {
@@ -1114,6 +1221,22 @@ invariant CompensationCannotSatisfyRequiredWork {
 
 invariant ShadowReferencesAuthorityWithoutBeingAuthority {
     every_shadow_workflow_references_exactly_one_authoritative_workflow_and_no_shadow_value_inhabits_semantic_authority
+}
+
+invariant ExternalAcceptanceKeyBindsExactlyOneWorkflow {
+    every_external_acceptance_key_within_profile_and_authority_scope_has_exactly_one_intent_and_workflow
+}
+
+invariant SupportedClientsShareOneSemanticProjection {
+    every_supported_client_projection_equals_the_product_reducer_capability_and_presentation_projection
+}
+
+invariant IndependentInboxConsumersDoNotOwnReducerDelivery {
+    every_additional_inbox_consumer_has_independent_disposition_and_never_mutates_reducer_delivery_or_runtime_acceptance
+}
+
+invariant CrashSpanningExternalWorkUsesAdmittedProfiles {
+    every_accepted_intent_requiring_ambiguity_leases_compensation_deadlines_owed_delivery_or_protocol_migration_uses_an_admitted_workflow_profile
 }
 
 invariant ProtocolDrainPreservesAuthority {
