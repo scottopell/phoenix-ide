@@ -6,7 +6,7 @@
 -- reducer mapping, and projections. Wake and creation behavior remains in their
 -- respective profile specifications.
 --
--- Requirement traceability: REQ-DWF-001 through REQ-DWF-018.
+-- Requirement traceability: REQ-DWF-001 through REQ-DWF-022.
 
 ------------------------------------------------------------
 -- Types
@@ -40,7 +40,8 @@ enum DivergenceSeverity { blocking | actionable | informational }
 enum DivergenceAction { halt_acceptance | retain_authority_and_investigate | record_only }
 
 enum ShadowDivergenceKind {
-    snapshot | transition | effect_plan | observation | receipt | reducer_event | projection
+    snapshot | transition | effect_plan | observation | receipt | reducer_event
+    | capability | user_projection
 }
 enum Capability {
     compose | runtime_start | cancel | retry | delete
@@ -62,6 +63,22 @@ value ProfileRef {
 value CodecRef {
     family: String
     version: Integer
+}
+
+value DrainCategoryEvidence {
+    count: Integer
+    identities: List<String>
+}
+
+value DrainProofEvidence {
+    nonterminal_workflows: DrainCategoryEvidence
+    active_or_unexpired_claims: DrainCategoryEvidence
+    eligible_or_retry_effects: DrainCategoryEvidence
+    uncompensated_effects: DrainCategoryEvidence
+    unresolved_manual_resolutions: DrainCategoryEvidence
+    pending_reducer_inbox: DrainCategoryEvidence
+    owed_acceptance: DrainCategoryEvidence
+    blocking_divergences: DrainCategoryEvidence
 }
 
 value ClaimAuthority {
@@ -173,6 +190,17 @@ entity ProfileCodec {
 entity ProfileExecutor {
     selection: ProfileProtocolSelection
     executor_kind: String
+}
+
+entity DrainProof {
+    id: String
+    selection: ProfileProtocolSelection
+    authority: SemanticAuthority
+    query_identity: String
+    query_version: Integer
+    evidence: DrainProofEvidence
+    complete: Boolean
+    generated_at: Timestamp
 }
 
 entity Workflow {
@@ -366,8 +394,10 @@ entity ShadowDivergence {
     shadow_workflow: Workflow
     authoritative_workflow: Workflow
     kind: ShadowDivergenceKind
+    profile_detail_kind: String
     severity: DivergenceSeverity
     required_action: DivergenceAction
+    evidence_identity: String
     resolved_at: Timestamp?
     expected_codec: CodecRef
     expected_payload: String
@@ -383,7 +413,7 @@ entity ShadowDivergence {
 -- Each helper is pure unless its name denotes an emitted request or persisted fact.
 -- next_workflow_id(), next_transition_id(), next_attempt_id(), next_observation_id()
 -- next_receipt_id(), next_reducer_inbox_id(), next_manual_resolution_id()
--- next_shadow_divergence_id(), opaque_claim_token()
+-- next_shadow_divergence_id(), next_drain_proof_id(), opaque_claim_token()
 -- profile_registered(profile), profile_accepting_new_work(profile)
 -- profile_has_lossless_decoder(profile, codec), profile_executor_available(profile)
 -- plan_codecs_supported(profile, plan), plan_is_complete(plan)
@@ -414,6 +444,12 @@ entity ShadowDivergence {
 -- duplicate_acceptance_starts_no_product_action(owed)
 -- shadow_matches_authoritative_input(shadow, authoritative_workflow)
 -- shadow_has_no_execution_authority(workflow)
+-- drain_query_identity(selection), drain_query_version(selection)
+-- authoritative_drain_evidence(selection): DrainProofEvidence
+-- drain_evidence_is_complete(evidence), every_drain_category_is_zero(evidence)
+-- shadow_rows_excluded_from_authoritative_drain_evidence(selection)
+-- divergence_evidence_identity(shadow, authoritative_workflow, kind, profile_detail_kind)
+-- divergence_inventory_for(selection), latest_drain_proof_for(selection)
 -- no_authoritative_work_remains(profile)
 -- kicks_are_optimization_only, durable_rows_suffice_after_restart
 
@@ -447,6 +483,34 @@ rule DrainProfileProtocol {
     ensures: selection.drained_at = now()
     ensures: ProfileAcceptanceClosedAtomically(selection)
     ensures: ProfileCodecsAndExecutorRetained(selection)
+}
+
+rule ProduceProtocolDrainProof {
+    when: ProtocolDrainProofRequested(operator, selection)
+    let evidence = authoritative_drain_evidence(selection)
+    ensures: DrainProof.created(
+        id: next_drain_proof_id(), selection: selection, authority: selection.authority,
+        query_identity: drain_query_identity(selection),
+        query_version: drain_query_version(selection), evidence: evidence,
+        complete: drain_evidence_is_complete(evidence), generated_at: now()
+    )
+    ensures: shadow_rows_excluded_from_authoritative_drain_evidence(selection)
+}
+
+rule RetireProtocolOnlyAfterCompleteZeroDrainProof {
+    when: ProtocolRetirementRequested(operator, selection, proof)
+    requires: proof.selection = selection
+    requires: proof.complete = true
+    requires: every_drain_category_is_zero(proof.evidence)
+    ensures: ProfileProtocolRetirementPermitted(selection)
+}
+
+rule RejectProtocolRetirementWithoutCompleteZeroDrainProof {
+    when: ProtocolRetirementRequested(operator, selection, proof)
+    requires: proof.selection != selection or proof.complete = false
+        or not every_drain_category_is_zero(proof.evidence)
+    ensures: ProfileProtocolRetirementRejected(selection)
+    ensures: not ProfileProtocolRetirementPermitted(selection)
 }
 
 rule AcceptWorkflow {
@@ -838,7 +902,7 @@ rule MirrorAuthoritativeFactIntoShadow {
 }
 
 rule RecordShadowDivergence {
-    when: ShadowComparisonCompleted(shadow, authoritative_workflow, kind,
+    when: ShadowComparisonCompleted(shadow, authoritative_workflow, kind, profile_detail_kind,
                                     expected_codec, expected_payload,
                                     actual_codec, actual_payload)
     requires: shadow.execution_mode = shadow
@@ -846,8 +910,11 @@ rule RecordShadowDivergence {
     ensures: ShadowDivergence.created(
         id: next_shadow_divergence_id(), shadow_workflow: shadow,
         authoritative_workflow: authoritative_workflow, kind: kind,
+        profile_detail_kind: profile_detail_kind,
         severity: divergence_severity(kind),
-        required_action: divergence_action(kind), resolved_at: null,
+        required_action: divergence_action(kind),
+        evidence_identity: divergence_evidence_identity(
+            shadow, authoritative_workflow, kind, profile_detail_kind), resolved_at: null,
         expected_codec: expected_codec, expected_payload: expected_payload,
         actual_codec: actual_codec, actual_payload: actual_payload,
         recorded_at: now()
@@ -932,7 +999,7 @@ surface ShadowMirrorSurface {
     context shadow: Workflow
     provides:
         ShadowMirrorRequested(mirror, shadow, authoritative_workflow, fact_codec, fact_payload)
-        ShadowComparisonCompleted(shadow, authoritative_workflow, kind,
+        ShadowComparisonCompleted(shadow, authoritative_workflow, kind, profile_detail_kind,
                                   expected_codec, expected_payload,
                                   actual_codec, actual_payload)
 }
@@ -943,6 +1010,33 @@ surface ProfileRegistrationSurface {
         ProfileRegistrationRequested(profile, authority, codecs, executor)
         ProfileAcceptanceSelectionRequested(registry, selection)
         ProfileDrainRequested(selection)
+}
+
+surface OperatorDrainSurface {
+    facing operator: ResolutionOperator
+    context selection: ProfileProtocolSelection
+    exposes:
+        latest_drain_proof_for(selection)
+    provides:
+        ProtocolDrainProofRequested(operator, selection)
+        ProtocolRetirementRequested(operator, selection, proof)
+}
+
+surface OperatorDivergenceInventorySurface {
+    facing operator: ResolutionOperator
+    context selection: ProfileProtocolSelection
+    exposes:
+        divergence_inventory_for(selection).authority_protocol
+        divergence_inventory_for(selection).shadow_protocol
+        divergence_inventory_for(selection).workflow
+        divergence_inventory_for(selection).canonical_kind
+        divergence_inventory_for(selection).profile_detail_kind
+        divergence_inventory_for(selection).severity
+        divergence_inventory_for(selection).expected_codec
+        divergence_inventory_for(selection).actual_codec
+        divergence_inventory_for(selection).evidence_identity
+        divergence_inventory_for(selection).required_action
+        divergence_inventory_for(selection).resolution
 }
 
 ------------------------------------------------------------
@@ -1023,5 +1117,5 @@ invariant ShadowReferencesAuthorityWithoutBeingAuthority {
 }
 
 invariant ProtocolDrainPreservesAuthority {
-    draining_closes_new_acceptance_atomically_and_retains_executors_and_codecs_until_no_nonterminal_effect_reducer_inbox_or_owed_acceptance_remains
+    draining_closes_new_acceptance_atomically_and_retains_executors_and_codecs_until_a_complete_zero_authoritative_drain_proof_permits_retirement
 }

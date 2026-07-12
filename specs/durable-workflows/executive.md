@@ -41,8 +41,8 @@ new acceptances.
 | REQ-DWF-010–012 deadlines, cancellation, manual resolution | Specified | Virtual-time schedules; cancellation transaction; operator flow |
 | REQ-DWF-013–017 capabilities, versions, migration, acceptance | Specified | API/runtime projection tests; shadow/cutover/drain tests |
 | REQ-DWF-018 deterministic verification | Specified | Property schedules with checked-in minimized regressions |
-| REQ-DWF-019 protocol admission and exact drain proof | Specified | Selector/registration transactions; category-complete drain query |
-| REQ-DWF-020 divergence severity and operator action | Specified | Typed divergence records; operator explanation and halt tests |
+| REQ-DWF-019 protocol admission and exact drain proof | Specified | Versioned authoritative query; category counts and identities; zero-proof retirement gate |
+| REQ-DWF-020 divergence severity and operator action | Specified | Canonical eight-kind vocabulary; profile mappings; operator inventory and halt tests |
 | REQ-DWF-021 evidence-based wake/creation cutover | Specified | Required deterministic and production schedule classes; authorization audit |
 | REQ-DWF-022 mixed-authority semantic parity | Specified | Cross-protocol product projection and capability comparisons |
 | REQ-DWF-WAKE-001–005 wake profile | Specified | Bash/tmux registration-to-resume end-to-end campaigns |
@@ -66,4 +66,4 @@ unresolved blocking divergence, codec and reversible-selector checks pass,
 mixed-authority user semantics match, and an operator explicitly authorizes the
 cutover. Elapsed soak duration is not evidence. Accepted legacy and engine versions
 drain under retained executors/codecs; retirement requires the category-complete
-zero-row drain report, and no in-flight translation is permitted.
+complete zero-count drain proof for every authoritative category, and no in-flight translation is permitted.

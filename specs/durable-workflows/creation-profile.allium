@@ -32,7 +32,8 @@ enum CreationEffectKind {
 enum CreationOutcome { provisioning | ready | cancelled | deleted | failed | manual_resolution }
 enum ReconciliationResult { absent | matching | foreign | indeterminate }
 enum CreationShadowComparisonKind {
-    acceptance | intent_binding | effect_plan | observation | receipt | readiness | projection
+    acceptance | intent_binding | effect_plan | observation | receipt | readiness
+    | capability | user_projection
 }
 enum CreationProtocolState { accepted | provisioning | ready | cancelling | cancelled | deletion_pending | deleted | failed | blocked }
 
@@ -149,7 +150,8 @@ entity CreationShadowParity {
     -- Internal diagnostic only; never exposed as conversation state or API output.
     binding: CreationWorkflowBinding
     authoritative_conversation_id: String
-    kind: CreationShadowComparisonKind
+    canonical_kind: dwf/ShadowDivergenceKind
+    profile_detail_kind: CreationShadowComparisonKind
     expected: CreationProtocolProjection
     actual: CreationProtocolProjection
     compared_at: Timestamp
@@ -207,6 +209,7 @@ config {
 -- all_compensations_terminal(binding), cancellation_deadline(binding), deletion_deadline(binding)
 -- legacy_projection(conversation_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding), parity_compared_for_every_authoritative_fact(binding)
+-- creation_canonical_divergence_kind(kind): dwf/ShadowDivergenceKind
 -- creation_divergence_severity(kind), creation_divergence_action(kind)
 -- unresolved_blocking_creation_divergence_exists(), mixed_authority_creation_semantics_are_equal()
 -- creation_protocol_selection(), authority_is_immutable(binding)
@@ -562,7 +565,8 @@ rule ShadowCreationProjectsParityWithoutExternalEffects {
     ensures: CreationShadowParity.created(
         binding: binding,
         authoritative_conversation_id: authoritative_conversation_id,
-        kind: kind,
+        canonical_kind: creation_canonical_divergence_kind(kind),
+        profile_detail_kind: kind,
         expected: expected,
         actual: actual,
         compared_at: now(),
@@ -573,6 +577,8 @@ rule ShadowCreationProjectsParityWithoutExternalEffects {
     )
     ensures: shadow_projection_is_internal_diagnostic_only(binding)
     ensures: binding.workflow.execution_mode = shadow
+    ensures: kind = capability implies creation_canonical_divergence_kind(kind) = capability
+    ensures: kind = user_projection implies creation_canonical_divergence_kind(kind) = user_projection
 }
 
 rule CreationParityGateBlocksCutoverOnUnresolvedBlockingDivergence {
@@ -594,8 +600,7 @@ rule ProtocolDrainStopsNewAcceptanceButPreservesExecutors {
     when: CreationProfileDrainRequested(registry, profile)
     ensures: CreationProfileStopsAcceptingNewWork(profile)
     ensures: CreationProfileRetainsExecutorAndCodecs(profile)
-    ensures: CreationProfileRetirementPermitted(profile)
-        when no_authoritative_creation_work(profile) and no_creation_acceptance_owed(profile)
+    ensures: CreationProfileRetirementRequiresCoreCompleteZeroDrainProof(profile)
 }
 
 ------------------------------------------------------------

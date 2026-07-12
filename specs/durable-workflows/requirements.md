@@ -261,18 +261,20 @@ semantic authority. Draining SHALL atomically close new acceptance while retaini
 its executor and codecs.
 
 THE drain proof SHALL query, by profile and protocol, exactly these blocking
-categories: nonterminal workflows, nonterminal effects, live or renewable claims,
-pending reducer deliveries, owed runtime acceptances, unresolved manual resolutions,
-and incomplete required or compensation barriers. Retirement SHALL require zero
-rows in every category and an operator-readable report identifying the query,
-protocol, authority, counts, and blocking identities.
+categories: nonterminal workflows, active or unexpired claims, eligible or retry
+effects, uncompensated effects, unresolved manual resolutions, pending reducer
+inbox items, owed runtime acceptances, and unresolved blocking divergences. Shadow
+work SHALL be excluded as authority. Retirement SHALL require a complete proof with
+zero rows in every category and an operator-readable report identifying the
+protocol selector, authoritative query identity and version, authority, exact counts,
+and blocking identities for every category.
 
 ### REQ-DWF-020: Divergence Classification and Operator Action
 
 EVERY shadow divergence SHALL have a typed severity of blocking, actionable, or
 informational and a typed required action of halt acceptance, retain authority and
-investigate, or record only. Snapshot, transition, effect-plan, receipt,
-reducer-event, capability, and user-projection differences that can change user
+investigate, or record only. Snapshot, transition, effect-plan, observation,
+receipt, reducer-event, capability, and user-projection differences that can change user
 semantics SHALL be blocking.
 
 THE SYSTEM SHALL expose the authoritative and shadow protocol, compared workflow,

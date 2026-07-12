@@ -26,6 +26,7 @@ enum WakeRegistrationFenceStatus { open | closed }
 enum LifecycleFenceStatus { open | closed }
 enum WakeShadowComparisonKind {
     registration | observation | terminal_receipt | inbox | acceptance | lifecycle
+    | capability | user_projection
 }
 
 value WorkScopeIdentity {
@@ -211,7 +212,8 @@ entity WakeShadowParity {
     -- Internal diagnostic only; never exposed through agent or product surfaces.
     binding: WakeWorkflowBinding
     authoritative_contract_id: String
-    kind: WakeShadowComparisonKind
+    canonical_kind: dwf/ShadowDivergenceKind
+    profile_detail_kind: WakeShadowComparisonKind
     expected: WakeProtocolProjection
     actual: WakeProtocolProjection
     compared_at: Timestamp
@@ -265,6 +267,7 @@ config {
 -- wake_protocol_selection(), authority_is_immutable(binding)
 -- legacy_projection(contract_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding)
+-- wake_canonical_divergence_kind(kind): dwf/ShadowDivergenceKind
 -- wake_divergence_severity(kind), wake_divergence_action(kind)
 -- unresolved_blocking_wake_divergence_exists(), mixed_authority_wake_semantics_are_equal()
 -- parity_compared_for_every_authoritative_fact(binding)
@@ -528,13 +531,16 @@ rule ShadowScheduleComparesWithoutAuthority {
     let actual = engine_projection(binding)
     ensures: WakeShadowParity.created(
         binding: binding, authoritative_contract_id: authoritative_contract_id,
-        kind: kind, expected: expected, actual: actual,
+        canonical_kind: wake_canonical_divergence_kind(kind),
+        profile_detail_kind: kind, expected: expected, actual: actual,
         compared_at: now(), equal: expected = actual,
         severity: wake_divergence_severity(kind), required_action: wake_divergence_action(kind),
         resolved_at: null
     )
     ensures: shadow_projection_is_internal_diagnostic_only(binding)
     ensures: binding.workflow.execution_mode = shadow
+    ensures: kind = capability implies wake_canonical_divergence_kind(kind) = capability
+    ensures: kind = user_projection implies wake_canonical_divergence_kind(kind) = user_projection
 }
 
 rule WakeParityGateBlocksCutoverOnUnresolvedBlockingDivergence {
