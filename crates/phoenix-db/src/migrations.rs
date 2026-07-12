@@ -1531,7 +1531,7 @@ CREATE TABLE IF NOT EXISTS workflow_observations (
     FOREIGN KEY (attempt_id, effect_id, workflow_id, declared_workflow_version, generation)
         REFERENCES workflow_attempts(id, effect_id, workflow_id, declared_workflow_version, generation)
         ON DELETE CASCADE,
-    CHECK (authoritative IN (0, 1)),
+    CHECK (authoritative = 1),
     CHECK (claim_token <> ''),
     CHECK (claim_worker_id <> '')
 );
@@ -1539,7 +1539,7 @@ CREATE TABLE IF NOT EXISTS workflow_observations (
 CREATE TABLE IF NOT EXISTS workflow_stale_observations (
     id TEXT PRIMARY KEY,
     effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
-    attempt_id TEXT REFERENCES workflow_attempts(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES workflow_attempts(id) ON DELETE CASCADE,
     workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     declared_workflow_version INTEGER NOT NULL,
     generation INTEGER NOT NULL,
@@ -1582,9 +1582,9 @@ CREATE TABLE IF NOT EXISTS workflow_receipts (
     CHECK (origin IN ('execution', 'adoption', 'reconciliation', 'manual')),
     CHECK (generation >= 0),
     CHECK (
-        (origin = 'manual' AND attempt_id IS NULL AND claim_token IS NULL AND claim_worker_id IS NULL AND claim_lease_until IS NULL AND claim_issued_at IS NULL)
+        (attempt_id IS NULL AND claim_token IS NULL AND claim_worker_id IS NULL AND claim_lease_until IS NULL AND claim_issued_at IS NULL)
         OR
-        (origin IN ('execution', 'adoption', 'reconciliation') AND attempt_id IS NOT NULL AND claim_token IS NOT NULL AND claim_worker_id IS NOT NULL AND claim_lease_until IS NOT NULL AND claim_issued_at IS NOT NULL AND claim_token <> '' AND claim_worker_id <> '')
+        (attempt_id IS NOT NULL AND claim_token IS NOT NULL AND claim_worker_id IS NOT NULL AND claim_lease_until IS NOT NULL AND claim_issued_at IS NOT NULL AND claim_token <> '' AND claim_worker_id <> '')
     )
 );
 
@@ -1617,9 +1617,14 @@ CREATE TABLE IF NOT EXISTS workflow_owed_acceptance (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     reducer_inbox_id TEXT NOT NULL UNIQUE REFERENCES workflow_reducer_inbox(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL,
+    event_codec_family TEXT NOT NULL,
+    event_codec_version INTEGER NOT NULL,
+    event_payload TEXT NOT NULL,
     status TEXT NOT NULL,
     resolving_transition_id TEXT REFERENCES workflow_transitions(id) ON DELETE SET NULL,
     suppression_reason TEXT,
+    CHECK (source_kind <> ''),
     CHECK (status IN ('owed', 'accepted', 'suppressed')),
     CHECK (
         (status = 'owed' AND resolving_transition_id IS NULL AND suppression_reason IS NULL)
@@ -1708,17 +1713,19 @@ CREATE TABLE IF NOT EXISTS workflow_shadow_divergences (
     required_action TEXT NOT NULL,
     evidence_identity TEXT NOT NULL,
     resolved_at TEXT,
-    expected_codec_family TEXT NOT NULL,
-    expected_codec_version INTEGER NOT NULL,
-    expected_payload TEXT NOT NULL,
-    actual_codec_family TEXT NOT NULL,
-    actual_codec_version INTEGER NOT NULL,
-    actual_payload TEXT NOT NULL,
+    expected_codec_family TEXT,
+    expected_codec_version INTEGER,
+    expected_payload TEXT,
+    actual_codec_family TEXT,
+    actual_codec_version INTEGER,
+    actual_payload TEXT,
     recorded_at TEXT NOT NULL,
     CHECK (kind IN ('snapshot', 'transition', 'effect_plan', 'observation', 'receipt', 'reducer_event', 'capability', 'user_projection')),
     CHECK (severity IN ('blocking', 'actionable', 'informational')),
     CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only')),
-    CHECK (shadow_workflow_id <> authoritative_workflow_id)
+    CHECK (shadow_workflow_id <> authoritative_workflow_id),
+    CHECK ((expected_codec_family IS NULL) = (expected_codec_version IS NULL) AND (expected_codec_family IS NULL) = (expected_payload IS NULL)),
+    CHECK ((actual_codec_family IS NULL) = (actual_codec_version IS NULL) AND (actual_codec_family IS NULL) = (actual_payload IS NULL))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_shadow_divergence_one_active
@@ -3339,20 +3346,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_042_accepts_stale_observation_without_attempt() {
+    async fn migration_042_enforces_observation_authoritative_true_only() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        let non_authoritative = sqlx::query(
+            "INSERT INTO workflow_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, observed_at, recorded_at, authoritative) \
+             VALUES ('obs-bad-auth', 'eff', 'att', 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 'obs', 1, '{}', 'now', 'now', 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(non_authoritative.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_requires_owed_acceptance_event_tuple_and_nonempty_source_kind() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         run_pending_migrations(&pool).await.unwrap();
         seed_workflow_stack(&pool).await;
 
         sqlx::query(
+            "INSERT INTO workflow_reducer_inbox \
+             (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, event_payload, delivery_status, consumed_by_transition_id) \
+             VALUES ('inbox-owed', 'wf', 'rcpt', NULL, 'event', 1, '{}', 'pending', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_owed_acceptance \
+             (id, workflow_id, reducer_inbox_id, source_kind, event_codec_family, event_codec_version, event_payload, status, resolving_transition_id, suppression_reason) \
+             VALUES ('owed-ok', 'wf', 'inbox-owed', 'receipt', 'owed-event', 1, '{}', 'owed', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let empty_source_kind = sqlx::query(
+            "INSERT INTO workflow_owed_acceptance \
+             (id, workflow_id, reducer_inbox_id, source_kind, event_codec_family, event_codec_version, event_payload, status, resolving_transition_id, suppression_reason) \
+             VALUES ('owed-empty-source', 'wf', 'inbox-empty-source', '', 'owed-event', 1, '{}', 'owed', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(empty_source_kind.is_err());
+
+        let missing_event_tuple = sqlx::query(
+            "INSERT INTO workflow_owed_acceptance \
+             (id, workflow_id, reducer_inbox_id, source_kind, status, resolving_transition_id, suppression_reason) \
+             VALUES ('owed-missing-event', 'wf', 'inbox-missing-event', 'receipt', 'owed', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(missing_event_tuple.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_shadow_divergence_codec_tuples_are_all_null_or_all_present() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel-shadow', 'wake', 'wake-selector', 1, 1, 'engine_protocol', 1, 1, 1, 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf-auth', 'wake', 1, 'engine_protocol', 'authoritative', NULL, 'sel-shadow', 1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf-shadow', 'wake', 1, 'engine_protocol', 'shadow', 'wf-auth', 'sel-shadow', 1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_shadow_divergences \
+             (id, shadow_workflow_id, authoritative_workflow_id, kind, profile_detail_kind, severity, required_action, evidence_identity, resolved_at, expected_codec_family, expected_codec_version, expected_payload, actual_codec_family, actual_codec_version, actual_payload, recorded_at) \
+             VALUES ('div-null', 'wf-shadow', 'wf-auth', 'snapshot', 'wake_terminal', 'informational', 'record_only', 'ev-1', NULL, NULL, NULL, NULL, 'actual', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let partial_expected = sqlx::query(
+            "INSERT INTO workflow_shadow_divergences \
+             (id, shadow_workflow_id, authoritative_workflow_id, kind, profile_detail_kind, severity, required_action, evidence_identity, resolved_at, expected_codec_family, expected_codec_version, expected_payload, actual_codec_family, actual_codec_version, actual_payload, recorded_at) \
+             VALUES ('div-bad-expected', 'wf-shadow', 'wf-auth', 'snapshot', 'wake_terminal', 'informational', 'record_only', 'ev-2', NULL, 'expected', NULL, NULL, NULL, NULL, NULL, 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(partial_expected.is_err());
+
+        let partial_actual = sqlx::query(
+            "INSERT INTO workflow_shadow_divergences \
+             (id, shadow_workflow_id, authoritative_workflow_id, kind, profile_detail_kind, severity, required_action, evidence_identity, resolved_at, expected_codec_family, expected_codec_version, expected_payload, actual_codec_family, actual_codec_version, actual_payload, recorded_at) \
+             VALUES ('div-bad-actual', 'wf-shadow', 'wf-auth', 'snapshot', 'wake_terminal', 'informational', 'record_only', 'ev-3', NULL, NULL, NULL, NULL, 'actual', 1, NULL, 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(partial_actual.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_rejects_stale_observation_without_attempt() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        let missing_attempt = sqlx::query(
             "INSERT INTO workflow_stale_observations \
              (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, observed_at, recorded_at, stale_reason) \
              VALUES ('stale-1', 'eff', NULL, 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 'obs', 1, '{}', 'now', 'now', 'superseded')",
         )
         .execute(&pool)
-        .await
-        .unwrap();
+        .await;
+        assert!(missing_attempt.is_err());
     }
 
     #[tokio::test]
@@ -3373,8 +3500,8 @@ mod tests {
 
         let bad_owed = sqlx::query(
             "INSERT INTO workflow_owed_acceptance \
-             (id, workflow_id, reducer_inbox_id, status, resolving_transition_id, suppression_reason) \
-             VALUES ('owed-bad', 'wf', 'inbox', 'suppressed', NULL, 'superseded')",
+             (id, workflow_id, reducer_inbox_id, source_kind, event_codec_family, event_codec_version, event_payload, status, resolving_transition_id, suppression_reason) \
+             VALUES ('owed-bad', 'wf', 'inbox', 'receipt', 'owed-event', 1, '{}', 'suppressed', NULL, 'superseded')",
         )
         .execute(&pool)
         .await;
