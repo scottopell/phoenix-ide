@@ -591,6 +591,7 @@ enum CodexWsError {
     Interrupted(LlmError),
     Cooldown,
     Backend(LlmError),
+    Reconnect(LlmError),
 }
 
 impl CodexWsError {
@@ -599,6 +600,9 @@ impl CodexWsError {
     }
     fn backend(error: LlmError) -> Self {
         Self::Backend(error)
+    }
+    fn reconnect(error: LlmError) -> Self {
+        Self::Reconnect(error)
     }
 }
 
@@ -697,6 +701,15 @@ fn connection_identity(api_key: &str, custom_headers: &[(String, String)]) -> [u
     hash.finalize().into()
 }
 
+fn is_websocket_connection_limit(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && value
+            .pointer("/error/code")
+            .or_else(|| value.pointer("/error/type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("websocket_connection_limit_reached")
+}
+
 fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmError> {
     if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
         return None;
@@ -732,14 +745,7 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
 }
 
 fn parse_codex_rate_limits(value: &serde_json::Value) -> Option<QuotaDetails> {
-    [
-        value.get("rate_limits"),
-        value.get("rateLimits"),
-        value.get("snapshot"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|snapshot| serde_json::from_value(snapshot.clone()).ok())
+    super::rate_limit::quota_from_codex_rate_limit_event(value)
 }
 
 fn evict_ws_sessions(pool: &mut CodexWsSessions, now: Instant) {
@@ -952,7 +958,11 @@ async fn complete_codex_websocket(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if let Some(error) = parse_wrapped_codex_websocket_error(&value) {
-                return Err(CodexWsError::backend(error));
+                return Err(if is_websocket_connection_limit(&value) {
+                    CodexWsError::reconnect(error)
+                } else {
+                    CodexWsError::backend(error)
+                });
             }
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
@@ -1024,6 +1034,12 @@ async fn complete_codex_websocket(
                             transport.message
                         )))
                     }
+                    CodexWsError::Reconnect(transport) => {
+                        CodexWsError::Interrupted(LlmError::network(format!(
+                            "Codex WebSocket expired after public output: {}",
+                            transport.message
+                        )))
+                    }
                     other @ (CodexWsError::Interrupted(_)
                     | CodexWsError::Cooldown
                     | CodexWsError::Backend(_)) => other,
@@ -1091,6 +1107,35 @@ pub async fn complete_streaming(
                 ),
                 Err(CodexWsError::Backend(error) | CodexWsError::Interrupted(error)) => {
                     return Err(error);
+                }
+                Err(CodexWsError::Reconnect(error)) => {
+                    tracing::debug!(error = %error.message,
+                        "Codex WebSocket lifetime exhausted; retrying once on a fresh socket");
+                    match complete_codex_websocket(
+                        &url,
+                        api_key,
+                        custom_headers,
+                        request.cache_key.as_str(),
+                        &responses_request,
+                        chunk_tx,
+                        sessions,
+                    )
+                    .await
+                    {
+                        Ok(response) => return Ok(response),
+                        Err(
+                            CodexWsError::Backend(error)
+                            | CodexWsError::Interrupted(error)
+                            | CodexWsError::Reconnect(error),
+                        ) => return Err(error),
+                        Err(CodexWsError::Cooldown) => tracing::debug!(
+                            "Codex WebSocket cooldown became active; using HTTP/SSE"
+                        ),
+                        Err(CodexWsError::Fallback(error)) => {
+                            tracing::warn!(error = %error.message,
+                                "fresh Codex WebSocket failed; falling back once to full HTTP/SSE");
+                        }
+                    }
                 }
                 Err(CodexWsError::Fallback(error)) => tracing::warn!(error = %error.message,
                     "Codex WebSocket transport/protocol failed; falling back once to full HTTP/SSE"),
@@ -2023,6 +2068,7 @@ mod tests {
         ws_headers: Arc<Mutex<Vec<AxumHeaderMap>>>,
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn mock_ws(
         ws: WebSocketUpgrade,
         headers: AxumHeaderMap,
@@ -2044,6 +2090,18 @@ mod tests {
                     "true"
                 );
                 let marker = request["input"].to_string();
+                if marker.contains("connection-limit") && connection == 0 {
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type": "error",
+                        "status": 429,
+                        "error": {
+                            "type": "websocket_connection_limit_reached",
+                            "code": "websocket_connection_limit_reached",
+                            "message": "connection lifetime exhausted"
+                        }
+                    }).to_string())).await.unwrap();
+                    continue;
+                }
                 if marker.contains("ws-fail") {
                     socket
                         .send(AxumWsMessage::Text(
@@ -2309,6 +2367,33 @@ mod tests {
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_connection_limit_reconnects_once_without_http_fallback() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request_with(&[("connection-limit", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+        let requests = state.ws_requests.lock().await;
+        assert!(requests[0].1.get("previous_response_id").is_none());
+        assert!(requests[1].1.get("previous_response_id").is_none());
     }
 
     #[tokio::test]

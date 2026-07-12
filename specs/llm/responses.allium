@@ -25,16 +25,9 @@
 --           message in error.rs) — this file governs the classification,
 --           not the localized string. Model registry / discovery.
 --
--- Why this file exists: a 2026-05 production incident. A read_image tool
---           result fed back to an OpenAI model produced HTTP 400:
---             "Invalid value: 'text'. Supported values are: 'input_text',
---              'input_image', 'output_text', ..."
---           The request translator emitted a function_call_output content
---           part with the Chat-Completions discriminant `text` instead of
---           the Responses API discriminant `input_text`. There was no
---           normative contract on the wire discriminant; the proptest in
---           place asserted the broken shape. ResponsesContentPartTypeValid
---           is that contract.
+-- The ResponsesContentPartTypeValid invariant makes wire discriminants
+-- explicit: function-call output content uses Responses API input-part
+-- discriminants rather than Chat-Completions discriminants.
 --
 -- Contrast with anthropic.allium: the same internal tool_result-with-
 --           images block lands on `input_text` / `input_image` here and
