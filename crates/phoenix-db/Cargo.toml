@@ -20,6 +20,7 @@ test-support = []
 # Shared domain vocabulary (persisted schema types, ConvState, ContentBlock,
 # LlmLanguage, Priority, the task-approval handoff parcel, …).
 phoenix-core = { path = "../phoenix-core" }
+phoenix-workflow = { path = "../phoenix-workflow" }
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }

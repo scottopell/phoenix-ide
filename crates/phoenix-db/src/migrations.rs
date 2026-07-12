@@ -1451,6 +1451,9 @@ CREATE TABLE IF NOT EXISTS workflow_barriers (
     declaring_workflow_version INTEGER NOT NULL,
     status TEXT NOT NULL,
     satisfied_at TEXT,
+    event_codec_family TEXT NOT NULL,
+    event_codec_version INTEGER NOT NULL,
+    event_payload TEXT NOT NULL,
     FOREIGN KEY (declaring_transition_id, workflow_id, declaring_workflow_version)
         REFERENCES workflow_transitions(id, workflow_id, to_version)
         ON DELETE CASCADE,
@@ -3360,6 +3363,43 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(non_authoritative.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_persists_barrier_event_tuple() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO workflow_barriers \
+             (id, workflow_id, declaring_transition_id, declaring_workflow_version, status, satisfied_at, event_codec_family, event_codec_version, event_payload) \
+             VALUES ('bar', 'wf', 'tr', 1, 'waiting', NULL, 'barrier-event', 1, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query(
+            "SELECT event_codec_family, event_codec_version, event_payload \
+             FROM workflow_barriers WHERE id = 'bar'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("event_codec_family"), "barrier-event");
+        assert_eq!(row.get::<i64, _>("event_codec_version"), 1);
+        assert_eq!(row.get::<String, _>("event_payload"), "{}");
+
+        let missing_event_tuple = sqlx::query(
+            "INSERT INTO workflow_barriers \
+             (id, workflow_id, declaring_transition_id, declaring_workflow_version, status, satisfied_at) \
+             VALUES ('bar-missing', 'wf', 'tr', 1, 'waiting', NULL)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(missing_event_tuple.is_err());
     }
 
     #[tokio::test]
