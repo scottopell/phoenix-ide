@@ -1062,10 +1062,12 @@ impl Database {
         .bind(work_scope_id)
         .fetch_optional(&mut *tx)
         .await?
-        .map(|row| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
-            repository_identity: row.get("repository_identity"),
-            branch_name: row.get("branch_name"),
-        });
+        .map(
+            |row| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity: row.get("repository_identity"),
+                branch_name: row.get("branch_name"),
+            },
+        );
         sqlx::query(
             "INSERT INTO work_scope_active_pr_selection (
                 work_scope_id, repo_owner, repo_name, pr_number, provenance,
@@ -1102,10 +1104,12 @@ impl Database {
         .await?;
         tx.commit().await?;
         let persisted = row_to_work_scope_active_pr_selection(&persisted)?;
-        Ok(phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
-            selection: persisted.selection,
-            inference_generation: persisted.inference_generation,
-        })
+        Ok(
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+                selection: persisted.selection,
+                inference_generation: persisted.inference_generation,
+            },
+        )
     }
 
     /// # Errors
@@ -1118,16 +1122,8 @@ impl Database {
         let Some(work_scope_id) = self.work_scope_id(scope).await? else {
             return Ok(None);
         };
-        let expected_generation = self
-            .active_work_scope_pr_selection(scope)
-            .await?
-            .map_or(0, |state| state.inference_generation);
-        self.derive_active_work_scope_pr_selection_for_scope_id(
-            work_scope_id,
-            input,
-            Some(expected_generation),
-        )
-        .await
+        self.clear_active_work_scope_pr_pin_for_scope_id(work_scope_id, input)
+            .await
     }
 
     /// # Errors
@@ -1145,6 +1141,57 @@ impl Database {
             work_scope_id,
             input,
             expected_generation,
+        )
+        .await
+    }
+    async fn clear_active_work_scope_pr_pin_for_scope_id(
+        &self,
+        work_scope_id: i64,
+        input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
+        let mut tx = self.pool.begin().await?;
+        let persisted = sqlx::query(
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
+                    latest_observed_repository_identity, latest_observed_branch_name,
+                    inference_generation, updated_at
+             FROM work_scope_active_pr_selection
+             WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row_to_work_scope_active_pr_selection(&row))
+        .transpose()?;
+        let current_generation = persisted.as_ref().map_or(0, |row| row.inference_generation);
+        tx.commit().await?;
+        let durable_input;
+        let input = if input.latest_observed_branch.is_none() {
+            let row = sqlx::query(
+                "SELECT repository_identity, branch_name
+                 FROM work_scope_observed_branches
+                 WHERE work_scope_id = ?1
+                 ORDER BY last_observed_at DESC, branch_name ASC
+                 LIMIT 1",
+            )
+            .bind(work_scope_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            durable_input = phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                latest_observed_branch: row.map(|row| {
+                    phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                        repository_identity: row.get("repository_identity"),
+                        branch_name: row.get("branch_name"),
+                    }
+                }),
+            };
+            &durable_input
+        } else {
+            input
+        };
+        self.derive_active_work_scope_pr_selection_for_scope_id(
+            work_scope_id,
+            input,
+            Some(current_generation),
         )
         .await
     }
@@ -1166,10 +1213,12 @@ impl Database {
         row.map(|row| row_to_work_scope_active_pr_selection(&row))
             .transpose()
             .map(|state| {
-                state.map(|row| phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
-                    selection: row.selection,
-                    inference_generation: row.inference_generation,
-                })
+                state.map(
+                    |row| phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+                        selection: row.selection,
+                        inference_generation: row.inference_generation,
+                    },
+                )
             })
     }
 
@@ -1277,7 +1326,7 @@ impl Database {
                 latest_observed_branch_name = excluded.latest_observed_branch_name,
                 inference_generation = excluded.inference_generation,
                 updated_at = excluded.updated_at
-             WHERE work_scope_active_pr_selection.inference_generation = ?9"
+             WHERE work_scope_active_pr_selection.inference_generation = ?9",
         )
         .bind(work_scope_id)
         .bind(inferred.as_ref().map(|pr| pr.repo_owner.as_str()))
@@ -1300,7 +1349,9 @@ impl Database {
         .await?;
         if write.rows_affected() == 0 {
             tx.rollback().await?;
-            return self.active_pr_selection_state_for_scope_id(work_scope_id).await;
+            return self
+                .active_pr_selection_state_for_scope_id(work_scope_id)
+                .await;
         }
         tx.commit().await?;
 
@@ -9225,9 +9276,13 @@ mod tests {
         let db_path = dir.path().join("phoenix.db");
         let db_path = db_path.to_string_lossy().into_owned();
         let first = Database::open(&db_path).await.unwrap();
-        migrations::run_pending_migrations(&first.pool).await.unwrap();
+        migrations::run_pending_migrations(&first.pool)
+            .await
+            .unwrap();
         let second = Database::open(&db_path).await.unwrap();
-        migrations::run_pending_migrations(&second.pool).await.unwrap();
+        migrations::run_pending_migrations(&second.pool)
+            .await
+            .unwrap();
         (dir, first, second)
     }
 
@@ -9297,9 +9352,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_pr_infers_unique_branch_match_from_local_repository_identity_when_scope_maps_to_one_repo() {
+    async fn active_pr_infers_unique_branch_match_from_local_repository_identity_when_scope_maps_to_one_repo(
+    ) {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-local-map".to_string());
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-local-map".to_string());
         let local_repo = tempfile::tempdir().unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -9348,7 +9405,9 @@ mod tests {
     #[tokio::test]
     async fn active_pr_does_not_map_local_repository_identity_when_scope_spans_multiple_repos() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-local-ambiguous".to_string());
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-local-ambiguous".to_string(),
+        );
         let local_repo = tempfile::tempdir().unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -9669,7 +9728,11 @@ mod tests {
             .unwrap();
         assert_eq!(stale.selection.as_ref().unwrap().pr.pr_number, 2);
         assert_eq!(stale.inference_generation, 1);
-        let persisted = db_b.active_work_scope_pr_selection(&scope).await.unwrap().unwrap();
+        let persisted = db_b
+            .active_work_scope_pr_selection(&scope)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.selection.unwrap().pr.pr_number, 2);
         assert_eq!(persisted.inference_generation, 1);
     }
@@ -9758,7 +9821,9 @@ mod tests {
     #[tokio::test]
     async fn active_pr_pin_requires_existing_scope_association() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-pin-membership".to_string());
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-pin-membership".to_string(),
+        );
 
         let err = db
             .pin_active_work_scope_pr_selection(
@@ -9777,7 +9842,9 @@ mod tests {
     #[tokio::test]
     async fn active_pr_pin_returns_persisted_generation() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-pin-generation".to_string());
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-pin-generation".to_string(),
+        );
         db.upsert_work_scope_pr_observations(
             &scope,
             &[pr_observation(
@@ -9853,6 +9920,128 @@ mod tests {
         assert_eq!(
             pinned.selection.unwrap().provenance,
             phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pr_clear_pin_uses_latest_durable_branch_evidence_when_input_missing() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-clear-durable".to_string(),
+        );
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 1,
+            },
+        )
+        .await
+        .unwrap();
+        seed_latest_observed_branch(&db, &scope, "owner/repo", "feature/b", "bbbb").await;
+
+        let resumed = db
+            .clear_active_work_scope_pr_pin(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let selection = resumed.selection.unwrap();
+        assert_eq!(selection.pr.pr_number, 2);
+        assert_eq!(
+            selection.provenance,
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pr_clear_pin_respects_compatible_repository_mapping() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-clear-compatible".to_string(),
+        );
+        let local_repo = tempfile::tempdir().unwrap();
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo-a",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/shared",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo-b",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/shared",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo-a".to_string(),
+                pr_number: 1,
+            },
+        )
+        .await
+        .unwrap();
+        seed_latest_observed_branch(
+            &db,
+            &scope,
+            &std::fs::canonicalize(local_repo.path())
+                .unwrap()
+                .to_string_lossy(),
+            "feature/shared",
+            "bbbb",
+        )
+        .await;
+
+        let resumed = db
+            .clear_active_work_scope_pr_pin(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            resumed.selection.is_none(),
+            "ambiguous local-repo evidence must not be remapped across multiple GitHub repos"
         );
     }
 

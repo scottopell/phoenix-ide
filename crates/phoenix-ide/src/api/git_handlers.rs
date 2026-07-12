@@ -770,8 +770,15 @@ async fn attach_pr_feedback_freshness(
         crate::api::pr_monitoring::pr_updated_after_baseline(baseline, updated_at)
     }) {
         let cwd_for_feedback = cwd.to_path_buf();
+        let repo_owner = active_pr.repo_owner.clone();
+        let repo_name = active_pr.repo_name.clone();
         let feedback = tokio::task::spawn_blocking(move || {
-            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
+            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(
+                &cwd_for_feedback,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -809,8 +816,15 @@ async fn attach_pr_feedback_freshness(
         }
     } else {
         let cwd_for_status = cwd.to_path_buf();
+        let repo_owner = active_pr.repo_owner.clone();
+        let repo_name = active_pr.repo_name.clone();
         let status = tokio::task::spawn_blocking(move || {
-            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(&cwd_for_status, pr_number)
+            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(
+                &cwd_for_status,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -882,14 +896,13 @@ pub(crate) async fn create_pr_auto_fix_context(
     let target_pr_number = active_pr.pr_number;
     let result = tokio::task::spawn_blocking(move || {
         let worktree = PathBuf::from(worktree_path);
-        let mut capture = crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(
+        crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(
             &worktree,
+            &target_repo_owner,
+            &target_repo_name,
             target_pr_number,
             conv.llm_language,
-        )?;
-        capture.response.repo_owner = target_repo_owner;
-        capture.response.repo_name = target_repo_name;
-        Ok::<_, crate::api::pr_monitoring::PrMonitorError>(capture)
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -1083,13 +1096,27 @@ pub(crate) async fn resume_associated_pr_inference(
             ));
         }
     };
+    let latest_durable_branch = state
+        .runtime
+        .db()
+        .list_work_scope_observed_branches(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .next()
+        .map(
+            |branch| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity: branch.repository_identity,
+                branch_name: branch.branch_name,
+            },
+        );
     let active = state
         .runtime
         .db()
         .clear_active_work_scope_pr_pin(
             &work_scope,
             &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
-                latest_observed_branch: None,
+                latest_observed_branch: latest_durable_branch,
             },
         )
         .await

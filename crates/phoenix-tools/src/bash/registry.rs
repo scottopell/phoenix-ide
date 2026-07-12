@@ -177,6 +177,7 @@ impl WorkScopeHandles {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BashLifecyclePhase {
     Spawned,
+    KillPendingKernel,
     Terminal,
 }
 
