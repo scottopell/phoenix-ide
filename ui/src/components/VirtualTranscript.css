@@ -1,0 +1,23 @@
+.virtual-transcript {
+  overflow-y: auto;
+  overflow-anchor: none;
+  contain: strict;
+}
+
+.virtual-transcript__inner {
+  min-height: 100%;
+  overflow-anchor: none;
+}
+
+.virtual-transcript__spacer {
+  flex: none;
+  overflow-anchor: none;
+}
+
+.virtual-transcript__row {
+  overflow-anchor: none;
+}
+
+.virtual-transcript__empty {
+  min-height: 100%;
+}

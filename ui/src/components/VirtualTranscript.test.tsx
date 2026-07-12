@@ -1,0 +1,296 @@
+import { type ReactElement } from 'react';
+import { act, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptRange } from './VirtualTranscript';
+
+interface TestItem {
+  id: string;
+  label: string;
+  height: number;
+}
+
+type ResizeObserverCallback = ConstructorParameters<typeof ResizeObserver>[0];
+
+const resizeObservers: TestResizeObserver[] = [];
+
+class TestResizeObserver implements ResizeObserver {
+  readonly callback: ResizeObserverCallback;
+  readonly elements = new Set<Element>();
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    resizeObservers.push(this);
+  }
+
+  observe(element: Element): void {
+    this.elements.add(element);
+  }
+
+  unobserve(element: Element): void {
+    this.elements.delete(element);
+  }
+
+  disconnect(): void {
+    this.elements.clear();
+  }
+
+  trigger(height: number): void {
+    const entries = [...this.elements].map((target) => ({
+      target,
+      contentRect: { height } as DOMRectReadOnly,
+    })) as ResizeObserverEntry[];
+    this.callback(entries, this);
+  }
+}
+
+function heightFromElement(element: Element): number {
+  const direct = element.getAttribute('data-height');
+  if (direct) return Number(direct);
+  const child = element.querySelector('[data-height]');
+  if (child) return Number(child.getAttribute('data-height'));
+  return 0;
+}
+
+function makeItems(count: number, height = 20): TestItem[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `item-${index}`,
+    label: `Item ${index}`,
+    height,
+  }));
+}
+
+function renderRow(item: TestItem): ReactElement {
+  return (
+    <div data-testid={`payload-${item.id}`} data-height={item.height}>
+      {item.label}
+    </div>
+  );
+}
+
+function virtualRows(): HTMLElement[] {
+  return screen.queryAllByText(/Item /).map((element) => {
+    const row = element.closest('[data-virtual-index]');
+    if (!(row instanceof HTMLElement)) throw new Error('row not found');
+    return row;
+  });
+}
+
+function rowIndexes(): number[] {
+  return virtualRows().map((row) => Number(row.dataset['virtualIndex']));
+}
+
+function scrollTopOf(element: HTMLDivElement | null): number | undefined {
+  return element?.scrollTop;
+}
+
+beforeEach(() => {
+  resizeObservers.length = 0;
+  vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+    configurable: true,
+    get() {
+      if (this.classList.contains('virtual-transcript')) return 100;
+      return heightFromElement(this);
+    },
+  });
+
+  HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+    const height = heightFromElement(this);
+    return {
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      bottom: height,
+      right: 0,
+      width: 320,
+      height,
+      toJSON: () => ({}),
+    } as DOMRect;
+  };
+});
+
+describe('VirtualTranscript', () => {
+  it('renders a bounded contiguous range with top and bottom spacers', () => {
+    const ranges: Array<VirtualTranscriptRange | null> = [];
+
+    render(
+      <VirtualTranscript
+        items={makeItems(100)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={20}
+        initialTail={false}
+        renderItem={renderRow}
+        onRangeChange={(range) => ranges.push(range)}
+      />,
+    );
+
+    const indexes = rowIndexes();
+    expect(indexes).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(indexes.length).toBeLessThan(100);
+    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 5 });
+
+    const scroller = document.querySelector('.virtual-transcript');
+    expect(scroller).toBeInstanceOf(HTMLElement);
+    expect(getComputedStyle(scroller as Element).overflowAnchor).toBe('none');
+  });
+
+  it('initially tails and reports signed physical anchor offsets', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(20, 10)}
+        getKey={(item) => item.id}
+        estimatedExtent={10}
+        overscan={0}
+        initialTail
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    expect(scrollTopOf(scroller)).toBe(100);
+    expect(rowIndexes()).toEqual([9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+
+    act(() => ref.current?.scrollToIndex(10, 'start', 25));
+
+    expect(scrollTopOf(scroller)).toBe(75);
+    let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+    act(() => {
+      anchor = ref.current?.captureVisibleAnchor() ?? null;
+    });
+    expect(anchor).toEqual({
+      index: 7,
+      key: 'item-7',
+      offset: -5,
+    });
+  });
+
+  it('compensates scrollTop when a measured row above the top-edge anchor resizes', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    const items = makeItems(30, 20);
+    const estimate = (item: TestItem) => item.height;
+
+    const view = render(
+      <VirtualTranscript
+        ref={ref}
+        items={items}
+        getKey={(item) => item.id}
+        estimatedExtent={estimate}
+        overscan={200}
+        initialTail={false}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    act(() => ref.current?.scrollToIndex(5, 'start'));
+    expect(scrollTopOf(scroller)).toBe(100);
+
+    const resized = items.map((item) => item.id === 'item-2'
+      ? { ...item, height: 50 }
+      : item);
+
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={resized}
+          getKey={(item) => item.id}
+          estimatedExtent={estimate}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+    });
+
+    act(() => ref.current?.captureVisibleAnchor());
+
+    expect(scrollTopOf(scroller)).toBe(130);
+    let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+    act(() => {
+      anchor = ref.current?.captureVisibleAnchor() ?? null;
+    });
+    expect(anchor).toEqual({
+      index: 4,
+      key: 'item-4',
+      offset: -20,
+    });
+  });
+
+  it('updates viewport geometry through ResizeObserver before publishing range', () => {
+    const ranges: Array<VirtualTranscriptRange | null> = [];
+
+    render(
+      <VirtualTranscript
+        items={makeItems(20, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        renderItem={renderRow}
+        onRangeChange={(range) => ranges.push(range)}
+      />,
+    );
+
+    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 4 });
+
+    act(() => {
+      resizeObservers.at(-1)?.trigger(60);
+    });
+
+    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 2 });
+    expect(rowIndexes()).toEqual([0, 1, 2]);
+  });
+
+  it('keeps getKey identities stable when new items are prepended', () => {
+    function MountedRow({ item }: { item: TestItem }) {
+      return <div data-testid={`mounted-${item.id}`} data-height={item.height}>{item.label}</div>;
+    }
+
+    const initial: TestItem[] = [
+      { id: 'a', label: 'Item A', height: 20 },
+      { id: 'b', label: 'Item B', height: 20 },
+      { id: 'c', label: 'Item C', height: 20 },
+    ];
+    const view = render(
+      <VirtualTranscript
+        items={initial}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        renderItem={(item) => <MountedRow item={item} />}
+      />,
+    );
+    const originalA = screen.getByTestId('mounted-a');
+    const originalB = screen.getByTestId('mounted-b');
+    const originalC = screen.getByTestId('mounted-c');
+
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={(item) => <MountedRow item={item} />}
+        />,
+      );
+    });
+
+    expect(screen.getByTestId('mounted-a')).toBe(originalA);
+    expect(screen.getByTestId('mounted-b')).toBe(originalB);
+    expect(screen.getByTestId('mounted-c')).toBe(originalC);
+    expect(rowIndexes()).toEqual([0, 1, 2, 3]);
+  });
+});
