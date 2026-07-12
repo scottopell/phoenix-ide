@@ -87,6 +87,34 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function canAcceptChatMessage(state: ConversationState): boolean {
+  switch (state.type) {
+    case 'idle':
+    case 'error':
+    case 'llm_requesting':
+    case 'seeded_llm_requesting':
+    case 'tool_executing':
+    case 'awaiting_sub_agents':
+      return true;
+    case 'awaiting_llm':
+    case 'awaiting_continuation':
+    case 'cancelling':
+    case 'cancelling_tool':
+    case 'cancelling_sub_agents':
+    case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
+    case 'awaiting_user_response':
+    case 'context_exhausted':
+    case 'handed_off':
+    case 'awaiting_recovery':
+    case 'terminal':
+      return false;
+    default:
+      state satisfies never;
+      return false;
+  }
+}
+
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   cwd,
   scopeKey,
@@ -109,10 +137,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const agentWorking = isAgentWorking(convState);
   const canCancel = canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
-  const blocksComposerSend =
-    isCancelling ||
-    convState.type === 'awaiting_llm' ||
-    convState.type === 'awaiting_continuation';
+  const acceptsChatMessage = canAcceptChatMessage(convState);
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -373,7 +398,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
 
     if (!text && images.length === 0 && files.length === 0) return;
-    if (blocksComposerSend || isUploadingFiles) return;
+    if (!acceptsChatMessage || isUploadingFiles) return;
     // The Send button is disabled while an expansion error is shown; gate the
     // keyboard (Enter) path too so a stale broken @reference isn't resubmitted
     // before it's corrected (REQ-IR-007).
@@ -423,7 +448,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     draft,
     images,
     files,
-    blocksComposerSend,
+    acceptsChatMessage,
     expansionError,
     isUploadingFiles,
     onSend,
@@ -445,8 +470,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.nativeEvent.isComposing) return;
       if (refKeyDown(e)) return;
-      if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
@@ -509,7 +535,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0;
-  const canSend = !blocksComposerSend && !isUploadingFiles;
+  const canSend = acceptsChatMessage && !isUploadingFiles;
   const sendEnabled = canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
@@ -709,7 +735,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               {isCancelling ? 'Stopping...' : 'Stop'}
             </button>
           )}
-          {!isCancelling && (
+          {acceptsChatMessage && (
             <button
               type="submit"
               className="input-send-btn"

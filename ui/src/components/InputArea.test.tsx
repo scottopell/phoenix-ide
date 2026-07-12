@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useRef } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
+import { VoicePermission } from './VoiceInput/VoicePermission';
 import type { InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
@@ -50,6 +51,24 @@ function renderInput({
   );
 }
 
+describe('VoicePermission form safety', () => {
+  it('marks every dialog action as a non-submit button', () => {
+    render(
+      <form>
+        <VoicePermission
+          error={{ type: 'permission', message: 'Allow microphone', recoverable: true }}
+          onRetry={() => {}}
+          onDismiss={() => {}}
+        />
+      </form>,
+    );
+
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toHaveAttribute('type', 'button');
+    }
+  });
+});
+
 describe('InputArea controlled-draft contract', () => {
   it('renders the draft prop and re-renders when the prop changes', () => {
     const { rerender } = renderInput({ cwd: 'conv-a', draft: 'draft A' });
@@ -92,9 +111,9 @@ describe('InputArea controlled-draft contract', () => {
     vi.spyOn(api, 'listProjectSkills').mockResolvedValue({ skills });
 
     let currentDraft = '';
-    const onDraftChange = (text: string) => {
+    const onDraftChange = vi.fn((text: string) => {
       currentDraft = text;
-    };
+    });
 
     const { rerender } = renderInput({
       cwd: '/repo',
@@ -122,6 +141,9 @@ describe('InputArea controlled-draft contract', () => {
       />,
     );
     expect(await screen.findByRole('listbox', { name: '/ autocomplete' })).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', isComposing: true });
+    expect(onDraftChange).not.toHaveBeenCalledWith('/review ');
 
     fireEvent.click(screen.getByRole('option', { name: /review/ }));
     expect(screen.getByText('<path>')).toBeInTheDocument();
@@ -321,9 +343,7 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    const queue = screen.getByRole('button', { name: 'Queue follow-up' });
-    expect(queue).toBeDisabled();
-    fireEvent.click(queue);
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -372,7 +392,24 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Queue follow-up' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
+    { type: 'awaiting_commission_review_approval', brief: 'Review', scope: undefined },
+    { type: 'awaiting_user_response', questions: [] },
+    { type: 'awaiting_recovery', message: 'Recover', recovery_kind: 'credential', resume: { type: 'conversation_turn' } },
+    { type: 'context_exhausted', summary: 'Done' },
+    { type: 'handed_off', successor_conv_id: 'next' },
+    { type: 'terminal' },
+  ] satisfies ConversationState[])('hides chat submission in $type', (convState) => {
+    const onSend = vi.fn();
+    renderInput({ cwd: 'conv-blocked', convState, draft: 'must not send', onSend });
+
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });

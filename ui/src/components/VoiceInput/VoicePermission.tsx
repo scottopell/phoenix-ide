@@ -17,6 +17,7 @@ export function VoicePermission({ error, onRetry, onDismiss }: VoicePermissionPr
     <div className="voice-permission-overlay">
       <div className="voice-permission-dialog">
         <button
+          type="button"
           className="voice-permission-close"
           onClick={onDismiss}
           aria-label="Dismiss error"
@@ -50,6 +51,7 @@ export function VoicePermission({ error, onRetry, onDismiss }: VoicePermissionPr
         
         <div className="voice-permission-actions">
           <button
+            type="button"
             className="voice-permission-btn voice-permission-btn--secondary"
             onClick={onDismiss}
           >
@@ -57,6 +59,7 @@ export function VoicePermission({ error, onRetry, onDismiss }: VoicePermissionPr
           </button>
           {error.recoverable && (
             <button
+              type="button"
               className="voice-permission-btn voice-permission-btn--primary"
               onClick={onRetry}
             >
