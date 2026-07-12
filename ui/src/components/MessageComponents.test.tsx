@@ -87,6 +87,38 @@ function toolMessage(toolUseId: string, content: string, sequenceId = 2, display
   };
 }
 
+function commissionReviewDisplayData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: 'commission_review',
+    status: 'success',
+    review_status: 'completed',
+    findings_status: 'complete',
+    findings_trust: 'complete',
+    retry_recommendation: 'do_not_retry',
+    finding_summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0 },
+    warnings_summary: [],
+    summary: {
+      target: {
+        kind: 'committed_branch_diff',
+        repo_root: '/repo/worktree',
+        base: 'origin/main',
+        head: 'HEAD',
+        dirty: false,
+      },
+      files_changed: 3,
+      files_reviewed: 3,
+      insertions: 18,
+      deletions: 4,
+      elapsed_ms: 1530,
+      reviewer_summary: 'No correctness issues found in the reviewed diff.',
+    },
+    unreviewed: [],
+    findings: [],
+    warnings: [],
+    ...overrides,
+  };
+}
+
 function systemMessage(messageId: string, text: string, sequenceId = 2): Message {
   return {
     message_id: messageId,
@@ -158,6 +190,228 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('commission review tool rendering', () => {
+  it('formats the commission review request input inline instead of raw json', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-input', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-input',
+            name: 'commission_review',
+            input: {
+              brief: 'Independent review before merge to validate the refactor.',
+              focus: 'Concurrency and edge-case handling',
+            },
+          }])}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByLabelText('Commission review request')).toHaveTextContent('brief');
+    expect(screen.getByText('Independent review before merge to validate the refactor.')).toBeInTheDocument();
+    expect(screen.getByText('Concurrency and edge-case handling')).toBeInTheDocument();
+    expect(screen.queryByText(/"brief"/)).not.toBeInTheDocument();
+  });
+
+  it('renders a clean structured summary for successful reviews with no findings', () => {
+    const result = toolMessage('tool-commission-review-clean', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-clean', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-clean',
+            name: 'commission_review',
+            input: { brief: 'Review before merge' },
+          }])}
+          toolResults={new Map([['tool-commission-review-clean', result]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByLabelText('Commission review summary')).toHaveTextContent('Clean');
+    expect(screen.queryByText('0/3 files reviewed')).not.toBeInTheDocument();
+    expect(screen.getByText('3/3 files reviewed')).toBeInTheDocument();
+    expect(screen.getByText('No correctness issues found in the reviewed diff.')).toBeInTheDocument();
+    expect(screen.getByText('No findings reported.')).toBeInTheDocument();
+  });
+
+  it('renders bounded findings for partial reviews with warnings and unreviewed files', () => {
+    const findings = Array.from({ length: 6 }, (_, index) => ({
+      severity: index === 0 ? 'critical' : index < 3 ? 'high' : index < 5 ? 'medium' : 'low',
+      confidence: 'high',
+      file: `src/file-${index}.ts`,
+      line: index + 10,
+      symbol: `fn${index}`,
+      title: `Finding ${index}`,
+      rationale: `Rationale ${index}`,
+      suggested_fix: `Fix ${index}`,
+    }));
+    const result = toolMessage('tool-commission-review-partial', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData({
+      status: 'partial',
+      review_status: 'completed_with_warnings',
+      findings_status: 'partial',
+      findings_trust: 'partial',
+      retry_recommendation: 'review_findings_first',
+      finding_summary: { total: 6, critical: 1, high: 2, medium: 2, low: 1 },
+      warnings_summary: ['model output repaired', 'review request timed out after partial output'],
+      summary: {
+        target: {
+          kind: 'committed_branch_diff',
+          repo_root: '/repo/worktree',
+          base: 'origin/main',
+          head: 'feature/branch',
+          dirty: false,
+        },
+        files_changed: 9,
+        files_reviewed: 7,
+        insertions: 220,
+        deletions: 41,
+        elapsed_ms: 6450,
+        reviewer_summary: 'Several correctness risks were found before coverage ended.',
+      },
+      unreviewed: [
+        { file: 'src/large-a.ts', reason: 'per_file_cap' },
+        { file: 'src/large-b.ts', reason: 'total_review_cap' },
+        { file: 'src/large-c.ts', reason: 'per_file_cap' },
+        { file: 'src/large-d.ts', reason: 'per_file_cap' },
+      ],
+      findings,
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-partial', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-partial',
+            name: 'commission_review',
+            input: { brief: 'Review before merge', focus: 'Correctness' },
+          }])}
+          toolResults={new Map([['tool-commission-review-partial', result]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByLabelText('Commission review summary')).toHaveTextContent('Partial');
+    expect(screen.getByText('critical 1')).toBeInTheDocument();
+    expect(screen.getByText('high 2')).toBeInTheDocument();
+    expect(screen.getByText('7/9 files reviewed')).toBeInTheDocument();
+    expect(screen.getByText('model output repaired')).toBeInTheDocument();
+    expect(screen.getByText('src/large-a.ts · per file cap')).toBeInTheDocument();
+    expect(screen.getByText('+1 more files')).toBeInTheDocument();
+    expect(screen.getByText('review findings first')).toBeInTheDocument();
+    expect(screen.getByText('Finding 0')).toBeInTheDocument();
+    expect(screen.getByText('+1 more findings not shown')).toBeInTheDocument();
+    expect(screen.queryByText('Finding 5')).not.toBeInTheDocument();
+  });
+
+  it('falls back to generic output when display_data is malformed and renders failed/rejected states when valid', () => {
+    const malformed = toolMessage('tool-commission-review-malformed', '{"status":"failed"}');
+    malformed.display_data = { kind: 'commission_review', status: 'failed' };
+
+    const failed = toolMessage('tool-commission-review-failed', JSON.stringify({ ok: true }));
+    failed.display_data = commissionReviewDisplayData({
+      status: 'failed',
+      review_status: 'model_timeout_no_findings',
+      findings_status: 'unavailable',
+      findings_trust: 'low',
+      retry_recommendation: 'retry',
+      warnings_summary: ['review request timed out before findings were produced'],
+      summary: {
+        target: {
+          kind: 'committed_branch_diff',
+          repo_root: '/repo/worktree',
+          base: 'origin/main',
+          head: 'feature/branch',
+          dirty: false,
+        },
+        files_changed: 4,
+        files_reviewed: 4,
+        insertions: 40,
+        deletions: 3,
+        elapsed_ms: 9200,
+        reviewer_summary: 'The model timed out before producing actionable review output.',
+      },
+    });
+
+    const rejected = toolMessage('tool-commission-review-rejected', JSON.stringify({ ok: true }));
+    rejected.display_data = commissionReviewDisplayData({
+      status: 'rejected',
+      review_status: 'rejected',
+      findings_status: 'unavailable',
+      findings_trust: 'low',
+      retry_recommendation: 'do_not_retry',
+      summary: {
+        target: {
+          kind: 'committed_branch_diff',
+          repo_root: '/repo/worktree',
+          base: 'origin/main',
+          head: 'feature/branch',
+          dirty: false,
+        },
+        files_changed: 1,
+        files_reviewed: 1,
+        insertions: 1,
+        deletions: 0,
+        elapsed_ms: 1,
+        reviewer_summary: 'The review request was rejected before spending tokens.',
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <>
+          <AgentMessage
+            message={agentMessage('agent-commission-review-malformed', [{
+              type: 'tool_use',
+              id: 'tool-commission-review-malformed',
+              name: 'commission_review',
+              input: { brief: 'Malformed payload' },
+            }])}
+            toolResults={new Map([['tool-commission-review-malformed', malformed]])}
+            onOpenFile={undefined}
+          />
+          <AgentMessage
+            message={agentMessage('agent-commission-review-failed', [{
+              type: 'tool_use',
+              id: 'tool-commission-review-failed',
+              name: 'commission_review',
+              input: { brief: 'Failure payload' },
+            }], 3)}
+            toolResults={new Map([['tool-commission-review-failed', failed]])}
+            onOpenFile={undefined}
+          />
+          <AgentMessage
+            message={agentMessage('agent-commission-review-rejected', [{
+              type: 'tool_use',
+              id: 'tool-commission-review-rejected',
+              name: 'commission_review',
+              input: { brief: 'Rejected payload' },
+            }], 5)}
+            toolResults={new Map([['tool-commission-review-rejected', rejected]])}
+            onOpenFile={undefined}
+          />
+        </>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('{"status":"failed"}')).toBeInTheDocument();
+    expect(screen.getByText('Failed')).toBeInTheDocument();
+    expect(screen.getByText('retry')).toBeInTheDocument();
+    expect(screen.getByText('No actionable findings were produced.')).toBeInTheDocument();
+    expect(screen.getByText('Rejected')).toBeInTheDocument();
+  });
+});
 
 describe('inline tool timers', () => {
   it('renders a visible waiting state when a tool_use has no matching result', () => {

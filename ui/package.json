@@ -27,6 +27,7 @@
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",
     "qa:work-actions": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-work-actions.mjs",
     "qa:tool-results": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-tool-results.mjs",
+    "qa:commission-review": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-commission-review.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
