@@ -20,6 +20,7 @@ import process from 'node:process';
  * @property {{width:number,height:number}} [viewport]   Capture viewport; defaults to 960x900.
  * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
+ * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
  */
 
 const port = Number(process.env.LADLE_PORT ?? 61123);
@@ -99,6 +100,7 @@ export async function captureSurface(config) {
     viewport = { width: 960, height: 900 },
     viewportMatrix,
     expectedConsoleErrors = new Map(),
+    captureStory,
   } = config;
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
@@ -149,7 +151,10 @@ export async function captureSurface(config) {
         const url = `${baseUrl}/?story=${storyKey}&mode=preview`;
         await page.goto(url, { waitUntil: 'networkidle' });
         await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
-        await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
+        const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
+        if (!captured) {
+          await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
+        }
         const unexpectedErrors = consoleErrors.filter((error) => {
           const expected = expectedConsoleErrors.get(id) ?? [];
           return !expected.some((item) => error.includes(item));

@@ -17,6 +17,9 @@ CompactToolStrip.storyName = 'compact-tool-strip';
 export const ScrollPolicyLong = storyFor('scroll-policy-long');
 ScrollPolicyLong.storyName = 'scroll-policy-long';
 
+export const PrefixContinuityOffsetBug = storyFor('prefix-continuity-offset-bug');
+PrefixContinuityOffsetBug.storyName = 'prefix-continuity-offset-bug';
+
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 

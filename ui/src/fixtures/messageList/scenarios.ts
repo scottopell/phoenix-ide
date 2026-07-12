@@ -245,6 +245,56 @@ const wideMarkdownTableMessages: Message[] = [
 ];
 
 
+const continuityParagraphs = Array.from({ length: 28 }, (_, index) => (
+  `Continuity marker ${String(index + 1).padStart(2, '0')}: this is deterministic tall-row text used to keep a precise reading position visible while earlier history is inserted.`
+));
+
+const prefixContinuityMessages: Message[] = [
+  {
+    message_id: 'continuity-user-anchor',
+    conversation_id: 'fixture-message-list-prefix-continuity',
+    sequence_id: 101,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T11:00:00.000Z',
+    content: { text: 'Give me a detailed walkthrough with enough depth to read midway through it.' },
+    display_data: {},
+  },
+  {
+    message_id: 'continuity-agent-anchor',
+    conversation_id: 'fixture-message-list-prefix-continuity',
+    sequence_id: 102,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T11:01:00.000Z',
+    content: [{ type: 'text', text: continuityParagraphs.join('\n\n') }],
+    display_data: {},
+  },
+  {
+    message_id: 'continuity-user-tail',
+    conversation_id: 'fixture-message-list-prefix-continuity',
+    sequence_id: 103,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T11:02:00.000Z',
+    content: { text: 'This tail message keeps the tall response away from the list boundary.' },
+    display_data: {},
+  },
+];
+
+export const prefixContinuityEarlierMessages: Message[] = Array.from({ length: 18 }, (_, index) => ({
+  message_id: `continuity-prefix-${index + 1}`,
+  conversation_id: 'fixture-message-list-prefix-continuity',
+  sequence_id: index + 1,
+  type: index % 2 === 0 ? 'user' : 'agent',
+  message_type: index % 2 === 0 ? 'user' : 'agent',
+  created_at: `2025-01-01T10:${String(index).padStart(2, '0')}:00.000Z`,
+  content: index % 2 === 0
+    ? { text: `Earlier user message ${index + 1}` }
+    : [{ type: 'text', text: `Earlier assistant response ${index + 1}. `.repeat(8) }],
+  display_data: {},
+} as Message));
+
 export const messageListScenarios = [
   {
     id: 'compact-latest-expanded',
@@ -262,6 +312,12 @@ export const messageListScenarios = [
     id: 'scroll-policy-long',
     title: 'Scroll policy long conversation',
     description: 'Long deterministic conversation with controls for real Virtuoso tail-follow QA.',
+    theme: 'dark',
+  },
+  {
+    id: 'prefix-continuity-offset-bug',
+    title: 'Prefix continuity offset bug',
+    description: 'Interactive real-Virtuoso reproduction of identity-only restoration jumping within a tall row.',
     theme: 'dark',
   },
   {
@@ -295,7 +351,9 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
         ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages
-          : baseMessages;
+          : scenario.id === 'prefix-continuity-offset-bug'
+            ? prefixContinuityMessages
+            : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,
