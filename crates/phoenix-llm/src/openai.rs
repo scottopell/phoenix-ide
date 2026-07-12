@@ -2636,6 +2636,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_lite_continuation_reserves_provider_prefix_items() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole};
+
+        let limits = crate::ContinuationRequestLimits::codex_responses_lite();
+        let history_cap = limits
+            .max_history_messages(1)
+            .expect("Codex Lite continuation item cap");
+        let mut req = empty_request();
+        req.messages = (0..history_cap)
+            .map(|i| LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!("history {i}"))],
+            })
+            .collect();
+        req.messages.push(LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("prepare continuation handoff")],
+        });
+
+        let translated = translate_to_backend_request("gpt-5.6-sol", &req, true);
+        let ResponsesBackendRequest::CodexLite(translated) = translated else {
+            panic!("GPT-5.6 Codex must use Responses Lite");
+        };
+        assert_eq!(translated.input.len(), history_cap + 1 + 2);
+        assert_eq!(translated.input.len(), limits.max_input_items().unwrap());
+    }
+
+    #[tokio::test]
     async fn test_request_tags_omitted_when_none() {
         let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
         let json = serde_json::to_value(&req).unwrap();

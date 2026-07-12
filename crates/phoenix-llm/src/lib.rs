@@ -100,9 +100,13 @@ pub enum TokenChunk {
 pub enum ContinuationRequestLimits {
     /// The route has no known request-shape limit beyond its token window.
     TokenWindowOnly,
-    /// The route accepts at most this many total provider input items, including
-    /// the final continuation prompt.
-    MaxInputItems(std::num::NonZeroUsize),
+    /// The route accepts at most `total` provider input items. `prefix_items`
+    /// are provider-owned items inserted after history planning and are
+    /// therefore subtracted structurally rather than by caller convention.
+    MaxInputItems {
+        total: std::num::NonZeroUsize,
+        prefix_items: usize,
+    },
 }
 
 impl ContinuationRequestLimits {
@@ -111,22 +115,43 @@ impl ContinuationRequestLimits {
     /// appended continuation prompt.
     #[must_use]
     pub const fn codex_bridge() -> Self {
-        Self::MaxInputItems(std::num::NonZeroUsize::MIN.saturating_add(900))
+        Self::MaxInputItems {
+            total: std::num::NonZeroUsize::MIN.saturating_add(900),
+            prefix_items: 0,
+        }
+    }
+
+    /// GPT-5.6 Responses Lite prepends additional-tools and developer-
+    /// instructions items after continuation history has been planned.
+    #[must_use]
+    pub const fn codex_responses_lite() -> Self {
+        Self::MaxInputItems {
+            total: std::num::NonZeroUsize::MIN.saturating_add(900),
+            prefix_items: 2,
+        }
     }
 
     #[must_use]
     pub const fn max_input_items(self) -> Option<usize> {
         match self {
             Self::TokenWindowOnly => None,
-            Self::MaxInputItems(max) => Some(max.get()),
+            Self::MaxInputItems { total, .. } => Some(total.get()),
         }
     }
 
     #[must_use]
     pub const fn max_history_messages(self, reserved_input_items: usize) -> Option<usize> {
-        match self.max_input_items() {
-            Some(max) => Some(max.saturating_sub(reserved_input_items)),
-            None => None,
+        match self {
+            Self::MaxInputItems {
+                total,
+                prefix_items,
+            } => Some(
+                total
+                    .get()
+                    .saturating_sub(prefix_items)
+                    .saturating_sub(reserved_input_items),
+            ),
+            Self::TokenWindowOnly => None,
         }
     }
 }

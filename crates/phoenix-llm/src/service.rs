@@ -166,7 +166,9 @@ impl LlmService for LlmServiceImpl {
     }
 
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
-        if self.use_codex_backend {
+        if self.use_codex_backend && self.spec.api_name.starts_with("gpt-5.6") {
+            super::ContinuationRequestLimits::codex_responses_lite()
+        } else if self.use_codex_backend {
             super::ContinuationRequestLimits::codex_bridge()
         } else {
             super::ContinuationRequestLimits::TokenWindowOnly
