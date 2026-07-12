@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use crate::{
     BarrierDecl, BarrierId, BarrierMemberDecl, CancellationRequest, ClaimAuthority, CodecRef,
     EffectAmbiguity, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole, EffectState,
-    EffectStatus, Generation, ManualChoice, ManualChoiceKind, ObservationRecord, ProfileRef,
-    ProtocolSelection, ReceiptFamily, ReducerDecision, ReducerInboxEvent, ReducerInboxKind,
-    ReducerInboxPayload, SemanticAuthority, ShadowDivergenceKind, Timestamp, TransitionPlan,
-    Version, WorkflowProfile, WorkflowState, WorkflowStatus,
+    EffectStatus, Generation, ManualChoice, ManualChoiceKind, ObservationRecord,
+    OwedAcceptanceDecl, ProfileRef, ProtocolSelection, ReceiptFamily, ReducerDecision,
+    ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, SemanticAuthority,
+    ShadowDivergenceKind, Timestamp, TransitionPlan, Version, WorkflowProfile, WorkflowState,
+    WorkflowStatus,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -19,47 +20,205 @@ pub const REGISTRATION_BARRIER_ID: BarrierId = BarrierId(1);
 pub const REGISTRATION_EFFECT_ID: EffectId = EffectId(1);
 pub const REGISTRATION_BARRIER_KIND: &str = "registration_observed";
 pub const OBSERVE_HANDLE_KIND: &str = "observe_handle";
-pub const BASH_RESOURCE: &str = "bash";
-pub const TMUX_RESOURCE: &str = "tmux";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkScopeKind {
+    Conversation,
+    Worktree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkScopeIdentity {
+    pub kind: WorkScopeKind,
+    pub stable_key: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BashResourceIdentity {
+    pub work_scope: WorkScopeIdentity,
+    pub handle_id: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TmuxResourceIdentity {
+    pub work_scope: WorkScopeIdentity,
+    pub server_generation: &'static str,
+    pub window_id: &'static str,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WakeResourceIdentity {
-    Bash { handle_id: &'static str },
-    Tmux { session_id: &'static str },
+    Bash(BashResourceIdentity),
+    TmuxWindow(TmuxResourceIdentity),
 }
 
 impl WakeResourceIdentity {
     #[must_use]
-    pub const fn resource_family(self) -> &'static str {
+    pub const fn work_scope(self) -> WorkScopeIdentity {
         match self {
-            Self::Bash { .. } => BASH_RESOURCE,
-            Self::Tmux { .. } => TMUX_RESOURCE,
+            Self::Bash(identity) => identity.work_scope,
+            Self::TmuxWindow(identity) => identity.work_scope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeRegistrationIntent {
+    pub contract_id: &'static str,
+    pub conversation_id: &'static str,
+    pub registration_scope: WorkScopeIdentity,
+    pub resource: WakeResourceIdentity,
+    pub registering_tool_use_id: &'static str,
+    pub registered_at: Timestamp,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserveHandleIntent {
+    pub contract_id: &'static str,
+    pub resource: WakeResourceIdentity,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeRegistrationReceipt {
+    pub contract_id: &'static str,
+    pub resource: WakeResourceIdentity,
+    pub expires_at: Timestamp,
+    pub registering_tool_use_id: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashTerminalStatus {
+    Exited,
+    Killed,
+    KillPendingKernel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxTerminalStatus {
+    ExitMarkerObserved,
+    WindowKilled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashTerminalEvidence {
+    pub identity: BashResourceIdentity,
+    pub status: BashTerminalStatus,
+    pub occurred_at: Timestamp,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub signal_number: Option<i32>,
+    pub kill_signal_sent: Option<&'static str>,
+    pub final_tail: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxTerminalEvidence {
+    pub identity: TmuxResourceIdentity,
+    pub status: TmuxTerminalStatus,
+    pub occurred_at: Timestamp,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub final_tail: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeTerminalEvidence {
+    Bash(BashTerminalEvidence),
+    TmuxWindow(TmuxTerminalEvidence),
+}
+
+impl WakeTerminalEvidence {
+    #[must_use]
+    pub const fn occurred_at(&self) -> Timestamp {
+        match self {
+            Self::Bash(evidence) => evidence.occurred_at,
+            Self::TmuxWindow(evidence) => evidence.occurred_at,
         }
     }
 
     #[must_use]
-    pub const fn stable_key(self) -> &'static str {
+    pub const fn identity(&self) -> WakeResourceIdentity {
         match self {
-            Self::Bash { handle_id } => handle_id,
-            Self::Tmux { session_id } => session_id,
+            Self::Bash(evidence) => WakeResourceIdentity::Bash(evidence.identity),
+            Self::TmuxWindow(evidence) => WakeResourceIdentity::TmuxWindow(evidence.identity),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeCancellationReason {
+    ExplicitCancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeForgottenReason {
+    HandleMissing,
+    RuntimeUnrecoverableAfterRestart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeTerminalPayload {
+    Fired {
+        contract_id: &'static str,
+        resource: WakeResourceIdentity,
+        evidence: WakeTerminalEvidence,
+        resolved_at: Timestamp,
+    },
+    Expired {
+        contract_id: &'static str,
+        resource: WakeResourceIdentity,
+        resolved_at: Timestamp,
+    },
+    Cancelled {
+        contract_id: &'static str,
+        resource: WakeResourceIdentity,
+        reason: WakeCancellationReason,
+        resolved_at: Timestamp,
+    },
+    Forgotten {
+        contract_id: &'static str,
+        resource: WakeResourceIdentity,
+        reason: WakeForgottenReason,
+        resolved_at: Timestamp,
+    },
+}
+
+impl WakeTerminalPayload {
+    #[must_use]
+    pub const fn contract_id(&self) -> &'static str {
+        match self {
+            Self::Fired { contract_id, .. }
+            | Self::Expired { contract_id, .. }
+            | Self::Cancelled { contract_id, .. }
+            | Self::Forgotten { contract_id, .. } => contract_id,
         }
     }
 
     #[must_use]
-    pub fn destructive_resource(self) -> &'static str {
+    pub const fn resource(&self) -> WakeResourceIdentity {
         match self {
-            Self::Bash { handle_id } => leak_concat(BASH_RESOURCE, handle_id),
-            Self::Tmux { session_id } => leak_concat(TMUX_RESOURCE, session_id),
+            Self::Fired { resource, .. }
+            | Self::Expired { resource, .. }
+            | Self::Cancelled { resource, .. }
+            | Self::Forgotten { resource, .. } => *resource,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeRegistrationSnapshot {
-    pub identity: WakeResourceIdentity,
-    pub deadline: Timestamp,
-    pub accepted: BusyIdleAcceptance,
-    pub continuation: Option<WakeContinuation>,
+    pub contract_id: &'static str,
+    pub conversation_id: &'static str,
+    pub registration_scope: WorkScopeIdentity,
+    pub resource: WakeResourceIdentity,
+    pub registering_tool_use_id: &'static str,
+    pub registered_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub registration_fence_version: Version,
+    pub continuation: Option<WakeContinuationTransfer>,
+    pub terminal: Option<WakeTerminalPayload>,
     pub cancelled: bool,
 }
 
@@ -68,124 +227,86 @@ pub enum WakeRegistrationEvent {
     Registered,
     CancelRequested,
     Continued,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WakeRegistrationIntent {
-    ObserveHandle {
-        identity: WakeResourceIdentity,
-        deadline: Timestamp,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalWakeEvidence {
-    Exited {
-        occurred_at: Timestamp,
-        exit_code: i32,
-    },
-    TmuxFinished {
-        occurred_at: Timestamp,
-    },
-    Missing,
-}
-
-impl TerminalWakeEvidence {
-    #[must_use]
-    pub const fn occurred_at(&self) -> Option<Timestamp> {
-        match self {
-            Self::Exited { occurred_at, .. } | Self::TmuxFinished { occurred_at } => {
-                Some(*occurred_at)
-            }
-            Self::Missing => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalWakeCause {
-    Fired,
-    Expired,
-    Cancelled,
-    Forgotten,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalWakeReceipt {
-    pub identity: WakeResourceIdentity,
-    pub cause: TerminalWakeCause,
-    pub observed_at: Timestamp,
+    RuntimeAccepted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeBarrierEvent {
-    RegistrationObserved { identity: WakeResourceIdentity },
+    RegistrationObserved { receipt: WakeRegistrationReceipt },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusyIdleAcceptance {
-    Busy,
-    Idle,
-    Either,
-}
-
-impl BusyIdleAcceptance {
-    #[must_use]
-    pub const fn accepts(self, cause: &TerminalWakeCause) -> bool {
-        !matches!(cause, TerminalWakeCause::Cancelled)
-    }
-
-    #[must_use]
-    pub const fn projects_busy(self) -> bool {
-        matches!(self, Self::Busy | Self::Either)
-    }
-
-    #[must_use]
-    pub const fn projects_idle(self) -> bool {
-        matches!(self, Self::Idle | Self::Either)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAvailability {
     Idle,
     Busy,
     Terminal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BusyIdleProjection {
-    AcceptNow(TerminalWakeCause),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAvailabilityProjection {
+    Accept,
     Defer,
     Suppress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WakeContinuation {
-    pub identity: WakeResourceIdentity,
-    pub deadline: Timestamp,
-    pub accepted: BusyIdleAcceptance,
+pub struct WakeContinuationTransfer {
+    pub pending_contract: &'static str,
+    pub resource: WakeResourceIdentity,
+    pub expires_at: Timestamp,
+    pub inbox_ids: Vec<ReducerInboxId>,
+    pub owed_ids: Vec<u64>,
+    pub successor_workflow_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeRegistrationFence {
+    pub status: FenceStatus,
+    pub version: Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeLifecycleFence {
-    pub workflow_version: Version,
-    pub generation: Generation,
-    pub effect_id: EffectId,
+    pub status: FenceStatus,
+    pub version: Version,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceStatus {
+    Open,
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeManualPayload {
-    AcceptBusy,
-    AcceptIdle,
-    AcceptDeadline,
+    Accept,
+    Defer,
+    Suppress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeShadowComparisonKind {
+    Registration,
+    Observation,
+    TerminalReceipt,
+    Inbox,
+    Acceptance,
+    Lifecycle,
+    Capability,
+    UserProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WakeShadowParity {
-    pub identity: WakeResourceIdentity,
-    pub selected_cause: TerminalWakeCause,
-    pub divergence_kind: Option<ShadowDivergenceKind>,
+pub struct WakeShadowComparison {
+    pub kind: WakeShadowComparisonKind,
+    pub generic_kind: ShadowDivergenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeReceiptComparison {
+    pub equal: bool,
+    pub exact_identity_match: bool,
+    pub exact_deadline_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,10 +315,10 @@ pub struct WakeProfile;
 impl WorkflowProfile for WakeProfile {
     type Snapshot = WakeRegistrationSnapshot;
     type Event = WakeRegistrationEvent;
-    type Intent = WakeRegistrationIntent;
-    type Observation = TerminalWakeEvidence;
-    type Receipt = TerminalWakeReceipt;
-    type ReceiptReducerEvent = TerminalWakeReceipt;
+    type Intent = ObserveHandleIntent;
+    type Observation = WakeTerminalEvidence;
+    type Receipt = WakeTerminalPayload;
+    type ReceiptReducerEvent = WakeTerminalPayload;
     type BarrierEvent = WakeBarrierEvent;
     type ManualPayload = WakeManualPayload;
 }
@@ -254,70 +375,83 @@ pub fn manual_codec() -> CodecRef {
 }
 
 #[must_use]
-pub fn barrier_events() -> BTreeMap<BarrierId, WakeBarrierEvent> {
+pub fn barrier_events(receipt: WakeRegistrationReceipt) -> BTreeMap<BarrierId, WakeBarrierEvent> {
     BTreeMap::from([(
         REGISTRATION_BARRIER_ID,
-        WakeBarrierEvent::RegistrationObserved {
-            identity: WakeResourceIdentity::Bash {
-                handle_id: "registration",
-            },
-        },
+        WakeBarrierEvent::RegistrationObserved { receipt },
     )])
 }
 
 #[must_use]
-pub fn registration_barrier_event(identity: WakeResourceIdentity) -> WakeBarrierEvent {
-    WakeBarrierEvent::RegistrationObserved { identity }
+pub fn registration_barrier_event(receipt: WakeRegistrationReceipt) -> WakeBarrierEvent {
+    WakeBarrierEvent::RegistrationObserved { receipt }
 }
 
 #[must_use]
 pub fn registration_snapshot(
-    identity: WakeResourceIdentity,
-    deadline: Timestamp,
-    accepted: BusyIdleAcceptance,
+    intent: &WakeRegistrationIntent,
+    fence_version: Version,
 ) -> WakeRegistrationSnapshot {
     WakeRegistrationSnapshot {
-        identity,
-        deadline,
-        accepted,
+        contract_id: intent.contract_id,
+        conversation_id: intent.conversation_id,
+        registration_scope: intent.registration_scope,
+        resource: intent.resource,
+        registering_tool_use_id: intent.registering_tool_use_id,
+        registered_at: intent.registered_at,
+        expires_at: intent.expires_at,
+        registration_fence_version: fence_version,
         continuation: None,
+        terminal: None,
         cancelled: false,
+    }
+}
+
+#[must_use]
+pub fn registration_receipt(intent: &WakeRegistrationIntent) -> WakeRegistrationReceipt {
+    WakeRegistrationReceipt {
+        contract_id: intent.contract_id,
+        resource: intent.resource,
+        expires_at: intent.expires_at,
+        registering_tool_use_id: intent.registering_tool_use_id,
     }
 }
 
 #[must_use]
 pub fn registration_decision(
     expected_workflow_version: Version,
-    identity: WakeResourceIdentity,
-    deadline: Timestamp,
-    accepted: BusyIdleAcceptance,
+    intent: &WakeRegistrationIntent,
+    fence_version: Version,
 ) -> (
     ReducerDecision<WakeProfile>,
     BTreeMap<BarrierId, WakeBarrierEvent>,
 ) {
-    let snapshot = registration_snapshot(identity, deadline, accepted);
-    let effect = EffectDecl {
-        effect_id: REGISTRATION_EFFECT_ID,
-        family: PROFILE_ID,
-        kind: OBSERVE_HANDLE_KIND,
-        codec: intent_codec(),
-        generation: Generation(0),
-        role: EffectRole::Required,
-        ambiguity: EffectAmbiguity::ObservableReconciliation,
-        intent: WakeRegistrationIntent::ObserveHandle { identity, deadline },
-        next_eligible_at: None,
-        destructive_resource: None,
+    let receipt = registration_receipt(intent);
+    let observe_intent = ObserveHandleIntent {
+        contract_id: intent.contract_id,
+        resource: intent.resource,
+        expires_at: intent.expires_at,
     };
-    let barrier_event = registration_barrier_event(identity);
     (
         ReducerDecision {
             expected_workflow_version,
             plan: TransitionPlan {
-                snapshot,
+                snapshot: registration_snapshot(intent, fence_version),
                 snapshot_codec: snapshot_codec(),
                 event: WakeRegistrationEvent::Registered,
                 event_codec: event_codec(),
-                effects: vec![effect],
+                effects: vec![EffectDecl {
+                    effect_id: REGISTRATION_EFFECT_ID,
+                    family: PROFILE_ID,
+                    kind: OBSERVE_HANDLE_KIND,
+                    codec: intent_codec(),
+                    generation: Generation(0),
+                    role: EffectRole::Required,
+                    ambiguity: EffectAmbiguity::ObservableReconciliation,
+                    intent: observe_intent,
+                    next_eligible_at: None,
+                    destructive_resource: None,
+                }],
                 dependencies: vec![],
                 barriers: vec![BarrierDecl {
                     barrier_id: REGISTRATION_BARRIER_ID,
@@ -331,13 +465,14 @@ pub fn registration_decision(
                 owed_acceptances: None,
             },
         },
-        BTreeMap::from([(REGISTRATION_BARRIER_ID, barrier_event)]),
+        barrier_events(receipt),
     )
 }
 
 #[must_use]
 pub fn cancellation_request(
     workflow: &WorkflowState<WakeProfile>,
+    resolved_at: Timestamp,
 ) -> CancellationRequest<WakeProfile> {
     let invalidations = workflow
         .effects
@@ -352,11 +487,17 @@ pub fn cancellation_request(
                 })
         })
         .collect::<Vec<_>>();
-    let mut snapshot = workflow.snapshot.clone();
-    snapshot.cancelled = true;
+    let mut next_snapshot = workflow.snapshot.clone();
+    next_snapshot.cancelled = true;
+    next_snapshot.terminal = Some(cancelled_terminal_payload(
+        next_snapshot.contract_id,
+        next_snapshot.resource,
+        WakeCancellationReason::ExplicitCancel,
+        resolved_at,
+    ));
     CancellationRequest {
         expected_workflow_version: workflow.version,
-        next_snapshot: snapshot,
+        next_snapshot,
         next_snapshot_codec: snapshot_codec(),
         event: WakeRegistrationEvent::CancelRequested,
         event_codec: event_codec(),
@@ -377,95 +518,179 @@ pub fn cancellation_request(
 }
 
 #[must_use]
-pub fn project_runtime_acceptance(
+pub const fn cancelled_terminal_payload(
+    contract_id: &'static str,
+    resource: WakeResourceIdentity,
+    reason: WakeCancellationReason,
+    resolved_at: Timestamp,
+) -> WakeTerminalPayload {
+    WakeTerminalPayload::Cancelled {
+        contract_id,
+        resource,
+        reason,
+        resolved_at,
+    }
+}
+
+#[must_use]
+pub const fn project_runtime_availability(
     runtime: RuntimeAvailability,
-    cause: TerminalWakeCause,
-) -> BusyIdleProjection {
-    match (runtime, cause) {
-        (RuntimeAvailability::Idle, cause) if cause != TerminalWakeCause::Cancelled => {
-            BusyIdleProjection::AcceptNow(cause)
-        }
-        (RuntimeAvailability::Busy, _) => BusyIdleProjection::Defer,
-        (RuntimeAvailability::Terminal, _) | (_, TerminalWakeCause::Cancelled) => {
-            BusyIdleProjection::Suppress
-        }
-        (RuntimeAvailability::Idle, _) => BusyIdleProjection::Suppress,
+) -> RuntimeAvailabilityProjection {
+    match runtime {
+        RuntimeAvailability::Busy => RuntimeAvailabilityProjection::Defer,
+        RuntimeAvailability::Idle => RuntimeAvailabilityProjection::Accept,
+        RuntimeAvailability::Terminal => RuntimeAvailabilityProjection::Suppress,
     }
 }
 
 #[must_use]
-pub fn receipt_from_evidence(
-    identity: WakeResourceIdentity,
-    evidence: &TerminalWakeEvidence,
-    deadline: Timestamp,
-) -> TerminalWakeReceipt {
-    let (cause, observed_at) = match evidence.occurred_at() {
-        Some(occurred_at) if occurred_at <= deadline => (TerminalWakeCause::Fired, occurred_at),
-        Some(_) => (TerminalWakeCause::Expired, deadline),
-        None => (TerminalWakeCause::Forgotten, deadline),
-    };
-    TerminalWakeReceipt {
-        identity,
-        cause,
-        observed_at,
+pub fn terminal_payload_from_evidence(
+    contract_id: &'static str,
+    resource: WakeResourceIdentity,
+    evidence: WakeTerminalEvidence,
+    expires_at: Timestamp,
+) -> Option<WakeTerminalPayload> {
+    if resource != evidence.identity() {
+        return None;
+    }
+    let occurred_at = evidence.occurred_at();
+    if occurred_at <= expires_at {
+        Some(WakeTerminalPayload::Fired {
+            contract_id,
+            resource,
+            evidence,
+            resolved_at: occurred_at,
+        })
+    } else {
+        Some(WakeTerminalPayload::Expired {
+            contract_id,
+            resource,
+            resolved_at: expires_at,
+        })
     }
 }
 
 #[must_use]
-pub fn continuation_from_snapshot(snapshot: &WakeRegistrationSnapshot) -> WakeContinuation {
-    WakeContinuation {
-        identity: snapshot.identity,
-        deadline: snapshot.deadline,
-        accepted: snapshot.accepted,
+pub const fn forgotten_terminal_payload(
+    contract_id: &'static str,
+    resource: WakeResourceIdentity,
+    reason: WakeForgottenReason,
+    resolved_at: Timestamp,
+) -> WakeTerminalPayload {
+    WakeTerminalPayload::Forgotten {
+        contract_id,
+        resource,
+        reason,
+        resolved_at,
+    }
+}
+
+#[must_use]
+pub fn evidence_matches_resource(
+    evidence: &WakeTerminalEvidence,
+    resource: WakeResourceIdentity,
+) -> bool {
+    evidence.identity() == resource
+}
+
+#[must_use]
+pub fn deadline_matches_exactly(lhs: Timestamp, rhs: Timestamp) -> bool {
+    lhs == rhs
+}
+
+#[must_use]
+pub fn compare_receipts(
+    expected: &WakeRegistrationReceipt,
+    actual: &WakeRegistrationReceipt,
+) -> WakeReceiptComparison {
+    WakeReceiptComparison {
+        equal: expected == actual,
+        exact_identity_match: expected.resource == actual.resource,
+        exact_deadline_match: deadline_matches_exactly(expected.expires_at, actual.expires_at),
+    }
+}
+
+#[must_use]
+pub fn continuation_from_snapshot(
+    snapshot: &WakeRegistrationSnapshot,
+    inbox_ids: Vec<ReducerInboxId>,
+    owed_ids: Vec<u64>,
+    successor_workflow_id: u64,
+) -> WakeContinuationTransfer {
+    WakeContinuationTransfer {
+        pending_contract: snapshot.contract_id,
+        resource: snapshot.resource,
+        expires_at: snapshot.expires_at,
+        inbox_ids,
+        owed_ids,
+        successor_workflow_id,
     }
 }
 
 #[must_use]
 pub fn transfer_continuation(
     snapshot: &WakeRegistrationSnapshot,
-    next_accepted: BusyIdleAcceptance,
+    inbox_ids: Vec<ReducerInboxId>,
+    owed_ids: Vec<u64>,
+    successor_workflow_id: u64,
 ) -> WakeRegistrationSnapshot {
-    WakeRegistrationSnapshot {
-        identity: snapshot.identity,
-        deadline: snapshot.deadline,
-        accepted: next_accepted,
-        continuation: Some(continuation_from_snapshot(snapshot)),
-        cancelled: snapshot.cancelled,
-    }
+    let mut next = snapshot.clone();
+    next.continuation = Some(continuation_from_snapshot(
+        snapshot,
+        inbox_ids,
+        owed_ids,
+        successor_workflow_id,
+    ));
+    next
 }
 
 #[must_use]
-pub fn lifecycle_fence(
+pub const fn registration_fence(version: Version, status: FenceStatus) -> WakeRegistrationFence {
+    WakeRegistrationFence { status, version }
+}
+
+#[must_use]
+pub const fn lifecycle_fence(version: Version, status: FenceStatus) -> WakeLifecycleFence {
+    WakeLifecycleFence { status, version }
+}
+
+#[must_use]
+pub fn fence_accepts(
     workflow: &WorkflowState<WakeProfile>,
-    effect_id: EffectId,
-) -> Option<WakeLifecycleFence> {
-    workflow
-        .effects
-        .get(&effect_id)
-        .map(|_| WakeLifecycleFence {
-            workflow_version: workflow.version,
-            generation: workflow.generation,
-            effect_id,
-        })
+    registration: &WakeRegistrationFence,
+    lifecycle: &WakeLifecycleFence,
+) -> bool {
+    workflow.status == WorkflowStatus::Active
+        && registration.status == FenceStatus::Open
+        && lifecycle.status == FenceStatus::Open
+        && registration.version == lifecycle.version
+        && workflow.snapshot.registration_fence_version == registration.version
 }
 
 #[must_use]
-pub fn fence_accepts(workflow: &WorkflowState<WakeProfile>, fence: &WakeLifecycleFence) -> bool {
-    workflow.version == fence.workflow_version
-        && workflow.generation == fence.generation
-        && workflow.effects.contains_key(&fence.effect_id)
-        && workflow.status == WorkflowStatus::Active
+pub fn shadow_comparison(kind: WakeShadowComparisonKind) -> WakeShadowComparison {
+    let generic_kind = match kind {
+        WakeShadowComparisonKind::Registration => ShadowDivergenceKind::Snapshot,
+        WakeShadowComparisonKind::Observation => ShadowDivergenceKind::Observation,
+        WakeShadowComparisonKind::TerminalReceipt => ShadowDivergenceKind::Receipt,
+        WakeShadowComparisonKind::Inbox => ShadowDivergenceKind::ReducerEvent,
+        WakeShadowComparisonKind::Acceptance => ShadowDivergenceKind::Transition,
+        WakeShadowComparisonKind::Lifecycle => ShadowDivergenceKind::EffectPlan,
+        WakeShadowComparisonKind::Capability => ShadowDivergenceKind::Capability,
+        WakeShadowComparisonKind::UserProjection => ShadowDivergenceKind::UserProjection,
+    };
+    WakeShadowComparison { kind, generic_kind }
 }
 
 #[must_use]
-pub fn shadow_parity(
-    authoritative: &TerminalWakeReceipt,
-    shadow: &TerminalWakeReceipt,
-) -> WakeShadowParity {
-    WakeShadowParity {
-        identity: authoritative.identity,
-        selected_cause: authoritative.cause.clone(),
-        divergence_kind: (authoritative != shadow).then_some(ShadowDivergenceKind::Receipt),
+pub fn acceptance_owed_decl(
+    inbox_id: ReducerInboxId,
+    receipt: WakeRegistrationReceipt,
+) -> OwedAcceptanceDecl<WakeBarrierEvent> {
+    OwedAcceptanceDecl {
+        reducer_inbox_id: inbox_id,
+        source_kind: REGISTRATION_BARRIER_KIND,
+        event: WakeBarrierEvent::RegistrationObserved { receipt },
     }
 }
 
@@ -475,17 +700,17 @@ pub fn manual_choices() -> Vec<ManualChoice<WakeProfile>> {
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
-            payload: WakeManualPayload::AcceptBusy,
+            payload: WakeManualPayload::Accept,
         },
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
-            payload: WakeManualPayload::AcceptIdle,
+            payload: WakeManualPayload::Defer,
         },
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
-            payload: WakeManualPayload::AcceptDeadline,
+            payload: WakeManualPayload::Suppress,
         },
     ]
 }
@@ -494,7 +719,7 @@ pub fn manual_choices() -> Vec<ManualChoice<WakeProfile>> {
 pub fn authoritative_observation<'a>(
     authority: &ClaimAuthority,
     effect: &'a EffectState<WakeProfile>,
-) -> Option<&'a ObservationRecord<TerminalWakeEvidence>> {
+) -> Option<&'a ObservationRecord<WakeTerminalEvidence>> {
     effect
         .observations
         .iter()
@@ -504,18 +729,14 @@ pub fn authoritative_observation<'a>(
 #[must_use]
 pub fn inbox_contains_registration_barrier(
     event: &ReducerInboxEvent<WakeProfile>,
-    identity: WakeResourceIdentity,
+    receipt: &WakeRegistrationReceipt,
 ) -> bool {
     event.kind == ReducerInboxKind::BarrierSatisfied
         && matches!(
             &event.payload,
-            ReducerInboxPayload::Barrier(WakeBarrierEvent::RegistrationObserved { identity: found })
-                if *found == identity
+            ReducerInboxPayload::Barrier(WakeBarrierEvent::RegistrationObserved { receipt: found })
+                if found == receipt
         )
-}
-
-fn leak_concat(prefix: &str, value: &str) -> &'static str {
-    Box::leak(format!("{prefix}:{value}").into_boxed_str())
 }
 
 #[cfg(test)]
