@@ -2317,7 +2317,6 @@ fn message_starts_render_unit(message: &crate::db::Message) -> bool {
 }
 
 const RENDER_UNIT_BACKFILL_CHUNK_SIZE: i64 = 64;
-const RENDER_UNIT_BACKFILL_SCAN_LIMIT: i64 = 512;
 
 async fn align_slice_start_to_render_unit(
     db: &crate::db::Database,
@@ -2332,44 +2331,34 @@ async fn align_slice_start_to_render_unit(
     }
 
     let mut before_sequence = first.sequence_id;
-    let mut scanned = 0i64;
-    let mut intervening_standalone = Vec::new();
-    while scanned < RENDER_UNIT_BACKFILL_SCAN_LIMIT {
-        let remaining = RENDER_UNIT_BACKFILL_SCAN_LIMIT - scanned;
-        let chunk_limit = remaining.min(RENDER_UNIT_BACKFILL_CHUNK_SIZE);
+    let mut intervening = Vec::new();
+    loop {
         let previous = db
-            .get_messages_before(conversation_id, before_sequence, chunk_limit)
+            .get_messages_before(
+                conversation_id,
+                before_sequence,
+                RENDER_UNIT_BACKFILL_CHUNK_SIZE,
+            )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if previous.is_empty() {
+            intervening.append(messages);
+            *messages = intervening;
             break;
         }
-        scanned += i64::try_from(previous.len()).map_err(|_| {
-            AppError::Internal("render-unit backfill chunk is too large".to_string())
-        })?;
         let oldest_sequence = previous[0].sequence_id;
 
         if let Some(owner_index) = previous.iter().rposition(message_starts_render_unit) {
-            let mut prefix = Vec::with_capacity(intervening_standalone.len() + 1);
-            prefix.push(previous[owner_index].clone());
-            prefix.extend(
-                previous
-                    .into_iter()
-                    .skip(owner_index + 1)
-                    .filter(|message| message.message_type != crate::db::MessageType::Tool),
-            );
-            prefix.append(&mut intervening_standalone);
+            let mut prefix = previous.into_iter().skip(owner_index).collect::<Vec<_>>();
+            prefix.append(&mut intervening);
             prefix.append(messages);
             *messages = prefix;
             break;
         }
 
-        let mut standalone = previous
-            .into_iter()
-            .filter(|message| message.message_type != crate::db::MessageType::Tool)
-            .collect::<Vec<_>>();
-        standalone.append(&mut intervening_standalone);
-        intervening_standalone = standalone;
+        let mut older_intervening = previous;
+        older_intervening.append(&mut intervening);
+        intervening = older_intervening;
         before_sequence = oldest_sequence;
     }
     Ok(())
@@ -7181,15 +7170,15 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn latest_message_slice_backfills_only_owner_when_tool_run_exceeds_limit() {
+    async fn latest_message_slice_backfills_contiguous_tool_run_past_chunk_cutoff() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let state = make_test_state().await;
         state
             .db
             .create_conversation(
-                "conv-history-latest-bounded-turn",
-                "history-latest-bounded-turn",
+                "conv-history-latest-long-turn",
+                "history-latest-long-turn",
                 "/tmp",
                 true,
                 None,
@@ -7201,8 +7190,8 @@ pub(crate) mod hard_delete_cascade_tests {
         state
             .db
             .add_message(
-                "bounded-user",
-                "conv-history-latest-bounded-turn",
+                "long-user",
+                "conv-history-latest-long-turn",
                 &crate::db::MessageContent::user("prompt"),
                 None,
                 None,
@@ -7212,10 +7201,10 @@ pub(crate) mod hard_delete_cascade_tests {
         state
             .db
             .add_message(
-                "bounded-agent",
-                "conv-history-latest-bounded-turn",
+                "long-agent",
+                "conv-history-latest-long-turn",
                 &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
-                    id: "tool-bounded".to_string(),
+                    id: "tool-long".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "foo"}),
                 }]),
@@ -7224,14 +7213,14 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("add agent");
-        for idx in 0..200 {
+        for idx in 0..600 {
             state
                 .db
                 .add_message(
-                    &format!("bounded-tool-{idx}"),
-                    "conv-history-latest-bounded-turn",
+                    &format!("long-tool-{idx}"),
+                    "conv-history-latest-long-turn",
                     &crate::db::MessageContent::tool(
-                        "tool-bounded",
+                        "tool-long",
                         format!("tool output {idx}"),
                         false,
                     ),
@@ -7244,7 +7233,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let Json(latest) = get_conversation_messages_latest(
             State(state),
-            Path("conv-history-latest-bounded-turn".to_string()),
+            Path("conv-history-latest-long-turn".to_string()),
             Query(LatestMessagesQuery { limit: Some(50) }),
         )
         .await
@@ -7255,10 +7244,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .iter()
             .map(|m| m.sequence_id)
             .collect::<Vec<_>>();
-        assert_eq!(sequence_ids.first().copied(), Some(2));
-        assert_eq!(sequence_ids.len(), 51);
-        assert_eq!(sequence_ids[1], 153);
-        assert_eq!(sequence_ids.last().copied(), Some(202));
+        assert_eq!(sequence_ids, (2..=602).collect::<Vec<_>>());
         assert!(latest.has_older_messages);
     }
 
@@ -7361,6 +7347,155 @@ pub(crate) mod hard_delete_cascade_tests {
             vec![3, 4]
         );
         assert!(before.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn repeated_older_page_traversal_returns_each_sequence_exactly_once() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use std::collections::HashSet;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-page-each-once",
+                "history-page-each-once",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+
+        state
+            .db
+            .add_message(
+                "page-user-1",
+                "conv-history-page-each-once",
+                &crate::db::MessageContent::user("older prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("add older user");
+        state
+            .db
+            .add_message(
+                "page-agent-1",
+                "conv-history-page-each-once",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-page-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "older"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add older agent");
+        for idx in 0..90 {
+            state
+                .db
+                .add_message(
+                    &format!("page-tool-1-{idx}"),
+                    "conv-history-page-each-once",
+                    &crate::db::MessageContent::tool(
+                        "tool-page-1",
+                        format!("older tool output {idx}"),
+                        false,
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add older tool");
+        }
+        state
+            .db
+            .add_message(
+                "page-user-2",
+                "conv-history-page-each-once",
+                &crate::db::MessageContent::user("newer prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("add newer user");
+        state
+            .db
+            .add_message(
+                "page-agent-2",
+                "conv-history-page-each-once",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-page-2".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "newer"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add newer agent");
+        for idx in 0..45 {
+            state
+                .db
+                .add_message(
+                    &format!("page-tool-2-{idx}"),
+                    "conv-history-page-each-once",
+                    &crate::db::MessageContent::tool(
+                        "tool-page-2",
+                        format!("newer tool output {idx}"),
+                        false,
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add newer tool");
+        }
+
+        let mut pages = Vec::new();
+        let Json(latest) = get_conversation_messages_latest(
+            State(state.clone()),
+            Path("conv-history-page-each-once".to_string()),
+            Query(LatestMessagesQuery { limit: Some(20) }),
+        )
+        .await
+        .expect("latest messages");
+        pages.push(latest);
+
+        while pages.last().is_some_and(|page| page.has_older_messages) {
+            let before_sequence = pages
+                .last()
+                .and_then(|page| page.messages.first())
+                .map(|message| message.sequence_id)
+                .expect("non-empty page");
+            let Json(older) = get_conversation_messages(
+                State(state.clone()),
+                Path("conv-history-page-each-once".to_string()),
+                Query(MessageHistoryQuery {
+                    before_message_sequence: Some(before_sequence),
+                    after_message_sequence: None,
+                    limit: Some(20),
+                }),
+            )
+            .await
+            .expect("older messages");
+            pages.push(older);
+        }
+
+        let mut chronological = Vec::new();
+        for page in pages.iter().rev() {
+            chronological.extend(page.messages.iter().map(|message| message.sequence_id));
+        }
+
+        let expected = (1..=139).collect::<Vec<_>>();
+        assert_eq!(chronological, expected);
+        assert_eq!(
+            chronological.iter().copied().collect::<HashSet<_>>().len(),
+            chronological.len()
+        );
     }
 
     #[tokio::test]
