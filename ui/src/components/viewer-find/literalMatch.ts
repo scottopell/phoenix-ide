@@ -53,7 +53,7 @@ export function findLiteralMatches(haystack: string, query: string): ViewerFindR
     const sourceEndStart = foldedHaystack.mapToSource[foldedEnd]!;
     const sourceEnd = sourceEndStart + codeUnitWidthAt(haystack, sourceEndStart);
     matches.push({ start: sourceStart, end: sourceEnd });
-    fromIndex = start + 1;
+    fromIndex = start + foldedQuery.length;
   }
 
   return { query, haystack, matches };

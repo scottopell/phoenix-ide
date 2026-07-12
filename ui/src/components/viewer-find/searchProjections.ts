@@ -353,6 +353,7 @@ export function buildBlockSearchProjection(
 }
 
 export interface ConversationProjectionOptions {
+  latestAgentKey?: string | null;
   density?: 'full' | 'compact';
   streamingBuffer?: StreamingBuffer | null;
   systemPrompt?: string | null;
@@ -387,7 +388,7 @@ export function buildConversationSearchProjection(
         }
         break;
       case 'agent_turn':
-        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density)) {
+        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density, unit.key === options.latestAgentKey)) {
           addConversationSource(
             sources,
             unitIndex,
@@ -589,9 +590,11 @@ function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
+  isLatestAgentMessage: boolean,
 ): Array<{ role: string; text: string; forceExpanded?: boolean }> {
+  const forceExpandedText = isLatestAgentMessage
+    || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const forceExpandedText = (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const out: Array<{ role: string; text: string; forceExpanded?: boolean }> = [];
   blocks.forEach((block, index) => {
     if (block.type === 'text') {

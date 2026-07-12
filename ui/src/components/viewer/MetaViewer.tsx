@@ -238,7 +238,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
     [find.query, findSourceText, shouldProjectFind],
   );
-  const activeFindMatch = find.isOpen && find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
+  const activeFindIndex = findProjection.matches.length === 0
+    ? -1
+    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  const activeFindMatch = find.isOpen && activeFindIndex >= 0 ? findProjection.matches[activeFindIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
     () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
     [find.isOpen, findProjection.matches],
@@ -252,7 +255,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     onAnnotate: notes.startAnnotate,
     registerLineRef,
     findQuery: find.isOpen ? find.query : '',
-    activeFindOccurrence: find.isOpen ? find.activeIndex : null,
+    activeFindOccurrence: find.isOpen ? activeFindIndex : null,
   };
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
 
@@ -262,7 +265,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       fileCodeRef.current?.scrollToFindTarget(activeFindMatch);
       return;
     }
-    const selector = `[data-find-occurrence="${find.activeIndex}"]`;
+    const selector = `[data-find-occurrence="${activeFindIndex}"]`;
     const matchEl = contentRef.current?.querySelector<HTMLElement>(selector);
     if (matchEl) {
       matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -270,7 +273,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     }
     const lineEl = lineRefs.current.get(activeFindMatch.lineNumber);
     lineEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, [activeFindMatch, find.activeIndex, find.isOpen, usePierreCode]);
+  }, [activeFindIndex, activeFindMatch, find.isOpen, usePierreCode]);
 
   const openFind = useCallback(() => {
     findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -310,12 +313,20 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   }, [find, findEligible, findSourceText, usePierreCode]);
 
   const handleFindNext = useCallback(() => {
-    find.nextMatch();
-  }, [find]);
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0 ? 0 : (activeFindIndex + 1) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
 
   const handleFindPrevious = useCallback(() => {
-    find.previousMatch();
-  }, [find]);
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? findProjection.matches.length - 1
+        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
 
   const headerExtras: ReactNode = textLike ? (
     <>
@@ -400,8 +411,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const banner: ReactNode = find.isOpen ? (
     <FindBar
       query={find.query}
-      activeIndex={find.activeIndex}
-      matchCount={findEligible ? find.matchCount : 0}
+      activeIndex={activeFindIndex}
+      matchCount={findProjection.matches.length}
       focusVersion={find.focusVersion}
       onQueryChange={handleFindQueryChange}
       onNext={handleFindNext}

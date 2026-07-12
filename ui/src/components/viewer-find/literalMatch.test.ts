@@ -9,10 +9,9 @@ describe('findLiteralMatches', () => {
     ]);
   });
 
-  it('supports overlapping literal matches', () => {
+  it('returns non-overlapping matches that renderers can mark exactly', () => {
     expect(findLiteralMatches('banana', 'ana').matches).toEqual([
       { start: 1, end: 4 },
-      { start: 3, end: 6 },
     ]);
   });
 

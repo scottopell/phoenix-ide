@@ -379,16 +379,25 @@ function MessageListImpl({
     [historicalUnits, tailUnits],
   );
 
+  const latestAgentKey = useMemo(() => {
+    for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
+      const unit = historicalUnits[i];
+      if (unit?.kind === 'agent_turn') return unit.key;
+    }
+    return null;
+  }, [historicalUnits]);
+
   const findProjection = useMemo(
     () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
           density,
+          latestAgentKey,
           streamingBuffer: findStreamingBuffer,
           systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
         })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer, systemPrompt, systemPromptExpanded],
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded],
   );
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
@@ -838,14 +847,6 @@ function MessageListImpl({
     () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt, systemPromptRef }),
     [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
   );
-
-  const latestAgentKey = useMemo(() => {
-    for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
-      const unit = historicalUnits[i];
-      if (unit?.kind === 'agent_turn') return unit.key;
-    }
-    return null;
-  }, [historicalUnits]);
 
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
