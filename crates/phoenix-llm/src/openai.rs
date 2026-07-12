@@ -710,6 +710,7 @@ fn is_websocket_connection_limit(value: &serde_json::Value) -> bool {
         && value
             .pointer("/error/code")
             .or_else(|| value.pointer("/error/type"))
+            .or_else(|| value.get("code"))
             .and_then(serde_json::Value::as_str)
             == Some("websocket_connection_limit_reached")
 }
@@ -722,8 +723,26 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
         .get("status")
         .or_else(|| value.get("status_code"))
         .and_then(serde_json::Value::as_u64)
-        .and_then(|status| u16::try_from(status).ok())?;
-    let error = value.get("error")?;
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or_else(
+            || match value.get("code").and_then(serde_json::Value::as_str) {
+                Some("websocket_connection_limit_reached" | "rate_limit_exceeded") => 429,
+                Some("context_length_exceeded" | "max_tokens") => 400,
+                _ => 500,
+            },
+        );
+    let error = value.get("error").unwrap_or(value);
+    if std::ptr::eq(error, value) {
+        let code = value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown_error");
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(code);
+        return Some(classify_responses_error(code, message));
+    }
     let body = serde_json::json!({ "error": error }).to_string();
     let mut headers = HeaderMap::new();
     if let Some(raw_headers) = value.get("headers").and_then(serde_json::Value::as_object) {
@@ -2277,6 +2296,17 @@ mod tests {
             quota.primary.as_ref().and_then(|w| w.window_minutes),
             Some(15)
         );
+    }
+
+    #[test]
+    fn flat_websocket_connection_limit_requests_reconnect() {
+        let value = serde_json::json!({
+            "type": "error",
+            "code": "websocket_connection_limit_reached",
+            "message": "connection lifetime exhausted"
+        });
+        assert!(is_websocket_connection_limit(&value));
+        assert!(parse_wrapped_codex_websocket_error(&value).is_some());
     }
 
     #[test]

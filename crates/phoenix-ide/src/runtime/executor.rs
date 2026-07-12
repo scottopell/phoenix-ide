@@ -46,6 +46,14 @@ const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty 
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn refresh_commission_review_approval_for_outcome(
     context: &mut ConvContext,
     outcome: &EffectOutcome,
@@ -4368,7 +4376,12 @@ where
             }
         });
 
+        let forwarder_abort = forwarder_handle.abort_handle();
         let handle = tokio::spawn(async move {
+            // Tokio cancellation is not recursive. Aborting the request must
+            // also stop its forwarder before buffered chunks reach a later turn.
+            let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
+
             if is_sub_agent {
                 tracing::info!(
                     conv_id = %conv_id,
