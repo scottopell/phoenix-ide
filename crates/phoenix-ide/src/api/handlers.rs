@@ -7349,6 +7349,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(before.has_older_messages);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn repeated_older_page_traversal_returns_each_sequence_exactly_once() {
         use phoenix_core::domain::llm_types::ContentBlock;
