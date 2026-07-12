@@ -1454,7 +1454,7 @@ describe('read_file structured result view', () => {
           toolResults={new Map([['tool-read-structured', toolMessage('tool-read-structured', lines, 2, {
               type: 'read_file', path: 'src/lib.rs', requested_offset: 40, requested_limit: 25,
               returned_start_line: 40, returned_end_line: 64, returned_line_count: 25,
-              total_line_count: 100, remaining_line_count: 36,
+              total_line_count: 100, remaining_line_count: 36, viewer_available: true,
             })]])}
           onOpenFile={onOpenFile}
         />
@@ -1484,7 +1484,7 @@ describe('read_file structured result view', () => {
     const metadata = {
       type: 'read_file', requested_offset: 1, requested_limit: 1,
       returned_start_line: 1, returned_end_line: 1, returned_line_count: 1,
-      total_line_count: 1, remaining_line_count: 0,
+      total_line_count: 1, remaining_line_count: 0, viewer_available: false,
     };
     const { rerender } = render(
       <MemoryRouter>
@@ -1519,7 +1519,7 @@ describe('read_file structured result view', () => {
           message={agentMessage('agent-read-in-root', [
             { type: 'tool_use', id: 'tool-read-in-root', name: 'read_file', input: { path: '/repo/src/in-root.txt' } },
           ])}
-          toolResults={new Map([['tool-read-in-root', toolMessage('tool-read-in-root', '     1\tinside', 2, { ...metadata, path: '/repo/src/in-root.txt' })]])}
+          toolResults={new Map([['tool-read-in-root', toolMessage('tool-read-in-root', '     1\tinside', 2, { ...metadata, path: '/repo/src/in-root.txt', viewer_available: true })]])}
           onOpenFile={vi.fn()}
           filePathRootDir="/repo"
         />
@@ -1538,7 +1538,7 @@ describe('read_file structured result view', () => {
           toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '', 2, {
               type: 'read_file', path: 'empty.txt', requested_offset: 1, requested_limit: 2000,
               returned_start_line: null, returned_end_line: null, returned_line_count: 0,
-              total_line_count: 0, remaining_line_count: 0,
+              total_line_count: 0, remaining_line_count: 0, viewer_available: true,
             })]])}
           onOpenFile={vi.fn()}
         />

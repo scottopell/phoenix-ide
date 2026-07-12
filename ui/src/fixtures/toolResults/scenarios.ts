@@ -271,6 +271,7 @@ function readFileDisplayData(
     returned_line_count: returnedLineCount,
     total_line_count: totalLineCount,
     remaining_line_count: returnedEndLine === null ? totalLineCount : Math.max(0, totalLineCount - returnedEndLine),
+    viewer_available: true,
   };
 }
 

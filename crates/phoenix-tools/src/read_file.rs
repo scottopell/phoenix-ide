@@ -33,6 +33,7 @@ struct ReadFileDisplayData {
     returned_line_count: usize,
     total_line_count: usize,
     remaining_line_count: usize,
+    viewer_available: bool,
 }
 
 /// Resolve a path relative to `working_dir`. Absolute paths are used as-is;
@@ -157,6 +158,11 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
+        let viewer_available = std::fs::canonicalize(&resolved)
+            .ok()
+            .zip(std::fs::canonicalize(&ctx.working_dir).ok())
+            .is_some_and(|(file, root)| file.starts_with(root));
+
         let display_data = serde_json::to_value(ReadFileDisplayData {
             r#type: "read_file",
             path: input.path,
@@ -167,6 +173,7 @@ impl Tool for ReadFileTool {
             returned_line_count: end_idx - start_idx,
             total_line_count: total_lines,
             remaining_line_count: remaining,
+            viewer_available,
         })
         .expect("read_file display metadata is serializable");
 
@@ -282,7 +289,31 @@ mod tests {
                 "returned_line_count": 2,
                 "total_line_count": 5,
                 "remaining_line_count": 2,
+                "viewer_available": true,
             }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_file_marks_symlink_escape_unavailable_to_viewer() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "link/secret.txt"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result.display_data().and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
         );
     }
 
