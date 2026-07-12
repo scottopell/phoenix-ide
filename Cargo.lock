@@ -2951,6 +2951,7 @@ dependencies = [
  "phoenix_ide",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
