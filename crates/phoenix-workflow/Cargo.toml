@@ -1,0 +1,18 @@
+[package]
+name = "phoenix-workflow"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Pure durable-workflow core algebra for Phoenix IDE. No storage or production side effects."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

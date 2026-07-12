@@ -3088,6 +3088,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-workflow"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "phoenix_ide"
 version = "0.10.0"
 dependencies = [
