@@ -125,7 +125,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
         replacement.install_barriers(&decision.plan, barrier_events)?;
-        replacement.install_owed_acceptances(&decision.plan);
+        if decision.plan.owed_acceptances.is_some() {
+            return Err(EngineError::InvalidInbox);
+        }
         replacement.refresh_eligibility(Timestamp(0));
         *self = replacement;
 
@@ -455,6 +457,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         resolution_id: ManualResolutionId,
         expected_workflow_version: Version,
         choice: &ManualChoice<P>,
+        transition_event: P::Event,
         receipt: P::Receipt,
         receipt_event: P::ReceiptReducerEvent,
     ) -> ManualResolutionOutcome<P> {
@@ -484,8 +487,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             expected_workflow_version,
             &existing,
             choice,
-            receipt,
-            receipt_event,
+            transition_event,
+            (receipt, receipt_event),
         );
         let barrier_event = replacement
             .evaluate_barriers()
@@ -555,7 +558,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
         replacement.install_barriers(&decision.plan, barrier_events)?;
-        replacement.install_owed_acceptances(&decision.plan);
+        replacement.install_owed_acceptances(&decision.plan, inbox_ids)?;
         for inbox_id in inbox_ids {
             let Some(inbox) = replacement.reducer_inbox.get_mut(inbox_id) else {
                 return Err(EngineError::InvalidInbox);
@@ -690,7 +693,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
         replacement.install_barriers(&decision.plan, barrier_events)?;
-        replacement.install_owed_acceptances(&decision.plan);
+        if decision.plan.owed_acceptances.is_some() {
+            return Err(EngineError::InvalidInbox);
+        }
         replacement.refresh_eligibility(Timestamp(0));
         *self = replacement;
 
@@ -871,16 +876,28 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         Ok(())
     }
 
-    fn install_owed_acceptances(&mut self, plan: &TransitionPlan<P>) {
+    fn install_owed_acceptances(
+        &mut self,
+        plan: &TransitionPlan<P>,
+        consumed_inbox_ids: &[ReducerInboxId],
+    ) -> Result<(), EngineError> {
+        if !self.binding.accepted_protocol().runtime_acceptance_enabled
+            && plan.owed_acceptances.is_some()
+        {
+            return Err(EngineError::InvalidInbox);
+        }
         if let Some(owed_acceptances) = &plan.owed_acceptances {
             for owed in owed_acceptances {
+                if !consumed_inbox_ids.contains(&owed.reducer_inbox_id) {
+                    return Err(EngineError::InvalidInbox);
+                }
                 let id = OwedAcceptanceId(self.next_owed_acceptance_id);
                 self.next_owed_acceptance_id += 1;
                 self.owed_acceptances.insert(
                     id,
                     OwedAcceptanceRecord {
                         id,
-                        reducer_inbox_id: ReducerInboxId(0),
+                        reducer_inbox_id: owed.reducer_inbox_id,
                         source_kind: owed.source_kind,
                         event: owed.event.clone(),
                         status: AcceptanceStatus::Owed,
@@ -889,6 +906,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 );
             }
         }
+        Ok(())
     }
 
     fn effect_ready_for_manual_resolution(&self, resolution: &ManualResolutionRecord<P>) -> bool {
@@ -905,13 +923,23 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         expected_workflow_version: Version,
         existing: &ManualResolutionRecord<P>,
         choice: &ManualChoice<P>,
-        receipt: P::Receipt,
-        receipt_event: P::ReceiptReducerEvent,
+        transition_event: P::Event,
+        receipt_and_event: (P::Receipt, P::ReceiptReducerEvent),
     ) -> ReceiptRecord<P::Receipt> {
-        self.version = self.version.next();
+        let (receipt, receipt_event) = receipt_and_event;
+        let transition = WorkflowTransition {
+            transition_id: TransitionId(self.next_transition_id),
+            from_version: self.version,
+            to_version: self.version.next(),
+            generation: self.generation,
+            event: transition_event,
+        };
+        self.next_transition_id += 1;
+        self.version = transition.to_version;
         if let WorkflowBinding::Authoritative(workflow) = &mut self.binding {
             workflow.version = self.version;
         }
+        self.transition_log.push(transition);
 
         let receipt_record = ReceiptRecord {
             id: ReceiptId(self.next_receipt_id),
@@ -1079,7 +1107,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
         replacement.install_barriers(&decision.plan, barrier_events)?;
-        replacement.install_owed_acceptances(&decision.plan);
+        if decision.plan.owed_acceptances.is_some() {
+            return Err(EngineError::InvalidInbox);
+        }
         let owed = replacement
             .owed_acceptances
             .get_mut(&owed_id)
