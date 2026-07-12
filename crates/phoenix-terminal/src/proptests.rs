@@ -78,7 +78,7 @@ fn dummy_handle_kind(
 /// see task 24691 and `DuplicateConnectionReclaimsSession` in terminal.allium.
 /// This test covers only the registry-level atomicity used as the race guard.
 #[test]
-fn shell_pid_snapshot_excludes_tmux_clients() {
+fn shell_session_snapshot_excludes_tmux_clients() {
     use crate::session::TerminalChildKind;
 
     let registry = ActiveTerminals::new();
@@ -98,7 +98,7 @@ fn shell_pid_snapshot_excludes_tmux_clients() {
         )
         .expect("tmux insert");
 
-    assert_eq!(registry.snapshot_shell_pgids(), vec![1]);
+    assert_eq!(registry.snapshot_shell_session_ids(), vec![1]);
 }
 
 #[test]

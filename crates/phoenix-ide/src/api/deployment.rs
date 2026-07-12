@@ -12,7 +12,8 @@
 use super::AppState;
 use crate::api::process_sample::{
     group_member_identities_for_sampling, process_identity_for_sampling,
-    sample_process_observations, ProcessIdentity, ProcessObservation,
+    sample_process_observations, session_member_identities_for_sampling, ProcessIdentity,
+    ProcessObservation,
 };
 use axum::{
     extract::{ConnectInfo, State},
@@ -922,13 +923,16 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
 }
 
 async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
-    let api_identities = sysinfo::get_current_pid()
+    let api_identity = sysinfo::get_current_pid()
         .ok()
         .map(sysinfo::Pid::as_u32)
-        .and_then(|pid| process_identity_for_sampling(pid).map(|identity| (pid, identity)))
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let api_pids = api_identities.keys().copied().collect::<BTreeSet<_>>();
+        .and_then(|pid| process_identity_for_sampling(pid).map(|identity| (pid, identity)));
+    let api_identities = api_identity.into_iter().collect::<BTreeMap<_, _>>();
+    let api_snapshot = if api_identities.is_empty() {
+        BashPidSnapshot::Unavailable
+    } else {
+        BashPidSnapshot::Available(api_identities.clone())
+    };
     let bash_pid_snapshot = match state {
         Some(state) => snapshot_bash_pids(state).await,
         None => BashPidSnapshot::Available(BTreeMap::new()),
@@ -954,14 +958,7 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
         .collect();
 
     let mut categories = Vec::new();
-    categories.push(build_category_from_observations(
-        ManagedResourceCategoryKind::Api,
-        "API",
-        ManagedResourceAttribution::Available,
-        None,
-        &api_pids,
-        &observed_rows_by_pid,
-    ));
+    categories.push(build_api_category(&api_snapshot, &observed_rows_by_pid));
 
     if let Some(state) = state {
         categories.push(build_bash_category(
@@ -1048,10 +1045,35 @@ async fn snapshot_bash_pids(state: &AppState) -> BashPidSnapshot {
 }
 
 fn snapshot_terminal_pids(state: &AppState) -> BashPidSnapshot {
-    let pgids = state.terminals.snapshot_shell_pgids().into_iter().collect();
-    match group_member_identities_for_sampling(&pgids) {
+    let session_ids = state
+        .terminals
+        .snapshot_shell_session_ids()
+        .into_iter()
+        .collect();
+    match session_member_identities_for_sampling(&session_ids) {
         Some(member_identities) => BashPidSnapshot::Available(member_identities),
         None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn build_api_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            ManagedResourceAttribution::Available,
+            None,
+            &identities.keys().copied().collect(),
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            "Phoenix API native process identity unavailable",
+        ),
     }
 }
 
@@ -1706,6 +1728,18 @@ mod tests {
         let abs = absolutize(Path::new("phoenix.db"));
         assert!(abs.is_absolute());
         assert_eq!(abs, cwd.join("phoenix.db"));
+    }
+
+    #[test]
+    fn unavailable_api_snapshot_preserves_capability_failure() {
+        let category = build_api_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+
+        assert_eq!(
+            category.attribution,
+            ManagedResourceAttribution::Unavailable
+        );
+        assert!(category.reason.is_some());
+        assert!(category.processes.is_empty());
     }
 
     #[test]

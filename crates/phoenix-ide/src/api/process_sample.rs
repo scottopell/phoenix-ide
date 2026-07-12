@@ -170,6 +170,21 @@ pub fn group_member_identities_for_sampling(
     )
 }
 
+pub fn session_member_identities_for_sampling(
+    session_ids: &BTreeSet<i32>,
+) -> Option<BTreeMap<u32, ProcessIdentity>> {
+    if session_ids.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let member_pids = session_member_pids(session_ids)?;
+    Some(
+        member_pids
+            .into_iter()
+            .filter_map(|pid| current_process_identity(pid).map(|identity| (pid, identity)))
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -329,6 +344,32 @@ async fn group_cpu_percent(pids: &[u32]) -> Option<f32> {
 // ===========================================================================
 
 #[cfg(target_os = "linux")]
+fn session_member_pids(session_ids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if proc_session_id(pid).is_some_and(|session_id| session_ids.contains(&session_id)) {
+            out.push(pid);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_session_id(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat.get(close + 1..)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
 fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
@@ -444,10 +485,25 @@ fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
 // ===========================================================================
 
 #[cfg(target_os = "macos")]
-fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
-    // Size the all-pids buffer. A null buffer returns the *count* of pids the
-    // kernel would write — not a byte size — so we allocate that many `c_int`
-    // slots (plus headroom to absorb pids that appear between the two calls).
+fn session_member_pids(session_ids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+    all_process_pids().map(|pids| {
+        pids.into_iter()
+            .filter(|pid| proc_session_id(*pid).is_some_and(|sid| session_ids.contains(&sid)))
+            .collect()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn proc_session_id(pid: u32) -> Option<i32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: getsid performs a read-only lookup for a positive process ID.
+    let session_id = unsafe { libc::getsid(pid) };
+    (session_id >= 0).then_some(session_id)
+}
+
+#[cfg(target_os = "macos")]
+fn all_process_pids() -> Option<Vec<u32>> {
+    // A null buffer returns the count of pids the kernel would write.
     // SAFETY: proc_listallpids with a null buffer only queries the count.
     let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if needed <= 0 {
@@ -473,11 +529,25 @@ fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     buf.truncate(written_count);
     Some(
         buf.into_iter()
-            .filter(|&p| p > 0 && proc_pgid(p).is_some_and(|pgid| pgids.contains(&pgid)))
+            .filter(|pid| *pid > 0)
             .map(u32::try_from)
             .filter_map(Result::ok)
             .collect(),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+    all_process_pids().map(|pids| {
+        pids.into_iter()
+            .filter(|pid| {
+                i32::try_from(*pid)
+                    .ok()
+                    .and_then(proc_pgid)
+                    .is_some_and(|pgid| pgids.contains(&pgid))
+            })
+            .collect()
+    })
 }
 
 /// Read a process's group id via `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_pgid`.
@@ -606,6 +676,12 @@ fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
 // ===========================================================================
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn session_member_pids(_session_ids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+    tracing::debug!("process session membership unsupported on this platform");
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn group_member_pids(_pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     tracing::debug!(
         "process-inspector: process-group membership unsupported on this platform \
@@ -630,6 +706,20 @@ mod tests {
         let pids = BTreeSet::new();
         let sample = sample_processes(&pids).await;
         assert_eq!(sample, SampledProcesses::empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn current_session_snapshot_contains_current_process() {
+        let pid = std::process::id();
+        // SAFETY: getsid performs a read-only lookup for the current process.
+        let session_id = unsafe { libc::getsid(0) };
+        assert!(session_id >= 0);
+
+        let members = session_member_identities_for_sampling(&BTreeSet::from([session_id]))
+            .expect("session enumeration should be supported");
+
+        assert!(members.contains_key(&pid));
     }
 
     #[test]

@@ -143,7 +143,7 @@ impl ActiveTerminals {
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     #[must_use]
-    pub fn snapshot_shell_pgids(&self) -> Vec<i32> {
+    pub fn snapshot_shell_session_ids(&self) -> Vec<i32> {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.values()
             .filter(|handle| handle.child_kind == TerminalChildKind::Shell)

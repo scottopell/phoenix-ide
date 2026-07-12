@@ -180,12 +180,7 @@ THE SYSTEM SHALL log per-process metric sampling failures at debug level or abov
 
 THE SYSTEM SHALL measure resource values on both macOS and Linux.
 
-**Rationale:** The operator question is broader than "what is the Phoenix server
-process using?" — the deployment page now answers "what resources are Phoenix
-and the processes it manages using, and how busy is the host around them?"
-Host memory, idle/busy state, and load make the machine context
-self-interpreting; category attribution shows whether pressure comes from the
-API process, spawned bash work, or a capability gap Phoenix cannot yet assign.
+**Rationale:** The operator question is broader than "what is the Phoenix server process using?" The deployment page answers "what resources are Phoenix and the processes it manages using, and how busy is the host around them?" Host memory, idle/busy state, and load make the machine context self-interpreting; category attribution distinguishes assigned managed pressure from explicit attribution capability gaps.
 PID deduplication is load-bearing because one native process must not inflate the
 managed total simply by appearing in more than one attribution path. Nullable
 per-process fields preserve the difference between "zero" and "not observable on
