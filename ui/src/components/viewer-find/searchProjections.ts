@@ -182,56 +182,11 @@ export function buildDiffSearchProjection(
         },
       });
 
-      for (const hunk of item.fileDiff.hunks) {
-        const seenAdditionLines = new Set<number>();
-        const seenDeletionLines = new Set<number>();
-        const maxRows = Math.max(hunk.additionCount, hunk.deletionCount);
-        for (let offset = 0; offset < maxRows; offset++) {
-          const additionLine = hunk.additionStart + offset;
-          const deletionLine = hunk.deletionStart + offset;
-          const additionText = diffLineTextAt(item.fileDiff, 'additions', additionLine);
-          const deletionText = diffLineTextAt(item.fileDiff, 'deletions', deletionLine);
-          if (
-            additionText !== undefined
-            && deletionText !== undefined
-            && additionText === deletionText
-            && !seenAdditionLines.has(additionLine)
-            && !seenDeletionLines.has(deletionLine)
-          ) {
-            seenAdditionLines.add(additionLine);
-            seenDeletionLines.add(deletionLine);
-            sources.push({
-              id: `${item.id}:context:${additionLine}:${deletionLine}`,
-              kind: 'line',
-              section,
-              filePath,
-              itemId: item.id,
-              order: order++,
-              side: 'additions',
-              lineNumber: additionLine,
-              text: additionText,
-              target: {
-                kind: 'diff-line',
-                section,
-                filePath,
-                itemId: item.id,
-                side: 'additions',
-                lineNumber: additionLine,
-                startColumn: 0,
-                endColumn: 0,
-              },
-            });
-            continue;
-          }
-          if (deletionText !== undefined && !seenDeletionLines.has(deletionLine)) {
-            seenDeletionLines.add(deletionLine);
-            sources.push(makeDiffLineSource(item.id, section, filePath, order++, 'deletions', deletionLine, deletionText));
-          }
-          if (additionText !== undefined && !seenAdditionLines.has(additionLine)) {
-            seenAdditionLines.add(additionLine);
-            sources.push(makeDiffLineSource(item.id, section, filePath, order++, 'additions', additionLine, additionText));
-          }
-        }
+      for (const source of buildDiffLineSources(item.fileDiff, item.id, section, filePath)) {
+        sources.push({
+          ...source,
+          order: order++,
+        });
       }
     }
   }
@@ -276,6 +231,76 @@ function makeDiffLineSource(
       endColumn: 0,
     },
   };
+}
+
+function buildDiffLineSources(
+  fileDiff: Parameters<typeof diffLineTextAt>[0],
+  itemId: string,
+  section: DiffSection,
+  filePath: string,
+): DiffSearchSource[] {
+  const sources: DiffSearchSource[] = [];
+  const additionLines = fileDiff.additionLines ?? [];
+  const deletionLines = fileDiff.deletionLines ?? [];
+  let additionCursor = 0;
+  let deletionCursor = 0;
+
+  for (const hunk of fileDiff.hunks) {
+    let additionLine = hunk.additionStart;
+    let deletionLine = hunk.deletionStart;
+
+    for (const segment of hunk.hunkContent) {
+      if (segment.type === 'context') {
+        for (let offset = 0; offset < segment.lines; offset += 1) {
+          const text = stripDiffSearchLineEnding(additionLines[additionCursor] ?? deletionLines[deletionCursor] ?? '');
+          sources.push({
+            id: `${itemId}:context:${additionLine}:${deletionLine}`,
+            kind: 'line',
+            section,
+            filePath,
+            itemId,
+            order: 0,
+            side: 'additions',
+            lineNumber: additionLine,
+            text,
+            target: {
+              kind: 'diff-line',
+              section,
+              filePath,
+              itemId,
+              side: 'additions',
+              lineNumber: additionLine,
+              startColumn: 0,
+              endColumn: 0,
+            },
+          });
+          additionCursor += 1;
+          deletionCursor += 1;
+          additionLine += 1;
+          deletionLine += 1;
+        }
+        continue;
+      }
+      for (let offset = 0; offset < segment.deletions; offset += 1) {
+        const text = stripDiffSearchLineEnding(deletionLines[deletionCursor] ?? '');
+        sources.push(makeDiffLineSource(itemId, section, filePath, 0, 'deletions', deletionLine, text));
+        deletionCursor += 1;
+        deletionLine += 1;
+      }
+      for (let offset = 0; offset < segment.additions; offset += 1) {
+        const text = stripDiffSearchLineEnding(additionLines[additionCursor] ?? '');
+        sources.push(makeDiffLineSource(itemId, section, filePath, 0, 'additions', additionLine, text));
+        additionCursor += 1;
+        additionLine += 1;
+      }
+    }
+  }
+
+  return sources;
+}
+
+function stripDiffSearchLineEnding(text: string): string {
+  return text.replace(/\r?\n$/, '');
 }
 
 function headerText(fileDiff: { name: string; prevName?: string }): string {

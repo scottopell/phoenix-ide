@@ -212,6 +212,28 @@ describe('TaskApprovalReader shared find integration', () => {
     expect(screen.getByText('Review task')).toBeInTheDocument();
   });
 
+  it('leaves repeated Ctrl/Cmd+F routed to the existing task find input', async () => {
+    renderTaskApprovalReader('# Plan\n\nalpha\nbeta alpha');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    expect(input).toHaveFocus();
+    fireEvent.keyDown(window, { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    await waitFor(() => expect(input).toHaveFocus());
+    expect((input as HTMLInputElement).selectionStart).toBe((input as HTMLInputElement).selectionEnd);
+  });
+
+  it('does not open find behind task-approval dialogs', () => {
+    renderTaskApprovalReader('# Plan\n\nalpha');
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    fireEvent.keyDown(cancel, { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
   it('clears task-plan marks when find closes', async () => {
     renderTaskApprovalReader('# Plan\n\nbanana');
 

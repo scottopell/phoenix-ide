@@ -362,6 +362,20 @@ describe('MetaViewer payload routing', () => {
     expect(iframe).toHaveAttribute('src', '/preview/tmp/project/thing');
   });
 
+  it('defers file search projection work until find is open with a query', async () => {
+    const searchProjectionModule = await import('../viewer-find/searchProjections');
+    const buildProjectionSpy = vi.spyOn(searchProjectionModule, 'buildFileSearchProjection');
+
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta' });
+    expect(buildProjectionSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    expect(buildProjectionSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(buildProjectionSpy).toHaveBeenCalledWith('alpha\nbeta', 'alpha');
+  });
+
   it('keeps image payloads out of file find and does not show false counts', () => {
     renderViewer({
       ...common,
@@ -375,7 +389,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps HTML source and markdown find ineligible so unrevealable matches are not counted', () => {
+  it('keeps HTML preview ineligible but allows source-like markdown and HTML source find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -390,18 +404,20 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
 
     unmount();
-    const { rerender } = render(
+    render(
       <ReviewNotesProvider>
         <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
       </ReviewNotesProvider>,
     );
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
-    rerender(<ReviewNotesProvider><MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha' }} /></ReviewNotesProvider>);
     expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
   });
 });

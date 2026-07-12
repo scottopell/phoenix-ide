@@ -174,6 +174,32 @@ describe('buildDiffSearchProjection', () => {
       },
     ]);
   });
+
+  it('walks parsed hunk rows so context after insertions is only indexed once', () => {
+    const diff = [
+      'diff --git a/src/demo.ts b/src/demo.ts',
+      '--- a/src/demo.ts',
+      '+++ b/src/demo.ts',
+      '@@ -1,2 +1,3 @@',
+      ' shared',
+      '+inserted',
+      ' tail',
+    ].join('\n');
+
+    const projection = buildDiffSearchProjection(diff, '', 'tail');
+    expect(projection.sources.filter((source) => source.text === 'tail')).toHaveLength(1);
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.matches[0]?.target).toEqual({
+      kind: 'diff-line',
+      section: 'committed',
+      filePath: 'src/demo.ts',
+      itemId: 'committed:src/demo.ts',
+      side: 'additions',
+      lineNumber: 3,
+      startColumn: 0,
+      endColumn: 4,
+    });
+  });
 });
 
 describe('buildConversationSearchProjection', () => {

@@ -1,12 +1,22 @@
-import { render } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { FocusScopeProvider, useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { useViewerFindKeyboardShortcut } from './useViewerFindKeyboardShortcut';
 
-function ShortcutHarness({ scopeId, onOpen }: { scopeId: string; onOpen: () => void }) {
+function ShortcutHarness({
+  scopeId,
+  onOpen,
+  dialogOpen = false,
+}: { scopeId: string; onOpen: () => void; dialogOpen?: boolean }) {
   useRegisterFocusScope(scopeId);
-  useViewerFindKeyboardShortcut({ scopeId, onOpen });
-  return <input aria-label="editor" />;
+  useViewerFindKeyboardShortcut({ scopeId, onOpen, dialogOpen });
+  return (
+    <>
+      <input aria-label="editor" />
+      <button type="button">Dialog button</button>
+      <input aria-label="find" data-viewer-find-input="true" />
+    </>
+  );
 }
 
 function InactiveScopeHarness({ scopeId, onOpen }: { scopeId: string; onOpen: () => void }) {
@@ -43,6 +53,32 @@ describe('useViewerFindKeyboardShortcut', () => {
 
     expect(preventDefault).toHaveBeenCalled();
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reopen find when the find input itself handles the repeated shortcut', () => {
+    const onOpen = vi.fn();
+    render(
+      <FocusScopeProvider>
+        <ShortcutHarness scopeId="viewer" onOpen={onOpen} />
+      </FocusScopeProvider>,
+    );
+
+    const findInput = screen.getByRole('textbox', { name: 'find' });
+    fireEvent.keyDown(findInput, { key: 'f', metaKey: true, bubbles: true, cancelable: true });
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('stands down while a dialog in the same surface is open', () => {
+    const onOpen = vi.fn();
+    render(
+      <FocusScopeProvider>
+        <ShortcutHarness scopeId="viewer" onOpen={onOpen} dialogOpen />
+      </FocusScopeProvider>,
+    );
+
+    const dialogButton = screen.getByRole('button', { name: 'Dialog button' });
+    fireEvent.keyDown(dialogButton, { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   it('ignores Cmd/Ctrl+F when another scope is active or when typing in an input', () => {

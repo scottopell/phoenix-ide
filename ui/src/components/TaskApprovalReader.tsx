@@ -386,7 +386,11 @@ export function TaskApprovalReader({
     return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [annotatingLine, closeFind, discardConfirmOpen, find.isOpen, handleAddNote]);
 
-  useViewerFindKeyboardShortcut({ scopeId: 'task-approval', onOpen: openFind });
+  useViewerFindKeyboardShortcut({
+    scopeId: 'task-approval',
+    onOpen: openFind,
+    dialogOpen: annotatingLine !== null || discardConfirmOpen,
+  });
   const findProjection = useMemo(
     () => (find.isOpen ? buildBlockSearchProjection(findablePlanBlocks, find.query) : { sources: [], matches: [] }),
     [find.isOpen, findablePlanBlocks, find.query]
@@ -649,6 +653,7 @@ export function TaskApprovalReader({
           query={find.query}
           activeIndex={find.activeIndex}
           matchCount={find.matchCount}
+          focusVersion={find.focusVersion}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}

@@ -230,14 +230,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
-  const findEligible = payload.kind === 'code'
-    || payload.kind === 'text'
-    || largeFallback;
+  const findEligible = (textLike && !htmlPreview) || largeFallback;
   const findSourceText = findEligible ? content : '';
   const find = useViewerFind({ text: findSourceText });
+  const shouldProjectFind = findEligible && find.isOpen && find.query.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
-    () => (findEligible ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
-    [findEligible, findSourceText, find.query],
+    () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
+    [find.query, findSourceText, shouldProjectFind],
   );
   const activeFindMatch = find.isOpen && find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
@@ -279,7 +278,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
   }, [find]);
 
-  useViewerFindKeyboardShortcut({ scopeId: 'file-viewer', onOpen: openFind, enabled: findEligible });
+  useViewerFindKeyboardShortcut({
+    scopeId: 'file-viewer',
+    onOpen: openFind,
+    enabled: findEligible,
+    dialogOpen: notes.annotating !== null,
+  });
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);

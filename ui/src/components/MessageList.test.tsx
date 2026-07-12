@@ -226,6 +226,38 @@ describe('MessageList', () => {
     expect(escape.defaultPrevented).toBe(false);
   });
 
+  it('steps from the normalized transcript match index after results shrink', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[
+          { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
+          { ...makeMessage(2, 'agent'), content: [{ type: 'text', text: 'alpha two' }] },
+          { ...makeMessage(3, 'agent'), content: [{ type: 'text', text: 'alpha three' }] },
+        ]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-normalized"
+      />,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 3')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('3 of 3')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'three' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
   it('renders skill invocations as inline slash-command user messages with attachments', () => {
     const skillMessage = {
       ...makeMessage(7, 'skill'),
