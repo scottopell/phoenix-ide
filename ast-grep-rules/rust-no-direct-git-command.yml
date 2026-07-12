@@ -1,0 +1,19 @@
+id: no-direct-git-command
+language: Rust
+severity: error
+message: |
+  Direct Git subprocess construction bypasses Phoenix's process-level safety
+  defaults and can invoke an interactive commit signer during tests or runtime.
+  Construct Git commands with `phoenix_core::git::command()`; async callers can
+  convert it with `tokio::process::Command::from(...)`.
+note: "Centralize Git subprocess configuration in crates/phoenix-core/src/git.rs"
+rule:
+  any:
+    - pattern: std::process::Command::new("git")
+    - pattern: tokio::process::Command::new("git")
+    - pattern: Command::new("git")
+ignores:
+  - "**/phoenix-core/src/git.rs"
+  # Cargo compiles build.rs before crate dependencies are available. This
+  # read-only build metadata probe cannot create a commit or invoke a signer.
+  - "**/phoenix-ide/build.rs"

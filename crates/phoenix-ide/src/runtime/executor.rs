@@ -276,7 +276,7 @@ fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
 }
 
 fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    let output = phoenix_core::git::command()
         .arg("--no-optional-locks")
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -304,7 +304,7 @@ mod commission_review_approval_tests {
     use std::path::PathBuf;
 
     fn git_ok(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(args)
             .current_dir(repo)
             .status()
@@ -313,7 +313,7 @@ mod commission_review_approval_tests {
     }
 
     fn git_output(repo: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let output = phoenix_core::git::command()
             .args(args)
             .current_dir(repo)
             .output()
@@ -7872,7 +7872,7 @@ mod test_git_helpers {
                 "-q",
             ][..],
         ] {
-            let s = std::process::Command::new("git")
+            let s = phoenix_core::git::command()
                 .args(args)
                 .current_dir(&root)
                 .status()
@@ -7889,7 +7889,7 @@ mod test_git_helpers {
         let wt = repo.join(".phoenix").join("worktrees").join(id);
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         let wt_s = wt.to_string_lossy().to_string();
-        let s = std::process::Command::new("git")
+        let s = phoenix_core::git::command()
             .args(["worktree", "add", "-b", branch, &wt_s])
             .current_dir(repo)
             .status()
@@ -7907,7 +7907,7 @@ mod test_git_helpers {
         let temp_branch = format!("task-pending-{id_prefix}");
         let wt = repo.join(".phoenix").join("worktrees").join(conv_id);
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
-        let s = std::process::Command::new("git")
+        let s = phoenix_core::git::command()
             .args([
                 "worktree",
                 "add",
@@ -7924,7 +7924,7 @@ mod test_git_helpers {
     }
 
     pub fn branch_exists(repo: &Path, branch: &str) -> bool {
-        let o = std::process::Command::new("git")
+        let o = phoenix_core::git::command()
             .args(["branch", "--list", branch])
             .current_dir(repo)
             .output()
@@ -7934,7 +7934,7 @@ mod test_git_helpers {
 
     pub fn worktree_list(repo: &Path) -> String {
         String::from_utf8_lossy(
-            &std::process::Command::new("git")
+            &phoenix_core::git::command()
                 .args(["worktree", "list", "--porcelain"])
                 .current_dir(repo)
                 .output()
@@ -8877,7 +8877,7 @@ mod plain_markdown_approval_tests {
 
     fn git_show_head(cwd: &std::path::Path) -> String {
         String::from_utf8_lossy(
-            &std::process::Command::new("git")
+            &phoenix_core::git::command()
                 .args(["log", "-1", "--name-only", "--pretty=%s"])
                 .current_dir(cwd)
                 .output()
@@ -9014,7 +9014,7 @@ mod plain_markdown_approval_tests {
                 "-q",
             ][..],
         ] {
-            let s = std::process::Command::new("git")
+            let s = phoenix_core::git::command()
                 .args(args)
                 .current_dir(&repo_root)
                 .status()
@@ -9040,7 +9040,7 @@ mod plain_markdown_approval_tests {
         assert_eq!(result.branch_name, format!("task-plan-{conv_prefix}"));
         let rev = |r: &str| {
             String::from_utf8_lossy(
-                &std::process::Command::new("git")
+                &phoenix_core::git::command()
                     .args(["rev-parse", r])
                     .current_dir(&repo_root)
                     .output()

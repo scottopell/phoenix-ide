@@ -4321,7 +4321,8 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # SCCACHE_CACHE_SIZE before invoking dev.py.
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
 
-    # Env classification + signing probe only matter when a cargo lane runs.
+    # Environment classification and Git subprocess safety only matter when a
+    # cargo lane runs.
     if cargo_active:
         # Classify the environment up front so the Rust suite skips the
         # classes of tests that would otherwise produce env-noise failures.
@@ -4339,33 +4340,14 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         _classify_browser_env()
         _classify_network_env()
 
-        # Probe for working commit signing. Some envs configure a custom
-        # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
-        # rejects unrecognised callers, breaking any test that runs `git commit`.
-        # If a probe commit fails, override `commit.gpgsign=false` for child
-        # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
-        # not the developer's actual git config.
-        #
-        # Per the print-only-on-behavior-change rule above, the success
-        # branch is silent and only the override branch prints.
-        import tempfile as _tempfile
-        try:
-            with _tempfile.TemporaryDirectory() as _td:
-                subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
-                               capture_output=True, timeout=5)
-                subprocess.run(
-                    ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
-                     "commit", "--allow-empty", "-m", "probe"],
-                    cwd=_td, check=True, capture_output=True, timeout=10,
-                )
-            _signing_ok = True
-        except Exception:
-            _signing_ok = False
-        if not _signing_ok:
-            os.environ["GIT_CONFIG_COUNT"] = "1"
-            os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
-            os.environ["GIT_CONFIG_VALUE_0"] = "false"
-            reporter.info("commit signing probe failed — disabling commit.gpgsign for tests")
+        # Tests create temporary commits and must never consult an interactive
+        # signing agent. Add a process-only override without probing the signer
+        # or modifying any Git config file. Append so caller-provided config
+        # entries remain intact while this final entry takes precedence.
+        _git_config_count = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+        os.environ[f"GIT_CONFIG_KEY_{_git_config_count}"] = "commit.gpgsign"
+        os.environ[f"GIT_CONFIG_VALUE_{_git_config_count}"] = "false"
+        os.environ["GIT_CONFIG_COUNT"] = str(_git_config_count + 1)
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:

@@ -293,7 +293,7 @@ fn git_state_dirs(repo_root: &Path) -> Vec<PathBuf> {
 }
 
 fn git_rev_parse_path(repo_root: &Path, arg: &str) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = phoenix_core::git::command()
         .args(["rev-parse", arg])
         .current_dir(repo_root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -342,7 +342,7 @@ mod tests {
     }
 
     fn run_git_for_test(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = phoenix_core::git::command()
             .args(args)
             .current_dir(cwd)
             .env("GIT_CONFIG_NOSYSTEM", "1")

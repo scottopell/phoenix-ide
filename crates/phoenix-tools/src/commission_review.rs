@@ -1903,7 +1903,7 @@ fn warning(kind: &str, message: &str, file: Option<&str>) -> ReviewWarning {
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let mut command = Command::from(phoenix_core::git::command());
     command.env("GIT_OPTIONAL_LOCKS", "0");
     command.env("GIT_NO_LAZY_FETCH", "1");
     command.kill_on_drop(true);

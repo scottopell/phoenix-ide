@@ -232,7 +232,7 @@ impl Drop for RemoveDirOnDrop {
 }
 
 fn run_host_git(cwd: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = phoenix_core::git::command()
         .args(args)
         .current_dir(cwd)
         .status()

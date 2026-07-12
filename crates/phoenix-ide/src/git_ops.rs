@@ -95,8 +95,6 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 ///   which the UI diff parser rejects (it only recognises `a/`/`b/`).
 fn apply_git_base_config(cmd: &mut std::process::Command) {
     cmd.env("GIT_CONFIG_COUNT", "5")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "diff.noprefix")
         .env("GIT_CONFIG_VALUE_1", "false")
         .env("GIT_CONFIG_KEY_2", "diff.mnemonicPrefix")
@@ -112,7 +110,7 @@ fn apply_git_base_config(cmd: &mut std::process::Command) {
 /// `git cat-file -p <ref>:<path>`) where trailing whitespace is significant
 /// and binary detection needs the exact bytes.
 pub(crate) fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = phoenix_core::git::command();
     cmd.args(args).current_dir(cwd);
     apply_git_base_config(&mut cmd);
     let output = cmd
@@ -135,7 +133,7 @@ pub(crate) fn run_git_with_env(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = phoenix_core::git::command();
     cmd.args(args).current_dir(cwd);
     apply_git_base_config(&mut cmd);
     for (k, v) in extra_env {
@@ -174,9 +172,9 @@ pub(crate) fn run_git_capped(
     hard_limit_bytes: u64,
 ) -> Result<CappedStdout, String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut cmd = Command::new("git");
+    let mut cmd = phoenix_core::git::command();
     cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
@@ -828,7 +826,7 @@ pub(crate) fn repo_root_from_phoenix_worktree(path: &Path) -> Option<std::path::
 /// bare `.phoenix` would spuriously report "not ignored" whenever the `.phoenix`
 /// directory does not yet exist.
 fn phoenix_is_already_ignored(dir: &Path) -> bool {
-    std::process::Command::new("git")
+    phoenix_core::git::command()
         .args(["check-ignore", "-q", ".phoenix/"])
         .current_dir(dir)
         .status()

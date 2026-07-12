@@ -286,7 +286,7 @@ fn is_ignored_in_dest_worktree(dest_root: &Path, relative: &Path) -> Result<bool
 }
 
 fn git_check_ignore(dest_root: &Path, relative: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
+    let output = phoenix_core::git::command()
         .arg("check-ignore")
         .arg("--quiet")
         .arg("--")

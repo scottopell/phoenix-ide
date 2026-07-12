@@ -233,7 +233,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = phoenix_core::git::command()
             .current_dir(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")

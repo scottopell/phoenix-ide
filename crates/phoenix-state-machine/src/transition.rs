@@ -3668,7 +3668,7 @@ mod tests {
     }
 
     fn git_ok(repo: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(args)
             .current_dir(repo)
             .status()
@@ -6364,7 +6364,7 @@ mod tests {
             git_ok(&repo, &["config", "user.name", "t"]);
             git_ok(&repo, &["config", "commit.gpgsign", "false"]);
             git_ok(&repo, &["commit", "-qm", "base", "--allow-empty"]);
-            let head = std::process::Command::new("git")
+            let head = phoenix_core::git::command()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo)
                 .output()

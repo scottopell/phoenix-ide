@@ -7,12 +7,28 @@
 
 use std::path::Path;
 
+/// Construct a Git subprocess with Phoenix's process-level safety defaults.
+///
+/// The environment override takes precedence over system, global, and local
+/// Git configuration without modifying any of them. Every statically spawned
+/// Git process in Phoenix goes through this constructor so even repository
+/// setup in tests cannot invoke an interactive signing agent.
+#[must_use]
+pub fn command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false");
+    command
+}
+
 /// Detect the git repository root for a given directory path.
 ///
 /// Returns `None` if the path is not inside a git repository.
 #[must_use]
 pub fn detect_git_repo_root(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = command()
         .arg("rev-parse")
         .arg("--show-toplevel")
         .current_dir(path)
@@ -68,14 +84,44 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
 
 /// Run `git <args>` in `path`, returning trimmed stdout on success.
 fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .ok()?;
+    let output = command().args(args).current_dir(path).output().ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn command_disables_hostile_commit_signing_configuration() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let output = command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@phoenix"]);
+        run(&["config", "user.name", "Phoenix Test"]);
+        run(&["config", "commit.gpgsign", "true"]);
+        run(&["config", "gpg.format", "ssh"]);
+        run(&[
+            "config",
+            "gpg.ssh.program",
+            "signing-program-must-never-run",
+        ]);
+        run(&["commit", "--allow-empty", "--quiet", "-m", "unsigned"]);
     }
 }
