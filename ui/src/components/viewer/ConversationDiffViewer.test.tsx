@@ -84,6 +84,30 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     expect(screen.getByRole('dialog', { name: 'PR #88 Diff' })).toBeInTheDocument();
   });
 
+  it('shows active PR diff retry context and retries after an error', async () => {
+    (api.getActivePrDiff as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('Failed to fetch PR diff'))
+      .mockResolvedValueOnce({
+        ...payloadFor('RETRY'),
+        label: 'PR #55 Diff',
+        kind: 'active_pr',
+        pr_number: 55,
+        comparator: 'task/base-pr',
+      });
+
+    render(
+      <ReviewNotesProvider>
+        <ConversationDiffViewer conversationId="conv-pr" target="active_pr" onClose={() => undefined} onSendNotes={() => undefined} />
+      </ReviewNotesProvider>,
+    );
+
+    expect(await screen.findByText('Failed to fetch PR diff')).toBeInTheDocument();
+    expect(screen.getByText('Compare against the selected PR base branch when available.')).toBeInTheDocument();
+    screen.getByText('Retry').click();
+    expect(await screen.findByText('RETRY.txt')).toBeInTheDocument();
+    expect(api.getActivePrDiff).toHaveBeenCalledTimes(2);
+  });
+
   it('renders fullscreen presentation as a takeover dialog', async () => {
     (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue(payloadFor('TAKEOVER'));
 

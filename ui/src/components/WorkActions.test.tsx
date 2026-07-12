@@ -22,7 +22,8 @@ import { useEffect } from 'react';
 import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { WorkControlBar } from './WorkActions';
-import { api, type PrStatusResponse } from '../api';
+import { StateBar } from './StateBar';
+import { api, type AssociatedPrStatusEnvelope, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 
 // WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
@@ -57,7 +58,29 @@ function cleanWorkChange(): PrStatusResponse['work_change'] {
   return { kind: 'clean' };
 }
 
-function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) {
+function selection(overrides: Partial<AssociatedPrStatusEnvelope> = {}): AssociatedPrStatusEnvelope {
+  return {
+    associated_prs: [
+      {
+        repo_owner: 'o',
+        repo_name: 'r',
+        pr_number: 12,
+        title: 'Fix CI',
+        url: 'https://github.com/o/r/pull/12',
+        state: 'OPEN',
+        draft: false,
+        display_state: 'open',
+        base: 'main',
+        head: 'task-123',
+        feedback_status: 'open',
+      },
+    ],
+    active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 }, provenance: 'inferred' },
+    ...overrides,
+  };
+}
+
+function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, overrides: Record<string, unknown> = {}) {
   const status: PrStatusResponse = {
     found: false,
     refresh: {
@@ -69,9 +92,19 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) 
     work_change: cleanWorkChange(),
     ...prStatus,
   };
+  const selectionValue = (status.selection ?? selection()) as NonNullable<PrStatusResponse['selection']>;
+  const associated = selectionValue?.associated_prs ?? [];
   return {
-    state: { status: 'ready' as const, prStatus: status },
+    state: { status: 'ready' as const, prStatus: selectionValue ? { ...status, selection: selectionValue } : status },
     refresh: vi.fn().mockResolvedValue(undefined),
+    activeSelection: selectionValue,
+    activePrSummary: selectionValue?.active_pr
+      ? associated.find((pr) => pr.pr_number === selectionValue.active_pr?.pr.pr_number) ?? null
+      : null,
+    ambiguous: !!selectionValue && !selectionValue.active_pr && associated.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft').length > 1,
+    pinActivePr: vi.fn().mockResolvedValue(undefined),
+    resumeInference: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
   };
 }
 
@@ -270,7 +303,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     const resolve = screen.getByTestId('address-feedback-button');
     expect(resolve).toBeInTheDocument();
     expect(resolve).toHaveClass('work-actions-btn--primary');
-    expect(resolve.textContent).toMatch(/Address feedback/i);
+    expect(resolve.textContent).toMatch(/Address PR #12 feedback/i);
     expect(primaryCount()).toBe(1);
   });
 
@@ -601,6 +634,120 @@ describe('WorkControlBar — View Diff (View Browser gone)', () => {
   });
 });
 
+describe('WorkControlBar — active PR interactions', () => {
+  it('retargets ambiguity guidance to the selector and opens focus there', async () => {
+    const handle = prStatusHandle(
+      { found: false },
+      {
+        activeSelection: selection({
+          associated_prs: [
+            { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123', feedback_status: 'open' },
+            { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+          ],
+        }),
+        activePrSummary: null,
+        ambiguous: true,
+      },
+    );
+    delete handle.activeSelection.active_pr;
+
+    renderWithProviders(
+      <>
+        <StateBar
+          conversation={{
+            id: 'conv-1', slug: 'slug', model: 'claude-sonnet-5', cwd: '/repo/.phoenix/worktrees/conv-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', message_count: 1, state: { type: 'idle' }, branch_name: 'task-123', base_branch: 'main', worktree_path: '/repo/.phoenix/worktrees/conv-1', task_title: 'Task', conv_mode_label: 'Work', browser_session_active: false, terminal_uses_tmux: false, work_scope_key: 'worktree:/repo/.phoenix/worktrees/conv-1',
+          }}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType="idle"
+          continuedInConvId={null}
+          onSendMessage={vi.fn()}
+          prStatusHandle={handle}
+        />
+      </>,
+    );
+
+    fireEvent.click(screen.getByTestId('active-pr-ambiguity-note'));
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+  });
+
+  it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {
+    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged' }, {
+      activeSelection: selection({
+        associated_prs: [
+          { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'CLOSED', draft: false, display_state: 'merged', base: 'main', head: 'task-123', feedback_status: 'approved' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Still open', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 55, title: 'Closed', url: 'https://github.com/o/r/pull/55', state: 'CLOSED', draft: false, display_state: 'closed', base: 'main', head: 'old-branch', feedback_status: 'open' },
+        ],
+      }),
+      activePrSummary: { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'CLOSED', draft: false, display_state: 'merged', base: 'main', head: 'task-123', feedback_status: 'approved' },
+    });
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 1 open/draft · 1 merged · 1 closed. Cleanup still applies only to this task branch.');
+    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
+  });
+
+  it('uses concise address-feedback copy and a full accessible target', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })}
+      />,
+    );
+
+    expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #12 feedback');
+    expect(screen.getByTestId('address-feedback-button')).toHaveAttribute('aria-label', expect.stringContaining('Address PR #12 feedback'));
+  });
+
+  it('gates active PR diff behind ambiguity and otherwise uses PR-specific comparator context', () => {
+    const ambiguousHandle = prStatusHandle({ found: false }, {
+      activeSelection: selection({ associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123', feedback_status: 'open' },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+      ] }),
+      activePrSummary: null,
+      ambiguous: true,
+    });
+    delete ambiguousHandle.activeSelection.active_pr;
+    const { rerender } = renderWithProviders(
+      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={ambiguousHandle} />,
+    );
+    expect(screen.queryByTestId('view-active-pr-diff-button')).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })} />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('view-active-pr-diff-button')).toHaveAttribute('aria-label', 'View PR #12 diff compared with its base branch');
+  });
+});
+
 describe('WorkControlBar — invariants', () => {
   it('exactly one element glows in a representative case (merged PR)', () => {
     renderWithProviders(
@@ -833,6 +980,10 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
       url: 'https://gh/pr/139',
       display_state: 'open',
       feedback_freshness: { state: 'new', count: 2 },
+      selection: selection({
+        associated_prs: [{ repo_owner: 'o', repo_name: 'r', pr_number: 139, title: 'Fix CI', url: 'https://gh/pr/139', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'main', head: 'task-123', feedback_status: 'open' }],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 139 }, provenance: 'inferred' },
+      }),
     });
 
     renderWithProviders(
@@ -869,7 +1020,7 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     });
     await waitFor(() => {
       expect(screen.getByTestId('address-feedback-button').textContent).toMatch(
-        /Address feedback/i,
+        /Address PR #139 feedback/i,
       );
     });
   });

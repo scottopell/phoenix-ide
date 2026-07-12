@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -127,6 +128,11 @@ export function WorkControlBar({
   const selection = prStatusHandle.activeSelection;
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
   const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
+  const associatedPrs = useMemo(() => selection?.associated_prs ?? [], [selection?.associated_prs]);
+  const actionablePrs = useMemo(
+    () => associatedPrs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft'),
+    [associatedPrs],
+  );
   const diffLabel = useMemo(
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
@@ -140,7 +146,6 @@ export function WorkControlBar({
     canSendMessage: !!onSendMessage,
     workChange: prStatus?.work_change ?? null,
   });
-  if (!disposition.visible) return null;
 
   const isBranch = convModeLabel === 'Branch';
   const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
@@ -163,7 +168,25 @@ export function WorkControlBar({
     }
   };
 
+  const mixedAssociatedStateSummary = useMemo(() => {
+    if (associatedPrs.length < 2) return null;
+    const states = new Set(associatedPrs.map((pr) => pr.display_state));
+    if (states.size < 2) return null;
+    const labels = [
+      actionablePrs.length > 0 ? `${actionablePrs.length} open/draft` : null,
+      associatedPrs.some((pr) => pr.display_state === 'merged') ? `${associatedPrs.filter((pr) => pr.display_state === 'merged').length} merged` : null,
+      associatedPrs.some((pr) => pr.display_state === 'closed') ? `${associatedPrs.filter((pr) => pr.display_state === 'closed').length} closed` : null,
+    ].filter(Boolean);
+    return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
+  }, [actionablePrs, associatedPrs]);
+
+  if (!disposition.visible) return null;
+
   const note = disposition.note;
+  const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
+  const addressFeedbackAriaLabel = canShowPrDiff
+    ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
+    : addressFeedbackLabel;
 
   return (
     <div className="work-actions-bar">
@@ -182,6 +205,7 @@ export function WorkControlBar({
           <button
             className="work-actions-btn work-actions-view-diff"
             data-testid="view-active-pr-diff-button"
+            aria-label={`View ${activePrLabel} diff compared with its base branch`}
             onClick={() => openDiffFullscreen('active_pr')}
           >
             {diffLabel}
@@ -197,10 +221,11 @@ export function WorkControlBar({
               type="button"
               className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
               data-testid="address-feedback-button"
+              aria-label={addressFeedbackAriaLabel}
               disabled={capturing}
               onClick={handleAddressFeedback}
             >
-              {capturing ? `Capturing ${activePrLabel}...` : `Address feedback for ${activePrLabel}`}
+              <span className="work-actions-address-copy">{addressFeedbackLabel}</span>
               {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
               <CoverageMarker marker={coverageMarker} />
             </button>
@@ -293,9 +318,17 @@ export function WorkControlBar({
       )}
 
       {prStatusHandle.ambiguous && selection && (
-        <span className="work-actions-pr-note work-actions-pr-note--warning" data-testid="active-pr-ambiguity-note">
+        <button
+          type="button"
+          className="work-actions-pr-note work-actions-pr-note--warning work-actions-pr-note-button"
+          data-testid="active-pr-ambiguity-note"
+          onClick={() => requestActivePrSelectorOpen()}
+        >
           Multiple actionable PRs are associated with this work. Select one before PR-specific actions.
-        </span>
+        </button>
+      )}
+      {mixedAssociatedStateSummary && (
+        <span className="work-actions-pr-note" data-testid="mixed-associated-pr-summary">{mixedAssociatedStateSummary}</span>
       )}
       {error && <div className="work-actions-error">{error}</div>}
     </div>

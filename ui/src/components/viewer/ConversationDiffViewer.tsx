@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { ViewerShell } from './ViewerShell';
@@ -42,21 +42,24 @@ export function ConversationDiffViewer({
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
+  const loadDiff = useCallback(() => {
+    setState({ status: 'loading' });
+    return (target === 'active_pr'
+      ? api.getActivePrDiff(conversationId)
+      : api.getConversationDiff(conversationId))
+      .then((payload) => ({ ok: true as const, payload }))
+      .catch((err: unknown) => ({ ok: false as const, message: err instanceof Error ? err.message : 'Failed to load diff' }));
+  }, [conversationId, target]);
+
   useEffect(() => {
     let cancelled = false;
-    setState({ status: 'loading' });
-    const load = target === 'active_pr'
-      ? api.getActivePrDiff(conversationId)
-      : api.getConversationDiff(conversationId);
-    load
-      .then((payload) => { if (!cancelled) setState({ status: 'ready', payload, conversationId }); })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setState({ status: 'error', message: err instanceof Error ? err.message : 'Failed to load diff', conversationId });
-        }
-      });
+    void loadDiff().then((result) => {
+      if (cancelled) return;
+      if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
+      else setState({ status: 'error', message: result.message, conversationId });
+    });
     return () => { cancelled = true; };
-  }, [conversationId, target]);
+  }, [conversationId, loadDiff]);
 
   // Treat a resolved state from a previous conversation as still-loading until
   // the effect refetches for the current conversationId.
@@ -99,7 +102,14 @@ export function ConversationDiffViewer({
           <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{state.message}</span>
-            <button onClick={onClose}>Close</button>
+            {target === 'active_pr' && <span>Compare against the selected PR base branch when available.</span>}
+            <div className="viewer-error-actions">
+              <button onClick={() => { void loadDiff().then((result) => {
+                if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
+                else setState({ status: 'error', message: result.message, conversationId });
+              }); }}>Retry</button>
+              <button onClick={onClose}>Close</button>
+            </div>
           </div>
         ) : (
           <div className="viewer-loading">

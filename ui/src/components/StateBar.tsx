@@ -2,6 +2,8 @@ import {
   useState,
   useRef,
   useEffect,
+  useId,
+  useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -20,6 +22,8 @@ import type { ConnectionState } from "../hooks";
 import { useIsMobile } from "../hooks";
 import { getStateDescription, isAgentWorking } from "../utils";
 import { ContextIndicator } from "./ContextIndicator";
+import "./StateBar.css";
+import { setActivePrSelectorIntent, type ActivePrSelectorIntent } from './activePrSelectorIntent';
 import {
   prBadgeClass,
   prBadgeLabel,
@@ -230,9 +234,31 @@ function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   );
 }
 
+function summarizeRepo(pr: { repo_owner: string; repo_name: string }): string {
+  return pr.repo_owner && pr.repo_name ? `${pr.repo_owner}/${pr.repo_name}` : 'current repo';
+}
+
+function selectorMetaLabel(pr: { head: string; base: string; repo_owner: string; repo_name: string }) {
+  return `${pr.head} → ${pr.base} · ${summarizeRepo(pr)}`;
+}
+
+function autoInferenceSummary(selection: NonNullable<ConversationPrStatusHandle['activeSelection']>) {
+  const observed = selection.latest_observed_branch;
+  if (!observed) return 'Auto follows the latest observed branch.';
+  return `Auto follows the latest observed branch: ${observed.branch_name} · ${observed.repository_identity}.`;
+}
+
 function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [pendingAction, setPendingAction] = useState<'pin' | 'resume' | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const rootRef = useRef<HTMLSpanElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const menuId = useId();
   const selection = handle.activeSelection;
   const activePr = handle.activePrSummary;
   const actionablePrs = selection?.associated_prs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft') ?? [];
@@ -240,80 +266,230 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const activeLabel = activePr ? `#${activePr.pr_number}` : 'Choose PR';
   const provenance = selection?.active_pr?.provenance;
   const pinned = provenance === 'pinned';
+  const auto = provenance === 'inferred';
   const canResume = provenance === 'pinned';
+  const autoSummary = selection ? autoInferenceSummary(selection) : null;
+  const optionCount = actionablePrs.length + (canResume ? 1 : 0);
+
+  const closeMenu = (restoreFocus = true) => {
+    setOpen(false);
+    setMutationError(null);
+    setPendingAction(null);
+    if (!restoreFocus) return;
+    window.setTimeout(() => {
+      const restoreTarget = restoreFocusRef.current;
+      restoreFocusRef.current = null;
+      if (restoreTarget && document.contains(restoreTarget)) restoreTarget.focus();
+      else triggerRef.current?.focus();
+    }, 0);
+  };
+
+  const openMenu = useCallback((focusIndex = 0, source?: HTMLElement | null) => {
+    if (source) restoreFocusRef.current = source;
+    setMutationError(null);
+    setOpen(true);
+    setActiveIndex(Math.max(0, Math.min(focusIndex, Math.max(optionCount - 1, 0))));
+  }, [optionCount]);
+
+  useEffect(() => {
+    setActiveIndex((current) => Math.max(0, Math.min(current, Math.max(optionCount - 1, 0))));
+  }, [optionCount]);
 
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      if (!rootRef.current?.contains(event.target as Node)) closeMenu(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeMenu();
+      }
     };
     document.addEventListener('mousedown', onPointerDown);
-    return () => document.removeEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    itemRefs.current[activeIndex]?.focus();
+  }, [open, activeIndex]);
+
+  useEffect(() => {
+    const intent: ActivePrSelectorIntent = {
+      requestOpen: () => openMenu(0, document.activeElement instanceof HTMLElement ? document.activeElement : null),
+    };
+    setActivePrSelectorIntent(intent);
+    return () => setActivePrSelectorIntent(null);
+  }, [openMenu]);
+
   if (actionablePrs.length === 0 && !activePr && !ambiguous) return null;
+
+  const runPin = async (index: number) => {
+    const pr = actionablePrs[index];
+    if (!pr || pendingAction) return;
+    setPendingAction('pin');
+    setMutationError(null);
+    try {
+      await handle.pinActivePr?.({ repo_owner: pr.repo_owner, repo_name: pr.repo_name, pr_number: pr.pr_number });
+      closeMenu();
+    } catch (error) {
+      setPendingAction(null);
+      setMutationError(error instanceof Error ? error.message : 'Failed to set active PR');
+    }
+  };
+
+  const runResume = async () => {
+    if (!canResume || pendingAction) return;
+    setPendingAction('resume');
+    setMutationError(null);
+    try {
+      await handle.resumeInference?.();
+      closeMenu();
+    } catch (error) {
+      setPendingAction(null);
+      setMutationError(error instanceof Error ? error.message : 'Failed to resume automatic PR selection');
+    }
+  };
+
+  const onMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (optionCount === 0) return;
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowRight':
+        event.preventDefault();
+        setActiveIndex((current) => (current + 1) % optionCount);
+        break;
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        event.preventDefault();
+        setActiveIndex((current) => (current - 1 + optionCount) % optionCount);
+        break;
+      case 'Home':
+        event.preventDefault();
+        setActiveIndex(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        setActiveIndex(optionCount - 1);
+        break;
+      case 'Enter':
+      case ' ': {
+        event.preventDefault();
+        if (activeIndex < actionablePrs.length) void runPin(activeIndex);
+        else void runResume();
+        break;
+      }
+      case 'Escape':
+        event.preventDefault();
+        closeMenu();
+        break;
+    }
+  };
 
   return (
     <span className="active-pr-selector" ref={rootRef}>
       <button
+        ref={triggerRef}
         type="button"
-        className={`active-pr-selector-trigger${ambiguous ? ' active-pr-selector-trigger--ambiguous' : ''}`}
+        className={`active-pr-selector-trigger${ambiguous ? ' active-pr-selector-trigger--ambiguous' : ''}${open ? ' active-pr-selector-trigger--open' : ''}`}
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         aria-label={ambiguous ? 'Select active pull request' : `Active pull request ${activeLabel}`}
         data-testid="active-pr-selector-trigger"
         onClick={(event) => {
           event.stopPropagation();
-          setOpen((value) => !value);
+          if (open) closeMenu();
+          else openMenu(0, event.currentTarget);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            openMenu(event.key === 'ArrowUp' && optionCount > 0 ? optionCount - 1 : 0, event.currentTarget);
+          }
         }}
       >
         <span className="active-pr-selector-label">{ambiguous ? 'PR ?' : activeLabel}</span>
         {pinned && <span className="active-pr-selector-badge" data-testid="active-pr-pinned-indicator">Pinned</span>}
-        {!pinned && activePr && provenance === 'inferred' && <span className="active-pr-selector-badge">Auto</span>}
+        {auto && activePr && <span className="active-pr-selector-badge">Auto</span>}
       </button>
       {open && (
-        <div className="active-pr-selector-menu" role="menu" aria-label="Active pull request choices">
+        <div
+          id={menuId}
+          ref={menuRef}
+          className="active-pr-selector-menu"
+          role="menu"
+          aria-label="Active pull request choices"
+          onKeyDown={onMenuKeyDown}
+        >
           {ambiguous && (
             <div className="active-pr-selector-note" data-testid="active-pr-ambiguity-label">
               Multiple actionable PRs — choose one.
             </div>
           )}
-          {actionablePrs.map((pr) => {
+          {autoSummary && auto && (
+            <div className="active-pr-selector-auto-summary" data-testid="active-pr-auto-summary">{autoSummary}</div>
+          )}
+          {actionablePrs.map((pr, index) => {
             const isActive = activePr?.pr_number === pr.pr_number;
             return (
               <button
                 key={`${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`}
+                ref={(element) => {
+                  itemRefs.current[index] = element;
+                }}
                 type="button"
-                role="menuitem"
+                role="menuitemradio"
+                aria-checked={isActive}
                 className={`active-pr-selector-item${isActive ? ' active-pr-selector-item--active' : ''}`}
                 data-testid={`active-pr-choice-${pr.pr_number}`}
-                onClick={async (event) => {
+                disabled={pendingAction !== null}
+                onClick={(event) => {
                   event.stopPropagation();
-                  await handle.pinActivePr?.({ repo_owner: pr.repo_owner, repo_name: pr.repo_name, pr_number: pr.pr_number });
-                  setOpen(false);
+                  void runPin(index);
                 }}
               >
-                <span className="active-pr-selector-item-label">#{pr.pr_number}</span>
-                <span className="active-pr-selector-item-title">{pr.title}</span>
-                {isActive && <span className="active-pr-selector-item-state">Active</span>}
+                <span className="active-pr-selector-item-main">
+                  <span className="active-pr-selector-item-line">
+                    <span className="active-pr-selector-item-label">#{pr.pr_number}</span>
+                    <span className="active-pr-selector-item-title">{pr.title}</span>
+                    {isActive && <span className="active-pr-selector-item-state">Active</span>}
+                  </span>
+                  <span className="active-pr-selector-item-meta">{selectorMetaLabel(pr)}</span>
+                </span>
               </button>
             );
           })}
           {canResume && (
             <button
+              ref={(element) => {
+                itemRefs.current[actionablePrs.length] = element;
+              }}
               type="button"
               role="menuitem"
               className="active-pr-selector-item active-pr-selector-item--resume"
               data-testid="active-pr-resume-inference"
-              onClick={async (event) => {
+              disabled={pendingAction !== null}
+              onClick={(event) => {
                 event.stopPropagation();
-                await handle.resumeInference?.();
-                setOpen(false);
+                void runResume();
               }}
             >
-              Resume automatic inference
+              <span className="active-pr-selector-item-main">
+                <span className="active-pr-selector-item-line active-pr-selector-item-line--resume">
+                  <span className="active-pr-selector-item-title">{pendingAction === 'resume' ? 'Resuming automatic selection…' : 'Resume automatic selection'}</span>
+                </span>
+                {selection && <span className="active-pr-selector-item-meta">{autoInferenceSummary(selection)}</span>}
+              </span>
             </button>
           )}
+          {pendingAction && <div className="active-pr-selector-status" role="status">Saving active PR…</div>}
+          {mutationError && <div className="active-pr-selector-error" role="alert">{mutationError}</div>}
         </div>
       )}
     </span>

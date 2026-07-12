@@ -338,7 +338,7 @@ describe('StateBar PR badge', () => {
     const selection = makeSelection({
       associated_prs: [
         { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/scottopell/phoenix-ide/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'a', feedback_status: 'open' },
-        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Stacked follow-up', url: 'https://github.com/scottopell/phoenix-ide/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'b', feedback_status: 'open' },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Stacked follow-up', url: 'https://github.com/scottopell/phoenix-ide/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'develop', head: 'b', feedback_status: 'open' },
       ],
     });
     delete selection.active_pr;
@@ -361,8 +361,87 @@ describe('StateBar PR badge', () => {
     expect(screen.queryByRole('link', { name: /^#12/i })).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
     expect(screen.getByTestId('active-pr-ambiguity-label')).toBeInTheDocument();
+    expect(screen.getByText('b → develop · o/r')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('active-pr-choice-34'));
     await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
+  });
+
+  it('supports keyboard navigation, selection, escape, and focus restoration', async () => {
+    const selection = makeSelection({
+      associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/scottopell/phoenix-ide/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123-pr-status', feedback_status: 'open' },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Stacked follow-up', url: 'https://github.com/scottopell/phoenix-ide/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123-pr-status', head: 'task-123-follow-up', feedback_status: 'open' },
+      ],
+      latest_observed_branch: { branch_name: 'task-123-follow-up', repository_identity: 'o/r' },
+    });
+    delete selection.active_pr;
+    const handle = makePrStatusHandle(mockPrStatus({ found: false }), selection);
+    render(
+      <MemoryRouter>
+        <button type="button">Before</button>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    const trigger = screen.getByTestId('active-pr-selector-trigger');
+    fireEvent.click(trigger);
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'ArrowDown' });
+    expect(screen.getByTestId('active-pr-choice-34')).toHaveFocus();
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: 'Home' });
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'End' });
+    expect(screen.getByTestId('active-pr-choice-34')).toHaveFocus();
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: 'Escape' });
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    fireEvent.keyDown(trigger, { key: 'Enter' });
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+    expect(screen.getByTestId('active-pr-ambiguity-label')).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'ArrowDown' });
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: ' ' });
+    await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('shows pending and visible error state for selector mutations and mobile-safe auto summary', async () => {
+    const selection = makeSelection({
+      latest_observed_branch: { branch_name: 'task-123-pr-status', repository_identity: 'o/r' },
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 }, provenance: 'pinned' },
+    });
+    const pinActivePr = vi.fn().mockRejectedValue(new Error('Pin failed'));
+    const resumeInference = vi.fn().mockImplementation(() => new Promise<void>(() => {}));
+    const handle = { ...makePrStatusHandle(mockPrStatus({ found: true, number: 12, url: 'https://github.com/scottopell/phoenix-ide/pull/12', display_state: 'open' }), selection), pinActivePr, resumeInference };
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    expect(screen.getByText('Auto follows the latest observed branch: task-123-pr-status · o/r.')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('active-pr-choice-12'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Pin failed');
+    fireEvent.click(screen.getByTestId('active-pr-resume-inference'));
+    expect(screen.getByRole('status')).toHaveTextContent('Saving active PR…');
   });
 });
 
