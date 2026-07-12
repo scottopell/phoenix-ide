@@ -126,16 +126,29 @@ pub async fn sample_process_observations(
         let Some(process) = sys.process(sys_pid) else {
             continue;
         };
-        let memory_bytes = stable_process_memory_bytes(pid, expected_identity);
-        let cpu_time_seconds = stable_process_cpu_time_seconds(pid, expected_identity);
+        let memory_bytes = log_metric_gap(
+            pid,
+            "proportional memory",
+            stable_process_memory_bytes(pid, expected_identity),
+        );
+        let cpu_time_seconds = log_metric_gap(
+            pid,
+            "cumulative CPU time",
+            stable_process_cpu_time_seconds(pid, expected_identity),
+        );
+        let thread_count = log_metric_gap(
+            pid,
+            "thread count",
+            process
+                .tasks()
+                .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
+        );
         rows.push(ProcessObservation {
             pid,
             name: process.name().to_string_lossy().into_owned(),
             cpu_percent: Some(process.cpu_usage()),
             memory_bytes,
-            thread_count: process
-                .tasks()
-                .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
+            thread_count,
             cpu_time_seconds,
         });
     }
@@ -193,15 +206,19 @@ fn retain_matching_process_identities(
         .collect()
 }
 
+fn log_metric_gap<T>(pid: u32, metric: &'static str, value: Option<T>) -> Option<T> {
+    if value.is_none() {
+        tracing::debug!(pid, metric, "process metric sample unavailable");
+    }
+    value
+}
+
 fn stable_process_memory_bytes(pid: u32, expected_identity: ProcessIdentity) -> Option<u64> {
     let before = current_process_identity(pid)?;
     if before != expected_identity {
         return None;
     }
-    let Some(memory_bytes) = process_pss_bytes_impl(pid) else {
-        tracing::debug!(pid, "process proportional-memory sample unavailable");
-        return None;
-    };
+    let memory_bytes = process_pss_bytes_impl(pid)?;
     let after = current_process_identity(pid)?;
     (after == expected_identity).then_some(memory_bytes)
 }
