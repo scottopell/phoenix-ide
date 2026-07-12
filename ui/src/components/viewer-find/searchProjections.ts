@@ -550,10 +550,9 @@ function isHiddenSystemMessage(message: Message): boolean {
 function visibleConversationText(
   text: string,
   density: 'full' | 'compact',
-  options: { forceExpanded?: boolean | undefined; previewOnly?: boolean | undefined } = {},
+  options: { forceExpanded?: boolean | undefined } = {},
 ): string {
   if (options.forceExpanded) return text;
-  if (options.previewOnly) return previewText(text);
   if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
   return firstLineSummary(text);
 }
@@ -566,10 +565,6 @@ function firstLineSummary(text: string, maxLen = 140): string {
   const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
   const flat = firstLine.replace(/\s+/g, ' ').trim();
   return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
-}
-
-function previewText(text: string, maxLines = 3): string {
-  return text.split('\n').slice(0, maxLines).join('\n');
 }
 
 function shouldCollapseCompactText(text: string): boolean {
@@ -606,11 +601,9 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
-      const inputText = stableJson(block.input);
-      const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
       if (densityToolDetailsVisible(block.name, density)) {
-        out.push({ role: `tool-use-input-${index}`, text: visibleConversationText(inputText, density, { previewOnly: shouldProjectToolPreviewOnly(block.name, inputText) }) });
-        out.push({ role: `tool-use-result-${index}`, text: visibleConversationText(resultText, density, { previewOnly: shouldProjectToolPreviewOnly(block.name, resultText) }) });
+        out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
+        out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
       }
       return;
     }
@@ -621,11 +614,6 @@ function agentTurnSources(
 function densityToolDetailsVisible(toolName: string | undefined, density: 'full' | 'compact'): boolean {
   if (toolName === 'think') return true;
   return density === 'full';
-}
-
-function shouldProjectToolPreviewOnly(toolName: string | undefined, text: string): boolean {
-  if (toolName === 'think' || toolName === 'read_file' || text.length === 0) return false;
-  return text.length >= 200 || text.split('\n').length > 3;
 }
 
 function containsMermaidFence(text: string): boolean {

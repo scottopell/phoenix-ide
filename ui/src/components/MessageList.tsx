@@ -232,7 +232,7 @@ interface SystemPromptHeaderProps {
   systemPrompt: string;
   expanded: boolean;
   onToggle: () => void;
-  contentRef: React.RefObject<HTMLPreElement | null>;
+  contentRef: React.RefObject<HTMLPreElement>;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -264,7 +264,7 @@ interface MessageListContext {
   systemPrompt: string | undefined;
   systemPromptExpanded: boolean;
   toggleSystemPrompt: () => void;
-  systemPromptRef: React.RefObject<HTMLPreElement | null>;
+  systemPromptRef: React.RefObject<HTMLPreElement>;
 }
 
 // Virtuoso slot component types are defined once at module scope so their
@@ -384,7 +384,7 @@ function MessageListImpl({
       ? buildConversationSearchProjection(allUnits, findQuery, {
           density,
           streamingBuffer: findStreamingBuffer,
-          systemPrompt,
+          systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
         })
       : { sources: [], matches: [] }),
@@ -804,9 +804,10 @@ function MessageListImpl({
       }, delay));
       return () => timers.forEach(clearTimeout);
     }
-    virtuosoRef.current?.scrollToIndex({ index: match.target.unitIndex, align: 'center', behavior: 'smooth' });
+    const unitMatch = match.target;
+    virtuosoRef.current?.scrollToIndex({ index: unitMatch.unitIndex, align: 'center', behavior: 'smooth' });
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
-      const row = findRowByKey(match.target.unitKey);
+      const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;
       scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
         .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
