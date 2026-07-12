@@ -1500,6 +1500,15 @@ export const api = {
     return resp.json();
   },
 
+  async getConversationMeta(id: string): Promise<ConversationMetaResponse> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/meta`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to get conversation metadata');
+    }
+    return resp.json();
+  },
+
   async getConversationMetaBySlug(slug: string): Promise<ConversationMetaResponse> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/meta`);
     if (!resp.ok) {

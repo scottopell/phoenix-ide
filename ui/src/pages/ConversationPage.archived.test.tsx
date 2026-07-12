@@ -19,7 +19,9 @@ vi.mock('../api', async () => {
     ...actual,
     api: {
       ...actual.api,
+      getConversation: vi.fn(),
       getConversationBySlug: vi.fn(),
+      getConversationMeta: vi.fn(),
       getConversationMetaBySlug: vi.fn(),
       getConversationMessagesAfter: vi.fn(),
       getConversationMessagesLatest: vi.fn(),
@@ -39,6 +41,7 @@ vi.mock('../api', async () => {
 
 vi.mock('../cache', () => ({
   cacheDB: {
+    getConversation: vi.fn(() => Promise.resolve(null)),
     getConversationBySlug: vi.fn(() => Promise.resolve(null)),
     getMessages: vi.fn(() => Promise.resolve([])),
     getMaxMessageSequenceId: vi.fn(() => Promise.resolve(null)),
@@ -61,15 +64,40 @@ vi.mock('../hooks', async () => {
 });
 
 vi.mock('../components/ConversationNavStack', () => ({
-  ConversationNavStack: ({ messages }: { messages: Message[] }) => (
-    <div data-testid="message-history">
-      {messages.map((message) => {
-        const content = message.content as { text?: string } | { type?: string; text?: string }[];
-        const rendered = Array.isArray(content)
-          ? content.find((block) => block.type === 'text')?.text
-          : content?.text;
-        return <div key={message.message_id}>{rendered}</div>;
-      })}
+  ConversationNavStack: ({
+    messages,
+    hasOlderMessages,
+    onLoadOlderMessages,
+    loadingOlderMessages,
+    historyScrollCommand,
+  }: {
+    messages: Message[];
+    hasOlderMessages?: boolean;
+    onLoadOlderMessages?: () => void;
+    loadingOlderMessages?: boolean;
+    historyScrollCommand?: { kind: string; token: number } | null;
+  }) => (
+    <div>
+      <div data-testid="message-history">
+        {messages.map((message) => {
+          const content = message.content as { text?: string } | { type?: string; text?: string }[];
+          const rendered = Array.isArray(content)
+            ? content.find((block) => block.type === 'text')?.text
+            : content?.text;
+          return <div key={message.message_id}>{rendered}</div>;
+        })}
+      </div>
+      <div data-testid="history-message-count">{messages.length}</div>
+      <div data-testid="history-has-older">{hasOlderMessages ? 'yes' : 'no'}</div>
+      {hasOlderMessages && onLoadOlderMessages && (
+        <button type="button" onClick={() => onLoadOlderMessages()}>
+          Load older messages
+        </button>
+      )}
+      <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
+      <div data-testid="history-scroll-command">
+        {historyScrollCommand ? `${historyScrollCommand.kind}:${historyScrollCommand.token}` : 'none'}
+      </div>
     </div>
   ),
 }));
@@ -127,7 +155,7 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
-function renderPage(conversation: Conversation) {
+function renderPage(conversation: Conversation, routeSegment: string = conversation.slug) {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
@@ -139,9 +167,22 @@ function renderPage(conversation: Conversation) {
     transcriptGeneration: conversation.transcript_generation ?? 1,
   });
 
+  vi.mocked(api.getConversation).mockResolvedValue({
+    conversation,
+    messages: [historyMessage],
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
   vi.mocked(api.getConversationBySlug).mockResolvedValue({
     conversation,
     messages: [historyMessage],
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
+  vi.mocked(api.getConversationMeta).mockResolvedValue({
+    conversation,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 0,
@@ -157,7 +198,7 @@ function renderPage(conversation: Conversation) {
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
         <ConversationReadinessProvider>
-          <MemoryRouter initialEntries={[`/c/${conversation.slug}`]}>
+          <MemoryRouter initialEntries={[`/c/${routeSegment}`]}>
             <Routes>
               <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
             </Routes>
@@ -166,6 +207,8 @@ function renderPage(conversation: Conversation) {
       </DraftContext.Provider>
     </ConversationContext.Provider>,
   );
+
+  return { store };
 }
 
 afterEach(() => {
@@ -213,6 +256,34 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('[data-testid="terminal-panel"]'));
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
+  });
+
+  it('cold-loads a UUID route via id metadata and id full-history paths', async () => {
+    const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
+    const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-archived', archived: true });
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(api.getConversationMeta).mockResolvedValue({
+      conversation: uuidConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+
+    renderPage(uuidConversation, uuidRoute);
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
+    });
+    expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
   });
 
   it('falls back to authoritative slug fetch when cached slug owner changed', async () => {
@@ -317,6 +388,89 @@ describe('ConversationPage archived read-only rendering', () => {
         expect.objectContaining({ latestMessageSequenceId: 4 }),
       );
     });
+  });
+
+  it('uses the id fetch path when UUID-route archive confirmation refreshes full data', async () => {
+    const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
+    const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-expand', archived: false });
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([catchUpMessage]);
+    vi.mocked(api.getConversationMeta).mockResolvedValue({
+      conversation: uuidConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversation).mockResolvedValue({
+      conversation: uuidConversation,
+      messages: [historyMessage, catchUpMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(uuidConversation, uuidRoute);
+
+    expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(api.getConversation).toHaveBeenCalledWith(uuidRoute);
+    });
+    expect(api.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+  });
+
+  it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {
+    const mismatchConversation = makeConversation({ transcript_generation: 2 });
+    const staleLatestWindowMessage = {
+      ...catchUpMessage,
+      message_id: 'm-stale-latest-window',
+      sequence_id: 2,
+      content: [{ type: 'text', text: 'stale latest-window message' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: mismatchConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [staleLatestWindowMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+
+    vi.mocked(cacheDB.putReplicaMeta).mockClear();
+    vi.mocked(cacheDB.putMessages).mockClear();
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('Conversation transcript changed while loading')).toBeInTheDocument();
+    expect(screen.queryByText('stale latest-window message')).not.toBeInTheDocument();
+    expect(cacheDB.putMessages).not.toHaveBeenCalledWith([staleLatestWindowMessage]);
+    expect(cacheDB.putReplicaMeta).not.toHaveBeenCalled();
   });
 
   it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {

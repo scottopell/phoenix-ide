@@ -147,6 +147,7 @@ pub fn create_router(state: AppState) -> Router {
             delete(stop_conversation_browser_session),
         )
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
+        .route("/api/conversations/:id/meta", get(get_conversation_meta))
         .route(
             "/api/conversations/:id/messages/latest",
             get(get_conversation_messages_latest),
@@ -2179,6 +2180,34 @@ async fn get_conversation(
     Ok(Json(ConversationWithMessagesResponse {
         conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         messages: enriched_msgs,
+        agent_working: conversation.is_agent_working(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
+        context_window_size,
+    }))
+}
+
+async fn get_conversation_meta(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationMetaResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let context_window_size = state
+        .runtime
+        .db()
+        .get_latest_usage_data(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .as_ref()
+        .map_or(0, crate::db::UsageData::context_window_used);
+
+    Ok(Json(ConversationMetaResponse {
+        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,

@@ -128,6 +128,50 @@ const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c
 const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
 
+function prefersConversationIdRoute(routeSegment: string): boolean {
+  return isUuidRouteSegment(routeSegment);
+}
+
+async function getCachedConversationForRoute(routeSegment: string): Promise<Conversation | null> {
+  return prefersConversationIdRoute(routeSegment)
+    ? await cacheDB.getConversation(routeSegment) ?? await cacheDB.getConversationBySlug(routeSegment)
+    : await cacheDB.getConversationBySlug(routeSegment) ?? await cacheDB.getConversation(routeSegment);
+}
+
+async function getConversationForRoute(routeSegment: string) {
+  if (prefersConversationIdRoute(routeSegment)) {
+    try {
+      return await api.getConversation(routeSegment);
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+      return api.getConversationBySlug(routeSegment);
+    }
+  }
+  try {
+    return await api.getConversationBySlug(routeSegment);
+  } catch (err) {
+    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+    return api.getConversation(routeSegment);
+  }
+}
+
+async function getConversationMetaForRoute(routeSegment: string) {
+  if (prefersConversationIdRoute(routeSegment)) {
+    try {
+      return await api.getConversationMeta(routeSegment);
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+      return api.getConversationMetaBySlug(routeSegment);
+    }
+  }
+  try {
+    return await api.getConversationMetaBySlug(routeSegment);
+  } catch (err) {
+    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+    return api.getConversationMeta(routeSegment);
+  }
+}
+
 
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -267,6 +311,8 @@ function ConversationPageContent() {
   );
 
   historyViewRef.current = historyExpansion.view;
+  const historyCoverageRef = useRef(historyExpansion.coverage);
+  historyCoverageRef.current = historyExpansion.coverage;
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -507,6 +553,25 @@ function ConversationPageContent() {
   const atomRef = useRef(atom);
   atomRef.current = atom;
 
+  useEffect(() => {
+    if (!conversationId || atom.transcriptGeneration === null) return;
+    const currentView = historyViewRef.current;
+    if (
+      currentView.conversationId === conversationId
+      && currentView.transcriptGeneration === atom.transcriptGeneration
+    ) return;
+    historyGenerationRef.current += 1;
+    dispatchHistoryExpansion({
+      type: 'view_changed',
+      view: {
+        conversationId,
+        generation: historyGenerationRef.current,
+        transcriptGeneration: atom.transcriptGeneration,
+      },
+      hasEarlierHistory: historyCoverageRef.current === 'tail',
+    });
+  }, [conversationId, atom.transcriptGeneration]);
+
   const eventCursorRef = useConversationEventCursorRef(slug!);
 
   const connectionInfo = useConnection({
@@ -536,7 +601,7 @@ function ConversationPageContent() {
       view: {
         conversationId: atomRef.current.conversationId ?? slug,
         generation: historyGenerationRef.current,
-        transcriptGeneration: atomRef.current.conversation?.transcript_generation ?? 0,
+        transcriptGeneration: atomRef.current.transcriptGeneration ?? 0,
       },
       hasEarlierHistory: false,
     });
@@ -550,9 +615,7 @@ function ConversationPageContent() {
         let cached = atomRef.current.conversation;
         let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
-          cached = isUuidRouteSegment(slug)
-            ? await cacheDB.getConversation(slug) ?? await cacheDB.getConversationBySlug(slug)
-            : await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
+          cached = await getCachedConversationForRoute(slug);
           if (cached) {
             cachedMessages = await cacheDB.getMessages(cached.id);
             if (!cancelled) {
@@ -642,7 +705,7 @@ function ConversationPageContent() {
                   lastHydratedAt: new Date().toISOString(),
                 });
 
-                const metadata = await api.getConversationMetaBySlug(slug);
+                const metadata = await getConversationMetaForRoute(slug);
                 if (cancelled) return;
                 const authoritativeConversation = metadata.conversation;
                 if (authoritativeConversation.id !== cachedConversationId) {
@@ -677,9 +740,13 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const metadata = await api.getConversationMetaBySlug(slug);
+            const metadata = await getConversationMetaForRoute(slug);
             if (cancelled) return;
             const latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+            const metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? latestWindow.transcript_generation;
+            if (metadataTranscriptGeneration !== latestWindow.transcript_generation) {
+              throw new Error('Conversation transcript changed while loading');
+            }
             const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
               dispatchHistoryExpansion({
@@ -687,7 +754,7 @@ function ConversationPageContent() {
                 view: {
                   conversationId: result.conversation.id,
                   generation: historyGenerationRef.current,
-                  transcriptGeneration: result.conversation.transcript_generation ?? latestWindow.transcript_generation,
+                  transcriptGeneration: metadataTranscriptGeneration,
                 },
                 hasEarlierHistory: latestWindow.has_older_messages,
               });
@@ -707,7 +774,7 @@ function ConversationPageContent() {
                 contextWindow: {
                   used: result.context_window_size || 0,
                 },
-                transcriptGeneration: result.conversation.transcript_generation ?? 1,
+                transcriptGeneration: metadataTranscriptGeneration,
                 eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
                 snapshotStartedAtEventSeq,
               });
@@ -761,11 +828,15 @@ function ConversationPageContent() {
     };
     dispatchHistoryExpansion({ type: 'request_started', request });
     try {
-      const result = await api.getConversationBySlug(slug);
+      const result = await getConversationForRoute(slug);
       const currentView = historyViewRef.current;
+      const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
+      const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
       const requestIsCurrent = currentView.conversationId === request.view.conversationId
         && currentView.generation === request.view.generation
-        && currentView.transcriptGeneration === request.view.transcriptGeneration;
+        && currentView.transcriptGeneration === request.view.transcriptGeneration
+        && authoritativeTranscriptGeneration === request.view.transcriptGeneration
+        && responseTranscriptGeneration === request.view.transcriptGeneration;
       if (!requestIsCurrent) return;
       dispatch({
         type: 'merge_conversation_data',
@@ -778,7 +849,7 @@ function ConversationPageContent() {
             ? { type: 'awaiting_llm' }
             : { type: 'idle' },
         contextWindow: { used: result.context_window_size || 0 },
-        transcriptGeneration: result.conversation.transcript_generation ?? 1,
+        transcriptGeneration: responseTranscriptGeneration,
         eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
         snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
       });
@@ -844,22 +915,7 @@ function ConversationPageContent() {
     const confirmArchiveStatus = async () => {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
-        const result = await (async () => {
-          if (isUuidRouteSegment(slug)) {
-            try {
-              return await api.getConversation(slug);
-            } catch (err) {
-              if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-              return api.getConversationBySlug(slug);
-            }
-          }
-          try {
-            return await api.getConversationBySlug(slug);
-          } catch (err) {
-            if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-            return api.getConversation(slug);
-          }
-        })();
+        const result = await getConversationForRoute(slug);
         if (cancelled) return;
         const replacesDifferentConversation = atomRef.current.conversationId !== null
           && atomRef.current.conversationId !== result.conversation.id;

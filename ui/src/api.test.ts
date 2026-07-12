@@ -96,6 +96,19 @@ describe('conversation metadata client', () => {
     vi.unstubAllGlobals();
   });
 
+  it('GETs metadata by id without fetching messages', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ conversation: { id: 'conv-1' }, agent_working: false, presentation_mode: 'idle', context_window_size: 0 }),
+    } as unknown as Response);
+
+    await api.getConversationMeta('conv/1');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv%2F1/meta');
+  });
+
   it('GETs metadata by slug without fetching messages', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({

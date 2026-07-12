@@ -51,6 +51,8 @@ const ChevronDown = () => (
     <polyline points="6 9 12 15 18 9" />
   </svg>
 );
+
+const HISTORY_SCROLL_ACK_TIMEOUT_MS = 1500;
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -627,12 +629,27 @@ function MessageListImpl({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
-      const onPointerDown = () => dispatchScrollEvent({ type: 'interactionStarted' });
-      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStarted' });
+      const releaseBeforeInteraction = () => {
+        continuityRestoreInFlightRef.current = false;
+        continuityRestoreTokenRef.current = null;
+        if (historyAckTimeoutRef.current !== 0) {
+          clearTimeout(historyAckTimeoutRef.current);
+          historyAckTimeoutRef.current = 0;
+        }
+      };
+      const onPointerDown = () => {
+        releaseBeforeInteraction();
+        dispatchScrollEvent({ type: 'interactionStarted' });
+      };
+      const onTouchStart = () => {
+        releaseBeforeInteraction();
+        dispatchScrollEvent({ type: 'touchStarted' });
+      };
       const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
       const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
       const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
       const onWheel = (e: WheelEvent) => {
+        releaseBeforeInteraction();
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
       };
@@ -782,6 +799,7 @@ function MessageListImpl({
     clearHighlight();
   }, [conversationId, clearHighlight]);
 
+
   const pulseIfMounted = useCallback((key: string) => {
     const row = Array.from(scrollerRef.current?.querySelectorAll<HTMLDivElement>('[data-render-unit-key]') ?? [])
       .find((candidate) => candidate.dataset['renderUnitKey'] === key);
@@ -839,8 +857,45 @@ function MessageListImpl({
 
   const handledHistoryCommandRef = useRef<number | null>(null);
   const acknowledgedHistoryCommandRef = useRef<number | null>(null);
+  const pendingHistoryAckRef = useRef<{ token: number; targetIndex: number } | null>(null);
+  const continuityRestoreTokenRef = useRef<number | null>(null);
+  const historyAckTimeoutRef = useRef(0);
+  const lastVisibleRangeRef = useRef<ListRange | null>(null);
+
+  const clearHistoryAckTimeout = useCallback(() => {
+    if (historyAckTimeoutRef.current !== 0) {
+      clearTimeout(historyAckTimeoutRef.current);
+      historyAckTimeoutRef.current = 0;
+    }
+  }, []);
+
+  const releaseContinuityRestoreSuppression = useCallback(() => {
+    continuityRestoreInFlightRef.current = false;
+    continuityRestoreTokenRef.current = null;
+    clearHistoryAckTimeout();
+  }, [clearHistoryAckTimeout]);
+
+  const finishHistoryCommand = useCallback((token: number, result: 'applied' | 'target_missing') => {
+    if (acknowledgedHistoryCommandRef.current === token) return;
+    acknowledgedHistoryCommandRef.current = token;
+    if (pendingHistoryAckRef.current?.token === token) pendingHistoryAckRef.current = null;
+    if (continuityRestoreTokenRef.current === token) releaseContinuityRestoreSuppression();
+    onHistoryScrollCommandHandled?.(token, result);
+  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression]);
+
+  useEffect(() => {
+    releaseContinuityRestoreSuppression();
+  }, [conversationId, releaseContinuityRestoreSuppression]);
+
+  useEffect(() => () => {
+    releaseContinuityRestoreSuppression();
+  }, [releaseContinuityRestoreSuppression]);
   useEffect(() => {
     if (!historyScrollCommand || handledHistoryCommandRef.current === historyScrollCommand.token) return;
+    if (continuityRestoreTokenRef.current !== null && continuityRestoreTokenRef.current !== historyScrollCommand.token) {
+      releaseContinuityRestoreSuppression();
+    }
+    pendingHistoryAckRef.current = null;
     handledHistoryCommandRef.current = historyScrollCommand.token;
     acknowledgedHistoryCommandRef.current = null;
     const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
@@ -848,19 +903,31 @@ function MessageListImpl({
       : historyScrollCommand.targetMessageId;
     const index = findUnitIndexByMessageId(messageId);
     if (index < 0) {
-      onHistoryScrollCommandHandled?.(historyScrollCommand.token, 'target_missing');
+      finishHistoryCommand(historyScrollCommand.token, 'target_missing');
       return;
     }
+    pendingHistoryAckRef.current = { token: historyScrollCommand.token, targetIndex: index };
     if (historyScrollCommand.kind === 'jump_to_message') {
       scrollToUnitIndex(index);
     } else {
       continuityRestoreInFlightRef.current = true;
+      continuityRestoreTokenRef.current = historyScrollCommand.token;
+      clearHistoryAckTimeout();
       virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
-      requestAnimationFrame(() => {
-        continuityRestoreInFlightRef.current = false;
-      });
     }
-  }, [findUnitIndexByMessageId, historyScrollCommand, onHistoryScrollCommandHandled, scrollToUnitIndex]);
+    const lastVisibleRange = lastVisibleRangeRef.current;
+    if (lastVisibleRange && index >= lastVisibleRange.startIndex && index <= lastVisibleRange.endIndex) {
+      finishHistoryCommand(historyScrollCommand.token, 'applied');
+      return;
+    }
+    if (historyScrollCommand.kind === 'restore_after_prefix_expansion') {
+      historyAckTimeoutRef.current = window.setTimeout(() => {
+        if (continuityRestoreTokenRef.current !== historyScrollCommand.token) return;
+        historyAckTimeoutRef.current = 0;
+        releaseContinuityRestoreSuppression();
+      }, HISTORY_SCROLL_ACK_TIMEOUT_MS);
+    }
+  }, [clearHistoryAckTimeout, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, releaseContinuityRestoreSuppression, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -900,23 +967,15 @@ function MessageListImpl({
 
   const handleRangeChanged = useCallback((range: ListRange) => {
     firstVisibleUnitIndexRef.current = range.startIndex;
-    const command = historyScrollCommand;
-    if (command && handledHistoryCommandRef.current === command.token) {
-      const messageId = command.kind === 'restore_after_prefix_expansion'
-        ? command.anchorMessageId
-        : command.targetMessageId;
-      const targetIndex = findUnitIndexByMessageId(messageId);
-      if (
-        targetIndex >= range.startIndex
-        && targetIndex <= range.endIndex
-        && acknowledgedHistoryCommandRef.current !== command.token
-      ) {
-        acknowledgedHistoryCommandRef.current = command.token;
-        onHistoryScrollCommandHandled?.(command.token, 'applied');
-      }
-    }
+    lastVisibleRangeRef.current = range;
+    const pendingAck = pendingHistoryAckRef.current;
+    if (
+      pendingAck
+      && pendingAck.targetIndex >= range.startIndex
+      && pendingAck.targetIndex <= range.endIndex
+    ) finishHistoryCommand(pendingAck.token, 'applied');
     onVisibleRangeChange?.(range);
-  }, [findUnitIndexByMessageId, historyScrollCommand, onHistoryScrollCommandHandled, onVisibleRangeChange]);
+  }, [finishHistoryCommand, onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);

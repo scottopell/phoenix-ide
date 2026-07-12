@@ -61,7 +61,7 @@ surface HistoryExpansionController {
         ViewChanged(view, conversation_id, view_generation, transcript_generation)
         ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
-        HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+        HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
         HistoryLoadFailed(view, request_token, view_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
         ExplicitRetryRequested(view, request_token, snapshot_event_seq)
@@ -121,7 +121,7 @@ rule DeepLinkStartsOneCoverageRequest {
 }
 
 rule StaleHistorySuccessCannotMutateView {
-    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
     requires: view.active_request = null
         or request_token != view.active_request.token
         or view_generation != view.view_generation
@@ -131,9 +131,10 @@ rule StaleHistorySuccessCannotMutateView {
 }
 
 rule ManualReaderExpansionCreatesContinuityCommand {
-    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    when: HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, _)
     requires: view.active_request != null
     requires: request_token = view.active_request.token
+    requires: command_token != ""
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
     requires: view.active_request.intent = manual_expand
@@ -141,6 +142,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
     ensures: view.coverage = complete
     ensures: view.pending_command = ScrollCommand(
         view: view,
+        token: command_token,
         request_token: request_token,
         kind: restore_after_prefix,
         message_id: view.active_request.message_id,
@@ -150,7 +152,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
 }
 
 rule ManualFollowingExpansionCreatesNoPositionCommand {
-    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
     requires: view.active_request != null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
@@ -163,9 +165,10 @@ rule ManualFollowingExpansionCreatesNoPositionCommand {
 }
 
 rule DeepLinkExpansionCreatesNavigationCommand {
-    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+    when: HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
     requires: view.active_request != null
     requires: request_token = view.active_request.token
+    requires: command_token != ""
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
     requires: view.active_request.intent = deep_link
@@ -173,6 +176,7 @@ rule DeepLinkExpansionCreatesNavigationCommand {
     ensures: view.coverage = complete
     ensures: view.pending_command = ScrollCommand(
         view: view,
+        token: command_token,
         request_token: request_token,
         kind: jump_to_message,
         message_id: view.active_request.message_id,
@@ -182,7 +186,7 @@ rule DeepLinkExpansionCreatesNavigationCommand {
 }
 
 rule MissingDeepLinkTargetTerminatesAttempt {
-    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+    when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, target_present)
     requires: view.active_request != null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation

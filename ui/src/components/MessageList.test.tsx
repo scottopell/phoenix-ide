@@ -4,8 +4,10 @@ import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } f
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
+import type { ListRange } from 'react-virtuoso';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
+import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 
@@ -94,6 +96,7 @@ const virtuosoMock = {
   scrollToIndex: vi.fn(),
   totalListHeightChanged: null as ((height: number) => void) | null,
   atBottomStateChange: null as ((atBottom: boolean) => void) | null,
+  rangeChanged: null as ((range: ListRange) => void) | null,
   renderedIndices: null as Set<number> | null,
 };
 
@@ -101,6 +104,7 @@ beforeEach(() => {
   virtuosoMock.scrollToIndex = vi.fn();
   virtuosoMock.totalListHeightChanged = null;
   virtuosoMock.atBottomStateChange = null;
+  virtuosoMock.rangeChanged = null;
   virtuosoMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
@@ -116,6 +120,7 @@ vi.mock('react-virtuoso', () => ({
     scrollerRef,
     totalListHeightChanged,
     atBottomStateChange,
+    rangeChanged,
   }: {
     data: T[];
     context?: C;
@@ -126,6 +131,7 @@ vi.mock('react-virtuoso', () => ({
     scrollerRef?: (ref: HTMLElement | Window | null) => void;
     totalListHeightChanged?: (height: number) => void;
     atBottomStateChange?: (atBottom: boolean) => void;
+    rangeChanged?: (range: ListRange) => void;
   }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
     const Header = components?.Header;
     const containerRef = useRef<HTMLDivElement>(null);
@@ -134,6 +140,9 @@ vi.mock('react-virtuoso', () => ({
     }
     if (atBottomStateChange) {
       virtuosoMock.atBottomStateChange = atBottomStateChange;
+    }
+    if (rangeChanged) {
+      virtuosoMock.rangeChanged = rangeChanged;
     }
     useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoMock.scrollToIndex }), []);
     useLayoutEffect(() => {
@@ -174,6 +183,17 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
 const appCss = readFileSync(`${process.cwd()}/src/index.css`, 'utf8');
 
 const idleState: ConversationState = { type: 'idle' };
+
+function makeRestoreAfterPrefixExpansionCommand(overrides: Partial<Extract<HistoryScrollCommand, { kind: 'restore_after_prefix_expansion' }>> = {}): Extract<HistoryScrollCommand, { kind: 'restore_after_prefix_expansion' }> {
+  return {
+    kind: 'restore_after_prefix_expansion',
+    token: 1,
+    requestToken: 11,
+    view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 },
+    anchorMessageId: 'msg-2',
+    ...overrides,
+  };
+}
 
 describe('latest assistant expansion in compact mode', () => {
   it('shows the latest finalized assistant text fully in compact mode', () => {
@@ -818,6 +838,278 @@ describe('MessageList', () => {
     expect(container.querySelector('.system-prompt-content')).toHaveTextContent(
       'SENTINEL SYSTEM PROMPT',
     );
+  });
+});
+
+describe('history scroll acknowledgement + continuity suppression', () => {
+  it('acknowledges restore commands exactly once after a delayed multi-frame range reveal', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+
+    render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+          onVisibleRangeChange={onVisibleRangeChange}
+        />,
+      ),
+    );
+
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledWith({ index: 1, align: 'start', behavior: 'auto' });
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 1 }));
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
+    expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it('acknowledges restore commands immediately and exactly once when the target is already visible', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+    const renderList = (historyScrollCommand?: HistoryScrollCommand) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={historyScrollCommand}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        onVisibleRangeChange={onVisibleRangeChange}
+      />,
+    );
+
+    const { rerender } = render(renderList());
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
+
+    rerender(renderList(makeRestoreAfterPrefixExpansionCommand()));
+
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledWith({ index: 1, align: 'start', behavior: 'auto' });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it('suppresses continuity until user input releases it before machine interaction dispatch', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+          onVisibleRangeChange={onVisibleRangeChange}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+    fireEvent.wheel(scroller, { deltaY: 10 });
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('range acknowledgement releases suppression for subsequent continuity handling', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+          onVisibleRangeChange={onVisibleRangeChange}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases suppression on bounded timeout without acknowledging', () => {
+    vi.useFakeTimers();
+    try {
+      const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+      const onHistoryScrollCommandHandled = vi.fn();
+      const onVisibleRangeChange = vi.fn();
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={messages}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-history"
+            historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+            onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+            onVisibleRangeChange={onVisibleRangeChange}
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      fireEvent.scroll(scroller);
+      expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+      act(() => vi.advanceTimersByTime(1600));
+      expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+
+      fireEvent.scroll(scroller);
+      expect(onVisibleRangeChange).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears suppressed continuity when a newer restore command supersedes the old one', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+    const renderList = (historyScrollCommand: HistoryScrollCommand) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={historyScrollCommand}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        onVisibleRangeChange={onVisibleRangeChange}
+      />,
+    );
+
+    const { container, rerender } = render(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 1, anchorMessageId: 'msg-2' })));
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+    rerender(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 2, anchorMessageId: 'msg-3' })));
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+    act(() => virtuosoMock.rangeChanged?.({ startIndex: 2, endIndex: 2 }));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied');
+    expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 2, align: 'start', behavior: 'auto' });
+  });
+
+  it('clears suppressed continuity on conversation change', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const onVisibleRangeChange = vi.fn();
+    const renderList = (conversationId: string, token: number) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId={conversationId}
+        historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        onVisibleRangeChange={onVisibleRangeChange}
+      />,
+    );
+
+    const { container, rerender } = render(renderList('conv-history-a', 1));
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+    rerender(renderList('conv-history-b', 2));
+    fireEvent.scroll(scroller);
+    expect(onVisibleRangeChange).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+  });
+
+  it('clears suppressed continuity on unmount', () => {
+    vi.useFakeTimers();
+    try {
+      const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+      const onHistoryScrollCommandHandled = vi.fn();
+      const onVisibleRangeChange = vi.fn();
+      const { container, unmount } = render(
+        withConvContext(
+          <MessageList
+            messages={messages}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-history"
+            historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+            onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+            onVisibleRangeChange={onVisibleRangeChange}
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      fireEvent.scroll(scroller);
+      expect(onVisibleRangeChange).not.toHaveBeenCalled();
+
+      unmount();
+      act(() => vi.advanceTimersByTime(1600));
+      expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
