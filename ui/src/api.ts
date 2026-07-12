@@ -366,7 +366,12 @@ export interface PrStatusResponse {
   feedback_status?: PrFeedbackStatus;
   feedback_coverage?: PrFeedbackCoverageHealth;
   work_change: WorkChangeSummary;
+  /** Backend flattens AssociatedPrStatusEnvelope into top-level fields on /pr-status.
+   *  `selection` remains optional here as a compatibility shim for seeded/tests. */
   selection?: AssociatedPrStatusEnvelope;
+  associated_prs?: AssociatedPrSummaryResponse[];
+  active_pr?: ActivePrSelectionResponse;
+  latest_observed_branch?: ObservedBranchSummaryResponse;
 }
 
 export interface Project {

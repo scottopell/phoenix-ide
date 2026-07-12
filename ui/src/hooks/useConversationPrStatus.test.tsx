@@ -51,7 +51,9 @@ function Probe({ conversationId, cached }: { conversationId: string; cached?: Ca
   const number = handle.state.status === 'ready' ? handle.state.prStatus.number : 'none';
   const title = handle.state.status === 'ready' ? handle.state.prStatus.title : 'none';
   const refreshState = handle.state.status === 'ready' ? handle.state.prStatus.refresh.state : 'none';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span></div>;
+  const associatedCount = handle.activeSelection?.associated_prs.length ?? 0;
+  const activePrNumber = handle.activePrSummary?.pr_number ?? 'none';
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span></div>;
 }
 
 describe('useConversationPrStatus', () => {
@@ -184,6 +186,51 @@ describe('useConversationPrStatus', () => {
 
     expect(screen.getByTestId('pr-number')).toHaveTextContent('12');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 12');
+  });
+
+  it('reads flattened selection fields from the PR status response', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValue({
+      found: true,
+      number: 12,
+      title: 'Flattened PR 12',
+      display_state: 'open',
+      refresh: {
+        state: 'fresh',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        last_refreshed_at: '2026-01-01T00:00:00Z',
+        stale: false,
+      },
+      work_change: { kind: 'clean' },
+      associated_prs: [{
+        repo_owner: 'o',
+        repo_name: 'r',
+        pr_number: 12,
+        title: 'Flattened PR 12',
+        url: 'https://github.com/o/r/pull/12',
+        state: 'OPEN',
+        draft: false,
+        display_state: 'open',
+        base: 'main',
+        head: 'branch-conv-12',
+        feedback_status: 'open',
+      }],
+      active_pr: {
+        pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 },
+        provenance: 'inferred',
+      },
+      latest_observed_branch: {
+        repository_identity: 'o/r',
+        branch_name: 'branch-conv-12',
+      },
+    } satisfies PrStatusResponse);
+
+    render(<Probe conversationId="conv-12" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('associated-count')).toHaveTextContent('1');
+      expect(screen.getByTestId('active-pr-number')).toHaveTextContent('12');
+    });
   });
 
   it('keeps the cached PR link when the fresh status request fails', async () => {

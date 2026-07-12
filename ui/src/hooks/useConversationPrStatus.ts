@@ -89,6 +89,20 @@ function samePrIdentity(
     && activePr?.pr.pr_number === pr.pr_number;
 }
 
+function selectionFromPrStatus(prStatus: PrStatusResponse): AssociatedPrStatusEnvelope | null {
+  if (prStatus.selection) return prStatus.selection;
+  if (prStatus.associated_prs) {
+    return {
+      associated_prs: prStatus.associated_prs,
+      ...(prStatus.active_pr ? { active_pr: prStatus.active_pr } : {}),
+      ...(prStatus.latest_observed_branch
+        ? { latest_observed_branch: prStatus.latest_observed_branch }
+        : {}),
+    };
+  }
+  return null;
+}
+
 function selectionForCachedPr(cachedPr: CachedPrSummary | null | undefined): AssociatedPrStatusEnvelope | null {
   if (!cachedPr) return null;
   return {
@@ -275,7 +289,7 @@ export function useConversationPrStatus({
 
   const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
   const activeSelection = publicState.status === 'ready'
-    ? (publicState.prStatus.selection ?? cachedSelection)
+    ? (selectionFromPrStatus(publicState.prStatus) ?? cachedSelection)
     : cachedSelection;
 
   const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {

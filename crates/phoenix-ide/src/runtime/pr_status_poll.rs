@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,12 +160,8 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
         let repository_identity =
             phoenix_core::git::detect_git_repo_root(Path::new(&worktree_path))
                 .and_then(|root| github_repo_identifier(Path::new(&root)));
-        let mut branches = BTreeSet::new();
-        if let Some(candidate) = candidate_for_conv_branch(&conv).and_then(|candidate| {
-            filter_candidate_for_repo(repository_identity.as_deref(), candidate)
-        }) {
-            branches.insert(candidate);
-        }
+        let mut branches = Vec::new();
+        let mut seen_branches = HashSet::new();
         for observed in db
             .list_work_scope_observed_branches(&work_scope)
             .await
@@ -178,14 +174,23 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
                     branch_name: observed.branch_name,
                 },
             ) {
-                branches.insert(candidate);
+                if seen_branches.insert(candidate.clone()) {
+                    branches.push(candidate);
+                }
+            }
+        }
+        if let Some(candidate) = candidate_for_conv_branch(&conv).and_then(|candidate| {
+            filter_candidate_for_repo(repository_identity.as_deref(), candidate)
+        }) {
+            if seen_branches.insert(candidate.clone()) {
+                branches.push(candidate);
             }
         }
         targets.push(PollTarget {
             work_scope,
             worktree_path: PathBuf::from(worktree_path),
             repository_identity,
-            candidate_branches: branches.into_iter().collect(),
+            candidate_branches: branches,
         });
     }
 
@@ -204,8 +209,9 @@ async fn poll_target(manager: &Arc<RuntimeManager>, target: PollTarget) {
         candidate_branches
             .into_iter()
             .map(|candidate| {
-                let refresh = crate::api::pr_monitoring::get_pr_status_for_branch(
+                let refresh = crate::api::pr_monitoring::get_pr_status_for_repo_branch(
                     &worktree_path,
+                    &candidate.repository_identity,
                     &candidate.branch_name,
                 );
                 (candidate, refresh)

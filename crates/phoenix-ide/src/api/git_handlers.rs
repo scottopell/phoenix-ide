@@ -135,6 +135,19 @@ fn selection_envelope_for_scope_from_snapshot(
     }
 }
 
+fn response_identity_matches_association(
+    response: &PrStatusResponse,
+    observations: &[crate::db::WorkScopePrObservation],
+    association: &crate::db::WorkScopePrAssociation,
+) -> bool {
+    response.number == Some(association.pr_number)
+        && observations.iter().any(|pr| {
+            pr.repo_owner == association.repo_owner
+                && pr.repo_name == association.repo_name
+                && pr.pr_number == association.pr_number
+        })
+}
+
 async fn active_selection_target_for_scope(
     db: &crate::db::Database,
     work_scope: &crate::work_scope::WorkScope,
@@ -613,20 +626,6 @@ pub(crate) fn summarize_work_change(
         base_branch: base_branch.to_string(),
     }
 }
-fn stale_primary_response_with_work_change(
-    primary: &crate::db::WorkScopePrAssociation,
-    refresh: crate::api::pr_monitoring::PrStatusRefresh,
-) -> PrStatusResponse {
-    let mut response = crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
-        primary,
-        refresh.response.refresh.state,
-        refresh.response.refresh.reason.clone(),
-        refresh.response.refresh.last_attempted_at,
-    );
-    response.work_change = refresh.response.work_change;
-    response
-}
-
 async fn pr_status_response_for_missing_worktree(
     state: &AppState,
     work_scope: &crate::work_scope::WorkScope,
@@ -789,15 +788,15 @@ pub(crate) async fn get_conversation_pr_status(
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    let associated_snapshot = db
+    let mut associated_snapshot = db
         .list_work_scope_pr_associations(&work_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let active_snapshot = db
+    let mut active_snapshot = db
         .active_work_scope_pr_selection(&work_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let observed_snapshot = db
+    let mut observed_snapshot = db
         .list_work_scope_observed_branches(&work_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -816,9 +815,15 @@ pub(crate) async fn get_conversation_pr_status(
         });
 
     let mut response = if let Some(active_pr) = selection {
-        if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
-            stale_primary_response_with_work_change(&active_pr, refresh)
-        } else if refresh.response.number != Some(active_pr.pr_number) {
+        let needs_direct_active_refresh = refresh.response.refresh.state
+            != crate::api::types::PrRefreshState::Fresh
+            || refresh.response.refresh.stale
+            || !response_identity_matches_association(
+                &refresh.response,
+                &refresh.observations,
+                &active_pr,
+            );
+        if needs_direct_active_refresh {
             let active_refresh = tokio::task::spawn_blocking({
                 let cwd = cwd.clone();
                 let repo_owner = active_pr.repo_owner.clone();
@@ -839,19 +844,64 @@ pub(crate) async fn get_conversation_pr_status(
                 db.upsert_work_scope_pr_observations(&work_scope, &active_refresh.observations)
                     .await
                     .map_err(|e| AppError::Internal(e.to_string()))?;
+                observed_snapshot = db
+                    .list_work_scope_observed_branches(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let latest_branch = observed_snapshot.first().map(|branch| {
+                    phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                        repository_identity: branch.repository_identity.clone(),
+                        branch_name: branch.branch_name.clone(),
+                    }
+                });
+                db.derive_active_work_scope_pr_selection(
+                    &work_scope,
+                    &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                        latest_observed_branch: latest_branch,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+                associated_snapshot = db
+                    .list_work_scope_pr_associations(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                active_snapshot = db
+                    .active_work_scope_pr_selection(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                observed_snapshot = db
+                    .list_work_scope_observed_branches(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
             }
+            let refreshed_active_pr = active_snapshot
+                .clone()
+                .and_then(|state| state.selection)
+                .and_then(|selection| {
+                    associated_snapshot
+                        .iter()
+                        .find(|pr| {
+                            pr.repo_owner == selection.pr.repo_owner
+                                && pr.repo_name == selection.pr.repo_name
+                                && pr.pr_number == selection.pr.pr_number
+                        })
+                        .cloned()
+                })
+                .unwrap_or(active_pr);
             if active_refresh.response.refresh.state == crate::api::types::PrRefreshState::Fresh {
                 attach_pr_feedback_freshness(
                     active_refresh.response,
                     &db,
                     &work_scope,
                     &cwd,
-                    &active_pr,
+                    &refreshed_active_pr,
                 )
                 .await?
             } else {
                 crate::api::pr_monitoring::persisted_primary_response(
-                    &active_pr,
+                    &refreshed_active_pr,
                     active_refresh.response.refresh,
                     true,
                 )

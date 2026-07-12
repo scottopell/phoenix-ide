@@ -222,25 +222,8 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
         }
     }
 
-    if let Some(head_oid) = git_capture(path, &["rev-parse", "HEAD^{commit}"]) {
-        if !head_oid.is_empty() {
-            return LocalGitHeadObservation::Detached {
-                repository_identity,
-                head_oid,
-            };
-        }
-    }
-
-    let branch_name = git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|name| !name.is_empty() && name != "HEAD")
-        .or(known_unborn_branch_name);
-    let head_exists = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .is_some_and(|output| output.status.success());
-    if !head_exists {
+    let branch_name = known_unborn_branch_name;
+    if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
         return LocalGitHeadObservation::Unborn {
             repository_identity,
             branch_name,

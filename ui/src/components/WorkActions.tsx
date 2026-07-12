@@ -230,14 +230,16 @@ export function WorkControlBar({
               <CoverageMarker marker={coverageMarker} />
             </button>
           )}
-          {(disposition.resolve.kind === 'merge_pr' ||
-            disposition.resolve.kind === 'open_pr' ||
-            disposition.resolve.kind === 'create_pr') && (
-            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-          )}
+          {!prStatusHandle.ambiguous &&
+            (disposition.resolve.kind === 'merge_pr' ||
+              disposition.resolve.kind === 'open_pr' ||
+              disposition.resolve.kind === 'create_pr') && (
+              <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+            )}
           {/* Non-glowing secondary link-out beside the Address-feedback primary
               (e.g. Merge on a passing PR). REQ-WAB-003: never a second primary. */}
-          {disposition.secondaryResolve &&
+          {!prStatusHandle.ambiguous &&
+            disposition.secondaryResolve &&
             (disposition.secondaryResolve.kind === 'merge_pr' ||
               disposition.secondaryResolve.kind === 'open_pr') && (
               <ResolveLink

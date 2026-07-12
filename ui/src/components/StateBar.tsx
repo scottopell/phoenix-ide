@@ -321,10 +321,10 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
 
   useEffect(() => {
     const intent: ActivePrSelectorIntent = {
+      owner: Symbol('active-pr-selector-intent'),
       requestOpen: () => openMenu(0, document.activeElement instanceof HTMLElement ? document.activeElement : null),
     };
-    setActivePrSelectorIntent(intent);
-    return () => setActivePrSelectorIntent(null);
+    return setActivePrSelectorIntent(intent);
   }, [openMenu]);
 
   if (actionablePrs.length === 0 && !activePr && !ambiguous) return null;
@@ -436,7 +436,9 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
             <div className="active-pr-selector-auto-summary" data-testid="active-pr-auto-summary">{autoSummary}</div>
           )}
           {actionablePrs.map((pr, index) => {
-            const isActive = activePr?.pr_number === pr.pr_number;
+            const isActive = activePr?.repo_owner === pr.repo_owner
+              && activePr.repo_name === pr.repo_name
+              && activePr.pr_number === pr.pr_number;
             return (
               <button
                 key={`${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`}

@@ -203,7 +203,9 @@ function makePrStatusHandle(prStatus: PrStatusResponse, selection: ReturnType<ty
     refresh: vi.fn().mockResolvedValue(undefined),
     activeSelection: selection,
     activePrSummary: selection?.active_pr
-      ? selection.associated_prs.find((pr) => pr.pr_number === selection.active_pr?.pr.pr_number) ?? null
+      ? selection.associated_prs.find((pr) => pr.repo_owner === selection.active_pr?.pr.repo_owner
+        && pr.repo_name === selection.active_pr?.pr.repo_name
+        && pr.pr_number === selection.active_pr?.pr.pr_number) ?? null
       : null,
     ambiguous: !!selection && !selection.active_pr && selection.associated_prs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft').length > 1,
     pinActivePr: vi.fn().mockResolvedValue(undefined),
@@ -332,6 +334,36 @@ describe('StateBar PR badge', () => {
     fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
     fireEvent.click(screen.getByTestId('active-pr-resume-inference'));
     await waitFor(() => expect(handle.resumeInference).toHaveBeenCalled());
+  });
+
+  it('marks only the fully matching repo/number row as active', async () => {
+    const selection = makeSelection({
+      associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Main repo PR', url: 'https://github.com/scottopell/phoenix-ide/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'a', feedback_status: 'open' },
+        { repo_owner: 'fork', repo_name: 'r', pr_number: 12, title: 'Fork PR', url: 'https://github.com/fork/r/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'b', feedback_status: 'open' },
+      ],
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 }, provenance: 'pinned' },
+    });
+    const handle = makePrStatusHandle(mockPrStatus({ found: true, number: 12, url: 'https://github.com/scottopell/phoenix-ide/pull/12', display_state: 'open' }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    expect(screen.getByText('Main repo PR').closest('[role="menuitemradio"]')).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByText('Fork PR').closest('[role="menuitemradio"]')).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getAllByText('Active')).toHaveLength(1);
   });
 
   it('shows ambiguity explicitly and does not render an unrelated PR badge', async () => {

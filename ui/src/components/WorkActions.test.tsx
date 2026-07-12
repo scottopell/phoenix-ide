@@ -99,7 +99,9 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     refresh: vi.fn().mockResolvedValue(undefined),
     activeSelection: selectionValue,
     activePrSummary: selectionValue?.active_pr
-      ? associated.find((pr) => pr.pr_number === selectionValue.active_pr?.pr.pr_number) ?? null
+      ? associated.find((pr) => pr.repo_owner === selectionValue.active_pr?.pr.repo_owner
+        && pr.repo_name === selectionValue.active_pr?.pr.repo_name
+        && pr.pr_number === selectionValue.active_pr?.pr.pr_number) ?? null
       : null,
     ambiguous: !!selectionValue && !selectionValue.active_pr && associated.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft').length > 1,
     pinActivePr: vi.fn().mockResolvedValue(undefined),
@@ -720,6 +722,41 @@ describe('WorkControlBar — active PR interactions', () => {
 
     expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #12 feedback');
     expect(screen.getByTestId('address-feedback-button')).toHaveAttribute('aria-label', expect.stringContaining('Address PR #12 feedback'));
+  });
+
+  it('gates PR-specific resolve link-outs when the active selection is ambiguous', () => {
+    const ambiguousHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://gh/pr/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: selection({
+        associated_prs: [
+          { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123', feedback_status: 'open' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+        ],
+      }),
+    }, {
+      activeSelection: selection({
+        associated_prs: [
+          { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123', feedback_status: 'open' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+        ],
+      }),
+      activePrSummary: null,
+      ambiguous: true,
+    });
+    delete ambiguousHandle.activeSelection.active_pr;
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={ambiguousHandle} />,
+    );
+
+    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('open-pr-link')).not.toBeInTheDocument();
+    expect(screen.getByTestId('active-pr-ambiguity-note')).toBeInTheDocument();
   });
 
   it('gates active PR diff behind ambiguity and otherwise uses PR-specific comparator context', () => {

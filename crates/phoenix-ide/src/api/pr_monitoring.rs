@@ -73,6 +73,11 @@ struct GhFailure {
 
 trait GhClient {
     fn pr_list_for_head(&self, branch: &str) -> Result<Vec<GhPrListItem>, GhFailure>;
+    fn pr_list_for_head_in_repo(
+        &self,
+        repository_identity: &str,
+        branch: &str,
+    ) -> Result<Vec<GhPrListItem>, GhFailure>;
     fn pr_view(&self, target: &GhPrTarget) -> Result<GhPrListItem, GhFailure>;
     fn pr_checks(&self, target: &GhPrTarget) -> Result<Vec<GhPrCheck>, GhFailure>;
     fn repo_view(&self) -> Result<GhRepoView, GhFailure>;
@@ -229,6 +234,30 @@ impl GhClient for ShellGhClient<'_> {
                 "number,title,url,state,isDraft,baseRefName,headRefName,updatedAt",
             ],
             "PR list",
+        )
+    }
+
+    fn pr_list_for_head_in_repo(
+        &self,
+        repository_identity: &str,
+        branch: &str,
+    ) -> Result<Vec<GhPrListItem>, GhFailure> {
+        self.run_json(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                repository_identity,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "20",
+                "--json",
+                "number,title,url,state,isDraft,baseRefName,headRefName,updatedAt",
+            ],
+            "repository-qualified PR list",
         )
     }
 
@@ -567,6 +596,51 @@ pub(crate) fn get_pr_status_for_branch(cwd: &Path, branch_name: &str) -> PrStatu
     }
     get_pr_status_with_client(&ShellGhClient::new(cwd), branch_name)
 }
+pub(crate) fn get_pr_status_for_repo_branch(
+    cwd: &Path,
+    repository_identity: &str,
+    branch_name: &str,
+) -> PrStatusRefresh {
+    get_pr_status_for_repo_branch_with_client(
+        &ShellGhClient::new(cwd),
+        repository_identity,
+        branch_name,
+    )
+}
+
+fn get_pr_status_for_repo_branch_with_client(
+    client: &dyn GhClient,
+    repository_identity: &str,
+    branch_name: &str,
+) -> PrStatusRefresh {
+    let attempted_at = Utc::now().to_rfc3339();
+    let prs = match client.pr_list_for_head_in_repo(repository_identity, branch_name) {
+        Ok(prs) => prs,
+        Err(error) => {
+            return PrStatusRefresh {
+                response: unavailable_at(error.kind.unavailable_reason(), attempted_at),
+                observations: Vec::new(),
+            };
+        }
+    };
+    status_refresh_from_prs(
+        client,
+        prs,
+        &GhRepoView {
+            owner: GhRepoOwner {
+                login: repository_identity
+                    .split_once('/')
+                    .map_or("", |(owner, _)| owner)
+                    .to_string(),
+            },
+            name: repository_identity
+                .split_once('/')
+                .map_or("", |(_, repo)| repo)
+                .to_string(),
+        },
+        attempted_at,
+    )
+}
 
 pub(crate) fn get_pr_status_for_branch_with_deadline(
     cwd: &Path,
@@ -631,13 +705,56 @@ fn get_pr_status_for_target_with_client(
     } else {
         unknown_checks()
     };
-    let observations = match client.repo_view() {
-        Ok(repo) => vec![gh_pr_to_observation(&repo, pr.clone())],
-        Err(e) => {
-            tracing::debug!(repo = %target.repo_arg(), error = %e.message, "gh repo view failed; PR status will not persist observations");
-            Vec::new()
-        }
+    let observations = vec![WorkScopePrObservation {
+        repo_owner: target.repo_owner.clone(),
+        repo_name: target.repo_name.clone(),
+        pr_number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        state: pr.state.clone(),
+        draft: pr.is_draft,
+        display_state,
+        base: pr.base_ref_name.clone(),
+        head: pr.head_ref_name.clone(),
+        github_updated_at: pr.updated_at.clone(),
+    }];
+    PrStatusRefresh {
+        response: fresh_response(gh_pr_to_identity(&pr), checks, attempted_at),
+        observations,
+    }
+}
+
+fn status_refresh_from_prs(
+    client: &dyn GhClient,
+    prs: Vec<GhPrListItem>,
+    repo: &GhRepoView,
+    attempted_at: String,
+) -> PrStatusRefresh {
+    let Some(pr) = choose_pr(prs.clone()) else {
+        return PrStatusRefresh {
+            response: not_found_at(attempted_at),
+            observations: Vec::new(),
+        };
     };
+    let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
+    let checks = if matches!(display_state, PrDisplayState::Open) {
+        match client.pr_checks(&gh_pr_target(repo, pr.number)) {
+            Ok(checks) => capture_checks(
+                &checks,
+                capture_log_snippets(client, &gh_pr_target(repo, pr.number), &checks),
+            ),
+            Err(error) => {
+                tracing::debug!(pr = pr.number, error = %error.message, "gh pr checks could not run");
+                unknown_checks()
+            }
+        }
+    } else {
+        unknown_checks()
+    };
+    let observations = prs
+        .into_iter()
+        .map(|pr| gh_pr_to_observation(repo, pr))
+        .collect();
     PrStatusRefresh {
         response: fresh_response(gh_pr_to_identity(&pr), checks, attempted_at),
         observations,
@@ -1145,6 +1262,7 @@ pub(crate) fn stale_response_with_refresh_state(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stale_primary_response_with_refresh_state(
     pr: &WorkScopePrAssociation,
     refresh_state: PrRefreshState,
@@ -2258,6 +2376,14 @@ mod tests {
         fn pr_list_for_head(&self, _: &str) -> Result<Vec<GhPrListItem>, GhFailure> {
             self.prs.clone()
         }
+
+        fn pr_list_for_head_in_repo(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<GhPrListItem>, GhFailure> {
+            self.prs.clone()
+        }
         fn pr_view(&self, target: &GhPrTarget) -> Result<GhPrListItem, GhFailure> {
             self.pr_view_targets
                 .lock()
@@ -2475,6 +2601,28 @@ mod tests {
                 .is_empty(),
             "branch capture should not relabel after a default-repo PR refetch"
         );
+    }
+
+    #[test]
+    fn target_status_persists_observation_under_target_repo_identity() {
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
+            checks: Ok(vec![check("ok", "SUCCESS", "pass")]),
+            repo: Ok(repo_named("cwd-owner", "cwd-repo")),
+            ..FakeGh::default()
+        };
+        let status = get_pr_status_for_target_with_client(
+            &gh,
+            &GhPrTarget {
+                repo_owner: "target-owner".to_string(),
+                repo_name: "target-repo".to_string(),
+                pr_number: 7,
+            },
+        );
+
+        assert_eq!(status.observations.len(), 1);
+        assert_eq!(status.observations[0].repo_owner, "target-owner");
+        assert_eq!(status.observations[0].repo_name, "target-repo");
     }
 
     #[test]
