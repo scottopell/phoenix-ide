@@ -239,12 +239,10 @@ impl WakeRegistrar for DbWakeRegistrar {
         if let Some(outcome) = initial.as_ref() {
             log_resolution(&contract, outcome, false);
         }
-        if initial.is_none() {
-            self.successful_tool_uses
-                .lock()
-                .await
-                .insert(registration.tool_use_id.clone());
-        }
+        self.successful_tool_uses
+            .lock()
+            .await
+            .insert(registration.tool_use_id.clone());
 
         let target = match handle.clone() {
             WakeContractHandle::Bash { handle_id } => WaitUntilTarget::Bash { handle_id },
@@ -450,6 +448,38 @@ pub(crate) async fn reconcile_pending(manager: &Arc<super::RuntimeManager>, star
         );
     }
     for contract in contracts {
+        if startup {
+            if let Some(tool_use_id) = contract.registering_tool_use_id.as_deref() {
+                let receipt_message_id = format!("{tool_use_id}-result");
+                match manager.db().message_exists(&receipt_message_id).await {
+                    Ok(false) => {
+                        match manager
+                            .db()
+                            .suppress_registration_after_tool_cancel(
+                                &contract.id,
+                                &contract.current_conversation_id,
+                            )
+                            .await
+                        {
+                            Ok(WakeRegistrationSuppressionOutcome::CancellationWon) => {
+                                tracing::info!(contract_id = %contract.id, %tool_use_id, "suppressed wake registration whose tool receipt was lost before restart");
+                                continue;
+                            }
+                            Ok(WakeRegistrationSuppressionOutcome::RegistrationWon(_)) => {}
+                            Err(error) => {
+                                tracing::warn!(contract_id = %contract.id, %error, "failed to suppress wake registration with no durable tool receipt");
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        tracing::warn!(contract_id = %contract.id, %error, "failed to verify durable wake registration receipt");
+                        continue;
+                    }
+                }
+            }
+        }
         if let Err(error) = observe_contract(
             manager.db(),
             manager.bash_handles(),
@@ -532,10 +562,34 @@ pub(crate) async fn dispatch_pending(manager: &Arc<super::RuntimeManager>, start
         };
         let message_id = format!("wake-inbox-{}-{}", conversation_id, snapshot.max_inbox_id);
         let content = phoenix_db::MessageContent::User(phoenix_db::UserContent::meta(&text));
+        match manager.db().message_exists(&message_id).await {
+            Ok(true) => {
+                tracing::debug!(%conversation_id, %message_id, "wake resume message already exists");
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%conversation_id, %error, "wake dispatcher could not check deterministic resume message");
+                continue;
+            }
+        }
+        let conversation = match manager.db().get_conversation(&conversation_id).await {
+            Ok(conversation) if !conversation.archived => conversation,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(%conversation_id, %error, "wake dispatcher could not recheck conversation");
+                continue;
+            }
+        };
+        let state = manager
+            .effective_conversation_state(&conversation_id)
+            .await
+            .unwrap_or(conversation.state);
+        if !matches!(state, crate::state_machine::ConvState::Idle) {
+            continue;
+        }
         // A wake message participates in the same total SSE order as every runtime
-        // event. Materialize a runtime on restart so its broadcaster is seeded from
-        // the durable watermark, then hold the canonical range gate across commit
-        // and broadcast.
+        // event. Reserve only after every no-broadcast gate has passed.
         let handle = match manager.get_or_create(&conversation_id).await {
             Ok(handle) => handle,
             Err(error) => {
@@ -546,26 +600,6 @@ pub(crate) async fn dispatch_pending(manager: &Arc<super::RuntimeManager>, start
         let (reserved_range, reserved_seqs) =
             handle.broadcast_tx.reserve_next_persisted_message_range(1);
         let reserved_seq = reserved_seqs[0];
-        let conversation = match manager.db().get_conversation(&conversation_id).await {
-            Ok(conversation) if !conversation.archived => conversation,
-            Ok(_) => {
-                drop(reserved_range);
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(%conversation_id, %error, "wake dispatcher could not recheck conversation");
-                drop(reserved_range);
-                continue;
-            }
-        };
-        let state = manager
-            .effective_conversation_state(&conversation_id)
-            .await
-            .unwrap_or(conversation.state);
-        if !matches!(state, crate::state_machine::ConvState::Idle) {
-            drop(reserved_range);
-            continue;
-        }
         let outcome = manager
             .db()
             .persist_wake_inbox_snapshot_message(
@@ -869,10 +903,10 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert!(matches!(inbox[0].cause, WakeInboxCause::Fired { .. }));
         assert!(
-            !registrar
+            registrar
                 .consume_round(std::iter::once("tool-wait-1".to_string()))
                 .await,
-            "immediate-terminal registration must not create park intent"
+            "immediate-terminal registration must park so its durable observation is consumed before another LLM request"
         );
     }
 

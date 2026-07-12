@@ -337,7 +337,7 @@ rule RegistrationRejectsForeignOrUnstableResource {
 }
 
 rule EvidenceScheduleRecordsReconciliationObservation {
-    when: WakeTerminalEvidenceObserved(adapter, binding, evidence: WakeTerminalEvidence)
+    when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
     requires: binding.observe_effect.status not in {receipted, invalidated}
     requires: evidence_matches_resource(evidence, binding.resource)
     ensures: observable_reconciliation_applied(binding.observe_effect)
@@ -346,7 +346,7 @@ rule EvidenceScheduleRecordsReconciliationObservation {
 }
 
 rule EvidenceBeforeDeadlineWins {
-    when: WakeTerminalEvidenceObserved(adapter, binding, evidence: WakeTerminalEvidence)
+    when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
     requires: evidence_matches_resource(evidence, binding.resource)
     requires: evidence_occurrence_time(evidence) <= binding.expires_at
     requires: terminal_winner(binding) = evidence

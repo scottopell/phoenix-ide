@@ -272,6 +272,16 @@ async fn inspect_target(
             }
         }
         WaitUntilTarget::TmuxWindow { handle_id } => {
+            if !ctx
+                .tmux_registry()
+                .owns_window_run(&ctx.work_scope, handle_id)
+                .await
+            {
+                return Err(error(
+                    "unknown_target",
+                    "tmux window is not owned by tmux_run in this work scope",
+                ));
+            }
             match ctx
                 .tmux_registry()
                 .inspect_window(&ctx.work_scope, handle_id)

@@ -321,6 +321,8 @@ const TMUX_COMMAND_NAMES: &[&str] = &[
 const DESTRUCTIVE_TMUX_COMMANDS: &[&str] =
     &["kill-pane", "kill-server", "kill-session", "kill-window"];
 const DESTRUCTIVE_TMUX_ALIASES: &[&str] = &["killp", "killw"];
+const NESTED_COMMAND_LAUNCHERS: &[&str] = &["if-shell", "confirm-before"];
+const RESPAWN_COMMANDS: &[&str] = &["respawn-pane", "respawn-window"];
 
 fn uniquely_resolved_tmux_command(token: &str) -> Option<&'static str> {
     let mut matches = TMUX_COMMAND_NAMES
@@ -368,19 +370,30 @@ impl<'a> GenericTmuxCommand<'a> {
         })
     }
 
-    fn treats_remaining_argv_as_data(&self) -> bool {
-        // These commands accept free-form trailing strings. Tmux does not reinterpret
-        // their payload as another command merely because it names a command or key.
-        let canonical_name = match self.name {
+    fn canonical_name(&self) -> Option<&'static str> {
+        match self.name {
             "send" => Some("send-keys"),
             "run" => Some("run-shell"),
             "display" => Some("display-message"),
             name => uniquely_resolved_tmux_command(name),
-        };
-        matches!(
-            canonical_name,
-            Some("send-keys" | "run-shell" | "display-message")
-        )
+        }
+    }
+
+    fn separator_is_payload(&self, position: usize) -> bool {
+        match self.canonical_name() {
+            Some("send-keys" | "display-message") => true,
+            Some("run-shell") => {
+                // run-shell consumes one optional command after its options. Once
+                // that payload has been consumed, a standalone separator starts a
+                // new tmux command and must remain fenced.
+                let payload_position = self
+                    .arguments
+                    .iter()
+                    .position(|argument| !argument.starts_with('-'));
+                payload_position.is_some_and(|payload| position <= payload)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -393,16 +406,20 @@ fn validate_generic_args(args: &[String]) -> Result<(), &'static str> {
         return Err("destructive tmux commands are not available through the generic tool; Phoenix-owned window cleanup must use the typed lifecycle path");
     }
 
-    // At the API boundary an argv element containing exactly `;` (or tmux's
-    // escaped spelling `\\;`) is a separator only where the current command's
-    // grammar has finished. Free-form command payloads remain data.
-    if !command.treats_remaining_argv_as_data()
-        && command
-            .arguments
-            .iter()
-            .any(|argument| matches!(argument.as_str(), ";" | "\\;"))
+    let canonical_name = command.canonical_name();
+    if canonical_name.is_some_and(|name| NESTED_COMMAND_LAUNCHERS.contains(&name)) {
+        return Err("tmux command launchers are not available through the generic tool; issue the intended non-destructive command directly");
+    }
+    if canonical_name.is_some_and(|name| RESPAWN_COMMANDS.contains(&name))
+        && command.arguments.iter().any(|argument| argument == "-k")
     {
-        return Err("tmux command sequences are not available through the generic tool; issue one non-destructive command per call");
+        return Err("destructive tmux respawn is not available through the generic tool; Phoenix-owned process cleanup must use the typed lifecycle path");
+    }
+
+    for (position, argument) in command.arguments.iter().enumerate() {
+        if matches!(argument.as_str(), ";" | "\\;") && !command.separator_is_payload(position) {
+            return Err("tmux command sequences are not available through the generic tool; issue one non-destructive command per call");
+        }
     }
 
     Ok(())
@@ -725,6 +742,11 @@ mod tests {
             vec!["kill-window", "-t", "@1"],
             vec!["list-windows", ";", "kill-window", "-t", "@1"],
             vec!["-S", "/tmp/other", "kill-window", "-t", "@1"],
+            vec!["run-shell", "-b", "true", ";", "kill-window", "-t", "@1"],
+            vec!["if-shell", "true", "kill-server"],
+            vec!["confirm-before", "kill-window"],
+            vec!["respawn-pane", "-k", "-t", "%1"],
+            vec!["respawn-window", "-k", "-t", "@1"],
         ] {
             let args = args.into_iter().map(String::from).collect::<Vec<_>>();
             assert!(validate_generic_args(&args).is_err(), "{args:?}");

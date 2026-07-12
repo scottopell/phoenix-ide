@@ -5158,6 +5158,14 @@ impl Database {
                AND NOT EXISTS (
                    SELECT 1 FROM wake_contracts
                    WHERE current_conversation_id = ?1 AND status = 'pending'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM wake_inbox
+                   WHERE conversation_id = ?1 AND auto_resume = 1 AND consumed_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM wake_resume_outbox
+                   WHERE conversation_id = ?1 AND status = 'pending'
                )",
         )
         .bind(conversation_id)
@@ -5177,8 +5185,13 @@ impl Database {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
         }
         let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wake_contracts
-             WHERE current_conversation_id = ?1 AND status = 'pending'",
+            "SELECT
+                 (SELECT COUNT(*) FROM wake_contracts
+                  WHERE current_conversation_id = ?1 AND status = 'pending')
+               + (SELECT COUNT(*) FROM wake_inbox
+                  WHERE conversation_id = ?1 AND auto_resume = 1 AND consumed_at IS NULL)
+               + (SELECT COUNT(*) FROM wake_resume_outbox
+                  WHERE conversation_id = ?1 AND status = 'pending')",
         )
         .bind(conversation_id)
         .fetch_one(&mut *tx)
@@ -5231,13 +5244,19 @@ impl Database {
         }
 
         let mut pending_query = sqlx::QueryBuilder::new(
-            "SELECT current_conversation_id FROM wake_contracts WHERE status = 'pending' AND current_conversation_id IN (",
+            "SELECT conversation_id FROM (
+                 SELECT current_conversation_id AS conversation_id FROM wake_contracts WHERE status = 'pending'
+                 UNION ALL
+                 SELECT conversation_id FROM wake_inbox WHERE auto_resume = 1 AND consumed_at IS NULL
+                 UNION ALL
+                 SELECT conversation_id FROM wake_resume_outbox WHERE status = 'pending'
+             ) WHERE conversation_id IN (",
         );
         let mut separated = pending_query.separated(", ");
         for id in conversation_ids {
             separated.push_bind(id);
         }
-        separated.push_unseparated(") ORDER BY current_conversation_id");
+        separated.push_unseparated(") ORDER BY conversation_id");
         let pending_ids: Vec<String> = pending_query
             .build_query_scalar()
             .fetch_all(&mut *tx)
@@ -5377,12 +5396,20 @@ impl Database {
             "SELECT EXISTS(SELECT 1 FROM wake_contracts WHERE current_conversation_id = ",
         );
         query.push_bind(conversation_id);
-        query.push(" AND status = 'pending' AND registering_tool_use_id IN (");
+        query.push(" AND registering_tool_use_id IN (");
         let mut ids = query.separated(", ");
         for id in tool_use_ids {
             ids.push_bind(id);
         }
-        ids.push_unseparated(") LIMIT 1)");
+        ids.push_unseparated(
+            ") AND (
+            status = 'pending'
+            OR EXISTS (
+                SELECT 1 FROM wake_inbox i
+                WHERE i.contract_id = wake_contracts.id AND i.auto_resume = 1 AND i.consumed_at IS NULL
+            )
+        ) LIMIT 1)",
+        );
         query
             .build_query_scalar()
             .fetch_one(&self.pool)

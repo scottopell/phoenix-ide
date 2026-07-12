@@ -786,6 +786,23 @@ impl TmuxRegistry {
             .cloned()
     }
 
+    /// Returns whether the window belongs to a `tmux_run` launched in this scope.
+    pub async fn owns_window_run(&self, work_scope: &WorkScope, window_id: &str) -> bool {
+        if self
+            .window_starts
+            .read()
+            .await
+            .contains_key(&(work_scope.clone(), window_id.to_string()))
+        {
+            return true;
+        }
+        self.load_durable_evidence(work_scope, window_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Persist terminal evidence using the run's current scope alias.
     ///
     /// # Errors
@@ -885,7 +902,7 @@ impl TmuxRegistry {
             .join(format!("window-{}.json", Self::digest_prefix_hex(&digest)))
     }
 
-    fn durable_record(
+    async fn durable_record(
         &self,
         work_scope: &WorkScope,
         window_id: &str,
@@ -893,12 +910,14 @@ impl TmuxRegistry {
         evidence: &TmuxTerminalEvidence,
         status: DurableEvidenceStatus,
     ) -> DurableTerminalEvidence {
+        let socket_path = if let Some(entry) = self.get_existing(work_scope).await {
+            entry.read().await.socket_path.clone()
+        } else {
+            self.derived_socket_path(work_scope)
+        };
         DurableTerminalEvidence {
             version: TERMINAL_EVIDENCE_VERSION,
-            socket_identity: self
-                .derived_socket_path(work_scope)
-                .to_string_lossy()
-                .into_owned(),
+            socket_identity: socket_path.to_string_lossy().into_owned(),
             generation: generation.to_string(),
             window_id: window_id.to_string(),
             observed_at: evidence.observed_at.into(),
@@ -1000,7 +1019,25 @@ impl TmuxRegistry {
                 reason: "window identity mismatch".to_string(),
             });
         }
-        let current_generation = self.current_generation(work_scope).await;
+        let mut current_generation = self.current_generation(work_scope).await;
+        if current_generation.is_none() && self.binary_available {
+            let recorded_socket = PathBuf::from(&record.socket_identity);
+            if probe(&recorded_socket)
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: recorded_socket.clone(),
+                    source,
+                })?
+                == ProbeResult::Live
+            {
+                let recovered = recover_or_install_generation(&recorded_socket).await?;
+                let (entry, _) = self.get_or_insert(work_scope, recorded_socket).await;
+                let mut server = entry.write().await;
+                server.generation = Some(recovered.clone());
+                server.status = ServerStatus::Live;
+                current_generation = Some(recovered);
+            }
+        }
         if current_generation.as_deref() != Some(&record.generation) {
             self.remove_evidence_file(work_scope, window_id).await?;
             return Ok(None);
@@ -1136,8 +1173,9 @@ impl TmuxRegistry {
             TmuxTerminalStatus::Exited => DurableEvidenceStatus::Exited,
             TmuxTerminalStatus::Killed => DurableEvidenceStatus::Killed,
         };
-        let record =
-            self.durable_record(work_scope, window_id, generation, &evidence, durable_status);
+        let record = self
+            .durable_record(work_scope, window_id, generation, &evidence, durable_status)
+            .await;
         self.write_durable_evidence(work_scope, window_id, &record)
             .await?;
         self.terminal_evidence
@@ -1170,13 +1208,15 @@ impl TmuxRegistry {
                 reason: "kill intent has no current server generation".to_string(),
             }
         })?;
-        let record = self.durable_record(
-            work_scope,
-            window_id,
-            &generation,
-            &evidence,
-            DurableEvidenceStatus::KillPending,
-        );
+        let record = self
+            .durable_record(
+                work_scope,
+                window_id,
+                &generation,
+                &evidence,
+                DurableEvidenceStatus::KillPending,
+            )
+            .await;
         self.write_durable_evidence(work_scope, window_id, &record)
             .await
     }
@@ -1208,7 +1248,9 @@ impl TmuxRegistry {
                     reason: "kill abort has no current server generation".to_string(),
                 }
             })?;
-            let record = self.durable_record(work_scope, window_id, &generation, &evidence, status);
+            let record = self
+                .durable_record(work_scope, window_id, &generation, &evidence, status)
+                .await;
             return self
                 .write_durable_evidence(work_scope, window_id, &record)
                 .await;
@@ -2709,13 +2751,15 @@ mod tests {
             TmuxTerminalStatus::Killed,
             "pending".into(),
         );
-        let stale = registry.durable_record(
-            &scope,
-            "@missing",
-            "different-generation",
-            &evidence,
-            DurableEvidenceStatus::KillPending,
-        );
+        let stale = registry
+            .durable_record(
+                &scope,
+                "@missing",
+                "different-generation",
+                &evidence,
+                DurableEvidenceStatus::KillPending,
+            )
+            .await;
         registry
             .write_durable_evidence(&scope, "@missing", &stale)
             .await

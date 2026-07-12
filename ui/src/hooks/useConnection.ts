@@ -312,13 +312,20 @@ export function useConnection({
 
           on('wake_contract_registered', (e) => {
             // Validate the private edge but keep the durable full snapshot as
-            // the sole UI representation of wake state.
-            parseEvent(
+            // the sole UI representation of wake state. The event still owns a
+            // position in the ordered stream, so consume its sequence explicitly.
+            const res = parseEvent(
               SseWakeContractRegisteredDataSchema,
               e,
               'wake_contract_registered',
               stampedDispatch,
             );
+            if (res.ok) {
+              stampedDispatch({
+                type: 'sse_sequence_consumed',
+                sequenceId: res.data.sequence_id,
+              });
+            }
           });
 
           on('wake_status_update', (e) => {
