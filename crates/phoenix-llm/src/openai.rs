@@ -697,6 +697,40 @@ fn connection_identity(api_key: &str, custom_headers: &[(String, String)]) -> [u
     hash.finalize().into()
 }
 
+fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmError> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    let status = value
+        .get("status")
+        .or_else(|| value.get("status_code"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())?;
+    let error = value.get("error")?;
+    let body = serde_json::json!({ "error": error }).to_string();
+    let mut headers = HeaderMap::new();
+    if let Some(raw_headers) = value.get("headers").and_then(serde_json::Value::as_object) {
+        for (name, raw_value) in raw_headers {
+            let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let value = match raw_value {
+                serde_json::Value::String(value) => value.clone(),
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::Bool(value) => value.to_string(),
+                serde_json::Value::Null
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => continue,
+            };
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    parse_codex_error(status, &headers, &body)
+        .or_else(|| Some(LlmError::from_http_status(status, &body)))
+}
+
 fn parse_codex_rate_limits(value: &serde_json::Value) -> Option<QuotaDetails> {
     [
         value.get("rate_limits"),
@@ -823,7 +857,7 @@ async fn complete_codex_websocket(
         })?;
     let headers = upgrade.headers_mut();
     headers.insert(
-        "Authorization",
+        "authorization",
         format!("Bearer {api_key}").parse().map_err(|e| {
             CodexWsError::backend(LlmError::invalid_request(format!(
                 "authorization header: {e}"
@@ -831,7 +865,7 @@ async fn complete_codex_websocket(
         })?,
     );
     headers.insert(
-        "OpenAI-Beta",
+        "openai-beta",
         "responses_websockets=2026-02-06"
             .parse()
             .expect("static header"),
@@ -878,12 +912,13 @@ async fn complete_codex_websocket(
             session.socket = Some(socket);
         }
         let socket = session.socket.as_mut().expect("socket initialized");
-        socket
-            .send(tungstenite::Message::Text(envelope.to_string().into()))
-            .await
-            .map_err(|e| {
-                CodexWsError::fallback(LlmError::network(format!("WebSocket send: {e}")))
-            })?;
+        tokio::time::timeout(
+            CODEX_WS_FRAME_TIMEOUT,
+            socket.send(tungstenite::Message::Text(envelope.to_string().into())),
+        )
+        .await
+        .map_err(|_| CodexWsError::fallback(LlmError::network("WebSocket send timeout")))?
+        .map_err(|e| CodexWsError::fallback(LlmError::network(format!("WebSocket send: {e}"))))?;
         let mut acc = ResponsesStreamAccumulator::new();
         let mut response_id = None;
         let mut server_output = Vec::new();
@@ -916,6 +951,9 @@ async fn complete_codex_websocket(
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            if let Some(error) = parse_wrapped_codex_websocket_error(&value) {
+                return Err(CodexWsError::backend(error));
+            }
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
                     let _ = chunk_tx
@@ -2128,6 +2166,47 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
+    }
+
+    #[test]
+    fn wrapped_websocket_usage_limit_preserves_quota_headers() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "pro",
+                "resets_at": 1_738_888_888
+            },
+            "headers": {
+                "x-codex-primary-used-percent": "100.0",
+                "x-codex-primary-window-minutes": 15
+            }
+        }))
+        .expect("wrapped error maps");
+        assert_eq!(error.kind, crate::LlmErrorKind::UsageLimitReached);
+        let quota = error.quota.expect("quota details");
+        assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(100.0));
+        assert_eq!(
+            quota.primary.as_ref().and_then(|w| w.window_minutes),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn wrapped_websocket_status_code_alias_maps_invalid_request() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "status_code": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": "unsupported input"
+            }
+        }))
+        .expect("wrapped error maps");
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
     }
 
     #[tokio::test]
