@@ -19,6 +19,7 @@ import {
   buildDiffSearchProjection,
   useViewerFind,
   useViewerFindKeyboardShortcut,
+  type DiffSearchMatchTarget,
 } from '../viewer-find';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
@@ -119,7 +120,7 @@ export function DiffView({
     [highlight, closePanel],
   );
 
-  const navigateFindTarget = useCallback((target: (typeof findProjection.matches)[number]['target']) => {
+  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
     if (target.kind === 'commit-log-line') {
       document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
       return;
