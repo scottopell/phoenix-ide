@@ -30,6 +30,8 @@ pub enum PlanError {
 pub enum EngineError {
     #[error("plan validation failed: {0:?}")]
     InvalidPlan(PlanError),
+    #[error("protocol selection is not accepting new workflows")]
+    ProtocolNotAccepting,
     #[error("workflow binding is shadow-only and cannot execute")]
     ShadowCannotExecute,
     #[error("validated plan omitted barrier event for barrier {0:?}")]

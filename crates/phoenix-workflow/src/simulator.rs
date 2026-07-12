@@ -34,6 +34,7 @@ pub enum SimOp<P: WorkflowProfile> {
         retry_at: Timestamp,
     },
     AdvanceTime(Timestamp),
+    Restart,
     CrashWorker {
         worker_id: &'static str,
     },
@@ -107,6 +108,10 @@ impl<P: WorkflowProfile> Simulator<P> {
             SimOp::AdvanceTime(now) => {
                 self.now = now;
                 self.workflow.refresh_eligibility(now);
+            }
+            SimOp::Restart => {
+                self.workflow.crashed_workers.clear();
+                self.workflow.refresh_eligibility(self.now);
             }
             SimOp::CrashWorker { worker_id } => {
                 self.workflow.crashed_workers.insert(worker_id);

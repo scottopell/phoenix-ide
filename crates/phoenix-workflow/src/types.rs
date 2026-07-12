@@ -329,6 +329,8 @@ pub trait WorkflowProfile {
     type ReceiptReducerEvent: Clone + Eq + std::fmt::Debug;
     type BarrierEvent: Clone + Eq + std::fmt::Debug;
     type ManualPayload: Clone + Eq + std::fmt::Debug;
+
+    fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

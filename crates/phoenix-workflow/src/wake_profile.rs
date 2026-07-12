@@ -217,6 +217,7 @@ pub struct WakeRegistrationSnapshot {
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
     pub registration_fence_version: Version,
+    pub runtime_availability: RuntimeAvailability,
     pub continuation: Option<WakeContinuationTransfer>,
     pub terminal: Option<WakeTerminalPayload>,
     pub cancelled: bool,
@@ -321,6 +322,20 @@ impl WorkflowProfile for WakeProfile {
     type ReceiptReducerEvent = WakeTerminalPayload;
     type BarrierEvent = WakeBarrierEvent;
     type ManualPayload = WakeManualPayload;
+
+    fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
+        matches!(
+            (&snapshot.runtime_availability, &snapshot.terminal),
+            (
+                RuntimeAvailability::Idle,
+                Some(
+                    WakeTerminalPayload::Fired { .. }
+                        | WakeTerminalPayload::Expired { .. }
+                        | WakeTerminalPayload::Forgotten { .. }
+                )
+            )
+        )
+    }
 }
 
 #[must_use]
@@ -401,6 +416,7 @@ pub fn registration_snapshot(
         registered_at: intent.registered_at,
         expires_at: intent.expires_at,
         registration_fence_version: fence_version,
+        runtime_availability: RuntimeAvailability::Busy,
         continuation: None,
         terminal: None,
         cancelled: false,
@@ -685,13 +701,16 @@ pub fn shadow_comparison(kind: WakeShadowComparisonKind) -> WakeShadowComparison
 #[must_use]
 pub fn acceptance_owed_decl(
     inbox_id: ReducerInboxId,
-    receipt: WakeRegistrationReceipt,
-) -> OwedAcceptanceDecl<WakeBarrierEvent> {
-    OwedAcceptanceDecl {
-        reducer_inbox_id: inbox_id,
-        source_kind: REGISTRATION_BARRIER_KIND,
-        event: WakeBarrierEvent::RegistrationObserved { receipt },
+    terminal: &WakeTerminalPayload,
+) -> Option<OwedAcceptanceDecl<WakeTerminalPayload>> {
+    if matches!(terminal, WakeTerminalPayload::Cancelled { .. }) {
+        return None;
     }
+    Some(OwedAcceptanceDecl {
+        reducer_inbox_id: inbox_id,
+        source_kind: "wake_terminal_receipt",
+        event: terminal.clone(),
+    })
 }
 
 #[must_use]

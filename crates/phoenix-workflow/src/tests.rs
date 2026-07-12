@@ -16,6 +16,10 @@ impl WorkflowProfile for TestProfile {
     type ReceiptReducerEvent = &'static str;
     type BarrierEvent = &'static str;
     type ManualPayload = &'static str;
+
+    fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
+        *snapshot != "runtime-blocked"
+    }
 }
 
 fn profile() -> ProfileRef {
@@ -104,6 +108,7 @@ fn workflow() -> WorkflowState<TestProfile> {
         codec("snapshot"),
         "initial",
     )
+    .expect("accepting protocol")
 }
 
 #[test]
@@ -136,6 +141,33 @@ fn rejects_dependency_cycles() {
 }
 
 #[test]
+fn closed_protocol_cannot_accept_authoritative_or_shadow_workflows() {
+    let mut closed = protocol();
+    closed.accepting = false;
+    assert_eq!(
+        WorkflowState::<TestProfile>::new_authoritative(
+            WorkflowId(1),
+            &profile(),
+            &closed,
+            codec("snapshot"),
+            "initial",
+        ),
+        Err(EngineError::ProtocolNotAccepting)
+    );
+    assert_eq!(
+        WorkflowState::<TestProfile>::new_shadow(
+            WorkflowId(2),
+            WorkflowId(1),
+            &profile(),
+            &closed,
+            codec("snapshot"),
+            "initial",
+        ),
+        Err(EngineError::ProtocolNotAccepting)
+    );
+}
+
+#[test]
 fn stale_cas_does_not_mutate_state() {
     let mut workflow = workflow();
     let result = workflow
@@ -161,7 +193,8 @@ fn shadow_workflow_cannot_execute_or_claim() {
         &protocol(),
         codec("snapshot"),
         "initial",
-    );
+    )
+    .expect("accepting protocol");
     assert_eq!(
         workflow.commit_transition(
             &ReducerDecision {
@@ -784,7 +817,8 @@ fn shadow_divergence_is_recorded_without_authority() {
         &protocol(),
         codec("snapshot"),
         "initial",
-    );
+    )
+    .expect("accepting protocol");
     workflow.record_shadow_divergence(
         WorkflowId(1),
         ShadowDivergenceKind::Snapshot,
@@ -837,6 +871,50 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
     assert_eq!(
         sim.workflow.effects[&EffectId(1)].status,
         EffectStatus::Eligible
+    );
+}
+
+#[test]
+fn simulator_restart_preserves_durable_claim_and_recovers_worker_runtime() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let mut sim = Simulator::new(workflow);
+    sim.apply(SimOp::Claim {
+        effect_id: EffectId(1),
+        worker_id: "worker-a",
+        lease_until: LeaseExpiry(10),
+    });
+    let durable_claim = sim.workflow.effects[&EffectId(1)]
+        .claim
+        .clone()
+        .expect("claim persisted");
+    sim.apply(SimOp::CrashWorker {
+        worker_id: "worker-a",
+    });
+    assert!(sim.workflow.crashed_workers.contains("worker-a"));
+    sim.apply(SimOp::Restart);
+    assert!(sim.workflow.crashed_workers.is_empty());
+    assert_eq!(
+        sim.workflow.effects[&EffectId(1)].claim.as_ref(),
+        Some(&durable_claim)
+    );
+    assert_eq!(
+        sim.workflow
+            .take_over_expired_claim(EffectId(1), &durable_claim, Timestamp(9)),
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        sim.workflow
+            .take_over_expired_claim(EffectId(1), &durable_claim, Timestamp(10)),
+        AuthorityOutcome::Authorized
     );
 }
 

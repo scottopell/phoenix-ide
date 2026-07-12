@@ -19,15 +19,21 @@ use crate::{
 };
 
 impl<P: WorkflowProfile> WorkflowState<P> {
-    #[must_use]
+    /// Creates an authoritative workflow under an open protocol selection.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::ProtocolNotAccepting`] when admission is closed.
     pub fn new_authoritative(
         workflow_id: WorkflowId,
         profile: &ProfileRef,
         accepted_protocol: &ProtocolSelection,
         snapshot_codec: CodecRef,
         snapshot: P::Snapshot,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, EngineError> {
+        if !accepted_protocol.accepting {
+            return Err(EngineError::ProtocolNotAccepting);
+        }
+        Ok(Self {
             binding: WorkflowBinding::Authoritative(AuthoritativeWorkflow {
                 workflow_id,
                 version: Version(0),
@@ -58,10 +64,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             next_manual_resolution_id: 1,
             next_shadow_divergence_id: 1,
             next_claim_token: 1,
-        }
+        })
     }
 
-    #[must_use]
+    /// Creates a non-authoritative shadow workflow under an open selection.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::ProtocolNotAccepting`] when admission is closed.
     pub fn new_shadow(
         workflow_id: WorkflowId,
         authoritative_workflow_id: WorkflowId,
@@ -69,8 +78,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         accepted_protocol: &ProtocolSelection,
         snapshot_codec: CodecRef,
         snapshot: P::Snapshot,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, EngineError> {
+        if !accepted_protocol.accepting {
+            return Err(EngineError::ProtocolNotAccepting);
+        }
+        Ok(Self {
             binding: WorkflowBinding::Shadow(ShadowWorkflow {
                 workflow_id,
                 authoritative_workflow_id,
@@ -100,7 +112,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             next_manual_resolution_id: 1,
             next_shadow_divergence_id: 1,
             next_claim_token: 1,
-        }
+        })
     }
 
     /// Applies a reducer-approved transition only if the expected workflow version still
@@ -167,6 +179,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         {
             return ineligible_claim();
         }
+        let Ok(ordinal_base) = u32::try_from(effect.attempts.len()) else {
+            return ineligible_claim();
+        };
+        let Some(ordinal) = ordinal_base.checked_add(1) else {
+            return ineligible_claim();
+        };
         let claim_token = self.next_claim_token;
         let Ok(resource_lock) =
             self.lock_grant_for_claim(effect_id, worker_id, claim_token, now, lease_until)
@@ -191,10 +209,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         effect.claim = Some(authority.clone());
         effect.pending_reconciliation = false;
         effect.destructive_lock = resource_lock;
-        let Ok(ordinal_base) = u32::try_from(effect.attempts.len()) else {
-            return ineligible_claim();
-        };
-        let ordinal = ordinal_base.saturating_add(1);
         let attempt = AttemptRecord {
             id: AttemptId(self.next_attempt_id),
             ordinal,
@@ -1096,6 +1110,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             });
         };
         if existing.status != AcceptanceStatus::Owed {
+            return Ok(RuntimeAcceptanceResult {
+                outcome: CommitOutcome::InvalidPlan,
+                transition: None,
+                owed_acceptance: Some(existing),
+            });
+        }
+        if next_status == AcceptanceStatus::Accepted && !P::runtime_start_allowed(&self.snapshot) {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::InvalidPlan,
                 transition: None,
