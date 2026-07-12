@@ -63,6 +63,7 @@ fn workflow() -> WorkflowState<WakeProfile> {
         super::snapshot_codec(),
         super::registration_snapshot(&intent, Version(3)),
     )
+    .expect("accepting protocol")
 }
 
 #[test]
@@ -527,14 +528,26 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         })
     ));
 
-    let receipt = registration_receipt(&registration_intent(bash_identity("b-15")));
-    let owed = acceptance_owed_decl(ReducerInboxId(9), receipt.clone());
+    let terminal = terminal_payload_from_evidence(
+        "contract-1",
+        bash_identity("b-15"),
+        observed.observation.clone(),
+        Timestamp(20),
+    )
+    .expect("matching evidence");
+    let owed = acceptance_owed_decl(ReducerInboxId(9), &terminal)
+        .expect("non-cancelled terminal receipt can auto-resume");
     assert_eq!(owed.reducer_inbox_id, ReducerInboxId(9));
-    assert_eq!(owed.source_kind, super::REGISTRATION_BARRIER_KIND);
-    assert_eq!(
-        owed.event,
-        super::WakeBarrierEvent::RegistrationObserved { receipt }
+    assert_eq!(owed.source_kind, "wake_terminal_receipt");
+    assert_eq!(owed.event, terminal);
+
+    let cancelled = cancelled_terminal_payload(
+        "contract-1",
+        bash_identity("b-15"),
+        WakeCancellationReason::ExplicitCancel,
+        Timestamp(7),
     );
+    assert_eq!(acceptance_owed_decl(ReducerInboxId(10), &cancelled), None);
 }
 
 #[test]
