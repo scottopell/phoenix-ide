@@ -247,6 +247,54 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText('Managed memory over time')).toBeInTheDocument();
   });
 
+  it('page refresh supersedes an in-flight resource request while visible', async () => {
+    const signals: AbortSignal[] = [];
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources
+      .mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+        signals.push(signal);
+        return new Promise<AboutResourcesSnapshot>(() => {});
+      })
+      .mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+        signals.push(signal);
+        return Promise.resolve(resourcesSnapshot({ sampled_at: '2026-06-01T00:00:10Z' }));
+      });
+
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    await screen.findByRole('button', { name: 'Refresh' });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      await Promise.resolve();
+    });
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText('Host mostly idle')).toBeInTheDocument();
+    expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
+  });
+
+  it('page refresh respects hidden resource polling suspension', async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
+    renderPage(deployment());
+
+    await screen.findByRole('button', { name: 'Refresh' });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      await Promise.resolve();
+    });
+
+    expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
+    expect(apiMock.deploymentDiskInfo).toHaveBeenCalledTimes(2);
+    expect(apiMock.deploymentResources).not.toHaveBeenCalled();
+  });
+
   it('polls only while visible, avoids overlap, and keeps the last good sample stale on error', async () => {
     vi.useFakeTimers();
     let resolveFirst: ((value: AboutResourcesSnapshot) => void) | undefined;

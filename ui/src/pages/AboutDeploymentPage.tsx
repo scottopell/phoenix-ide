@@ -612,8 +612,12 @@ export function AboutDeploymentPage() {
       .finally(() => setDiskLoading(false));
   }, []);
 
-  const fetchResources = useCallback(() => {
-    if (resourcesInFlightRef.current) return;
+  const fetchResources = useCallback((supersede = false) => {
+    if (document.visibilityState !== 'visible') return;
+    if (resourcesInFlightRef.current) {
+      if (!supersede) return;
+      invalidateActiveResourceRequest();
+    }
     resourcesInFlightRef.current = true;
     const generation = resourcesGenerationRef.current;
     const controller = new AbortController();
@@ -657,7 +661,7 @@ export function AboutDeploymentPage() {
           activeResourceRequestRef.current = null;
         }
       });
-  }, []);
+  }, [invalidateActiveResourceRequest]);
 
   useEffect(() => {
     resourcesMountedRef.current = true;
@@ -712,6 +716,7 @@ export function AboutDeploymentPage() {
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
+    fetchResources(true);
     return Promise.all([
       api
         .deploymentInfo()
@@ -720,7 +725,7 @@ export function AboutDeploymentPage() {
         .finally(() => setLoading(false)),
       loadDisk(),
     ]);
-  }, [loadDisk]);
+  }, [fetchResources, loadDisk]);
 
   useEffect(() => {
     let cancelled = false;
@@ -796,7 +801,7 @@ export function AboutDeploymentPage() {
                 )}
               </section>
 
-              <ResourceMonitor state={resources} refresh={() => { void fetchResources(); }} />
+              <ResourceMonitor state={resources} refresh={() => { fetchResources(true); }} />
 
               <section className="settings-section">
                 <div className="settings-section__title-row">
