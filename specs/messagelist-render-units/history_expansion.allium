@@ -31,6 +31,7 @@ entity HistoryRequest {
     intent: RequestIntent
     restore_basis: RestoreBasis
     message_id: String?
+    viewport_start_offset: Decimal?
     snapshot_started_at_event_seq: Integer
 }
 
@@ -40,6 +41,7 @@ entity ScrollCommand {
     request_token: String
     kind: CommandKind
     message_id: String
+    viewport_start_offset: Decimal?
     issued_view_generation: Integer
 }
 
@@ -59,7 +61,7 @@ surface HistoryExpansionController {
 
     provides:
         ViewChanged(view, conversation_id, view_generation, transcript_generation)
-        ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
+        ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
         LoadedTargetRequested(view, command_token, target_message_id)
         DeepLinkTargetChanged(view, target_message_id)
@@ -132,13 +134,14 @@ rule LoadedTargetCreatesNavigationCommandWithoutExpandingCoverage {
         request_token: "",
         kind: jump_to_message,
         message_id: target_message_id,
+        viewport_start_offset: null,
         issued_view_generation: view.view_generation
     )
     ensures: view.coverage = view.coverage
 }
 
 rule ManualExpansionStartsOneRequest {
-    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
+    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
     requires: restore_basis in { reader_anchor, following_tail }
@@ -148,6 +151,7 @@ rule ManualExpansionStartsOneRequest {
         intent: manual_expand,
         restore_basis: restore_basis,
         message_id: anchor_message_id,
+        viewport_start_offset: viewport_start_offset,
         snapshot_started_at_event_seq: snapshot_event_seq
     )
     ensures: view.failure = null
@@ -163,6 +167,7 @@ rule DeepLinkStartsOneCoverageRequest {
         intent: deep_link,
         restore_basis: target_message,
         message_id: target_message_id,
+        viewport_start_offset: null,
         snapshot_started_at_event_seq: snapshot_event_seq
     )
     ensures: view.failure = null
@@ -194,6 +199,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
         request_token: request_token,
         kind: restore_after_prefix,
         message_id: view.active_request.message_id,
+        viewport_start_offset: view.active_request.viewport_start_offset,
         issued_view_generation: view_generation
     )
     ensures: view.active_request = null
@@ -228,6 +234,7 @@ rule DeepLinkExpansionCreatesNavigationCommand {
         request_token: request_token,
         kind: jump_to_message,
         message_id: view.active_request.message_id,
+        viewport_start_offset: null,
         issued_view_generation: view_generation
     )
     ensures: view.active_request = null
@@ -293,8 +300,10 @@ contract HistoryExpansionSafety {
     validate: (view: HistoryView) -> Boolean
 
     @invariant ContinuityRestorationDoesNotAcquireNavigationOwnership
-        -- A restore_after_prefix command preserves the scroll policy's existing
-        -- reader or following ownership and never highlights a message.
+        -- A restore_after_prefix command positions the canonical historical
+        -- message so unitTop - viewportTop equals the captured
+        -- viewport_start_offset, preserves the scroll policy's existing reader
+        -- or following ownership, and never highlights a message.
 
     @invariant FollowingTailExpansionEmitsNoPositioningCommand
         -- Expanding complete history while following the tail leaves physical

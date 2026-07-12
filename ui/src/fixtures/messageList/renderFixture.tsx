@@ -85,7 +85,7 @@ export function MessageListFixture({ scenario }: Props) {
     if (!basis || basis.kind !== 'reader_anchor') return;
     const measured = measureAnchor(basis.messageId);
     if (!measured) return;
-    pendingAnchorRef.current = { messageId: basis.messageId, offset: measured.anchorOffset };
+    pendingAnchorRef.current = { messageId: basis.messageId, offset: basis.viewportStartOffset };
     recordMilestone({ name: 'before-prefix', ...measured });
     setMessages((current) => [...prefixContinuityEarlierMessages, ...current]);
   };
@@ -98,7 +98,8 @@ export function MessageListFixture({ scenario }: Props) {
       token: 1,
       requestToken: 1,
       view: { conversationId: data.conversationId, generation: 1, transcriptGeneration: 1 },
-      anchorMessageId: pending.messageId,
+      messageId: pending.messageId,
+      viewportStartOffset: pending.offset,
     });
   }, [data.conversationId, messages]);
 

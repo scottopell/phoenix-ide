@@ -5,7 +5,7 @@ export type HistoryView = {
 };
 
 export type RestoreBasis =
-  | { kind: 'reader_anchor'; messageId: string }
+  | { kind: 'reader_anchor'; messageId: string; viewportStartOffset: number }
   | { kind: 'following_tail' };
 
 export type HistoryIntent =
@@ -27,7 +27,8 @@ export type HistoryScrollCommand =
       token: HistoryCommandToken;
       requestToken: number;
       view: HistoryView;
-      anchorMessageId: string;
+      messageId: string;
+      viewportStartOffset: number;
     }
   | {
       kind: 'jump_to_message';
@@ -160,7 +161,8 @@ export function reduceHistoryExpansion(
               token: event.commandToken,
               requestToken: request.token,
               view: request.view,
-              anchorMessageId: request.intent.restore.messageId,
+              messageId: request.intent.restore.messageId,
+              viewportStartOffset: request.intent.restore.viewportStartOffset,
             }
           : null;
       return {
@@ -189,7 +191,7 @@ export function reduceHistoryExpansion(
       if (event.result === 'target_missing') {
         const failure = command.kind === 'jump_to_message'
           ? { kind: 'target_not_found' as const, targetMessageId: command.targetMessageId }
-          : { kind: 'anchor_not_found' as const, anchorMessageId: command.anchorMessageId };
+          : { kind: 'anchor_not_found' as const, anchorMessageId: command.messageId };
         return { ...state, pendingCommand: null, failure };
       }
       return { ...state, pendingCommand: null };

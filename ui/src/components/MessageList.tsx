@@ -71,7 +71,7 @@ const ChevronDown = () => (
   </svg>
 );
 
-const HISTORY_SCROLL_ACK_TIMEOUT_MS = 1500;
+const HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX = 2;
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -798,6 +798,12 @@ function MessageListImpl({
     [historicalUnits],
   );
 
+  const messageIdForHistoricalUnit = useCallback((unit: HistoricalUnit): string | null => {
+    if (unit.kind === 'agent_turn') return unit.agent.message_id;
+    if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
+    return null;
+  }, []);
+
   const scrollToMessageId = useCallback((messageId: string) => {
     const index = findUnitIndexByMessageId(messageId);
     if (index < 0) return false;
@@ -810,14 +816,14 @@ function MessageListImpl({
     if (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading')) {
       return { kind: 'following_tail' };
     }
-    const unit = historicalUnits[firstVisibleUnitIndexRef.current];
-    if (!unit) return { kind: 'following_tail' };
-    if (unit.kind === 'agent_turn') return { kind: 'reader_anchor', messageId: unit.agent.message_id };
-    if ('message' in unit && 'message_id' in unit.message) {
-      return { kind: 'reader_anchor', messageId: unit.message.message_id };
-    }
-    return { kind: 'following_tail' };
-  }, [historicalUnits]);
+    const anchor = transcriptRef.current?.captureVisibleAnchor();
+    if (!anchor) return { kind: 'following_tail' };
+    const unit = historicalUnits[anchor.index];
+    if (!unit || unit.key !== anchor.key) return { kind: 'following_tail' };
+    const messageId = messageIdForHistoricalUnit(unit);
+    if (!messageId) return { kind: 'following_tail' };
+    return { kind: 'reader_anchor', messageId, viewportStartOffset: anchor.offset };
+  }, [historicalUnits, messageIdForHistoricalUnit]);
 
   useImperativeHandle(
     ref,
@@ -827,23 +833,14 @@ function MessageListImpl({
 
   const handledHistoryCommandRef = useRef<number | null>(null);
   const acknowledgedHistoryCommandRef = useRef<number | null>(null);
-  const pendingHistoryAckRef = useRef<{ token: number; targetIndex: number } | null>(null);
+  const pendingHistoryAckRef = useRef<{ token: number; targetIndex: number; viewportStartOffset: number | null } | null>(null);
   const continuityRestoreTokenRef = useRef<number | null>(null);
-  const historyAckTimeoutRef = useRef(0);
   const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
-
-  const clearHistoryAckTimeout = useCallback(() => {
-    if (historyAckTimeoutRef.current !== 0) {
-      clearTimeout(historyAckTimeoutRef.current);
-      historyAckTimeoutRef.current = 0;
-    }
-  }, []);
 
   const releaseContinuityRestoreSuppression = useCallback(() => {
     continuityRestoreInFlightRef.current = false;
     continuityRestoreTokenRef.current = null;
-    clearHistoryAckTimeout();
-  }, [clearHistoryAckTimeout]);
+  }, []);
 
   const finishHistoryCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
     if (acknowledgedHistoryCommandRef.current === token) return;
@@ -874,35 +871,38 @@ function MessageListImpl({
     handledHistoryCommandRef.current = historyScrollCommand.token;
     acknowledgedHistoryCommandRef.current = null;
     const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
-      ? historyScrollCommand.anchorMessageId
+      ? historyScrollCommand.messageId
       : historyScrollCommand.targetMessageId;
     const index = findUnitIndexByMessageId(messageId);
     if (index < 0) {
       finishHistoryCommand(historyScrollCommand.token, 'target_missing');
       return;
     }
-    pendingHistoryAckRef.current = { token: historyScrollCommand.token, targetIndex: index };
+    pendingHistoryAckRef.current = {
+      token: historyScrollCommand.token,
+      targetIndex: index,
+      viewportStartOffset: historyScrollCommand.kind === 'restore_after_prefix_expansion'
+        ? historyScrollCommand.viewportStartOffset
+        : null,
+    };
     if (historyScrollCommand.kind === 'jump_to_message') {
       scrollToUnitIndex(index);
     } else {
       continuityRestoreInFlightRef.current = true;
       continuityRestoreTokenRef.current = historyScrollCommand.token;
-      clearHistoryAckTimeout();
-      transcriptRef.current?.scrollToIndex(index, 'start');
+      transcriptRef.current?.scrollToIndex(index, 'start', historyScrollCommand.viewportStartOffset);
     }
     const lastVisibleRange = lastVisibleRangeRef.current;
     if (lastVisibleRange && index >= lastVisibleRange.startIndex && index <= lastVisibleRange.endIndex) {
-      finishHistoryCommand(historyScrollCommand.token, 'applied');
-      return;
+      const actualOffset = historyScrollCommand.kind === 'restore_after_prefix_expansion'
+        ? transcriptRef.current?.measureOffsetForIndex(index) ?? null
+        : null;
+      if (historyScrollCommand.kind === 'jump_to_message'
+        || (actualOffset !== null && Math.abs(actualOffset - historyScrollCommand.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX)) {
+        finishHistoryCommand(historyScrollCommand.token, 'applied');
+      }
     }
-    if (historyScrollCommand.kind === 'restore_after_prefix_expansion') {
-      historyAckTimeoutRef.current = window.setTimeout(() => {
-        if (continuityRestoreTokenRef.current !== historyScrollCommand.token) return;
-        historyAckTimeoutRef.current = 0;
-        finishHistoryCommand(historyScrollCommand.token, 'superseded');
-      }, HISTORY_SCROLL_ACK_TIMEOUT_MS);
-    }
-  }, [clearHistoryAckTimeout, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, releaseContinuityRestoreSuppression, scrollToUnitIndex]);
+  }, [findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, releaseContinuityRestoreSuppression, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -949,7 +949,16 @@ function MessageListImpl({
       pendingAck
       && pendingAck.targetIndex >= range.startIndex
       && pendingAck.targetIndex <= range.endIndex
-    ) finishHistoryCommand(pendingAck.token, 'applied');
+    ) {
+      if (pendingAck.viewportStartOffset === null) {
+        finishHistoryCommand(pendingAck.token, 'applied');
+      } else {
+        const actualOffset = transcriptRef.current?.measureOffsetForIndex(pendingAck.targetIndex) ?? null;
+        if (actualOffset !== null && Math.abs(actualOffset - pendingAck.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX) {
+          finishHistoryCommand(pendingAck.token, 'applied');
+        }
+      }
+    }
     onVisibleRangeChange?.(range);
   }, [finishHistoryCommand, onVisibleRangeChange]);
 

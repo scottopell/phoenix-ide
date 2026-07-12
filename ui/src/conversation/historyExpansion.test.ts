@@ -16,7 +16,7 @@ const manualRequest = (currentView: HistoryView, token = 1): ActiveHistoryReques
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
-  intent: { kind: 'manual_expansion', restore: { kind: 'reader_anchor', messageId: 'm50' } },
+  intent: { kind: 'manual_expansion', restore: { kind: 'reader_anchor', messageId: 'm50', viewportStartOffset: 12 } },
 });
 
 const deepLinkRequest = (currentView: HistoryView, token = 1): ActiveHistoryRequest => ({
@@ -49,7 +49,7 @@ describe('history expansion reducer', () => {
     });
 
     expect(state.pendingCommand).toMatchObject({
-      kind: 'restore_after_prefix_expansion', anchorMessageId: 'm50', token: 101, requestToken: 1,
+      kind: 'restore_after_prefix_expansion', messageId: 'm50', viewportStartOffset: 12, token: 101, requestToken: 1,
     });
     const duplicate = reduceHistoryExpansion(state, {
       type: 'history_loaded', requestToken: 1, view: view('a', 1), targetPresent: true, commandToken: 101,
