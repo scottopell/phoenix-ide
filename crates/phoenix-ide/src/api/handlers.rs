@@ -13,7 +13,7 @@ use super::git_handlers::{
     get_conversation_pr_status, list_git_branches, pin_associated_pr,
     record_pr_auto_fix_context_baseline, resume_associated_pr_inference,
 };
-use super::global_recall;
+use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
@@ -113,15 +113,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
-        .route("/api/global/open-work", get(global_recall::open_work))
+        .route("/api/global/open-work", get(global_read::open_work))
         .route(
             "/api/global/coordinator",
             get(get_coordinator).post(get_coordinator),
         )
-        .route(
-            "/api/global/resolve",
-            post(global_recall::resolve_reference),
-        )
+        .route("/api/global/resolve", post(global_read::resolve_reference))
         .route(
             "/api/conversations/archived",
             get(list_archived_conversations),

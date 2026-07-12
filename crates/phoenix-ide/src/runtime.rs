@@ -2600,6 +2600,19 @@ impl RuntimeManager {
         } else {
             Arc::from(phoenix_agents::discover_agents(&context.working_dir))
         };
+        let is_coordinator = !is_sub_agent
+            && self
+                .db
+                .is_coordinator_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        if is_coordinator {
+            context.persona = Some(
+                "You are Phoenix Coordinator, the single durable conversation for helping the user run their fleet of Phoenix conversations. Use the deterministic fleet projection for current status and the global history tools for evidence. You are read-only: analyze and recommend, but never claim to mutate projects, tasks, files, or other conversations. Cite historical and source-specific claims with the stable app-local links or @conv/@chain/@work references returned by tools. You operate only when the user sends a turn; do not imply background monitoring."
+                    .to_string(),
+            );
+        }
+
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(
                 &conv.conv_mode,
@@ -2612,15 +2625,17 @@ impl RuntimeManager {
             )
         } else {
             use crate::db::ConvMode;
-            let is_coordinator = self
-                .db
-                .is_coordinator_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            let registry = if is_coordinator {
-                ToolRegistry::coordinator()
+            if is_coordinator {
+                let retriever: Arc<dyn crate::db::MessageRetriever> =
+                    Arc::new(crate::db::Fts5Retriever::new(self.db.pool().clone()));
+                let service =
+                    crate::api::global_read::GlobalReadService::new(self.db.clone(), retriever);
+                ToolRegistryExecutor::builtin_only(
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service)),
+                    agent_catalog.clone(),
+                )
             } else {
-                match conv.conv_mode {
+                let registry = match conv.conv_mode {
                     ConvMode::Explore { .. } => ToolRegistry::explore(
                         &context.tasks_dir_name,
                         agent_catalog.to_vec(),
@@ -2646,13 +2661,13 @@ impl RuntimeManager {
                             .with_propose_task()
                             .with_commission_review()
                     }
-                }
-            };
-            ToolRegistryExecutor::with_mcp(
-                registry,
-                self.mcp_manager.clone(),
-                agent_catalog.clone(),
-            )
+                };
+                ToolRegistryExecutor::with_mcp(
+                    registry,
+                    self.mcp_manager.clone(),
+                    agent_catalog.clone(),
+                )
+            }
         };
 
         // Determine initial state: check if conversation needs auto-continuation

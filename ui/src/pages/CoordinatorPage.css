@@ -23,12 +23,6 @@
 .coordinator-project-header {
   display: flex;
   gap: 16px;
-}
-
-.coordinator-header,
-.coordinator-section-title,
-.coordinator-item-row,
-.coordinator-project-header {
   justify-content: space-between;
   align-items: flex-start;
 }
@@ -158,7 +152,7 @@
   border-top: 1px solid var(--border-color);
 }
 
-@media (max-width: 900px) {
+@media (width <= 900px) {
   .coordinator-header,
   .coordinator-section-title,
   .coordinator-item-row,

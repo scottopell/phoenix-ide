@@ -242,6 +242,16 @@ const MIGRATIONS: &[Migration] = &[
 >>>>>>> 97974b6e (feat: replace recall surface with coordinator foundation)
 ];
 
+const MIGRATION_041: &str = r"
+CREATE TABLE coordinator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE RESTRICT
+);
+DROP TABLE IF EXISTS global_recall_messages;
+DROP TABLE IF EXISTS global_recall_sessions;
+";
+
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
 /// closing the divergence between SQL `json_extract` queries and Rust deserialization.
 const MIGRATION_001: &str = r#"
@@ -2837,13 +2847,3 @@ mod tests {
         );
     }
 }
-
-const MIGRATION_041: &str = r#"
-CREATE TABLE coordinator (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    conversation_id TEXT NOT NULL UNIQUE
-        REFERENCES conversations(id) ON DELETE RESTRICT
-);
-DROP TABLE IF EXISTS global_recall_messages;
-DROP TABLE IF EXISTS global_recall_sessions;
-"#;

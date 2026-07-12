@@ -8,6 +8,7 @@ mod api;
 mod chain_qa;
 mod chain_runtime;
 mod conversation_cwd;
+mod coordinator_tools;
 mod discovery;
 pub mod drive_turn;
 pub(crate) mod git_ops;

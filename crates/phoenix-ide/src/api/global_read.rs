@@ -3,35 +3,24 @@ use crate::db::MessageContent;
 use crate::db::{ConvMode, Conversation, DbError, MessageType, RetrievalScope};
 use crate::state_machine::ConvState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Query, State},
     Json,
 };
 use chrono::{DateTime, Utc};
-use phoenix_llm::{
-    ContentBlock, LlmMessage, LlmRequest, MessageRole, PromptCacheKey, SystemContent,
-    ToolDefinition,
-};
+use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 
 use super::handlers::AppError;
 
 const RECENT_DAYS: i64 = 14;
 const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
-const MAX_RECALL_TURNS: usize = 6;
-const ANSWER_MAX_TOKENS: u32 = 3072;
 const READ_MESSAGE_BATCH: i64 = 64;
 const READ_TARGET_SIDE_MESSAGES: i64 = 32;
-const RECALL_SESSION_PAGE: i64 = 50;
-const RECALL_MESSAGE_PAGE: i64 = 100;
 const OPEN_WORK_PAGE: usize = 100;
-
-static RECALL_SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 pub struct GlobalOpenWorkResponse {
@@ -86,56 +75,6 @@ pub struct GlobalOpenWorkItem {
     pub reference: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct GlobalRecallSessionsResponse {
-    pub sessions: Vec<GlobalRecallSession>,
-    pub has_more: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GlobalRecallSessionResponse {
-    pub session: GlobalRecallSession,
-    pub messages: Vec<GlobalRecallMessage>,
-    pub older_cursor: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GlobalRecallSession {
-    pub id: String,
-    pub title: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GlobalRecallMessage {
-    pub id: String,
-    pub role: String,
-    pub content: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateGlobalRecallSessionRequest {
-    pub title: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateGlobalRecallSessionResponse {
-    pub session: GlobalRecallSession,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AskGlobalRecallRequest {
-    pub question: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AskGlobalRecallResponse {
-    pub user_message: GlobalRecallMessage,
-    pub assistant_message: GlobalRecallMessage,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ResolveGlobalReferenceRequest {
     pub reference: String,
@@ -156,137 +95,116 @@ pub struct OpenWorkPageQuery {
     pub offset: usize,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SessionPageQuery {
-    #[serde(default)]
-    pub offset: i64,
+#[derive(Clone)]
+pub(crate) struct GlobalReadService {
+    db: crate::db::Database,
+    message_retriever: Arc<dyn crate::db::MessageRetriever>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct MessagePageQuery {
-    pub before: Option<i64>,
+impl GlobalReadService {
+    pub(crate) fn new(
+        db: crate::db::Database,
+        message_retriever: Arc<dyn crate::db::MessageRetriever>,
+    ) -> Self {
+        Self {
+            db,
+            message_retriever,
+        }
+    }
+
+    fn from_state(state: &AppState) -> Self {
+        Self::new(state.db.clone(), state.message_retriever.clone())
+    }
+
+    pub(crate) async fn open_work(&self) -> Result<GlobalOpenWorkResponse, AppError> {
+        build_open_work(self).await
+    }
+
+    pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("query is required".to_string());
+        }
+        let hits = self
+            .message_retriever
+            .retrieve(query, RetrievalScope::Global, SEARCH_TOP_K)
+            .await
+            .map_err(|e| format!("search failed: {e}"))?;
+        if hits.is_empty() {
+            Ok("No matching messages found.".to_string())
+        } else {
+            Ok(format_global_search_hits(self, &hits).await)
+        }
+    }
+
+    pub(crate) async fn read_conversation(
+        &self,
+        conversation: &str,
+        cursor: usize,
+    ) -> Result<String, String> {
+        let target = resolve_conversation_read_target(self, conversation).await?;
+        let conv = self
+            .db
+            .get_conversation(&target.conversation_id)
+            .await
+            .map_err(|e| format!("conversation not found: {e}"))?;
+        if let Some(message_id) = target.message_id.as_deref() {
+            read_conversation_around_message(&self.db, &conv, message_id)
+                .await
+                .map_err(|e| format!("read failed: {e}"))
+        } else {
+            read_conversation_page(&self.db, &conv, cursor)
+                .await
+                .map_err(|e| format!("read failed: {e}"))
+        }
+    }
+
+    pub(crate) async fn open_work_page(&self, offset: usize) -> Result<String, String> {
+        let view = self
+            .open_work()
+            .await
+            .map_err(|e| format!("open work projection failed: {e:?}"))?;
+        Ok(format_open_work_for_agent(
+            &paginate_open_work(view, offset, OPEN_WORK_PAGE),
+            offset,
+        ))
+    }
+
+    pub(crate) async fn resolve_reference(
+        &self,
+        reference: &str,
+    ) -> Result<ResolveGlobalReferenceResponse, AppError> {
+        resolve_reference_impl(self, reference).await
+    }
 }
 
 pub async fn open_work(
     State(state): State<AppState>,
     Query(page): Query<OpenWorkPageQuery>,
 ) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    let view = build_open_work(&state).await?;
+    let view = GlobalReadService::from_state(&state).open_work().await?;
     Ok(Json(paginate_open_work(view, page.offset, OPEN_WORK_PAGE)))
-}
-
-pub async fn list_sessions(
-    State(state): State<AppState>,
-    Query(page): Query<SessionPageQuery>,
-) -> Result<Json<GlobalRecallSessionsResponse>, AppError> {
-    let mut sessions = sqlx::query(
-        "SELECT id, title, created_at, updated_at FROM global_recall_sessions
-         ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2",
-    )
-    .bind(RECALL_SESSION_PAGE + 1)
-    .bind(page.offset.max(0))
-    .try_map(parse_session_row)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    let has_more = sessions.len() > usize::try_from(RECALL_SESSION_PAGE).unwrap_or(50);
-    sessions.truncate(usize::try_from(RECALL_SESSION_PAGE).unwrap_or(50));
-    Ok(Json(GlobalRecallSessionsResponse { sessions, has_more }))
-}
-
-pub async fn create_session(
-    State(state): State<AppState>,
-    Json(req): Json<CreateGlobalRecallSessionRequest>,
-) -> Result<Json<CreateGlobalRecallSessionResponse>, AppError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now();
-    let title = req
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Global Recall")
-        .to_string();
-    sqlx::query(
-        "INSERT INTO global_recall_sessions (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-    )
-    .bind(&id)
-    .bind(&title)
-    .bind(now.to_rfc3339())
-    .bind(now.to_rfc3339())
-    .execute(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(CreateGlobalRecallSessionResponse {
-        session: GlobalRecallSession {
-            id,
-            title,
-            created_at: now,
-            updated_at: now,
-        },
-    }))
-}
-
-pub async fn get_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(page): Query<MessagePageQuery>,
-) -> Result<Json<GlobalRecallSessionResponse>, AppError> {
-    let session = load_session(&state, &id).await?;
-    let (messages, older_cursor) = load_session_message_page(&state, &id, page.before).await?;
-    Ok(Json(GlobalRecallSessionResponse {
-        session,
-        messages,
-        older_cursor,
-    }))
-}
-
-pub async fn ask_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<AskGlobalRecallRequest>,
-) -> Result<Json<AskGlobalRecallResponse>, AppError> {
-    let question = req.question.trim();
-    if question.is_empty() {
-        return Err(AppError::BadRequest("question is required".to_string()));
-    }
-    let _session = load_session(&state, &id).await?;
-    let session_lock = recall_session_lock(&id)?;
-    let _guard = session_lock.lock().await;
-    let answer = run_global_recall_agent(&state, &id, question).await?;
-    let (user_message, assistant_message) =
-        insert_recall_turn(&state.db, &id, question, &answer).await?;
-    Ok(Json(AskGlobalRecallResponse {
-        user_message,
-        assistant_message,
-    }))
 }
 
 pub async fn resolve_reference(
     State(state): State<AppState>,
     Json(req): Json<ResolveGlobalReferenceRequest>,
 ) -> Result<Json<ResolveGlobalReferenceResponse>, AppError> {
-    Ok(Json(resolve_reference_impl(&state, &req.reference).await?))
+    Ok(Json(
+        GlobalReadService::from_state(&state)
+            .resolve_reference(&req.reference)
+            .await?,
+    ))
 }
 
-fn recall_session_lock(session_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, AppError> {
-    let mut locks = RECALL_SESSION_LOCKS.lock().map_err(|_| {
-        AppError::Internal("Global Recall session lock registry is poisoned".to_string())
-    })?;
-    Ok(locks
-        .entry(session_id.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
-}
-
-async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, AppError> {
+async fn build_open_work(service: &GlobalReadService) -> Result<GlobalOpenWorkResponse, AppError> {
     let now = Utc::now();
-    let conversations = state
+    let conversations = service
         .db
         .list_all_conversations()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let coordinator_id = state
+    let coordinator_id = service
         .db
         .coordinator_conversation_id()
         .await
@@ -295,7 +213,7 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
         .into_iter()
         .filter(|conversation| Some(&conversation.id) != coordinator_id.as_ref())
         .collect();
-    let projects = state
+    let projects = service
         .db
         .list_projects()
         .await
@@ -670,357 +588,8 @@ fn task_status_from_disk(worktree: &str, task_id: &str) -> Option<String> {
     None
 }
 
-async fn load_session(state: &AppState, id: &str) -> Result<GlobalRecallSession, AppError> {
-    sqlx::query(
-        "SELECT id, title, created_at, updated_at FROM global_recall_sessions WHERE id = ?1",
-    )
-    .bind(id)
-    .try_map(parse_session_row)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("global recall session not found".to_string()))
-}
-
-async fn load_session_messages(
-    state: &AppState,
-    id: &str,
-) -> Result<Vec<GlobalRecallMessage>, AppError> {
-    let mut messages = sqlx::query(
-        "SELECT id, role, content, created_at FROM global_recall_messages
-         WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 8",
-    )
-    .bind(id)
-    .try_map(parse_message_row)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    messages.reverse();
-    Ok(messages)
-}
-
-async fn load_session_message_page(
-    state: &AppState,
-    id: &str,
-    before: Option<i64>,
-) -> Result<(Vec<GlobalRecallMessage>, Option<i64>), AppError> {
-    let mut rows = sqlx::query(
-        "SELECT ordinal, id, role, content, created_at FROM global_recall_messages
-         WHERE session_id = ?1 AND (?2 IS NULL OR ordinal < ?2)
-         ORDER BY ordinal DESC LIMIT ?3",
-    )
-    .bind(id)
-    .bind(before)
-    .bind(RECALL_MESSAGE_PAGE + 1)
-    .try_map(parse_message_with_ordinal_row)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    let page_size = usize::try_from(RECALL_MESSAGE_PAGE).unwrap_or(100);
-    let has_more = rows.len() > page_size;
-    rows.truncate(page_size);
-    rows.reverse();
-    let older_cursor = has_more
-        .then(|| rows.first().map(|(ordinal, _)| *ordinal))
-        .flatten();
-    Ok((
-        rows.into_iter().map(|(_, message)| message).collect(),
-        older_cursor,
-    ))
-}
-
-async fn insert_recall_turn(
-    db: &crate::db::Database,
-    session_id: &str,
-    question: &str,
-    answer: &str,
-) -> Result<(GlobalRecallMessage, GlobalRecallMessage), AppError> {
-    let user = GlobalRecallMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: "user".to_string(),
-        content: question.to_string(),
-        created_at: Utc::now(),
-    };
-    let assistant = GlobalRecallMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: "assistant".to_string(),
-        content: answer.to_string(),
-        created_at: Utc::now(),
-    };
-    for attempt in 0..3 {
-        match insert_recall_turn_once(db, session_id, &user, &assistant).await {
-            Ok(()) => return Ok((user, assistant)),
-            Err(e) if attempt < 2 && is_recall_ordinal_conflict(&e) => (),
-            Err(e) => return Err(e),
-        }
-    }
-    Err(AppError::Internal(
-        "failed to insert Global Recall turn".to_string(),
-    ))
-}
-
-async fn insert_recall_turn_once(
-    db: &crate::db::Database,
-    session_id: &str,
-    user: &GlobalRecallMessage,
-    assistant: &GlobalRecallMessage,
-) -> Result<(), AppError> {
-    let mut tx = db
-        .pool()
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    insert_recall_message_in_tx(&mut tx, session_id, user).await?;
-    insert_recall_message_in_tx(&mut tx, session_id, assistant).await?;
-    sqlx::query("UPDATE global_recall_sessions SET updated_at = ?1 WHERE id = ?2")
-        .bind(assistant.created_at.to_rfc3339())
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))
-}
-
-fn is_recall_ordinal_conflict(error: &AppError) -> bool {
-    matches!(error, AppError::Internal(message) if message.contains("global_recall_messages.session_id") || message.contains("UNIQUE constraint failed"))
-}
-
-async fn insert_recall_message_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    session_id: &str,
-    message: &GlobalRecallMessage,
-) -> Result<(), AppError> {
-    sqlx::query(
-        "INSERT INTO global_recall_messages (id, session_id, ordinal, role, content, created_at)
-         SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5
-         FROM global_recall_messages WHERE session_id = ?2",
-    )
-    .bind(&message.id)
-    .bind(session_id)
-    .bind(&message.role)
-    .bind(&message.content)
-    .bind(message.created_at.to_rfc3339())
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(())
-}
-
-async fn run_global_recall_agent(
-    state: &AppState,
-    session_id: &str,
-    question: &str,
-) -> Result<String, AppError> {
-    let (_model_id, service) = state
-        .llm_registry
-        .get_mid_tier_model()
-        .or_else(|| {
-            state
-                .llm_registry
-                .get_cheap_model()
-                .map(|svc| ("cheap".to_string(), svc))
-        })
-        .ok_or_else(|| {
-            AppError::Internal("no LLM model available for Global Recall".to_string())
-        })?;
-    let history = load_session_messages(state, session_id).await?;
-    let mut messages = Vec::new();
-    let mut orientation = String::from(
-        "You are a read-only Phoenix Global Recall analyst. You may search and read Phoenix conversation history, inspect deterministic open-work projections, and resolve Phoenix references. Do not claim to have edited files or changed tasks. Cite sources using markdown links when tool results provide them; otherwise cite @conv:<id>, @chain:<id>, or message ids.\n\nRecent saved session context:\n",
-    );
-    for m in &history {
-        let _ = writeln!(orientation, "{}: {}", m.role, trim_chars(&m.content, 1200));
-    }
-    let _ = writeln!(orientation, "\nCurrent question: {question}");
-    messages.push(LlmMessage {
-        role: MessageRole::User,
-        content: vec![ContentBlock::text(orientation)],
-    });
-
-    for turn in 0..MAX_RECALL_TURNS {
-        let force_answer = turn + 1 == MAX_RECALL_TURNS;
-        let request = LlmRequest {
-            system: vec![SystemContent::new("Answer cross-conversation Phoenix strategy and handoff questions from read-only recalled evidence. Prefer concise synthesis, and include citations for factual claims.".to_string())],
-            messages: messages.clone(),
-            tools: if force_answer { vec![] } else { global_recall_tools() },
-            max_tokens: Some(ANSWER_MAX_TOKENS),
-            cache_key: PromptCacheKey::stable("global-recall-agent/v1"),
-        };
-        let resp = service
-            .complete(&request)
-            .await
-            .map_err(|e| AppError::Internal(e.message))?;
-        let tool_calls: Vec<_> = resp
-            .tool_uses()
-            .into_iter()
-            .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
-            .collect();
-        if tool_calls.is_empty() || force_answer {
-            return Ok(resp.text());
-        }
-        messages.push(LlmMessage {
-            role: MessageRole::Assistant,
-            content: resp.content.clone(),
-        });
-        let mut results = Vec::with_capacity(tool_calls.len());
-        for (idx, (tool_use_id, name, input)) in tool_calls.iter().enumerate() {
-            let (content, is_error) = if idx < 4 {
-                execute_global_tool(state, name, input).await
-            } else {
-                (
-                    "error: too many tool calls in one turn; issue fewer calls".to_string(),
-                    true,
-                )
-            };
-            results.push(ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                content,
-                images: vec![],
-                is_error,
-            });
-        }
-        messages.push(LlmMessage {
-            role: MessageRole::User,
-            content: results,
-        });
-    }
-    Err(AppError::Internal(
-        "global recall agent did not produce an answer".to_string(),
-    ))
-}
-
-fn global_recall_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "search_conversations".to_string(),
-            description: "Search all Phoenix conversation messages by relevance. Returns citable snippets with conversation/message references and app-local links.".to_string(),
-            input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
-            defer_loading: false,
-        },
-        ToolDefinition {
-            name: "read_conversation".to_string(),
-            description: "Read one source conversation transcript one bounded page at a time. Use conversation_id from search/open-work/reference results. If more content is available, call again with cursor.".to_string(),
-            input_schema: serde_json::json!({"type":"object","properties":{"conversation_id":{"type":"string"},"cursor":{"type":"integer"}},"required":["conversation_id"]}),
-            defer_loading: false,
-        },
-        ToolDefinition {
-            name: "list_open_work".to_string(),
-            description: "Read the deterministic Global Open Work projection grouped by project, including item references and explainable signals.".to_string(),
-            input_schema: serde_json::json!({"type":"object","properties":{"offset":{"type":"integer","minimum":0}}}),
-            defer_loading: false,
-        },
-        ToolDefinition {
-            name: "resolve_reference".to_string(),
-            description: "Resolve @conv:<id>, @chain:<id>, @work:<id>, or app-local /c/... and /chains/... references.".to_string(),
-            input_schema: serde_json::json!({"type":"object","properties":{"reference":{"type":"string"}},"required":["reference"]}),
-            defer_loading: false,
-        },
-    ]
-}
-
-async fn execute_global_tool(
-    state: &AppState,
-    name: &str,
-    input: &serde_json::Value,
-) -> (String, bool) {
-    match name {
-        "search_conversations" => {
-            let query = input
-                .get("query")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if query.is_empty() {
-                return ("error: query is required".to_string(), true);
-            }
-            if !global_index_is_fresh(state) {
-                return (
-                    "search unavailable: the global message index is still warming; try again after startup reconciliation completes".to_string(),
-                    true,
-                );
-            }
-            match state
-                .message_retriever
-                .retrieve(query, RetrievalScope::Global, SEARCH_TOP_K)
-                .await
-            {
-                Ok(hits) if hits.is_empty() => ("No matching messages found.".to_string(), false),
-                Ok(hits) => (format_global_search_hits(state, &hits).await, false),
-                Err(e) => (format!("error: search failed: {e}"), true),
-            }
-        }
-        "read_conversation" => {
-            let conv_ref = input
-                .get("conversation_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if conv_ref.is_empty() {
-                return ("error: conversation_id is required".to_string(), true);
-            }
-            let target = match resolve_conversation_read_target(state, conv_ref).await {
-                Ok(target) => target,
-                Err(e) => return (format!("error: {e}"), true),
-            };
-            let cursor = usize::try_from(
-                input
-                    .get("cursor")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-            .unwrap_or(0);
-            match state.db.get_conversation(&target.conversation_id).await {
-                Ok(conv) => {
-                    let result = if let Some(message_id) = target.message_id.as_deref() {
-                        read_conversation_around_message(&state.db, &conv, message_id).await
-                    } else {
-                        read_conversation_page(&state.db, &conv, cursor).await
-                    };
-                    match result {
-                        Ok(page) => (page, false),
-                        Err(e) => (format!("error: read failed: {e}"), true),
-                    }
-                }
-                Err(e) => (format!("error: conversation not found: {e}"), true),
-            }
-        }
-        "list_open_work" => {
-            let offset = usize::try_from(
-                input
-                    .get("offset")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-            .unwrap_or(usize::MAX);
-            match build_open_work(state).await {
-                Ok(view) => {
-                    let page = paginate_open_work(view, offset, OPEN_WORK_PAGE);
-                    (format_open_work_for_agent(&page, offset), false)
-                }
-                Err(e) => (format!("error: open work projection failed: {e:?}"), true),
-            }
-        }
-        "resolve_reference" => {
-            let reference = input
-                .get("reference")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            match resolve_reference_impl(state, reference).await {
-                Ok(r) => (
-                    serde_json::to_string_pretty(&r).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ),
-                Err(e) => (format!("error: {e:?}"), true),
-            }
-        }
-        other => (format!("error: unknown tool {other}"), true),
-    }
-}
-
 async fn resolve_conversation_read_target(
-    state: &AppState,
+    service: &GlobalReadService,
     raw: &str,
 ) -> Result<ConversationReadTarget, String> {
     let reference = raw.trim().trim_start_matches('#');
@@ -1036,7 +605,7 @@ async fn resolve_conversation_read_target(
     }
     if let Some(rest) = reference.strip_prefix("/c/") {
         let (slug, fragment) = split_fragment(rest);
-        let conv = load_conversation_by_slug_or_id(state, slug)
+        let conv = load_conversation_by_slug_or_id(service, slug)
             .await
             .map_err(|e| format!("conversation reference not found: {e:?}"))?;
         return Ok(ConversationReadTarget {
@@ -1055,14 +624,13 @@ async fn resolve_conversation_read_target(
     }
 }
 
-fn global_index_is_fresh(state: &AppState) -> bool {
-    state.message_retriever.index_reconciled()
-}
-
-async fn format_global_search_hits(state: &AppState, hits: &[crate::db::RetrievedChunk]) -> String {
+async fn format_global_search_hits(
+    service: &GlobalReadService,
+    hits: &[crate::db::RetrievedChunk],
+) -> String {
     let mut out = String::new();
     for hit in hits {
-        let (title, href) = match state.db.get_conversation(&hit.conversation_id).await {
+        let (title, href) = match service.db.get_conversation(&hit.conversation_id).await {
             Ok(conv) => {
                 let title = conv
                     .title
@@ -1276,11 +844,11 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
             if !c.images.is_empty() {
                 tracing::debug!(
                     n = c.images.len(),
-                    "global recall read_conversation: dropping user-message images — image recall is unsupported",
+                    "coordinator read_conversation: dropping user-message images — image recall is unsupported",
                 );
                 let _ = write!(
                     text,
-                    "\n[{} image(s) attached to this message are not shown — Global Recall reads text only]",
+                    "\n[{} image(s) attached to this message are not shown — Coordinator reads text only]",
                     c.images.len()
                 );
             }
@@ -1298,10 +866,10 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
                 tracing::debug!(
                     tool_use_id = %c.tool_use_id,
                     n = c.images.len(),
-                    "global recall read_conversation: dropping tool-result images — image recall is unsupported",
+                    "coordinator read_conversation: dropping tool-result images — image recall is unsupported",
                 );
                 format!(
-                    "{}\n[{} image(s) in this tool result are not shown — Global Recall reads text only]",
+                    "{}\n[{} image(s) in this tool result are not shown — Coordinator reads text only]",
                     c.content,
                     c.images.len()
                 )
@@ -1372,41 +940,41 @@ fn format_open_work_for_agent(view: &GlobalOpenWorkResponse, offset: usize) -> S
 }
 
 async fn resolve_reference_impl(
-    state: &AppState,
+    service: &GlobalReadService,
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
     if let Some(rest) = reference.strip_prefix("/c/") {
         let (slug, fragment) = split_fragment(rest);
-        let conv = load_conversation_by_slug_or_id(state, slug).await?;
+        let conv = load_conversation_by_slug_or_id(service, slug).await?;
         if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(state, conv, message_id).await;
+            return resolve_message(service, conv, message_id).await;
         }
         return Ok(resolve_conversation(conv));
     }
     if let Some(rest) = reference.strip_prefix("/chains/") {
         let (id, _) = split_fragment(rest);
-        return resolve_chain(state, id).await;
+        return resolve_chain(service, id).await;
     }
     if let Some(rest) = reference.strip_prefix("@conv:") {
         let (id, message_id) = parse_conv_handle(rest);
-        let conv = state
+        let conv = service
             .db
             .get_conversation(id)
             .await
             .map_err(map_db_not_found)?;
         if let Some(message_id) = message_id {
-            return resolve_message(state, conv, message_id).await;
+            return resolve_message(service, conv, message_id).await;
         }
         return Ok(resolve_conversation(conv));
     }
     if let Some(rest) = reference.strip_prefix("@chain:") {
         let (id, _) = split_fragment(rest);
-        return resolve_chain(state, first_token(id)).await;
+        return resolve_chain(service, first_token(id)).await;
     }
     if let Some(rest) = reference.strip_prefix("@work:") {
         let (id, _) = split_fragment(rest);
-        return resolve_work(state, first_token(id)).await;
+        return resolve_work(service, first_token(id)).await;
     }
     Err(AppError::BadRequest(
         "unsupported reference syntax".to_string(),
@@ -1456,12 +1024,12 @@ fn parse_conv_handle(rest: &str) -> (&str, Option<&str>) {
 }
 
 async fn load_conversation_by_slug_or_id(
-    state: &AppState,
+    service: &GlobalReadService,
     slug_or_id: &str,
 ) -> Result<Conversation, AppError> {
-    match state.db.get_conversation_by_slug(slug_or_id).await {
+    match service.db.get_conversation_by_slug(slug_or_id).await {
         Ok(conv) => Ok(conv),
-        Err(DbError::ConversationNotFound(_)) => state
+        Err(DbError::ConversationNotFound(_)) => service
             .db
             .get_conversation(slug_or_id)
             .await
@@ -1488,11 +1056,11 @@ fn resolve_conversation(conv: Conversation) -> ResolveGlobalReferenceResponse {
 }
 
 async fn resolve_message(
-    state: &AppState,
+    service: &GlobalReadService,
     conv: Conversation,
     message_id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let message = state
+    let message = service
         .db
         .get_message_by_id(message_id)
         .await
@@ -1529,20 +1097,20 @@ async fn resolve_message(
 }
 
 async fn resolve_chain(
-    state: &AppState,
+    service: &GlobalReadService,
     root_id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let root = state
+    let root = service
         .db
         .get_conversation(root_id)
         .await
         .map_err(map_db_not_found)?;
-    let members = state
+    let members = service
         .db
         .chain_members_forward(root_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let resolved_root = state
+    let resolved_root = service
         .db
         .chain_root_of(root_id)
         .await
@@ -1580,15 +1148,15 @@ async fn resolve_chain(
 }
 
 async fn resolve_work(
-    state: &AppState,
+    service: &GlobalReadService,
     id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let root = state
+    let root = service
         .db
         .get_conversation(id)
         .await
         .map_err(map_db_not_found)?;
-    let chain_root = state
+    let chain_root = service
         .db
         .chain_root_of(id)
         .await
@@ -1598,7 +1166,7 @@ async fn resolve_work(
             "work reference target not found".to_string(),
         ));
     }
-    let member_ids = state
+    let member_ids = service
         .db
         .chain_members_forward(id)
         .await
@@ -1607,7 +1175,7 @@ async fn resolve_work(
     if member_ids.len() >= 2 {
         for member_id in member_ids {
             members.push(
-                state
+                service
                     .db
                     .get_conversation(&member_id)
                     .await
@@ -1626,7 +1194,7 @@ async fn resolve_work(
     } else {
         "closed"
     };
-    let projects = state
+    let projects = service
         .db
         .list_projects()
         .await
@@ -1683,43 +1251,6 @@ fn map_db_not_found(e: DbError) -> AppError {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn parse_session_row(row: sqlx::sqlite::SqliteRow) -> Result<GlobalRecallSession, sqlx::Error> {
-    Ok(GlobalRecallSession {
-        id: row.try_get("id")?,
-        title: row.try_get("title")?,
-        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?, "created_at")?,
-        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
-    })
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn parse_message_with_ordinal_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<(i64, GlobalRecallMessage), sqlx::Error> {
-    let ordinal = row.try_get("ordinal")?;
-    Ok((ordinal, parse_message_row(row)?))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn parse_message_row(row: sqlx::sqlite::SqliteRow) -> Result<GlobalRecallMessage, sqlx::Error> {
-    Ok(GlobalRecallMessage {
-        id: row.try_get("id")?,
-        role: row.try_get("role")?,
-        content: row.try_get("content")?,
-        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?, "created_at")?,
-    })
-}
-
-fn parse_datetime(s: &str, column: &'static str) -> Result<DateTime<Utc>, sqlx::Error> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| sqlx::Error::ColumnDecode {
-            index: column.to_string(),
-            source: Box::new(e),
-        })
-}
-
 fn trim_chars(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in s.chars().enumerate() {
@@ -1744,7 +1275,6 @@ mod tests {
     use crate::state_machine::ConvState;
     use chrono::{Duration, Utc};
     use phoenix_core::llm_language::LlmLanguage;
-    use sqlx::Row;
 
     fn conversation(id: &str) -> Conversation {
         let now = Utc::now();
@@ -1843,62 +1373,6 @@ mod tests {
             format_open_work_for_agent(&page, 100),
             "Open work page offset 100\nhas_more: false\nnext_offset: none\nNo active work found.\n"
         );
-    }
-
-    #[tokio::test]
-    async fn multiple_sessions_keep_ordered_independent_turns() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
-        let now = Utc::now().to_rfc3339();
-        for id in ["session-a", "session-b"] {
-            sqlx::query(
-                "INSERT INTO global_recall_sessions (id, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)",
-            )
-            .bind(id)
-            .bind(id)
-            .bind(&now)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        }
-
-        super::insert_recall_turn(&db, "session-a", "question 1", "answer 1")
-            .await
-            .unwrap();
-        super::insert_recall_turn(&db, "session-b", "question b", "answer b")
-            .await
-            .unwrap();
-        super::insert_recall_turn(&db, "session-a", "question 2", "answer 2")
-            .await
-            .unwrap();
-
-        let rows = sqlx::query(
-            "SELECT ordinal, role, content FROM global_recall_messages
-             WHERE session_id = 'session-a' ORDER BY ordinal",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        let values: Vec<(i64, String, String)> = rows
-            .iter()
-            .map(|row| (row.get("ordinal"), row.get("role"), row.get("content")))
-            .collect();
-        assert_eq!(
-            values,
-            vec![
-                (0, "user".to_string(), "question 1".to_string()),
-                (1, "assistant".to_string(), "answer 1".to_string()),
-                (2, "user".to_string(), "question 2".to_string()),
-                (3, "assistant".to_string(), "answer 2".to_string()),
-            ]
-        );
-        let other_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM global_recall_messages WHERE session_id = 'session-b'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(other_count, 2);
     }
 
     #[test]

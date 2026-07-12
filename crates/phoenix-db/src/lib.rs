@@ -2397,6 +2397,9 @@ impl Database {
     }
 
     /// Resolve the singleton Coordinator, creating its standard-runtime row atomically.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction, insert, or conversation reload fails.
     pub async fn get_or_create_coordinator(
         &self,
         cwd: &str,
@@ -2413,7 +2416,8 @@ impl Database {
         } else {
             let id = uuid::Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
-            let idle = serde_json::to_string(&ConvState::Idle).unwrap();
+            let idle = serde_json::to_string(&ConvState::Idle)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
                  VALUES (?1, 'coordinator', 'Coordinator', ?2, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, 'phoenix-native', 'explore')",
@@ -2436,6 +2440,9 @@ impl Database {
     }
 
     /// Return the Coordinator conversation id when the singleton has been created.
+    ///
+    /// # Errors
+    /// Returns an error when the singleton relation cannot be queried.
     pub async fn coordinator_conversation_id(&self) -> DbResult<Option<String>> {
         sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
             .fetch_optional(&self.pool)
@@ -2444,6 +2451,9 @@ impl Database {
     }
 
     /// Whether this conversation is the singleton Coordinator.
+    ///
+    /// # Errors
+    /// Returns an error when the singleton relation cannot be queried.
     pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
         let found: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM coordinator WHERE singleton = 1 AND conversation_id = ?1",

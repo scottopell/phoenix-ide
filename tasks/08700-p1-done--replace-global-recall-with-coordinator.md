@@ -52,47 +52,17 @@ The transcript and composer should reuse the ordinary conversation experience ra
 
 ## Implementation snapshot
 
-This task is **not complete**. Commits `97974b6e` and the subsequent singleton-relation correction establish the Coordinator foundation but stop at the most important backend integration boundary.
+### Complete
 
-### Done
-
-- Added a normalized singleton `coordinator` relation whose checked primary key permits exactly one row and whose unique foreign key identifies an ordinary conversation as the Coordinator. Ordinary conversations carry no Coordinator discriminator or redundant `standard` value.
-- Added migration 041 creating that singleton relation and removing the unreleased `global_recall_sessions` / `global_recall_messages` tables.
-- Added `GET`/`POST /api/global/coordinator` to atomically resolve or create the singleton Coordinator conversation.
-- Routed the Coordinator through the standard conversation record, state machine, persistence, SSE transcript, and composer path.
-- Added a Coordinator-specific runtime registry selected by membership in the singleton relation rather than title, project nullability, or `ConvMode`.
-- Kept the Coordinator out of the ordinary conversation list and deterministic open-work projection.
-- Replaced the Recall session UI/API client with a Coordinator page and renamed the navigation entry.
-- Embedded the existing `ConversationPage` under `/global/:slug` so the normal transcript/composer remains on the same page as the fleet snapshot.
-- Added the compact expandable fleet view and UI coverage for its default/detail states.
-- Reframed `specs/global-recall/requirements.md` and `executive.md` around the Coordinator product.
-- Targeted Coordinator/Sidebar UI tests pass; `cargo check`, TypeScript compilation, formatting, and `git diff --check` pass.
-
-### Incomplete or incorrect
-
-- The Coordinator registry currently contains only `think`. It is read-only, but it does **not** yet expose the required global capabilities:
-  - deterministic fleet/open-work read
-  - global message search
-  - paged conversation read
-  - reference resolution
-- Those capabilities still exist as inline `ToolDefinition`/dispatch functions inside the retired bespoke Recall agent loop. They must become normal `Tool` implementations usable by the standard runtime. Until then, the Coordinator cannot perform its core job.
-- `api/global_recall.rs` still contains the dead Recall session structs, handlers, locks, persistence functions, synchronous LLM loop, inline tool dispatcher, and associated tests. Routes and frontend callers are gone, but the backend implementation has not been deleted or cleanly separated into reusable fleet/history services.
-- Coordinator-specific system guidance has not been added to the normal runtime prompt.
-- The in-page reuse mounts route-aware `ConversationPage` under `/global/:slug`. This is functional reuse rather than a clean shared conversation-surface extraction and needs browser QA for layout/provider/route assumptions.
-- Singleton identity and repeated get-or-create behavior are schema- and DB-tested, but concurrent callers and endpoint idempotence still lack dedicated tests.
-- Migration 041, normal-list exclusion, open-work exclusion, standard runtime resume/streaming, removed Recall routes, and Coordinator tool isolation lack focused regression tests.
-- A full `./dev.py check` has not passed for this implementation snapshot. Targeted compile/tests must be rerun after the singleton-relation correction, followed by the complete check.
-- The task was deliberately returned to `in-progress`; do not mark it done until the global tools are integrated, dead Recall code is removed, focused tests exist, browser QA is complete, and `./dev.py check` passes.
-
-### Recommended continuation sequence
-
-1. Extract the four global read capabilities from `api/global_recall.rs` into a host-bound service with narrow dependencies (`Database` plus `MessageRetriever` where required).
-2. Implement four standard runtime `Tool` types over that service and register exactly those tools plus `think` in `ToolRegistry::coordinator`; do not expose filesystem, browser, shell, task, sub-agent, MCP, or lifecycle mutation tools.
-3. Thread the host-bound service into runtime/tool construction without adding global data to ordinary `ToolContext` or making unsupported capabilities representable for normal conversations.
-4. Add Coordinator-specific system guidance covering fleet orientation, recommendation-only authority, and mandatory source citations.
-5. Delete all Recall session storage/API/agent-loop code and its obsolete tests; retain only the deterministic fleet endpoint/reference endpoint needed by UI or refactor them over the shared service.
-6. Add the missing DB/API/runtime/tool boundary tests, then run `./dev.py check`.
-7. Start the app and browser-QA `/global` for transcript streaming, sending/cancelling, compact/expanded fleet layout, navigation, refresh, and responsive behavior.
+- The normalized singleton `coordinator` relation identifies one ordinary persisted conversation without adding a discriminator to every conversation.
+- `/api/global/coordinator` resolves or creates that durable identity; removed Recall session routes return 404.
+- The Coordinator runs through the standard transcript, SSE, composer, persistence, context, and continuation machinery.
+- Its runtime registry contains only `think` plus four host-bound, read-only tools: deterministic fleet inspection, global message search, paged conversation reads, and durable reference resolution. MCP, filesystem, shell, browser, task mutation, lifecycle, and sub-agent tools are structurally absent.
+- Coordinator-specific system guidance establishes its fleet role, recommendation-only authority, citation behavior, deterministic-current-state preference, and on-demand operation.
+- Shared global reads live in `api/global_read.rs`; both HTTP endpoints and normal runtime tools use the same service over `Database` and `MessageRetriever`.
+- The bespoke Recall session storage handlers, locks, synchronous LLM loop, inline tool dispatcher, frontend session state, and obsolete tests are deleted. Migration 041 drops the unreleased Recall tables.
+- `/global` embeds the ordinary conversation surface beside the compact, expandable, responsive fleet snapshot and excludes the Coordinator from open work.
+- `./dev.py check` passes all 19 lanes. Browser QA verified stable singleton routing, the real composer, desktop/mobile fleet layout, detail expansion, API idempotence, and removed-route 404 behavior.
 
 ## Explicitly deferred
 
