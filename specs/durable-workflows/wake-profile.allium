@@ -1,0 +1,624 @@
+-- allium: 3
+-- Engine-backed wake profile: concrete mapping onto the durable workflow core.
+-- Core owns transition atomicity, claims, attempts, receipts, reducer delivery,
+-- generations, deadlines, and shadow safety. This profile owns wake-domain types,
+-- policy, schedules, reducer mapping, continuation, and protocol projection.
+
+use "./durable-workflows.allium" as dwf
+use "../wake-contracts/wake-contracts.allium" as wake
+use "../bedrock/bedrock.allium" as bedrock
+use "../bash/bash.allium" as bash
+use "../tmux-integration/tmux-integration.allium" as tmux
+
+------------------------------------------------------------
+-- Types
+------------------------------------------------------------
+
+enum WakeProtocolAuthority { legacy_wake | engine_wake | shadow_wake }
+enum WakeHandleKind { bash | tmux_window }
+enum WakeTerminalCause { fired | expired | cancelled | forgotten }
+enum WakeCancellationReason { explicit_cancel }
+enum WakeForgottenReason { handle_missing | runtime_unrecoverable_after_restart }
+enum BashTerminalStatus { exited | killed | kill_pending_kernel }
+enum TmuxTerminalStatus { exit_marker_observed | window_killed }
+enum WakeAcceptanceStatus { owed | accepted | suppressed }
+enum LifecycleFenceStatus { open | closed }
+enum WakeShadowComparisonKind {
+    registration | observation | terminal_receipt | inbox | acceptance | lifecycle
+}
+
+value WorkScopeIdentity {
+    kind: bash/WorkScopeKind
+    stable_key: String
+}
+
+value BashResourceIdentity {
+    work_scope: WorkScopeIdentity
+    handle_id: String
+}
+
+value TmuxResourceIdentity {
+    work_scope: WorkScopeIdentity
+    server_generation: String
+    window_id: String
+}
+
+value WakeResourceIdentity {
+    kind: WakeHandleKind
+    bash: BashResourceIdentity? when kind = bash
+    tmux_window: TmuxResourceIdentity? when kind = tmux_window
+}
+
+value WakeRegistrationIntent {
+    contract_id: String
+    conversation_id: String
+    registration_scope: WorkScopeIdentity
+    resource: WakeResourceIdentity
+    registering_tool_use_id: String
+    registered_at: Timestamp
+    expires_at: Timestamp
+}
+
+value ObserveHandleIntent {
+    contract_id: String
+    resource: WakeResourceIdentity
+    expires_at: Timestamp
+}
+
+value WakeRegistrationReceipt {
+    contract_id: String
+    resource: WakeResourceIdentity
+    expires_at: Timestamp
+    registering_tool_use_id: String
+}
+
+value BashTerminalEvidence {
+    status: BashTerminalStatus
+    occurred_at: Timestamp
+    exit_code: Integer?
+    duration_ms: Integer?
+    signal_number: Integer?
+    kill_signal_sent: bash/KillSignal?
+    final_tail: List<bash/RingLine>
+}
+
+value TmuxTerminalEvidence {
+    status: TmuxTerminalStatus
+    occurred_at: Timestamp
+    server_generation: String
+    exit_code: Integer?
+    duration_ms: Integer?
+    final_tail: List<String>
+}
+
+value WakeTerminalEvidence {
+    kind: WakeHandleKind
+    bash: BashTerminalEvidence? when kind = bash
+    tmux_window: TmuxTerminalEvidence? when kind = tmux_window
+}
+
+value WakeFiredPayload {
+    kind: WakeHandleKind
+    bash: BashTerminalEvidence? when kind = bash
+    tmux_window: TmuxTerminalEvidence? when kind = tmux_window
+}
+
+value WakeTerminalPayload {
+    contract_id: String
+    resource: WakeResourceIdentity
+    cause: WakeTerminalCause
+    fired: WakeFiredPayload? when cause = fired
+    cancellation_reason: WakeCancellationReason? when cause = cancelled
+    forgotten_reason: WakeForgottenReason? when cause = forgotten
+    resolved_at: Timestamp
+}
+
+value WakeBatchItem {
+    inbox_item_id: String
+    contract_id: String
+    terminal: WakeTerminalPayload
+    committed_at: Timestamp
+}
+
+value WakeAcceptancePayload {
+    obligation_id: String
+    conversation_id: String
+    snapshot_upper_bound: Integer
+    items: List<WakeBatchItem>
+}
+
+value WakeProtocolProjection {
+    contract_id: String
+    authority: WakeProtocolAuthority
+    registration: WakeRegistrationReceipt
+    terminal: WakeTerminalPayload?
+    inbox_item_id: String?
+    acceptance_obligation_id: String?
+}
+
+------------------------------------------------------------
+-- Actors and profile-owned entities
+------------------------------------------------------------
+
+actor WakeAgent { identified_by: bedrock/Conversation }
+actor WakeEffectAdapter {}
+actor WakeReducer {}
+actor WakeRuntime { identified_by: bedrock/Conversation }
+actor WakeContinuationManager {}
+actor WakeLifecycleManager {}
+actor WakeProtocolMirror {}
+
+entity WakeWorkflowBinding {
+    contract_id: String
+    workflow: dwf/Workflow
+    conversation: bedrock/Conversation
+    registration_scope: WorkScopeIdentity
+    resource: WakeResourceIdentity
+    expires_at: Timestamp
+    authority: WakeProtocolAuthority
+    observe_effect: dwf/Effect
+    lifecycle_fence: LifecycleFenceStatus
+
+    transitions lifecycle_fence {
+        open -> closed
+        terminal: closed
+    }
+}
+
+entity WakeObservationInboxItem {
+    id: String
+    binding: WakeWorkflowBinding
+    terminal_receipt: dwf/Receipt
+    terminal: WakeTerminalPayload
+    sequence: Integer
+    committed_at: Timestamp
+    consumed_at: Timestamp?
+}
+
+entity WakeRuntimeObligation {
+    id: String
+    conversation: bedrock/Conversation
+    payload: WakeAcceptancePayload
+    status: WakeAcceptanceStatus
+    created_at: Timestamp
+    accepted_at: Timestamp? when status = accepted
+    terminal_reason: String? when status = suppressed
+
+    transitions status {
+        owed -> accepted
+        owed -> suppressed
+        terminal: accepted, suppressed
+    }
+}
+
+entity WakeShadowParity {
+    binding: WakeWorkflowBinding
+    authoritative_contract_id: String
+    kind: WakeShadowComparisonKind
+    expected: WakeProtocolProjection
+    actual: WakeProtocolProjection
+    compared_at: Timestamp
+    equal: Boolean
+}
+
+config {
+    default_max_wait_seconds: Integer = 600
+    max_max_wait_seconds: Integer = 1800
+    max_acceptance_batch_items: Integer = 64
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- All helpers are pure predicates/projections unless an ensure names a durable fact.
+-- next_contract_id(), next_inbox_item_id(), next_obligation_id()
+-- wake_profile_ref(), wake_snapshot_codec(), wake_event_codec(), wake_effect_codec()
+-- resolve_work_scope(conversation), stable_scope_identity(scope)
+-- resource_is_owned_in_scope(resource, scope)
+-- resource_identity_is_stable(resource), resource_is_evaluable(resource)
+-- observe_effect_for(intent), registration_transition_for(intent, effect)
+-- workflow_and_effect_created_atomically(binding), receipt_returned_after_commit(binding)
+-- evidence_matches_resource(evidence, resource), evidence_occurrence_time(evidence)
+-- durable_terminal_evidence_at_or_before(binding, deadline)
+-- fired_payload_from(evidence), terminal_receipt_for(binding, payload)
+-- observable_reconciliation_applied(effect), no_external_replay_during_reconciliation(effect)
+-- cancellation_winner(binding), terminal_winner(binding)
+-- cancellation_compensation_plan(binding), compensation_does_not_kill_resource(binding)
+-- no_resume_scheduled_only_for_cancel(binding)
+-- reducer_event_for_wake_receipt(receipt), committed_sequence(receipt)
+-- undelivered_items_through(conversation, upper_bound)
+-- bounded_prefix(items, maximum), snapshot_upper_bound(conversation)
+-- exact_acceptance_payload(conversation, items, upper_bound)
+-- conversation_runtime_idle(conversation), conversation_runtime_busy(conversation)
+-- no_overlapping_llm_request(conversation), owed_items_remain_durable(conversation)
+-- accepting_llm_requesting_persisted_atomically(obligation)
+-- later_items_excluded_from(obligation), duplicate_acceptance_starts_no_llm(obligation)
+-- transferable_pending_bindings(predecessor), transferable_unconsumed_items(predecessor)
+-- transferable_unaccepted_obligations(predecessor)
+-- successor_safe_item_identity(item, successor)
+-- resource_scope_stable(predecessor, successor), exact_single_successor(predecessor, successor)
+-- transfer_is_atomic(predecessor, successor), predecessor_history_unchanged(predecessor)
+-- lifecycle_action_is_destructive(action), pending_wake_count(conversation)
+-- lifecycle_fence_serializes_with_registration(conversation)
+-- protocol_authority_for_new_registration(), authority_is_immutable(binding)
+-- legacy_projection(contract_id), engine_projection(binding)
+-- shadow_projection_has_no_execution_authority(binding)
+-- parity_compared_for_every_authoritative_fact(binding)
+
+------------------------------------------------------------
+-- Concrete schedules
+------------------------------------------------------------
+
+rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: requested_max_wait_seconds >= 1
+    requires: requested_max_wait_seconds <= config.max_max_wait_seconds
+    requires: resource.kind in {bash, tmux_window}
+    requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource_identity_is_stable(resource)
+    requires: protocol_authority_for_new_registration() = engine_wake
+    requires: not conversation.archived
+    requires: not conversation.is_terminal
+
+    let contract_id = next_contract_id()
+    let scope = stable_scope_identity(resolve_work_scope(conversation))
+    let expires_at = now() + requested_max_wait_seconds
+    let intent = WakeRegistrationIntent{
+        contract_id: contract_id, conversation_id: conversation.id,
+        registration_scope: scope, resource: resource,
+        registering_tool_use_id: tool_use_id, registered_at: now(), expires_at: expires_at
+    }
+    let observe = observe_effect_for(ObserveHandleIntent{
+        contract_id: contract_id, resource: resource, expires_at: expires_at
+    })
+
+    ensures: observe.role = required
+    ensures: observe.ambiguity_policy = observable_reconciliation
+    ensures: WakeWorkflowBinding.created(
+        contract_id: contract_id, conversation: conversation,
+        registration_scope: scope, resource: resource, expires_at: expires_at,
+        authority: engine_wake, observe_effect: observe, lifecycle_fence: open
+    )
+    ensures: registration_transition_for(intent, observe)
+    ensures: workflow_and_effect_created_atomically(WakeWorkflowBinding{contract_id: contract_id})
+    ensures: receipt_returned_after_commit(WakeWorkflowBinding{contract_id: contract_id})
+    ensures: WakeRegistrationSucceeded(WakeRegistrationReceipt{
+        contract_id: contract_id, resource: resource, expires_at: expires_at,
+        registering_tool_use_id: tool_use_id
+    })
+}
+
+rule RegistrationScheduleUsesDefaultBound {
+    when: WakeRegistrationRequested(agent, conversation, resource, omitted, tool_use_id)
+    requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    ensures: WakeRegistrationRequested(agent, conversation, resource,
+        config.default_max_wait_seconds, tool_use_id)
+}
+
+rule RegistrationRejectsForeignOrUnstableResource {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: not resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+        or not resource_identity_is_stable(resource)
+    ensures: WakeRegistrationRejected("wake_unauthorized_handle")
+    ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
+}
+
+rule EvidenceScheduleRecordsReconciliationObservation {
+    when: WakeTerminalEvidenceObserved(adapter, binding, evidence: WakeTerminalEvidence)
+    requires: binding.observe_effect.status not in {receipted, invalidated}
+    requires: evidence_matches_resource(evidence, binding.resource)
+    ensures: observable_reconciliation_applied(binding.observe_effect)
+    ensures: no_external_replay_during_reconciliation(binding.observe_effect)
+    ensures: WakeEvidenceRecorded(binding, evidence, evidence_occurrence_time(evidence))
+}
+
+rule EvidenceBeforeDeadlineWins {
+    when: WakeTerminalEvidenceObserved(adapter, binding, evidence: WakeTerminalEvidence)
+    requires: evidence_matches_resource(evidence, binding.resource)
+    requires: evidence_occurrence_time(evidence) <= binding.expires_at
+    requires: terminal_winner(binding) = evidence
+
+    let payload = WakeTerminalPayload{
+        contract_id: binding.contract_id, resource: binding.resource,
+        cause: fired, fired: fired_payload_from(evidence), resolved_at: now()
+    }
+    ensures: terminal_receipt_for(binding, payload)
+}
+
+rule DeadlineScheduleExpiresEvaluableResource {
+    when: WakeDeadlineDue(adapter, binding, now)
+    requires: now >= binding.expires_at
+    requires: not durable_terminal_evidence_at_or_before(binding, binding.expires_at)
+    requires: resource_is_evaluable(binding.resource)
+    requires: terminal_winner(binding) = deadline
+    ensures: terminal_receipt_for(binding, WakeTerminalPayload{
+        contract_id: binding.contract_id, resource: binding.resource,
+        cause: expired, resolved_at: now
+    })
+}
+
+rule DeadlineScheduleForgetsUnevaluableResource {
+    when: WakeDeadlineDue(adapter, binding, now)
+    requires: now >= binding.expires_at
+    requires: not durable_terminal_evidence_at_or_before(binding, binding.expires_at)
+    requires: not resource_is_evaluable(binding.resource)
+    requires: terminal_winner(binding) = forgotten
+    ensures: terminal_receipt_for(binding, WakeTerminalPayload{
+        contract_id: binding.contract_id, resource: binding.resource,
+        cause: forgotten, forgotten_reason: handle_missing, resolved_at: now
+    })
+}
+
+rule CancellationScheduleArbitratesAndCompensates {
+    when: WakeCancellationRequested(conversation, binding)
+    requires: binding.conversation = conversation
+    requires: binding.observe_effect.status not in {receipted, invalidated}
+    requires: cancellation_winner(binding) = explicit_cancel
+    ensures: WakeCancellationGenerationTransitionCommitted(binding)
+    ensures: cancellation_compensation_plan(binding)
+    ensures: compensation_does_not_kill_resource(binding)
+    ensures: terminal_receipt_for(binding, WakeTerminalPayload{
+        contract_id: binding.contract_id, resource: binding.resource,
+        cause: cancelled, cancellation_reason: explicit_cancel, resolved_at: now()
+    })
+    ensures: no_resume_scheduled_only_for_cancel(binding)
+}
+
+rule LosingCancellationIsIdempotent {
+    when: WakeCancellationRequested(conversation, binding)
+    requires: terminal_winner(binding) != explicit_cancel
+    ensures: WakeCancellationOutcome(already_terminal)
+    ensures: no_resume_scheduled_only_for_cancel(binding)
+}
+
+rule TerminalReceiptMaterializesDurableObservation {
+    when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
+    requires: receipt.effect = binding.observe_effect
+    requires: terminal.contract_id = binding.contract_id
+    requires: terminal.cause != cancelled
+    ensures: WakeObservationInboxItem.created(
+        id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
+        terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
+    )
+    ensures: WakeInboxSchedulingRequested(binding.conversation)
+}
+
+rule CancelledReceiptMaterializesWithoutAutoResume {
+    when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
+    requires: terminal.cause = cancelled
+    ensures: WakeObservationInboxItem.created(
+        id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
+        terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
+    )
+    ensures: no_resume_scheduled_only_for_cancel(binding)
+}
+
+rule IdleScheduleCreatesBoundedCoalescedObligation {
+    when: WakeInboxSchedulingRequested(conversation)
+    requires: conversation_runtime_idle(conversation)
+    requires: exists WakeObservationInboxItem{
+        binding: WakeWorkflowBinding{conversation: conversation}, consumed_at: null
+    }
+
+    let upper_bound = snapshot_upper_bound(conversation)
+    let eligible = undelivered_items_through(conversation, upper_bound)
+    let batch = bounded_prefix(eligible, config.max_acceptance_batch_items)
+    let obligation_id = next_obligation_id()
+    ensures: WakeRuntimeObligation.created(
+        id: obligation_id, conversation: conversation,
+        payload: exact_acceptance_payload(conversation, batch, upper_bound),
+        status: owed, created_at: now()
+    )
+    ensures: count(batch) >= 1
+    ensures: count(batch) <= config.max_acceptance_batch_items
+    ensures: AtMostOneOwedWakeRuntimeObligation(conversation)
+}
+
+rule BusyScheduleLeavesDeliveryOwed {
+    when: WakeInboxSchedulingRequested(conversation)
+    requires: conversation_runtime_busy(conversation)
+    ensures: owed_items_remain_durable(conversation)
+    ensures: no_overlapping_llm_request(conversation)
+    ensures: not WakeObservationInboxItem.consumed(binding: WakeWorkflowBinding{conversation: conversation})
+}
+
+rule RuntimeAcceptanceScheduleIsAtomic {
+    when: WakeRuntimeAcceptanceRequested(runtime, obligation)
+    requires: obligation.status = owed
+    requires: conversation_runtime_idle(obligation.conversation)
+    ensures: accepting_llm_requesting_persisted_atomically(obligation)
+    ensures: obligation.status = accepted
+    ensures: obligation.accepted_at = now()
+    ensures: WakeObservationInboxItemsConsumedExactly(obligation.payload.items)
+    ensures: later_items_excluded_from(obligation)
+    ensures: LlmInvocationPermittedAfterCommit(obligation.conversation)
+}
+
+rule DuplicateRuntimeAcceptanceStartsNothing {
+    when: WakeRuntimeAcceptanceRequested(runtime, obligation)
+    requires: obligation.status in {accepted, suppressed}
+    ensures: duplicate_acceptance_starts_no_llm(obligation)
+}
+
+rule ContinuationScheduleTransfersOutstandingWakeWork {
+    when: WakeContinuationRequested(manager, predecessor, successor)
+    requires: exact_single_successor(predecessor, successor)
+    requires: resource_scope_stable(predecessor, successor)
+    ensures: WakeBindingsTransferred(transferable_pending_bindings(predecessor), successor)
+    ensures: WakeInboxItemsTransferred(transferable_unconsumed_items(predecessor), successor,
+        successor_safe_item_identity)
+    ensures: WakeRuntimeObligationsTransferred(transferable_unaccepted_obligations(predecessor), successor)
+    ensures: transfer_is_atomic(predecessor, successor)
+    ensures: predecessor_history_unchanged(predecessor)
+    ensures: WakeRegistrationFenceClosed(predecessor)
+    ensures: WakeRegistrationFenceOpened(successor)
+}
+
+rule LifecycleScheduleClosesFenceWhenNoPendingWake {
+    when: DestructiveLifecycleRequested(manager, conversation, action)
+    requires: lifecycle_action_is_destructive(action)
+    requires: pending_wake_count(conversation) = 0
+    ensures: WakeLifecycleFenceClosed(conversation)
+    ensures: lifecycle_fence_serializes_with_registration(conversation)
+    ensures: DestructiveLifecycleMayProceed(conversation, action)
+}
+
+rule LifecycleScheduleRejectsWhileWakePending {
+    when: DestructiveLifecycleRequested(manager, conversation, action)
+    requires: lifecycle_action_is_destructive(action)
+    requires: pending_wake_count(conversation) > 0
+    ensures: DestructiveLifecycleRejected("wake_contract_pending")
+    ensures: not DestructiveLifecycleMayProceed(conversation, action)
+}
+
+rule LegacyProtocolRemainsAuthoritativeForStampedContract {
+    when: LegacyWakeFactCommitted(mirror, contract_id)
+    requires: legacy_projection(contract_id).authority = legacy_wake
+    ensures: LegacyWakeProtocolActsAuthoritatively(contract_id)
+    ensures: EngineWakeProtocolDoesNotActAuthoritatively(contract_id)
+    ensures: authority_is_immutable(contract_id)
+}
+
+rule EngineProtocolRemainsAuthoritativeForStampedWorkflow {
+    when: EngineWakeFactCommitted(mirror, binding)
+    requires: binding.authority = engine_wake
+    ensures: EngineWakeProtocolActsAuthoritatively(binding.contract_id)
+    ensures: LegacyWakeProtocolDoesNotActAuthoritatively(binding.contract_id)
+    ensures: authority_is_immutable(binding)
+}
+
+rule ShadowScheduleComparesWithoutAuthority {
+    when: WakeShadowComparisonRequested(mirror, binding, authoritative_contract_id, kind)
+    requires: binding.authority = shadow_wake
+    let expected = legacy_projection(authoritative_contract_id)
+    let actual = engine_projection(binding)
+    ensures: WakeShadowParity.created(
+        binding: binding, authoritative_contract_id: authoritative_contract_id,
+        kind: kind, expected: expected, actual: actual,
+        compared_at: now(), equal: expected = actual
+    )
+    ensures: shadow_projection_has_no_execution_authority(binding)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface WakeRegistrationSurface {
+    facing agent: WakeAgent
+    context conversation: bedrock/Conversation
+    provides:
+        WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds?, tool_use_id)
+}
+
+surface WakeEffectSurface {
+    facing adapter: WakeEffectAdapter
+    context binding: WakeWorkflowBinding
+    provides:
+        WakeTerminalEvidenceObserved(adapter, binding, evidence)
+        WakeDeadlineDue(adapter, binding, now)
+}
+
+surface WakeReducerSurface {
+    facing reducer: WakeReducer
+    context binding: WakeWorkflowBinding
+    provides:
+        WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
+        WakeInboxSchedulingRequested(conversation)
+}
+
+surface WakeRuntimeSurface {
+    facing runtime: WakeRuntime
+    context obligation: WakeRuntimeObligation
+    provides:
+        WakeRuntimeAcceptanceRequested(runtime, obligation)
+}
+
+surface WakeCancellationSurface {
+    facing agent: WakeAgent
+    context conversation: bedrock/Conversation
+    provides:
+        WakeCancellationRequested(conversation, binding)
+}
+
+surface WakeContinuationSurface {
+    facing manager: WakeContinuationManager
+    provides:
+        WakeContinuationRequested(manager, predecessor, successor)
+}
+
+surface WakeLifecycleSurface {
+    facing manager: WakeLifecycleManager
+    context conversation: bedrock/Conversation
+    provides:
+        DestructiveLifecycleRequested(manager, conversation, action)
+}
+
+surface WakeProtocolParitySurface {
+    facing mirror: WakeProtocolMirror
+    provides:
+        LegacyWakeFactCommitted(mirror, contract_id)
+        EngineWakeFactCommitted(mirror, binding)
+        WakeShadowComparisonRequested(mirror, binding, authoritative_contract_id, kind)
+}
+
+------------------------------------------------------------
+-- Profile invariants
+------------------------------------------------------------
+
+invariant RegistrationCommitsObserveEffectBeforeReceipt {
+    every_successful_wake_registration_has_one_authoritative_workflow_and_one_required_observe_effect_before_receipt
+}
+
+invariant WorkScopeAuthorizesStableResourceIdentity {
+    every_wake_binding_preserves_registration_scope_and_addresses_exactly_one_resource_in_that_scope
+}
+
+invariant WakeObservationUsesObservableReconciliation {
+    every_observe_handle_effect_uses_observable_reconciliation_without_blind_external_replay
+}
+
+invariant EvidenceTimestampPrecedesSchedulerTime {
+    terminal_evidence_occurring_at_or_before_deadline_wins_over_later_deadline_observation
+}
+
+invariant OneTypedTerminalReceiptPerContract {
+    every_wake_binding_has_at_most_one_terminal_receipt_with_exactly_one_structural_cause_payload
+}
+
+invariant CancellationDoesNotResumeOrKillWatchedWork {
+    explicit_wake_cancellation_neither_auto_resumes_nor_terminates_the_watched_resource
+}
+
+invariant ObservationInboxIsDurableAndSingular {
+    every_nonpending_terminal_contract_has_exactly_one_durable_observation_inbox_item
+}
+
+invariant AcceptanceIsBoundedOrderedAndCoalesced {
+    every_wake_acceptance_payload_is_a_nonempty_committed_order_prefix_within_the_batch_bound
+}
+
+invariant BusyWakeRemainsOwed {
+    busy_arrivals_remain_durable_and_unconsumed_without_overlapping_llm_execution
+}
+
+invariant LlmRequestingAndAcceptanceAreAtomic {
+    no_llm_invocation_can_begin_without_the_exact_obligation_and_llm_requesting_state_committed_together
+}
+
+invariant ContinuationTransfersOnlyOutstandingSemanticWork {
+    each_pending_binding_unconsumed_item_and_unaccepted_obligation_moves_once_to_one_successor_with_stable_resource_scope
+}
+
+invariant LifecycleFenceSerializesWithRegistration {
+    destructive_lifecycle_and_new_wake_registration_cannot_both_commit_across_the_same_open_fence
+}
+
+invariant OneWakeProtocolAuthority {
+    every_contract_is_forever_owned_by_exactly_one_of_legacy_wake_or_engine_wake_and_shadow_wake_never_executes
+}
+
+invariant ShadowParityCoversAuthoritativeFacts {
+    parity_compared_for_every_authoritative_fact
+}
