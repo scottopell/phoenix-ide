@@ -376,6 +376,7 @@ pub struct EffectInvalidationDecl {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwedAcceptanceDecl<E> {
+    pub reducer_inbox_id: ReducerInboxId,
     pub source_kind: &'static str,
     pub event: E,
 }
