@@ -2113,11 +2113,28 @@ struct GetConversationQuery {
     after_sequence: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StreamInitMode {
+    Full,
+    MessagesAfterFloor,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct StreamConversationQuery {
     after_event_sequence: Option<i64>,
     #[allow(dead_code)]
     after_sequence: Option<i64>,
+    init_mode: Option<StreamInitMode>,
+    after_message_floor: Option<i64>,
+    transcript_generation: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamDbMessageSelection {
+    Full,
+    AfterFloor(i64),
+    None,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2290,6 +2307,76 @@ fn build_messages_around_response(
     }
 }
 
+fn message_starts_render_unit(message: &crate::db::Message) -> bool {
+    matches!(
+        message.message_type,
+        crate::db::MessageType::User
+            | crate::db::MessageType::Agent
+            | crate::db::MessageType::Skill
+    )
+}
+
+async fn align_slice_start_to_render_unit(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    messages: &mut Vec<crate::db::Message>,
+) -> Result<(), AppError> {
+    while let Some(first) = messages.first() {
+        if message_starts_render_unit(first) {
+            break;
+        }
+
+        let mut previous = db
+            .get_messages_before(conversation_id, first.sequence_id, 1)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let Some(previous) = previous.pop() else {
+            break;
+        };
+        messages.insert(0, previous);
+    }
+    Ok(())
+}
+
+async fn get_latest_aligned_messages(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    limit: i64,
+) -> Result<(Vec<crate::db::Message>, bool), AppError> {
+    let requested_count = usize::try_from(limit)
+        .map_err(|_| AppError::BadRequest("limit is too large for this server".to_string()))?;
+    let mut messages = db
+        .get_latest_messages(conversation_id, limit + 1)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let has_older_messages = messages.len() > requested_count;
+    if has_older_messages {
+        messages.remove(0);
+    }
+    align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
+    Ok((messages, has_older_messages))
+}
+
+async fn get_messages_before_aligned(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    before: i64,
+    limit: i64,
+) -> Result<(Vec<crate::db::Message>, bool), AppError> {
+    let requested_count = usize::try_from(limit)
+        .map_err(|_| AppError::BadRequest("limit is too large for this server".to_string()))?;
+    let mut messages = db
+        .get_messages_before(conversation_id, before, limit + 1)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let has_older_messages = messages.len() > requested_count;
+    if has_older_messages {
+        messages.remove(0);
+    }
+    align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
+    Ok((messages, has_older_messages))
+}
+
 async fn get_server_message_tail(
     db: &crate::db::Database,
     conversation_id: &str,
@@ -2314,16 +2401,7 @@ async fn get_conversation_messages_latest(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let limit = validate_message_history_limit("limit", query.limit, 100)?;
     let db = state.runtime.db();
-    let requested_count = usize::try_from(limit)
-        .map_err(|_| AppError::BadRequest("limit is too large for this server".to_string()))?;
-    let mut messages = db
-        .get_latest_messages(&id, limit + 1)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let has_older_messages = messages.len() > requested_count;
-    if has_older_messages {
-        messages.remove(0);
-    }
+    let (messages, has_older_messages) = get_latest_aligned_messages(db, &id, limit).await?;
     let server_message_tail = get_server_message_tail(db, &id).await?;
     Ok(Json(build_message_slice_response(
         &messages,
@@ -2354,17 +2432,8 @@ async fn get_conversation_messages(
         )),
         (Some(before), None) => {
             let db = state.runtime.db();
-            let requested_count = usize::try_from(limit).map_err(|_| {
-                AppError::BadRequest("limit is too large for this server".to_string())
-            })?;
-            let mut messages = db
-                .get_messages_before(&id, before, limit + 1)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            let has_older_messages = messages.len() > requested_count;
-            if has_older_messages {
-                messages.remove(0);
-            }
+            let (messages, has_older_messages) =
+                get_messages_before_aligned(db, &id, before, limit).await?;
             let server_message_tail = get_server_message_tail(db, &id).await?;
             Ok(Json(build_message_slice_response(
                 &messages,
@@ -2688,15 +2757,28 @@ fn snapshot_pending_for_stream(
     }
 }
 
-fn can_omit_db_messages_for_stream(
+fn db_message_selection_for_stream(
     cursor_replay_served: bool,
     query: &StreamConversationQuery,
     last_sequence_id: i64,
-) -> bool {
-    cursor_replay_served
+    transcript_generation: i64,
+) -> StreamDbMessageSelection {
+    if cursor_replay_served
         && query
             .after_event_sequence
             .is_some_and(|after_event_sequence| after_event_sequence >= last_sequence_id)
+    {
+        return StreamDbMessageSelection::None;
+    }
+
+    match (query.init_mode, query.after_message_floor) {
+        (Some(StreamInitMode::MessagesAfterFloor), Some(after_floor))
+            if query.transcript_generation == Some(transcript_generation) =>
+        {
+            StreamDbMessageSelection::AfterFloor(after_floor)
+        }
+        _ => StreamDbMessageSelection::Full,
+    }
 }
 
 fn stream_state_starts_runtime(state: &ConvState) -> bool {
@@ -2770,22 +2852,32 @@ async fn stream_conversation(
         cursor_replay_served,
     ) = snapshot_pending_for_stream(&broadcast_tx, &query);
 
-    let can_omit_db_messages =
-        can_omit_db_messages_for_stream(cursor_replay_served, &query, last_sequence_id);
-    let messages = if can_omit_db_messages {
-        Vec::new()
-    } else {
-        state
+    let db_message_selection = db_message_selection_for_stream(
+        cursor_replay_served,
+        &query,
+        last_sequence_id,
+        conversation.transcript_generation,
+    );
+    let messages = match db_message_selection {
+        StreamDbMessageSelection::None => Vec::new(),
+        StreamDbMessageSelection::Full => state
             .runtime
             .db()
             .get_messages(&id)
             .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+        StreamDbMessageSelection::AfterFloor(after_floor) => state
+            .runtime
+            .db()
+            .get_messages_after(&id, after_floor)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     };
-    let highest_message_seq = if can_omit_db_messages {
-        last_sequence_id
-    } else {
-        messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
+    let highest_message_seq = match db_message_selection {
+        StreamDbMessageSelection::None => last_sequence_id,
+        StreamDbMessageSelection::Full | StreamDbMessageSelection::AfterFloor(_) => {
+            messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
+        }
     };
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
@@ -2793,7 +2885,7 @@ async fn stream_conversation(
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = if can_omit_db_messages {
+    let context_window_size = if matches!(db_message_selection, StreamDbMessageSelection::None) {
         state
             .runtime
             .db()
@@ -6815,6 +6907,193 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn latest_message_slice_aligns_to_agent_turn_boundary_without_losing_has_older() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-latest-turn",
+                "history-latest-turn",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+
+        state
+            .db
+            .add_message(
+                "turn-user-1",
+                "conv-history-latest-turn",
+                &crate::db::MessageContent::user("before"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user 1");
+        state
+            .db
+            .add_message(
+                "turn-user-2",
+                "conv-history-latest-turn",
+                &crate::db::MessageContent::user("prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user 2");
+        state
+            .db
+            .add_message(
+                "turn-agent",
+                "conv-history-latest-turn",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-a".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "foo"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add agent");
+        state
+            .db
+            .add_message(
+                "turn-tool",
+                "conv-history-latest-turn",
+                &crate::db::MessageContent::tool("tool-a", "tool output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("add tool");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-history-latest-turn".to_string()),
+            Query(LatestMessagesQuery { limit: Some(2) }),
+        )
+        .await
+        .expect("latest messages");
+
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn before_message_slice_aligns_to_agent_turn_boundary_without_losing_has_older() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-before-turn",
+                "history-before-turn",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+
+        state
+            .db
+            .add_message(
+                "before-user-1",
+                "conv-history-before-turn",
+                &crate::db::MessageContent::user("older"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user 1");
+        state
+            .db
+            .add_message(
+                "before-user-2",
+                "conv-history-before-turn",
+                &crate::db::MessageContent::user("prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user 2");
+        state
+            .db
+            .add_message(
+                "before-agent",
+                "conv-history-before-turn",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-b".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "bar"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add agent");
+        state
+            .db
+            .add_message(
+                "before-tool",
+                "conv-history-before-turn",
+                &crate::db::MessageContent::tool("tool-b", "tool output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("add tool");
+        state
+            .db
+            .add_message(
+                "before-user-3",
+                "conv-history-before-turn",
+                &crate::db::MessageContent::user("tail"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user 3");
+
+        let Json(before) = get_conversation_messages(
+            State(state),
+            Path("conv-history-before-turn".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: Some(5),
+                after_message_sequence: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("before messages");
+
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(before.has_older_messages);
+    }
+
+    #[tokio::test]
     async fn message_history_before_after_and_around_use_explicit_query_names() {
         let state = make_test_state().await;
         state
@@ -7013,6 +7292,9 @@ pub(crate) mod hard_delete_cascade_tests {
             &StreamConversationQuery {
                 after_event_sequence: Some(persisted.sequence_id + 1),
                 after_sequence: Some(999_999),
+                init_mode: None,
+                after_message_floor: None,
+                transcript_generation: None,
             },
         );
 
@@ -7033,30 +7315,100 @@ pub(crate) mod hard_delete_cascade_tests {
 
     #[test]
     fn cursored_stream_omits_db_messages_only_when_cursor_covers_db_tail() {
-        assert!(can_omit_db_messages_for_stream(
-            true,
-            &StreamConversationQuery {
-                after_event_sequence: Some(10),
-                after_sequence: None,
-            },
-            10,
-        ));
-        assert!(!can_omit_db_messages_for_stream(
-            true,
-            &StreamConversationQuery {
-                after_event_sequence: Some(9),
-                after_sequence: None,
-            },
-            10,
-        ));
-        assert!(!can_omit_db_messages_for_stream(
-            false,
-            &StreamConversationQuery {
-                after_event_sequence: Some(10),
-                after_sequence: None,
-            },
-            10,
-        ));
+        assert_eq!(
+            db_message_selection_for_stream(
+                true,
+                &StreamConversationQuery {
+                    after_event_sequence: Some(10),
+                    after_sequence: None,
+                    init_mode: None,
+                    after_message_floor: None,
+                    transcript_generation: None,
+                },
+                10,
+                1,
+            ),
+            StreamDbMessageSelection::None
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                true,
+                &StreamConversationQuery {
+                    after_event_sequence: Some(9),
+                    after_sequence: None,
+                    init_mode: None,
+                    after_message_floor: None,
+                    transcript_generation: None,
+                },
+                10,
+                1,
+            ),
+            StreamDbMessageSelection::Full
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                false,
+                &StreamConversationQuery {
+                    after_event_sequence: Some(10),
+                    after_sequence: None,
+                    init_mode: None,
+                    after_message_floor: None,
+                    transcript_generation: None,
+                },
+                10,
+                1,
+            ),
+            StreamDbMessageSelection::Full
+        );
+    }
+
+    #[test]
+    fn demand_driven_stream_modes_select_db_messages_by_rest_floor() {
+        assert_eq!(
+            db_message_selection_for_stream(
+                false,
+                &StreamConversationQuery {
+                    after_event_sequence: None,
+                    after_sequence: None,
+                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
+                    after_message_floor: Some(50),
+                    transcript_generation: Some(3),
+                },
+                75,
+                3,
+            ),
+            StreamDbMessageSelection::AfterFloor(50)
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                false,
+                &StreamConversationQuery {
+                    after_event_sequence: None,
+                    after_sequence: None,
+                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
+                    after_message_floor: Some(50),
+                    transcript_generation: Some(2),
+                },
+                75,
+                3,
+            ),
+            StreamDbMessageSelection::Full
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                false,
+                &StreamConversationQuery {
+                    after_event_sequence: None,
+                    after_sequence: None,
+                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
+                    after_message_floor: None,
+                    transcript_generation: Some(3),
+                },
+                75,
+                3,
+            ),
+            StreamDbMessageSelection::Full
+        );
     }
 
     #[tokio::test]

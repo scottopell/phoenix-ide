@@ -141,6 +141,34 @@ describe('history expansion reducer', () => {
     expect(state.failure).toBeNull();
   });
 
+  it('creates a navigation command for a target already present in tail coverage', () => {
+    const currentView = view('a', 1);
+    const state = initialHistoryExpansionState(currentView, true);
+    const next = reduceHistoryExpansion(state, {
+      type: 'loaded_target_requested',
+      targetMessageId: 'm42',
+      commandToken: 7,
+    });
+
+    expect(next.coverage).toBe('tail');
+    expect(next.pendingCommand?.kind).toBe('jump_to_message');
+  });
+
+  it('does not reissue a known failed deep-link target', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, false),
+      failure: { kind: 'target_not_found' as const, targetMessageId: 'm42' },
+    };
+    const next = reduceHistoryExpansion(state, {
+      type: 'loaded_target_requested',
+      targetMessageId: 'm42',
+      commandToken: 7,
+    });
+
+    expect(next).toBe(state);
+  });
+
   it('failure leaves tail coverage usable and cannot retry itself', () => {
     const currentView = view('a', 1);
     const request = deepLinkRequest(currentView);

@@ -188,6 +188,7 @@ export interface InitPayload {
     *  applied unseen events contiguously across the missing gap. */
 
   pendingTruncated: boolean;
+  messageSnapshot?: 'full' | 'suffix';
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
@@ -1053,8 +1054,9 @@ export function conversationReducer(
       // `specs/conversation_atom/conversation_atom.allium`.
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
       const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
+      const mergesMessageSuffix = p.messageSnapshot === 'suffix' && !generationChanged;
       let mergedMessages: Message[];
-      if (!isFreshConnect) {
+      if (!isFreshConnect || mergesMessageSuffix) {
         const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
         const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
         const existingIds = new Set(atom.messages.map((m) => m.message_id));

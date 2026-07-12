@@ -141,15 +141,37 @@ export interface ConnectionInfo {
   retryNow: () => void;
 }
 
+export type InitialSseRequestMode =
+  | { kind: 'full' }
+  | { kind: 'messages_after_floor'; afterMessageFloor: number; transcriptGeneration: number };
+
+
 interface UseConnectionOptions {
   conversationId: string | undefined;
   /** Dispatch SSE events directly to the conversation atom. */
   dispatch: Dispatch<SSEAction>;
   /** Latest event-sequence cursor already applied by the atom, if any. */
   getLastAppliedEventSeq?: () => number;
+  /** Optional demand-driven cold-load mode used only before an event cursor exists. */
+  getInitialRequestMode?: () => InitialSseRequestMode;
 }
 
-function transformInitData(raw: SseInitData): InitPayload {
+function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode): string {
+  const params = new URLSearchParams();
+  if (lastAppliedEventSeq > 0) {
+    params.set('after_event_sequence', String(lastAppliedEventSeq));
+  } else if (initialRequestMode?.kind === 'messages_after_floor') {
+    params.set('init_mode', 'messages_after_floor');
+    params.set('after_message_floor', String(initialRequestMode.afterMessageFloor));
+    params.set('transcript_generation', String(initialRequestMode.transcriptGeneration));
+  }
+  const query = params.toString();
+  return query.length > 0
+    ? `/api/conversations/${conversationId}/stream?${query}`
+    : `/api/conversations/${conversationId}/stream`;
+}
+
+function transformInitData(raw: SseInitData, requestMode?: InitialSseRequestMode): InitPayload {
   const conversation = raw.project_name != null
     ? { ...raw.conversation, project_name: raw.project_name }
     : raw.conversation;
@@ -168,6 +190,10 @@ function transformInitData(raw: SseInitData): InitPayload {
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
+    messageSnapshot: requestMode?.kind === 'messages_after_floor'
+      && requestMode.transcriptGeneration === raw.transcript_generation
+      ? 'suffix'
+      : 'full',
   };
 }
 
@@ -185,6 +211,7 @@ export function useConnection({
   conversationId,
   dispatch,
   getLastAppliedEventSeq,
+  getInitialRequestMode,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -208,6 +235,7 @@ export function useConnection({
   const latestConversationRef = useRef<import('../api').Conversation | null>(null);
   const latestPhaseRef = useRef<import('../api').ConversationState | null>(null);
   const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
+  const getInitialRequestModeRef = useRef(getInitialRequestMode);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -220,6 +248,10 @@ export function useConnection({
   useEffect(() => {
     getLastAppliedEventSeqRef.current = getLastAppliedEventSeq;
   }, [getLastAppliedEventSeq]);
+
+  useEffect(() => {
+    getInitialRequestModeRef.current = getInitialRequestMode;
+  }, [getInitialRequestMode]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -261,9 +293,10 @@ export function useConnection({
           dispatchRef.current({ type: 'connection_opened', epoch });
 
           const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
-          const url = lastAppliedEventSeq > 0
-            ? `/api/conversations/${convId}/stream?after_event_sequence=${lastAppliedEventSeq}`
-            : `/api/conversations/${convId}/stream`;
+          const initialRequestMode = lastAppliedEventSeq > 0
+            ? undefined
+            : getInitialRequestModeRef.current?.();
+          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode);
           const es = new EventSource(url);
           eventSourceRef.current = es;
           const isCurrentOwner = () =>
@@ -299,7 +332,7 @@ export function useConnection({
             if (!res.ok) return;
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
-            const payload = transformInitData(res.data);
+            const payload = transformInitData(res.data, initialRequestMode);
             latestConversationRef.current = payload.conversation;
             latestPhaseRef.current = payload.phase;
             stampedDispatch({

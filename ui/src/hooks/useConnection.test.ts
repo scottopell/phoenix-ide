@@ -140,6 +140,37 @@ describe('useConnection epoch stamping (task 08683)', () => {
     );
   });
 
+  it('uses demand-driven init query params before an event cursor exists', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
+    }));
+
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      '/api/conversations/conv-A/stream?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3',
+    );
+  });
+
+  it('prefers the replay cursor over demand-driven init params once live event ordering exists', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      getLastAppliedEventSeq: () => 42,
+      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
+    }));
+
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    );
+  });
+
   it('stamps every wire-derived dispatch with the connection epoch', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

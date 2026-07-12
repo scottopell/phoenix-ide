@@ -578,6 +578,13 @@ function ConversationPageContent() {
     conversationId,
     dispatch,
     getLastAppliedEventSeq: () => eventCursorRef.current,
+    getInitialRequestMode: () => {
+      const latestLoadedMessageSeq = latestMessageSequenceId(atomRef.current.messages);
+      if (latestLoadedMessageSeq === null) return { kind: 'full' };
+      const transcriptGeneration = atomRef.current.transcriptGeneration;
+      if (transcriptGeneration === null) return { kind: 'full' };
+      return { kind: 'messages_after_floor', afterMessageFloor: latestLoadedMessageSeq, transcriptGeneration };
+    },
   });
 
   const isOffline =
@@ -895,30 +902,37 @@ function ConversationPageContent() {
   }, [slug, conversationId, historyExpansion, targetMessageId, dispatch, eventCursorRef]);
 
   const requestedLoadedTargetRef = useRef<string | null>(null);
+  const loadedTargetPresent = targetMessageId
+    ? atom.messages.some((message) => message.message_id === targetMessageId)
+    : false;
+  const loadedTargetRequestKey = targetMessageId
+    ? `${historyExpansion.view.conversationId}:${historyExpansion.view.generation}:${historyExpansion.view.transcriptGeneration}:${targetMessageId}`
+    : null;
   useEffect(() => {
-    if (!targetMessageId) {
+    if (!loadedTargetRequestKey) {
       requestedLoadedTargetRef.current = null;
       return;
     }
     if (
-      historyExpansion.coverage === 'complete'
+      (historyExpansion.coverage === 'complete' || loadedTargetPresent)
       && !historyExpansion.pendingCommand
-      && requestedLoadedTargetRef.current !== targetMessageId
+      && !historyExpansion.failure
+      && requestedLoadedTargetRef.current !== loadedTargetRequestKey
     ) {
-      requestedLoadedTargetRef.current = targetMessageId;
+      requestedLoadedTargetRef.current = loadedTargetRequestKey;
       dispatchHistoryExpansion({
         type: 'loaded_target_requested',
-        targetMessageId,
+        targetMessageId: targetMessageId!,
         commandToken: ++historyCommandTokenRef.current,
       });
     }
-  }, [targetMessageId, historyExpansion.coverage, historyExpansion.pendingCommand]);
+  }, [targetMessageId, loadedTargetPresent, loadedTargetRequestKey, historyExpansion.coverage, historyExpansion.pendingCommand, historyExpansion.failure]);
 
   useEffect(() => {
-    if (targetMessageId && historyExpansion.coverage === 'tail' && !historyExpansion.activeRequest && !historyExpansion.failure) {
+    if (targetMessageId && !loadedTargetPresent && historyExpansion.coverage === 'tail' && !historyExpansion.activeRequest && !historyExpansion.failure) {
       void loadOlderMessages();
     }
-  }, [targetMessageId, historyExpansion, loadOlderMessages]);
+  }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessages]);
 
   const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
     dispatchHistoryExpansion({
@@ -935,32 +949,25 @@ function ConversationPageContent() {
 
     const confirmArchiveStatus = async () => {
       try {
-        const snapshotStartedAtEventSeq = eventCursorRef.current;
-        const result = await getConversationForRoute(slug);
-        if (cancelled) return;
-        const replacesDifferentConversation = atomRef.current.conversationId !== null
-          && atomRef.current.conversationId !== result.conversation.id;
+        const result = await getConversationMetaForRoute(slug);
+        if (cancelled || result.conversation.id !== atomRef.current.conversationId) return;
         dispatch({
-          type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
-          reset: replacesDifferentConversation,
+          type: 'merge_conversation_data',
           conversationId: result.conversation.id,
           conversation: result.conversation,
-          messages: result.messages,
+          messages: [],
           phase: result.conversation.state
             ? parseConversationState(result.conversation.state)
             : result.presentation_mode === 'working'
               ? { type: 'awaiting_llm' }
               : { type: 'idle' },
-          contextWindow: {
-            used: result.context_window_size || 0,
-          },
-          transcriptGeneration: result.conversation.transcript_generation ?? 1,
-          eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
-          snapshotStartedAtEventSeq,
+          contextWindow: { used: result.context_window_size || 0 },
+          transcriptGeneration: atomRef.current.transcriptGeneration ?? result.conversation.transcript_generation ?? 1,
+          eventCursorFloor: eventCursorRef.current,
+          snapshotStartedAtEventSeq: eventCursorRef.current,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);
-        await cacheDB.putMessages(result.messages);
       } catch (err) {
         if (!cancelled) console.warn('Failed to confirm archive status:', err);
       }

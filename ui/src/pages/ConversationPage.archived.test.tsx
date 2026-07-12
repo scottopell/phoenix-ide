@@ -53,11 +53,15 @@ vi.mock('../cache', () => ({
   },
 }));
 
+const hooksMockState = vi.hoisted(() => ({
+  useConnection: vi.fn(() => ({ state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn() })),
+}));
+
 vi.mock('../hooks', async () => {
   const actual = await vi.importActual<typeof import('../hooks')>('../hooks');
   return {
     ...actual,
-    useConnection: () => ({ state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn() }),
+    useConnection: hooksMockState.useConnection,
     useIsDesktop: () => viewportFlags.isDesktop,
     useIsWideDesktop: () => viewportFlags.isWideDesktop,
   };
@@ -291,7 +295,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
   });
 
-  it('falls back to authoritative slug fetch when cached slug owner changed', async () => {
+  it('uses authoritative metadata when the cached slug owner changed', async () => {
     const staleConversation = makeConversation({ id: 'stale-conv' });
     const authoritativeConversation = makeConversation({ id: 'authoritative-conv' });
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
@@ -340,8 +344,9 @@ describe('ConversationPage archived read-only rendering', () => {
     );
 
     await waitFor(() => {
-      expect(api.getConversationBySlug).toHaveBeenCalledWith(slug);
+      expect(api.getConversationMetaBySlug).toHaveBeenCalledWith(slug);
     });
+    expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
   it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
@@ -395,7 +400,7 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
-  it('uses the id fetch path when UUID-route archive confirmation refreshes full data', async () => {
+  it('uses the id metadata path for UUID-route archive confirmation', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-expand', archived: false });
     vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
@@ -425,9 +430,54 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
     await waitFor(() => {
-      expect(api.getConversation).toHaveBeenCalledWith(uuidRoute);
+      expect(api.getConversationMeta).toHaveBeenCalledWith(uuidRoute);
     });
+    expect(api.getConversation).not.toHaveBeenCalled();
     expect(api.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+  });
+
+  it('requests a generation-bound SSE suffix for an initialized message tail', async () => {
+    const store = new ConversationStore();
+    const conversation = makeConversation({ transcript_generation: 1 });
+    const latestWindowMessage = {
+      ...catchUpMessage,
+      message_id: 'm-latest-only',
+      sequence_id: 2,
+      content: [{ type: 'text', text: 'latest-window message' }],
+    } as Message;
+    store.dispatch(slug, {
+      type: 'set_initial_data',
+      conversationId,
+      conversation,
+      messages: [historyMessage, latestWindowMessage],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+      transcriptGeneration: 1,
+    });
+
+    render(
+      <ConversationContext.Provider value={store}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    await waitFor(() => expect(hooksMockState.useConnection).toHaveBeenCalled());
+    const options = (hooksMockState.useConnection.mock.calls as unknown as Array<[unknown]>).at(-1)![0] as {
+      getInitialRequestMode?: () => { kind: string; afterMessageFloor?: number; transcriptGeneration?: number };
+    };
+    expect(options.getInitialRequestMode?.()).toEqual({
+      kind: 'messages_after_floor',
+      afterMessageFloor: 2,
+      transcriptGeneration: 1,
+    });
   });
 
   it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {

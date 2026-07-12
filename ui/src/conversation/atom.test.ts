@@ -107,6 +107,40 @@ describe('conversationReducer', () => {
       expect(next.messages).toHaveLength(2);
     });
 
+    it('merges a generation-matched suffix into a REST tail on first SSE connect', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: 3,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([40, 50, 51]);
+    });
+
+    it('replaces a REST tail when the SSE transcript generation changed', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: 2,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(1)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1]);
+    });
+
     it('clears streaming buffer on init', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

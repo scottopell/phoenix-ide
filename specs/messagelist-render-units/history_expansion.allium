@@ -61,6 +61,7 @@ surface HistoryExpansionController {
         ViewChanged(view, conversation_id, view_generation, transcript_generation)
         ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
+        LoadedTargetRequested(view, command_token, target_message_id)
         HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
         HistoryLoadFailed(view, request_token, view_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
@@ -87,6 +88,21 @@ rule ViewChangeInvalidatesOutstandingWork {
     ensures: view.active_request = null
     ensures: view.pending_command = null
     ensures: view.failure = null
+}
+
+rule LoadedTargetCreatesNavigationCommandWithoutExpandingCoverage {
+    when: LoadedTargetRequested(view, command_token, target_message_id)
+    requires: view.pending_command = null
+    requires: view.failure = null
+    ensures: view.pending_command = ScrollCommand(
+        view: view,
+        token: command_token,
+        request_token: "",
+        kind: jump_to_message,
+        message_id: target_message_id,
+        issued_view_generation: view.view_generation
+    )
+    ensures: view.coverage = view.coverage
 }
 
 rule ManualExpansionStartsOneRequest {

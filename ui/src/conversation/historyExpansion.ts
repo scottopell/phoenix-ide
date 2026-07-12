@@ -97,7 +97,7 @@ export function reduceHistoryExpansion(
       return initialHistoryExpansionState(event.view, event.hasEarlierHistory);
 
     case 'loaded_target_requested':
-      if (state.coverage !== 'complete' || state.pendingCommand) return state;
+      if (state.pendingCommand || state.failure) return state;
       return {
         ...state,
         pendingCommand: {
