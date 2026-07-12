@@ -78,8 +78,10 @@ THE SYSTEM SHALL reject cyclic effect dependencies. An effect SHALL become
 eligible only after every declared dependency has a compatible terminal receipt.
 Independent eligible effects MAY execute concurrently.
 
-A completion barrier SHALL be satisfied only by compatible receipts for all and
-only its declared required members. Optional effects SHALL NOT delay required
+A completion barrier SHALL be satisfied only by receipts from the current workflow
+generation, for the same declared effect, and in the receipt family declared by the
+profile for all and only its normalized required-member rows. Compensation receipts
+SHALL satisfy only compensation barriers and SHALL NOT substitute for required work. Optional effects SHALL NOT delay required
 completion and MAY continue afterward. Product completion SHALL occur only when
 the reducer accepts the barrier-derived event; barrier satisfaction alone is
 execution truth, not product meaning.
@@ -103,7 +105,8 @@ evidence when useful and SHALL NOT mutate current execution or product state.
 
 THE SYSTEM SHALL append an immutable attempt before or as a claimed execution
 begins, append immutable typed observations for external facts, and persist at
-most one accepted terminal typed receipt for an effect.
+most one accepted terminal typed receipt for an effect. The receipt and exactly one
+normalized reducer-delivery artifact SHALL commit atomically.
 
 An observation SHALL describe evidence without asserting product success. A
 receipt SHALL describe the engine's accepted terminal execution outcome and MAY
@@ -243,6 +246,69 @@ and codec rejection.
 THE verification SHALL check authority, atomicity, dependency, receipt, barrier,
 and singular-authority invariants after every operation and retain minimized
 counterexamples as regressions.
+
+### REQ-DWF-019: Protocol Admission and Drain Proof
+
+WHEN a profile protocol is registered
+THE SYSTEM SHALL durably register its profile, protocol version, semantic authority,
+executor, lossless codecs, runtime-acceptance capability, and acceptance selector
+before that protocol can accept work.
+
+THE selector SHALL designate exactly one active protocol for each new authoritative
+acceptance. Rollback SHALL switch only future acceptance and SHALL permit legacy and
+engine protocols to coexist while each accepted workflow retains its original
+semantic authority. Draining SHALL atomically close new acceptance while retaining
+its executor and codecs.
+
+THE drain proof SHALL query, by profile and protocol, exactly these blocking
+categories: nonterminal workflows, nonterminal effects, live or renewable claims,
+pending reducer deliveries, owed runtime acceptances, unresolved manual resolutions,
+and incomplete required or compensation barriers. Retirement SHALL require zero
+rows in every category and an operator-readable report identifying the query,
+protocol, authority, counts, and blocking identities.
+
+### REQ-DWF-020: Divergence Classification and Operator Action
+
+EVERY shadow divergence SHALL have a typed severity of blocking, actionable, or
+informational and a typed required action of halt acceptance, retain authority and
+investigate, or record only. Snapshot, transition, effect-plan, receipt,
+reducer-event, capability, and user-projection differences that can change user
+semantics SHALL be blocking.
+
+THE SYSTEM SHALL expose the authoritative and shadow protocol, compared workflow,
+typed divergence kind, severity, codec versions, evidence identity, required action,
+and resolution state to operators. A blocking divergence SHALL prevent authority
+cutover and SHALL halt new engine acceptance when discovered after cutover until an
+operator explicitly selects rollback or reauthorization.
+
+### REQ-DWF-021: Evidence-Based Authority Cutover
+
+WHEN engine authority is selected for new wake registrations or creation requests
+THE SYSTEM SHALL require zero unresolved blocking divergences across all required
+deterministic fault schedules and representative production schedule classes,
+lossless codec and rollback-selector verification, mixed-authority user-semantic
+parity, and explicit operator authorization.
+
+Required deterministic classes SHALL include concurrency, duplicate and reordered
+kicks, lease expiry and takeover, stale results, restart at every commit boundary,
+ambiguous outcomes, cancellation and compensation, reducer redelivery, runtime
+acceptance duplication, and codec rejection. Required production classes SHALL
+include each supported substrate, profile mode, protocol version, lifecycle path,
+and contention class observed by that profile. Elapsed soak time alone SHALL NOT
+satisfy the gate.
+
+A new profile SHALL NOT be admitted until its typed codecs, ambiguity policies,
+barrier receipt families, runtime-acceptance capability, deterministic schedule
+suite, production schedule-class inventory, selector rollback, drain query, and
+operator explainability surfaces are registered and verified.
+
+### REQ-DWF-022: Mixed-Authority Semantic Parity
+
+WHILE legacy-authoritative and engine-authoritative workflows coexist
+THE SYSTEM SHALL present identical user semantics for equivalent accepted intent,
+including visible state, capabilities, cancellation and retry meaning, lifecycle
+guards, terminal outcomes, and operator explanations. Protocol identity MAY be
+shown diagnostically but SHALL NOT alter product meaning.
 
 ## Wake Profile
 

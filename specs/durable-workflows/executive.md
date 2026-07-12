@@ -14,10 +14,12 @@ comparison and a versioned acceptance cutover.
 
 ## Current Reality
 
-The normative requirements and architectural decisions are specified. Existing
-wake and creation implementations remain their respective execution authorities
-until an engine-backed protocol is selected for new acceptances. No durable
-workflow Allium model is part of this specification pass.
+The normative requirements, architectural decisions, and Allium package are
+specified. The package comprises the profile-neutral
+`durable-workflows.allium`, `wake-profile.allium`, and `creation-profile.allium`.
+Existing wake and creation implementations remain their respective execution
+authorities until the evidence-based gate authorizes an engine-backed selector for
+new acceptances.
 
 ## Delivery Sequence
 
@@ -39,6 +41,10 @@ workflow Allium model is part of this specification pass.
 | REQ-DWF-010–012 deadlines, cancellation, manual resolution | Specified | Virtual-time schedules; cancellation transaction; operator flow |
 | REQ-DWF-013–017 capabilities, versions, migration, acceptance | Specified | API/runtime projection tests; shadow/cutover/drain tests |
 | REQ-DWF-018 deterministic verification | Specified | Property schedules with checked-in minimized regressions |
+| REQ-DWF-019 protocol admission and exact drain proof | Specified | Selector/registration transactions; category-complete drain query |
+| REQ-DWF-020 divergence severity and operator action | Specified | Typed divergence records; operator explanation and halt tests |
+| REQ-DWF-021 evidence-based wake/creation cutover | Specified | Required deterministic and production schedule classes; authorization audit |
+| REQ-DWF-022 mixed-authority semantic parity | Specified | Cross-protocol product projection and capability comparisons |
 | REQ-DWF-WAKE-001–005 wake profile | Specified | Bash/tmux registration-to-resume end-to-end campaigns |
 | REQ-DWF-CREATE-001–005 creation profile | Specified | Shell-first creation, Git/resource, cancel/delete campaigns |
 
@@ -54,8 +60,10 @@ workflow Allium model is part of this specification pass.
 
 ## Implementation Gate
 
-Engine-backed authority is not selected for new profile work until deterministic
-fault schedules, real persistence contention/restart tests, profile parity, codec
-compatibility, and reversible acceptance selection pass with no unresolved
-semantic divergence. Accepted legacy and engine versions drain under their own
-executors; no in-flight translation is permitted.
+Engine-backed authority is not selected for new wake or creation work until every
+required deterministic and representative production schedule class has zero
+unresolved blocking divergence, codec and reversible-selector checks pass,
+mixed-authority user semantics match, and an operator explicitly authorizes the
+cutover. Elapsed soak duration is not evidence. Accepted legacy and engine versions
+drain under retained executors/codecs; retirement requires the category-complete
+zero-row drain report, and no in-flight translation is permitted.

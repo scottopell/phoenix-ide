@@ -12,7 +12,13 @@
 -- Types
 ------------------------------------------------------------
 
-enum SemanticAuthority { legacy_protocol | engine_protocol | shadow }
+enum SemanticAuthority { legacy_protocol | engine_protocol }
+enum ExecutionMode { authoritative | shadow }
+enum ProtocolSelectionStatus { accepting | drained }
+enum DeliveryStatus { pending | consumed }
+enum SuppressionReason { cancelled | superseded | lifecycle_terminal | operator_rejected }
+enum ReceiptFamily { current_generation_effect | compensation_effect }
+enum ManualChoiceKind { adopt | retry | compensate | fail | suppress }
 enum WorkflowStatus { active | cancelling | cancelled | deletion_pending | completed | failed }
 enum EffectRole { required | optional | compensation }
 enum AmbiguityPolicy {
@@ -28,8 +34,11 @@ enum EffectStatus {
 enum AttemptStatus { begun | observation_recorded | receipt_accepted | authority_lost }
 enum ReceiptOrigin { execution | adoption | reconciliation | manual }
 enum BarrierStatus { waiting | satisfied }
-enum InboxStatus { owed | accepted | suppressed }
+enum AcceptanceStatus { owed | accepted | suppressed }
 enum ResolutionStatus { required | resolved }
+enum DivergenceSeverity { blocking | actionable | informational }
+enum DivergenceAction { halt_acceptance | retain_authority_and_investigate | record_only }
+
 enum ShadowDivergenceKind {
     snapshot | transition | effect_plan | observation | receipt | reducer_event | projection
 }
@@ -85,7 +94,30 @@ value DependencyDeclaration {
 
 value BarrierDeclaration {
     barrier_id: String
-    required_effect_ids: String
+}
+
+
+value BarrierMemberDeclaration {
+    barrier_id: String
+    effect_id: String
+    receipt_family: ReceiptFamily
+}
+
+value EffectInvalidationDeclaration {
+    effect_id: String
+}
+
+value OwedAcceptanceDeclaration {
+    source_kind: String
+    event_codec: CodecRef
+    event_payload: String
+}
+
+value ManualChoiceDeclaration {
+    choice_id: String
+    kind: ManualChoiceKind
+    codec: CodecRef
+    payload: String
 }
 
 value TransitionPlan {
@@ -96,8 +128,9 @@ value TransitionPlan {
     effects: EffectDeclaration
     dependencies: DependencyDeclaration
     barriers: BarrierDeclaration
-    invalidated_effect_ids: String
-    owed_acceptance_payloads: String
+    barrier_members: BarrierMemberDeclaration
+    invalidations: EffectInvalidationDeclaration
+    owed_acceptances: OwedAcceptanceDeclaration
 }
 
 value ReducerDecision {
@@ -105,10 +138,6 @@ value ReducerDecision {
     plan: TransitionPlan
 }
 
-value ManualChoice {
-    choice_codec: CodecRef
-    choice_payload: String
-}
 
 ------------------------------------------------------------
 -- Actors
@@ -127,10 +156,32 @@ actor ProfileRegistry {}
 -- Entities
 ------------------------------------------------------------
 
+entity ProfileProtocolSelection {
+    profile: ProfileRef
+    authority: SemanticAuthority
+    accepting: Boolean
+    runtime_acceptance_enabled: Boolean
+    registered_at: Timestamp
+    drained_at: Timestamp? when accepting = false
+}
+
+entity ProfileCodec {
+    selection: ProfileProtocolSelection
+    codec: CodecRef
+}
+
+entity ProfileExecutor {
+    selection: ProfileProtocolSelection
+    executor_kind: String
+}
+
 entity Workflow {
     id: String
     profile: ProfileRef
     authority: SemanticAuthority
+    execution_mode: ExecutionMode
+    authoritative_workflow: Workflow? when execution_mode = shadow
+    protocol_selection: ProfileProtocolSelection
     version: Integer
     generation: Integer
     status: WorkflowStatus
@@ -267,16 +318,17 @@ entity ReducerInbox {
     barrier: Barrier?
     event_codec: CodecRef
     event_payload: String
-    delivered_at: Timestamp?
+    delivery_status: DeliveryStatus
+    consumed_by: Transition? when delivery_status = consumed
 }
 
 entity OwedAcceptance {
     id: String
     workflow: Workflow
     reducer_inbox: ReducerInbox
-    status: InboxStatus
+    status: AcceptanceStatus
     accepting_transition: Transition? when status = accepted
-    terminal_reason: String? when status = suppressed
+    suppression_reason: SuppressionReason? when status = suppressed
 
     transitions status {
         owed -> accepted
@@ -290,9 +342,9 @@ entity ManualResolution {
     workflow: Workflow
     effect: Effect
     status: ResolutionStatus
-    evidence: String
-    permitted_choices: String
-    choice: ManualChoice? when status = resolved
+    evidence_codec: CodecRef
+    evidence_payload: String
+    accepted_choice: ManualResolutionChoice? when status = resolved
     resolved_by: ResolutionOperator? when status = resolved
 
     transitions status {
@@ -301,11 +353,22 @@ entity ManualResolution {
     }
 }
 
+entity ManualResolutionChoice {
+    id: String
+    resolution: ManualResolution
+    kind: ManualChoiceKind
+    codec: CodecRef
+    payload: String
+}
+
 entity ShadowDivergence {
     id: String
     shadow_workflow: Workflow
-    authoritative_workflow_id: String
+    authoritative_workflow: Workflow
     kind: ShadowDivergenceKind
+    severity: DivergenceSeverity
+    required_action: DivergenceAction
+    resolved_at: Timestamp?
     expected_codec: CodecRef
     expected_payload: String
     actual_codec: CodecRef
@@ -349,7 +412,7 @@ entity ShadowDivergence {
 -- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
--- shadow_matches_authoritative_input(shadow, authoritative_workflow_id)
+-- shadow_matches_authoritative_input(shadow, authoritative_workflow)
 -- shadow_has_no_execution_authority(workflow)
 -- no_authoritative_work_remains(profile)
 -- kicks_are_optimization_only, durable_rows_suffice_after_restart
@@ -358,19 +421,51 @@ entity ShadowDivergence {
 -- Acceptance and transition rules
 ------------------------------------------------------------
 
-rule AcceptWorkflow {
-    when: WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+rule RegisterProfileProtocol {
+    when: ProfileRegistrationRequested(profile, authority, codecs, executor)
+    requires: not protocol_selection_exists(profile, authority)
+    requires: codecs_are_lossless_and_complete(profile, codecs)
+    ensures: ProfileProtocolSelection.created(
+        profile: profile, authority: authority, accepting: false,
+        runtime_acceptance_enabled: profile_declares_runtime_acceptance(profile),
+        registered_at: now()
+    )
+    ensures: ProfileCodecsAndExecutorPersisted(profile, authority, codecs, executor)
+}
 
-    requires: authority in {legacy_protocol, engine_protocol, shadow}
-    requires: profile_registered(profile)
-    requires: profile_accepting_new_work(profile)
+rule SelectProfileProtocolForAcceptance {
+    when: ProfileAcceptanceSelectionRequested(registry, selection)
+    requires: selection.accepting = false
+    requires: profile_executor_and_codecs_available(selection)
+    ensures: ExactlyOneAcceptingSelectionPersistedAtomically(selection.profile, selection)
+}
+
+rule DrainProfileProtocol {
+    when: ProfileDrainRequested(selection)
+    requires: selection.accepting = true
+    ensures: selection.accepting = false
+    ensures: selection.drained_at = now()
+    ensures: ProfileAcceptanceClosedAtomically(selection)
+    ensures: ProfileCodecsAndExecutorRetained(selection)
+}
+
+rule AcceptWorkflow {
+    when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
+
+    let selection = accepting_selection_for(profile)
+    requires: selection.accepting = true
+    requires: execution_mode in {authoritative, shadow}
+    requires: execution_mode = authoritative or authoritative_workflow != null
     requires: profile_has_lossless_decoder(profile, snapshot_codec)
     requires: profile_executor_available(profile)
 
     ensures: Workflow.created(
         id: next_workflow_id(),
         profile: profile,
-        authority: authority,
+        authority: selection.authority,
+        execution_mode: execution_mode,
+        authoritative_workflow: authoritative_workflow,
+        protocol_selection: selection,
         version: 0,
         generation: 0,
         status: active,
@@ -382,7 +477,7 @@ rule AcceptWorkflow {
 }
 
 rule RejectUnsupportedWorkflowCodec {
-    when: WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+    when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
     requires: not profile_has_lossless_decoder(profile, snapshot_codec)
              or not profile_executor_available(profile)
     ensures: AcceptanceOutcome(unsupported_codec)
@@ -392,7 +487,7 @@ rule RejectUnsupportedWorkflowCodec {
 rule CommitReducerPlan {
     when: ReducerPlanCommitRequested(reducer, workflow, decision)
 
-    requires: workflow.authority = engine_protocol
+    requires: workflow.authority = engine_protocol and workflow.execution_mode = authoritative
     requires: decision.expected_workflow_version = workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
     requires: plan_codecs_supported(workflow.profile, decision.plan)
@@ -462,7 +557,7 @@ rule DependenciesMakeEffectEligible {
 
 rule ClaimEligibleEffect {
     when: EffectClaimRequested(worker, effect, lease_until)
-    requires: effect.workflow.authority = engine_protocol
+    requires: effect.workflow.authority = engine_protocol and effect.workflow.execution_mode = authoritative
     requires: effect.status = eligible
     requires: effect.generation = effect.workflow.generation
     requires: lease_until > now()
@@ -551,6 +646,7 @@ rule AcceptTerminalReceipt {
     requires: accepted_receipt_count(effect) = 0
     requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     requires: origin in {execution, adoption, reconciliation}
+    ensures: ReceiptAndExactlyOneReducerInboxCommittedAtomically(effect)
     ensures: Receipt.created(
         id: next_receipt_id(), effect: effect, attempt: attempt,
         codec: codec, payload: payload, origin: origin,
@@ -589,7 +685,9 @@ rule RequireManualResolution {
     ensures: ManualResolution.created(
         id: next_manual_resolution_id(), workflow: effect.workflow,
         effect: effect, status: required,
-        evidence: evidence_for(effect), permitted_choices: permitted_choices_for(effect)
+        evidence_codec: evidence_codec_for(effect), evidence_payload: evidence_for(effect)
+    )
+    ensures: PermittedManualChoicesPersisted(ManualResolution{effect: effect}, permitted_choice_declarations_for(effect)
     )
     ensures: dependency_path_stopped(effect)
 }
@@ -649,14 +747,14 @@ rule CommitManualResolution {
     requires: manual_choice_permitted(resolution, choice)
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
-    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.choice_codec)
+    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
     requires: accepted_receipt_count(resolution.effect) = 0
     ensures: resolution.status = resolved
-    ensures: resolution.choice = choice
+    ensures: resolution.accepted_choice = choice
     ensures: resolution.resolved_by = operator
     ensures: Receipt.created(
         id: next_receipt_id(), effect: resolution.effect,
-        codec: choice.choice_codec, payload: choice.choice_payload,
+        codec: choice.codec, payload: choice.payload,
         origin: manual, accepted_at: now(),
         generation: resolution.workflow.generation
     )
@@ -692,12 +790,13 @@ rule SatisfyCompletionBarrier {
 
 rule ReducerAcceptsInboxEvent {
     when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
-    requires: inbox.workflow.authority = engine_protocol
-    requires: inbox.delivered_at = null
+    requires: inbox.workflow.authority = engine_protocol and inbox.workflow.execution_mode = authoritative
+    requires: inbox.delivery_status = pending
     requires: decision.expected_workflow_version = inbox.workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
     ensures: ReducerPlanCommitRequested(reducer, inbox.workflow, decision)
-    ensures: inbox.delivered_at = now()
+    ensures: inbox.delivery_status = consumed
+    ensures: inbox.consumed_by = latest_transition(inbox.workflow)
 }
 
 rule RuntimeAcceptsOwedAcceptance {
@@ -730,23 +829,25 @@ rule RejectAbsentCapability {
 }
 
 rule MirrorAuthoritativeFactIntoShadow {
-    when: ShadowMirrorRequested(mirror, shadow, authoritative_workflow_id, fact_codec, fact_payload)
-    requires: shadow.authority = shadow
-    requires: shadow_matches_authoritative_input(shadow, authoritative_workflow_id)
+    when: ShadowMirrorRequested(mirror, shadow, authoritative_workflow, fact_codec, fact_payload)
+    requires: shadow.execution_mode = shadow
+    requires: shadow_matches_authoritative_input(shadow, authoritative_workflow)
     requires: profile_has_lossless_decoder(shadow.profile, fact_codec)
-    ensures: ShadowFactMirrored(shadow, authoritative_workflow_id, fact_codec, fact_payload)
+    ensures: ShadowFactMirrored(shadow, authoritative_workflow, fact_codec, fact_payload)
     ensures: shadow_has_no_execution_authority(shadow)
 }
 
 rule RecordShadowDivergence {
-    when: ShadowComparisonCompleted(shadow, authoritative_workflow_id, kind,
+    when: ShadowComparisonCompleted(shadow, authoritative_workflow, kind,
                                     expected_codec, expected_payload,
                                     actual_codec, actual_payload)
-    requires: shadow.authority = shadow
+    requires: shadow.execution_mode = shadow
     requires: expected_payload != actual_payload or expected_codec != actual_codec
     ensures: ShadowDivergence.created(
         id: next_shadow_divergence_id(), shadow_workflow: shadow,
-        authoritative_workflow_id: authoritative_workflow_id, kind: kind,
+        authoritative_workflow: authoritative_workflow, kind: kind,
+        severity: divergence_severity(kind),
+        required_action: divergence_action(kind), resolved_at: null,
         expected_codec: expected_codec, expected_payload: expected_payload,
         actual_codec: actual_codec, actual_payload: actual_payload,
         recorded_at: now()
@@ -761,7 +862,7 @@ rule RecordShadowDivergence {
 surface WorkflowAcceptanceSurface {
     facing user: WorkflowClient
     provides:
-        WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+        WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
 }
 
 surface ReducerCommitSurface {
@@ -830,8 +931,8 @@ surface ShadowMirrorSurface {
     facing user: ShadowMirror
     context shadow: Workflow
     provides:
-        ShadowMirrorRequested(mirror, shadow, authoritative_workflow_id, fact_codec, fact_payload)
-        ShadowComparisonCompleted(shadow, authoritative_workflow_id, kind,
+        ShadowMirrorRequested(mirror, shadow, authoritative_workflow, fact_codec, fact_payload)
+        ShadowComparisonCompleted(shadow, authoritative_workflow, kind,
                                   expected_codec, expected_payload,
                                   actual_codec, actual_payload)
 }
@@ -839,8 +940,9 @@ surface ShadowMirrorSurface {
 surface ProfileRegistrationSurface {
     facing user: ProfileRegistry
     provides:
-        ProfileRegistrationRequested(profile, supported_codecs, ambiguity_policies, executor)
-        ProfileDrainRequested(profile)
+        ProfileRegistrationRequested(profile, authority, codecs, executor)
+        ProfileAcceptanceSelectionRequested(registry, selection)
+        ProfileDrainRequested(selection)
 }
 
 ------------------------------------------------------------
@@ -892,6 +994,34 @@ invariant ShadowCannotActAuthoritatively {
     every_shadow_is_unable_to_claim_execute_reduce_or_publish
 }
 
+invariant OpaquePayloadsAreCodecAggregates {
+    every_payload_string_is_an_indivisible_codec_versioned_aggregate_and_is_never_queried_field_wise
+}
+
+invariant ReceiptCreatesExactlyOneDeliveryArtifactAtomically {
+    every_accepted_receipt_is_committed_atomically_with_exactly_one_reducer_inbox
+}
+
+invariant ReducerDeliveryAndRuntimeAcceptanceAreDisjoint {
+    reducer_inbox_delivery_state_is_owned_only_by_reducer_consumption_and_owed_acceptance_state_is_owned_only_by_runtime_acceptance
+}
+
+invariant ProfileAcceptanceCapabilityIsStructural {
+    every_consumed_reducer_inbox_for_a_profile_without_runtime_acceptance_has_no_owed_acceptance_and_every_consumed_reducer_inbox_for_a_profile_with_runtime_acceptance_creates_exactly_one_owed_acceptance_atomically
+}
+
+invariant BarrierReceiptCompatibilityIsTyped {
+    every_satisfied_barrier_member_has_a_receipt_for_the_current_workflow_generation_for_the_same_effect_and_the_profile_declared_receipt_family
+}
+
+invariant CompensationCannotSatisfyRequiredWork {
+    compensation_receipts_satisfy_only_compensation_barriers_and_never_substitute_for_required_effect_receipts
+}
+
+invariant ShadowReferencesAuthorityWithoutBeingAuthority {
+    every_shadow_workflow_references_exactly_one_authoritative_workflow_and_no_shadow_value_inhabits_semantic_authority
+}
+
 invariant ProtocolDrainPreservesAuthority {
-    profile_retirement_requires_no_authoritative_work_and_no_owed_acceptance
+    draining_closes_new_acceptance_atomically_and_retains_executors_and_codecs_until_no_nonterminal_effect_reducer_inbox_or_owed_acceptance_remains
 }

@@ -38,6 +38,11 @@ scheduled runtime, the engine core may persist a normalized owed-acceptance reco
 acceptance is complete only in the transaction that persists the exact accepting
 product state. Profiles without this boundary do not create synthetic acceptance
 records.
+Receipt acceptance atomically creates exactly one reducer inbox row. Reducer
+inbox progression has its own pending/consumed delivery state and does not share a
+status or timestamp with runtime acceptance. Reducer consumption either ends there
+for a profile without the capability or atomically creates one typed owed-acceptance
+row for a profile that declares it. Suppression uses a typed reason.
 
 Wake uses the capability for coalesced resume requests and continuation transfer.
 Creation uses observations and receipts but owes runtime acceptance only for a

@@ -38,6 +38,18 @@ effects and dependency rows, claims and leases, attempts, observations, receipts
 barriers, deadlines, and scheduling. Queryable authority never depends on JSON
 extraction. Typed profiles own domain state and families without duplicating core
 facts. The existing product reducer remains the sole semantic authority.
+Core plan collections are normalized declaration rows rather than encoded string
+lists. The only opaque strings are profile-owned, codec-versioned aggregates that
+are read and written whole and never queried field-wise. Semantic authority
+(`legacy_protocol` or `engine_protocol`) is distinct from execution mode
+(`authoritative` or `shadow`); a shadow references its authoritative workflow and
+cannot inhabit the authority field.
+
+Each profile/protocol has a durable acceptance selection carrying authority,
+executor, codecs, and whether it accepts new work. Acceptance consumes the one
+active selection. Draining atomically closes acceptance but retains executors and
+codecs for accepted work; rollback selects a different protocol only for future
+work.
 
 Wake is the first authoritative engine profile after shadow parity. Conversation
 creation follows under a separate protocol selection and drain. This adoption

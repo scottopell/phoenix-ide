@@ -39,6 +39,12 @@ Every effect family declares exactly one ambiguity policy: observable
 reconciliation, externally enforced idempotency, safe repeatability, or manual
 resolution. Lease expiry enables takeover but never proves external failure.
 Destructive profile effects also acquire their physical resource lock.
+Barrier membership is a normalized typed contract: a receipt satisfies a member
+only when it belongs to the current generation, the same effect, and the receipt
+family declared by the profile. Compensation has separate membership and cannot
+stand in for required forward work. Manual resolution persists normalized permitted
+choice rows with kind and codec; resolution references the accepted row rather than
+copying an untyped choice payload.
 
 ## Consequences
 
