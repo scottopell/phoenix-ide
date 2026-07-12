@@ -53,6 +53,7 @@ export type HistoryExpansionState = {
 export type HistoryExpansionEvent =
   | { type: 'view_changed'; view: HistoryView; hasEarlierHistory: boolean }
   | { type: 'request_started'; request: ActiveHistoryRequest }
+  | { type: 'target_changed'; targetMessageId: string | null }
   | { type: 'loaded_target_requested'; targetMessageId: string; commandToken: HistoryCommandToken }
   | {
       type: 'history_loaded';
@@ -95,6 +96,13 @@ export function reduceHistoryExpansion(
   switch (event.type) {
     case 'view_changed':
       return initialHistoryExpansionState(event.view, event.hasEarlierHistory);
+
+    case 'target_changed':
+      if (
+        state.failure?.kind === 'target_not_found'
+        && state.failure.targetMessageId !== event.targetMessageId
+      ) return { ...state, failure: null };
+      return state;
 
     case 'loaded_target_requested':
       if (state.pendingCommand || state.failure) return state;

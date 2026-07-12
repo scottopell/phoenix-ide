@@ -62,6 +62,7 @@ surface HistoryExpansionController {
         ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
         LoadedTargetRequested(view, command_token, target_message_id)
+        DeepLinkTargetChanged(view, target_message_id)
         HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
         HistoryLoadFailed(view, request_token, view_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
@@ -87,6 +88,14 @@ rule ViewChangeInvalidatesOutstandingWork {
     ensures: view.transcript_generation = transcript_generation
     ensures: view.active_request = null
     ensures: view.pending_command = null
+    ensures: view.failure = null
+}
+
+rule ChangedDeepLinkClearsOnlyItsStaleMissingTargetFailure {
+    when: DeepLinkTargetChanged(view, target_message_id)
+    requires: view.failure != null
+    requires: view.failure.kind = target_not_found
+    requires: view.failure.message != target_message_id
     ensures: view.failure = null
 }
 

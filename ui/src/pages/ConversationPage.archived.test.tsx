@@ -349,6 +349,38 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
+  it('preserves complete coverage when the cache already starts at the transcript beginning', async () => {
+    const cachedConversation = makeConversation();
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage, catchUpMessage]);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: false,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    await waitFor(() => expect(api.getConversationMessagesLatest).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: 'Load older messages' })).not.toBeInTheDocument();
+  });
+
   it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
     const cachedConversation = makeConversation();
     const message3 = { ...catchUpMessage, message_id: 'm3', sequence_id: 3, content: [{ type: 'text', text: 'middle message' }] } as Message;
@@ -538,20 +570,21 @@ describe('ConversationPage archived read-only rendering', () => {
       content: [{ type: 'text', text: 'wrong conversation history' }],
     } as Message;
 
+    const partialHistoryMessage = { ...historyMessage, sequence_id: 2 } as Message;
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([partialHistoryMessage]);
     vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
       messages: [],
       tombstones: [],
       transcript_generation: 1,
-      server_message_tail: 1,
+      server_message_tail: 2,
       has_older_messages: true,
     });
     vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
-      messages: [historyMessage],
+      messages: [partialHistoryMessage],
       tombstones: [],
       transcript_generation: 1,
-      server_message_tail: 1,
+      server_message_tail: 2,
       has_older_messages: true,
     });
     vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({

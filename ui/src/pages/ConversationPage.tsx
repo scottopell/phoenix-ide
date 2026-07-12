@@ -725,6 +725,9 @@ function ConversationPageContent() {
                   atomRef.current.conversationId === null
                   || atomRef.current.conversationId === authoritativeConversation.id
                 ) {
+                  const cachedStartsAtTranscriptBeginning = mergedMessages.some(
+                    (message) => message.sequence_id === 1,
+                  );
                   dispatchHistoryExpansion({
                     type: 'view_changed',
                     view: {
@@ -732,7 +735,7 @@ function ConversationPageContent() {
                       generation: historyGenerationRef.current,
                       transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
                     },
-                    hasEarlierHistory: latestWindow.has_older_messages,
+                    hasEarlierHistory: latestWindow.has_older_messages && !cachedStartsAtTranscriptBeginning,
                   });
                   dispatch({
                     type: 'merge_conversation_data',
@@ -900,6 +903,10 @@ function ConversationPageContent() {
       });
     }
   }, [slug, conversationId, historyExpansion, targetMessageId, dispatch, eventCursorRef]);
+
+  useEffect(() => {
+    dispatchHistoryExpansion({ type: 'target_changed', targetMessageId: targetMessageId ?? null });
+  }, [targetMessageId]);
 
   const requestedLoadedTargetRef = useRef<string | null>(null);
   const loadedTargetPresent = targetMessageId

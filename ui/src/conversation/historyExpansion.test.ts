@@ -154,6 +154,34 @@ describe('history expansion reducer', () => {
     expect(next.pendingCommand?.kind).toBe('jump_to_message');
   });
 
+  it('clears a missing-target failure when the deep-link target changes', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, false),
+      failure: { kind: 'target_not_found' as const, targetMessageId: 'missing' },
+    };
+
+    const next = reduceHistoryExpansion(state, {
+      type: 'target_changed',
+      targetMessageId: 'loaded',
+    });
+
+    expect(next.failure).toBeNull();
+  });
+
+  it('retains a missing-target failure while the same target remains active', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, false),
+      failure: { kind: 'target_not_found' as const, targetMessageId: 'missing' },
+    };
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'target_changed',
+      targetMessageId: 'missing',
+    })).toBe(state);
+  });
+
   it('does not reissue a known failed deep-link target', () => {
     const currentView = view('a', 1);
     const state = {

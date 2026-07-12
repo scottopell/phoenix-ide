@@ -2316,24 +2316,44 @@ fn message_starts_render_unit(message: &crate::db::Message) -> bool {
     )
 }
 
+const RENDER_UNIT_BACKFILL_CHUNK_SIZE: i64 = 64;
+const RENDER_UNIT_BACKFILL_SCAN_LIMIT: i64 = 512;
+
 async fn align_slice_start_to_render_unit(
     db: &crate::db::Database,
     conversation_id: &str,
     messages: &mut Vec<crate::db::Message>,
 ) -> Result<(), AppError> {
-    while let Some(first) = messages.first() {
-        if message_starts_render_unit(first) {
+    let Some(first) = messages.first() else {
+        return Ok(());
+    };
+    if message_starts_render_unit(first) {
+        return Ok(());
+    }
+
+    let mut before_sequence = first.sequence_id;
+    let mut scanned = 0i64;
+    while scanned < RENDER_UNIT_BACKFILL_SCAN_LIMIT {
+        let remaining = RENDER_UNIT_BACKFILL_SCAN_LIMIT - scanned;
+        let chunk_limit = remaining.min(RENDER_UNIT_BACKFILL_CHUNK_SIZE);
+        let previous = db
+            .get_messages_before(conversation_id, before_sequence, chunk_limit)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if previous.is_empty() {
+            break;
+        }
+        scanned += i64::try_from(previous.len()).map_err(|_| {
+            AppError::Internal("render-unit backfill chunk is too large".to_string())
+        })?;
+        let oldest_sequence = previous[0].sequence_id;
+
+        if let Some(owner) = previous.into_iter().rev().find(message_starts_render_unit) {
+            messages.insert(0, owner);
             break;
         }
 
-        let mut previous = db
-            .get_messages_before(conversation_id, first.sequence_id, 1)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let Some(previous) = previous.pop() else {
-            break;
-        };
-        messages.insert(0, previous);
+        before_sequence = oldest_sequence;
     }
     Ok(())
 }
@@ -2885,7 +2905,13 @@ async fn stream_conversation(
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = if matches!(db_message_selection, StreamDbMessageSelection::None) {
+    let context_window_size = if matches!(db_message_selection, StreamDbMessageSelection::Full) {
+        messages
+            .iter()
+            .filter_map(|m| m.usage_data.as_ref())
+            .next_back()
+            .map_or(0, crate::db::UsageData::context_window_used)
+    } else {
         state
             .runtime
             .db()
@@ -2893,12 +2919,6 @@ async fn stream_conversation(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
             .as_ref()
-            .map_or(0, crate::db::UsageData::context_window_used)
-    } else {
-        messages
-            .iter()
-            .filter_map(|m| m.usage_data.as_ref())
-            .next_back()
             .map_or(0, crate::db::UsageData::context_window_used)
     };
 
@@ -6989,6 +7009,88 @@ pub(crate) mod hard_delete_cascade_tests {
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
+        assert!(latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_backfills_only_owner_when_tool_run_exceeds_limit() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-latest-bounded-turn",
+                "history-latest-bounded-turn",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+
+        state
+            .db
+            .add_message(
+                "bounded-user",
+                "conv-history-latest-bounded-turn",
+                &crate::db::MessageContent::user("prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("add user");
+        state
+            .db
+            .add_message(
+                "bounded-agent",
+                "conv-history-latest-bounded-turn",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-bounded".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "foo"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add agent");
+        for idx in 0..200 {
+            state
+                .db
+                .add_message(
+                    &format!("bounded-tool-{idx}"),
+                    "conv-history-latest-bounded-turn",
+                    &crate::db::MessageContent::tool(
+                        "tool-bounded",
+                        format!("tool output {idx}"),
+                        false,
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add tool");
+        }
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-history-latest-bounded-turn".to_string()),
+            Query(LatestMessagesQuery { limit: Some(50) }),
+        )
+        .await
+        .expect("latest messages");
+
+        let sequence_ids = latest
+            .messages
+            .iter()
+            .map(|m| m.sequence_id)
+            .collect::<Vec<_>>();
+        assert_eq!(sequence_ids.first().copied(), Some(2));
+        assert_eq!(sequence_ids.len(), 51);
+        assert_eq!(sequence_ids[1], 153);
+        assert_eq!(sequence_ids.last().copied(), Some(202));
         assert!(latest.has_older_messages);
     }
 
