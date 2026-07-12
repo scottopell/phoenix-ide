@@ -5021,7 +5021,10 @@ def cmd_drive_turn(drive_turn_args: list[str]) -> None:
     if build.returncode != 0:
         sys.exit(build.returncode)
 
-    binary = ROOT / "target" / "debug" / "drive-turn"
+    metadata = _workspace_metadata()
+    if metadata is None:
+        die("cargo metadata failed after building drive-turn")
+    binary = Path(metadata["target_directory"]) / "debug" / "drive-turn"
     os.execve(binary, [str(binary), *drive_turn_args], env)
 
 

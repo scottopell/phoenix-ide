@@ -2199,7 +2199,8 @@ impl McpClientManager {
     /// Spawn a background task that reads config files and connects to each
     /// MCP server in parallel. Servers become available in `tool_definitions`
     /// and `call_tool` as they finish connecting.
-    pub fn start_background_discovery(self: &Arc<Self>) {
+    #[must_use = "await the handle when MCP tools must be ready before continuing"]
+    pub fn start_background_discovery(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let configs = Self::read_all_configs();
@@ -2291,7 +2292,7 @@ impl McpClientManager {
                 names = ?server_names,
                 "Discovered {total_tools} MCP tools from {connected_servers} servers",
             );
-        });
+        })
     }
 
     /// Return status of all connected MCP servers plus any pending OAuth entries.

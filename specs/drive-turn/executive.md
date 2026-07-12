@@ -2,9 +2,9 @@
 
 ## Current Reality
 
-`drive-turn` is a separate workspace binary that drives one user turn without starting HTTP, SSE, TLS, or UI services. The `phoenix-ide` package exposes its existing server modules as a library; both the server binary and `phoenix-drive-turn` link that same library. The driver constructs the production `RuntimeManager`, provider registry, database adapter, MCP manager, built-in tool registry, state machine, and continuation loop, then observes the runtime's authoritative state watch until a typed stable outcome is also visible in persistence.
+`drive-turn` is a separate workspace binary that drives one user turn without starting HTTP, SSE, TLS, or UI services. The `phoenix-ide` package exposes its existing server modules as a library; both the server binary and `phoenix-drive-turn` link that same library. The driver constructs the production `RuntimeManager`, provider registry, database adapter, MCP manager, built-in tool registry, state machine, and continuation loop, awaits initial MCP discovery, then observes the runtime's authoritative state watch until a typed stable outcome is also visible in persistence.
 
-The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata. A timed-out turn is cancelled through the production cancellation event and must reach a persisted stable state before the driver returns. Awaiting external recovery is reported as a stable outcome. Every return path tears down conversation-owned tmux, browser, and bash resources.
+The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata. A persisted user message distinguishes a completed empty-response idle turn from the conversation's initial idle state. A timed-out turn is cancelled through the production cancellation event and must reach a persisted stable state before the driver returns. Awaiting external recovery is reported as a stable outcome. Every return path tears down conversation-owned tmux, browser, and bash resources.
 
 ## Usage
 
@@ -23,7 +23,7 @@ The CLI supports transient in-memory SQLite, retained unique temporary-file SQLi
   --timeout 180
 ```
 
-The `dev.py` wrapper layers `.phoenix-ide.env` and `.phoenix-ide.dev.env` exactly as development server startup does, builds the driver, and forwards all arguments. Direct binary invocation remains available when the caller has already prepared the process environment. The process reads the same LLM environment variables as the server. Standard output is reserved for JSON. The CLI installs structured runtime tracing on standard error using `RUST_LOG` when set and the Phoenix development filter otherwise; invocation and runtime failures are also written to standard error with a non-zero exit status.
+The `dev.py` wrapper layers `.phoenix-ide.env` and `.phoenix-ide.dev.env` exactly as development server startup does, builds the driver, resolves the executable from Cargo's effective target directory, and forwards all arguments. Direct binary invocation remains available when the caller has already prepared the process environment. The process reads the same LLM environment variables as the server. Standard output is reserved for JSON. The CLI installs structured runtime tracing on standard error using `RUST_LOG` when set and the Phoenix development filter otherwise; invocation and runtime failures are also written to standard error with a non-zero exit status.
 
 ## Verification
 

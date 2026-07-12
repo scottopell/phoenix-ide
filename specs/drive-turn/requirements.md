@@ -5,6 +5,7 @@
 WHEN an operator submits one user prompt through drive-turn
 THE SYSTEM SHALL create and drive the conversation through the same Phoenix conversation runtime, state machine, LLM provider adapters, persistence layer, and built-in tool registry used by the server
 AND SHALL NOT inject synthetic tool results or implement a parallel agent loop
+AND SHALL complete initial MCP discovery before submitting the user message
 
 ## REQ-DRIVE-TURN-002: Stable Completion
 
@@ -12,6 +13,7 @@ WHEN the driven conversation reaches a stable state after processing the submitt
 AND that state has been persisted
 THE SYSTEM SHALL stop driving the turn
 AND report the typed stable outcome
+AND SHALL accept a persisted user message as evidence that an idle turn completed even when the model produced no agent message
 
 WHEN the conversation is waiting for external recovery
 THE SYSTEM SHALL report awaiting recovery as a stable outcome

@@ -139,7 +139,9 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
         Ok(disabled) => manager.set_disabled_servers(disabled).await,
         Err(error) => tracing::warn!(error = %error, "Failed to load disabled MCP servers"),
     }
-    manager.start_background_discovery();
+    if let Err(error) = manager.start_background_discovery().await {
+        tracing::warn!(error = %error, "MCP discovery task terminated unexpectedly");
+    }
     manager
 }
 
@@ -367,6 +369,12 @@ async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult),
     Ok((db, DatabaseResult::File { path }))
 }
 
+fn turn_has_persisted_input(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .any(|message| message.message_type == MessageType::User)
+}
+
 async fn wait_for_stable_turn(
     db: &Database,
     conversation_id: &str,
@@ -384,10 +392,7 @@ async fn wait_for_stable_turn(
                     .get_messages(conversation_id)
                     .await
                     .map_err(|error| DriveTurnError::Database(error.to_string()))?;
-                let has_agent_output = messages
-                    .iter()
-                    .any(|message| message.message_type == MessageType::Agent);
-                if has_agent_output || !matches!(outcome, StableOutcome::Idle) {
+                if turn_has_persisted_input(&messages) || !matches!(outcome, StableOutcome::Idle) {
                     return Ok(outcome);
                 }
             }
@@ -441,6 +446,12 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             message: message.clone(),
             error_kind: error_kind.clone(),
         }),
+        ConvState::CreationFailed {
+            error, error_kind, ..
+        } => Some(StableOutcome::Error {
+            message: error.clone(),
+            error_kind: error_kind.clone(),
+        }),
         ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
@@ -449,9 +460,10 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         }
         ConvState::ContextExhausted { .. } => Some(StableOutcome::ContextExhausted),
         ConvState::HandedOff { .. } => Some(StableOutcome::HandedOff),
-        ConvState::Terminal => Some(StableOutcome::Terminal),
+        ConvState::Terminal | ConvState::CreationCancelled { .. } => Some(StableOutcome::Terminal),
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
         | ConvState::ToolExecuting { .. }
         | ConvState::CancellingTool { .. }
         | ConvState::AwaitingSubAgents { .. }
@@ -469,6 +481,24 @@ fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_user_input_distinguishes_completed_empty_turn_from_initial_idle() {
+        assert!(!turn_has_persisted_input(&[]));
+        let message = Message {
+            message_id: "user-message".into(),
+            conversation_id: "conversation".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: phoenix_core::domain::db_schema::MessageContent::User(
+                phoenix_core::domain::db_schema::UserContent::new("hello"),
+            ),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(turn_has_persisted_input(&[message]));
+    }
 
     #[test]
     fn bare_database_filename_has_no_directory_to_create() {

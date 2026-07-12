@@ -861,7 +861,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         mcp_manager.set_oauth_redirect_base(redirect_base);
     }
-    mcp_manager.start_background_discovery();
+    std::mem::drop(mcp_manager.start_background_discovery());
 
     // Static deployment facts served read-only by GET /api/deployment
     // (specs/deployment-info/).
