@@ -233,20 +233,20 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 44,
-        name: "replace_global_recall_with_coordinator",
+        name: "create_workflow_protocol_registry_tables",
         sql: MIGRATION_044,
     },
+    Migration {
+        version: 45,
+        name: "create_durable_workflow_core_tables",
+        sql: MIGRATION_045,
+    },
+    Migration {
+        version: 46,
+        name: "create_wake_profile_tables",
+        sql: MIGRATION_046,
+    },
 ];
-
-const MIGRATION_044: &str = r"
-CREATE TABLE coordinator (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    conversation_id TEXT NOT NULL UNIQUE
-        REFERENCES conversations(id) ON DELETE RESTRICT
-);
-DROP TABLE IF EXISTS global_recall_messages;
-DROP TABLE IF EXISTS global_recall_sessions;
-";
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
 /// closing the divergence between SQL `json_extract` queries and Rust deserialization.
@@ -1290,6 +1290,741 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+const MIGRATION_044: &str = r"
+CREATE TABLE IF NOT EXISTS workflow_protocol_selections (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    selector_identity TEXT NOT NULL,
+    selector_version INTEGER NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    authority TEXT NOT NULL,
+    accepting INTEGER NOT NULL,
+    runtime_acceptance_enabled INTEGER NOT NULL,
+    external_acceptance_enabled INTEGER NOT NULL,
+    registered_at TEXT NOT NULL,
+    drained_at TEXT,
+    UNIQUE (id, profile_id, protocol_version, authority),
+    UNIQUE (profile_id, selector_identity, selector_version, protocol_version, authority),
+    CHECK (authority IN ('legacy_protocol', 'engine_protocol')),
+    CHECK (accepting IN (0, 1)),
+    CHECK (runtime_acceptance_enabled IN (0, 1)),
+    CHECK (external_acceptance_enabled IN (0, 1)),
+    CHECK (selector_version >= 0),
+    CHECK (protocol_version >= 0),
+    CHECK ((accepting = 0) = (drained_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_protocol_one_accepting_per_profile
+    ON workflow_protocol_selections(profile_id)
+    WHERE accepting = 1;
+
+CREATE TABLE IF NOT EXISTS workflow_profile_codecs (
+    selection_id TEXT NOT NULL REFERENCES workflow_protocol_selections(id) ON DELETE CASCADE,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    PRIMARY KEY (selection_id, codec_family, codec_version)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_profile_executors (
+    selection_id TEXT NOT NULL REFERENCES workflow_protocol_selections(id) ON DELETE CASCADE,
+    executor_kind TEXT NOT NULL,
+    PRIMARY KEY (selection_id, executor_kind)
+);
+";
+
+const MIGRATION_045: &str = r"
+CREATE TABLE IF NOT EXISTS external_acceptance_bindings (
+    id TEXT PRIMARY KEY,
+    selection_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    authority TEXT NOT NULL,
+    authority_scope TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    intent_fingerprint TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    receipt_codec_family TEXT NOT NULL,
+    receipt_codec_version INTEGER NOT NULL,
+    receipt_payload TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    FOREIGN KEY (selection_id, profile_id, protocol_version, authority)
+        REFERENCES workflow_protocol_selections(id, profile_id, protocol_version, authority)
+        ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, profile_id, protocol_version, authority)
+        REFERENCES workflows(id, profile_id, protocol_version, authority)
+        ON DELETE CASCADE,
+    CHECK (authority IN ('legacy_protocol', 'engine_protocol')),
+    CHECK (protocol_version >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_acceptance_idempotency
+    ON external_acceptance_bindings(
+        profile_id,
+        protocol_version,
+        authority,
+        authority_scope,
+        idempotency_key
+    );
+
+CREATE TABLE IF NOT EXISTS workflows (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    authority TEXT NOT NULL,
+    execution_mode TEXT NOT NULL,
+    authoritative_workflow_id TEXT REFERENCES workflows(id) ON DELETE RESTRICT,
+    protocol_selection_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_codec_family TEXT NOT NULL,
+    snapshot_codec_version INTEGER NOT NULL,
+    snapshot_payload TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    UNIQUE (id, version),
+    UNIQUE (id, profile_id, protocol_version, authority),
+    FOREIGN KEY (protocol_selection_id, profile_id, protocol_version, authority)
+        REFERENCES workflow_protocol_selections(id, profile_id, protocol_version, authority)
+        ON DELETE RESTRICT,
+    CHECK (authority IN ('legacy_protocol', 'engine_protocol')),
+    CHECK (execution_mode IN ('authoritative', 'shadow')),
+    CHECK (status IN ('active', 'cancelling', 'cancelled', 'deletion_pending', 'completed', 'failed')),
+    CHECK (version >= 0),
+    CHECK (generation >= 0),
+    CHECK ((execution_mode = 'shadow') = (authoritative_workflow_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_transitions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    from_version INTEGER NOT NULL,
+    to_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    event_codec_family TEXT NOT NULL,
+    event_codec_version INTEGER NOT NULL,
+    event_payload TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    UNIQUE (workflow_id, from_version),
+    UNIQUE (workflow_id, to_version),
+    UNIQUE (id, workflow_id, to_version),
+    CHECK (to_version = from_version + 1),
+    CHECK (from_version >= 0),
+    CHECK (generation >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_effects (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declaring_transition_id TEXT NOT NULL REFERENCES workflow_transitions(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    family TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    ambiguity_policy TEXT NOT NULL,
+    intent_payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    next_eligible_at TEXT,
+    destructive_resource TEXT,
+    UNIQUE (id, workflow_id, declared_workflow_version, generation),
+    FOREIGN KEY (declaring_transition_id, workflow_id, declared_workflow_version)
+        REFERENCES workflow_transitions(id, workflow_id, to_version)
+        ON DELETE CASCADE,
+    CHECK (role IN ('required', 'optional', 'compensation')),
+    CHECK (ambiguity_policy IN ('observable_reconciliation', 'external_idempotency', 'safe_repeatability', 'manual_resolution')),
+    CHECK (status IN ('blocked', 'eligible', 'claimed', 'retry_wait', 'ambiguity_wait', 'receipted', 'invalidated'))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_effect_dependencies (
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    dependency_effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    PRIMARY KEY (effect_id, dependency_effect_id),
+    CHECK (effect_id <> dependency_effect_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_barriers (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declaring_transition_id TEXT NOT NULL REFERENCES workflow_transitions(id) ON DELETE CASCADE,
+    declaring_workflow_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    satisfied_at TEXT,
+    FOREIGN KEY (declaring_transition_id, workflow_id, declaring_workflow_version)
+        REFERENCES workflow_transitions(id, workflow_id, to_version)
+        ON DELETE CASCADE,
+    CHECK (status IN ('waiting', 'satisfied')),
+    CHECK ((status = 'satisfied') = (satisfied_at IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_barrier_members (
+    barrier_id TEXT NOT NULL REFERENCES workflow_barriers(id) ON DELETE CASCADE,
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    receipt_family TEXT NOT NULL,
+    PRIMARY KEY (barrier_id, effect_id),
+    CHECK (receipt_family IN ('current_generation_effect', 'compensation_effect'))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_claims (
+    effect_id TEXT PRIMARY KEY REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    claim_token TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    lease_until TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    revoked_at TEXT,
+    UNIQUE (effect_id, workflow_id, declared_workflow_version, generation),
+    UNIQUE (workflow_id, claim_token),
+    FOREIGN KEY (effect_id, workflow_id, declared_workflow_version, generation)
+        REFERENCES workflow_effects(id, workflow_id, declared_workflow_version, generation)
+        ON DELETE CASCADE,
+    CHECK (declared_workflow_version >= 0),
+    CHECK (generation >= 0),
+    CHECK (claim_token <> ''),
+    CHECK (worker_id <> '')
+);
+
+CREATE TABLE IF NOT EXISTS workflow_attempts (
+    id TEXT PRIMARY KEY,
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    claim_token TEXT NOT NULL,
+    claim_worker_id TEXT NOT NULL,
+    claim_lease_until TEXT NOT NULL,
+    claim_issued_at TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    begun_at TEXT NOT NULL,
+    UNIQUE (id, effect_id, workflow_id, declared_workflow_version, generation),
+    UNIQUE (effect_id, ordinal),
+    FOREIGN KEY (effect_id, workflow_id, declared_workflow_version, generation)
+        REFERENCES workflow_effects(id, workflow_id, declared_workflow_version, generation)
+        ON DELETE CASCADE,
+    CHECK (status IN ('begun', 'observation_recorded', 'receipt_accepted', 'authority_lost')),
+    CHECK (ordinal >= 0),
+    CHECK (claim_token <> ''),
+    CHECK (claim_worker_id <> '')
+);
+
+CREATE TABLE IF NOT EXISTS workflow_observations (
+    id TEXT PRIMARY KEY,
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES workflow_attempts(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    claim_token TEXT NOT NULL,
+    claim_worker_id TEXT NOT NULL,
+    claim_lease_until TEXT NOT NULL,
+    claim_issued_at TEXT NOT NULL,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    authoritative INTEGER NOT NULL,
+    FOREIGN KEY (attempt_id, effect_id, workflow_id, declared_workflow_version, generation)
+        REFERENCES workflow_attempts(id, effect_id, workflow_id, declared_workflow_version, generation)
+        ON DELETE CASCADE,
+    CHECK (authoritative IN (0, 1)),
+    CHECK (claim_token <> ''),
+    CHECK (claim_worker_id <> '')
+);
+
+CREATE TABLE IF NOT EXISTS workflow_stale_observations (
+    id TEXT PRIMARY KEY,
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    attempt_id TEXT REFERENCES workflow_attempts(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    claim_token TEXT NOT NULL,
+    claim_worker_id TEXT NOT NULL,
+    claim_lease_until TEXT NOT NULL,
+    claim_issued_at TEXT NOT NULL,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    stale_reason TEXT NOT NULL,
+    FOREIGN KEY (attempt_id, effect_id, workflow_id, declared_workflow_version, generation)
+        REFERENCES workflow_attempts(id, effect_id, workflow_id, declared_workflow_version, generation)
+        ON DELETE CASCADE,
+    CHECK (claim_token <> ''),
+    CHECK (claim_worker_id <> '')
+);
+
+CREATE TABLE IF NOT EXISTS workflow_receipts (
+    id TEXT PRIMARY KEY,
+    effect_id TEXT NOT NULL UNIQUE REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    attempt_id TEXT REFERENCES workflow_attempts(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    declared_workflow_version INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    claim_token TEXT,
+    claim_worker_id TEXT,
+    claim_lease_until TEXT,
+    claim_issued_at TEXT,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    FOREIGN KEY (attempt_id, effect_id, workflow_id, declared_workflow_version, generation)
+        REFERENCES workflow_attempts(id, effect_id, workflow_id, declared_workflow_version, generation)
+        ON DELETE CASCADE,
+    CHECK (origin IN ('execution', 'adoption', 'reconciliation', 'manual')),
+    CHECK (generation >= 0),
+    CHECK (
+        (origin = 'manual' AND attempt_id IS NULL AND claim_token IS NULL AND claim_worker_id IS NULL AND claim_lease_until IS NULL AND claim_issued_at IS NULL)
+        OR
+        (origin IN ('execution', 'adoption', 'reconciliation') AND attempt_id IS NOT NULL AND claim_token IS NOT NULL AND claim_worker_id IS NOT NULL AND claim_lease_until IS NOT NULL AND claim_issued_at IS NOT NULL AND claim_token <> '' AND claim_worker_id <> '')
+    )
+);
+
+CREATE TABLE IF NOT EXISTS workflow_reducer_inbox (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    receipt_id TEXT REFERENCES workflow_receipts(id) ON DELETE CASCADE,
+    barrier_id TEXT REFERENCES workflow_barriers(id) ON DELETE CASCADE,
+    event_codec_family TEXT NOT NULL,
+    event_codec_version INTEGER NOT NULL,
+    event_payload TEXT NOT NULL,
+    delivery_status TEXT NOT NULL,
+    consumed_by_transition_id TEXT REFERENCES workflow_transitions(id) ON DELETE SET NULL,
+    CHECK (delivery_status IN ('pending', 'consumed')),
+    CHECK ((delivery_status = 'consumed') = (consumed_by_transition_id IS NOT NULL)),
+    CHECK ((receipt_id IS NOT NULL) <> (barrier_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_inbox_consumer_dispositions (
+    reducer_inbox_id TEXT NOT NULL REFERENCES workflow_reducer_inbox(id) ON DELETE CASCADE,
+    consumer_kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    consumed_at TEXT,
+    PRIMARY KEY (reducer_inbox_id, consumer_kind),
+    CHECK (status IN ('pending', 'consumed')),
+    CHECK ((status = 'consumed') = (consumed_at IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_owed_acceptance (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    reducer_inbox_id TEXT NOT NULL UNIQUE REFERENCES workflow_reducer_inbox(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    resolving_transition_id TEXT REFERENCES workflow_transitions(id) ON DELETE SET NULL,
+    suppression_reason TEXT,
+    CHECK (status IN ('owed', 'accepted', 'suppressed')),
+    CHECK (
+        (status = 'owed' AND resolving_transition_id IS NULL AND suppression_reason IS NULL)
+        OR (status = 'accepted' AND resolving_transition_id IS NOT NULL AND suppression_reason IS NULL)
+        OR (status = 'suppressed' AND resolving_transition_id IS NOT NULL AND suppression_reason IS NOT NULL AND suppression_reason IN ('cancelled', 'superseded', 'lifecycle_terminal', 'operator_rejected'))
+    )
+);
+
+CREATE TABLE IF NOT EXISTS workflow_manual_resolutions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    effect_id TEXT NOT NULL REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    evidence_codec_family TEXT NOT NULL,
+    evidence_codec_version INTEGER NOT NULL,
+    evidence_payload TEXT NOT NULL,
+    accepted_choice_id TEXT,
+    resolved_by TEXT,
+    UNIQUE (id, workflow_id),
+    CHECK (status IN ('required', 'resolved')),
+    CHECK (
+        (status = 'required' AND accepted_choice_id IS NULL AND resolved_by IS NULL)
+        OR (status = 'resolved' AND accepted_choice_id IS NOT NULL AND resolved_by IS NOT NULL AND resolved_by <> '')
+    )
+);
+
+CREATE TABLE IF NOT EXISTS workflow_manual_resolution_choices (
+    id TEXT PRIMARY KEY,
+    resolution_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    codec_family TEXT NOT NULL,
+    codec_version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE (id, resolution_id, workflow_id),
+    FOREIGN KEY (resolution_id, workflow_id)
+        REFERENCES workflow_manual_resolutions(id, workflow_id)
+        ON DELETE CASCADE,
+    CHECK (kind IN ('adopt', 'retry', 'compensate', 'fail', 'suppress'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_workflow_manual_resolution_choice_owner_insert
+BEFORE INSERT ON workflow_manual_resolutions
+FOR EACH ROW
+WHEN NEW.accepted_choice_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1
+    FROM workflow_manual_resolution_choices c
+    WHERE c.id = NEW.accepted_choice_id
+      AND c.resolution_id = NEW.id
+      AND c.workflow_id = NEW.workflow_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'accepted choice must belong to same resolution');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_workflow_manual_resolution_choice_owner_update
+BEFORE UPDATE OF accepted_choice_id, workflow_id, id ON workflow_manual_resolutions
+FOR EACH ROW
+WHEN NEW.accepted_choice_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1
+    FROM workflow_manual_resolution_choices c
+    WHERE c.id = NEW.accepted_choice_id
+      AND c.resolution_id = NEW.id
+      AND c.workflow_id = NEW.workflow_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'accepted choice must belong to same resolution');
+END;
+
+CREATE TABLE IF NOT EXISTS workflow_manual_resolution_evidence_links (
+    resolution_id TEXT NOT NULL REFERENCES workflow_manual_resolutions(id) ON DELETE CASCADE,
+    evidence_kind TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    PRIMARY KEY (resolution_id, evidence_kind, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_shadow_divergences (
+    id TEXT PRIMARY KEY,
+    shadow_workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    authoritative_workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL,
+    profile_detail_kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    required_action TEXT NOT NULL,
+    evidence_identity TEXT NOT NULL,
+    resolved_at TEXT,
+    expected_codec_family TEXT NOT NULL,
+    expected_codec_version INTEGER NOT NULL,
+    expected_payload TEXT NOT NULL,
+    actual_codec_family TEXT NOT NULL,
+    actual_codec_version INTEGER NOT NULL,
+    actual_payload TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    CHECK (kind IN ('snapshot', 'transition', 'effect_plan', 'observation', 'receipt', 'reducer_event', 'capability', 'user_projection')),
+    CHECK (severity IN ('blocking', 'actionable', 'informational')),
+    CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only')),
+    CHECK (shadow_workflow_id <> authoritative_workflow_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_shadow_divergence_one_active
+    ON workflow_shadow_divergences(shadow_workflow_id, kind, evidence_identity)
+    WHERE resolved_at IS NULL;
+";
+
+const MIGRATION_046: &str = r"
+CREATE TABLE IF NOT EXISTS wake_registration_fences (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, version),
+    CHECK (status IN ('open', 'closed')),
+    CHECK (version >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS wake_workflow_bindings (
+    contract_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    registration_scope_kind TEXT NOT NULL,
+    registration_scope_stable_key TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    bash_work_scope_kind TEXT,
+    bash_work_scope_stable_key TEXT,
+    bash_handle_id TEXT,
+    tmux_work_scope_kind TEXT,
+    tmux_work_scope_stable_key TEXT,
+    tmux_server_generation TEXT,
+    tmux_window_id TEXT,
+    registering_tool_use_id TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    registration_fence_version INTEGER NOT NULL,
+    observe_effect_id TEXT NOT NULL,
+    lifecycle_fence_status TEXT NOT NULL,
+    UNIQUE (contract_id, workflow_id),
+    UNIQUE (contract_id, workflow_id, observe_effect_id),
+    FOREIGN KEY (conversation_id, registration_fence_version)
+        REFERENCES wake_registration_fences(conversation_id, version)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (observe_effect_id, workflow_id)
+        REFERENCES workflow_effects(id, workflow_id)
+        ON DELETE RESTRICT,
+    CHECK (resource_kind IN ('bash', 'tmux_window')),
+    CHECK (lifecycle_fence_status IN ('open', 'closed')),
+    CHECK (registering_tool_use_id <> ''),
+    CHECK (
+        (resource_kind = 'bash'
+        AND bash_work_scope_kind IS NOT NULL
+        AND bash_work_scope_stable_key IS NOT NULL
+        AND bash_handle_id IS NOT NULL
+        AND tmux_work_scope_kind IS NULL
+        AND tmux_work_scope_stable_key IS NULL
+        AND tmux_server_generation IS NULL
+        AND tmux_window_id IS NULL)
+        OR
+        (resource_kind = 'tmux_window'
+        AND bash_work_scope_kind IS NULL
+        AND bash_work_scope_stable_key IS NULL
+        AND bash_handle_id IS NULL
+        AND tmux_work_scope_kind IS NOT NULL
+        AND tmux_work_scope_stable_key IS NOT NULL
+        AND tmux_server_generation IS NOT NULL
+        AND tmux_window_id IS NOT NULL)
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_wake_binding_observe_effect_insert
+BEFORE INSERT ON wake_workflow_bindings
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_effects e
+    WHERE e.id = NEW.observe_effect_id
+      AND e.workflow_id = NEW.workflow_id
+      AND e.family = 'wake'
+      AND e.kind = 'observe_handle'
+      AND e.role = 'required'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observe_effect_id must be wake required observe_handle effect for workflow');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_wake_binding_observe_effect_update
+BEFORE UPDATE OF observe_effect_id, workflow_id ON wake_workflow_bindings
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_effects e
+    WHERE e.id = NEW.observe_effect_id
+      AND e.workflow_id = NEW.workflow_id
+      AND e.family = 'wake'
+      AND e.kind = 'observe_handle'
+      AND e.role = 'required'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observe_effect_id must be wake required observe_handle effect for workflow');
+END;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_receipts_id_effect_workflow
+    ON workflow_receipts(id, effect_id, workflow_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_effects_id_workflow
+    ON workflow_effects(id, workflow_id);
+
+CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
+    receipt_id TEXT PRIMARY KEY REFERENCES workflow_receipts(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL,
+    observe_effect_id TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    bash_status TEXT,
+    bash_occurred_at TEXT,
+    bash_exit_code INTEGER,
+    bash_duration_ms INTEGER,
+    bash_signal_number INTEGER,
+    bash_kill_signal_sent TEXT,
+    tmux_status TEXT,
+    tmux_occurred_at TEXT,
+    tmux_server_generation TEXT,
+    tmux_exit_code INTEGER,
+    tmux_duration_ms INTEGER,
+    forgotten_reason TEXT,
+    cancellation_reason TEXT,
+    UNIQUE (receipt_id, workflow_id, observe_effect_id),
+    FOREIGN KEY (contract_id, workflow_id, observe_effect_id)
+        REFERENCES wake_workflow_bindings(contract_id, workflow_id, observe_effect_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (receipt_id, observe_effect_id, workflow_id)
+        REFERENCES workflow_receipts(id, effect_id, workflow_id)
+        ON DELETE CASCADE,
+    CHECK (resource_kind IN ('bash', 'tmux_window')),
+    CHECK (status IN ('fired', 'expired', 'cancelled', 'forgotten')),
+    CHECK (bash_status IS NULL OR bash_status IN ('exited', 'killed', 'kill_pending_kernel')),
+    CHECK (tmux_status IS NULL OR tmux_status IN ('exit_marker_observed', 'window_killed')),
+    CHECK (bash_kill_signal_sent IS NULL OR bash_kill_signal_sent IN ('TERM', 'KILL')),
+    CHECK (forgotten_reason IS NULL OR forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart')),
+    CHECK (cancellation_reason IS NULL OR cancellation_reason IN ('explicit_cancel')),
+    CHECK (
+        (status = 'fired'
+            AND (
+                (resource_kind = 'bash'
+                    AND bash_status IS NOT NULL
+                    AND bash_occurred_at IS NOT NULL
+                    AND bash_duration_ms IS NOT NULL
+                    AND tmux_status IS NULL
+                    AND tmux_occurred_at IS NULL
+                    AND tmux_server_generation IS NULL
+                    AND tmux_exit_code IS NULL
+                    AND tmux_duration_ms IS NULL
+                    AND forgotten_reason IS NULL
+                    AND cancellation_reason IS NULL)
+                OR
+                (resource_kind = 'tmux_window'
+                    AND tmux_status IS NOT NULL
+                    AND tmux_occurred_at IS NOT NULL
+                    AND tmux_server_generation IS NOT NULL
+                    AND tmux_duration_ms IS NOT NULL
+                    AND bash_status IS NULL
+                    AND bash_occurred_at IS NULL
+                    AND bash_exit_code IS NULL
+                    AND bash_duration_ms IS NULL
+                    AND bash_signal_number IS NULL
+                    AND bash_kill_signal_sent IS NULL
+                    AND forgotten_reason IS NULL
+                    AND cancellation_reason IS NULL)
+            )
+        )
+        OR
+        (status = 'expired'
+            AND bash_status IS NULL
+            AND bash_occurred_at IS NULL
+            AND bash_exit_code IS NULL
+            AND bash_duration_ms IS NULL
+            AND bash_signal_number IS NULL
+            AND bash_kill_signal_sent IS NULL
+            AND tmux_status IS NULL
+            AND tmux_occurred_at IS NULL
+            AND tmux_server_generation IS NULL
+            AND tmux_exit_code IS NULL
+            AND tmux_duration_ms IS NULL
+            AND forgotten_reason IS NULL
+            AND cancellation_reason IS NULL)
+        OR
+        (status = 'cancelled'
+            AND bash_status IS NULL
+            AND bash_occurred_at IS NULL
+            AND bash_exit_code IS NULL
+            AND bash_duration_ms IS NULL
+            AND bash_signal_number IS NULL
+            AND bash_kill_signal_sent IS NULL
+            AND tmux_status IS NULL
+            AND tmux_occurred_at IS NULL
+            AND tmux_server_generation IS NULL
+            AND tmux_exit_code IS NULL
+            AND tmux_duration_ms IS NULL
+            AND forgotten_reason IS NULL
+            AND cancellation_reason IS NOT NULL)
+        OR
+        (status = 'forgotten'
+            AND bash_status IS NULL
+            AND bash_occurred_at IS NULL
+            AND bash_exit_code IS NULL
+            AND bash_duration_ms IS NULL
+            AND bash_signal_number IS NULL
+            AND bash_kill_signal_sent IS NULL
+            AND tmux_status IS NULL
+            AND tmux_occurred_at IS NULL
+            AND tmux_server_generation IS NULL
+            AND tmux_exit_code IS NULL
+            AND tmux_duration_ms IS NULL
+            AND forgotten_reason IS NOT NULL
+            AND cancellation_reason IS NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wake_terminal_receipts_receipt_workflow
+    ON wake_terminal_receipts(receipt_id, workflow_id);
+
+CREATE TABLE IF NOT EXISTS wake_terminal_receipt_bash_tail (
+    receipt_id TEXT NOT NULL REFERENCES wake_terminal_receipts(receipt_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    stream TEXT,
+    offset INTEGER,
+    line TEXT NOT NULL,
+    PRIMARY KEY (receipt_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS wake_terminal_receipt_tmux_tail (
+    receipt_id TEXT NOT NULL REFERENCES wake_terminal_receipts(receipt_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    line TEXT NOT NULL,
+    PRIMARY KEY (receipt_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS wake_observation_inbox (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL,
+    terminal_receipt_id TEXT NOT NULL UNIQUE REFERENCES workflow_receipts(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    committed_at TEXT NOT NULL,
+    consumed_at TEXT,
+    UNIQUE (id, contract_id, terminal_receipt_id, conversation_id),
+    FOREIGN KEY (contract_id, workflow_id)
+        REFERENCES wake_workflow_bindings(contract_id, workflow_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (terminal_receipt_id, workflow_id)
+        REFERENCES wake_terminal_receipts(receipt_id, workflow_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS wake_runtime_obligations (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    snapshot_upper_bound INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    terminal_reason TEXT,
+    UNIQUE (id, conversation_id),
+    CHECK (status IN ('owed', 'accepted', 'suppressed')),
+    CHECK (
+        (status = 'owed' AND resolved_at IS NULL AND terminal_reason IS NULL)
+        OR (status = 'accepted' AND resolved_at IS NOT NULL AND terminal_reason = 'accepted')
+        OR (status = 'suppressed' AND resolved_at IS NOT NULL AND terminal_reason IN ('suppressed', 'lifecycle_terminal', 'superseded'))
+    )
+);
+
+CREATE TABLE IF NOT EXISTS wake_runtime_obligation_items (
+    obligation_id TEXT NOT NULL REFERENCES wake_runtime_obligations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    inbox_item_id TEXT NOT NULL REFERENCES wake_observation_inbox(id) ON DELETE CASCADE,
+    PRIMARY KEY (obligation_id, ordinal),
+    UNIQUE (obligation_id, inbox_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS wake_shadow_parity (
+    id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL REFERENCES wake_workflow_bindings(contract_id) ON DELETE CASCADE,
+    authoritative_contract_id TEXT NOT NULL REFERENCES wake_workflow_bindings(contract_id) ON DELETE CASCADE,
+    canonical_kind TEXT NOT NULL,
+    profile_detail_kind TEXT NOT NULL,
+    expected_codec_family TEXT NOT NULL,
+    expected_codec_version INTEGER NOT NULL,
+    expected_payload TEXT NOT NULL,
+    actual_codec_family TEXT NOT NULL,
+    actual_codec_version INTEGER NOT NULL,
+    actual_payload TEXT NOT NULL,
+    compared_at TEXT NOT NULL,
+    equal INTEGER NOT NULL,
+    severity TEXT NOT NULL,
+    required_action TEXT NOT NULL,
+    resolved_at TEXT,
+    CHECK (canonical_kind IN ('snapshot', 'transition', 'effect_plan', 'observation', 'receipt', 'reducer_event', 'capability', 'user_projection')),
+    CHECK (equal IN (0, 1)),
+    CHECK (severity IN ('blocking', 'actionable', 'informational')),
+    CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only'))
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -2246,6 +2981,650 @@ mod tests {
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`
     /// column on `conversations`. Existing rows default to NULL and the column
     /// should be queryable via `PRAGMA table_info` after migration.
+    #[tokio::test]
+    async fn migrations_041_to_043_create_expected_tables() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        for table in [
+            "workflow_protocol_selections",
+            "workflow_profile_codecs",
+            "workflow_profile_executors",
+            "external_acceptance_bindings",
+            "workflows",
+            "workflow_transitions",
+            "workflow_effects",
+            "workflow_effect_dependencies",
+            "workflow_barriers",
+            "workflow_barrier_members",
+            "workflow_claims",
+            "workflow_attempts",
+            "workflow_observations",
+            "workflow_stale_observations",
+            "workflow_receipts",
+            "workflow_reducer_inbox",
+            "workflow_owed_acceptance",
+            "workflow_manual_resolutions",
+            "workflow_manual_resolution_choices",
+            "workflow_shadow_divergences",
+            "wake_registration_fences",
+            "wake_workflow_bindings",
+            "wake_terminal_receipts",
+            "wake_terminal_receipt_bash_tail",
+            "wake_terminal_receipt_tmux_tail",
+            "wake_observation_inbox",
+            "wake_runtime_obligations",
+            "wake_runtime_obligation_items",
+            "wake_shadow_parity",
+        ] {
+            let exists: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists.as_deref(), Some(table), "missing table {table}");
+        }
+    }
+
+    async fn seed_workflow_stack(pool: &SqlitePool) {
+        seed_workflow_stack_at_version(pool, 1).await;
+    }
+
+    async fn seed_workflow_stack_at_version(pool: &SqlitePool, workflow_version: i64) {
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel', 'wake', 'wake-selector', 1, 1, 'engine_protocol', 1, 1, 1, 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf', 'wake', 1, 'engine_protocol', 'authoritative', NULL, 'sel', ?1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .bind(workflow_version)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_transitions \
+             (id, workflow_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) \
+             VALUES ('tr', 'wf', 0, 1, 0, 'event', 1, '{}', 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects \
+             (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status) \
+             VALUES ('eff', 'wf', 'tr', 1, 0, 'wake', 'observe_handle', 'effect', 1, 'required', 'observable_reconciliation', '{}', 'eligible')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects \
+             (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status) \
+             VALUES ('eff-other', 'wf', 'tr', 1, 0, 'wake', 'register', 'effect', 1, 'required', 'observable_reconciliation', '{}', 'eligible')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_attempts \
+             (id, effect_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, ordinal, status, begun_at) \
+             VALUES ('att', 'eff', 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 0, 'begun', 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_attempts \
+             (id, effect_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, ordinal, status, begun_at) \
+             VALUES ('att-other', 'eff-other', 'wf', 1, 0, 'claim-2', 'worker-2', 'later', 'now', 0, 'begun', 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES ('rcpt', 'eff', 'att', 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 'receipt', 1, '{}', 'execution', 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES ('rcpt-other', 'eff-other', 'att-other', 'wf', 1, 0, 'claim-2', 'worker-2', 'later', 'now', 'receipt', 1, '{}', 'execution', 'now')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_041_enforces_selection_authority_tuple_and_accepting_uniqueness() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel-1', 'wake', 'wake-selector', 1, 1, 'engine_protocol', 1, 1, 0, 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let dup_accepting = sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel-2', 'wake', 'wake-selector-2', 1, 2, 'legacy_protocol', 1, 0, 0, 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(dup_accepting.is_err());
+
+        let dup_authority_tuple = sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) \
+             VALUES ('sel-3', 'wake', 'wake-selector', 1, 1, 'engine_protocol', 0, 1, 0, 'now', 'later')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(dup_authority_tuple.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_enforces_selection_workflow_and_external_binding_coherence() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel-a', 'creation', 'create', 1, 1, 'engine_protocol', 1, 1, 1, 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) \
+             VALUES ('sel-b', 'creation', 'create', 2, 2, 'legacy_protocol', 0, 0, 0, 'now', 'later')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mismatched_workflow = sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf-bad', 'creation', 1, 'engine_protocol', 'authoritative', NULL, 'sel-b', 1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_workflow.is_err());
+
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf-ok', 'creation', 1, 'engine_protocol', 'authoritative', NULL, 'sel-a', 1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO external_acceptance_bindings \
+             (id, selection_id, profile_id, protocol_version, authority, authority_scope, idempotency_key, intent_fingerprint, workflow_id, receipt_codec_family, receipt_codec_version, receipt_payload, accepted_at) \
+             VALUES ('bind-1', 'sel-a', 'creation', 1, 'engine_protocol', 'repo:1', 'idem-1', 'fp-a', 'wf-ok', 'handle', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let replay = sqlx::query(
+            "INSERT INTO external_acceptance_bindings \
+             (id, selection_id, profile_id, protocol_version, authority, authority_scope, idempotency_key, intent_fingerprint, workflow_id, receipt_codec_family, receipt_codec_version, receipt_payload, accepted_at) \
+             VALUES ('bind-2', 'sel-a', 'creation', 1, 'engine_protocol', 'repo:1', 'idem-1', 'fp-b', 'wf-ok', 'handle', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(replay.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_rejects_external_binding_to_wrong_workflow_tuple() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at) \
+             VALUES ('sel-a', 'creation', 'create', 1, 1, 'engine_protocol', 1, 1, 1, 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) \
+             VALUES ('sel-b', 'other-profile', 'create', 2, 1, 'engine_protocol', 0, 1, 1, 'now', 'later')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
+             VALUES ('wf-other', 'other-profile', 1, 'engine_protocol', 'authoritative', NULL, 'sel-b', 1, 0, 'active', 'snapshot', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let wrong_workflow = sqlx::query(
+            "INSERT INTO external_acceptance_bindings \
+             (id, selection_id, profile_id, protocol_version, authority, authority_scope, idempotency_key, intent_fingerprint, workflow_id, receipt_codec_family, receipt_codec_version, receipt_payload, accepted_at) \
+             VALUES ('bind-wrong', 'sel-a', 'creation', 1, 'engine_protocol', 'repo:1', 'idem-wrong', 'fp-a', 'wf-other', 'handle', 1, '{}', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_workflow.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_enforces_attempt_observation_and_receipt_exact_effect_claim_context() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        let bad_attempt = sqlx::query(
+            "INSERT INTO workflow_attempts \
+             (id, effect_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, ordinal, status, begun_at) \
+             VALUES ('att-bad', 'eff', 'wf', 0, 0, 'claim-2', 'worker-1', 'later', 'now', 1, 'begun', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_attempt.is_err());
+
+        sqlx::query(
+            "INSERT INTO workflow_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, observed_at, recorded_at, authoritative) \
+             VALUES ('obs-1', 'eff', 'att', 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 'obs', 1, '{}', 'now', 'now', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bad_observation = sqlx::query(
+            "INSERT INTO workflow_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, observed_at, recorded_at, authoritative) \
+             VALUES ('obs-bad', 'eff', 'att', 'wf', 1, 99, 'claim-1', 'worker-1', 'later', 'now', 'obs', 1, '{}', 'now', 'now', 1)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_observation.is_err());
+
+        let bad_receipt = sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES ('rcpt-bad', 'eff', 'att', 'wf', 1, 0, 'other-claim', 'worker-1', 'later', 'now', 'receipt', 1, '{}', 'execution', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_receipt.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_retains_historical_effect_after_workflow_version_advances() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack_at_version(&pool, 2).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_effects WHERE id = 'eff' AND workflow_id = 'wf' AND declared_workflow_version = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_042_accepts_manual_receipt_without_attempt_but_rejects_execution_without_attempt(
+    ) {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        sqlx::query("DELETE FROM workflow_receipts WHERE id = 'rcpt'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES ('rcpt-manual', 'eff', NULL, 'wf', 1, 0, NULL, NULL, NULL, NULL, 'receipt', 1, '{}', 'manual', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let execution_without_attempt = sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES ('rcpt-exec-bad', 'eff', NULL, 'wf', 1, 0, NULL, NULL, NULL, NULL, 'receipt', 1, '{}', 'execution', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(execution_without_attempt.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_042_accepts_stale_observation_without_attempt() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO workflow_stale_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, codec_version, payload, observed_at, recorded_at, stale_reason) \
+             VALUES ('stale-1', 'eff', NULL, 'wf', 1, 0, 'claim-1', 'worker-1', 'later', 'now', 'obs', 1, '{}', 'now', 'now', 'superseded')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_042_enforces_manual_resolution_choice_ownership_and_owed_resolution_state() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        seed_workflow_stack(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO workflow_reducer_inbox \
+             (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, event_payload, delivery_status, consumed_by_transition_id) \
+             VALUES ('inbox', 'wf', 'rcpt', NULL, 'event', 1, '{}', 'pending', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bad_owed = sqlx::query(
+            "INSERT INTO workflow_owed_acceptance \
+             (id, workflow_id, reducer_inbox_id, status, resolving_transition_id, suppression_reason) \
+             VALUES ('owed-bad', 'wf', 'inbox', 'suppressed', NULL, 'superseded')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_owed.is_err());
+
+        sqlx::query(
+            "INSERT INTO workflow_manual_resolutions \
+             (id, workflow_id, effect_id, status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by) \
+             VALUES ('res-a', 'wf', 'eff', 'required', 'evidence', 1, '{}', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_manual_resolutions \
+             (id, workflow_id, effect_id, status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by) \
+             VALUES ('res-b', 'wf', 'eff', 'required', 'evidence', 1, '{}', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_manual_resolution_choices \
+             (id, resolution_id, workflow_id, kind, codec_family, codec_version, payload) \
+             VALUES ('choice-a', 'res-a', 'wf', 'retry', 'choice', 1, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let wrong_owner = sqlx::query(
+            "UPDATE workflow_manual_resolutions \
+             SET status = 'resolved', accepted_choice_id = 'choice-a', resolved_by = 'operator' \
+             WHERE id = 'res-b'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_owner.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_043_rejects_wrong_or_non_observe_binding_effects() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, state_updated_at, created_at, updated_at) VALUES ('conv', '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_workflow_stack(&pool).await;
+        sqlx::query(
+            "INSERT INTO wake_registration_fences (conversation_id, version, status) VALUES ('conv', 7, 'open')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let missing_registering_tool_use = sqlx::query(
+            "INSERT INTO wake_workflow_bindings \
+             (contract_id, workflow_id, conversation_id, registration_scope_kind, registration_scope_stable_key, resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
+             VALUES ('contract-missing-tool', 'wf', 'conv', 'conversation', 'conv', 'bash', 'conversation', 'conv', 'b-1', NULL, NULL, NULL, NULL, '', 'now', 'later', 7, 'eff', 'open')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(missing_registering_tool_use.is_err());
+
+        let wrong_effect_kind = sqlx::query(
+            "INSERT INTO wake_workflow_bindings \
+             (contract_id, workflow_id, conversation_id, registration_scope_kind, registration_scope_stable_key, resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
+             VALUES ('contract-wrong-effect', 'wf', 'conv', 'conversation', 'conv', 'bash', 'conversation', 'conv', 'b-1', NULL, NULL, NULL, NULL, 'tool-1', 'now', 'later', 7, 'eff-other', 'open')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_effect_kind.is_err());
+
+        let wrong_fence = sqlx::query(
+            "INSERT INTO wake_workflow_bindings \
+             (contract_id, workflow_id, conversation_id, registration_scope_kind, registration_scope_stable_key, resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
+             VALUES ('contract-bad-fence', 'wf', 'conv', 'conversation', 'conv', 'bash', 'conversation', 'conv', 'b-1', NULL, NULL, NULL, NULL, 'tool-1', 'now', 'later', 999, 'eff', 'open')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_fence.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_043_rejects_wrong_receipt_effect_and_invalid_terminal_branches() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, state_updated_at, created_at, updated_at) VALUES ('conv-term', '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_workflow_stack(&pool).await;
+        sqlx::query(
+            "INSERT INTO wake_registration_fences (conversation_id, version, status) VALUES ('conv-term', 1, 'open')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_workflow_bindings \
+             (contract_id, workflow_id, conversation_id, registration_scope_kind, registration_scope_stable_key, resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
+             VALUES ('contract', 'wf', 'conv-term', 'conversation', 'conv-term', 'bash', 'conversation', 'conv-term', 'b-1', NULL, NULL, NULL, NULL, 'tool-1', 'now', 'later', 1, 'eff', 'open')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let wrong_receipt_effect = sqlx::query(
+            "INSERT INTO wake_terminal_receipts \
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms) \
+             VALUES ('rcpt-other', 'wf', 'contract', 'eff', 'bash', 'fired', 'now', 'exited', 'now', 0, 10)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_receipt_effect.is_err());
+
+        let invalid_cancelled_branch = sqlx::query(
+            "INSERT INTO wake_terminal_receipts \
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, bash_status, bash_occurred_at, cancellation_reason) \
+             VALUES ('rcpt', 'wf', 'contract', 'eff', 'bash', 'cancelled', 'now', 'killed', 'now', 'explicit_cancel')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_cancelled_branch.is_err());
+
+        sqlx::query(
+            "INSERT INTO wake_terminal_receipts \
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, cancellation_reason) \
+             VALUES ('rcpt', 'wf', 'contract', 'eff', 'bash', 'cancelled', 'now', 'explicit_cancel')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let wrong_conv = sqlx::query(
+            "INSERT INTO wake_observation_inbox \
+             (id, workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, committed_at) \
+             VALUES ('inbox-bad', 'wf', 'contract', 'rcpt', 'other-conv', 1, 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(wrong_conv.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_043_rejects_unresolved_resolver_and_supports_obligation_minimal_shape() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, state_updated_at, created_at, updated_at) VALUES ('conv-tail', '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_workflow_stack(&pool).await;
+        sqlx::query(
+            "INSERT INTO wake_registration_fences (conversation_id, version, status) VALUES ('conv-tail', 1, 'open')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_workflow_bindings \
+             (contract_id, workflow_id, conversation_id, registration_scope_kind, registration_scope_stable_key, resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
+             VALUES ('contract-tail', 'wf', 'conv-tail', 'conversation', 'conv-tail', 'bash', 'conversation', 'conv-tail', 'b-1', NULL, NULL, NULL, NULL, 'tool-1', 'now', 'later', 1, 'eff', 'open')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_terminal_receipts \
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms) \
+             VALUES ('rcpt', 'wf', 'contract-tail', 'eff', 'bash', 'fired', 'now', 'exited', 'now', 0, 10)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_observation_inbox \
+             (id, workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, committed_at) \
+             VALUES ('inbox', 'wf', 'contract-tail', 'rcpt', 'conv-tail', 1, 'now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_runtime_obligations \
+             (id, conversation_id, snapshot_upper_bound, status, created_at, resolved_at, terminal_reason) \
+             VALUES ('obl', 'conv-tail', 1, 'accepted', 'now', 'now', 'accepted')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let unresolved_resolver = sqlx::query(
+            "INSERT INTO workflow_manual_resolutions \
+             (id, workflow_id, effect_id, status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by) \
+             VALUES ('res-required-bad', 'wf', 'eff', 'required', 'evidence', 1, '{}', NULL, 'operator')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(unresolved_resolver.is_err());
+
+        let missing_resolved_by = sqlx::query(
+            "INSERT INTO workflow_manual_resolutions \
+             (id, workflow_id, effect_id, status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by) \
+             VALUES ('res-resolved-bad', 'wf', 'eff', 'resolved', 'evidence', 1, '{}', 'missing-choice', '')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(missing_resolved_by.is_err());
+
+        sqlx::query(
+            "INSERT INTO wake_runtime_obligation_items \
+             (obligation_id, ordinal, inbox_item_id) \
+             VALUES ('obl', 0, 'inbox')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_terminal_receipt_bash_tail (receipt_id, ordinal, stream, offset, line) VALUES ('rcpt', 0, 'stdout', 1, 'hello')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_terminal_receipt_bash_tail (receipt_id, ordinal, stream, offset, line) VALUES ('rcpt', 1, 'stderr', 2, 'bye')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_terminal_receipt_bash_tail WHERE receipt_id = 'rcpt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
     #[tokio::test]
     async fn migration_003_adds_continued_in_conv_id_column() {
         let pool = test_pool().await;
