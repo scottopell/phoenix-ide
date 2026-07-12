@@ -781,7 +781,6 @@ mod tests {
     fn registry_with_test_llm() -> std::sync::Arc<phoenix_llm::ModelRegistry> {
         use async_trait::async_trait;
         use phoenix_llm::{ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, Usage};
-        use tokio::sync::broadcast;
 
         #[derive(Debug)]
         struct StubLlm;
@@ -797,7 +796,7 @@ mod tests {
             async fn complete_streaming(
                 &self,
                 r: &LlmRequest,
-                _: &broadcast::Sender<phoenix_llm::TokenChunk>,
+                _: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
             ) -> Result<LlmResponse, LlmError> {
                 self.complete(r).await
             }

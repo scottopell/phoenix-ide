@@ -83,7 +83,7 @@ impl LlmService for CountingLlm {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        _chunk_tx: &broadcast::Sender<TokenChunk>,
+        _chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         self.complete(request).await
     }
@@ -237,10 +237,10 @@ impl LlmService for StreamingLlm {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         for delta in &self.deltas {
-            let _ = chunk_tx.send(TokenChunk::Text(delta.clone()));
+            let _ = chunk_tx.send(TokenChunk::Text(delta.clone())).await;
             // Yield so the forwarder task gets a chance to drain the
             // channel before the next chunk arrives — keeps test ordering
             // deterministic without depending on broadcast capacity.
@@ -279,9 +279,11 @@ impl LlmService for FailingStreamingLlm {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let _ = chunk_tx.send(TokenChunk::Text("partial-".to_string()));
+        let _ = chunk_tx
+            .send(TokenChunk::Text("partial-".to_string()))
+            .await;
         tokio::task::yield_now().await;
         Err(LlmError::auth("simulated stream failure"))
     }
@@ -523,10 +525,12 @@ impl LlmService for ScriptedToolLlm {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // Final answer turn: stream the answer.
-        let _ = chunk_tx.send(TokenChunk::Text("final answer after search".to_string()));
+        let _ = chunk_tx
+            .send(TokenChunk::Text("final answer after search".to_string()))
+            .await;
         tokio::task::yield_now().await;
         Ok(LlmResponse {
             content: vec![ContentBlock::text("final answer after search")],
@@ -730,9 +734,11 @@ impl LlmService for AlwaysSearchLlm {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let _ = chunk_tx.send(TokenChunk::Text("forced final answer".to_string()));
+        let _ = chunk_tx
+            .send(TokenChunk::Text("forced final answer".to_string()))
+            .await;
         tokio::task::yield_now().await;
         Ok(LlmResponse {
             content: vec![ContentBlock::text("forced final answer")],

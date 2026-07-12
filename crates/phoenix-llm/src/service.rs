@@ -9,7 +9,7 @@ use super::{
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 /// Empty placeholder used when no tags should be forwarded — keeps the
 /// provider-call signatures uniform without allocating per request.
@@ -138,7 +138,7 @@ impl LlmService for LlmServiceImpl {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let result = self.complete_streaming_inner(request, chunk_tx).await;
 
@@ -268,7 +268,7 @@ impl LlmServiceImpl {
     async fn complete_streaming_inner(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {

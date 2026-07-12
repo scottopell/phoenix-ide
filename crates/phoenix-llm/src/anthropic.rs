@@ -56,11 +56,11 @@ impl StreamAccumulator {
     }
 
     /// Process one complete SSE event (`event_type` + JSON data).
-    fn process_event(
+    async fn process_event(
         &mut self,
         event_type: &str,
         data: &str,
-        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     ) -> Result<(), LlmError> {
         let v: serde_json::Value = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse SSE data: {e} - data: {data}"))
@@ -81,7 +81,7 @@ impl StreamAccumulator {
                     .unwrap_or(0);
             }
             "content_block_start" => self.on_block_start(&v),
-            "content_block_delta" => self.on_block_delta(&v, chunk_tx),
+            "content_block_delta" => self.on_block_delta(&v, chunk_tx).await,
             "content_block_stop" => self.on_block_stop(),
             "message_delta" => {
                 if let Some(sr) = v
@@ -186,10 +186,10 @@ impl StreamAccumulator {
         }
     }
 
-    fn on_block_delta(
+    async fn on_block_delta(
         &mut self,
         v: &serde_json::Value,
-        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     ) {
         let delta_type = v
             .pointer("/delta/type")
@@ -200,7 +200,9 @@ impl StreamAccumulator {
                 if let Some(text) = v.pointer("/delta/text").and_then(serde_json::Value::as_str) {
                     self.current_text.push_str(text);
                     // Forward token to UI — failures are fine (ephemeral, no subscribers)
-                    let _ = chunk_tx.send(super::TokenChunk::Text(text.to_string()));
+                    let _ = chunk_tx
+                        .send(super::TokenChunk::Text(text.to_string()))
+                        .await;
                 }
             }
             "input_json_delta" => {
@@ -340,7 +342,7 @@ pub async fn complete_streaming(
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
-    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
@@ -399,7 +401,10 @@ pub async fn complete_streaming(
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
         for event in sse.push(&chunk) {
-            if let Err(e) = acc.process_event(&event.event_type, &event.data, chunk_tx) {
+            if let Err(e) = acc
+                .process_event(&event.event_type, &event.data, chunk_tx)
+                .await
+            {
                 tracing::error!(
                     event_type = %event.event_type,
                     data_len = event.data.len(),
@@ -419,7 +424,8 @@ pub async fn complete_streaming(
 
     // Flush any trailing event (lenient: some gateways omit final blank line)
     for event in sse.finish() {
-        acc.process_event(&event.event_type, &event.data, chunk_tx)?;
+        acc.process_event(&event.event_type, &event.data, chunk_tx)
+            .await?;
     }
 
     acc.into_response_with_diagnostics(&diagnostics)
@@ -1119,8 +1125,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_source_header_suppresses_default_source_header() {
+    #[tokio::test]
+    async fn custom_source_header_suppresses_default_source_header() {
         assert!(has_custom_source_header(&[(
             "source".to_string(),
             "custom-poc".to_string(),
@@ -1135,8 +1141,8 @@ mod tests {
         )]));
     }
 
-    #[test]
-    fn test_tool_search_enabled_serialization() {
+    #[tokio::test]
+    async fn test_tool_search_enabled_serialization() {
         let spec = test_spec(true);
         let request = test_request_with_tools();
         let anthropic_req = translate_request(&spec, &request);
@@ -1171,8 +1177,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_tool_search_disabled_serialization() {
+    #[tokio::test]
+    async fn test_tool_search_disabled_serialization() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
         let anthropic_req = translate_request(&spec, &request);
@@ -1200,8 +1206,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cache_breakpoint_lands_on_trailing_tool_result() {
+    #[tokio::test]
+    async fn test_cache_breakpoint_lands_on_trailing_tool_result() {
         // A tool-loop request whose last user message is a single ToolResult block
         // must still receive the message-history cache breakpoint. Otherwise the
         // accumulating tool-loop tail is re-sent and re-charged at full price every
@@ -1232,16 +1238,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
+    #[tokio::test]
+    async fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
         let mut acc = StreamAccumulator::new();
-        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(1);
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event(
                 "error",
                 r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}"#,
                 &chunk_tx,
             )
+            .await
             .unwrap_err();
 
         assert_eq!(err.kind, crate::LlmErrorKind::ServerOverloaded);
@@ -1254,44 +1261,50 @@ mod tests {
 
     // --- streaming SSE accumulator robustness ---
 
-    #[test]
-    fn streaming_assembles_text_and_usage_from_event_sequence() {
+    #[tokio::test]
+    async fn streaming_assembles_text_and_usage_from_event_sequence() {
         let mut acc = StreamAccumulator::new();
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
             "message_start",
             r#"{"message":{"usage":{"input_tokens":7}}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event(
             "content_block_start",
             r#"{"index":0,"content_block":{"type":"text"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event(
             "content_block_delta",
             r#"{"index":0,"delta":{"type":"text_delta","text":"Hello "}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event(
             "content_block_delta",
             r#"{"index":0,"delta":{"type":"text_delta","text":"world"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .await
             .unwrap();
         acc.process_event(
             "message_delta",
             r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":11}}"#,
             &tx,
         )
+        .await
         .unwrap();
-        acc.process_event("message_stop", "{}", &tx).unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
         let resp = acc.into_response_with_diagnostics("").unwrap();
         assert_eq!(resp.content.len(), 1);
@@ -1301,16 +1314,17 @@ mod tests {
         assert_eq!(resp.usage.output_tokens, 11);
     }
 
-    #[test]
-    fn streaming_assembles_tool_use_from_split_input_json() {
+    #[tokio::test]
+    async fn streaming_assembles_tool_use_from_split_input_json() {
         let mut acc = StreamAccumulator::new();
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
             "content_block_start",
             r#"{"index":0,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         // The arguments object arrives split across two deltas.
         acc.process_event(
@@ -1318,22 +1332,26 @@ mod tests {
             r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event(
             "content_block_delta",
             r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .await
             .unwrap();
         acc.process_event(
             "message_delta",
             r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
             &tx,
         )
+        .await
         .unwrap();
-        acc.process_event("message_stop", "{}", &tx).unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
         let resp = acc.into_response_with_diagnostics("").unwrap();
         assert_eq!(resp.content.len(), 1);
@@ -1344,12 +1362,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn streaming_malformed_sse_data_is_invalid_response_not_panic() {
+    #[tokio::test]
+    async fn streaming_malformed_sse_data_is_invalid_response_not_panic() {
         let mut acc = StreamAccumulator::new();
-        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event("content_block_delta", "{ not json", &tx)
+            .await
             .unwrap_err();
         assert!(
             err.message.contains("Failed to parse SSE data"),
@@ -1358,21 +1377,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn streaming_ping_and_unknown_events_are_ignored() {
+    #[tokio::test]
+    async fn streaming_ping_and_unknown_events_are_ignored() {
         let mut acc = StreamAccumulator::new();
-        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Keep-alive pings and forward-compatible unknown events must be no-ops,
         // not errors — the stream keeps flowing.
-        acc.process_event("ping", "{}", &tx).unwrap();
+        acc.process_event("ping", "{}", &tx).await.unwrap();
         acc.process_event("some_future_event", r#"{"x":1}"#, &tx)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn streaming_text_delta_before_block_start_is_not_committed() {
+    #[tokio::test]
+    async fn streaming_text_delta_before_block_start_is_not_committed() {
         let mut acc = StreamAccumulator::new();
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         // A delta with no preceding content_block_start has no committed block to
         // attach to; it must be dropped rather than fabricated into output.
         acc.process_event(
@@ -1380,14 +1400,16 @@ mod tests {
             r#"{"index":0,"delta":{"type":"text_delta","text":"ghost"}}"#,
             &tx,
         )
+        .await
         .unwrap();
         acc.process_event(
             "message_delta",
             r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
             &tx,
         )
+        .await
         .unwrap();
-        acc.process_event("message_stop", "{}", &tx).unwrap();
+        acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
         let resp = acc.into_response_with_diagnostics("").unwrap();
         assert!(
@@ -1397,20 +1419,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_resolve_anthropic_url_override_takes_priority() {
+    #[tokio::test]
+    async fn test_resolve_anthropic_url_override_takes_priority() {
         let url = resolve_anthropic_url(Some("https://ai-gateway.us1.ddbuild.io/v1/messages"));
         assert_eq!(url, "https://ai-gateway.us1.ddbuild.io/v1/messages");
     }
 
-    #[test]
-    fn test_resolve_anthropic_url_default() {
+    #[tokio::test]
+    async fn test_resolve_anthropic_url_default() {
         let url = resolve_anthropic_url(None);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
     }
 
-    #[test]
-    fn test_request_tags_omitted_when_none() {
+    #[tokio::test]
+    async fn test_request_tags_omitted_when_none() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
         let req = translate_request(&spec, &request);
@@ -1421,8 +1443,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_request_tags_serialized_when_set() {
+    #[tokio::test]
+    async fn test_request_tags_serialized_when_set() {
         let spec = test_spec(false);
         let request = test_request_with_tools();
         let mut req = translate_request(&spec, &request);
@@ -1435,8 +1457,8 @@ mod tests {
         assert_eq!(json["tags"]["foo"], "bar");
     }
 
-    #[test]
-    fn test_normalize_response_with_server_tool_use() {
+    #[tokio::test]
+    async fn test_normalize_response_with_server_tool_use() {
         let resp = AnthropicResponse {
             content: vec![
                 AnthropicContentBlock::Text {
@@ -1478,8 +1500,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_normalize_response_known_server_blocks() {
+    #[tokio::test]
+    async fn test_normalize_response_known_server_blocks() {
         // tool_search_tool_result now deserializes to a real variant
         let json = r#"{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_123", "content": {"type": "tool_search_tool_search_result", "tool_references": [{"type": "tool_reference", "tool_name": "bash"}]}}"#;
         let block: AnthropicContentBlock = serde_json::from_str(json).unwrap();
@@ -1501,8 +1523,8 @@ mod tests {
         assert!(matches!(block3, AnthropicContentBlock::Unknown));
     }
 
-    #[test]
-    fn test_normalize_response_only_server_blocks_with_end_turn() {
+    #[tokio::test]
+    async fn test_normalize_response_only_server_blocks_with_end_turn() {
         let resp = AnthropicResponse {
             content: vec![AnthropicContentBlock::ServerToolUse {
                 id: "srvtoolu_abc".to_string(),
@@ -1529,8 +1551,8 @@ mod tests {
         assert!(result.end_turn);
     }
 
-    #[test]
-    fn test_normalize_response_only_server_blocks_with_tool_use_stop_reason() {
+    #[tokio::test]
+    async fn test_normalize_response_only_server_blocks_with_tool_use_stop_reason() {
         // Edge case: response has only ServerToolUse blocks (no regular ToolUse)
         // with stop_reason="tool_use". This should be rejected -- there's nothing
         // for the client to execute, so the state machine would be stuck.

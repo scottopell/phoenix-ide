@@ -722,6 +722,7 @@ mod codex_request_shape {
                 "store": false,
                 "prompt_cache_key": "conversation-1",
                 "parallel_tool_calls": false,
+                "tool_choice": "auto",
                 "reasoning": {"context":"all_turns"}
             })
         );

@@ -80,7 +80,7 @@ pub use phoenix_core::domain::llm_types::{self as types, *};
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 /// Chunks emitted during streaming. Only text deltas are forwarded to the UI;
@@ -143,7 +143,7 @@ pub trait LlmService: Send + Sync {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // Default: ignore chunk_tx, fall back to non-streaming
         let _ = chunk_tx;
@@ -261,44 +261,16 @@ impl LlmService for LoggingService {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(true);
         let start = std::time::Instant::now();
-
-        // Best-effort time-to-first-token: watch the broadcast channel from a
-        // side task and record the elapsed time when the first text chunk
-        // lands. Subscribing is side-effect free (providers ignore send
-        // errors, so an extra receiver changes nothing). The task is aborted
-        // once the request resolves so its span clone cannot hold the span
-        // open past the request. On Lagged the first token is long gone —
-        // skip recording rather than fabricate a late value.
-        let ttft_watch = {
-            let span = span.clone();
-            let mut rx = chunk_tx.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(TokenChunk::Text(_)) => {
-                            span.record(
-                                "time_to_first_token_ms",
-                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            );
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            })
-        };
 
         let result = self
             .inner
             .complete_streaming(request, chunk_tx)
             .instrument(span.clone())
             .await;
-        ttft_watch.abort();
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
 

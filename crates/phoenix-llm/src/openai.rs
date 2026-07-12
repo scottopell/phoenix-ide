@@ -49,7 +49,11 @@ pub async fn complete(
     use_codex_backend: bool,
 ) -> Result<LlmResponse, LlmError> {
     if use_codex_backend {
-        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(1);
+        // Non-streaming callers do not consume deltas. Close the receiver so
+        // awaited provider sends fail immediately instead of filling a bounded
+        // channel and deadlocking before the terminal response.
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(1);
+        drop(chunk_rx);
         return complete_streaming(
             spec,
             api_key,
@@ -193,24 +197,6 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
     }
 }
 
-trait TokenChunkSink {
-    fn emit(&self, chunk: super::TokenChunk);
-}
-
-impl TokenChunkSink for tokio::sync::broadcast::Sender<super::TokenChunk> {
-    fn emit(&self, chunk: super::TokenChunk) {
-        let _ = self.send(chunk);
-    }
-}
-
-impl TokenChunkSink for std::sync::Mutex<Vec<super::TokenChunk>> {
-    fn emit(&self, chunk: super::TokenChunk) {
-        self.lock()
-            .expect("chunk buffer mutex poisoned")
-            .push(chunk);
-    }
-}
-
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
@@ -245,11 +231,11 @@ impl ResponsesStreamAccumulator {
     }
 
     #[allow(clippy::too_many_lines)] // dispatch table; each arm is small
-    fn process_event(
+    async fn process_event(
         &mut self,
         event_type: &str,
         data: &str,
-        emit: &impl TokenChunkSink,
+        emit: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     ) -> Result<(), LlmError> {
         // Sentinel — not valid JSON, nothing to do.
         if data == "[DONE]" {
@@ -271,7 +257,7 @@ impl ResponsesStreamAccumulator {
             "response.output_text.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
                     if !delta.is_empty() {
-                        emit.emit(super::TokenChunk::Text(delta.to_string()));
+                        let _ = emit.send(super::TokenChunk::Text(delta.to_string())).await;
                     }
                 }
             }
@@ -503,6 +489,9 @@ pub(crate) struct CodexWsSessions {
     /// The outer mutex protects entry creation and bounded eviction. Each cache
     /// cohort has its own mutex, so unrelated conversations remain concurrent.
     by_cache_key: HashMap<String, Arc<CodexWsSessionEntry>>,
+    /// Transport health belongs to the shared Codex endpoint pool, not to a
+    /// prompt-cache cohort. A failed endpoint must be avoided by new conversations too.
+    cooldown: std::sync::Mutex<CodexWsCooldown>,
 }
 
 #[derive(Debug)]
@@ -513,7 +502,6 @@ struct CodexWsSessionEntry {
     /// the next acquisition to discard the potentially misaligned socket.
     dirty: AtomicBool,
     last_used: std::sync::Mutex<Instant>,
-    cooldown: std::sync::Mutex<CodexWsCooldown>,
 }
 
 impl Default for CodexWsSessionEntry {
@@ -522,7 +510,6 @@ impl Default for CodexWsSessionEntry {
             session: Mutex::new(CodexWsSession::default()),
             dirty: AtomicBool::new(false),
             last_used: std::sync::Mutex::new(Instant::now()),
-            cooldown: std::sync::Mutex::new(CodexWsCooldown::default()),
         }
     }
 }
@@ -601,6 +588,7 @@ fn reset_ws_session(session: &mut CodexWsSession) {
 #[derive(Debug)]
 enum CodexWsError {
     Fallback(LlmError),
+    Interrupted(LlmError),
     Cooldown,
     Backend(LlmError),
 }
@@ -741,25 +729,6 @@ fn evict_ws_sessions(pool: &mut CodexWsSessions, now: Instant) {
     }
 }
 
-fn coalesce_buffered_chunks(chunks: Vec<super::TokenChunk>) -> Vec<super::TokenChunk> {
-    let mut text = String::new();
-    let mut latest_quota = None;
-    for chunk in chunks {
-        match chunk {
-            super::TokenChunk::Text(delta) => text.push_str(&delta),
-            super::TokenChunk::RateLimitSnapshot(snapshot) => latest_quota = Some(snapshot),
-        }
-    }
-    let mut result = Vec::with_capacity(2);
-    if !text.is_empty() {
-        result.push(super::TokenChunk::Text(text));
-    }
-    if let Some(snapshot) = latest_quota {
-        result.push(super::TokenChunk::RateLimitSnapshot(snapshot));
-    }
-    result
-}
-
 #[allow(clippy::too_many_lines)]
 async fn complete_codex_websocket(
     http_url: &str,
@@ -767,7 +736,7 @@ async fn complete_codex_websocket(
     custom_headers: &[(String, String)],
     cache_key: &str,
     full_request: &ResponsesBackendRequest,
-    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     sessions: &Arc<Mutex<CodexWsSessions>>,
 ) -> Result<LlmResponse, CodexWsError> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -793,7 +762,9 @@ async fn complete_codex_websocket(
     };
     let mut session = entry.session.lock().await;
     *entry.last_used.lock().expect("last_used mutex poisoned") = Instant::now();
-    if entry
+    if sessions
+        .lock()
+        .await
         .cooldown
         .lock()
         .expect("cooldown mutex poisoned")
@@ -844,11 +815,6 @@ async fn complete_codex_websocket(
     let mut envelope = wire;
     envelope["type"] = serde_json::Value::String("response.create".to_string());
 
-    // Buffer WebSocket emissions in owned memory until terminal success. A
-    // transport failure therefore cannot leak speculative deltas or impose a
-    // fixed-capacity truncation point before the HTTP fallback.
-    let buffered_chunks = std::sync::Mutex::new(Vec::new());
-
     let mut upgrade = websocket_url(http_url)
         .map_err(CodexWsError::backend)?
         .into_client_request()
@@ -890,6 +856,11 @@ async fn complete_codex_websocket(
         })?;
         headers.insert(name, value);
     }
+
+    // Once text is observable on the public channel, replaying the request over
+    // HTTP could duplicate user-visible output. Quota-only frames do not close
+    // this fallback window.
+    let mut public_output_started = false;
 
     let result = async {
         if session.socket.is_none() {
@@ -947,15 +918,23 @@ async fn complete_codex_websocket(
                 .unwrap_or("");
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
-                    buffered_chunks
-                        .lock()
-                        .expect("chunk buffer mutex poisoned")
-                        .push(super::TokenChunk::RateLimitSnapshot(snapshot));
+                    let _ = chunk_tx
+                        .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                        .await;
                 }
                 continue;
             }
-            acc.process_event(event_type, &text, &buffered_chunks)
+            acc.process_event(event_type, &text, chunk_tx)
+                .await
                 .map_err(CodexWsError::backend)?;
+            if event_type == "response.output_text.delta"
+                && value
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|delta| !delta.is_empty())
+            {
+                public_output_started = true;
+            }
             if event_type == "response.completed" {
                 response_id = value
                     .pointer("/response/id")
@@ -983,19 +962,9 @@ async fn complete_codex_websocket(
 
     match result {
         Ok((response, response_id, server_output)) => {
-            // WebSocket output is withheld until terminal success so fallback
-            // cannot duplicate speculative deltas. Coalesce it before crossing
-            // the lossy public broadcast boundary: regardless of model delta
-            // count, successful replay is at most one text chunk plus the latest
-            // quota snapshot and therefore cannot overflow channel capacity.
-            for chunk in coalesce_buffered_chunks(
-                buffered_chunks
-                    .into_inner()
-                    .expect("chunk buffer mutex poisoned"),
-            ) {
-                let _ = chunk_tx.send(chunk);
-            }
-            entry
+            sessions
+                .lock()
+                .await
                 .cooldown
                 .lock()
                 .expect("cooldown mutex poisoned")
@@ -1008,13 +977,31 @@ async fn complete_codex_websocket(
             attempt.finish();
             Ok(response)
         }
-        Err(error) => {
+        Err(mut error) => {
+            if public_output_started {
+                error = match error {
+                    CodexWsError::Fallback(transport) => {
+                        CodexWsError::Interrupted(LlmError::network(format!(
+                            "Codex WebSocket interrupted after public output: {}",
+                            transport.message
+                        )))
+                    }
+                    other @ (CodexWsError::Interrupted(_)
+                    | CodexWsError::Cooldown
+                    | CodexWsError::Backend(_)) => other,
+                };
+            }
             // A protocol or transport failure poisons the stream. Reconnect on
             // the next request and require a full create; never continue from
             // metadata whose terminal response was not observed.
             reset_ws_session(&mut session);
-            if matches!(error, CodexWsError::Fallback(_)) {
-                entry
+            if matches!(
+                error,
+                CodexWsError::Fallback(_) | CodexWsError::Interrupted(_)
+            ) {
+                sessions
+                    .lock()
+                    .await
                     .cooldown
                     .lock()
                     .expect("cooldown mutex poisoned")
@@ -1027,6 +1014,7 @@ async fn complete_codex_websocket(
 }
 
 /// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
     spec: &ModelSpec,
@@ -1035,7 +1023,7 @@ pub async fn complete_streaming(
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
-    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     use_codex_backend: bool,
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
@@ -1063,7 +1051,9 @@ pub async fn complete_streaming(
                     cache_key = request.cache_key.as_str(),
                     "Codex WebSocket transport cooldown active; using HTTP/SSE"
                 ),
-                Err(CodexWsError::Backend(error)) => return Err(error),
+                Err(CodexWsError::Backend(error) | CodexWsError::Interrupted(error)) => {
+                    return Err(error);
+                }
                 Err(CodexWsError::Fallback(error)) => tracing::warn!(error = %error.message,
                     "Codex WebSocket transport/protocol failed; falling back once to full HTTP/SSE"),
             }
@@ -1120,7 +1110,9 @@ pub async fn complete_streaming(
         if let Some(snapshot) =
             super::rate_limit::quota_from_codex_response_headers(response.headers())
         {
-            let _ = chunk_tx.send(super::TokenChunk::RateLimitSnapshot(snapshot));
+            let _ = chunk_tx
+                .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                .await;
         }
     }
 
@@ -1131,7 +1123,10 @@ pub async fn complete_streaming(
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
         for event in sse.push(&chunk) {
-            if let Err(e) = acc.process_event(&event.event_type, &event.data, chunk_tx) {
+            if let Err(e) = acc
+                .process_event(&event.event_type, &event.data, chunk_tx)
+                .await
+            {
                 tracing::error!(
                     event_type = %event.event_type,
                     data_len = event.data.len(),
@@ -1147,7 +1142,8 @@ pub async fn complete_streaming(
     }
 
     for event in sse.finish() {
-        acc.process_event(&event.event_type, &event.data, chunk_tx)?;
+        acc.process_event(&event.event_type, &event.data, chunk_tx)
+            .await?;
     }
 
     acc.into_response()
@@ -1655,11 +1651,18 @@ struct CodexResponsesLiteRequest {
     store: bool,
     prompt_cache_key: String,
     parallel_tool_calls: bool,
+    tool_choice: CodexResponsesLiteToolChoice,
     reasoning: CodexResponsesLiteReasoning,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodexResponsesLiteToolChoice {
+    Auto,
 }
 
 #[derive(Debug, Serialize)]
@@ -1701,6 +1704,7 @@ impl CodexResponsesLiteRequest {
                 .prompt_cache_key
                 .expect("LlmRequest always supplies a prompt cache key"),
             parallel_tool_calls: false,
+            tool_choice: CodexResponsesLiteToolChoice::Auto,
             reasoning: CodexResponsesLiteReasoning {
                 context: CodexReasoningContext::AllTurns,
             },
@@ -1995,6 +1999,7 @@ mod tests {
                 assert_eq!(request["type"], "response.create");
                 assert!(request.get("response").is_none());
                 assert!(request["model"].is_string());
+                assert_eq!(request["tool_choice"], "auto");
                 assert_eq!(
                     request["client_metadata"]
                         ["ws_request_header_x_openai_internal_codex_responses_lite"],
@@ -2129,7 +2134,7 @@ mod tests {
     async fn websocket_reuses_connection_continues_resets_and_falls_back_safely() {
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let call = |request: LlmRequest| {
             let url = url.clone();
             let sessions = sessions.clone();
@@ -2193,14 +2198,15 @@ mod tests {
         assert!(requests[3].1.get("previous_response_id").is_none());
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
-        // A failed socket may have produced speculative deltas internally. Exactly
-        // one HTTP fallback occurs and only the fallback chunk becomes public.
-        call(request_with(&[("ws-fail", MessageRole::User)]))
+        // Once a text delta is public, transport interruption is returned without
+        // replaying the request over HTTP.
+        let err = call(request_with(&[("ws-fail", MessageRole::User)]))
             .await
-            .unwrap();
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+            .unwrap_err();
+        assert_eq!(err.kind, crate::LlmErrorKind::Network);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
         let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(!chunks
+        assert!(chunks
             .iter()
             .any(|c| matches!(c, super::super::TokenChunk::Text(t) if t == "speculative")));
         // The cohort is now cooling down, so the next turn goes straight to
@@ -2208,9 +2214,13 @@ mod tests {
         call(request_with(&[("cooldown-skip", MessageRole::User)]))
             .await
             .unwrap();
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
+        {
+            let pool = sessions.lock().await;
+            pool.cooldown.lock().unwrap().reset();
+        }
         sessions.lock().await.by_cache_key.clear();
         // Reconnect after failure, but a terminal model error is returned as-is
         // rather than changing semantics by replaying it over HTTP.
@@ -2218,7 +2228,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
     }
 
@@ -2226,7 +2236,7 @@ mod tests {
     async fn websocket_continuation_includes_item_done_output_when_terminal_omits_output() {
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let (tx, _) = tokio::sync::mpsc::channel(8);
         let call = |request: LlmRequest| {
             let (url, sessions, tx) = (url.clone(), sessions.clone(), tx.clone());
             async move {
@@ -2268,8 +2278,17 @@ mod tests {
     async fn websocket_replays_more_than_public_capacity_without_loss() {
         let (url, _) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
-        let receiver = tokio::spawn(async move { rx.recv().await.unwrap() });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let receiver = tokio::spawn(async move {
+            let mut text = String::new();
+            while let Some(chunk) = rx.recv().await {
+                if let super::super::TokenChunk::Text(delta) = chunk {
+                    text.push_str(&delta);
+                    tokio::task::yield_now().await;
+                }
+            }
+            text
+        });
         complete_streaming(
             &codex_spec(),
             "secret",
@@ -2283,10 +2302,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let chunk = receiver.await.unwrap();
-        let super::super::TokenChunk::Text(text) = chunk else {
-            panic!("expected coalesced text");
-        };
+        drop(tx);
+        let text = receiver.await.unwrap();
         let expected = (0..1_300).fold(String::new(), |mut output, i| {
             use std::fmt::Write;
             write!(output, "{i},").expect("write to String");
@@ -2295,8 +2312,8 @@ mod tests {
         assert_eq!(text, expected);
     }
 
-    #[test]
-    fn websocket_cooldown_backoff_skip_expiry_and_reset_are_deterministic() {
+    #[tokio::test]
+    async fn websocket_cooldown_backoff_skip_expiry_and_reset_are_deterministic() {
         let start = Instant::now();
         let mut cooldown = CodexWsCooldown::default();
         cooldown.record_transport_failure(start);
@@ -2315,7 +2332,7 @@ mod tests {
     {
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let headers = vec![
             ("OpenAI-Beta".into(), "responses=experimental".into()),
             ("chatgpt-account-id".into(), "workspace-a".into()),
@@ -2371,7 +2388,7 @@ mod tests {
     async fn websocket_frame_timeout_falls_back_and_header_identity_reconnects() {
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let (tx, _) = tokio::sync::mpsc::channel(8);
         let headers_a = vec![("chatgpt-account-id".into(), "a".into())];
         complete_streaming(
             &codex_spec(),
@@ -2388,6 +2405,10 @@ mod tests {
         .unwrap();
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         sessions.lock().await.by_cache_key.clear();
+        {
+            let pool = sessions.lock().await;
+            pool.cooldown.lock().unwrap().reset();
+        }
         let headers_b = vec![("ChatGPT-Account-ID".into(), "b".into())];
         complete_streaming(
             &codex_spec(),
@@ -2409,7 +2430,7 @@ mod tests {
     async fn websocket_cancelled_attempt_is_dropped_before_reuse() {
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
-        let (tx, _) = tokio::sync::broadcast::channel(8);
+        let (tx, _) = tokio::sync::mpsc::channel(8);
         let task = tokio::spawn({
             let (url, sessions, tx) = (url.clone(), sessions.clone(), tx.clone());
             async move {
@@ -2452,8 +2473,8 @@ mod tests {
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn websocket_pool_evicts_idle_and_oldest_capacity_entries_without_credentials() {
+    #[tokio::test]
+    async fn websocket_pool_evicts_idle_and_oldest_capacity_entries_without_credentials() {
         let mut pool = CodexWsSessions::default();
         let now = Instant::now();
         for i in 0..CODEX_WS_MAX_SESSIONS {
@@ -2486,8 +2507,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn websocket_continuation_requires_exact_prefix_including_server_output() {
+    #[tokio::test]
+    async fn websocket_continuation_requires_exact_prefix_including_server_output() {
         let compatibility = serde_json::json!({"model":"gpt-5.6","stream":true});
         let prefix = vec![
             serde_json::json!({"type":"message","role":"user","content":"one"}),
@@ -2504,8 +2525,8 @@ mod tests {
         assert!(continuation_suffix(&old, &compatibility, &next).is_none());
     }
 
-    #[test]
-    fn websocket_continuation_resets_on_non_prefix_or_property_change() {
+    #[tokio::test]
+    async fn websocket_continuation_resets_on_non_prefix_or_property_change() {
         let compatibility = serde_json::json!({"model":"gpt-5.6","stream":true});
         let old = ws_session(vec![serde_json::json!("a")], compatibility.clone());
         assert!(continuation_suffix(&old, &compatibility, &[serde_json::json!("x")]).is_none());
@@ -2517,8 +2538,8 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn websocket_server_output_canonicalizes_to_next_request_input_shape() {
+    #[tokio::test]
+    async fn websocket_server_output_canonicalizes_to_next_request_input_shape() {
         let output = vec![
             serde_json::json!({"type":"message","content":[{"type":"output_text","text":"answer"}]}),
         ];
@@ -2538,8 +2559,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_source_header_suppresses_default_source_header() {
+    #[tokio::test]
+    async fn custom_source_header_suppresses_default_source_header() {
         assert!(has_custom_source_header(&[(
             "source".to_string(),
             "custom-poc".to_string(),
@@ -2558,8 +2579,8 @@ mod tests {
     /// `function_call_output` parts with the Responses API's `input_text` /
     /// `input_image` discriminants. Regression guard: the API rejects the
     /// Chat-Completions-style `text` / `image_url` types with HTTP 400.
-    #[test]
-    fn tool_result_image_serialises_with_responses_api_part_types() {
+    #[tokio::test]
+    async fn tool_result_image_serialises_with_responses_api_part_types() {
         use crate::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
 
         let mut req = empty_request();
@@ -2586,8 +2607,8 @@ mod tests {
         assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
     }
 
-    #[test]
-    fn codex_continuation_input_including_prompt_fits_typed_item_limit() {
+    #[tokio::test]
+    async fn codex_continuation_input_including_prompt_fits_typed_item_limit() {
         use crate::types::{ContentBlock, LlmMessage, MessageRole};
 
         let limits = crate::ContinuationRequestLimits::codex_bridge();
@@ -2614,8 +2635,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_request_tags_omitted_when_none() {
+    #[tokio::test]
+    async fn test_request_tags_omitted_when_none() {
         let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
         let json = serde_json::to_value(&req).unwrap();
         assert!(
@@ -2792,8 +2813,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_request_tags_serialized_when_set() {
+    #[tokio::test]
+    async fn test_request_tags_serialized_when_set() {
         let mut req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
         let mut tags = BTreeMap::new();
         tags.insert("disable_data_logging".to_string(), "true".to_string());
@@ -2804,8 +2825,8 @@ mod tests {
         assert_eq!(json["tags"]["foo"], "bar");
     }
 
-    #[test]
-    fn classify_responses_error_codex_codes_route_to_terminal_variants() {
+    #[tokio::test]
+    async fn classify_responses_error_codex_codes_route_to_terminal_variants() {
         use super::super::LlmErrorKind;
         // Matches PR 77's HTTP-path semantics — keep these two paths in sync.
         assert_eq!(
@@ -2839,8 +2860,8 @@ mod tests {
             .is_auto_retryable());
     }
 
-    #[test]
-    fn classify_responses_error_maps_codes() {
+    #[tokio::test]
+    async fn classify_responses_error_maps_codes() {
         use super::super::LlmErrorKind;
         assert_eq!(
             classify_responses_error("rate_limit_exceeded", "x").kind,
@@ -2878,23 +2899,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_event_returns_err_on_top_level_error() {
+    #[tokio::test]
+    async fn process_event_returns_err_on_top_level_error() {
         use super::super::LlmErrorKind;
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
-        let err = acc.process_event("error", data, &tx).unwrap_err();
+        let err = acc.process_event("error", data, &tx).await.unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
     }
 
     // --- streaming SSE accumulator robustness ---
 
-    #[test]
-    fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
-        let err = acc.process_event("", "{ not json", &tx).unwrap_err();
+        let err = acc.process_event("", "{ not json", &tx).await.unwrap_err();
         assert!(
             err.message.contains("Failed to parse SSE data"),
             "got: {}",
@@ -2902,44 +2923,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_event_done_sentinel_is_ignored() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_done_sentinel_is_ignored() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         // The `[DONE]` sentinel is not JSON; it must be a no-op, not a parse error.
-        acc.process_event("", "[DONE]", &tx).unwrap();
+        acc.process_event("", "[DONE]", &tx).await.unwrap();
         assert!(
             !acc.done,
             "[DONE] sentinel alone does not finalize the stream"
         );
     }
 
-    #[test]
-    fn process_event_unknown_dispatch_type_is_ignored() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_unknown_dispatch_type_is_ignored() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         acc.process_event("", r#"{"type":"response.in_progress"}"#, &tx)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn process_event_empty_dispatch_type_is_ignored_and_logged_once() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_empty_dispatch_type_is_ignored_and_logged_once() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         // An event whose embedded `type` is empty has nothing to dispatch on; it
         // must be tolerated (logged exactly once), never erroring the stream.
         assert!(!acc.logged_empty_dispatch);
-        acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
+        acc.process_event("", r#"{"type":""}"#, &tx).await.unwrap();
         assert!(
             acc.logged_empty_dispatch,
             "first empty-dispatch event is logged"
         );
-        acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
+        acc.process_event("", r#"{"type":""}"#, &tx).await.unwrap();
     }
 
-    #[test]
-    fn process_event_assembles_message_text_from_output_item_done() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_assembles_message_text_from_output_item_done() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         // The primary (non-fallback) assembly path: a completed message item.
         let data = r#"{
@@ -2949,6 +2971,7 @@ mod tests {
             ]}
         }"#;
         acc.process_event("response.output_item.done", data, &tx)
+            .await
             .unwrap();
         assert_eq!(acc.output_items.len(), 1);
 
@@ -2962,38 +2985,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_event_handles_codex_nested_error_shape() {
+    #[tokio::test]
+    async fn process_event_handles_codex_nested_error_shape() {
         use super::super::LlmErrorKind;
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         // Real codex/ChatGPT-backend payload captured 2026-05-11 via WARN log.
         let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
-        let err = acc.process_event("error", data, &tx).unwrap_err();
+        let err = acc.process_event("error", data, &tx).await.unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
         assert!(!err.kind.is_auto_retryable());
         assert!(err.message.contains("context_length_exceeded"));
         assert!(err.message.contains("Your input exceeds"));
     }
 
-    #[test]
-    fn process_event_returns_err_on_response_failed() {
+    #[tokio::test]
+    async fn process_event_returns_err_on_response_failed() {
         use super::super::LlmErrorKind;
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream"}}}"#;
-        let err = acc.process_event("response.failed", data, &tx).unwrap_err();
+        let err = acc
+            .process_event("response.failed", data, &tx)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ServerError);
     }
 
-    #[test]
-    fn process_event_returns_err_on_response_incomplete_max_tokens() {
+    #[tokio::test]
+    async fn process_event_returns_err_on_response_incomplete_max_tokens() {
         use super::super::LlmErrorKind;
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
         let err = acc
             .process_event("response.incomplete", data, &tx)
+            .await
             .unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ServerError);
     }
@@ -3004,9 +3031,9 @@ mod tests {
     /// assembled message. Repro of the 2026-05-11 gateway behaviour where
     /// `support-chat-completions` produced 5 output tokens, was billed for
     /// them, but Phoenix persisted "`end_turn` with empty content".
-    #[test]
-    fn process_event_recovers_output_from_response_completed_when_no_item_done() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_recovers_output_from_response_completed_when_no_item_done() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{
             "type":"response.completed",
@@ -3020,6 +3047,7 @@ mod tests {
             }
         }"#;
         acc.process_event("response.completed", data, &tx)
+            .await
             .expect("response.completed handler should not error on valid payload");
         assert!(acc.done, "response.completed should set done");
         assert_eq!(
@@ -3033,9 +3061,9 @@ mod tests {
 
     /// `OpenAI`'s cached-read and cache-write details are both subsets of
     /// `input_tokens`; normalization splits both without changing context usage.
-    #[test]
-    fn responses_api_cache_details_are_threaded_without_double_counting() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn responses_api_cache_details_are_threaded_without_double_counting() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{
             "type":"response.completed",
@@ -3053,6 +3081,7 @@ mod tests {
             }
         }"#;
         acc.process_event("response.completed", data, &tx)
+            .await
             .expect("handler should not error");
         assert_eq!(acc.cached_tokens, 600);
         assert_eq!(acc.cache_write_tokens, 200);
@@ -3076,8 +3105,8 @@ mod tests {
         assert_eq!(resp.usage.context_window_used(), 1050);
     }
 
-    #[test]
-    fn gpt56_emits_valid_breakpoints_but_older_and_codex_models_do_not() {
+    #[tokio::test]
+    async fn gpt56_emits_valid_breakpoints_but_older_and_codex_models_do_not() {
         let mut request = empty_request();
         for i in 0..5 {
             request.messages.push(LlmMessage {
@@ -3130,8 +3159,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_cache_breakpoints_preserve_fifty_read_boundaries() {
+    #[tokio::test]
+    async fn explicit_cache_breakpoints_preserve_fifty_read_boundaries() {
         let mut request = empty_request();
         for i in 0..55 {
             request.messages.push(LlmMessage {
@@ -3160,8 +3189,8 @@ mod tests {
     /// accounting: cached defaults to 0 and `input_tokens` is unchanged.
     /// `output_tokens` is 0 here — an empty, unbilled response, so the
     /// billed-but-empty guard does not fire.
-    #[test]
-    fn responses_api_usage_without_cached_details_defaults_to_zero() {
+    #[tokio::test]
+    async fn responses_api_usage_without_cached_details_defaults_to_zero() {
         let usage: ResponsesApiUsage =
             serde_json::from_str(r#"{"input_tokens":10,"output_tokens":0}"#).unwrap();
         assert_eq!(usage.input_tokens_details.cached_tokens, 0);
@@ -3180,8 +3209,8 @@ mod tests {
     /// response with no content block means the assembled message was
     /// lost in transit (a gateway dropping the output array). Normalization
     /// must surface a retryable error, not a silently-empty agent turn.
-    #[test]
-    fn responses_api_empty_content_with_billed_tokens_is_retryable_error() {
+    #[tokio::test]
+    async fn responses_api_empty_content_with_billed_tokens_is_retryable_error() {
         let err = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: vec![],
@@ -3205,8 +3234,8 @@ mod tests {
     /// A `refusal` message part is the model's actual reply — it declined.
     /// It must surface as non-empty text content so the billed-but-empty
     /// guard does not mistake a final answer for a lost message and retry.
-    #[test]
-    fn responses_api_refusal_message_surfaces_as_text_not_retried() {
+    #[tokio::test]
+    async fn responses_api_refusal_message_surfaces_as_text_not_retried() {
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: vec![ResponsesApiOutput {
@@ -3244,9 +3273,9 @@ mod tests {
     /// If both `response.output_item.done` and `response.completed` carry
     /// output, the per-item events win — don't double-count by appending the
     /// terminal-event payload on top.
-    #[test]
-    fn process_event_fallback_skips_when_output_items_already_captured() {
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+    #[tokio::test]
+    async fn process_event_fallback_skips_when_output_items_already_captured() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let item_done = r#"{
             "type":"response.output_item.done",
@@ -3266,8 +3295,10 @@ mod tests {
             }
         }"#;
         acc.process_event("response.output_item.done", item_done, &tx)
+            .await
             .unwrap();
         acc.process_event("response.completed", completed, &tx)
+            .await
             .unwrap();
         assert_eq!(
             acc.output_items.len(),

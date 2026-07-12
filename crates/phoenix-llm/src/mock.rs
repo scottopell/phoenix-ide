@@ -29,7 +29,7 @@ use super::{LlmError, LlmService, TokenChunk};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 /// Per-conversation retry-attempt counter, keyed by `LlmRequest.cache_key`
 /// (which is the conversation id at the call site — `executor.rs` builds
@@ -680,7 +680,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
 /// surface (server holds the connection open but stops sending data).
 async fn stream_text_with_optional_stall(
     text: &str,
-    chunk_tx: &broadcast::Sender<TokenChunk>,
+    chunk_tx: &mpsc::Sender<TokenChunk>,
     stall: Option<(usize, u64)>,
 ) {
     // Split into small chunks (roughly word-sized) for realistic streaming
@@ -705,7 +705,7 @@ async fn stream_text_with_optional_stall(
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
             }
-            let _ = chunk_tx.send(TokenChunk::Text(buf.clone()));
+            let _ = chunk_tx.send(TokenChunk::Text(buf.clone())).await;
             buf.clear();
             chunks_sent += 1;
             // Small delay between chunks: 15-40ms feels realistic
@@ -714,7 +714,7 @@ async fn stream_text_with_optional_stall(
     }
 
     if !buf.is_empty() {
-        let _ = chunk_tx.send(TokenChunk::Text(buf));
+        let _ = chunk_tx.send(TokenChunk::Text(buf)).await;
     }
 }
 
@@ -766,7 +766,7 @@ impl LlmService for MockLlmService {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // `[[retry:KIND,N]]` driver — the first N calls for this
         // conversation fail with the requested LlmErrorKind; the

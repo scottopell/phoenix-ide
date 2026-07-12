@@ -8902,7 +8902,6 @@ mod regenerate_conversation_name_tests {
         ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
     };
     use std::sync::Arc;
-    use tokio::sync::broadcast;
 
     #[derive(Debug)]
     enum StubLlm {
@@ -8926,7 +8925,7 @@ mod regenerate_conversation_name_tests {
         async fn complete_streaming(
             &self,
             r: &LlmRequest,
-            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
+            _: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
         ) -> Result<LlmResponse, LlmError> {
             self.complete(r).await
         }
@@ -9115,7 +9114,6 @@ mod upgrade_model_state_guard_tests {
         ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
     };
     use std::sync::Arc;
-    use tokio::sync::broadcast;
 
     #[derive(Debug)]
     struct StubLlm;
@@ -9131,7 +9129,7 @@ mod upgrade_model_state_guard_tests {
         async fn complete_streaming(
             &self,
             r: &LlmRequest,
-            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
+            _: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
         ) -> Result<LlmResponse, LlmError> {
             self.complete(r).await
         }

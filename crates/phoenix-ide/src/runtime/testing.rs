@@ -109,14 +109,16 @@ impl LlmClient for StreamingMockLlmClient {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // Emit the burst. Each send is a fire-and-forget into the broadcast
         // channel; the forwarder task reads and re-broadcasts as
         // `SseEvent::Token`. The count is deliberately large so the forwarder
         // provably has pending work when `complete_streaming` returns.
         for i in 0..self.token_count {
-            let _ = chunk_tx.send(phoenix_llm::TokenChunk::Text(format!("chunk{i} ")));
+            let _ = chunk_tx
+                .send(phoenix_llm::TokenChunk::Text(format!("chunk{i} ")))
+                .await;
         }
         Ok(LlmResponse {
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],

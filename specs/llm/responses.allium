@@ -248,13 +248,13 @@ rule CodexWebSocketContinuationSelected {
         ):
             CodexWebSocketAttempt.created(
                 disposition: incremental,
-                emitted_before_success: false,
+                emitted_before_success: true,
                 beta_header: "responses_websockets=2026-02-06"
             )
         else:
             CodexWebSocketAttempt.created(
                 disposition: full,
-                emitted_before_success: false,
+                emitted_before_success: true,
                 beta_header: "responses_websockets=2026-02-06"
             )
 
@@ -267,8 +267,10 @@ rule CodexWebSocketContinuationSelected {
         -- terminal event replaces the session prefix with full input plus exact
         -- server output. Auth/model/property/compaction or non-prefix changes do
         -- not reuse the old response id.
-        -- A codex.rate_limits frame is parsed into a quota snapshot and emitted
-        -- as TokenChunk::RateLimitSnapshot only with the successful buffered turn.
+        -- Text deltas and codex.rate_limits quota snapshots are emitted through
+        -- the bounded single-consumer channel as their frames arrive. Only a
+        -- non-empty text delta starts public output; quota frames leave the
+        -- pre-output HTTP fallback window open.
 }
 
 rule CodexWebSocketFailureFallsBackOnce {
@@ -279,28 +281,27 @@ rule CodexWebSocketFailureFallsBackOnce {
         if failure_kind in { connect, transport, protocol, frame_timeout }:
             CodexWebSocketAttempt.created(
                 disposition: http_fallback,
-                emitted_before_success: false,
+                emitted_before_success: true,
                 beta_header: "responses_websockets=2026-02-06"
             )
         else:
             CodexWebSocketAttempt.created(
                 disposition: backend_error,
-                emitted_before_success: false,
+                emitted_before_success: true,
                 beta_header: "responses_websockets=2026-02-06"
             )
 
     @guidance
-        -- WebSocket token chunks remain in an unbounded owned collection until
-        -- response.completed. Success replays every chunk in order to the public
-        -- stream with cooperative scheduling between sends; transport/protocol
-        -- failure discards them and issues exactly one full HTTP/SSE request.
-        -- Rate limits and every backend model error return to the caller without
-        -- replay or transport cooldown, preserving executor semantics.
+        -- Before any text is public, a transport/protocol failure issues exactly
+        -- one full HTTP/SSE request. After text is public, transport failure is an
+        -- interrupted network error and never replays the request. Backend/model
+        -- errors return directly and never affect transport cooldown.
         -- Connect plus protocol handshake and each frame read have explicit
         -- terminal timeouts, so a half-open peer cannot retain the cohort lock.
-        -- Each transport fallback increments a per-cache-key exponential,
-        -- capped cooldown. Requests inside it skip WebSocket immediately; expiry
-        -- permits a retry, and terminal WebSocket success resets the history.
+        -- Each transport failure increments a shared Codex endpoint-pool
+        -- exponential capped cooldown, so different prompt-cache cohorts also
+        -- skip WebSocket. Expiry permits a retry and terminal WebSocket success
+        -- resets the shared history.
 }
 
 rule CodexWebSocketPoolBoundedAndCancellationSafe {

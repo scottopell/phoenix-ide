@@ -27,7 +27,7 @@ use phoenix_llm::{
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 /// Maximum number of tool-using turns the Q&A agent may take before it must
 /// answer (REQ-CHN-009). Bounds cost/latency so the loop terminates; the
@@ -471,40 +471,22 @@ impl ChainQa {
         // Final turn forces an answer with an empty tool set; search gating is
         // irrelevant here.
         let request = build_agent_request(messages, prep.language, true, false);
-        let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
         let forwarder = tokio::spawn(async move {
             let mut partial = String::new();
             loop {
                 match chunk_rx.recv().await {
-                    Ok(TokenChunk::Text(delta)) => {
+                    Some(TokenChunk::Text(delta)) => {
                         partial.push_str(&delta);
                         runtime_handle.publish(ChainSseEvent::Token {
                             chain_qa_id: qa_id.clone(),
                             delta,
                         });
                     }
-                    Ok(TokenChunk::RateLimitSnapshot(_)) => {}
-                    // The forwarder fell behind the provider and the channel
-                    // dropped `skipped` token chunks. They're unrecoverable, but
-                    // the failed-row contract preserves *what streamed* — so
-                    // record the gap (in both the persisted partial and the live
-                    // view) instead of silently concatenating a misleading
-                    // suffix.
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            chain_qa_id = %qa_id, skipped,
-                            "chain Q&A answer stream lagged; dropped token chunks",
-                        );
-                        let marker = "\n[… some streamed tokens were dropped …]\n".to_string();
-                        partial.push_str(&marker);
-                        runtime_handle.publish(ChainSseEvent::Token {
-                            chain_qa_id: qa_id.clone(),
-                            delta: marker,
-                        });
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Some(TokenChunk::RateLimitSnapshot(_)) => {}
+                    None => break,
                 }
             }
             partial
