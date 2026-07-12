@@ -3690,12 +3690,17 @@ def _make_reporter(pretty: bool, active: set, skipped: dict):
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
+    env.pop("GIT_CONFIG_PARAMETERS", None)
     try:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
             raise ValueError
+        import re
+        valid_key = re.compile(r"^[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z0-9-]*$")
         if any(
-            f"GIT_CONFIG_KEY_{index}" not in env or f"GIT_CONFIG_VALUE_{index}" not in env
+            f"GIT_CONFIG_KEY_{index}" not in env
+            or f"GIT_CONFIG_VALUE_{index}" not in env
+            or not valid_key.fullmatch(env[f"GIT_CONFIG_KEY_{index}"])
             for index in range(count)
         ):
             raise ValueError

@@ -37,11 +37,25 @@ class CheckPlanTests(unittest.TestCase):
         self.assertEqual("commit.gpgsign", env["GIT_CONFIG_KEY_1"])
         self.assertEqual("false", env["GIT_CONFIG_VALUE_1"])
 
+    def test_git_config_override_removes_higher_precedence_parameters(self):
+        env = {"GIT_CONFIG_PARAMETERS": "'commit.gpgsign=true'"}
+
+        self.dev._append_git_config_override("commit.gpgsign", "false", env)
+
+        self.assertNotIn("GIT_CONFIG_PARAMETERS", env)
+        self.assertEqual("commit.gpgsign", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
+
     def test_git_config_override_resets_malformed_inherited_entries(self):
         for malformed in (
             {"GIT_CONFIG_COUNT": "wat", "GIT_CONFIG_KEY_9": "stale"},
             {"GIT_CONFIG_COUNT": "-1", "GIT_CONFIG_VALUE_9": "stale"},
             {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "incomplete"},
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "bad key",
+                "GIT_CONFIG_VALUE_0": "true",
+            },
         ):
             with self.subTest(malformed=malformed):
                 env = malformed.copy()

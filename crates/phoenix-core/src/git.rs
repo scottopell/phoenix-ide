@@ -27,6 +27,7 @@ pub fn command() -> std::process::Command {
 #[must_use]
 pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
+    command.env_remove("GIT_CONFIG_PARAMETERS");
     let inherited = inherited_config_count();
 
     if inherited.is_none() {
@@ -54,10 +55,42 @@ fn inherited_config_count() -> Option<usize> {
     let count = raw_count.to_str()?.parse::<usize>().ok()?;
     (0..count)
         .all(|index| {
-            std::env::var_os(format!("GIT_CONFIG_KEY_{index}")).is_some()
+            std::env::var(format!("GIT_CONFIG_KEY_{index}"))
+                .ok()
+                .is_some_and(|key| is_valid_config_key(&key))
                 && std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")).is_some()
         })
         .then_some(count)
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let Some(first_dot) = key.find('.') else {
+        return false;
+    };
+    let Some(last_dot) = key.rfind('.') else {
+        return false;
+    };
+    let Some(section) = key.get(..first_dot) else {
+        return false;
+    };
+    let Some(name) = key.get(last_dot + 1..) else {
+        return false;
+    };
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    };
+
+    section
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && valid_component(section)
+        && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && valid_component(name)
+        && !key.contains(['\0', '\n'])
 }
 
 fn clear_inherited_config(command: &mut std::process::Command) {
@@ -143,6 +176,24 @@ fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod command_tests {
     use super::*;
+
+    #[test]
+    fn config_key_validation_rejects_keys_git_cannot_parse() {
+        assert!(is_valid_config_key("commit.gpgsign"));
+        assert!(is_valid_config_key("http.https://example.com.proxy"));
+        assert!(!is_valid_config_key("bad key"));
+        assert!(!is_valid_config_key("nosection"));
+        assert!(!is_valid_config_key("section.9name"));
+        assert!(!is_valid_config_key("section.name\nother.value"));
+    }
+
+    #[test]
+    fn command_removes_higher_precedence_config_parameters() {
+        let command = command();
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| { key == "GIT_CONFIG_PARAMETERS" && value.is_none() }));
+    }
 
     #[test]
     fn additional_config_is_preserved_and_signing_override_has_final_precedence() {
