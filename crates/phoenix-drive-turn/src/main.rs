@@ -1,6 +1,7 @@
 use phoenix_ide::drive_turn::{self, DatabaseMode, DriveTurnRequest};
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing_subscriber::EnvFilter;
 
 const HELP: &str = "drive-turn — drive one user turn through the production Phoenix runtime
 
@@ -28,6 +29,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    if let Err(error) = init_tracing() {
+        eprintln!("drive-turn: failed to initialize tracing: {error}");
+        std::process::exit(1);
+    }
+
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(Some(args)) => args,
         Ok(None) => {
@@ -60,6 +66,18 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into());
+    tracing_subscriber::fmt()
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, String> {

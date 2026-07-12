@@ -23,7 +23,7 @@ The CLI supports transient in-memory SQLite, retained unique temporary-file SQLi
   --timeout 180
 ```
 
-The `dev.py` wrapper layers `.phoenix-ide.env` and `.phoenix-ide.dev.env` exactly as development server startup does, builds the driver, and forwards all arguments. Direct binary invocation remains available when the caller has already prepared the process environment. The process reads the same LLM environment variables as the server. Standard output is reserved for JSON; invocation and runtime failures are written to standard error with a non-zero exit status.
+The `dev.py` wrapper layers `.phoenix-ide.env` and `.phoenix-ide.dev.env` exactly as development server startup does, builds the driver, and forwards all arguments. Direct binary invocation remains available when the caller has already prepared the process environment. The process reads the same LLM environment variables as the server. Standard output is reserved for JSON. The CLI installs structured runtime tracing on standard error using `RUST_LOG` when set and the Phoenix development filter otherwise; invocation and runtime failures are also written to standard error with a non-zero exit status.
 
 ## Verification
 
