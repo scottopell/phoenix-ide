@@ -193,6 +193,24 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
     }
 }
 
+trait TokenChunkSink {
+    fn emit(&self, chunk: super::TokenChunk);
+}
+
+impl TokenChunkSink for tokio::sync::broadcast::Sender<super::TokenChunk> {
+    fn emit(&self, chunk: super::TokenChunk) {
+        let _ = self.send(chunk);
+    }
+}
+
+impl TokenChunkSink for std::sync::Mutex<Vec<super::TokenChunk>> {
+    fn emit(&self, chunk: super::TokenChunk) {
+        self.lock()
+            .expect("chunk buffer mutex poisoned")
+            .push(chunk);
+    }
+}
+
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
@@ -231,7 +249,7 @@ impl ResponsesStreamAccumulator {
         &mut self,
         event_type: &str,
         data: &str,
-        chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+        emit: &impl TokenChunkSink,
     ) -> Result<(), LlmError> {
         // Sentinel — not valid JSON, nothing to do.
         if data == "[DONE]" {
@@ -253,7 +271,7 @@ impl ResponsesStreamAccumulator {
             "response.output_text.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
                     if !delta.is_empty() {
-                        let _ = chunk_tx.send(super::TokenChunk::Text(delta.to_string()));
+                        emit.emit(super::TokenChunk::Text(delta.to_string()));
                     }
                 }
             }
@@ -463,6 +481,12 @@ type CodexSocket =
 const CODEX_WS_MAX_SESSIONS: usize = 32;
 const CODEX_WS_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 #[cfg(not(test))]
+const CODEX_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CODEX_WS_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const CODEX_WS_COOLDOWN_BASE: Duration = Duration::from_secs(1);
+const CODEX_WS_COOLDOWN_MAX: Duration = Duration::from_secs(5 * 60);
+#[cfg(not(test))]
 const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
 const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
@@ -482,6 +506,7 @@ struct CodexWsSessionEntry {
     /// the next acquisition to discard the potentially misaligned socket.
     dirty: AtomicBool,
     last_used: std::sync::Mutex<Instant>,
+    cooldown: std::sync::Mutex<CodexWsCooldown>,
 }
 
 impl Default for CodexWsSessionEntry {
@@ -490,6 +515,7 @@ impl Default for CodexWsSessionEntry {
             session: Mutex::new(CodexWsSession::default()),
             dirty: AtomicBool::new(false),
             last_used: std::sync::Mutex::new(Instant::now()),
+            cooldown: std::sync::Mutex::new(CodexWsCooldown::default()),
         }
     }
 }
@@ -524,6 +550,32 @@ impl Drop for AttemptMarker {
 }
 
 #[derive(Debug, Default)]
+struct CodexWsCooldown {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl CodexWsCooldown {
+    fn is_active(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| now < retry_at)
+    }
+
+    fn record_transport_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let shift = self.consecutive_failures.saturating_sub(1).min(31);
+        let multiplier = 1_u32 << shift;
+        let delay = CODEX_WS_COOLDOWN_BASE
+            .saturating_mul(multiplier)
+            .min(CODEX_WS_COOLDOWN_MAX);
+        self.retry_at = Some(now + delay);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Default)]
 struct CodexWsSession {
     socket: Option<CodexSocket>,
     response_id: Option<String>,
@@ -542,6 +594,7 @@ fn reset_ws_session(session: &mut CodexWsSession) {
 #[derive(Debug)]
 enum CodexWsError {
     Fallback(LlmError),
+    Cooldown,
     Backend(LlmError),
 }
 
@@ -681,6 +734,25 @@ fn evict_ws_sessions(pool: &mut CodexWsSessions, now: Instant) {
     }
 }
 
+fn coalesce_buffered_chunks(chunks: Vec<super::TokenChunk>) -> Vec<super::TokenChunk> {
+    let mut text = String::new();
+    let mut latest_quota = None;
+    for chunk in chunks {
+        match chunk {
+            super::TokenChunk::Text(delta) => text.push_str(&delta),
+            super::TokenChunk::RateLimitSnapshot(snapshot) => latest_quota = Some(snapshot),
+        }
+    }
+    let mut result = Vec::with_capacity(2);
+    if !text.is_empty() {
+        result.push(super::TokenChunk::Text(text));
+    }
+    if let Some(snapshot) = latest_quota {
+        result.push(super::TokenChunk::RateLimitSnapshot(snapshot));
+    }
+    result
+}
+
 #[allow(clippy::too_many_lines)]
 async fn complete_codex_websocket(
     http_url: &str,
@@ -714,6 +786,14 @@ async fn complete_codex_websocket(
     };
     let mut session = entry.session.lock().await;
     *entry.last_used.lock().expect("last_used mutex poisoned") = Instant::now();
+    if entry
+        .cooldown
+        .lock()
+        .expect("cooldown mutex poisoned")
+        .is_active(Instant::now())
+    {
+        return Err(CodexWsError::Cooldown);
+    }
     if entry.dirty.swap(false, Ordering::AcqRel) {
         reset_ws_session(&mut session);
     }
@@ -751,10 +831,10 @@ async fn complete_codex_websocket(
     let mut envelope = wire;
     envelope["type"] = serde_json::Value::String("response.create".to_string());
 
-    // Buffer WebSocket emissions until a terminal success. If the socket fails,
-    // the HTTP fallback starts from a clean public stream and cannot duplicate
-    // speculative deltas already observed on the failed transport.
-    let (buffer_tx, mut buffer_rx) = tokio::sync::broadcast::channel(1024);
+    // Buffer WebSocket emissions in owned memory until terminal success. A
+    // transport failure therefore cannot leak speculative deltas or impose a
+    // fixed-capacity truncation point before the HTTP fallback.
+    let buffered_chunks = std::sync::Mutex::new(Vec::new());
 
     let mut upgrade = websocket_url(http_url)
         .map_err(CodexWsError::backend)?
@@ -800,9 +880,17 @@ async fn complete_codex_websocket(
 
     let result = async {
         if session.socket.is_none() {
-            let (socket, _) = connect_async(upgrade).await.map_err(|e| {
-                CodexWsError::fallback(LlmError::network(format!("WebSocket connect: {e}")))
-            })?;
+            let (socket, _) =
+                tokio::time::timeout(CODEX_WS_CONNECT_TIMEOUT, connect_async(upgrade))
+                    .await
+                    .map_err(|_| {
+                        CodexWsError::fallback(LlmError::network(
+                            "WebSocket connect/handshake timeout",
+                        ))
+                    })?
+                    .map_err(|e| {
+                        CodexWsError::fallback(LlmError::network(format!("WebSocket connect: {e}")))
+                    })?;
             session.socket = Some(socket);
         }
         let socket = session.socket.as_mut().expect("socket initialized");
@@ -846,11 +934,14 @@ async fn complete_codex_websocket(
                 .unwrap_or("");
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
-                    let _ = buffer_tx.send(super::TokenChunk::RateLimitSnapshot(snapshot));
+                    buffered_chunks
+                        .lock()
+                        .expect("chunk buffer mutex poisoned")
+                        .push(super::TokenChunk::RateLimitSnapshot(snapshot));
                 }
                 continue;
             }
-            acc.process_event(event_type, &text, &buffer_tx)
+            acc.process_event(event_type, &text, &buffered_chunks)
                 .map_err(CodexWsError::backend)?;
             if event_type == "response.completed" {
                 response_id = value
@@ -879,10 +970,23 @@ async fn complete_codex_websocket(
 
     match result {
         Ok((response, response_id, server_output)) => {
-            drop(buffer_tx);
-            while let Ok(chunk) = buffer_rx.try_recv() {
+            // WebSocket output is withheld until terminal success so fallback
+            // cannot duplicate speculative deltas. Coalesce it before crossing
+            // the lossy public broadcast boundary: regardless of model delta
+            // count, successful replay is at most one text chunk plus the latest
+            // quota snapshot and therefore cannot overflow channel capacity.
+            for chunk in coalesce_buffered_chunks(
+                buffered_chunks
+                    .into_inner()
+                    .expect("chunk buffer mutex poisoned"),
+            ) {
                 let _ = chunk_tx.send(chunk);
             }
+            entry
+                .cooldown
+                .lock()
+                .expect("cooldown mutex poisoned")
+                .reset();
             let mut prefix = full_input;
             prefix.extend(canonical_server_output(server_output));
             session.response_id = Some(response_id);
@@ -896,6 +1000,13 @@ async fn complete_codex_websocket(
             // the next request and require a full create; never continue from
             // metadata whose terminal response was not observed.
             reset_ws_session(&mut session);
+            if matches!(error, CodexWsError::Fallback(_)) {
+                entry
+                    .cooldown
+                    .lock()
+                    .expect("cooldown mutex poisoned")
+                    .record_transport_failure(Instant::now());
+            }
             attempt.finish();
             Err(error)
         }
@@ -935,6 +1046,10 @@ pub async fn complete_streaming(
             .await
             {
                 Ok(response) => return Ok(response),
+                Err(CodexWsError::Cooldown) => tracing::debug!(
+                    cache_key = request.cache_key.as_str(),
+                    "Codex WebSocket transport cooldown active; using HTTP/SSE"
+                ),
                 Err(CodexWsError::Backend(error)) => return Err(error),
                 Err(CodexWsError::Fallback(error)) => tracing::warn!(error = %error.message,
                     "Codex WebSocket transport/protocol failed; falling back once to full HTTP/SSE"),
@@ -1896,6 +2011,13 @@ mod tests {
                         "secondary":null,"credits":null,"promo_message":null}
                     }).to_string())).await.unwrap();
                 }
+                if marker.contains("many-deltas") {
+                    for i in 0..1_300 {
+                        socket.send(AxumWsMessage::Text(serde_json::json!({
+                            "type":"response.output_text.delta", "delta":format!("{i},")
+                        }).to_string())).await.unwrap();
+                    }
+                }
                 if marker.contains("terminal") {
                     socket
                         .send(AxumWsMessage::Text(
@@ -2042,15 +2164,69 @@ mod tests {
         assert!(!chunks
             .iter()
             .any(|c| matches!(c, super::super::TokenChunk::Text(t) if t == "speculative")));
+        // The cohort is now cooling down, so the next turn goes straight to
+        // HTTP without another WebSocket connection attempt.
+        call(request_with(&[("cooldown-skip", MessageRole::User)]))
+            .await
+            .unwrap();
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
 
+        sessions.lock().await.by_cache_key.clear();
         // Reconnect after failure, but a terminal model error is returned as-is
         // rather than changing semantics by replaying it over HTTP.
         let err = call(request_with(&[("terminal", MessageRole::User)]))
             .await
             .unwrap_err();
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 2);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_replays_more_than_public_capacity_without_loss() {
+        let (url, _) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        let receiver = tokio::spawn(async move { rx.recv().await.unwrap() });
+        complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &[],
+            &BTreeMap::new(),
+            &request_with(&[("many-deltas", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        let chunk = receiver.await.unwrap();
+        let super::super::TokenChunk::Text(text) = chunk else {
+            panic!("expected coalesced text");
+        };
+        let expected = (0..1_300).fold(String::new(), |mut output, i| {
+            use std::fmt::Write;
+            write!(output, "{i},").expect("write to String");
+            output
+        });
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn websocket_cooldown_backoff_skip_expiry_and_reset_are_deterministic() {
+        let start = Instant::now();
+        let mut cooldown = CodexWsCooldown::default();
+        cooldown.record_transport_failure(start);
+        assert!(cooldown.is_active(start));
+        assert!(!cooldown.is_active(start + CODEX_WS_COOLDOWN_BASE));
+        cooldown.record_transport_failure(start + CODEX_WS_COOLDOWN_BASE);
+        assert!(cooldown.is_active(start + CODEX_WS_COOLDOWN_BASE * 2));
+        assert!(!cooldown.is_active(start + CODEX_WS_COOLDOWN_BASE * 3));
+        cooldown.reset();
+        assert!(!cooldown.is_active(start));
+        assert_eq!(cooldown.consecutive_failures, 0);
     }
 
     #[tokio::test]
@@ -2130,6 +2306,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        sessions.lock().await.by_cache_key.clear();
         let headers_b = vec![("ChatGPT-Account-ID".into(), "b".into())];
         complete_streaming(
             &codex_spec(),

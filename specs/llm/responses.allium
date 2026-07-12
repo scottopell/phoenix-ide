@@ -290,12 +290,17 @@ rule CodexWebSocketFailureFallsBackOnce {
             )
 
     @guidance
-        -- WebSocket token chunks remain private until response.completed.
-        -- Transport/protocol failure discards them and issues exactly one full
-        -- HTTP/SSE request. Rate limits and every backend model error return to
-        -- the caller without replay, preserving executor backoff and semantics.
-        -- Each frame read has a terminal timeout, so an accepted half-open
-        -- connection cannot retain its session lock indefinitely.
+        -- WebSocket token chunks remain in an unbounded owned collection until
+        -- response.completed. Success replays every chunk in order to the public
+        -- stream with cooperative scheduling between sends; transport/protocol
+        -- failure discards them and issues exactly one full HTTP/SSE request.
+        -- Rate limits and every backend model error return to the caller without
+        -- replay or transport cooldown, preserving executor semantics.
+        -- Connect plus protocol handshake and each frame read have explicit
+        -- terminal timeouts, so a half-open peer cannot retain the cohort lock.
+        -- Each transport fallback increments a per-cache-key exponential,
+        -- capped cooldown. Requests inside it skip WebSocket immediately; expiry
+        -- permits a retry, and terminal WebSocket success resets the history.
 }
 
 rule CodexWebSocketPoolBoundedAndCancellationSafe {
