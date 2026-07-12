@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 const DEFAULT_LIMIT: usize = 2000;
+const FILE_VIEWER_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Read a file's contents with line numbers.
 pub struct ReadFileTool;
@@ -161,7 +162,9 @@ impl Tool for ReadFileTool {
         let viewer_available = std::fs::canonicalize(&resolved)
             .ok()
             .zip(std::fs::canonicalize(&ctx.working_dir).ok())
-            .is_some_and(|(file, root)| file.starts_with(root));
+            .is_some_and(|(file, root)| file.starts_with(root))
+            && std::fs::metadata(&resolved)
+                .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES);
 
         let display_data = serde_json::to_value(ReadFileDisplayData {
             r#type: "read_file",
@@ -291,6 +294,28 @@ mod tests {
                 "remaining_line_count": 2,
                 "viewer_available": true,
             }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_oversized_file_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("large.txt"),
+            vec![b'x'; usize::try_from(FILE_VIEWER_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "large.txt", "limit": 1}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result.display_data().and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
         );
     }
 

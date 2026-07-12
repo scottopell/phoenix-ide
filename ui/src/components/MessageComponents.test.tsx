@@ -1473,11 +1473,37 @@ describe('read_file structured result view', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Copy file excerpt/i }));
     await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith(lines);
+      expect(copyToClipboard).toHaveBeenCalledWith(lines.split('\n').slice(0, 20).join('\n'));
     });
 
     expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+  });
+
+  it('caps structured previews and copy payloads by characters', async () => {
+    const longLine = 'x'.repeat(20_000);
+    const copyMock = vi.mocked(copyToClipboard);
+    copyMock.mockClear();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-long-line', [
+            { type: 'tool_use', id: 'tool-read-long-line', name: 'read_file', input: { path: 'generated.min.js' } },
+          ])}
+          toolResults={new Map([['tool-read-long-line', toolMessage('tool-read-long-line', `     1\t${longLine}`, 2, {
+            type: 'read_file', path: 'generated.min.js', requested_offset: 1, requested_limit: 2000,
+            returned_start_line: 1, returned_end_line: 1, returned_line_count: 1,
+            total_line_count: 1, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/returned line truncated for preview/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Copy file excerpt/i }));
+    await waitFor(() => expect(copyMock).toHaveBeenCalled());
+    expect(copyMock.mock.calls.at(-1)?.[0].length).toBeLessThanOrEqual(5_010);
   });
 
   it('hides the viewer action for absolute and traversal read paths', () => {

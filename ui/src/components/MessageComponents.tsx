@@ -1653,8 +1653,26 @@ function parseReadFileDisplayData(value: unknown): ReadFileDisplayData | null {
   return data as ReadFileDisplayData;
 }
 
-const READ_FILE_PREVIEW_MIN_LINES = 12;
 const READ_FILE_PREVIEW_MAX_LINES = 20;
+const READ_FILE_PREVIEW_MAX_CHARS = 5_000;
+
+function boundedReadFileLines(lines: ReadFileLine[]): { lines: ReadFileLine[]; truncated: boolean } {
+  const visible: ReadFileLine[] = [];
+  let remainingChars = READ_FILE_PREVIEW_MAX_CHARS;
+  for (const line of lines.slice(0, READ_FILE_PREVIEW_MAX_LINES)) {
+    if (remainingChars <= 0) break;
+    const content = line.content.length > remainingChars
+      ? `${line.content.slice(0, remainingChars)}…`
+      : line.content;
+    visible.push({ ...line, content });
+    remainingChars -= Math.min(line.content.length, remainingChars);
+    if (content.endsWith('…')) break;
+  }
+  return {
+    lines: visible,
+    truncated: visible.length < lines.length || visible.some((line, index) => line.content !== lines[index]?.content),
+  };
+}
 
 function parseReadFileRequest(input: Record<string, unknown>): ReadFileRequest {
   const path = typeof input['path'] === 'string' ? input['path'] : '';
@@ -1716,11 +1734,12 @@ function formatReadFileRange(request: ReadFileRequest, parsed: ReadFileParseResu
   return 'from start of file';
 }
 
-function buildReadFileCopyText(_request: ReadFileRequest, parsed: ReadFileParseResult, rawText: string): string {
+function buildReadFileCopyText(parsed: ReadFileParseResult, rawText: string): string {
   if (parsed.lines.length === 0) {
-    return rawText;
+    return rawText.slice(0, READ_FILE_PREVIEW_MAX_CHARS);
   }
-  return parsed.lines.map((line) => `${line.lineNumber}\t${line.content}`).join('\n');
+  const preview = boundedReadFileLines(parsed.lines);
+  return preview.lines.map((line) => `${line.lineNumber}\t${line.content}`).join('\n');
 }
 
 function ReadFileResultView({
@@ -1736,12 +1755,9 @@ function ReadFileResultView({
 }) {
   const request = useMemo(() => parseReadFileRequest(input), [input]);
   const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
-  const previewLines = useMemo(() => {
-    if (parsed.lines.length <= READ_FILE_PREVIEW_MIN_LINES) return parsed.lines;
-    return parsed.lines.slice(0, Math.min(READ_FILE_PREVIEW_MAX_LINES, parsed.lines.length));
-  }, [parsed.lines]);
-  const visibleLines = previewLines;
-  const hasMore = visibleLines.length < parsed.lines.length;
+  const preview = useMemo(() => boundedReadFileLines(parsed.lines), [parsed.lines]);
+  const visibleLines = preview.lines;
+  const hasMore = preview.truncated;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
 
@@ -1758,7 +1774,7 @@ function ReadFileResultView({
   }
 
   const rangeLabel = formatReadFileRange(request, parsed);
-  const copyText = buildReadFileCopyText(request, parsed, rawText);
+  const copyText = buildReadFileCopyText(parsed, rawText);
 
   return (
     <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
@@ -1795,7 +1811,9 @@ function ReadFileResultView({
       </div>
       {(hasMore || metadata.remaining_line_count > 0) && (
         <div className="read-file-result-more">
-          {hasMore && `${parsed.lines.length - visibleLines.length} more returned lines`}
+          {hasMore && (parsed.lines.length > visibleLines.length
+            ? `${parsed.lines.length - visibleLines.length} more returned lines`
+            : 'returned line truncated for preview')}
           {hasMore && metadata.remaining_line_count > 0 && ' · '}
           {metadata.remaining_line_count > 0 && `${metadata.remaining_line_count} file lines not returned`}
           {' · view the complete current file for full context'}
