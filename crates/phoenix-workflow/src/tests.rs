@@ -42,11 +42,32 @@ fn protocol() -> ProtocolSelection {
         authority: SemanticAuthority::EngineProtocol,
         accepting: true,
         runtime_acceptance_enabled: true,
+        external_acceptance_enabled: true,
         selector: "selector-v1",
     }
 }
 
+fn legacy_protocol() -> ProtocolSelection {
+    let mut selection = protocol();
+    selection.authority = SemanticAuthority::LegacyProtocol;
+    selection
+}
+
 fn effect(effect_id: u64, role: EffectRole, generation: Generation) -> EffectDecl<&'static str> {
+    effect_with_ambiguity(
+        effect_id,
+        role,
+        generation,
+        EffectAmbiguity::SafeRepeatability,
+    )
+}
+
+fn effect_with_ambiguity(
+    effect_id: u64,
+    role: EffectRole,
+    generation: Generation,
+    ambiguity: EffectAmbiguity,
+) -> EffectDecl<&'static str> {
     EffectDecl {
         effect_id: EffectId(effect_id),
         family: "test",
@@ -54,7 +75,7 @@ fn effect(effect_id: u64, role: EffectRole, generation: Generation) -> EffectDec
         codec: codec("intent"),
         generation,
         role,
-        ambiguity: EffectAmbiguity::SafeRepeatability,
+        ambiguity,
         intent: "intent",
         next_eligible_at: None,
         destructive_resource: None,
@@ -138,6 +159,87 @@ fn rejects_dependency_cycles() {
         validate_plan(&plan, &barrier_events()),
         Err(PlanError::DependencyCycle)
     );
+}
+
+#[test]
+fn external_acceptance_replays_same_receipt_and_rejects_conflicting_intent() {
+    let selection = protocol();
+    let mut registry = ExternalAcceptanceRegistry::new();
+    let first = registry.accept(
+        &selection,
+        "account:a",
+        "client-key",
+        "intent:v1",
+        WorkflowId(10),
+        "conversation-10",
+    );
+    let ExternalAcceptanceOutcome::New(first_receipt) = first else {
+        panic!("first acceptance must be new");
+    };
+    let replay = registry.accept(
+        &selection,
+        "account:a",
+        "client-key",
+        "intent:v1",
+        WorkflowId(99),
+        "conversation-99",
+    );
+    assert_eq!(replay, ExternalAcceptanceOutcome::Replay(first_receipt));
+    assert_eq!(
+        registry.accept(
+            &selection,
+            "account:a",
+            "client-key",
+            "intent:v2",
+            WorkflowId(11),
+            "conversation-11",
+        ),
+        ExternalAcceptanceOutcome::Conflict
+    );
+}
+
+#[test]
+fn external_acceptance_key_is_scoped_and_capability_is_structural() {
+    let selection = protocol();
+    let mut registry = ExternalAcceptanceRegistry::new();
+    assert!(matches!(
+        registry.accept(
+            &selection,
+            "account:a",
+            "same-key",
+            "intent",
+            WorkflowId(1),
+            "conversation-a",
+        ),
+        ExternalAcceptanceOutcome::New(_)
+    ));
+    assert!(matches!(
+        registry.accept(
+            &selection,
+            "account:b",
+            "same-key",
+            "intent",
+            WorkflowId(2),
+            "conversation-b",
+        ),
+        ExternalAcceptanceOutcome::New(_)
+    ));
+
+    let mut unsupported = protocol();
+    unsupported.external_acceptance_enabled = false;
+    let mut unsupported_registry = ExternalAcceptanceRegistry::new();
+    assert_eq!(
+        unsupported_registry.accept(
+            &unsupported,
+            "account:a",
+            "key",
+            "intent",
+            WorkflowId(3),
+            "conversation-c",
+        ),
+        ExternalAcceptanceOutcome::Unsupported
+    );
+    assert!(unsupported_registry.is_empty());
 }
 
 #[test]
@@ -407,9 +509,12 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             codec: codec("manual"),
             payload: "adopt",
         },
-        "manual-transition",
-        "receipt",
-        "manual-receipt-event",
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
     );
     assert_eq!(stale.outcome, CommitOutcome::VersionConflict);
     let invalid = workflow.resolve_manual(
@@ -420,9 +525,12 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             codec: codec("manual"),
             payload: "retry",
         },
-        "manual-transition",
-        "receipt",
-        "manual-receipt-event",
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
     );
     assert_eq!(invalid.outcome, CommitOutcome::InvalidPlan);
 
@@ -434,9 +542,12 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             codec: codec("manual"),
             payload: "adopt",
         },
-        "manual-transition",
-        "receipt",
-        "manual-receipt-event",
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
     );
     assert_eq!(committed.outcome, CommitOutcome::Committed);
     let receipt = committed.receipt.expect("manual receipt persisted");
@@ -490,9 +601,12 @@ fn manual_resolution_version_has_matching_transition_history() {
             codec: codec("manual"),
             payload: "adopt",
         },
-        "manual-transition",
-        "receipt",
-        "manual-receipt-event",
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
     );
     assert_eq!(outcome.outcome, CommitOutcome::Committed);
     assert_eq!(workflow.transition_log.len(), before + 1);
@@ -788,12 +902,734 @@ fn invalid_manual_resolution_does_not_mutate_state() {
             codec: codec("manual"),
             payload: "retry",
         },
-        "manual-transition",
-        "receipt",
-        "manual-receipt-event",
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
     assert_eq!(workflow, before);
+}
+
+#[test]
+fn claim_rejects_pending_reconciliation_and_preserves_flag() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    assert_eq!(
+        workflow.take_over_expired_claim(EffectId(1), &authority, Timestamp(10)),
+        AuthorityOutcome::Authorized
+    );
+    assert!(workflow.effects[&EffectId(1)].pending_reconciliation);
+    let retry_claim =
+        workflow.claim_effect(EffectId(1), "worker-b", Timestamp(10), LeaseExpiry(20));
+    assert_eq!(retry_claim.outcome, ClaimOutcome::Ineligible);
+    assert!(workflow.effects[&EffectId(1)].pending_reconciliation);
+}
+
+#[test]
+fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual_origin() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let rejected = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Manual,
+        "receipt",
+        "manual-receipt-event",
+    );
+    assert_eq!(rejected.outcome, AuthorityOutcome::StaleAuthority);
+    assert!(workflow.effects[&EffectId(1)].receipt.is_none());
+
+    let resolution = workflow
+        .require_manual_resolution(
+            &authority,
+            Timestamp(1),
+            vec![ManualChoice {
+                kind: ManualChoiceKind::Adopt,
+                codec: codec("manual"),
+                payload: "adopt",
+            }],
+        )
+        .manual_resolution
+        .expect("resolution persisted");
+    let committed = workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        &ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+        },
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
+    );
+    assert_eq!(
+        committed.receipt.expect("manual receipt persisted").origin,
+        ReceiptOrigin::Manual
+    );
+}
+
+#[test]
+fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let accepted = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    let inbox_id = accepted.receipt_inbox_ids[0];
+
+    let duplicate = workflow.consume_reducer_inbox_atomically(
+        &[inbox_id, inbox_id],
+        &ReducerDecision {
+            expected_workflow_version: Version(1),
+            plan: TransitionPlan {
+                snapshot: "accepted",
+                snapshot_codec: codec("snapshot"),
+                event: "consume",
+                event_codec: codec("event"),
+                effects: vec![],
+                dependencies: vec![],
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: Some(vec![
+                    OwedAcceptanceDecl {
+                        reducer_inbox_id: inbox_id,
+                        source_kind: "wake",
+                        event: "runtime-event-a",
+                    },
+                    OwedAcceptanceDecl {
+                        reducer_inbox_id: inbox_id,
+                        source_kind: "wake",
+                        event: "runtime-event-b",
+                    },
+                ]),
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(duplicate, Err(EngineError::InvalidInbox));
+    assert_eq!(workflow.version, Version(1));
+    assert!(workflow.owed_acceptances.is_empty());
+
+    let missing = workflow.consume_reducer_inbox_atomically(
+        &[inbox_id],
+        &ReducerDecision {
+            expected_workflow_version: Version(1),
+            plan: TransitionPlan {
+                snapshot: "accepted",
+                snapshot_codec: codec("snapshot"),
+                event: "consume",
+                event_codec: codec("event"),
+                effects: vec![],
+                dependencies: vec![],
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: None,
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(missing, Err(EngineError::InvalidInbox));
+    assert_eq!(workflow.version, Version(1));
+    assert!(workflow.owed_acceptances.is_empty());
+}
+
+#[test]
+fn commit_rejects_effect_and_barrier_id_collisions() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let result = workflow.commit_transition(
+        &ReducerDecision {
+            expected_workflow_version: Version(1),
+            plan: plan(),
+        },
+        &barrier_events(),
+    );
+    assert_eq!(
+        result,
+        Err(EngineError::InvalidPlan(PlanError::EffectIdCollision(
+            EffectId(1)
+        )))
+    );
+}
+
+#[test]
+fn commit_rejects_barrier_id_collision_independently() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let mut collision = plan();
+    collision.effects[0].effect_id = EffectId(3);
+    collision.effects[1].effect_id = EffectId(4);
+    collision.dependencies[0] = DependencyDecl {
+        effect_id: EffectId(4),
+        depends_on_effect_id: EffectId(3),
+    };
+    collision.barrier_members[0].effect_id = EffectId(3);
+    collision.barrier_members[1].effect_id = EffectId(4);
+    let result = workflow.commit_transition(
+        &ReducerDecision {
+            expected_workflow_version: Version(1),
+            plan: collision,
+        },
+        &barrier_events(),
+    );
+    assert_eq!(
+        result,
+        Err(EngineError::InvalidPlan(PlanError::BarrierIdCollision(
+            BarrierId(10)
+        )))
+    );
+}
+
+#[test]
+fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
+    let mut selection = protocol();
+    selection.runtime_acceptance_enabled = false;
+    assert!(selection.external_acceptance_enabled);
+    let mut workflow = WorkflowState::<TestProfile>::new_authoritative(
+        WorkflowId(20),
+        &profile(),
+        &selection,
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("accepting protocol");
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("ordinary transition succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("claim");
+    let attempt = claim.attempt.expect("attempt");
+    let receipt = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    let inbox_id = receipt.receipt_inbox_ids[0];
+    let consume = workflow.consume_reducer_inbox_atomically(
+        &[inbox_id],
+        &ReducerDecision {
+            expected_workflow_version: Version(1),
+            plan: TransitionPlan {
+                snapshot: "consumed",
+                snapshot_codec: codec("snapshot"),
+                event: "consume",
+                event_codec: codec("event"),
+                effects: vec![],
+                dependencies: vec![],
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: Some(vec![OwedAcceptanceDecl {
+                    reducer_inbox_id: inbox_id,
+                    source_kind: "wake",
+                    event: "runtime-event",
+                }]),
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(consume, Err(EngineError::InvalidInbox));
+    assert_eq!(workflow.version, Version(1));
+}
+
+#[test]
+fn cas_conflict_wins_before_plan_validation_in_versioned_paths() {
+    let mut workflow = workflow();
+    let mut invalid = plan();
+    invalid.barrier_members.clear();
+    let commit = workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(99),
+                plan: invalid.clone(),
+            },
+            &barrier_events(),
+        )
+        .expect("cas handled");
+    assert_eq!(commit.outcome, CommitOutcome::VersionConflict);
+
+    let consume = workflow
+        .consume_reducer_inbox_atomically(
+            &[],
+            &ReducerDecision {
+                expected_workflow_version: Version(99),
+                plan: invalid.clone(),
+            },
+            &barrier_events(),
+        )
+        .expect("cas handled");
+    assert_eq!(consume.outcome, CommitOutcome::VersionConflict);
+
+    let runtime = workflow
+        .runtime_accept_atomically(
+            OwedAcceptanceId(1),
+            &ReducerDecision {
+                expected_workflow_version: Version(99),
+                plan: invalid.clone(),
+            },
+            &barrier_events(),
+        )
+        .expect("cas handled");
+    assert_eq!(runtime.outcome, CommitOutcome::VersionConflict);
+
+    let cancel = workflow
+        .cancel_with_compensation(
+            &CancellationRequest {
+                expected_workflow_version: Version(99),
+                next_snapshot: "cancelled",
+                next_snapshot_codec: codec("snapshot"),
+                event: "cancel",
+                event_codec: codec("event"),
+                invalidations: vec![],
+                compensation_plan: invalid,
+            },
+            &barrier_events(),
+        )
+        .expect("cas handled");
+    assert_eq!(cancel.outcome, CommitOutcome::VersionConflict);
+}
+
+#[test]
+fn suppression_persists_typed_disposition() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let accepted = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    let inbox_id = accepted.receipt_inbox_ids[0];
+    workflow
+        .consume_reducer_inbox_atomically(
+            &[inbox_id],
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    snapshot: "accepted",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: Some(vec![OwedAcceptanceDecl {
+                        reducer_inbox_id: inbox_id,
+                        source_kind: "wake",
+                        event: "runtime-event",
+                    }]),
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("owed recorded");
+    let owed_id = *workflow.owed_acceptances.keys().next().expect("owed id");
+    let suppressed = workflow
+        .suppress_runtime_acceptance_atomically(
+            owed_id,
+            &ReducerDecision {
+                expected_workflow_version: Version(2),
+                plan: TransitionPlan {
+                    snapshot: "suppressed",
+                    snapshot_codec: codec("snapshot"),
+                    event: "suppress",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+            SuppressionReason::OperatorRejected,
+        )
+        .expect("suppression succeeds");
+    assert_eq!(suppressed.outcome, CommitOutcome::Committed);
+    assert_eq!(
+        suppressed
+            .owed_acceptance
+            .expect("owed returned")
+            .disposition,
+        OwedAcceptanceDisposition::Suppressed {
+            transition: TransitionId(3),
+            reason: SuppressionReason::OperatorRejected,
+        }
+    );
+}
+
+#[test]
+fn reject_unknown_and_receipted_invalidations() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    assert_eq!(
+        workflow.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    snapshot: "next",
+                    snapshot_codec: codec("snapshot"),
+                    event: "evt",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![EffectInvalidationDecl {
+                        effect_id: EffectId(999),
+                    }],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        ),
+        Err(EngineError::InvalidPlan(
+            PlanError::UnknownInvalidationTarget(EffectId(999),)
+        ))
+    );
+
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let _ = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    assert_eq!(
+        workflow.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    snapshot: "next",
+                    snapshot_codec: codec("snapshot"),
+                    event: "evt",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![EffectInvalidationDecl {
+                        effect_id: EffectId(1),
+                    }],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        ),
+        Err(EngineError::InvalidPlan(
+            PlanError::InvalidatesReceiptedEffect(EffectId(1),)
+        ))
+    );
+}
+
+#[test]
+fn legacy_authority_cannot_execute() {
+    let profile = profile();
+    let mut workflow = WorkflowState::<TestProfile>::new_authoritative(
+        WorkflowId(3),
+        &profile,
+        &legacy_protocol(),
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("accepting protocol");
+    assert_eq!(
+        workflow.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        ),
+        Err(EngineError::ShadowCannotExecute)
+    );
+}
+
+#[test]
+fn manual_only_ambiguity_cannot_schedule_retry() {
+    let mut workflow = workflow();
+    let mut manual_plan = plan();
+    manual_plan.effects = vec![effect_with_ambiguity(
+        1,
+        EffectRole::Required,
+        Generation(0),
+        EffectAmbiguity::ManualResolution,
+    )];
+    manual_plan.dependencies.clear();
+    manual_plan.barriers.clear();
+    manual_plan.barrier_members.clear();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: manual_plan,
+            },
+            &BTreeMap::new(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let outcome = workflow.schedule_retry(&authority, Timestamp(1), Timestamp(5));
+    assert_eq!(outcome.outcome, AuthorityOutcome::Authorized);
+    assert_eq!(
+        outcome.decision,
+        Some(ReconciliationDecision::RequestManualResolution)
+    );
+    assert_eq!(workflow.effects[&EffectId(1)].status, EffectStatus::Claimed);
+}
+
+#[test]
+fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    assert_eq!(
+        workflow
+            .transition_log
+            .last()
+            .expect("transition")
+            .event_codec,
+        codec("event")
+    );
+
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let resolution = workflow
+        .require_manual_resolution(
+            &authority,
+            Timestamp(1),
+            vec![ManualChoice {
+                kind: ManualChoiceKind::Adopt,
+                codec: codec("manual"),
+                payload: "adopt",
+            }],
+        )
+        .manual_resolution
+        .expect("resolution persisted");
+    let _ = workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        &ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+        },
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
+    );
+    assert_eq!(
+        workflow
+            .transition_log
+            .last()
+            .expect("manual transition")
+            .event_codec,
+        codec("manual-transition")
+    );
+}
+
+#[test]
+fn shadow_mutation_apis_reject_manual_resolution() {
+    let profile = profile();
+    let mut workflow = WorkflowState::<TestProfile>::new_shadow(
+        WorkflowId(4),
+        WorkflowId(1),
+        &profile,
+        &protocol(),
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("accepting protocol");
+    let outcome = workflow.resolve_manual(
+        ManualResolutionId(1),
+        Version(0),
+        &ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+        },
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            receipt: "receipt",
+            receipt_event: "manual-receipt-event",
+        },
+    );
+    assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
+}
+
+#[test]
+fn cancel_only_invalidates_active_like_effects() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let _ = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    let _ = workflow
+        .cancel_with_compensation(
+            &CancellationRequest {
+                expected_workflow_version: Version(1),
+                next_snapshot: "cancelled",
+                next_snapshot_codec: codec("snapshot"),
+                event: "cancel",
+                event_codec: codec("cancel-event"),
+                invalidations: vec![EffectInvalidationDecl {
+                    effect_id: EffectId(1),
+                }],
+                compensation_plan: TransitionPlan {
+                    snapshot: "cancelled",
+                    snapshot_codec: codec("snapshot"),
+                    event: "cancel",
+                    event_codec: codec("cancel-event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("cancel succeeds");
+    assert_eq!(
+        workflow.effects[&EffectId(1)].status,
+        EffectStatus::Receipted
+    );
+    assert_eq!(
+        workflow
+            .transition_log
+            .last()
+            .expect("cancel transition")
+            .event_codec,
+        codec("cancel-event")
+    );
 }
 
 #[test]

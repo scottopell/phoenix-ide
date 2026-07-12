@@ -10,10 +10,14 @@ use crate::types::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     DuplicateEffectId(EffectId),
+    EffectIdCollision(EffectId),
     DuplicateBarrierId(BarrierId),
+    BarrierIdCollision(BarrierId),
     MissingCodec(&'static str),
     UnknownEffectReference(EffectId),
     UnknownBarrierReference(BarrierId),
+    UnknownInvalidationTarget(EffectId),
+    InvalidatesReceiptedEffect(EffectId),
     DependencyCycle,
     BarrierHasNoMembers(BarrierId),
     BarrierIncludesNonRequiredEffect {

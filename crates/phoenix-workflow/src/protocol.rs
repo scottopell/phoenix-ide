@@ -1,9 +1,75 @@
 use std::collections::BTreeMap;
 
 use crate::types::{
-    AcceptanceStatus, DeliveryStatus, DivergenceSeverity, DrainCategoryEvidence, DrainProof,
-    EffectRole, EffectStatus, ResolutionStatus, WorkflowProfile, WorkflowState, WorkflowStatus,
+    DeliveryStatus, DivergenceSeverity, DrainCategoryEvidence, DrainProof, EffectRole,
+    EffectStatus, ExternalAcceptanceBinding, ExternalAcceptanceKey, ExternalAcceptanceOutcome,
+    ExternalAcceptanceReceipt, ProtocolSelection, ResolutionStatus, WorkflowId, WorkflowProfile,
+    WorkflowState, WorkflowStatus,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAcceptanceRegistry<H> {
+    bindings: BTreeMap<ExternalAcceptanceKey, ExternalAcceptanceBinding<H>>,
+}
+
+impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bindings: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    pub fn accept(
+        &mut self,
+        selection: &ProtocolSelection,
+        authority_scope: &str,
+        idempotency_key: &str,
+        intent_fingerprint: &str,
+        workflow_id: WorkflowId,
+        handle: H,
+    ) -> ExternalAcceptanceOutcome<H> {
+        if !selection.accepting || !selection.external_acceptance_enabled {
+            return ExternalAcceptanceOutcome::Unsupported;
+        }
+        let key = ExternalAcceptanceKey {
+            profile: selection.profile.clone(),
+            authority_scope: authority_scope.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+        };
+        if let Some(binding) = self.bindings.get(&key) {
+            return if binding.intent_fingerprint == intent_fingerprint {
+                ExternalAcceptanceOutcome::Replay(binding.receipt.clone())
+            } else {
+                ExternalAcceptanceOutcome::Conflict
+            };
+        }
+        let receipt = ExternalAcceptanceReceipt {
+            idempotency_key: idempotency_key.to_owned(),
+            workflow_id,
+            handle,
+        };
+        self.bindings.insert(
+            key,
+            ExternalAcceptanceBinding {
+                intent_fingerprint: intent_fingerprint.to_owned(),
+                receipt: receipt.clone(),
+            },
+        );
+        ExternalAcceptanceOutcome::New(receipt)
+    }
+}
+
+impl<H: Clone + Eq> Default for ExternalAcceptanceRegistry<H> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[must_use]
 pub fn exact_drain_categories() -> [&'static str; 8] {
@@ -195,12 +261,12 @@ fn owed_runtime_acceptances_evidence<P: WorkflowProfile>(
         count: workflow
             .owed_acceptances
             .values()
-            .filter(|owed| owed.status == AcceptanceStatus::Owed)
+            .filter(|owed| owed.disposition == crate::OwedAcceptanceDisposition::Owed)
             .count(),
         identities: workflow
             .owed_acceptances
             .values()
-            .filter(|owed| owed.status == AcceptanceStatus::Owed)
+            .filter(|owed| owed.disposition == crate::OwedAcceptanceDisposition::Owed)
             .map(|owed| format!("owed:{}", owed.id.0))
             .collect(),
     }

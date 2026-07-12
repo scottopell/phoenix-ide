@@ -353,6 +353,7 @@ pub fn protocol(selector: &'static str, accepting: bool) -> ProtocolSelection {
         authority: SemanticAuthority::EngineProtocol,
         accepting,
         runtime_acceptance_enabled: true,
+        external_acceptance_enabled: false,
         selector,
     }
 }
