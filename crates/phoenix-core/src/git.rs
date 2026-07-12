@@ -20,31 +20,28 @@ pub fn command() -> std::process::Command {
 
 /// Construct a safe Git subprocess with additional process-level configuration.
 ///
-/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries are
-/// appended, then `commit.gpgsign=false` is appended last so no inherited or
-/// caller-provided entry can re-enable interactive signing. Malformed inherited
-/// configuration is discarded as a unit rather than passed through to Git.
+/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries and
+/// `commit.gpgsign=false` are applied as command-line `-c` arguments, which take
+/// precedence over inherited `GIT_CONFIG_PARAMETERS` without discarding unrelated
+/// parameters. Malformed inherited indexed configuration is discarded as a unit.
 #[must_use]
 pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.env_remove("GIT_CONFIG_PARAMETERS");
     let inherited = inherited_config_count();
 
     if inherited.is_none() {
         clear_inherited_config(&mut command);
     }
 
-    let mut index = inherited.unwrap_or(0);
+    if let Some(count) = inherited.filter(|count| *count > 0) {
+        command.env("GIT_CONFIG_COUNT", count.to_string());
+    }
     for &(key, value) in config
         .iter()
         .chain(std::iter::once(&("commit.gpgsign", "false")))
     {
-        command
-            .env(format!("GIT_CONFIG_KEY_{index}"), key)
-            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
-        index += 1;
+        command.arg("-c").arg(format!("{key}={value}"));
     }
-    command.env("GIT_CONFIG_COUNT", index.to_string());
     command
 }
 
@@ -188,46 +185,30 @@ mod command_tests {
     }
 
     #[test]
-    fn command_removes_higher_precedence_config_parameters() {
+    fn command_preserves_config_parameters_and_overrides_signing_on_command_line() {
         let command = command();
-        assert!(command
+        assert!(!command
             .get_envs()
-            .any(|(key, value)| { key == "GIT_CONFIG_PARAMETERS" && value.is_none() }));
+            .any(|(key, _)| key == "GIT_CONFIG_PARAMETERS"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-c", "commit.gpgsign=false"]
+        );
     }
 
     #[test]
     fn additional_config_is_preserved_and_signing_override_has_final_precedence() {
         let command = command_with_config(&[("fetch.prune", "true"), ("commit.gpgsign", "true")]);
-        let environment = command
-            .get_envs()
-            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        let count = environment["GIT_CONFIG_COUNT"].parse::<usize>().unwrap();
-        assert!(count >= 3);
         assert_eq!(
-            environment[format!("GIT_CONFIG_KEY_{}", count - 3).as_str()],
-            "fetch.prune"
-        );
-        assert_eq!(
-            environment[format!("GIT_CONFIG_VALUE_{}", count - 3).as_str()],
-            "true"
-        );
-        assert_eq!(
-            environment[format!("GIT_CONFIG_KEY_{}", count - 2).as_str()],
-            "commit.gpgsign"
-        );
-        assert_eq!(
-            environment[format!("GIT_CONFIG_VALUE_{}", count - 2).as_str()],
-            "true"
-        );
-        assert_eq!(
-            environment[format!("GIT_CONFIG_KEY_{}", count - 1).as_str()],
-            "commit.gpgsign"
-        );
-        assert_eq!(
-            environment[format!("GIT_CONFIG_VALUE_{}", count - 1).as_str()],
-            "false"
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-c",
+                "fetch.prune=true",
+                "-c",
+                "commit.gpgsign=true",
+                "-c",
+                "commit.gpgsign=false",
+            ]
         );
     }
 

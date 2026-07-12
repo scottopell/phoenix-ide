@@ -450,7 +450,7 @@ pub(crate) fn capture_branch_diff(
 
     let committed = run_git_capped(
         worktree,
-        &["diff", &format!("{comparator}...HEAD")],
+        &["diff", "--no-ext-diff", &format!("{comparator}...HEAD")],
         &[],
         max_section_bytes,
         hard_limit,
@@ -489,8 +489,14 @@ fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) 
             worktree = %worktree.display(),
             "could not isolate git index — falling back to tracked-only uncommitted diff"
         );
-        return run_git_capped(worktree, &["diff", "HEAD"], &[], max_bytes, hard_limit)
-            .unwrap_or_else(|_| empty());
+        return run_git_capped(
+            worktree,
+            &["diff", "--no-ext-diff", "HEAD"],
+            &[],
+            max_bytes,
+            hard_limit,
+        )
+        .unwrap_or_else(|_| empty());
     };
 
     let temp_path_str = temp.0.to_string_lossy().into_owned();
@@ -499,8 +505,14 @@ fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) 
     // Stage untracked files in the temp index so they surface in the diff.
     // Errors here are non-fatal — diff just won't include the untracked.
     let _ = run_git_with_env(worktree, &["add", "-N", "."], &env);
-    run_git_capped(worktree, &["diff", "HEAD"], &env, max_bytes, hard_limit)
-        .unwrap_or_else(|_| empty())
+    run_git_capped(
+        worktree,
+        &["diff", "--no-ext-diff", "HEAD"],
+        &env,
+        max_bytes,
+        hard_limit,
+    )
+    .unwrap_or_else(|_| empty())
 }
 
 /// Find the worktree's git index, copy it to a unique temp path, and
@@ -1476,6 +1488,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn capture_branch_diff_ignores_external_diff_configuration() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("tracked.txt"), "base\n").unwrap();
+        run_git(tmp.path(), &["add", "tracked.txt"]).unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-m", "base"]).unwrap();
+        std::fs::write(tmp.path().join("tracked.txt"), "changed\n").unwrap();
+        run_git(
+            tmp.path(),
+            &["config", "diff.external", "external-diff-must-not-run"],
+        )
+        .unwrap();
+
+        let captured = capture_branch_diff(tmp.path(), "main", 100 * 1024);
+
+        assert!(captured.uncommitted_diff.contains("-base"));
+        assert!(captured.uncommitted_diff.contains("+changed"));
     }
 
     #[test]

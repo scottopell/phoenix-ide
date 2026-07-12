@@ -43,9 +43,10 @@ class CheckPlanTests(unittest.TestCase):
 
         self.dev._append_git_config_override("commit.gpgsign", "false", env)
 
-        self.assertEqual("2", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
         self.assertEqual("url.https://github.com/.insteadOf", env["GIT_CONFIG_KEY_0"])
         self.assertEqual("ssh://git@github.com/", env["GIT_CONFIG_VALUE_0"])
+        self.assertEqual("'commit.gpgsign=false'", env["GIT_CONFIG_PARAMETERS"])
 
     def test_git_config_override_composes_with_complete_inherited_entries(self):
         env = {
@@ -56,20 +57,21 @@ class CheckPlanTests(unittest.TestCase):
 
         self.dev._append_git_config_override("commit.gpgsign", "false", env)
 
-        self.assertEqual("2", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("1", env["GIT_CONFIG_COUNT"])
         self.assertEqual("fetch.prune", env["GIT_CONFIG_KEY_0"])
         self.assertEqual("true", env["GIT_CONFIG_VALUE_0"])
-        self.assertEqual("commit.gpgsign", env["GIT_CONFIG_KEY_1"])
-        self.assertEqual("false", env["GIT_CONFIG_VALUE_1"])
+        self.assertEqual("'commit.gpgsign=false'", env["GIT_CONFIG_PARAMETERS"])
 
-    def test_git_config_override_removes_higher_precedence_parameters(self):
-        env = {"GIT_CONFIG_PARAMETERS": "'commit.gpgsign=true'"}
+    def test_git_config_override_preserves_parameters_and_disables_signing_last(self):
+        env = {"GIT_CONFIG_PARAMETERS": "'safe.directory=/repo' 'commit.gpgsign=true'"}
 
         self.dev._append_git_config_override("commit.gpgsign", "false", env)
 
-        self.assertNotIn("GIT_CONFIG_PARAMETERS", env)
-        self.assertEqual("commit.gpgsign", env["GIT_CONFIG_KEY_0"])
-        self.assertEqual("false", env["GIT_CONFIG_VALUE_0"])
+        self.assertEqual(
+            "'safe.directory=/repo' 'commit.gpgsign=true' 'commit.gpgsign=false'",
+            env["GIT_CONFIG_PARAMETERS"],
+        )
+        self.assertEqual("0", env["GIT_CONFIG_COUNT"])
 
     def test_git_config_override_resets_malformed_inherited_entries(self):
         for malformed in (
@@ -87,9 +89,8 @@ class CheckPlanTests(unittest.TestCase):
                 self.dev._append_git_config_override("commit.gpgsign", "false", env)
                 self.assertEqual(
                     {
-                        "GIT_CONFIG_COUNT": "1",
-                        "GIT_CONFIG_KEY_0": "commit.gpgsign",
-                        "GIT_CONFIG_VALUE_0": "false",
+                        "GIT_CONFIG_COUNT": "0",
+                        "GIT_CONFIG_PARAMETERS": "'commit.gpgsign=false'",
                     },
                     env,
                 )

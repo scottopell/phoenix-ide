@@ -3702,7 +3702,8 @@ def _is_valid_git_config_key(key):
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
-    env.pop("GIT_CONFIG_PARAMETERS", None)
+    parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
+    env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
     try:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
@@ -3720,9 +3721,12 @@ def _append_git_config_override(key, value, environ=None):
                 env.pop(name, None)
         count = 0
 
-    env[f"GIT_CONFIG_KEY_{count}"] = key
-    env[f"GIT_CONFIG_VALUE_{count}"] = value
-    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    if key != "commit.gpgsign" or value != "false":
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        env["GIT_CONFIG_COUNT"] = str(count + 1)
+    else:
+        env["GIT_CONFIG_COUNT"] = str(count)
 
 
 def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
