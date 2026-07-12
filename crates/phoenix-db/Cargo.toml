@@ -56,6 +56,7 @@ phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
 
 # `#[tokio::test]` runtime for the async persistence tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
 
 [lints]
 workspace = true
