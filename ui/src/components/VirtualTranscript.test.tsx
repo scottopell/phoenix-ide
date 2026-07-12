@@ -35,11 +35,14 @@ class TestResizeObserver implements ResizeObserver {
   }
 
   trigger(height: number): void {
-    const entries = [...this.elements].map((target) => ({
+    this.triggerEntries([...this.elements].map((target) => [target, height]));
+  }
+
+  triggerEntries(entries: Array<[Element, number]>): void {
+    this.callback(entries.map(([target, height]) => ({
       target,
       contentRect: { height } as DOMRectReadOnly,
-    })) as ResizeObserverEntry[];
-    this.callback(entries, this);
+    })) as ResizeObserverEntry[], this);
   }
 }
 
@@ -212,7 +215,8 @@ describe('VirtualTranscript', () => {
       );
     });
 
-    act(() => ref.current?.captureVisibleAnchor());
+    const row2 = document.querySelector<HTMLElement>('[data-virtual-key="item-2"]')!;
+    act(() => resizeObservers[0]!.triggerEntries([[row2, 50]]));
 
     expect(scrollTopOf(scroller)).toBe(130);
     let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
@@ -243,12 +247,188 @@ describe('VirtualTranscript', () => {
 
     expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 4 });
 
+    const scroller = document.querySelector('.virtual-transcript')!;
     act(() => {
-      resizeObservers.at(-1)?.trigger(60);
+      resizeObservers.at(-1)?.triggerEntries([[scroller, 60]]);
     });
 
     expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 2 });
     expect(rowIndexes()).toEqual([0, 1, 2]);
+  });
+
+  it('uses one shared ResizeObserver for scroller, header, and every mounted row, with cleanup', () => {
+    const { unmount } = render(
+      <VirtualTranscript
+        items={makeItems(3, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        header={<div data-testid="header" data-height={15}>Header</div>}
+        renderItem={renderRow}
+      />,
+    );
+
+    expect(resizeObservers).toHaveLength(1);
+    const observer = resizeObservers[0]!;
+    expect(observer.elements.size).toBe(5);
+    expect(observer.elements.has(document.querySelector('.virtual-transcript')!)).toBe(true);
+    expect(observer.elements.has(document.querySelector('[data-virtual-header]')!)).toBe(true);
+    for (const row of virtualRows()) expect(observer.elements.has(row)).toBe(true);
+
+    unmount();
+
+    expect(observer.elements.size).toBe(0);
+  });
+
+  it('updates keyed intrinsic resize through ResizeObserver with anchor compensation', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    const totals: number[] = [];
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(20, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+        onTotalExtentChange={(total) => totals.push(total)}
+      />,
+    );
+
+    act(() => ref.current?.scrollToIndex(5, 'start'));
+    expect(scrollTopOf(scroller)).toBe(100);
+
+    const row2 = document.querySelector<HTMLElement>('[data-virtual-key="item-2"]')!;
+    act(() => resizeObservers[0]!.triggerEntries([[row2, 50]]));
+
+    expect(scrollTopOf(scroller)).toBe(130);
+    expect(totals.at(-1)).toBe(430);
+  });
+
+  it('measures header into total extent, offsets, initial tail, and async resize geometry', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    const totals: number[] = [];
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(20, 10)}
+        getKey={(item) => item.id}
+        estimatedExtent={10}
+        overscan={0}
+        initialTail
+        header={<div data-testid="header" data-height={30}>Header</div>}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+        onTotalExtentChange={(total) => totals.push(total)}
+      />,
+    );
+
+    expect(totals.at(-1)).toBe(230);
+    expect(scrollTopOf(scroller)).toBe(130);
+
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(scrollTopOf(scroller)).toBe(30);
+    expect(ref.current?.measureOffsetForIndex(0)).toBe(0);
+
+    const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+    act(() => resizeObservers[0]!.triggerEntries([[header, 60]]));
+
+    expect(totals.at(-1)).toBe(260);
+    expect(scrollTopOf(scroller)).toBe(60);
+    expect(ref.current?.measureOffsetForIndex(0)).toBe(0);
+  });
+
+  it('renders header with the empty state and observes async header resize', () => {
+    const totals: number[] = [];
+
+    render(
+      <VirtualTranscript
+        items={[]}
+        getKey={(item: TestItem) => item.id}
+        estimatedExtent={20}
+        initialTail={false}
+        header={<div data-testid="header" data-height={25}>Header</div>}
+        empty={<div data-testid="empty">Empty</div>}
+        renderItem={renderRow}
+        onTotalExtentChange={(total) => totals.push(total)}
+      />,
+    );
+
+    expect(screen.getByTestId('header')).toBeInTheDocument();
+    expect(screen.getByTestId('empty')).toBeInTheDocument();
+    expect(totals.at(-1)).toBe(25);
+
+    const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
+    act(() => resizeObservers[0]!.triggerEntries([[header, 40]]));
+
+    expect(totals.at(-1)).toBe(40);
+  });
+
+  it('preserves measured extents by stable key across prepends and removes only absent keys', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+
+    const initial: TestItem[] = [
+      { id: 'a', label: 'Item A', height: 20 },
+      { id: 'b', label: 'Item B', height: 20 },
+      { id: 'c', label: 'Item C', height: 20 },
+    ];
+    const view = render(
+      <VirtualTranscript
+        ref={ref}
+        items={initial}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail={false}
+        renderItem={renderRow}
+      />,
+    );
+
+    const rowB = document.querySelector<HTMLElement>('[data-virtual-key="b"]')!;
+    act(() => resizeObservers[0]!.triggerEntries([[rowB, 80]]));
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(ref.current?.measureOffsetForIndex(2)).toBe(100);
+
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+        />,
+      );
+    });
+
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(ref.current?.measureOffsetForIndex(3)).toBe(120);
+
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[initial[0]!, initial[2]!]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+        />,
+      );
+    });
+
+    act(() => ref.current?.scrollToIndex(0, 'start'));
+    expect(ref.current?.measureOffsetForIndex(1)).toBe(20);
   });
 
   it('keeps getKey identities stable when new items are prepended', () => {
