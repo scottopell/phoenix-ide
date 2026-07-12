@@ -221,13 +221,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_work_scope_observed_branches",
         sql: MIGRATION_041,
     },
-
     Migration {
         version: 42,
         name: "create_work_scope_active_pr_selection",
         sql: MIGRATION_042,
     },
-
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
