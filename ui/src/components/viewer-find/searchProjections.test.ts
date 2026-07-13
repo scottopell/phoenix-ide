@@ -443,7 +443,7 @@ describe('buildConversationSearchProjection', () => {
       ['agent_turn', 'tool-use-name-1', 'search'],
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
       ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
-      ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
+      ['agent_turn', 'tool-use-result-1:search-note:Tool%20alpha%20result:0', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'completed summarize beta path done\npending inspect alpha path'],
     ]);
     const unitTargets = projection.matches

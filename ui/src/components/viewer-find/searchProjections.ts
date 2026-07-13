@@ -586,7 +586,7 @@ function addConversationSource(
   role: string,
   text: string,
   fragmentId?: string,
-  revealTarget?: ConversationTextFragmentRevealTarget,
+  revealTarget?: ConversationFragmentRevealTarget,
 ): void {
   if (text.length === 0) return;
   out.push({
@@ -714,21 +714,21 @@ export function buildSearchOutputProjection(
 
   const notes: Array<{ text: string; fragment: SearchResultFragment }> = [];
   const hits: SearchHitProjection[] = [];
-  let noteIndex = 0;
-  let hitIndex = 0;
+  const duplicateCounts = new Map<string, number>();
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     if (line.startsWith('[') && line.trimEnd().endsWith(']')) {
       const note = line.trim().slice(1, -1);
+      const duplicateIndex = duplicateCounts.get(note) ?? 0;
+      duplicateCounts.set(note, duplicateIndex + 1);
       const fragment: SearchResultFragment = {
-        fragmentId: `search-note:${noteIndex}`,
+        fragmentId: `search-note:${encodeURIComponent(note)}:${duplicateIndex}`,
         semanticText: note,
         display: { path: '', note },
         revealTarget: revealBase,
         kind: 'note',
       };
       notes.push({ text: note, fragment });
-      noteIndex += 1;
       continue;
     }
     const m = /^(.+?):(\d+):\s?(.*)$/.exec(line);
@@ -737,27 +737,29 @@ export function buildSearchOutputProjection(
       const lineNumber = parseInt(m[2], 10);
       const content = m[3] ?? '';
       const semanticText = `${path}:${lineNumber}: ${content}`;
+      const duplicateIndex = duplicateCounts.get(semanticText) ?? 0;
+      duplicateCounts.set(semanticText, duplicateIndex + 1);
       const fragment: SearchResultFragment = {
-        fragmentId: `search-hit:${encodeURIComponent(path)}:${lineNumber}:${hitIndex}`,
+        fragmentId: `search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
         semanticText,
         display: { path, lineNumber, content },
         revealTarget: { ...revealBase, path, lineNumber },
         kind: 'hit',
       };
       hits.push({ path, lineNumber, content, fragment });
-      hitIndex += 1;
       continue;
     }
     const note = line;
+    const duplicateIndex = duplicateCounts.get(note) ?? 0;
+    duplicateCounts.set(note, duplicateIndex + 1);
     const fragment: SearchResultFragment = {
-      fragmentId: `search-note:${noteIndex}`,
+      fragmentId: `search-note:${encodeURIComponent(note)}:${duplicateIndex}`,
       semanticText: note,
       display: { path: '', note },
       revealTarget: revealBase,
       kind: 'note',
     };
     notes.push({ text: note, fragment });
-    noteIndex += 1;
   }
 
   if (hits.length === 0 && notes.length === 0) {
@@ -901,11 +903,11 @@ function agentTurnSources(
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
-): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationTextFragmentRevealTarget }> {
+): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationTextFragmentRevealTarget }> = [];
+  const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> = [];
   for (const fragment of buildAgentTextFragments(blocks, density, { forceExpandedText })) {
     out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
   }
@@ -922,12 +924,8 @@ function agentTurnSources(
         }
       } else if (block.name === 'search') {
         const searchProjection = buildSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {});
-        if (density === 'compact') {
-          for (const fragment of searchProjection.fragments) {
-            out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
-          }
-        } else {
-          out.push({ role: `tool-use-result-${index}`, text: resultText });
+        for (const fragment of searchProjection.fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
       } else if (detailsVisible) {
         out.push({ role: `tool-use-result-${index}`, text: resultText });

@@ -1943,9 +1943,19 @@ export function SearchResultsView({
             <div className="search-results-hits">
               {group.hits.map((hit) => {
                 const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
-                const content = highlight
-                  ? renderHighlightedText(hit.fragment.semanticText, highlight.start, highlight.end)
-                  : <><span className="search-result-lineno">{hit.lineNumber}</span><span className="search-result-content">{hit.content || ' '}</span></>;
+                const lineText = String(hit.lineNumber);
+                const pathPrefixLength = hit.path.length + 1;
+                const contentStart = pathPrefixLength + lineText.length + 2;
+                const lineNumberContent = (
+                  <>
+                    <span className="search-result-lineno">
+                      {keywordFieldHighlight(highlight, pathPrefixLength, lineText)}
+                    </span>
+                    <span className="search-result-content">
+                      {keywordFieldHighlight(highlight, contentStart, hit.content || ' ')}
+                    </span>
+                  </>
+                );
                 return onOpenFile ? (
                   <button
                     key={hit.fragment.fragmentId}
@@ -1954,13 +1964,11 @@ export function SearchResultsView({
                     data-fragment-id={hit.fragment.fragmentId}
                     onClick={() => onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)}
                   >
-                    {highlight ? (
-                      <span>{content}</span>
-                    ) : content}
+                    {lineNumberContent}
                   </button>
                 ) : (
                   <div key={hit.fragment.fragmentId} className="search-result-line" data-fragment-id={hit.fragment.fragmentId}>
-                    {highlight ? <span>{content}</span> : content}
+                    {lineNumberContent}
                   </div>
                 );
               })}

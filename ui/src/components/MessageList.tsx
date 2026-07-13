@@ -14,7 +14,7 @@ import {
   FindBar,
   buildConversationSearchProjection,
   useViewerFindKeyboardShortcut,
-  type ConversationTextFragmentRevealTarget,
+  type ConversationFragmentRevealTarget,
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
@@ -1126,7 +1126,7 @@ function MessageListImpl({
     const unitMatch = match.target;
     if (unitMatch.fragmentId) {
       const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
-      const revealTarget: ConversationTextFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
+      const revealTarget: ConversationFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
       setPendingRevealRequest({
         unitKey: unitMatch.unitKey,
         fragmentId: unitMatch.fragmentId,

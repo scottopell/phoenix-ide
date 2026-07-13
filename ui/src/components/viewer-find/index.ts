@@ -36,6 +36,7 @@ export {
   type BlockSearchMatchTarget,
   type BlockSearchProjection,
   type BlockSearchSource,
+  type ConversationFragmentRevealTarget,
   type ConversationSearchMatchTarget,
   type ConversationSearchProjection,
   type ConversationSearchSource,
