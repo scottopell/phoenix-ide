@@ -3479,21 +3479,17 @@ async fn send_chat(
             .await
             .unwrap_or_else(|| conversation.state.clone())
     };
-    let effective_state = if matches!(effective_state, ConvState::Idle) {
+    if matches!(effective_state, ConvState::Idle) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
-        if phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
-            .has_pending_for_conversation(&id)
+        let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .cancel_pending_for_conversation(&id, chrono::Utc::now())
             .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            ConvState::LlmRequesting { attempt: 1 }
-        } else {
-            effective_state
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if cancelled > 0 {
+            state.runtime.kick_wake_worker();
         }
-    } else {
-        effective_state
-    };
+    }
     if let Err(err) = check_user_message_acceptable(&effective_state) {
         // `AgentBusy` and `CancellationInProgress` states are transient — the
         // conversation will reach `Idle` once the current operation completes.
