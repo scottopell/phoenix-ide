@@ -122,14 +122,16 @@ export function DiffView({
       }
     });
   }, [navigateFindTarget, restoreFocus]);
-  const find = useFindSession<DiffSearchMatchTarget, DiffFindFocusOrigin>({ onCommands: handleFindCommands });
+  const { state: findState, send: sendFind } = useFindSession<DiffSearchMatchTarget, DiffFindFocusOrigin>({
+    onCommands: handleFindCommands,
+  });
 
   const openFind = useCallback(() => {
     const focusOrigin = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : { token: 'diff-find-button' as const };
     findPreviousFocusRef.current = focusOrigin instanceof HTMLElement ? focusOrigin : null;
-    find.send({
+    sendFind({
       type: 'open',
       surface: {
         key: DIFF_FIND_SURFACE_KEY,
@@ -138,32 +140,34 @@ export function DiffView({
         focusOrigin,
       },
     });
-  }, [find]);
+  }, [sendFind]);
 
   const closeFind = useCallback(() => {
-    find.send({ type: 'close' });
-  }, [find]);
+    sendFind({ type: 'close' });
+  }, [sendFind]);
 
   useEffect(() => {
     if (open) return;
-    find.send({ type: 'reset' });
+    sendFind({ type: 'reset' });
     findPreviousFocusRef.current = null;
-  }, [open, find]);
+  }, [open, sendFind]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
     onOpen: openFind,
     dialogOpen: !open || notes.annotating !== null,
   });
-  const findSession = find.state.status === 'open' ? find.state : null;
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
   const findProjection = useMemo(
-    () => (findSession && findSession.query.length > 0
-      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, findSession.query, commitLog)
+    () => (findQuery.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, findQuery, commitLog)
       : { sources: [], matches: [] }),
-    [commitLog, committedDiff, findSession, uncommittedDiff],
+    [commitLog, committedDiff, findQuery, uncommittedDiff],
   );
   const sessionMatches = useMemo(
-    () => projectionMatchesToSessionMatches(findProjection.matches, (match) => stableDiffMatchId(match.target)),
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableDiffMatchId),
     [findProjection.matches],
   );
   const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
@@ -197,32 +201,21 @@ export function DiffView({
   );
 
   useEffect(() => {
-    if (!findSession) return;
-    if (findSession.query.length === 0) {
-      find.send({ type: 'replace-results', matches: [] });
-      return;
-    }
-    find.send({ type: 'replace-results', matches: sessionMatches });
-  }, [find, findSession, sessionMatches]);
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: sessionMatches });
+  }, [findOpen, findQuery, sendFind, sessionMatches]);
 
   const handleFindQueryChange = useCallback((query: string) => {
-    const projection = query.length > 0
-      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog)
-      : { matches: [] as const };
-    find.send({
-      type: 'set-query-and-results',
-      query,
-      matches: projectionMatchesToSessionMatches(projection.matches, (match) => stableDiffMatchId(match.target)),
-    });
-  }, [commitLog, committedDiff, find, uncommittedDiff]);
+    sendFind({ type: 'set-query', query });
+  }, [sendFind]);
 
   const handleFindNext = useCallback(() => {
-    find.send({ type: 'next' });
-  }, [find]);
+    sendFind({ type: 'next' });
+  }, [sendFind]);
 
   const handleFindPrevious = useCallback(() => {
-    find.send({ type: 'previous' });
-  }, [find]);
+    sendFind({ type: 'previous' });
+  }, [sendFind]);
 
   if (!open) return null;
 
@@ -230,7 +223,7 @@ export function DiffView({
 
   return (
     <ViewerShell
-      closeOnEscape={findSession === null}
+      closeOnEscape={!findOpen}
       onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel={label ?? 'Worktree diff'}
@@ -317,7 +310,7 @@ export function DiffView({
                 commitLog={commitLog}
                 matches={findProjection.matches}
                 activeMatchIndex={activeFindIndex}
-                findOpen={findSession !== null}
+                findOpen={findOpen}
               />
             )}
             <DiffSummaryBar
@@ -348,15 +341,15 @@ export function DiffView({
   );
 }
 
-function stableDiffMatchId(target: DiffSearchMatchTarget): string {
-  return [
-    target.kind,
-    target.itemId,
-    target.side ?? '',
-    target.lineNumber ?? '',
-    target.startColumn,
-    target.endColumn,
-  ].join(':');
+function stableDiffMatchId(match: {
+  sourceId: string;
+  sourceText: string;
+  start: number;
+  end: number;
+  target: DiffSearchMatchTarget;
+}): string {
+  const target = match.target;
+  return `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.sourceText}:${match.start}:${match.end}`;
 }
 
 function CommitLogSection({

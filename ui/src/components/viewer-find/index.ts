@@ -23,6 +23,11 @@ export {
   activateFindSessionMatch,
 } from './findSession';
 export {
+  activeSessionMatchIndex,
+  projectionMatchesToSessionMatches,
+  type MatchIdentity,
+} from './projectionSession';
+export {
   buildBlockSearchProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,

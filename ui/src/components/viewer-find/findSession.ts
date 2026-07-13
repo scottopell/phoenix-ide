@@ -40,6 +40,7 @@ export type FindSessionCommand<TTarget, TFocusOrigin> =
 export type FindSessionAction<TTarget, TFocusOrigin> =
   | { type: 'open'; surface: SearchableSurface<TTarget, TFocusOrigin> }
   | { type: 'close' }
+  | { type: 'set-query'; query: string }
   | { type: 'set-query-and-results'; query: string; matches: readonly FindSessionMatch<TTarget>[] }
   | { type: 'replace-results'; matches: readonly FindSessionMatch<TTarget>[] }
   | { type: 'next' }
@@ -74,6 +75,8 @@ export function reduceFindSession<TTarget, TFocusOrigin>(
       return openFindSession(state, action.surface);
     case 'close':
       return closeFindSession(state);
+    case 'set-query':
+      return setFindSessionQuery(state, action.query);
     case 'set-query-and-results':
       return setFindSessionQueryAndResults(state, action.query, action.matches);
     case 'replace-results':
@@ -124,6 +127,17 @@ export function closeFindSession<TTarget, TFocusOrigin>(
       { kind: 'clear-decorations' },
       { kind: 'restore-focus', focusOrigin: state.focusOrigin },
     ],
+  };
+}
+
+export function setFindSessionQuery<TTarget, TFocusOrigin>(
+  state: FindSessionState<TTarget, TFocusOrigin>,
+  query: string,
+): ReduceFindSessionResult<TTarget, TFocusOrigin> {
+  if (state.status === 'closed') return { state, commands: [] };
+  return {
+    state: { ...state, query, matches: [], activeMatchId: null },
+    commands: [{ kind: 'clear-decorations' }],
   };
 }
 

@@ -7,6 +7,8 @@ import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierr
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 
 export interface SearchableSourceMatch<TTarget> {
+  sourceId: string;
+  sourceText: string;
   target: TTarget;
   start: number;
   end: number;
@@ -647,7 +649,13 @@ function projectMatches<TTarget, TSource extends SearchableSource<TTarget>>(
   const out: SearchableSourceMatch<TTarget>[] = [];
   for (const source of sources) {
     for (const match of findLiteralMatches(source.text, query).matches) {
-      out.push({ target: buildTarget(source, match), start: match.start, end: match.end });
+      out.push({
+        sourceId: source.id,
+        sourceText: source.text,
+        target: buildTarget(source, match),
+        start: match.start,
+        end: match.end,
+      });
     }
   }
   return out;
