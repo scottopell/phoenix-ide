@@ -2,6 +2,7 @@ export { FindBar, type FindBarProps } from './FindBar';
 export { findLiteralMatches, type ViewerFindMatch, type ViewerFindResult } from './literalMatch';
 export {
   createMatchId,
+  createSurfaceKey,
   type FindSessionCommand,
   type FindSessionMatch,
   type FindSessionOpenState,
@@ -42,6 +43,7 @@ export {
   type SearchableSourceMatch,
   type SearchableSourceProjection,
 } from './searchProjections';
+export { useFindSession, type UseFindSessionOptions } from './useFindSession';
 export {
   useViewerFind,
   type UseViewerFindOptions,
