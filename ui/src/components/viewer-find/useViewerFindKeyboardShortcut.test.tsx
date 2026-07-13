@@ -58,7 +58,7 @@ function RouterHarness({
     id,
     layer,
     key: keyName,
-    scopeId,
+    ...(scopeId ? { scopeId } : {}),
     enabled,
     allowWhenNoActiveScope,
     dialogOpen,
@@ -95,7 +95,7 @@ describe('useViewerFindKeyboardShortcut', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it('does not reopen find when the find input itself handles the repeated shortcut', () => {
+  it('routes repeated find from the find input back to the owning session', () => {
     const onOpen = vi.fn();
     render(
       <FocusScopeProvider>
@@ -105,7 +105,7 @@ describe('useViewerFindKeyboardShortcut', () => {
 
     const findInput = screen.getByRole('textbox', { name: 'find' });
     fireEvent.keyDown(findInput, { key: 'f', metaKey: true, bubbles: true, cancelable: true });
-    expect(onOpen).not.toHaveBeenCalled();
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
   it('stands down while a dialog in the same surface is open', () => {

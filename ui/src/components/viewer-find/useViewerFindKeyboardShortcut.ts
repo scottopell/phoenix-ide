@@ -26,8 +26,6 @@ export function useViewerFindKeyboardShortcut({
     dialogOpen,
     handler: (event: KeyboardEvent) => {
       event.preventDefault();
-      const target = event.target;
-      if (target instanceof HTMLElement && target.dataset['viewerFindInput'] === 'true') return;
       onOpen();
     },
   }), [allowWhenNoActiveScope, dialogOpen, enabled, onOpen, scopeId]);
