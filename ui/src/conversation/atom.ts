@@ -1052,13 +1052,14 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
-      const suffixGenerationMatches = atom.transcriptGeneration !== null
+      const knownGenerationMatches = atom.transcriptGeneration !== null
         && atom.transcriptGeneration === p.transcriptGeneration;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
       const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
-      const mergesMessageSuffix = p.messageSnapshot === 'suffix' && suffixGenerationMatches;
+      const snapshotIsSuffix = p.messageSnapshot === 'suffix';
+      const mergesMessageSuffix = snapshotIsSuffix && knownGenerationMatches;
       let mergedMessages: Message[];
-      if (!isFreshConnect || mergesMessageSuffix) {
+      if ((!isFreshConnect && !snapshotIsSuffix) || mergesMessageSuffix) {
         const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
         const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
         const existingIds = new Set(atom.messages.map((m) => m.message_id));

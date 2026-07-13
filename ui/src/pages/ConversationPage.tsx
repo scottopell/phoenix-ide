@@ -12,6 +12,7 @@ import {
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
+  type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
 import {
@@ -962,14 +963,14 @@ function ConversationPageContent() {
     }
   }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
 
-  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
+  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => {
     dispatchHistoryExpansion({
       type: 'command_acknowledged',
       commandToken: token,
-      view: historyExpansion.view,
+      view,
       result,
     });
-  }, [historyExpansion.view]);
+  }, []);
 
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;

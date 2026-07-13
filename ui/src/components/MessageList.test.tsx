@@ -889,7 +889,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
     expect(virtualTranscriptMock.measureOffsetForIndex).toHaveBeenCalledWith(1);
 
@@ -926,7 +926,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied');
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
@@ -959,7 +959,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.wheel(scroller, { deltaY: 10 });
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded');
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
 
     act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
@@ -1053,8 +1053,9 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
     act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 2, endIndex: 2 }));
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied');
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
   });
 
@@ -1085,6 +1086,37 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+  });
+
+  it('does not let a stale history range callback acknowledge a new conversation with overlapping indices', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (conversationId: string, token: number) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId={conversationId}
+        historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList('conv-history-a', 1));
+    virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-21.5);
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+
+    rerender(renderList('conv-history-b', 2));
+    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith(
+      1,
+      'applied',
+      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
+    );
   });
 
   it('clears suppressed continuity on unmount', () => {

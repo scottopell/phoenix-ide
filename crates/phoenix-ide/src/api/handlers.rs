@@ -2812,6 +2812,7 @@ fn db_message_selection_for_stream(
     }
 
     if cursor_replay_served
+        && query.transcript_generation == Some(transcript_generation)
         && query
             .after_event_sequence
             .is_some_and(|after_event_sequence| after_event_sequence >= last_sequence_id)
@@ -7736,12 +7737,28 @@ pub(crate) mod hard_delete_cascade_tests {
                     after_sequence: None,
                     init_mode: None,
                     after_message_floor: None,
-                    transcript_generation: None,
+                    transcript_generation: Some(1),
                 },
                 10,
                 1,
             ),
             StreamDbMessageSelection::None
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                true,
+                &StreamConversationQuery {
+                    after_event_sequence: Some(10),
+                    after_sequence: None,
+                    init_mode: None,
+                    after_message_floor: None,
+                    transcript_generation: None,
+                },
+                10,
+                1,
+            ),
+            StreamDbMessageSelection::Full,
+            "a covering event cursor cannot omit DB messages unless the client also proves it is on the current transcript generation"
         );
         assert_eq!(
             db_message_selection_for_stream(

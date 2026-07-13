@@ -105,7 +105,7 @@ interface MessageListProps {
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   historyScrollCommand?: HistoryScrollCommand | null | undefined;
-  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded') => void) | undefined;
+  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -831,31 +831,47 @@ function MessageListImpl({
     [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
   );
 
-  const handledHistoryCommandRef = useRef<number | null>(null);
-  const acknowledgedHistoryCommandRef = useRef<number | null>(null);
-  const pendingHistoryAckRef = useRef<{ token: number; targetIndex: number; viewportStartOffset: number | null } | null>(null);
+  const handledHistoryCommandRef = useRef<{ token: number; view: HistoryScrollCommand['view'] } | null>(null);
+  const acknowledgedHistoryCommandRef = useRef<{ token: number; view: HistoryScrollCommand['view'] } | null>(null);
+  const pendingHistoryAckRef = useRef<{ token: number; view: HistoryScrollCommand['view']; targetIndex: number; viewportStartOffset: number | null } | null>(null);
   const continuityRestoreTokenRef = useRef<number | null>(null);
+  const continuityRestoreViewRef = useRef<HistoryScrollCommand['view'] | null>(null);
   const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
+
+  const sameHistoryView = useCallback((left: HistoryScrollCommand['view'] | null, right: HistoryScrollCommand['view'] | null) => (
+    left !== null
+    && right !== null
+    && left.conversationId === right.conversationId
+    && left.generation === right.generation
+    && left.transcriptGeneration === right.transcriptGeneration
+  ), []);
 
   const releaseContinuityRestoreSuppression = useCallback(() => {
     continuityRestoreInFlightRef.current = false;
     continuityRestoreTokenRef.current = null;
+    continuityRestoreViewRef.current = null;
   }, []);
 
-  const finishHistoryCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded') => {
-    if (acknowledgedHistoryCommandRef.current === token) return;
-    acknowledgedHistoryCommandRef.current = token;
-    if (pendingHistoryAckRef.current?.token === token) pendingHistoryAckRef.current = null;
-    if (continuityRestoreTokenRef.current === token) releaseContinuityRestoreSuppression();
-    onHistoryScrollCommandHandled?.(token, result);
-  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression]);
+  const finishHistoryCommand = useCallback((token: number, view: HistoryScrollCommand['view'], result: 'applied' | 'target_missing' | 'superseded') => {
+    const acknowledged = acknowledgedHistoryCommandRef.current;
+    if (acknowledged?.token === token && sameHistoryView(acknowledged.view, view)) return;
+    acknowledgedHistoryCommandRef.current = { token, view };
+    if (pendingHistoryAckRef.current?.token === token && sameHistoryView(pendingHistoryAckRef.current.view, view)) pendingHistoryAckRef.current = null;
+    if (continuityRestoreTokenRef.current === token && sameHistoryView(continuityRestoreViewRef.current, view)) releaseContinuityRestoreSuppression();
+    onHistoryScrollCommandHandled?.(token, result, view);
+  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression, sameHistoryView]);
 
   cancelHistoryCommandRef.current = () => {
     const token = continuityRestoreTokenRef.current;
-    if (token !== null) finishHistoryCommand(token, 'superseded');
+    const view = continuityRestoreViewRef.current;
+    if (token !== null && view !== null) finishHistoryCommand(token, view, 'superseded');
   };
 
   useEffect(() => {
+    pendingHistoryAckRef.current = null;
+    handledHistoryCommandRef.current = null;
+    acknowledgedHistoryCommandRef.current = null;
+    lastVisibleRangeRef.current = null;
     releaseContinuityRestoreSuppression();
   }, [conversationId, releaseContinuityRestoreSuppression]);
 
@@ -863,23 +879,29 @@ function MessageListImpl({
     releaseContinuityRestoreSuppression();
   }, [releaseContinuityRestoreSuppression]);
   useEffect(() => {
-    if (!historyScrollCommand || handledHistoryCommandRef.current === historyScrollCommand.token) return;
-    if (continuityRestoreTokenRef.current !== null && continuityRestoreTokenRef.current !== historyScrollCommand.token) {
-      releaseContinuityRestoreSuppression();
+    const handled = handledHistoryCommandRef.current;
+    if (!historyScrollCommand || (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view))) return;
+    const activeContinuityToken = continuityRestoreTokenRef.current;
+    const activeContinuityView = continuityRestoreViewRef.current;
+    if (activeContinuityToken !== null
+      && activeContinuityView !== null
+      && (activeContinuityToken !== historyScrollCommand.token || !sameHistoryView(activeContinuityView, historyScrollCommand.view))) {
+      finishHistoryCommand(activeContinuityToken, activeContinuityView, 'superseded');
     }
     pendingHistoryAckRef.current = null;
-    handledHistoryCommandRef.current = historyScrollCommand.token;
+    handledHistoryCommandRef.current = { token: historyScrollCommand.token, view: historyScrollCommand.view };
     acknowledgedHistoryCommandRef.current = null;
     const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
       ? historyScrollCommand.messageId
       : historyScrollCommand.targetMessageId;
     const index = findUnitIndexByMessageId(messageId);
     if (index < 0) {
-      finishHistoryCommand(historyScrollCommand.token, 'target_missing');
+      finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'target_missing');
       return;
     }
     pendingHistoryAckRef.current = {
       token: historyScrollCommand.token,
+      view: historyScrollCommand.view,
       targetIndex: index,
       viewportStartOffset: historyScrollCommand.kind === 'restore_after_prefix_expansion'
         ? historyScrollCommand.viewportStartOffset
@@ -890,6 +912,7 @@ function MessageListImpl({
     } else {
       continuityRestoreInFlightRef.current = true;
       continuityRestoreTokenRef.current = historyScrollCommand.token;
+      continuityRestoreViewRef.current = historyScrollCommand.view;
       transcriptRef.current?.scrollToIndex(index, 'start', historyScrollCommand.viewportStartOffset);
     }
     const lastVisibleRange = lastVisibleRangeRef.current;
@@ -899,10 +922,10 @@ function MessageListImpl({
         : null;
       if (historyScrollCommand.kind === 'jump_to_message'
         || (actualOffset !== null && Math.abs(actualOffset - historyScrollCommand.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX)) {
-        finishHistoryCommand(historyScrollCommand.token, 'applied');
+        finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'applied');
       }
     }
-  }, [findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, releaseContinuityRestoreSuppression, scrollToUnitIndex]);
+  }, [findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, sameHistoryView, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -951,11 +974,11 @@ function MessageListImpl({
       && pendingAck.targetIndex <= range.endIndex
     ) {
       if (pendingAck.viewportStartOffset === null) {
-        finishHistoryCommand(pendingAck.token, 'applied');
+        finishHistoryCommand(pendingAck.token, pendingAck.view, 'applied');
       } else {
         const actualOffset = transcriptRef.current?.measureOffsetForIndex(pendingAck.targetIndex) ?? null;
         if (actualOffset !== null && Math.abs(actualOffset - pendingAck.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX) {
-          finishHistoryCommand(pendingAck.token, 'applied');
+          finishHistoryCommand(pendingAck.token, pendingAck.view, 'applied');
         }
       }
     }
