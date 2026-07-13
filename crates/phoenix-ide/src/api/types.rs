@@ -1275,12 +1275,22 @@ impl PrStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
 }
 
 impl ErrorResponse {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             error: message.into(),
+            error_type: None,
+        }
+    }
+
+    pub fn typed(message: impl Into<String>, error_type: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            error_type: Some(error_type.into()),
         }
     }
 }

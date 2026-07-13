@@ -2164,6 +2164,7 @@ struct AroundMessagesQuery {
 
 const MAX_EXACT_MESSAGE_RANGE_SPAN: i64 = 10_000;
 const MAX_MESSAGE_HISTORY_LIMIT: i64 = 500;
+const MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES: usize = 2_048;
 
 async fn get_conversation(
     State(state): State<AppState>,
@@ -2410,6 +2411,15 @@ fn message_starts_render_unit(message: &crate::db::Message) -> bool {
 
 const RENDER_UNIT_BACKFILL_CHUNK_SIZE: i64 = 64;
 
+fn render_unit_alignment_ceiling_error() -> AppError {
+    AppError::TypedBadRequest {
+        message: format!(
+            "Aligned message slice exceeds the server response ceiling of {MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES} messages"
+        ),
+        error_type: "message_slice_render_unit_ceiling_exceeded".to_string(),
+    }
+}
+
 async fn align_slice_start_to_render_unit(
     db: &crate::db::Database,
     conversation_id: &str,
@@ -2422,22 +2432,26 @@ async fn align_slice_start_to_render_unit(
         return Ok(());
     }
 
+    if messages.len() > MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES {
+        return Err(render_unit_alignment_ceiling_error());
+    }
+
     let mut before_sequence = first.sequence_id;
     let mut intervening = Vec::new();
-    loop {
+    let mut remaining_prefix_budget = MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES - messages.len();
+    while remaining_prefix_budget > 0 {
+        let fetch_limit = RENDER_UNIT_BACKFILL_CHUNK_SIZE.min(
+            i64::try_from(remaining_prefix_budget)
+                .map_err(|_| AppError::Internal("render-unit ceiling exceeds i64".to_string()))?,
+        );
         let previous = db
-            .get_messages_before(
-                conversation_id,
-                before_sequence,
-                RENDER_UNIT_BACKFILL_CHUNK_SIZE,
-            )
+            .get_messages_before(conversation_id, before_sequence, fetch_limit)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if previous.is_empty() {
-            intervening.append(messages);
-            *messages = intervening;
-            break;
+            return Err(render_unit_alignment_ceiling_error());
         }
+        remaining_prefix_budget -= previous.len();
         let oldest_sequence = previous[0].sequence_id;
 
         if let Some(owner_index) = previous.iter().rposition(message_starts_render_unit) {
@@ -2445,7 +2459,7 @@ async fn align_slice_start_to_render_unit(
             prefix.append(&mut intervening);
             prefix.append(messages);
             *messages = prefix;
-            break;
+            return Ok(());
         }
 
         let mut older_intervening = previous;
@@ -2453,7 +2467,7 @@ async fn align_slice_start_to_render_unit(
         intervening = older_intervening;
         before_sequence = oldest_sequence;
     }
-    Ok(())
+    Err(render_unit_alignment_ceiling_error())
 }
 
 async fn has_messages_before(
@@ -6411,6 +6425,10 @@ async fn shared_sse_stream(
 #[derive(Debug)]
 pub(crate) enum AppError {
     BadRequest(String),
+    TypedBadRequest {
+        message: String,
+        error_type: String,
+    },
     NotFound(String),
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
@@ -6432,6 +6450,17 @@ impl IntoResponse for AppError {
                 (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse::new(msg.clone())),
+                )
+                    .into_response()
+            }
+            AppError::TypedBadRequest {
+                message,
+                error_type,
+            } => {
+                tracing::debug!(error = %message, error_type = %error_type, "400 Bad Request");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::typed(message, error_type)),
                 )
                     .into_response()
             }
@@ -7475,6 +7504,76 @@ pub(crate) mod hard_delete_cascade_tests {
             vec![3, 4]
         );
         assert!(before.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_fails_when_render_unit_backfill_exceeds_ceiling() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-over-ceiling-turn",
+                "history-over-ceiling-turn",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                "over-ceiling-agent",
+                "conv-history-over-ceiling-turn",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-over-ceiling".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "foo"}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("add agent");
+        for idx in 0..MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES {
+            state
+                .db
+                .add_message(
+                    &format!("over-ceiling-tool-{idx}"),
+                    "conv-history-over-ceiling-turn",
+                    &crate::db::MessageContent::tool(
+                        "tool-over-ceiling",
+                        format!("tool output {idx}"),
+                        false,
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add tool");
+        }
+
+        let err = get_conversation_messages_latest(
+            State(state),
+            Path("conv-history-over-ceiling-turn".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect_err("over-ceiling aligned slice should fail explicitly");
+
+        match err {
+            AppError::TypedBadRequest {
+                error_type,
+                message,
+            } => {
+                assert_eq!(error_type, "message_slice_render_unit_ceiling_exceeded");
+                assert!(message.contains(&MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES.to_string()));
+            }
+            other => panic!("expected typed bad request, got {other:?}"),
+        }
     }
 
     #[allow(clippy::too_many_lines)]

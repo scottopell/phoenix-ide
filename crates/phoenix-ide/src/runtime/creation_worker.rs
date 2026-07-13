@@ -1478,6 +1478,7 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
     match error {
         AppError::Conflict(response) => (response.error.clone(), ErrorKind::InvalidRequest),
         AppError::BadRequest(message)
+        | AppError::TypedBadRequest { message, .. }
         | AppError::UnprocessableEntity(crate::api::ExpansionErrorResponse {
             error: message,
             ..
