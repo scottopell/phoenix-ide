@@ -229,6 +229,35 @@ fn external_acceptance_replays_same_receipt_and_rejects_conflicting_intent() {
         "conversation-99",
     );
     assert_eq!(replay, ExternalAcceptanceOutcome::Replay(first_receipt));
+    for distinct_selection in [
+        ProtocolSelection {
+            selector: "selector-v2",
+            ..selection.clone()
+        },
+        ProtocolSelection {
+            authority: SemanticAuthority::LegacyProtocol,
+            ..selection.clone()
+        },
+        ProtocolSelection {
+            profile: ProfileRef {
+                profile_id: "test",
+                protocol_version: 2,
+            },
+            ..selection.clone()
+        },
+    ] {
+        assert!(matches!(
+            registry.accept(
+                &distinct_selection,
+                "account:a",
+                "client-key",
+                "intent:v1",
+                WorkflowId(99),
+                "conversation-99",
+            ),
+            ExternalAcceptanceOutcome::New(_)
+        ));
+    }
     assert_eq!(
         registry.accept(
             &selection,
@@ -357,6 +386,55 @@ fn shadow_workflow_cannot_execute_or_claim() {
             .outcome,
         ClaimOutcome::AuthorityConflict
     );
+}
+
+#[test]
+fn terminal_workflow_rejects_claim_even_when_effect_remains_eligible() {
+    for terminal_status in [WorkflowStatus::Completed, WorkflowStatus::Failed] {
+        let mut workflow = workflow();
+        workflow
+            .commit_transition(
+                &ReducerDecision {
+                    expected_workflow_version: Version(0),
+                    plan: plan(),
+                },
+                &barrier_events(),
+            )
+            .expect("effect plan commits");
+        assert_eq!(
+            workflow.effects[&EffectId(1)].status,
+            EffectStatus::Eligible
+        );
+        workflow
+            .commit_transition(
+                &ReducerDecision {
+                    expected_workflow_version: Version(1),
+                    plan: TransitionPlan {
+                        next_status: terminal_status,
+                        snapshot: "terminal",
+                        snapshot_codec: codec("snapshot"),
+                        event: "terminal",
+                        event_codec: codec("event"),
+                        effects: vec![],
+                        dependencies: vec![],
+                        barriers: vec![],
+                        barrier_members: vec![],
+                        invalidations: vec![],
+                        owed_acceptances: None,
+                    },
+                },
+                &BTreeMap::new(),
+            )
+            .expect("terminal transition commits");
+
+        assert_eq!(
+            workflow
+                .claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10))
+                .outcome,
+            ClaimOutcome::Ineligible
+        );
+        assert!(workflow.effects[&EffectId(1)].attempts.is_empty());
+    }
 }
 
 #[test]
@@ -3737,6 +3815,13 @@ fn review_regressions_cancellation_suppresses_manual_and_owed_work_atomically() 
     let proof = drain_proof(&protocol(), [&workflow]);
     assert_eq!(proof.categories["unresolved_manual_resolutions"].count, 0);
     assert_eq!(proof.categories["owed_runtime_acceptances"].count, 0);
+    assert_eq!(proof.categories["pending_reducer_inbox"].count, 0);
+    assert!(workflow.reducer_inbox.values().all(|event| {
+        event.delivery_status
+            == DeliveryStatus::Suppressed {
+                reason: SuppressionReason::Cancelled,
+            }
+    }));
 }
 
 #[test]
@@ -3936,9 +4021,10 @@ fn terminal_cancellation_delivery_is_suppressed_and_drainable() {
 }
 
 #[test]
-fn cancellation_terminal_status_still_validates_the_complete_plan_body() {
+fn terminal_cancellation_plan_cannot_declare_remaining_compensation_effects() {
     let mut workflow = workflow();
-    let malformed = workflow.cancel_with_compensation(
+    let before = workflow.clone();
+    let result = workflow.cancel_with_compensation(
         &CancellationRequest {
             expected_workflow_version: Version(0),
             next_snapshot: "cancelled",
@@ -3953,10 +4039,7 @@ fn cancellation_terminal_status_still_validates_the_complete_plan_body() {
                 snapshot_codec: codec("snapshot"),
                 event: "cancel",
                 event_codec: codec("event"),
-                effects: vec![
-                    effect(20, EffectRole::Compensation, Generation(1)),
-                    effect(20, EffectRole::Compensation, Generation(1)),
-                ],
+                effects: vec![effect(20, EffectRole::Compensation, Generation(1))],
                 dependencies: vec![],
                 barriers: vec![],
                 barrier_members: vec![],
@@ -3968,13 +4051,12 @@ fn cancellation_terminal_status_still_validates_the_complete_plan_body() {
     );
 
     assert_eq!(
-        malformed,
-        Err(EngineError::InvalidPlan(PlanError::DuplicateEffectId(
-            EffectId(20)
-        )))
+        result,
+        Err(EngineError::InvalidPlan(
+            PlanError::TerminalPlanDeclaresEffects(WorkflowStatus::Cancelled)
+        ))
     );
-    assert_eq!(workflow.version, Version(0));
-    assert_eq!(workflow.generation, Generation(0));
+    assert_eq!(workflow, before);
 }
 
 #[test]
