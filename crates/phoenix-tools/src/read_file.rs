@@ -4,7 +4,7 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
-use phoenix_core::file_viewer::has_opaque_extension;
+use phoenix_core::file_viewer::{classify_for_viewer, ViewerFileClass};
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::Deserialize;
 use serde::Serialize;
@@ -176,7 +176,8 @@ impl Tool for ReadFileTool {
         let viewer_available = is_within_viewer_roots(&resolved, &ctx.working_dir)
             && std::fs::metadata(&resolved)
                 .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
-            && !has_opaque_extension(&resolved);
+            && classify_for_viewer(&resolved) == ViewerFileClass::Text
+            && !text.as_bytes().contains(&0);
 
         let display_data = serde_json::to_value(ReadFileDisplayData {
             r#type: "read_file",
@@ -306,6 +307,49 @@ mod tests {
                 "remaining_line_count": 2,
                 "viewer_available": true,
             }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_image_extension_unavailable_to_source_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.svg"), "<svg>text</svg>\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "source.svg"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_late_nul_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut contents = vec![b'x'; 9_000];
+        contents.push(0);
+        contents.extend_from_slice(b"tail\n");
+        std::fs::write(dir.path().join("nul.txt"), contents).unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "nul.txt", "limit": 1}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
         );
     }
 

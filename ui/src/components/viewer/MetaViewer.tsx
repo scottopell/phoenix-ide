@@ -49,7 +49,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // lineRef/contentRef machinery below (scroll restore, jump-to-line, select-all,
   // copy) is bypassed for them and handled by PhoenixFileCodeView via its typed
   // handle instead.
-  const usePierreCode = payload.kind === 'code' || payload.kind === 'text';
+  const largeRangeFocus = focusRange !== undefined
+    && textLike
+    && payload.renderMode === 'plainLargeText';
+  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || largeRangeFocus;
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');

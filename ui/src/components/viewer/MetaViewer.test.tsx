@@ -259,6 +259,20 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
+  it('uses the line-aware viewer when a large source has a focused read range', () => {
+    const largeContent = 'line\n'.repeat(2_001);
+    const { container } = renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: largeContent,
+      renderMode: 'plainLargeText',
+      focusRange: { startLine: 100, endLine: 110 },
+    });
+
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
+    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
+  });
+
   it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({

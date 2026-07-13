@@ -359,12 +359,14 @@ impl FileViewerKind {
                 "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif",
             ) => FileViewerKind::Image,
             // Known-binary extensions: the viewer cannot open them.
-            Some(_) if phoenix_core::file_viewer::has_opaque_extension(path) => {
-                FileViewerKind::Opaque
-            }
-            // Unknown extension: optimistically text; the read path confirms by
+            Some(_) => match phoenix_core::file_viewer::classify_for_viewer(path) {
+                phoenix_core::file_viewer::ViewerFileClass::Image => FileViewerKind::Image,
+                phoenix_core::file_viewer::ViewerFileClass::Opaque => FileViewerKind::Opaque,
+                phoenix_core::file_viewer::ViewerFileClass::Text => text(TextCategory::Unknown),
+            },
+            // No extension: optimistically text; the read path confirms by
             // content-sniffing before committing.
-            _ => text(TextCategory::Unknown),
+            None => text(TextCategory::Unknown),
         }
     }
 }

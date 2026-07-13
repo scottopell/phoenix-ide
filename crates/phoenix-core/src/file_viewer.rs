@@ -1,5 +1,29 @@
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerFileClass {
+    Text,
+    Image,
+    Opaque,
+}
+
+pub fn classify_for_viewer(path: &Path) -> ViewerFileClass {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_lowercase);
+    if matches!(
+        extension.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif")
+    ) {
+        ViewerFileClass::Image
+    } else if has_opaque_extension(path) {
+        ViewerFileClass::Opaque
+    } else {
+        ViewerFileClass::Text
+    }
+}
+
 pub fn has_opaque_extension(path: &Path) -> bool {
     matches!(
         path.extension()
