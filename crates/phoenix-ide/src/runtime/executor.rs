@@ -1644,6 +1644,8 @@ where
     bash_handles: Arc<crate::tools::BashHandleRegistry>,
     /// Tmux server registry for `ToolContext` (REQ-TMUX-013).
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
+    /// Durable wake registration capability for `wait_until`.
+    wake_registrar: Option<Arc<dyn phoenix_tools::WakeRegistrar>>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
@@ -1900,6 +1902,7 @@ where
             bash_handles,
             tmux_registry,
             llm_registry,
+            wake_registrar: None,
             terminals,
             event_rx,
             event_tx,
@@ -1964,6 +1967,14 @@ where
     /// Attach a watch sender so the runtime publishes its current `ConvState`
     /// on every transition. The paired receiver lives in `ConversationHandle`
     /// and lets HTTP handlers read live state without consulting the DB.
+    pub(crate) fn with_wake_registrar(
+        mut self,
+        registrar: Arc<dyn phoenix_tools::WakeRegistrar>,
+    ) -> Self {
+        self.wake_registrar = Some(registrar);
+        self
+    }
+
     pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
         self.state_watcher = Some(tx);
         self
@@ -4749,6 +4760,11 @@ where
             self.tmux_registry.clone(),
             scope_worktree,
         );
+        let tool_ctx = if let Some(registrar) = &self.wake_registrar {
+            tool_ctx.with_wake_capability(tool.id.clone(), registrar.clone())
+        } else {
+            tool_ctx
+        };
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();

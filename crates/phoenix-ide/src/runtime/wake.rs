@@ -6,6 +6,7 @@
 
 use std::{sync::Arc, time::Duration as StdDuration};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use phoenix_core::work_scope::WorkScope;
 use phoenix_db::workflow::{
@@ -17,6 +18,10 @@ use phoenix_db::workflow::{
     WorkflowRepository,
 };
 use phoenix_tools::{BashTerminalInspection, TmuxTerminalInspection, TmuxWindowIdentity};
+use phoenix_tools::{
+    WaitUntilTarget, WakeRegistrar, WakeRegistrarError, WakeRegistration, WakeRegistrationReceipt,
+    WakeRegistrationTarget,
+};
 use phoenix_workflow::{
     wake_profile::{
         BashTerminalEvidence, BashTerminalStatus, TmuxTerminalEvidence, TmuxTerminalStatus,
@@ -25,6 +30,8 @@ use phoenix_workflow::{
     },
     Timestamp,
 };
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tokio::sync::watch;
 
 use super::RuntimeManager;
@@ -34,6 +41,279 @@ const HANDLE_POLL: Duration = Duration::seconds(1);
 const MAX_IDLE_POLL: StdDuration = StdDuration::from_secs(1);
 const ERROR_BACKOFF_MIN: StdDuration = StdDuration::from_millis(250);
 const ERROR_BACKOFF_MAX: StdDuration = StdDuration::from_secs(5);
+
+#[derive(Clone)]
+pub(crate) struct ProductionWakeRegistrar {
+    manager: Arc<RuntimeManager>,
+}
+
+impl ProductionWakeRegistrar {
+    pub(crate) fn new(manager: Arc<RuntimeManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl WakeRegistrar for ProductionWakeRegistrar {
+    async fn register(
+        &self,
+        registration: WakeRegistration,
+    ) -> Result<WakeRegistrationReceipt, WakeRegistrarError> {
+        let stable =
+            stable_registration_key(&registration.conversation_id, &registration.tool_use_id);
+        let contract_id = format!("wake-contract-{stable}");
+        if let Some(receipt) = existing_receipt(&self.manager, &contract_id, &registration).await? {
+            self.manager.kick_wake_worker();
+            return Ok(receipt);
+        }
+        let accepted_at = Utc::now();
+        let expires_at = accepted_at
+            + Duration::seconds(
+                i64::try_from(registration.max_wait_seconds)
+                    .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?,
+            );
+        let registration_scope = scope_identity(&registration.work_scope)?;
+        let (resource, target) = match registration.target {
+            WakeRegistrationTarget::Bash { handle_id } => (
+                WakeResourceIdentity::Bash(phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: registration_scope.clone(),
+                    handle_id: handle_id.clone(),
+                }),
+                WaitUntilTarget::Bash { handle_id },
+            ),
+            WakeRegistrationTarget::TmuxWindow {
+                server_generation,
+                window_id,
+            } => (
+                WakeResourceIdentity::TmuxWindow(
+                    phoenix_workflow::wake_profile::TmuxResourceIdentity {
+                        work_scope: registration_scope.clone(),
+                        server_generation,
+                        window_id: window_id.clone(),
+                    },
+                ),
+                WaitUntilTarget::TmuxWindow { window_id },
+            ),
+        };
+        let workflow_id = format!("wake-workflow-{stable}");
+        let registered_at = timestamp(accepted_at).map_err(WakeRegistrarError::Persistence)?;
+        let expires_timestamp = timestamp(expires_at).map_err(WakeRegistrarError::Persistence)?;
+        let expires_at = DateTime::<Utc>::from_timestamp(
+            i64::try_from(expires_timestamp.0)
+                .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?,
+            0,
+        )
+        .ok_or_else(|| WakeRegistrarError::Persistence("wake expiry is out of range".to_owned()))?;
+        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: contract_id.clone(),
+            conversation_id: registration.conversation_id.clone(),
+            registration_scope,
+            resource,
+            registering_tool_use_id: registration.tool_use_id.clone(),
+            registered_at,
+            expires_at: expires_timestamp,
+        };
+        let repository = WorkflowRepository::new(self.manager.db().pool().clone());
+        let adapter = WakeWorkflowAdapter::new(&repository);
+        let fence_version = adapter
+            .registration_fence_version(&registration.conversation_id)
+            .await
+            .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
+        let request = phoenix_db::workflow::wake::WakeRegistrationRequest {
+            idempotency_key: format!("wake-register-{stable}"),
+            intent_fingerprint: intent_fingerprint(&intent),
+            workflow_id,
+            transition_id: format!("wake-transition-{stable}"),
+            binding_id: format!("wake-acceptance-{stable}"),
+            authority_scope: registration.conversation_id.clone(),
+            intent,
+            fence_version,
+            accepted_at,
+        };
+        let result = adapter
+            .register(&request)
+            .await
+            .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
+        match result {
+            phoenix_db::workflow::wake::WakeRegistrationResult::New { .. }
+            | phoenix_db::workflow::wake::WakeRegistrationResult::Replay { .. } => {
+                // register() commits the complete graph before returning.
+                self.manager.kick_wake_worker();
+                Ok(WakeRegistrationReceipt {
+                    contract_id,
+                    target,
+                    expires_at,
+                    registering_tool_use_id: registration.tool_use_id,
+                })
+            }
+            phoenix_db::workflow::wake::WakeRegistrationResult::Conflict => {
+                Err(WakeRegistrarError::Conflict)
+            }
+            phoenix_db::workflow::wake::WakeRegistrationResult::Retryable => {
+                Err(WakeRegistrarError::Retryable)
+            }
+            phoenix_db::workflow::wake::WakeRegistrationResult::NotAccepting => {
+                Err(WakeRegistrarError::NotAccepting)
+            }
+        }
+    }
+}
+
+async fn existing_receipt(
+    manager: &RuntimeManager,
+    contract_id: &str,
+    registration: &WakeRegistration,
+) -> Result<Option<WakeRegistrationReceipt>, WakeRegistrarError> {
+    let row = sqlx::query(
+        "SELECT conversation_id, resource_kind, bash_work_scope_kind, \
+         bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, \
+         tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, \
+         registering_tool_use_id, registered_at, expires_at FROM wake_workflow_bindings \
+         WHERE contract_id = ?1",
+    )
+    .bind(contract_id)
+    .fetch_optional(manager.db().pool())
+    .await
+    .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let matches_owner = row.get::<String, _>("conversation_id") == registration.conversation_id
+        && row.get::<String, _>("registering_tool_use_id") == registration.tool_use_id;
+    let target = match &registration.target {
+        WakeRegistrationTarget::Bash { handle_id }
+            if row.get::<String, _>("resource_kind") == "bash"
+                && stored_scope_matches(&row, "bash", &registration.work_scope)
+                && row.get::<Option<String>, _>("bash_handle_id").as_deref()
+                    == Some(handle_id.as_str()) =>
+        {
+            Some(WaitUntilTarget::Bash {
+                handle_id: handle_id.clone(),
+            })
+        }
+        WakeRegistrationTarget::TmuxWindow {
+            server_generation,
+            window_id,
+        } if row.get::<String, _>("resource_kind") == "tmux_window"
+            && stored_scope_matches(&row, "tmux", &registration.work_scope)
+            && row
+                .get::<Option<String>, _>("tmux_server_generation")
+                .as_deref()
+                == Some(server_generation.as_str())
+            && row.get::<Option<String>, _>("tmux_window_id").as_deref()
+                == Some(window_id.as_str()) =>
+        {
+            Some(WaitUntilTarget::TmuxWindow {
+                window_id: window_id.clone(),
+            })
+        }
+        _ => None,
+    };
+    if !matches_owner || target.is_none() {
+        return Err(WakeRegistrarError::Conflict);
+    }
+    let registered_at = DateTime::parse_from_rfc3339(&row.get::<String, _>("registered_at"))
+        .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?
+        .with_timezone(&Utc);
+    let expires_at = DateTime::parse_from_rfc3339(&row.get::<String, _>("expires_at"))
+        .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?
+        .with_timezone(&Utc);
+    let requested_wait = i64::try_from(registration.max_wait_seconds)
+        .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
+    if (expires_at - registered_at).num_seconds() != requested_wait {
+        return Err(WakeRegistrarError::Conflict);
+    }
+    Ok(Some(WakeRegistrationReceipt {
+        contract_id: contract_id.to_owned(),
+        target: target.expect("matched target is present"),
+        expires_at,
+        registering_tool_use_id: registration.tool_use_id.clone(),
+    }))
+}
+
+fn stored_scope_matches(row: &sqlx::sqlite::SqliteRow, prefix: &str, scope: &WorkScope) -> bool {
+    let kind = row.get::<Option<String>, _>(format!("{prefix}_work_scope_kind").as_str());
+    let key = row.get::<Option<String>, _>(format!("{prefix}_work_scope_stable_key").as_str());
+    match scope {
+        WorkScope::Conversation(id) => {
+            kind.as_deref() == Some("conversation") && key.as_deref() == Some(id)
+        }
+        WorkScope::Worktree(path) => {
+            kind.as_deref() == Some("worktree") && key.as_deref() == Some(path)
+        }
+        WorkScope::Global => false,
+    }
+}
+
+fn stable_registration_key(conversation_id: &str, tool_use_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"phoenix.wake.registration.v1\0");
+    digest.update(conversation_id.as_bytes());
+    digest.update([0]);
+    digest.update(tool_use_id.as_bytes());
+    hex_digest(digest.finalize())
+}
+
+fn intent_fingerprint(intent: &phoenix_workflow::wake_profile::WakeRegistrationIntent) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"phoenix.wake.intent.v1\0");
+    for field in [
+        intent.contract_id.as_str(),
+        intent.conversation_id.as_str(),
+        intent.registration_scope.stable_key.as_str(),
+        intent.registering_tool_use_id.as_str(),
+    ] {
+        digest.update(field.as_bytes());
+        digest.update([0]);
+    }
+    digest.update(match intent.registration_scope.kind {
+        WorkScopeKind::Conversation => b"conversation".as_slice(),
+        WorkScopeKind::Worktree => b"worktree".as_slice(),
+    });
+    digest.update([0]);
+    match &intent.resource {
+        WakeResourceIdentity::Bash(identity) => {
+            digest.update(b"bash\0");
+            digest.update(identity.handle_id.as_bytes());
+        }
+        WakeResourceIdentity::TmuxWindow(identity) => {
+            digest.update(b"tmux_window\0");
+            digest.update(identity.server_generation.as_bytes());
+            digest.update([0]);
+            digest.update(identity.window_id.as_bytes());
+        }
+    }
+    digest.update(intent.registered_at.0.to_be_bytes());
+    digest.update(intent.expires_at.0.to_be_bytes());
+    hex_digest(digest.finalize())
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    bytes
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+            out
+        })
+}
+
+fn scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, WakeRegistrarError> {
+    match scope {
+        WorkScope::Conversation(id) => Ok(WorkScopeIdentity {
+            kind: WorkScopeKind::Conversation,
+            stable_key: id.clone(),
+        }),
+        WorkScope::Worktree(path) => Ok(WorkScopeIdentity {
+            kind: WorkScopeKind::Worktree,
+            stable_key: path.clone(),
+        }),
+        WorkScope::Global => Err(WakeRegistrarError::Persistence(
+            "global resources cannot be registered for conversation wake".to_owned(),
+        )),
+    }
+}
 
 pub(crate) async fn run(manager: Arc<RuntimeManager>, mut kick: watch::Receiver<u64>) {
     let worker_id = format!("wake-worker-{}", uuid::Uuid::new_v4());
@@ -431,6 +711,7 @@ mod tests {
     use chrono::TimeZone;
     use phoenix_db::workflow::wake::{WakeRegistrationRequest, WakeRegistrationResult};
     use phoenix_llm::ModelRegistry;
+    use phoenix_tools::Tool;
     use phoenix_workflow::wake_profile::{
         BashResourceIdentity, TmuxResourceIdentity, WakeRegistrationIntent,
     };
@@ -502,6 +783,121 @@ mod tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn production_registration_persists_graph_and_worker_processes_resource() {
+        let manager = Arc::new(manager_with_due_wakes(0).await);
+        let context = phoenix_tools::ToolContext::new(
+            tokio_util::sync::CancellationToken::new(),
+            "conv".to_owned(),
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(phoenix_tools::BrowserSessionManager::default()),
+            manager.bash_handles().clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            phoenix_terminal::ActiveTerminals::new(),
+            manager.tmux_registry().clone(),
+            None,
+        );
+        let spawned = phoenix_tools::BashTool
+            .run(
+                serde_json::json!({"op":"run","cmd":"true","wait_seconds":0}),
+                context.clone(),
+            )
+            .await;
+        let handle_id = spawned.display_data().unwrap()["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registrar = ProductionWakeRegistrar::new(manager.clone());
+        let receipt = registrar
+            .register(WakeRegistration {
+                conversation_id: "conv".to_owned(),
+                tool_use_id: "wait-tool-1".to_owned(),
+                work_scope: WorkScope::Conversation("conv".to_owned()),
+                target: WakeRegistrationTarget::Bash {
+                    handle_id: handle_id.clone(),
+                },
+                max_wait_seconds: 60,
+            })
+            .await
+            .expect("registration");
+
+        let graph_counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM wake_workflow_bindings WHERE contract_id = ?1), \
+             (SELECT COUNT(*) FROM workflows WHERE id LIKE 'wake-workflow-%'), \
+             (SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id LIKE 'wake-workflow-%'), \
+             (SELECT COUNT(*) FROM workflow_effects WHERE workflow_id LIKE 'wake-workflow-%')",
+        )
+        .bind(&receipt.contract_id)
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(graph_counts, (1, 1, 1, 1));
+
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        drain_due(&manager, "test-worker", Utc::now).await.unwrap();
+        let repository = WorkflowRepository::new(manager.db().pool().clone());
+        assert!(WakeWorkflowAdapter::new(&repository)
+            .due(Utc::now())
+            .await
+            .unwrap()
+            .is_empty());
+        let terminal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflows WHERE id LIKE 'wake-workflow-%' AND status = 'completed'",
+        )
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(terminal_count, 1);
+    }
+
+    #[tokio::test]
+    async fn production_registration_replay_returns_original_durable_receipt() {
+        let manager = Arc::new(manager_with_due_wakes(0).await);
+        let registrar = ProductionWakeRegistrar::new(manager.clone());
+        let registration = WakeRegistration {
+            conversation_id: "conv".to_owned(),
+            tool_use_id: "wait-tool-replay".to_owned(),
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            target: WakeRegistrationTarget::Bash {
+                handle_id: "missing-but-owned-before-registration".to_owned(),
+            },
+            max_wait_seconds: 60,
+        };
+        let first = registrar.register(registration.clone()).await.unwrap();
+        let second = registrar.register(registration).await.unwrap();
+        assert_eq!(first, second);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_workflow_bindings WHERE contract_id = ?1",
+        )
+        .bind(first.contract_id)
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn production_registration_rejects_changed_wait_for_same_tool_use() {
+        let manager = Arc::new(manager_with_due_wakes(0).await);
+        let registrar = ProductionWakeRegistrar::new(manager);
+        let registration = WakeRegistration {
+            conversation_id: "conv".to_owned(),
+            tool_use_id: "wait-tool-conflict".to_owned(),
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            target: WakeRegistrationTarget::Bash {
+                handle_id: "b-conflict".to_owned(),
+            },
+            max_wait_seconds: 30,
+        };
+        registrar.register(registration.clone()).await.unwrap();
+        let mut changed = registration;
+        changed.max_wait_seconds = 31;
+        assert!(matches!(
+            registrar.register(changed).await,
+            Err(WakeRegistrarError::Conflict)
+        ));
     }
 
     #[tokio::test]

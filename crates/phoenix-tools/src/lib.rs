@@ -21,6 +21,7 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
+mod wait_until;
 pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
@@ -50,6 +51,10 @@ pub use think::ThinkTool;
 pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
     TmuxTerminalInspection, TmuxTool, TmuxWindowIdentity,
+};
+pub use wait_until::{
+    DisabledWakeRegistrar, WaitUntilTarget, WaitUntilTool, WakeRegistrar, WakeRegistrarError,
+    WakeRegistration, WakeRegistrationReceipt, WakeRegistrationTarget,
 };
 
 use async_trait::async_trait;
@@ -288,6 +293,10 @@ pub struct ToolContext {
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
     pub work_scope: WorkScope,
+
+    /// Identity and persistence capability for the current tool invocation.
+    pub tool_use_id: Option<String>,
+    wake_registrar: Arc<dyn WakeRegistrar>,
 }
 
 impl ToolContext {
@@ -316,7 +325,25 @@ impl ToolContext {
             tmux_registry,
             worktree_path,
             work_scope,
+            tool_use_id: None,
+            wake_registrar: Arc::new(DisabledWakeRegistrar),
         }
+    }
+
+    #[must_use]
+    pub fn with_wake_capability(
+        mut self,
+        tool_use_id: impl Into<String>,
+        registrar: Arc<dyn WakeRegistrar>,
+    ) -> Self {
+        self.tool_use_id = Some(tool_use_id.into());
+        self.wake_registrar = registrar;
+        self
+    }
+
+    #[must_use]
+    pub fn wake_registrar(&self) -> &Arc<dyn WakeRegistrar> {
+        &self.wake_registrar
     }
 
     /// Get or create the browser session for this conversation's
@@ -555,6 +582,12 @@ fn explore_coordination_tools() -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(AskUserQuestionTool), Arc::new(SkillTool)]
 }
 
+/// Durable suspension is parent-only: sub-agents report to their parent instead of
+/// parking the parent conversation's runtime.
+fn parent_wake_tools() -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(WaitUntilTool)]
+}
+
 /// Sub-agent terminal tools — how a sub-agent reports its result or error
 /// back to the parent. Only available to sub-agents.
 fn sub_agent_terminal_tools() -> Vec<Arc<dyn Tool>> {
@@ -777,6 +810,7 @@ impl ToolRegistry {
             // Parent conversations can read the terminal, spawn sub-agents,
             // ask user questions, and invoke skills.
             tools.extend(parent_terminal_tools());
+            tools.extend(parent_wake_tools());
             tools.extend(parent_coordination_tools(agents));
         }
 
@@ -995,6 +1029,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn wait_until_is_parent_only() {
+        assert!(names(&ToolRegistry::standard()).contains("wait_until"));
+        assert!(names(&ToolRegistry::direct(Vec::new())).contains("wait_until"));
+        assert!(!names(&ToolRegistry::for_subagent_work()).contains("wait_until"));
+        assert!(
+            !names(&ToolRegistry::for_subagent_explore(sandbox_policy())).contains("wait_until")
+        );
     }
 
     /// Per-mode capability matrix. If a constructor starts handing out the

@@ -2774,6 +2774,9 @@ impl RuntimeManager {
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone())
         .with_agent_catalog(agent_catalog);
+        let runtime = runtime.with_wake_registrar(Arc::new(wake::ProductionWakeRegistrar::new(
+            Arc::clone(self),
+        )));
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer

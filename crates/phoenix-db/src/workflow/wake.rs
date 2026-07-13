@@ -222,6 +222,24 @@ impl<'a> WakeWorkflowAdapter<'a> {
         }
     }
 
+    /// Read the version a new registration must compare-and-swap.
+    pub async fn registration_fence_version(
+        &self,
+        conversation_id: &str,
+    ) -> WorkflowRepositoryResult<u64> {
+        let version: Option<i64> = sqlx::query_scalar(
+            "SELECT version FROM wake_registration_fences WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(self.repository.pool())
+        .await?;
+        u64::try_from(version.unwrap_or(0)).map_err(|_| {
+            WorkflowRepositoryError::CorruptState(
+                "wake registration fence has a negative version".to_owned(),
+            )
+        })
+    }
+
     /// Atomically accept registration and install its complete initial durable graph.
     pub async fn register(
         &self,
@@ -362,14 +380,37 @@ impl<'a> WakeWorkflowAdapter<'a> {
         })
     }
 
+    async fn cancellation_binding_matches(
+        &self,
+        request: &WakeCancellationRequest,
+    ) -> WorkflowRepositoryResult<bool> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT contract_id, observe_effect_id FROM wake_workflow_bindings WHERE workflow_id = ?1",
+        )
+        .bind(&request.workflow_id)
+        .fetch_optional(self.repository.pool())
+        .await?;
+        let Some((contract_id, observe_effect_id)) = row else {
+            return Ok(false);
+        };
+        Ok(contract_id == request.contract_id
+            && observe_effect_id == request.observe_effect_id
+            && self.load_resource(&request.workflow_id).await? == request.resource)
+    }
+
     pub async fn next_deadline(&self) -> WorkflowRepositoryResult<Option<DateTime<Utc>>> {
         let value: Option<String> = sqlx::query_scalar(
-            "SELECT MIN(b.expires_at) FROM wake_workflow_bindings b \
+            "SELECT MIN(CASE \
+                 WHEN e.status = 'eligible' THEN b.expires_at \
+                 WHEN e.status = 'retry_wait' THEN e.next_eligible_at \
+                 WHEN e.status = 'claimed' THEN c.lease_until \
+             END) FROM wake_workflow_bindings b \
              JOIN workflows w ON w.id = b.workflow_id \
              JOIN workflow_effects e ON e.id = b.observe_effect_id AND e.workflow_id = w.id \
+             LEFT JOIN workflow_claims c ON c.effect_id = e.id AND c.workflow_id = w.id \
              WHERE w.status = 'active' AND w.authority = 'engine_protocol' \
                AND w.execution_mode = 'authoritative' AND e.generation = w.generation \
-               AND e.status NOT IN ('receipted', 'invalidated')",
+               AND e.status IN ('eligible', 'retry_wait', 'claimed')",
         )
         .fetch_one(self.repository.pool())
         .await?;
@@ -455,7 +496,9 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let binding = self
             .load_binding(&observation.authority.workflow_id)
             .await?;
-        if observation.evidence.identity() != binding.resource {
+        if observation.evidence.identity() != binding.resource
+            || timestamp(observation.evidence.occurred_at())? > binding.expires_at
+        {
             return Ok(AcceptReceiptResult::StaleAuthority);
         }
         self.repository
@@ -519,15 +562,16 @@ impl<'a> WakeWorkflowAdapter<'a> {
         &self,
         request: &WakeTerminalReceiptRequest,
     ) -> WorkflowRepositoryResult<AcceptReceiptResult> {
-        let binding_resource = self.load_resource(&request.authority.workflow_id).await?;
-        if request.terminal.resource() != &binding_resource
-            || matches!(
-                &request.terminal,
-                WakeTerminalPayload::Fired { evidence, .. }
-                    if evidence.identity() != binding_resource
-            )
-        {
+        let binding = self.load_binding(&request.authority.workflow_id).await?;
+        if request.terminal.resource() != &binding.resource {
             return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+        if let WakeTerminalPayload::Fired { evidence, .. } = &request.terminal {
+            if evidence.identity() != binding.resource
+                || timestamp(evidence.occurred_at())? > binding.expires_at
+            {
+                return Ok(AcceptReceiptResult::StaleAuthority);
+            }
         }
         self.repository
             .accept_receipt(&DurableAcceptReceiptRequest {
@@ -575,12 +619,16 @@ impl<'a> WakeWorkflowAdapter<'a> {
         &self,
         request: &WakeCancellationRequest,
     ) -> WorkflowRepositoryResult<bool> {
+        if !self.cancellation_binding_matches(request).await? {
+            return Ok(false);
+        }
         let terminal = WakeTerminalPayload::Cancelled {
             contract_id: request.contract_id.to_owned(),
             resource: request.resource.clone(),
             reason: WakeCancellationReason::ExplicitCancel,
             resolved_at: request.resolved_at,
         };
+        let terminal_resolved_at = timestamp(request.resolved_at)?;
         let mut tx = self.repository.pool().begin().await?;
         let next_generation = request.expected_generation.checked_add(1).ok_or(
             WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation),
@@ -705,7 +753,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
                      AND wi.workflow_id = ?2\
                )",
         )
-        .bind(request.committed_at.to_rfc3339())
+        .bind(terminal_resolved_at.to_rfc3339())
         .bind(&request.workflow_id)
         .execute(&mut *tx)
         .await?;
@@ -778,7 +826,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(request.contract_id)
         .bind(&request.observe_effect_id)
         .bind(match request.resource { WakeResourceIdentity::Bash(_) => "bash", WakeResourceIdentity::TmuxWindow(_) => "tmux_window" })
-        .bind(request.committed_at.to_rfc3339())
+        .bind(terminal_resolved_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
             let sequence: i64 = sqlx::query_scalar(

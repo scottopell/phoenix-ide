@@ -286,6 +286,72 @@ async fn terminal_evidence_requires_a_fired_receipt() {
 }
 
 #[tokio::test]
+async fn fired_evidence_after_expiry_is_rejected_in_atomic_and_direct_receipt_paths() {
+    let (pool, repo) = registered(bash()).await;
+    let claim = claimed(&repo).await;
+    let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
+        identity: match bash() {
+            WakeResourceIdentity::Bash(identity) => identity,
+            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+        },
+        status: BashTerminalStatus::Exited,
+        occurred_at: Timestamp(1_101),
+        exit_code: Some(0),
+        duration_ms: None,
+        signal_number: None,
+        kill_signal_sent: None,
+        tail_start_offset: 0,
+        tail_end_offset: 0,
+        tail_truncated_before: false,
+        tail_offsets: vec![],
+        final_tail: vec![],
+    });
+    let receipt = WakeTerminalReceiptRequest {
+        receipt_id: "late-receipt".to_owned(),
+        reducer_inbox_id: "late-inbox".to_owned(),
+        authority: claim.authority.clone(),
+        attempt_id: claim.attempt_id.clone(),
+        terminal: WakeTerminalPayload::Fired {
+            contract_id: "wake-contract".to_owned(),
+            resource: bash(),
+            evidence: evidence.clone(),
+            resolved_at: Timestamp(1_101),
+        },
+        accepted_at: Utc.timestamp_opt(1_101, 0).single().unwrap(),
+        origin: DurableReceiptOrigin::Execution,
+    };
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert_eq!(
+        adapter
+            .record_terminal_evidence(
+                &WakeObservationRequest {
+                    observation_id: "late-observation".to_owned(),
+                    authority: claim.authority,
+                    attempt_id: claim.attempt_id,
+                    evidence,
+                    recorded_at: Utc.timestamp_opt(1_101, 0).single().unwrap(),
+                },
+                &receipt,
+            )
+            .await
+            .unwrap(),
+        AcceptReceiptResult::StaleAuthority
+    );
+    assert_eq!(
+        adapter.accept_terminal_receipt(&receipt).await.unwrap(),
+        AcceptReceiptResult::StaleAuthority
+    );
+    let writes: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM workflow_observations WHERE id = 'late-observation') \
+              + (SELECT COUNT(*) FROM workflow_receipts WHERE id = 'late-receipt')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(writes, 0);
+}
+
+#[tokio::test]
 async fn ensure_protocol_selection_reports_existing_accepting_selection_without_altering_it() {
     let pool = pool().await;
     let repo = WorkflowRepository::new(pool.clone());
@@ -762,6 +828,31 @@ async fn next_deadline_excludes_receipted_and_invalidated_observe_effects() {
 }
 
 #[tokio::test]
+async fn next_deadline_uses_live_claim_lease_and_retry_actionable_time() {
+    let (_pool, repo) = registered(bash()).await;
+    let claim = claimed(&repo).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert_eq!(
+        adapter.next_deadline().await.unwrap(),
+        Some(Utc.timestamp_opt(1_050, 0).single().unwrap())
+    );
+
+    let retry_at = Utc.timestamp_opt(1_030, 0).single().unwrap();
+    assert_eq!(
+        adapter
+            .schedule_retry(
+                &claim.authority,
+                Utc.timestamp_opt(1_010, 0).single().unwrap(),
+                retry_at,
+            )
+            .await
+            .unwrap(),
+        ReconcileEffectResult::ScheduledRetry
+    );
+    assert_eq!(adapter.next_deadline().await.unwrap(), Some(retry_at));
+}
+
+#[tokio::test]
 async fn retry_promotes_only_the_exact_due_deadline() {
     let (_pool, repo) = registered(bash()).await;
     let claim = claimed(&repo).await;
@@ -814,7 +905,7 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
             contract_id: "wake-contract",
             resource: bash(),
             resolved_at: Timestamp(1_015),
-            committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),
+            committed_at: Utc.timestamp_opt(1_016, 0).single().unwrap(),
         })
         .await
         .unwrap());
@@ -860,6 +951,16 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
     assert_eq!(projection.0, "cancelled");
     assert_eq!(projection.1, "explicit_cancel");
     assert_eq!(projection.2, "wake-cancel-receipt:wake-workflow");
+    let normalized_resolved_at: String = sqlx::query_scalar(
+        "SELECT resolved_at FROM wake_terminal_receipts WHERE receipt_id = 'wake-cancel-receipt:wake-workflow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        normalized_resolved_at,
+        Utc.timestamp_opt(1_015, 0).single().unwrap().to_rfc3339()
+    );
     let runtime_obligations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM wake_runtime_obligations")
             .fetch_one(&pool)
@@ -995,6 +1096,16 @@ async fn cancellation_revokes_live_claim_and_rejects_wrong_effect_id() {
         committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),
     };
     assert!(!adapter.cancel(&request).await.unwrap());
+    request.observe_effect_id = "wake-observe:wake-workflow".to_owned();
+    request.contract_id = "wrong-contract";
+    assert!(!adapter.cancel(&request).await.unwrap());
+    request.contract_id = "wake-contract";
+    request.resource = WakeResourceIdentity::Bash(BashResourceIdentity {
+        work_scope: scope(),
+        handle_id: "wrong-handle".to_owned(),
+    });
+    assert!(!adapter.cancel(&request).await.unwrap());
+    request.resource = bash();
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT status FROM workflows WHERE id = 'wake-workflow'")
             .fetch_one(&pool)
