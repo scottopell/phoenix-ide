@@ -152,10 +152,10 @@ export function DiffView({
   }, [find]);
 
   useEffect(() => {
-    if (!find.isOpen || find.query.length === 0 || find.requestedActiveIndex >= 0) return;
+    if (!find.isOpen || find.query.length === 0) return;
     const target = findProjection.matches[0]?.target;
     if (target) navigateFindTarget(target);
-  }, [find.isOpen, find.query, find.requestedActiveIndex, findProjection.matches, navigateFindTarget]);
+  }, [find.isOpen, find.query, findProjection.matches, navigateFindTarget]);
 
   const handleFindNext = useCallback(() => {
     const nextIndex = findProjection.matches.length === 0
