@@ -799,6 +799,11 @@ impl TmuxRegistry {
         if !matches!(probe(&socket_path).await, Ok(ProbeResult::Live)) {
             return None;
         }
+        if tmux_window_option(&socket_path, window_id, "@phoenix_wait_targetable").await
+            != Some("1".to_owned())
+        {
+            return None;
+        }
         let generation = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await?;
         let identity = TmuxWindowIdentity {
             work_scope: work_scope.clone(),
@@ -1103,6 +1108,23 @@ async fn run_tmux_quiet(socket_path: &Path, args: &[&str]) {
 /// Read one variable from a server's global environment, or `None` if unset.
 /// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
 /// not.
+async fn tmux_window_option(socket_path: &Path, window_id: &str, option: &str) -> Option<String> {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let out = tokio::process::Command::new("tmux")
+        .args(["-S", &sock, "show-option", "-wqv", "-t", window_id, option])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
 async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
     let sock = socket_path.to_string_lossy().into_owned();
     let out = tokio::process::Command::new("tmux")

@@ -768,7 +768,13 @@ pub fn transition_core(
             let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
             for wake_result in results {
                 transition = transition.with_effect(Effect::PersistMessage {
-                    content: MessageContent::user(&wake_result.content),
+                    content: MessageContent::Tool(
+                        phoenix_core::domain::db_schema::ToolContent::new(
+                            &wake_result.registering_tool_use_id,
+                            &wake_result.content,
+                            false,
+                        ),
+                    ),
                     display_data: None,
                     usage_data: None,
                     message_id: wake_result.message_id.clone(),

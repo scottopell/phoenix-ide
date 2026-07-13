@@ -29,6 +29,7 @@ use std::collections::HashMap;
 pub struct WakeObservationResult {
     pub inbox_id: String,
     pub message_id: String,
+    pub registering_tool_use_id: String,
     pub content: String,
 }
 

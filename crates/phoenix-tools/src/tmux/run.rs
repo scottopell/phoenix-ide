@@ -365,6 +365,26 @@ async fn start_tmux_window(
         .filter(|s| !s.is_empty())
         .unwrap_or(requested_name)
         .to_string();
+    let ownership = run_tmux_cli(
+        config_path,
+        socket_path,
+        &[
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            window_id.clone(),
+            "@phoenix_wait_targetable".to_owned(),
+            "1".to_owned(),
+        ],
+    )
+    .await
+    .map_err(|error| error_envelope("tmux_run_start_failed", &error))?;
+    if !ownership.status.success() {
+        return Err(error_envelope(
+            "tmux_run_start_failed",
+            "failed to persist tmux_run ownership marker",
+        ));
+    }
     Ok(TmuxRunTarget {
         window_name,
         window_id,

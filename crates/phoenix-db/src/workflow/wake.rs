@@ -400,8 +400,8 @@ impl<'a> WakeWorkflowAdapter<'a> {
     ) -> WorkflowRepositoryResult<u64> {
         let mut tx = self.repository.pool().begin().await?;
         sqlx::query(
-            "INSERT OR IGNORE INTO wake_registration_fences (conversation_id, last_accepted_at) \
-             SELECT ?1, last_accepted_at FROM wake_registration_fences WHERE conversation_id = ?2",
+            "INSERT OR IGNORE INTO wake_registration_fences (conversation_id, version, status) \
+             SELECT ?1, version, status FROM wake_registration_fences WHERE conversation_id = ?2",
         )
         .bind(successor_id)
         .bind(predecessor_id)

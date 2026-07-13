@@ -2703,13 +2703,9 @@ where
     /// (e.g., from `SpawnAgentsComplete`).
     async fn apply_transition_result(
         &mut self,
-        mut result: crate::state_machine::transition::TransitionResult,
+        result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
-
-        if !self.accept_transition_wakes(&mut result).await? {
-            return Ok(generated_events);
-        }
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -2876,35 +2872,6 @@ where
         }
 
         Ok(generated_events)
-    }
-
-    async fn accept_transition_wakes(
-        &self,
-        result: &mut crate::state_machine::transition::TransitionResult,
-    ) -> Result<bool, String> {
-        let Some(position) = result
-            .effects
-            .iter()
-            .position(|effect| matches!(effect, Effect::AcceptWakeObservations { .. }))
-        else {
-            return Ok(true);
-        };
-        let Effect::AcceptWakeObservations { inbox_ids } = &result.effects[position] else {
-            unreachable!();
-        };
-        if !self
-            .storage
-            .accept_owed_wakes(&self.context.conversation_id, inbox_ids)
-            .await?
-        {
-            tracing::debug!(
-                conv_id = %self.context.conversation_id,
-                "dropping stale wake delivery after acceptance was lost"
-            );
-            return Ok(false);
-        }
-        result.effects.remove(position);
-        Ok(true)
     }
 
     /// Defer any `RequestLlm` in `original_effects`, run the rest, then process
@@ -3858,8 +3825,19 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
-            Effect::AcceptWakeObservations { .. } => {
-                Err("wake observations must be accepted before applying the transition".to_owned())
+            Effect::AcceptWakeObservations { inbox_ids } => {
+                if self
+                    .storage
+                    .accept_owed_wakes(&self.context.conversation_id, &inbox_ids)
+                    .await?
+                {
+                    Ok(None)
+                } else {
+                    Err(
+                        "wake observation acceptance was lost to a concurrent lifecycle action"
+                            .to_owned(),
+                    )
+                }
             }
 
             Effect::RequestLlm => self.dispatch_llm_request().await,

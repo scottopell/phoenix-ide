@@ -2571,57 +2571,27 @@ async fn accept_new_receipt_in_transaction(
         .bind(&request.authority.workflow_id)
         .fetch_one(&mut *tx)
         .await?;
-        let existing_obligation: Option<String> = sqlx::query_scalar(
-            "SELECT o.id FROM wake_runtime_obligations o \
-             WHERE o.conversation_id = ?1 AND o.status = 'owed' \
-               AND (SELECT COUNT(*) FROM wake_runtime_obligation_items i WHERE i.obligation_id = o.id) < ?2 \
-             ORDER BY o.created_at LIMIT 1",
-        )
-        .bind(&conversation_id)
-        .bind(i64::try_from(phoenix_workflow::wake_profile::MAX_ACCEPTANCE_BATCH_ITEMS)
-            .expect("wake acceptance batch bound fits SQLite"))
-        .fetch_optional(&mut *tx)
-        .await?;
-        let obligation_id = if let Some(id) = existing_obligation {
-            sqlx::query(
-                "UPDATE wake_runtime_obligations SET snapshot_upper_bound = MAX(snapshot_upper_bound, ?1) \
-                 WHERE id = ?2 AND status = 'owed'",
-            )
-            .bind(sequence)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-            id
-        } else {
-            let id = format!(
-                "wake-obligation:{}:{sequence}",
-                request.authority.workflow_id
-            );
-            sqlx::query(
-                "INSERT INTO wake_runtime_obligations \
-                 (id, conversation_id, snapshot_upper_bound, status, created_at, resolved_at, terminal_reason) \
-                 VALUES (?1, ?2, ?3, 'owed', ?4, NULL, NULL)",
-            )
-            .bind(&id)
-            .bind(&conversation_id)
-            .bind(sequence)
-            .bind(request.now.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
-            id
-        };
-        let ordinal: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wake_runtime_obligation_items WHERE obligation_id = ?1",
+        let obligation_id = format!(
+            "wake-obligation:{}:{sequence}",
+            request.authority.workflow_id
+        );
+        sqlx::query(
+            "INSERT INTO wake_runtime_obligations \
+             (id, conversation_id, snapshot_upper_bound, status, created_at, resolved_at, terminal_reason) \
+             VALUES (?1, ?2, ?3, 'owed', ?4, NULL, NULL)",
         )
         .bind(&obligation_id)
-        .fetch_one(&mut *tx)
+        .bind(&conversation_id)
+        .bind(sequence)
+        .bind(request.now.to_rfc3339())
+        .execute(&mut *tx)
         .await?;
         sqlx::query(
             "INSERT INTO wake_runtime_obligation_items (obligation_id, ordinal, inbox_item_id) \
              VALUES (?1, ?2, ?3)",
         )
         .bind(&obligation_id)
-        .bind(ordinal)
+        .bind(0_i64)
         .bind(&request.reducer_inbox_id)
         .execute(&mut *tx)
         .await?;
