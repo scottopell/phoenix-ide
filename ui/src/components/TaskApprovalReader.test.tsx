@@ -189,7 +189,7 @@ describe('TaskApprovalReader shared find integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'ana' } });
 
-    await waitFor(() => expect(screen.getByText('banana')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('[data-line="3"]')?.textContent).toContain('banana'));
     await waitFor(() => expect(document.querySelectorAll('mark').length).toBe(1));
   });
 

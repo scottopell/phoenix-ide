@@ -8,6 +8,9 @@ import {
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
+  buildMarkdownDisplayBlocks,
+  buildSubAgentCardFragments,
+  buildTerminalToolResultProjection,
 } from './searchProjections';
 
 function userMsg(id: string, text = 'hi', files?: Array<{ original_name: string }>): Message {
@@ -200,6 +203,53 @@ describe('buildDiffSearchProjection', () => {
       lineNumber: 3,
       startColumn: 0,
       endColumn: 4,
+    });
+  });
+});
+
+describe('typed semantic display projections', () => {
+  it('parses Markdown into stable visible-text blocks without source punctuation', () => {
+    const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```');
+    expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([
+      'Plan',
+      'Use alpha and diagram text.',
+      'diagram text',
+      'const beta = 1;',
+    ]));
+    expect(blocks.some((block) => block.searchableText.includes('**'))).toBe(false);
+    expect(blocks.some((block) => block.searchableText.includes('diagram.png'))).toBe(false);
+    expect(blocks.every((block) => block.sourceRange.end > block.sourceRange.start)).toBe(true);
+  });
+
+  it('normalizes structured terminal fields instead of indexing JSON punctuation', () => {
+    const projection = buildTerminalToolResultProjection(
+      'tmux',
+      JSON.stringify({ status: 'exited', stdout: 'semantic output', stderr: '' }),
+      undefined,
+      { toolUseId: 'tmux-1' },
+    );
+    expect(projection.fullText).toContain('stdout: semantic output');
+    expect(projection.fullText).not.toContain('{');
+    expect(projection.fragments[0].revealTarget).toMatchObject({
+      kind: 'tool-result-terminal',
+      family: 'tmux',
+      toolUseId: 'tmux-1',
+    });
+  });
+
+  it('keeps complete sub-agent outcomes searchable behind compact previews', () => {
+    const longOutcome = `prefix ${'hidden '.repeat(40)}exact outcome token`;
+    const fragments = buildSubAgentCardFragments({
+      type: 'subagent_summary',
+      results: [{ agent_id: 'agent-1', task: 'Inspect renderer', outcome: { type: 'success', result: longOutcome } }],
+    }, 'spawn-1');
+    expect(fragments).toHaveLength(1);
+    expect(fragments[0]?.semanticText).toContain('exact outcome token');
+    expect(fragments[0]?.revealTarget).toEqual({
+      kind: 'subagent-card',
+      toolUseId: 'spawn-1',
+      agentId: 'agent-1',
+      fragmentId: 'subagent-card:agent-1',
     });
   });
 });

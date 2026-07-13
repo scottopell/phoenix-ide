@@ -1,3 +1,8 @@
+import { toString as mdastToString } from 'mdast-util-to-string';
+import remarkParse from 'remark-parse';
+import remarkGfm from 'remark-gfm';
+import { unified } from 'unified';
+
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
 import type { StreamingBuffer } from '../../conversation/atom';
 import type { DiffSection } from '../../contexts/ReviewNotesContext';
@@ -289,6 +294,55 @@ export type ConversationSearchProjection = SearchableSourceProjection<
   ConversationSearchMatchTarget,
   ConversationSearchSource
 >;
+
+interface MarkdownNodePosition {
+  start?: { line?: number; offset?: number };
+  end?: { line?: number; offset?: number };
+}
+
+interface MarkdownNode {
+  type: string;
+  position?: MarkdownNodePosition;
+  children?: MarkdownNode[];
+  value?: string;
+  alt?: string;
+}
+
+export interface MarkdownDisplayBlock {
+  id: string;
+  lineNumber: number;
+  sourceRange: { start: number; end: number };
+  searchableText: string;
+  kind: string;
+}
+
+export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
+  const processor = unified().use(remarkParse).use(remarkGfm);
+  const tree = processor.runSync(processor.parse(markdown)) as MarkdownNode;
+  const blocks: MarkdownDisplayBlock[] = [];
+  const visit = (node: MarkdownNode, path: readonly number[]) => {
+    if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {
+      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code', 'image'].includes(node.type);
+      if (isDisplayBlock) {
+        const searchableText = node.type === 'image'
+          ? node.alt ?? ''
+          : mdastToString(node as Parameters<typeof mdastToString>[0]);
+        if (searchableText) {
+          blocks.push({
+            id: `markdown:${path.join('.')}:${node.position.start.offset}-${node.position.end.offset}`,
+            lineNumber: node.position.start.line,
+            sourceRange: { start: node.position.start.offset, end: node.position.end.offset },
+            searchableText,
+            kind: node.type,
+          });
+        }
+      }
+    }
+    node.children?.forEach((child, index) => visit(child, [...path, index]));
+  };
+  visit(tree, []);
+  return blocks;
+}
 
 export interface BlockSearchMatchTarget {
   kind: 'block';

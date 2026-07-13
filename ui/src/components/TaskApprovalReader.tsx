@@ -25,6 +25,7 @@ import {
   FindBar,
   activeSessionMatchIndex,
   buildBlockSearchProjection,
+  buildMarkdownDisplayBlocks,
   createSurfaceKey,
   projectionMatchesToSessionMatches,
   useFindSession,
@@ -277,7 +278,11 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
-  const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
+  const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan), [plan]);
+  const findablePlanBlocks = useMemo(
+    () => markdownDisplayBlocks.map((block) => ({ id: block.id, lineNumber: block.lineNumber, text: block.searchableText })),
+    [markdownDisplayBlocks],
+  );
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
@@ -477,7 +482,6 @@ export function TaskApprovalReader({
   // Render plan as markdown with annotatable blocks.
   const renderPlanMarkdown = useMemo(() => {
     const rawLines = plan.split('\n');
-    const nextFindableBlocks: Array<{ id: string; lineNumber: number; text: string }> = [];
     const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
       const lineMatches = matchesByLine.get(match.target.lineNumber) ?? [];
@@ -489,14 +493,10 @@ export function TaskApprovalReader({
       matchesByLine.set(match.target.lineNumber, lineMatches);
     });
 
-    const findBlockRegistry = new Set<string>();
-    const registerFindableBlock = (lineNumber: number, text: string, blockId = `line:${lineNumber}`) => {
-      if (lineNumber <= 0) return blockId;
-      if (text.length === 0) return blockId;
-      if (findBlockRegistry.has(blockId)) return blockId;
-      findBlockRegistry.add(blockId);
-      nextFindableBlocks.push({ id: blockId, lineNumber, text });
-      return blockId;
+    const claimDisplayBlock = (lineNumber: number, kind?: string): string => {
+      const candidates = markdownDisplayBlocks.filter((block) => block.lineNumber === lineNumber);
+      const match = kind ? candidates.find((block) => block.kind === kind) : candidates[0];
+      return match?.id ?? `markdown:line:${lineNumber}`;
     };
 
     const annotatable = (Tag: React.ElementType) =>
@@ -522,17 +522,11 @@ export function TaskApprovalReader({
           .join(' ')
           .slice(0, 200);
         const lineText = rawLines[ln - 1] ?? '';
-        const childText = typeof children === 'string'
-          ? children
-          : Array.isArray(children) && children.every((child) => typeof child === 'string')
-            ? children.join('')
-            : null;
-        const blockId = registerFindableBlock(ln, childText ?? lineText);
+        const blockId = claimDisplayBlock(ln);
+        const displayBlock = markdownDisplayBlocks.find((block) => block.id === blockId);
+        const blockText = displayBlock?.searchableText ?? lineText;
         const lineMatches = matchesByLine.get(ln) ?? [];
-        const shouldDecorateChildren =
-          lineMatches.length > 0
-          && childText !== null
-          && childText === lineText;
+        const shouldDecorateChildren = lineMatches.length > 0;
         return (
           <AnnotatableBlock
             as={Tag}
@@ -553,24 +547,12 @@ export function TaskApprovalReader({
             {...props}
           >
             {shouldDecorateChildren
-              ? renderFindFragments(childText ?? lineText, lineMatches, activeFindIndex)
+              ? renderFindFragments(blockText, lineMatches, activeFindIndex)
               : children}
           </AnnotatableBlock>
         );
       };
 
-
-    queueMicrotask(() => {
-      setFindablePlanBlocks((prev) => {
-        if (
-          prev.length === nextFindableBlocks.length
-          && prev.every((block, index) => block.id === nextFindableBlocks[index]?.id && block.text === nextFindableBlocks[index]?.text)
-        ) {
-          return prev;
-        }
-        return nextFindableBlocks;
-      });
-    });
 
     return (
       <ReactMarkdown
@@ -606,11 +588,7 @@ export function TaskApprovalReader({
               const language = match?.[1]?.toLowerCase();
               const codeText = String(children).replace(/\n$/, '');
               const lineNumber = node?.position?.start?.line ?? 0;
-              if (inline) {
-                registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:inline-code:${nextFindableBlocks.length}`);
-              }
-              const codeBlockId = `line:${lineNumber}:code-block`;
-              if (!inline) registerFindableBlock(lineNumber, codeText, codeBlockId);
+              const codeBlockId = claimDisplayBlock(lineNumber, 'code');
               if (!inline && language === 'mermaid') {
                 return (
                   <div ref={(element) => registerBlockRef(codeBlockId, element)}>
@@ -641,7 +619,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, registerBlockRef]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, markdownDisplayBlocks, registerBlockRef]);
 
   return (
     <div className="task-approval-reader">
