@@ -36,6 +36,13 @@ impl WorkflowProfile for TestProfile {
         )
     }
 
+    fn owed_acceptance_matches_inbox(
+        event: &Self::OwedAcceptanceEvent,
+        inbox_payload: &ReducerInboxPayload<Self>,
+    ) -> bool {
+        matches!(inbox_payload, ReducerInboxPayload::Receipt(payload) if payload == event)
+    }
+
     fn decision_handles_owed_acceptance(
         event: &Self::OwedAcceptanceEvent,
         decision_event: &Self::Event,
@@ -579,6 +586,7 @@ fn barrier_satisfaction_returns_all_events() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn manual_resolution_requires_permitted_choice_and_cas() {
     let mut workflow = workflow();
     workflow
@@ -600,6 +608,10 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -612,15 +624,15 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(stale.outcome, CommitOutcome::VersionConflict);
@@ -632,15 +644,15 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             kind: ManualChoiceKind::Retry,
             codec: codec("manual"),
             payload: "retry",
+            receipt_codec: codec("receipt"),
+            receipt: "retry-receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "retry-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(invalid.outcome, CommitOutcome::InvalidPlan);
@@ -653,15 +665,15 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(committed.outcome, CommitOutcome::Committed);
@@ -669,6 +681,8 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
     assert_eq!(receipt.origin, ReceiptOrigin::Manual);
     assert_eq!(receipt.authority.worker_id, "manual");
     assert_eq!(receipt.authority.declared_workflow_version, Version(1));
+    assert_eq!(receipt.receipt, "receipt");
+    assert_eq!(receipt.receipt_codec, codec("receipt"));
     let inbox = workflow
         .reducer_inbox
         .values()
@@ -703,6 +717,10 @@ fn manual_resolution_version_has_matching_transition_history() {
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -716,15 +734,15 @@ fn manual_resolution_version_has_matching_transition_history() {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::Committed);
@@ -736,9 +754,10 @@ fn manual_resolution_version_has_matching_transition_history() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn owed_acceptance_requires_exact_consumed_inbox_link() {
-    let mut workflow = workflow();
-    workflow
+    let mut state = workflow();
+    state
         .commit_transition(
             &ReducerDecision {
                 expected_workflow_version: Version(0),
@@ -747,10 +766,10 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
             &barrier_events(),
         )
         .expect("commit succeeds");
-    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let claim = state.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
     let attempt = claim.attempt.expect("attempt created");
-    let accepted = workflow.accept_receipt(
+    let accepted = state.accept_receipt(
         &authority,
         Timestamp(1),
         Some(attempt.id),
@@ -775,16 +794,16 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         owed_acceptances: Some(vec![OwedAcceptanceDecl {
             reducer_inbox_id: inbox_id,
             source_kind: "wake",
-            event_codec: codec("runtime-event"),
-            event: "runtime-event",
+            event_codec: codec("receipt-event"),
+            event: "receipt-event",
         }]),
     };
-    let result = workflow
+    let result = state
         .consume_reducer_inbox_atomically(
             &InboxDecisionBinding {
                 inbox: [inbox_id]
                     .iter()
-                    .map(|id| workflow.reducer_inbox[id].clone())
+                    .map(|id| state.reducer_inbox[id].clone())
                     .collect(),
                 decision: ReducerDecision {
                     expected_workflow_version: Version(1),
@@ -795,12 +814,62 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         )
         .expect("consume succeeds");
     assert_eq!(result.outcome, CommitOutcome::Committed);
-    let owed = workflow
+    let owed = state
         .owed_acceptances
         .values()
         .next()
         .expect("owed created");
     assert_eq!(owed.reducer_inbox_id, inbox_id);
+
+    let mut payload_mismatch = workflow();
+    payload_mismatch.reducer_inbox.insert(
+        ReducerInboxId(88),
+        ReducerInboxEvent {
+            id: ReducerInboxId(88),
+            effect_id: None,
+            barrier_id: None,
+            kind: ReducerInboxKind::ReceiptAccepted,
+            event_codec: codec("terminal"),
+            requires_runtime_acceptance: true,
+            payload: ReducerInboxPayload::Receipt("terminal-a"),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        },
+    );
+    let linked = payload_mismatch.reducer_inbox[&ReducerInboxId(88)].clone();
+    let rejected = payload_mismatch.consume_reducer_inbox_atomically(
+        &InboxDecisionBinding {
+            inbox: vec![linked],
+            decision: ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "wrong-terminal",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: Some(vec![OwedAcceptanceDecl {
+                        reducer_inbox_id: ReducerInboxId(88),
+                        source_kind: "wake",
+                        event_codec: codec("terminal"),
+                        event: "terminal-b",
+                    }]),
+                },
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(rejected, Err(EngineError::InvalidInbox));
+    assert_eq!(payload_mismatch.version, Version(0));
+    assert_eq!(
+        payload_mismatch.reducer_inbox[&ReducerInboxId(88)].delivery_status,
+        DeliveryStatus::Pending
+    );
 
     consume_plan.owed_acceptances = Some(vec![OwedAcceptanceDecl {
         reducer_inbox_id: ReducerInboxId(999),
@@ -808,11 +877,11 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         event_codec: codec("runtime-event"),
         event: "runtime-event",
     }]);
-    let rejected = workflow.consume_reducer_inbox_atomically(
+    let rejected = state.consume_reducer_inbox_atomically(
         &InboxDecisionBinding {
             inbox: []
                 .iter()
-                .map(|id| workflow.reducer_inbox[id].clone())
+                .map(|id| state.reducer_inbox[id].clone())
                 .collect(),
             decision: ReducerDecision {
                 expected_workflow_version: Version(2),
@@ -1034,6 +1103,10 @@ fn invalid_manual_resolution_does_not_mutate_state() {
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -1047,15 +1120,15 @@ fn invalid_manual_resolution_does_not_mutate_state() {
             kind: ManualChoiceKind::Retry,
             codec: codec("manual"),
             payload: "retry",
+            receipt_codec: codec("receipt"),
+            receipt: "retry-receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "retry-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -1131,6 +1204,10 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -1143,15 +1220,15 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(
@@ -1513,8 +1590,8 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
                         owed_acceptances: Some(vec![OwedAcceptanceDecl {
                             reducer_inbox_id: inbox_id,
                             source_kind: "wake",
-                            event_codec: codec("runtime-event"),
-                            event: "runtime-event",
+                            event_codec: codec("receipt-event"),
+                            event: "receipt-event",
                         }]),
                     },
                 },
@@ -1523,6 +1600,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
         )
         .expect("owed recorded");
     let owed_id = *workflow.owed_acceptances.keys().next().expect("owed");
+    let stale_owed_binding = workflow.owed_acceptances[&owed_id].clone();
     let decision = ReducerDecision {
         expected_workflow_version: workflow.version,
         plan: TransitionPlan {
@@ -1553,12 +1631,12 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
     let retry = workflow
         .runtime_accept_atomically(
             &OwedAcceptanceDecisionBinding {
-                owed: workflow.owed_acceptances[&owed_id].clone(),
+                owed: stale_owed_binding,
                 decision: decision.clone(),
             },
             &BTreeMap::new(),
         )
-        .expect("retry is idempotent");
+        .expect("stale owed retry is idempotent");
     assert_eq!(retry.outcome, CommitOutcome::Committed);
     assert_eq!(retry.transition, None);
     assert_eq!(retry.owed_acceptance, Some(accepted));
@@ -1613,8 +1691,8 @@ fn suppression_persists_typed_disposition() {
                         owed_acceptances: Some(vec![OwedAcceptanceDecl {
                             reducer_inbox_id: inbox_id,
                             source_kind: "wake",
-                            event_codec: codec("runtime-event"),
-                            event: "runtime-event",
+                            event_codec: codec("receipt-event"),
+                            event: "receipt-event",
                         }]),
                     },
                 },
@@ -1828,6 +1906,10 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -1840,15 +1922,15 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(
@@ -1881,15 +1963,15 @@ fn shadow_mutation_apis_reject_manual_resolution() {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -2204,13 +2286,9 @@ fn simulator_restart_preserves_durable_claim_and_recovers_worker_runtime() {
 }
 
 #[test]
-fn active_allows_completed_failed_and_deletion_pending_but_terminals_do_not_reopen() {
+fn active_allows_completed_and_failed_but_terminals_do_not_reopen() {
     let workflow = workflow();
-    for next_status in [
-        WorkflowStatus::Completed,
-        WorkflowStatus::Failed,
-        WorkflowStatus::DeletionPending,
-    ] {
+    for next_status in [WorkflowStatus::Completed, WorkflowStatus::Failed] {
         let mut candidate = workflow.clone();
         let committed = candidate
             .commit_transition(
@@ -2263,6 +2341,77 @@ fn active_allows_completed_failed_and_deletion_pending_but_terminals_do_not_reop
                 }
             ))
         );
+    }
+}
+
+#[test]
+fn generic_commits_reserve_generation_bump_edges_and_reject_terminal_self_loops() {
+    let workflow = workflow();
+    for reserved in [
+        WorkflowStatus::Cancelling,
+        WorkflowStatus::DeletionPending,
+        WorkflowStatus::Cancelled,
+    ] {
+        let mut candidate = workflow.clone();
+        let result = candidate.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    next_status: reserved,
+                    snapshot: "reserved",
+                    snapshot_codec: codec("snapshot"),
+                    event: "reserved",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(EngineError::InvalidPlan(
+                PlanError::InvalidStatusTransition { current, next }
+            )) if current == WorkflowStatus::Active && next == reserved
+        ));
+    }
+
+    for terminal in [
+        WorkflowStatus::Cancelled,
+        WorkflowStatus::Completed,
+        WorkflowStatus::Failed,
+    ] {
+        let mut candidate = workflow.clone();
+        candidate.status = terminal;
+        let result = candidate.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    next_status: terminal,
+                    snapshot: "terminal-mutation",
+                    snapshot_codec: codec("snapshot"),
+                    event: "terminal-self-loop",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(EngineError::InvalidPlan(
+                PlanError::InvalidStatusTransition { current, next }
+            )) if current == terminal && next == terminal
+        ));
     }
 }
 
@@ -2643,6 +2792,10 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -2656,6 +2809,10 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: CodecRef {
@@ -2664,10 +2821,6 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             },
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(empty_codec.outcome, CommitOutcome::InvalidPlan);
@@ -2682,15 +2835,15 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         },
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "receipt",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt-event",
         },
     );
     assert_eq!(invalid_status.outcome, CommitOutcome::InvalidPlan);
@@ -3074,6 +3227,10 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -3117,10 +3274,6 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual",
             next_status: WorkflowStatus::Active,
-            receipt_codec: codec("receipt"),
-            receipt: "adopted",
-            receipt_event_codec: codec("receipt-event"),
-            receipt_event: "manual-receipt",
         },
     );
     assert_eq!(resolved.outcome, CommitOutcome::Committed);
@@ -3273,6 +3426,10 @@ fn review_regressions_cancellation_suppresses_manual_and_owed_work_atomically() 
                 kind: ManualChoiceKind::Adopt,
                 codec: codec("manual"),
                 payload: "adopt",
+                receipt_codec: codec("receipt"),
+                receipt: "receipt",
+                receipt_event_codec: codec("receipt-event"),
+                receipt_event: "manual-receipt-event",
             }],
         )
         .manual_resolution
@@ -3430,6 +3587,10 @@ fn review_regression_rejects_empty_manual_choice_codec() {
                 version: 1,
             },
             payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
         }],
     );
     assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
