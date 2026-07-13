@@ -30,7 +30,7 @@ export interface FileSearchMatchTarget {
   lineNumber: number;
   startColumn: number;
   endColumn: number;
-  matchOrdinal: number;
+  matchOrdinal?: number;
 }
 
 export interface FileSearchSource extends SearchableSource<FileSearchMatchTarget> {

@@ -260,8 +260,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       fileCodeRef.current?.scrollToFindTarget(target);
       return;
     }
-    const selector = `[data-find-occurrence="${target.matchOrdinal}"]`;
-    const matchEl = contentRef.current?.querySelector<HTMLElement>(selector);
+    const matchEl = target.matchOrdinal === undefined
+      ? null
+      : contentRef.current?.querySelector<HTMLElement>(`[data-find-occurrence="${target.matchOrdinal}"]`);
     if (matchEl) {
       matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
