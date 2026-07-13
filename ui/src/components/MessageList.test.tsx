@@ -1123,6 +1123,58 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
   });
 
+  it('supersedes an active restore when current view ownership disappears', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (currentHistoryView?: HistoryScrollCommand['view']) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        currentHistoryView={currentHistoryView}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(view));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    rerender(renderList(undefined));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
+  it('supersedes an active restore when its command disappears', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={historyScrollCommand}
+        currentHistoryView={view}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(command));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    rerender(renderList(null));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
   it('clears suppressed continuity on conversation change', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();

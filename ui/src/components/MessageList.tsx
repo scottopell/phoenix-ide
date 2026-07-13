@@ -881,12 +881,18 @@ function MessageListImpl({
     releaseContinuityRestoreSuppression();
   }, [releaseContinuityRestoreSuppression]);
   useEffect(() => {
-    const handled = handledHistoryCommandRef.current;
-    if (!historyScrollCommand || (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view))) return;
+    const activeToken = continuityRestoreTokenRef.current;
+    const activeView = continuityRestoreViewRef.current;
+    if (!historyScrollCommand) {
+      if (activeToken !== null && activeView !== null) finishHistoryCommand(activeToken, activeView, 'superseded');
+      return;
+    }
     if (!sameHistoryView(historyScrollCommand.view, currentHistoryView ?? null)) {
       finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'superseded');
       return;
     }
+    const handled = handledHistoryCommandRef.current;
+    if (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view)) return;
     const activeContinuityToken = continuityRestoreTokenRef.current;
     const activeContinuityView = continuityRestoreViewRef.current;
     if (activeContinuityToken !== null
