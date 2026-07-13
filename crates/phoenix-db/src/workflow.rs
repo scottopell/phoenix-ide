@@ -387,6 +387,29 @@ pub enum AcceptReceiptResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableWakeTerminalProjection {
+    pub contract_id: String,
+    pub resource_kind: String,
+    pub status: String,
+    pub resolved_at: DateTime<Utc>,
+    pub bash_status: Option<String>,
+    pub bash_occurred_at: Option<DateTime<Utc>>,
+    pub bash_exit_code: Option<i32>,
+    pub bash_duration_ms: Option<u64>,
+    pub bash_signal_number: Option<i32>,
+    pub bash_kill_signal_sent: Option<String>,
+    pub bash_tail: Vec<String>,
+    pub tmux_status: Option<String>,
+    pub tmux_occurred_at: Option<DateTime<Utc>>,
+    pub tmux_server_generation: Option<String>,
+    pub tmux_exit_code: Option<i32>,
+    pub tmux_duration_ms: Option<u64>,
+    pub tmux_tail: Vec<String>,
+    pub forgotten_reason: Option<String>,
+    pub cancellation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableAcceptReceiptRequest {
     pub receipt_id: String,
     pub reducer_inbox_id: String,
@@ -396,6 +419,7 @@ pub struct DurableAcceptReceiptRequest {
     pub origin: DurableReceiptOrigin,
     pub receipt: DurablePayload,
     pub reducer_event: DurablePayload,
+    pub wake_terminal_projection: Option<DurableWakeTerminalProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,7 +686,7 @@ impl WorkflowRepository {
                AND declared_workflow_version = ?4 AND generation = ?5 \
                AND claim_token = ?6 AND claim_worker_id = ?7 \
                AND claim_lease_until = ?8 AND claim_issued_at = ?9 \
-               AND status = 'begun'",
+               AND status IN ('begun', 'observation_recorded')",
         )
         .bind(attempt_id)
         .bind(&request.authority.effect_id)
@@ -718,6 +742,10 @@ impl WorkflowRepository {
         .await?;
 
         fail_if_configured(&mut tx, failpoint, WorkflowFailpoint::AfterReceiptInsert).await?;
+
+        if let Some(projection) = &request.wake_terminal_projection {
+            insert_wake_terminal_projection(&mut tx, request, projection).await?;
+        }
 
         let claim_deleted = sqlx::query(
             "DELETE FROM workflow_claims \
@@ -2671,6 +2699,43 @@ async fn update_effect_status_if_live_claim(
     Ok(updated.rows_affected())
 }
 
+async fn insert_wake_terminal_projection(
+    tx: &mut SqliteConnection,
+    request: &DurableAcceptReceiptRequest,
+    projection: &DurableWakeTerminalProjection,
+) -> WorkflowRepositoryResult<()> {
+    sqlx::query(
+        "INSERT INTO wake_terminal_receipts \
+         (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, \
+          bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms, bash_signal_number, \
+          bash_kill_signal_sent, tmux_status, tmux_occurred_at, tmux_server_generation, tmux_exit_code, \
+          tmux_duration_ms, forgotten_reason, cancellation_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+    )
+    .bind(&request.receipt_id).bind(&request.authority.workflow_id).bind(&projection.contract_id)
+    .bind(&request.authority.effect_id).bind(&projection.resource_kind).bind(&projection.status)
+    .bind(projection.resolved_at.to_rfc3339()).bind(&projection.bash_status)
+    .bind(projection.bash_occurred_at.map(|value| value.to_rfc3339())).bind(projection.bash_exit_code)
+    .bind(projection.bash_duration_ms.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("bash duration exceeds SQLite range".to_owned()))?)
+    .bind(projection.bash_signal_number).bind(&projection.bash_kill_signal_sent).bind(&projection.tmux_status)
+    .bind(projection.tmux_occurred_at.map(|value| value.to_rfc3339())).bind(&projection.tmux_server_generation)
+    .bind(projection.tmux_exit_code)
+    .bind(projection.tmux_duration_ms.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("tmux duration exceeds SQLite range".to_owned()))?)
+    .bind(&projection.forgotten_reason).bind(&projection.cancellation_reason)
+    .execute(&mut *tx).await?;
+    for (ordinal, line) in projection.bash_tail.iter().enumerate() {
+        sqlx::query("INSERT INTO wake_terminal_receipt_bash_tail (receipt_id, ordinal, stream, offset, line) VALUES (?1, ?2, NULL, NULL, ?3)")
+            .bind(&request.receipt_id).bind(i64::try_from(ordinal).expect("tail ordinal fits i64")).bind(line)
+            .execute(&mut *tx).await?;
+    }
+    for (ordinal, line) in projection.tmux_tail.iter().enumerate() {
+        sqlx::query("INSERT INTO wake_terminal_receipt_tmux_tail (receipt_id, ordinal, line) VALUES (?1, ?2, ?3)")
+            .bind(&request.receipt_id).bind(i64::try_from(ordinal).expect("tail ordinal fits i64")).bind(line)
+            .execute(&mut *tx).await?;
+    }
+    Ok(())
+}
+
 fn epoch_utc() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
         .expect("epoch timestamp is valid RFC3339")
@@ -2795,7 +2860,7 @@ fn is_unique_constraint(err: &sqlx::Error) -> bool {
     false
 }
 
-fn is_busy_or_locked(err: &sqlx::Error) -> bool {
+pub(super) fn is_busy_or_locked(err: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db_err) = err {
         return db_err
             .try_downcast_ref::<SqliteError>()
@@ -3061,6 +3126,8 @@ fn parse_receipt_origin_sql(origin: &str) -> Option<DurableReceiptOrigin> {
         _ => None,
     }
 }
+
+pub mod wake;
 
 #[cfg(test)]
 mod tests {
@@ -3362,6 +3429,7 @@ mod tests {
                 },
                 payload: "receipt-event".to_owned(),
             },
+            wake_terminal_projection: None,
         }
     }
 
