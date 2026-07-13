@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     AuthorityOutcome, ClaimOutcome, CommitOutcome, EffectStatus, LeaseExpiry, ReducerInboxId,
-    ReducerInboxKind, ReducerInboxPayload, Timestamp, Version, WorkflowId, WorkflowState,
+    ReducerInboxKind, ReducerInboxPayload, Timestamp, Version, WorkflowId, WorkflowProfile,
+    WorkflowState,
 };
 
 use super::{
@@ -673,8 +674,43 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
 }
 
 #[test]
-fn manual_choices_export_expected_codec_and_payloads() {
-    let choices = manual_choices();
+fn runtime_acceptance_decision_names_the_exact_owed_terminal() {
+    let owed = forgotten_terminal_payload(
+        "contract-1",
+        bash_identity("b-15"),
+        WakeForgottenReason::HandleMissing,
+        Timestamp(20),
+    );
+    let other = forgotten_terminal_payload(
+        "contract-2",
+        bash_identity("b-16"),
+        WakeForgottenReason::HandleMissing,
+        Timestamp(21),
+    );
+
+    assert!(WakeProfile::decision_handles_owed_acceptance(
+        &owed,
+        &super::WakeRegistrationEvent::RuntimeAccepted {
+            terminal: Box::new(owed.clone()),
+        }
+    ));
+    assert!(!WakeProfile::decision_handles_owed_acceptance(
+        &owed,
+        &super::WakeRegistrationEvent::RuntimeAccepted {
+            terminal: Box::new(other),
+        }
+    ));
+}
+
+#[test]
+fn manual_choices_export_expected_codec_payloads_and_terminal_receipts() {
+    let terminal = forgotten_terminal_payload(
+        "contract-1",
+        bash_identity("b-15"),
+        WakeForgottenReason::HandleMissing,
+        Timestamp(20),
+    );
+    let choices = manual_choices(&terminal);
     assert_eq!(choices.len(), 3);
     assert!(choices
         .iter()
@@ -682,4 +718,8 @@ fn manual_choices_export_expected_codec_and_payloads() {
     assert_eq!(choices[0].payload, WakeManualPayload::Accept);
     assert_eq!(choices[1].payload, WakeManualPayload::Defer);
     assert_eq!(choices[2].payload, WakeManualPayload::Suppress);
+    assert!(choices.iter().all(|choice| choice.receipt == terminal));
+    assert!(choices
+        .iter()
+        .all(|choice| choice.receipt_event == terminal));
 }

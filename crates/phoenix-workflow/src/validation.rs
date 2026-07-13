@@ -102,11 +102,7 @@ pub(crate) fn validate_status_transition(
     let valid = match current_status {
         WorkflowStatus::Active => matches!(
             next_status,
-            WorkflowStatus::Active
-                | WorkflowStatus::Cancelling
-                | WorkflowStatus::DeletionPending
-                | WorkflowStatus::Completed
-                | WorkflowStatus::Failed
+            WorkflowStatus::Active | WorkflowStatus::Completed | WorkflowStatus::Failed
         ),
         WorkflowStatus::Cancelling => {
             matches!(
@@ -120,9 +116,7 @@ pub(crate) fn validate_status_transition(
             next_status,
             WorkflowStatus::DeletionPending | WorkflowStatus::Completed
         ),
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed => {
-            next_status == current_status
-        }
+        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed => false,
     };
     if valid {
         Ok(())
