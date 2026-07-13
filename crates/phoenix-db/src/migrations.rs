@@ -2069,6 +2069,67 @@ CREATE TABLE IF NOT EXISTS wake_shadow_parity (
     CHECK (severity IN ('blocking', 'actionable', 'informational')),
     CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only'))
 );
+
+CREATE TABLE IF NOT EXISTS creation_shadow_bindings (
+    shadow_workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE CASCADE,
+    authoritative_workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id) ON DELETE RESTRICT,
+    creation_job_id TEXT NOT NULL UNIQUE REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    CHECK (shadow_workflow_id <> authoritative_workflow_id)
+);
+
+CREATE TABLE IF NOT EXISTS creation_shadow_projections (
+    shadow_workflow_id TEXT PRIMARY KEY REFERENCES creation_shadow_bindings(shadow_workflow_id) ON DELETE CASCADE,
+    oracle_generation INTEGER NOT NULL,
+    oracle_attempt INTEGER NOT NULL,
+    projection_status TEXT NOT NULL,
+    completion TEXT NOT NULL,
+    compensation TEXT NOT NULL,
+    hidden INTEGER NOT NULL,
+    can_read INTEGER NOT NULL,
+    can_write INTEGER NOT NULL,
+    can_runtime INTEGER NOT NULL,
+    can_cancel INTEGER NOT NULL,
+    can_start_over INTEGER NOT NULL,
+    can_delete INTEGER NOT NULL,
+    projected_at TEXT NOT NULL,
+    CHECK (oracle_generation >= 0 AND oracle_attempt >= 0),
+    CHECK (projection_status IN ('provisioning', 'failed', 'cancelled', 'deletion_pending', 'ready')),
+    CHECK (completion IN ('pending', 'complete', 'failed', 'cancelled', 'deletion_pending')),
+    CHECK (compensation IN ('none', 'required_for_cancellation', 'required_for_deletion')),
+    CHECK (hidden IN (0, 1)),
+    CHECK (can_read IN (0, 1) AND can_write IN (0, 1) AND can_runtime IN (0, 1)
+       AND can_cancel IN (0, 1) AND can_start_over IN (0, 1) AND can_delete IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS creation_shadow_readiness_effects (
+    shadow_workflow_id TEXT NOT NULL REFERENCES creation_shadow_bindings(shadow_workflow_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    effect_number INTEGER NOT NULL,
+    PRIMARY KEY (shadow_workflow_id, ordinal),
+    UNIQUE (shadow_workflow_id, effect_number)
+);
+
+CREATE TABLE IF NOT EXISTS creation_shadow_effect_predictions (
+    shadow_workflow_id TEXT NOT NULL REFERENCES creation_shadow_bindings(shadow_workflow_id) ON DELETE CASCADE,
+    effect_number INTEGER NOT NULL,
+    prediction TEXT NOT NULL,
+    PRIMARY KEY (shadow_workflow_id, effect_number),
+    CHECK (prediction IN ('completed', 'eligible', 'blocked', 'omitted'))
+);
+
+CREATE TABLE IF NOT EXISTS creation_shadow_divergences (
+    shadow_workflow_id TEXT NOT NULL REFERENCES creation_shadow_bindings(shadow_workflow_id) ON DELETE CASCADE,
+    evidence_identity TEXT NOT NULL,
+    expected_value TEXT NOT NULL,
+    actual_value TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    resolved_at TEXT,
+    PRIMARY KEY (shadow_workflow_id, evidence_identity, recorded_at)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_creation_shadow_one_active_divergence
+    ON creation_shadow_divergences(shadow_workflow_id, evidence_identity)
+    WHERE resolved_at IS NULL;
 ";
 
 /// Run all pending migrations against the database.

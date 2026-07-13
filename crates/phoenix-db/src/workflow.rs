@@ -3526,6 +3526,7 @@ fn parse_receipt_origin_sql(origin: &str) -> Option<DurableReceiptOrigin> {
     }
 }
 
+pub mod creation_shadow;
 pub mod wake;
 
 #[cfg(test)]
