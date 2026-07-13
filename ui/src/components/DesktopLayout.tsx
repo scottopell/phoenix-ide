@@ -139,12 +139,19 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
 
   useEffect(() => {
+    const acceptCoordinator = (conversation: Conversation) => {
+      registerCoordinatorForNotifications(conversation.id);
+      setCoordinatorForNotifications(conversation);
+    };
     api.getGlobalCoordinator()
-      .then(({ conversation }) => {
-        registerCoordinatorForNotifications(conversation.id);
-        setCoordinatorForNotifications(conversation);
-      })
+      .then(({ conversation }) => acceptCoordinator(conversation))
       .catch(() => setCoordinatorForNotifications(null));
+    const onCoordinatorReady = (event: Event) => {
+      const conversation = (event as CustomEvent<{ conversation?: Conversation }>).detail?.conversation;
+      if (conversation) acceptCoordinator(conversation);
+    };
+    window.addEventListener('phoenix:coordinator-ready', onCoordinatorReady);
+    return () => window.removeEventListener('phoenix:coordinator-ready', onCoordinatorReady);
   }, [conversations]);
 
   const notificationConversations = useMemo(

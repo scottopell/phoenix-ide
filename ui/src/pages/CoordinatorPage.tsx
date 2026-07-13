@@ -15,31 +15,51 @@ export function CoordinatorPage() {
   const [openWorkLoadingMore, setOpenWorkLoadingMore] = useState(false);
   const [expandedReferences, setExpandedReferences] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [fleetError, setFleetError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [copiedReference, setCopiedReference] = useState<string | null>(null);
 
   const refreshOpenWork = useCallback(() => {
-    setError(null);
+    setFleetError(null);
     api.getGlobalOpenWork()
       .then((work) => {
         setOpenWork(work);
-        setError(null);
+        setFleetError(null);
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => setFleetError(e instanceof Error ? e.message : String(e)));
   }, []);
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([api.ensureGlobalCoordinator(), api.getGlobalOpenWork()])
-      .then(([coordinator, work]) => {
-        setOpenWork(work);
+    let cancelled = false;
+    api.ensureGlobalCoordinator()
+      .then((coordinator) => {
+        if (cancelled) return;
+        window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
+          detail: { conversation: coordinator.conversation },
+        }));
         if (slug !== coordinator.conversation.id) {
           navigate(`/global/${coordinator.conversation.id}`, { replace: true });
         }
         setError(null);
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    api.getGlobalOpenWork()
+      .then((work) => {
+        if (!cancelled) {
+          setOpenWork(work);
+          setFleetError(null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setFleetError(e instanceof Error ? e.message : String(e));
+      });
+    return () => { cancelled = true; };
   }, [navigate, slug]);
 
   const itemCount = useMemo(
@@ -112,6 +132,7 @@ export function CoordinatorPage() {
       )}
 
       <section className="coordinator-open-work">
+        {fleetError && <div className="coordinator-error">Fleet unavailable: {fleetError}</div>}
         <div className="coordinator-section-title">
           <h2>Fleet</h2>
           <span>{itemCount} item{itemCount === 1 ? '' : 's'}</span>

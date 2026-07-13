@@ -115,6 +115,14 @@ describe('CoordinatorPage', () => {
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
   });
 
+  it('mounts the Coordinator even when fleet loading fails', async () => {
+    apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
+    renderPage();
+
+    expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
+    expect(await screen.findByText('Fleet unavailable: projection unavailable')).toBeInTheDocument();
+  });
+
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {
     render(
       <MemoryRouter initialEntries={['/global/stale-coordinator']}>
