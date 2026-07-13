@@ -516,10 +516,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             payload: ReducerInboxPayload::Receipt(receipt_event),
             delivery_status: if matches!(
                 self.status,
-                WorkflowStatus::Cancelled
-                    | WorkflowStatus::DeletionPending
-                    | WorkflowStatus::Completed
-                    | WorkflowStatus::Failed
+                WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
             ) {
                 DeliveryStatus::Suppressed {
                     reason: SuppressionReason::LifecycleTerminal,
