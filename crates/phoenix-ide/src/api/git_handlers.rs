@@ -958,8 +958,42 @@ pub(crate) async fn get_conversation_pr_status(
                         })
                         .cloned()
                 })
-                .unwrap_or(active_pr);
-            if active_refresh.response.refresh.state == crate::api::types::PrRefreshState::Fresh {
+                .unwrap_or_else(|| active_pr.clone());
+            let refreshed_identity_changed = !refreshed_active_pr
+                .repo_owner
+                .eq_ignore_ascii_case(&active_pr.repo_owner)
+                || !refreshed_active_pr
+                    .repo_name
+                    .eq_ignore_ascii_case(&active_pr.repo_name)
+                || refreshed_active_pr.pr_number != active_pr.pr_number;
+            if refreshed_identity_changed {
+                let retargeted_refresh = tokio::task::spawn_blocking({
+                    let cwd = cwd.clone();
+                    let repo_owner = refreshed_active_pr.repo_owner.clone();
+                    let repo_name = refreshed_active_pr.repo_name.clone();
+                    let pr_number = refreshed_active_pr.pr_number;
+                    move || {
+                        crate::api::pr_monitoring::get_pr_status_for_pr(
+                            &cwd,
+                            &repo_owner,
+                            &repo_name,
+                            pr_number,
+                        )
+                    }
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+                attach_pr_feedback_freshness(
+                    retargeted_refresh.response,
+                    &db,
+                    &work_scope,
+                    &cwd,
+                    &refreshed_active_pr,
+                )
+                .await?
+            } else if active_refresh.response.refresh.state
+                == crate::api::types::PrRefreshState::Fresh
+            {
                 attach_pr_feedback_freshness(
                     active_refresh.response,
                     &db,

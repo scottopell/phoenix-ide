@@ -521,6 +521,10 @@ fn github_repository_identity(pr: &WorkScopePrAssociation) -> String {
     format!("{}/{}", pr.repo_owner, pr.repo_name)
 }
 
+fn github_repository_identity_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 fn repository_identity_is_structurally_local_path(identity: &str) -> bool {
     let path = std::path::Path::new(identity);
     path.is_absolute()
@@ -532,16 +536,19 @@ fn latest_branch_repository_matches_pr(
     pr: &WorkScopePrAssociation,
 ) -> bool {
     let pr_identity = github_repository_identity(pr);
-    if branch.repository_identity == pr_identity {
+    if github_repository_identity_eq(&branch.repository_identity, &pr_identity) {
         return true;
     }
     if !repository_identity_is_structurally_local_path(&branch.repository_identity) {
         return false;
     }
 
-    let repo_identities: std::collections::BTreeSet<_> =
-        prs.iter().map(github_repository_identity).collect();
-    repo_identities.len() == 1 && repo_identities.contains(&pr_identity)
+    let repo_identities: std::collections::BTreeSet<_> = prs
+        .iter()
+        .map(github_repository_identity)
+        .map(|identity| identity.to_ascii_lowercase())
+        .collect();
+    repo_identities.len() == 1 && repo_identities.contains(&pr_identity.to_ascii_lowercase())
 }
 
 fn find_association_by_identity<'a>(
@@ -549,8 +556,8 @@ fn find_association_by_identity<'a>(
     identity: &phoenix_core::domain::active_pr_selection::ActivePrIdentity,
 ) -> Option<&'a WorkScopePrAssociation> {
     prs.iter().find(|pr| {
-        pr.repo_owner == identity.repo_owner
-            && pr.repo_name == identity.repo_name
+        pr.repo_owner.eq_ignore_ascii_case(&identity.repo_owner)
+            && pr.repo_name.eq_ignore_ascii_case(&identity.repo_name)
             && pr.pr_number == identity.pr_number
     })
 }
