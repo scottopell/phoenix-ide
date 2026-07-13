@@ -756,6 +756,10 @@ pub fn transition_core(
             handle_core_sub_agents(state, event)
         }
 
+        (_, CoreEvent::WakeObservationReady { .. }) if !matches!(state, CoreState::Idle) => {
+            Ok(CoreTransitionResult::new(state.clone()))
+        }
+
         (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
             let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
             for wake_result in results {
@@ -967,6 +971,30 @@ fn handle_core_tool_complete(
     };
 
     match event {
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id
+            && matches!(current_tool.input, ToolInput::WaitUntil(_))
+            && matches!(result.outcome, ToolOutcome::Success { .. })
+            && pending_sub_agents.is_empty() =>
+        {
+            let mut all_results = completed_results.clone();
+            all_results.push(result);
+            for remaining in remaining_tools {
+                all_results.push(ToolResult::error(
+                    remaining.id.clone(),
+                    "tool skipped because wait_until suspended the tool round".to_owned(),
+                ));
+            }
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in wait-until transition");
+            Ok(CoreTransitionResult::new(CoreState::Idle)
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()))
+        }
+
         // ToolComplete (more tools remaining) -> next tool
         CoreEvent::ToolComplete {
             tool_use_id,
@@ -988,25 +1016,6 @@ fn handle_core_tool_complete(
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
-        }
-
-        // A successful wait registration ends the tool round without another LLM turn.
-        CoreEvent::ToolComplete {
-            tool_use_id,
-            result,
-        } if tool_use_id == current_tool.id
-            && matches!(current_tool.input, ToolInput::WaitUntil(_))
-            && matches!(result.outcome, ToolOutcome::Success { .. })
-            && pending_sub_agents.is_empty() =>
-        {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
-                .expect("tool_use/tool_result count mismatch in wait-until transition");
-            Ok(CoreTransitionResult::new(CoreState::Idle)
-                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change()))
         }
 
         // ToolComplete (last tool, no sub-agents) -> LlmRequesting

@@ -2522,6 +2522,15 @@ where
         }
     }
 
+    async fn accept_wake_inbox_ids(&self, inbox_ids: Option<Vec<String>>) -> Result<(), String> {
+        if let Some(inbox_ids) = inbox_ids {
+            self.storage
+                .accept_owed_wakes(&self.context.conversation_id, &inbox_ids)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // A fresh user turn always resets the parent tool-cycle counter
         // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
@@ -2612,7 +2621,9 @@ where
                 }
             }
 
-            let wake_inbox_ids = Self::wake_inbox_ids(&current_event);
+            let wake_inbox_ids = matches!(self.state, ConvState::Idle)
+                .then(|| Self::wake_inbox_ids(&current_event))
+                .flatten();
 
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
@@ -2636,11 +2647,7 @@ where
             };
 
             let generated_events = self.apply_transition_result(result).await?;
-            if let Some(inbox_ids) = wake_inbox_ids {
-                self.storage
-                    .accept_owed_wakes(&self.context.conversation_id, &inbox_ids)
-                    .await?;
-            }
+            self.accept_wake_inbox_ids(wake_inbox_ids).await?;
             events_to_process.extend(generated_events);
         }
 

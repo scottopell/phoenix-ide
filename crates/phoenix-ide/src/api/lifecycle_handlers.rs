@@ -382,6 +382,18 @@ pub(crate) async fn abandon_task(
     // REQ-BED-031: reject if the conversation has already been continued.
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "abandon")?;
+    let wake_repo =
+        phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+    if phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+        .has_pending_for_conversation(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot abandon a conversation with a pending wait. Cancel the wait first.",
+            "cancel_first",
+        ))));
+    }
 
     // REQ-BED-031: abandon is permitted from Idle, ContextExhausted, *and*
     // Error. A parent with no continuation that is stuck (context-exhausted
@@ -667,6 +679,18 @@ pub(crate) async fn mark_merged(
     // REQ-BED-031: reject if the conversation has already been continued.
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "mark as merged")?;
+    let wake_repo =
+        phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+    if phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+        .has_pending_for_conversation(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot mark merged while a wait is pending. Cancel the wait first.",
+            "cancel_first",
+        ))));
+    }
 
     // REQ-BED-031: mark-as-merged is permitted from Idle, ContextExhausted,
     // *and* Error. A parent whose work has already been merged externally
