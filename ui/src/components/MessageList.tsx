@@ -37,6 +37,7 @@ import {
   QueuedUserMessage,
   AgentMessage,
   type AgentTextRevealRequest,
+  type ConversationHighlight,
   SubAgentStatus,
   SkillCommandText,
   formatMessageTime,
@@ -190,7 +191,7 @@ function renderHistoricalUnit(
   activeToolUseId: string | undefined,
   isLatestAgentMessage: boolean,
   revealRequest: AgentTextRevealRequest | null,
-  activeHighlight: { fragmentId: string; start: number; end: number } | null,
+  activeHighlight: ConversationHighlight | null,
   onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
@@ -287,7 +288,7 @@ function renderUnit(
   activeToolUseId: string | undefined,
   isLatestAgentMessage: boolean,
   revealRequest: AgentTextRevealRequest | null,
-  activeHighlight: { fragmentId: string; start: number; end: number } | null,
+  activeHighlight: ConversationHighlight | null,
   onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   if (
@@ -494,20 +495,23 @@ function MessageListImpl({
     ? `${activeFindMatch.kind}:${activeFindMatch.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}:${findRevealVersion}`
     : null;
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
-  const activeFindHighlight = useMemo(
-    () => activeFindMatch?.kind === 'unit-text' && activeFindMatch.fragmentId
-      ? {
-          unitKey: activeFindMatch.unitKey,
-          fragmentId: activeFindMatch.fragmentId,
-          start: activeFindMatch.start,
-          end: activeFindMatch.end,
-        }
-      : null,
-    [activeFindMatch],
-  );
   const activeFindRevealTarget = activeFindMatch?.kind === 'unit-text'
     ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.sourceId)?.revealTarget ?? null
     : null;
+  const activeFindHighlight = useMemo((): (ConversationHighlight & { unitKey: string }) | null => {
+    if (activeFindMatch?.kind !== 'unit-text' || !activeFindMatch.fragmentId || !activeFindRevealTarget) return null;
+    const range = {
+      unitKey: activeFindMatch.unitKey,
+      fragmentId: activeFindMatch.fragmentId,
+      start: activeFindMatch.start,
+      end: activeFindMatch.end,
+    };
+    return activeFindRevealTarget.kind === 'agent-text'
+      ? { ...range, owner: 'agent-text' }
+      : 'toolUseId' in activeFindRevealTarget
+        ? { ...range, owner: 'tool-result', toolUseId: activeFindRevealTarget.toolUseId }
+        : null;
+  }, [activeFindMatch, activeFindRevealTarget]);
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;
@@ -1248,7 +1252,7 @@ function MessageListImpl({
                 || activeFindRevealTarget?.kind === 'tool-result-terminal'
                 || activeFindRevealTarget?.kind === 'subagent-card'
               )
-              ? { fragmentId: activeFindHighlight.fragmentId, start: activeFindHighlight.start, end: activeFindHighlight.end }
+              ? activeFindHighlight
               : null
             : null,
           handleRevealHandled,

@@ -2196,13 +2196,41 @@ describe('compact tool summaries', () => {
           onOpenFile={undefined}
           unitKey="unit-1"
           revealRequest={revealRequest}
-          activeHighlight={{ fragmentId: revealRequest.fragmentId, start: 2, end: 8 }}
+          activeHighlight={{ fragmentId: revealRequest.fragmentId, start: 2, end: 8, owner: 'tool-result', toolUseId: 'tool-read' }}
         />
       </MemoryRouter>,
     );
 
     await waitFor(() => expect(container.querySelectorAll('.tool-block')).toHaveLength(1));
     expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('hidden');
+  });
+
+  it('scopes identical fragment IDs to the owning tool use', async () => {
+    mockDensity = 'full';
+    const message = agentMessage('agent-owner-scope', [
+      { type: 'tool_use', id: 'read-a', name: 'read_file', input: { path: 'a.ts', offset: 1, limit: 1 } },
+      { type: 'tool_use', id: 'read-b', name: 'read_file', input: { path: 'b.ts', offset: 1, limit: 1 } },
+    ]);
+    const results = new Map<string, Message>([
+      ['read-a', toolMessage('read-a', '     1\tsame token')],
+      ['read-b', toolMessage('read-b', '     1\tsame token')],
+    ]);
+    const fragmentId = 'read-file-line:same%20token:0';
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={results}
+          onOpenFile={undefined}
+          unitKey="unit-owner-scope"
+          activeHighlight={{ fragmentId, start: 2, end: 6, owner: 'tool-result', toolUseId: 'read-b' }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-tool-id="read-a"] .viewer-find-inline-match--active')).toBeNull();
+    expect(container.querySelector('[data-tool-id="read-b"] .viewer-find-inline-match--active')?.textContent).toBe('same');
   });
 });
 
@@ -3161,7 +3189,7 @@ describe('AgentMessage compact find reveal', () => {
             revealTarget: { kind: 'agent-text', key: 'agent-text:unit-find:agent-text-0' },
             nonce: 1,
           }}
-          activeHighlight={{ fragmentId: 'agent-text-0', start: 30, end: 42 }}
+          activeHighlight={{ fragmentId: 'agent-text-0', start: 30, end: 42, owner: 'agent-text' }}
           onRevealHandled={onRevealHandled}
         />
       </MemoryRouter>,

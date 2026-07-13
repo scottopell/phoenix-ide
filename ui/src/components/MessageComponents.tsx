@@ -839,6 +839,11 @@ export interface AgentTextHighlight {
   end: number;
 }
 
+export type ConversationHighlight = AgentTextHighlight & (
+  | { owner: 'agent-text' }
+  | { owner: 'tool-result'; toolUseId: string }
+);
+
 interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
@@ -861,7 +866,7 @@ interface AgentMessageProps {
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
-  activeHighlight?: AgentTextHighlight | null;
+  activeHighlight?: ConversationHighlight | null;
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
@@ -1026,7 +1031,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
     const remarkPlugins = usesGfmSyntax(fragment.semanticText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
     const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
-    const highlight = activeHighlight?.fragmentId === fragment.fragmentId
+    const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
       : null;
     if (!expanded) {
@@ -1254,7 +1259,7 @@ interface ToolUseBlockProps {
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   revealRequest?: AgentTextRevealRequest | null;
-  activeHighlight?: AgentTextHighlight | null;
+  activeHighlight?: ConversationHighlight | null;
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
@@ -2342,7 +2347,9 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     () => buildSubAgentCardFragments(result?.display_data, toolId),
     [result?.display_data, toolId],
   );
-  const toolActiveHighlight = activeHighlight?.fragmentId
+  const toolActiveHighlight = activeHighlight?.owner === 'tool-result'
+    && activeHighlight.toolUseId === toolId
+    && activeHighlight.fragmentId
     && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))

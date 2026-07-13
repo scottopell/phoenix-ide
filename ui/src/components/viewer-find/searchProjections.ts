@@ -947,9 +947,14 @@ function semanticSubAgentOutcome(outcome: unknown): string {
   if (!outcome || typeof outcome !== 'object') return '';
   const value = outcome as Record<string, unknown>;
   for (const key of ['result', 'error', 'partial_result']) {
-    if (typeof value[key] === 'string') return value[key];
+    if (typeof value[key] === 'string' && value[key].length > 0) return value[key];
   }
-  return '';
+  switch (value['type']) {
+    case 'success': return 'Completed successfully';
+    case 'failure': return 'Failed';
+    case 'timed_out': return 'Timed out: sub-agent exceeded its time limit';
+    default: return '';
+  }
 }
 
 export function buildTerminalToolResultProjection(
