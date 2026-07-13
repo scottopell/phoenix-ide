@@ -3479,6 +3479,21 @@ async fn send_chat(
             .await
             .unwrap_or_else(|| conversation.state.clone())
     };
+    let effective_state = if matches!(effective_state, ConvState::Idle) {
+        let repository =
+            phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+        if phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .has_pending_for_conversation(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            ConvState::LlmRequesting { attempt: 1 }
+        } else {
+            effective_state
+        }
+    } else {
+        effective_state
+    };
     if let Err(err) = check_user_message_acceptable(&effective_state) {
         // `AgentBusy` and `CancellationInProgress` states are transient — the
         // conversation will reach `Idle` once the current operation completes.
@@ -3662,6 +3677,12 @@ async fn cancel_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conversation.state.clone());
+
     if matches!(conversation.state, ConvState::Provisioning { .. }) {
         state
             .runtime
@@ -3695,7 +3716,7 @@ async fn cancel_conversation(
         }));
     }
 
-    if matches!(conversation.state, ConvState::Idle) {
+    if matches!(effective_state, ConvState::Idle) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
         let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
@@ -3711,10 +3732,10 @@ async fn cancel_conversation(
         }
     }
 
-    if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
+    if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         tracing::debug!(
             conv_id = %id,
-            state = conversation.state.variant_name(),
+            state = effective_state.variant_name(),
             "cancel no-op: conversation has nothing in flight"
         );
         return Ok(Json(CancelResponse {
@@ -3723,11 +3744,11 @@ async fn cancel_conversation(
         }));
     }
 
-    if !conversation.state.allows_user_cancel() {
+    if !effective_state.allows_user_cancel() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             format!(
                 "Conversation cannot be cancelled while in {} state",
-                conversation.state.variant_name()
+                effective_state.variant_name()
             ),
             "cannot_cancel_state",
         ))));

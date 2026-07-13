@@ -501,7 +501,6 @@ async fn deliver_owed(
                         "Durable wait observation for registration {registering_tool_use_id}: {output}"
                     ),
                     inbox_id,
-                    registering_tool_use_id,
                 },
             )
             .collect();
