@@ -446,6 +446,8 @@ function MessageListImpl({
   const activeFindMatch = findOpen && normalizedFindIndex >= 0 ? findMatches[normalizedFindIndex] ?? null : null;
   const activeFindMatchRef = useRef(activeFindMatch);
   activeFindMatchRef.current = activeFindMatch;
+  const findSourcesRef = useRef(findProjection.sources);
+  findSourcesRef.current = findProjection.sources;
   const activeFindMatchKey = activeFindMatch
     ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
     : null;
@@ -1123,7 +1125,7 @@ function MessageListImpl({
     }
     const unitMatch = match.target;
     if (unitMatch.fragmentId) {
-      const source = findProjection.sources.find((candidate) => candidate.id === unitMatch.sourceId);
+      const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
       const revealTarget: ConversationTextFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
       setPendingRevealRequest({
         unitKey: unitMatch.unitKey,
