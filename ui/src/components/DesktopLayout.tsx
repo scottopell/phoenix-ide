@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -7,6 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
+import { api, type Conversation } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -32,6 +33,7 @@ import {
   consumeNotificationPermissionCue,
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
+  registerCoordinatorForNotifications,
   useNotificationClickNavigationBridge,
 } from '../notifications';
 
@@ -134,14 +136,31 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // `Conversation[]` state, no per-field bridge hooks.
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
+  const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
 
   useEffect(() => {
-    void loadNotificationSettingsAndCatchUp(conversations).catch(() => {});
+    api.getGlobalCoordinator()
+      .then(({ conversation }) => {
+        registerCoordinatorForNotifications(conversation.id);
+        setCoordinatorForNotifications(conversation);
+      })
+      .catch(() => setCoordinatorForNotifications(null));
   }, [conversations]);
 
+  const notificationConversations = useMemo(
+    () => coordinatorForNotifications
+      ? [...conversations, coordinatorForNotifications]
+      : conversations,
+    [conversations, coordinatorForNotifications],
+  );
+
   useEffect(() => {
-    notifyCatchUp(conversations);
-  }, [conversations]);
+    void loadNotificationSettingsAndCatchUp(notificationConversations).catch(() => {});
+  }, [notificationConversations]);
+
+  useEffect(() => {
+    notifyCatchUp(notificationConversations);
+  }, [notificationConversations]);
 
   useEffect(() => {
     const handler = () => {

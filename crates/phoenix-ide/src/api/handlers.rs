@@ -816,7 +816,7 @@ async fn get_coordinator(
     let conversation = state
         .db
         .get_or_create_coordinator(
-            "",
+            &state.runtime_env.home().to_string_lossy(),
             Some(state.llm_registry.default_model_id()),
             llm_language,
         )

@@ -11,7 +11,11 @@ import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { Conversation, ConversationState, NotificationSettings } from './api';
 import { parseConversationState } from './utils';
-import { NotificationStore, getBrowserNotificationPermission } from './notifications/store';
+import {
+  NotificationStore,
+  getBrowserNotificationPermission,
+  registerCoordinatorNotificationTarget,
+} from './notifications/store';
 
 import type { SettingsStatus } from './notifications/policy';
 
@@ -55,6 +59,10 @@ export function notifyConversationSnapshotChange(next: Conversation): void {
   const previousState = previous.state ? parseConversationState(previous.state) : undefined;
   store.dispatch({ type: 'conversation_state_changed', conversation: next, previousState, nextState });
   previousSnapshotsById.set(next.id, next);
+}
+
+export function registerCoordinatorForNotifications(conversationId: string): void {
+  registerCoordinatorNotificationTarget(conversationId);
 }
 
 export function notifyCatchUp(conversations: readonly Conversation[]): void {
@@ -117,8 +125,8 @@ export function useNotificationClickNavigationBridge(): void {
   const navigate = useNavigate();
   useEffect(() => {
     const handler = (event: Event) => {
-      const slug = (event as CustomEvent<{ slug?: string }>).detail?.slug;
-      if (slug) navigate(`/c/${slug}`);
+      const route = (event as CustomEvent<{ route?: string }>).detail?.route;
+      if (route) navigate(route);
     };
     window.addEventListener('phoenix:navigate-to-conversation', handler);
     return () => window.removeEventListener('phoenix:navigate-to-conversation', handler);

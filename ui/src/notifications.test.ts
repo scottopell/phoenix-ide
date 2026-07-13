@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Conversation } from './api';
+import { notificationRoute } from './notifications/store';
 import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
@@ -7,6 +8,7 @@ import {
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
+  registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
 } from './notifications';
 
@@ -70,6 +72,16 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+describe('Coordinator notification routing', () => {
+  it('uses global routes for registered Coordinator ids', () => {
+    registerCoordinatorForNotifications('coordinator-id');
+    expect(notificationRoute({ id: 'coordinator-id', slug: 'coordinator' }))
+      .toBe('/global/coordinator-id');
+    expect(notificationRoute({ id: 'ordinary-id', slug: 'ordinary' }))
+      .toBe('/c/ordinary');
+  });
 });
 
 describe('browser desktop notifications', () => {

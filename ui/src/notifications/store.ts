@@ -16,6 +16,18 @@ import {
   notificationPolicyReducer,
 } from './policy';
 
+const coordinatorConversationIds = new Set<string>();
+
+export function registerCoordinatorNotificationTarget(conversationId: string): void {
+  coordinatorConversationIds.add(conversationId);
+}
+
+export function notificationRoute(conversation: { id: string; slug?: string | null }): string {
+  return coordinatorConversationIds.has(conversation.id)
+    ? `/global/${conversation.id}`
+    : `/c/${conversation.slug ?? conversation.id}`;
+}
+
 export function getBrowserNotificationPermission(): BrowserPermission {
   if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported';
   return Notification.permission;
@@ -23,7 +35,7 @@ export function getBrowserNotificationPermission(): BrowserPermission {
 
 function currentActiveSlug(): string | null {
   if (typeof window === 'undefined') return null;
-  const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
+  const match = window.location.pathname.match(/^\/(?:c|global)\/([^/?#]+)/);
   return match?.[1] ? decodeURIComponent(match[1]) : null;
 }
 
@@ -111,7 +123,7 @@ export class NotificationStore {
             this.closeForConversation(effect.conversation.id);
             window.dispatchEvent(
               new CustomEvent('phoenix:navigate-to-conversation', {
-                detail: { slug: effect.conversation.slug },
+                detail: { route: notificationRoute(effect.conversation) },
               }),
             );
           };
