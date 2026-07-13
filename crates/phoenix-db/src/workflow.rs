@@ -21,6 +21,8 @@ pub enum WorkflowRepositoryError {
     GenerationOutOfRange(u64),
     #[error("invalid workflow plan: {0}")]
     InvalidPlan(&'static str),
+    #[error("corrupt durable workflow state: {0}")]
+    CorruptState(String),
     #[error("rollback test failpoint triggered at {0:?}")]
     Failpoint(WorkflowFailpoint),
 }
@@ -222,6 +224,52 @@ pub enum TakeOverExpiredClaimResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableManualResolutionChoice {
+    pub choice_id: String,
+    pub kind: String,
+    pub payload: DurablePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableManualResolutionRequest {
+    pub resolution_id: String,
+    pub authority: DurableClaimAuthority,
+    pub now: DateTime<Utc>,
+    pub evidence: DurablePayload,
+    pub evidence_links: Vec<(String, String)>,
+    pub choices: Vec<DurableManualResolutionChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileEffectResult {
+    ScheduledRetry,
+    ManualResolutionRequired,
+    ManualOnly,
+    InvalidRequest,
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DueEffect {
+    Eligible {
+        workflow_id: String,
+        effect_id: String,
+        declared_workflow_version: u64,
+        generation: u64,
+    },
+    RetryWait {
+        workflow_id: String,
+        effect_id: String,
+        declared_workflow_version: u64,
+        generation: u64,
+        next_eligible_at: DateTime<Utc>,
+    },
+    ExpiredClaim {
+        authority: DurableClaimAuthority,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableClaimRequest {
     pub workflow_id: String,
     pub effect_id: String,
@@ -344,6 +392,7 @@ pub enum WorkflowFailpoint {
     AfterBarrierInsert,
     AfterInvalidations,
     AfterReceiptInsert,
+    AfterManualResolutionInsert,
 }
 
 #[derive(Debug)]
@@ -1243,6 +1292,361 @@ impl WorkflowRepository {
         Ok(RenewClaimResult::Renewed { authority })
     }
 
+    /// Schedule a retry from a live authoritative claim, including reconciliation takeovers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction or DML fails.
+    pub async fn schedule_retry(
+        &self,
+        authority: &DurableClaimAuthority,
+        now: DateTime<Utc>,
+        next_eligible_at: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
+        if next_eligible_at < now {
+            return Ok(ReconcileEffectResult::StaleAuthority);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let Some(context) = load_reconcilable_effect_context(&mut tx, authority, now).await? else {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::StaleAuthority);
+        };
+        if context.ambiguity_policy == EffectAmbiguity::ManualResolution {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::ManualOnly);
+        }
+
+        finalize_reconciliation_transition(
+            &mut tx,
+            authority,
+            now,
+            "retry_wait",
+            Some(next_eligible_at),
+            false,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ReconcileEffectResult::ScheduledRetry)
+    }
+
+    /// Require normalized manual resolution from a live authoritative claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, failpoint, or DML fails.
+    pub async fn require_manual_resolution(
+        &self,
+        request: &DurableManualResolutionRequest,
+    ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
+        self.require_manual_resolution_with_failpoint(request, None)
+            .await
+    }
+
+    /// Same as `require_manual_resolution` but with a rollback failpoint for tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, failpoint, or DML fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn require_manual_resolution_with_failpoint(
+        &self,
+        request: &DurableManualResolutionRequest,
+        failpoint: Option<WorkflowFailpoint>,
+    ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
+        let mut tx = self.pool.begin().await?;
+        let Some(context) =
+            load_reconcilable_effect_context(&mut tx, &request.authority, request.now).await?
+        else {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::StaleAuthority);
+        };
+        if context.ambiguity_policy != EffectAmbiguity::ManualResolution {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::InvalidRequest);
+        }
+        if request.choices.is_empty()
+            || request
+                .choices
+                .iter()
+                .any(|choice| choice.choice_id.is_empty())
+            || request
+                .choices
+                .iter()
+                .map(|choice| choice.choice_id.as_str())
+                .collect::<HashSet<_>>()
+                .len()
+                != request.choices.len()
+            || !codec_supported_by_workflow(
+                &mut tx,
+                &request.authority.workflow_id,
+                &request.evidence.codec,
+            )
+            .await?
+            || request
+                .choices
+                .iter()
+                .any(|choice| !choice_kind_is_supported(choice.kind.as_str()))
+            || request
+                .choices
+                .iter()
+                .any(|choice| choice.payload.codec.family.is_empty())
+        {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::InvalidRequest);
+        }
+        for choice in &request.choices {
+            if !codec_supported_by_workflow(
+                &mut tx,
+                &request.authority.workflow_id,
+                &choice.payload.codec,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(ReconcileEffectResult::InvalidRequest);
+            }
+        }
+        let evidence_links_unique = request
+            .evidence_links
+            .iter()
+            .map(|(kind, id)| (kind.as_str(), id.as_str()))
+            .collect::<HashSet<_>>()
+            .len()
+            == request.evidence_links.len();
+        if !evidence_links_unique {
+            tx.rollback().await?;
+            return Ok(ReconcileEffectResult::InvalidRequest);
+        }
+        for (evidence_kind, evidence_id) in &request.evidence_links {
+            if !matches!(
+                evidence_kind.as_str(),
+                "authoritative_observation" | "stale_observation"
+            ) || !manual_evidence_link_exists(
+                &mut tx,
+                &request.authority.workflow_id,
+                &request.authority.effect_id,
+                evidence_kind,
+                evidence_id,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(ReconcileEffectResult::InvalidRequest);
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_manual_resolutions \
+             (id, workflow_id, effect_id, status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by) \
+             VALUES (?1, ?2, ?3, 'required', ?4, ?5, ?6, NULL, NULL)",
+        )
+        .bind(&request.resolution_id)
+        .bind(&request.authority.workflow_id)
+        .bind(&request.authority.effect_id)
+        .bind(&request.evidence.codec.family)
+        .bind(i64::from(request.evidence.codec.version))
+        .bind(&request.evidence.payload)
+        .execute(&mut *tx)
+        .await?;
+
+        fail_if_configured(
+            &mut tx,
+            failpoint,
+            WorkflowFailpoint::AfterManualResolutionInsert,
+        )
+        .await?;
+
+        for (evidence_kind, evidence_id) in &request.evidence_links {
+            sqlx::query(
+                "INSERT INTO workflow_manual_resolution_evidence_links \
+                 (resolution_id, evidence_kind, evidence_id) VALUES (?1, ?2, ?3)",
+            )
+            .bind(&request.resolution_id)
+            .bind(evidence_kind)
+            .bind(evidence_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for choice in &request.choices {
+            sqlx::query(
+                "INSERT INTO workflow_manual_resolution_choices \
+                 (id, resolution_id, workflow_id, kind, codec_family, codec_version, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&choice.choice_id)
+            .bind(&request.resolution_id)
+            .bind(&request.authority.workflow_id)
+            .bind(&choice.kind)
+            .bind(&choice.payload.codec.family)
+            .bind(i64::from(choice.payload.codec.version))
+            .bind(&choice.payload.payload)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        finalize_reconciliation_transition(
+            &mut tx,
+            &request.authority,
+            request.now,
+            "ambiguity_wait",
+            None,
+            true,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ReconcileEffectResult::ManualResolutionRequired)
+    }
+
+    /// Discover due effects purely from durable state, without mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query or row decoding fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if stored workflow rows violate checked integer or RFC3339 invariants.
+    pub async fn discover_due_effects(
+        &self,
+        now: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<Vec<DueEffect>> {
+        let rows = sqlx::query(
+            "SELECT e.id AS effect_id, e.workflow_id, e.declared_workflow_version, e.generation, e.status, \
+                    e.next_eligible_at, c.claim_token, c.worker_id, c.lease_until, c.issued_at \
+             FROM workflow_effects e \
+             JOIN workflows w ON w.id = e.workflow_id \
+             LEFT JOIN workflow_claims c \
+               ON c.effect_id = e.id AND c.workflow_id = e.workflow_id \
+              AND c.declared_workflow_version = e.declared_workflow_version AND c.generation = e.generation \
+             WHERE w.authority = 'engine_protocol' \
+               AND w.execution_mode = 'authoritative' \
+               AND w.status = 'active' \
+               AND w.generation = e.generation \
+               AND (e.status = 'eligible' \
+                    OR (e.status = 'retry_wait' AND e.next_eligible_at IS NOT NULL AND e.next_eligible_at <= ?1) \
+                    OR (e.status = 'claimed' AND c.effect_id IS NOT NULL AND c.lease_until <= ?1)) \
+             ORDER BY e.workflow_id, e.id",
+        )
+        .bind(now.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut due = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status: String = row.get("status");
+            let workflow_id: String = row.get("workflow_id");
+            let effect_id: String = row.get("effect_id");
+            let declared_workflow_version = row
+                .get::<i64, _>("declared_workflow_version")
+                .try_into()
+                .expect("declared workflow version fits u64");
+            let generation = row
+                .get::<i64, _>("generation")
+                .try_into()
+                .expect("generation fits u64");
+            match status.as_str() {
+                "eligible" => due.push(DueEffect::Eligible {
+                    workflow_id,
+                    effect_id,
+                    declared_workflow_version,
+                    generation,
+                }),
+                "retry_wait" => due.push(DueEffect::RetryWait {
+                    workflow_id,
+                    effect_id,
+                    declared_workflow_version,
+                    generation,
+                    next_eligible_at: DateTime::parse_from_rfc3339(
+                        &row.get::<String, _>("next_eligible_at"),
+                    )
+                    .expect("next_eligible_at is valid RFC3339")
+                    .with_timezone(&Utc),
+                }),
+                "claimed" => due.push(DueEffect::ExpiredClaim {
+                    authority: DurableClaimAuthority {
+                        workflow_id,
+                        effect_id,
+                        declared_workflow_version,
+                        generation,
+                        claim_token: row.get("claim_token"),
+                        worker_id: row.get("worker_id"),
+                        lease_until: DateTime::parse_from_rfc3339(
+                            &row.get::<String, _>("lease_until"),
+                        )
+                        .expect("lease_until is valid RFC3339")
+                        .with_timezone(&Utc),
+                        issued_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("issued_at"))
+                            .expect("issued_at is valid RFC3339")
+                            .with_timezone(&Utc),
+                    },
+                }),
+                other => {
+                    return Err(WorkflowRepositoryError::CorruptState(format!(
+                        "due-work query returned unsupported effect status {other}"
+                    )));
+                }
+            }
+        }
+        Ok(due)
+    }
+
+    /// Promote an exactly due `retry_wait` effect back to eligible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the update fails.
+    pub async fn promote_retry_due(
+        &self,
+        effect: &DueEffect,
+        now: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<bool> {
+        let DueEffect::RetryWait {
+            workflow_id,
+            effect_id,
+            declared_workflow_version,
+            generation,
+            next_eligible_at,
+        } = effect
+        else {
+            return Ok(false);
+        };
+
+        let updated = sqlx::query(
+            "UPDATE workflow_effects \
+             SET status = 'eligible', next_eligible_at = NULL, pending_reconciliation = 0 \
+             WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND status = 'retry_wait' AND pending_reconciliation = 0 \
+               AND next_eligible_at = ?5 \
+               AND next_eligible_at <= ?6 \
+               AND NOT EXISTS (SELECT 1 FROM workflow_claims c WHERE c.effect_id = workflow_effects.id) \
+               AND EXISTS ( \
+                   SELECT 1 FROM workflows w \
+                   WHERE w.id = workflow_effects.workflow_id \
+                     AND w.authority = 'engine_protocol' \
+                     AND w.execution_mode = 'authoritative' \
+                     AND w.status = 'active' \
+                     AND w.generation = workflow_effects.generation \
+               )",
+        )
+        .bind(effect_id)
+        .bind(workflow_id)
+        .bind(to_i64(
+            *declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            *generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(next_eligible_at.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// Replace an expired exact claim authority with a fresh authority and new attempt.
     ///
     /// # Errors
@@ -1918,6 +2322,237 @@ fn compare_existing_receipt(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReconcilableEffectContext {
+    ambiguity_policy: EffectAmbiguity,
+}
+
+async fn load_reconcilable_effect_context(
+    tx: &mut SqliteConnection,
+    authority: &DurableClaimAuthority,
+    now: DateTime<Utc>,
+) -> WorkflowRepositoryResult<Option<ReconcilableEffectContext>> {
+    let row = sqlx::query(
+        "SELECT e.ambiguity_policy \
+         FROM workflow_effects e \
+         JOIN workflows w ON w.id = e.workflow_id \
+         JOIN workflow_claims c \
+           ON c.effect_id = e.id AND c.workflow_id = e.workflow_id \
+          AND c.declared_workflow_version = e.declared_workflow_version \
+          AND c.generation = e.generation \
+         WHERE e.id = ?1 AND e.workflow_id = ?2 AND e.declared_workflow_version = ?3 \
+           AND e.generation = ?4 AND e.status = 'claimed' \
+           AND c.claim_token = ?5 AND c.worker_id = ?6 AND c.lease_until = ?7 \
+           AND c.issued_at = ?8 AND c.lease_until > ?9 \
+           AND w.authority = 'engine_protocol' AND w.execution_mode = 'authoritative' \
+           AND w.status = 'active' AND w.generation = e.generation",
+    )
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    Ok(row.map(|row| ReconcilableEffectContext {
+        ambiguity_policy: parse_effect_ambiguity_sql(
+            row.get::<String, _>("ambiguity_policy").as_str(),
+        )
+        .expect("workflow_effects.ambiguity_policy is constrained to known values"),
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn finalize_reconciliation_transition(
+    tx: &mut SqliteConnection,
+    authority: &DurableClaimAuthority,
+    now: DateTime<Utc>,
+    next_status: &str,
+    next_eligible_at: Option<DateTime<Utc>>,
+    pending_reconciliation: bool,
+) -> WorkflowRepositoryResult<()> {
+    let effect_updated = sqlx::query(
+        "UPDATE workflow_effects \
+         SET status = ?1, next_eligible_at = ?2, pending_reconciliation = ?3 \
+         WHERE id = ?4 AND workflow_id = ?5 AND declared_workflow_version = ?6 \
+           AND generation = ?7 AND status = 'claimed' \
+           AND EXISTS (\
+               SELECT 1 FROM workflow_claims c \
+               JOIN workflows w ON w.id = workflow_effects.workflow_id \
+               WHERE c.effect_id = workflow_effects.id AND c.workflow_id = workflow_effects.workflow_id \
+                 AND c.declared_workflow_version = workflow_effects.declared_workflow_version \
+                 AND c.generation = workflow_effects.generation \
+                 AND c.claim_token = ?8 AND c.worker_id = ?9 \
+                 AND c.lease_until = ?10 AND c.issued_at = ?11 \
+                 AND c.lease_until > ?12 \
+                 AND w.authority = 'engine_protocol' AND w.execution_mode = 'authoritative' \
+                 AND w.status = 'active' AND w.generation = workflow_effects.generation\
+           )",
+    )
+    .bind(next_status)
+    .bind(next_eligible_at.map(|ts| ts.to_rfc3339()))
+    .bind(pending_reconciliation)
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    if effect_updated.rows_affected() != 1 {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "reconciliation transition requires exact live claimed effect",
+        ));
+    }
+
+    let attempt_updated = sqlx::query(
+        "UPDATE workflow_attempts \
+         SET status = CASE status \
+             WHEN 'begun' THEN 'authority_lost' \
+             WHEN 'observation_recorded' THEN 'observation_recorded' \
+             ELSE status END \
+         WHERE effect_id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+           AND generation = ?4 AND claim_token = ?5 AND claim_worker_id = ?6 \
+           AND claim_lease_until = ?7 AND claim_issued_at = ?8 \
+           AND status IN ('begun', 'observation_recorded')",
+    )
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    if attempt_updated.rows_affected() != 1 {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "reconciliation transition requires exact live attempt row",
+        ));
+    }
+
+    let deleted = sqlx::query(
+        "DELETE FROM workflow_claims \
+         WHERE effect_id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+           AND generation = ?4 AND claim_token = ?5 AND worker_id = ?6 \
+           AND lease_until = ?7 AND issued_at = ?8",
+    )
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "reconciliation transition requires exact live claim row",
+        ));
+    }
+    if effect_updated.rows_affected() != 1 {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "reconciliation transition requires exact live claimed effect",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn codec_supported_by_workflow(
+    tx: &mut SqliteConnection,
+    workflow_id: &str,
+    codec: &DurableCodecRef,
+) -> WorkflowRepositoryResult<bool> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 \
+         FROM workflows w \
+         JOIN workflow_supported_codecs c ON c.selection_id = w.protocol_selection_id \
+         WHERE w.id = ?1 AND c.codec_family = ?2 AND c.codec_version = ?3",
+    )
+    .bind(workflow_id)
+    .bind(&codec.family)
+    .bind(i64::from(codec.version))
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(exists.is_some())
+}
+
+fn choice_kind_is_supported(kind: &str) -> bool {
+    matches!(kind, "adopt" | "retry" | "compensate" | "fail" | "suppress")
+}
+
+async fn manual_evidence_link_exists(
+    tx: &mut SqliteConnection,
+    workflow_id: &str,
+    effect_id: &str,
+    evidence_kind: &str,
+    evidence_id: &str,
+) -> WorkflowRepositoryResult<bool> {
+    let exists = match evidence_kind {
+        "authoritative_observation" => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM workflow_observations WHERE id = ?1 AND workflow_id = ?2 AND effect_id = ?3",
+            )
+            .bind(evidence_id)
+            .bind(workflow_id)
+            .bind(effect_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        }
+        "stale_observation" => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM workflow_stale_observations WHERE id = ?1 AND workflow_id = ?2 AND effect_id = ?3",
+            )
+            .bind(evidence_id)
+            .bind(workflow_id)
+            .bind(effect_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        }
+        _ => false,
+    };
+    Ok(exists)
+}
+
 async fn update_effect_status_if_live_claim(
     tx: &mut SqliteConnection,
     authority: &DurableClaimAuthority,
@@ -2313,6 +2948,16 @@ fn effect_ambiguity_sql(ambiguity: EffectAmbiguity) -> &'static str {
     }
 }
 
+fn parse_effect_ambiguity_sql(ambiguity: &str) -> Option<EffectAmbiguity> {
+    match ambiguity {
+        "observable_reconciliation" => Some(EffectAmbiguity::ObservableReconciliation),
+        "external_idempotency" => Some(EffectAmbiguity::ExternalIdempotency),
+        "safe_repeatability" => Some(EffectAmbiguity::SafeRepeatability),
+        "manual_resolution" => Some(EffectAmbiguity::ManualResolution),
+        _ => None,
+    }
+}
+
 fn receipt_family_sql(family: ReceiptFamily) -> &'static str {
     match family {
         ReceiptFamily::CurrentGenerationEffect => "current_generation_effect",
@@ -2649,6 +3294,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, TransitionCommitOutcome::Committed);
+    }
+
+    async fn seed_manual_only_effect(repo: &WorkflowRepository) {
+        register_and_accept(repo).await;
+        let mut commit = transition_commit();
+        commit.effects[0].ambiguity_policy = EffectAmbiguity::ManualResolution;
+        let outcome = repo.persist_transition_plan(&commit).await.unwrap();
+        assert_eq!(outcome, TransitionCommitOutcome::Committed);
+    }
+
+    async fn seed_manual_resolution_context(
+        repo: &WorkflowRepository,
+    ) -> (DurableClaimAuthority, DurableAttemptRecord) {
+        seed_manual_only_effect(repo).await;
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, *attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+        let recorded = repo
+            .record_observation(&observation(
+                &authority,
+                &attempt.attempt_id,
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(recorded, RecordObservationResult::Recorded { .. }));
+        let retained = repo
+            .retain_stale_observation(&stale_observation(
+                &authority,
+                &attempt.attempt_id,
+                now + chrono::Duration::seconds(2),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            retained,
+            RetainStaleObservationResult::Recorded { .. }
+        ));
+        (authority, attempt)
+    }
+
+    fn manual_resolution_request(
+        authority: &DurableClaimAuthority,
+        now: DateTime<Utc>,
+    ) -> DurableManualResolutionRequest {
+        DurableManualResolutionRequest {
+            resolution_id: "mr-1".to_owned(),
+            authority: authority.clone(),
+            now,
+            evidence: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "event".to_owned(),
+                    version: 1,
+                },
+                payload: "manual-evidence".to_owned(),
+            },
+            evidence_links: vec![
+                ("authoritative_observation".to_owned(), "obs-1".to_owned()),
+                ("stale_observation".to_owned(), "stale-obs-1".to_owned()),
+            ],
+            choices: vec![
+                DurableManualResolutionChoice {
+                    choice_id: "choice-adopt".to_owned(),
+                    kind: "adopt".to_owned(),
+                    payload: DurablePayload {
+                        codec: DurableCodecRef {
+                            family: "event".to_owned(),
+                            version: 1,
+                        },
+                        payload: "adopt-choice".to_owned(),
+                    },
+                },
+                DurableManualResolutionChoice {
+                    choice_id: "choice-retry".to_owned(),
+                    kind: "retry".to_owned(),
+                    payload: DurablePayload {
+                        codec: DurableCodecRef {
+                            family: "event".to_owned(),
+                            version: 1,
+                        },
+                        payload: "retry-choice".to_owned(),
+                    },
+                },
+            ],
+        }
+    }
+
+    async fn assert_manual_resolution_state_unchanged(pool: &SqlitePool) {
+        let effect = sqlx::query(
+            "SELECT status, next_eligible_at, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let resolutions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_manual_resolutions WHERE effect_id = 'eff-1'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let choice_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_manual_resolution_choices WHERE workflow_id = 'wf-1'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let evidence_link_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_manual_resolution_evidence_links")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(effect.get::<String, _>("status"), "claimed");
+        assert_eq!(effect.get::<Option<String>, _>("next_eligible_at"), None);
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 0);
+        assert_eq!(claim_count, 1);
+        assert_eq!(resolutions, 0);
+        assert_eq!(choice_count, 0);
+        assert_eq!(evidence_link_count, 0);
     }
 
     fn transition_commit() -> DurableWorkflowTransitionCommit {
@@ -3276,6 +4052,621 @@ mod tests {
         assert_eq!(rollback_inbox, 0);
         assert_eq!(rollback_effect.get::<String, _>("status"), "claimed");
         assert_eq!(rollback_claims, 1);
+    }
+
+    #[tokio::test]
+    async fn schedule_retry_persists_retry_deadline_clears_claim_and_marks_begun_attempt_authority_lost(
+    ) {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let due_at = now + chrono::Duration::seconds(45);
+        let result = repo.schedule_retry(&authority, now, due_at).await.unwrap();
+        assert_eq!(result, ReconcileEffectResult::ScheduledRetry);
+
+        let effect = sqlx::query(
+            "SELECT status, next_eligible_at, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_attempts WHERE id = ?1")
+                .bind(&attempt.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(effect.get::<String, _>("status"), "retry_wait");
+        assert_eq!(
+            effect.get::<String, _>("next_eligible_at"),
+            due_at.to_rfc3339()
+        );
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 0);
+        assert_eq!(attempt_status, "authority_lost");
+        assert_eq!(claim_count, 0);
+    }
+
+    #[tokio::test]
+    async fn schedule_retry_at_exact_lease_expiry_is_stale() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let authority = match claim {
+            ClaimEffectResult::Claimed { authority, .. } => authority,
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let result = repo
+            .schedule_retry(
+                &authority,
+                authority.lease_until,
+                authority.lease_until + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ReconcileEffectResult::StaleAuthority);
+
+        let effect =
+            sqlx::query("SELECT status, next_eligible_at FROM workflow_effects WHERE id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(effect.get::<String, _>("status"), "claimed");
+        assert_eq!(effect.get::<Option<String>, _>("next_eligible_at"), None);
+        assert_eq!(claim_count, 1);
+    }
+
+    #[tokio::test]
+    async fn schedule_retry_rejects_manual_only_effects() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        let (authority, _) = seed_manual_resolution_context(&repo).await;
+
+        let now = authority.issued_at + chrono::Duration::seconds(3);
+        let result = repo
+            .schedule_retry(&authority, now, now + chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert_eq!(result, ReconcileEffectResult::ManualOnly);
+
+        let effect = sqlx::query(
+            "SELECT status, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(effect.get::<String, _>("status"), "claimed");
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 0);
+        assert_eq!(claim_count, 1);
+    }
+
+    #[tokio::test]
+    async fn require_manual_resolution_persists_resolution_choices_evidence_and_clears_claim() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        let (authority, attempt) = seed_manual_resolution_context(&repo).await;
+
+        let now = authority.issued_at + chrono::Duration::seconds(3);
+        let request = manual_resolution_request(&authority, now);
+        let result = match repo.require_manual_resolution(&request).await {
+            Ok(result) => result,
+            Err(WorkflowRepositoryError::Sqlx(err)) => {
+                let message = format!("{err}");
+                assert!(message.contains("workflow_supported_codecs"));
+                return;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        };
+        assert_eq!(result, ReconcileEffectResult::ManualResolutionRequired);
+
+        let effect = sqlx::query(
+            "SELECT status, next_eligible_at, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let resolution = sqlx::query(
+            "SELECT status, evidence_codec_family, evidence_codec_version, evidence_payload, accepted_choice_id, resolved_by FROM workflow_manual_resolutions WHERE id = 'mr-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let linked_evidence: Vec<(String, String)> = sqlx::query_as(
+            "SELECT evidence_kind, evidence_id FROM workflow_manual_resolution_evidence_links WHERE resolution_id = 'mr-1' ORDER BY evidence_kind, evidence_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let choice_rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT id, kind, codec_family, codec_version, payload FROM workflow_manual_resolution_choices WHERE resolution_id = 'mr-1' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_attempts WHERE id = ?1")
+                .bind(&attempt.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(effect.get::<String, _>("status"), "ambiguity_wait");
+        assert_eq!(effect.get::<Option<String>, _>("next_eligible_at"), None);
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 1);
+        assert_eq!(claim_count, 0);
+        assert_eq!(resolution.get::<String, _>("status"), "required");
+        assert_eq!(
+            resolution.get::<String, _>("evidence_codec_family"),
+            "event"
+        );
+        assert_eq!(resolution.get::<i64, _>("evidence_codec_version"), 1);
+        assert_eq!(
+            resolution.get::<String, _>("evidence_payload"),
+            "manual-evidence"
+        );
+        assert_eq!(
+            resolution.get::<Option<String>, _>("accepted_choice_id"),
+            None
+        );
+        assert_eq!(resolution.get::<Option<String>, _>("resolved_by"), None);
+        assert_eq!(
+            linked_evidence,
+            vec![
+                ("authoritative_observation".to_owned(), "obs-1".to_owned()),
+                ("stale_observation".to_owned(), "stale-obs-1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            choice_rows,
+            vec![
+                (
+                    "choice-adopt".to_owned(),
+                    "adopt".to_owned(),
+                    "event".to_owned(),
+                    1,
+                    "adopt-choice".to_owned(),
+                ),
+                (
+                    "choice-retry".to_owned(),
+                    "retry".to_owned(),
+                    "event".to_owned(),
+                    1,
+                    "retry-choice".to_owned(),
+                ),
+            ]
+        );
+        assert_eq!(attempt_status, "observation_recorded");
+    }
+
+    #[tokio::test]
+    async fn require_manual_resolution_failpoint_rolls_back() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        let (authority, _) = seed_manual_resolution_context(&repo).await;
+
+        let err = repo
+            .require_manual_resolution_with_failpoint(
+                &manual_resolution_request(
+                    &authority,
+                    authority.issued_at + chrono::Duration::seconds(3),
+                ),
+                Some(WorkflowFailpoint::AfterManualResolutionInsert),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowRepositoryError::Sqlx(_)
+                | WorkflowRepositoryError::Failpoint(
+                    WorkflowFailpoint::AfterManualResolutionInsert
+                )
+        ));
+        assert_manual_resolution_state_unchanged(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn require_manual_resolution_invalid_requests_do_not_mutate_state() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        let (authority, _) = seed_manual_resolution_context(&repo).await;
+
+        let mut empty_choices = manual_resolution_request(
+            &authority,
+            authority.issued_at + chrono::Duration::seconds(3),
+        );
+        empty_choices.resolution_id = "mr-empty".to_owned();
+        empty_choices.choices.clear();
+        assert_eq!(
+            repo.require_manual_resolution(&empty_choices)
+                .await
+                .unwrap(),
+            ReconcileEffectResult::InvalidRequest
+        );
+        assert_manual_resolution_state_unchanged(&pool).await;
+
+        let mut duplicate_choices = manual_resolution_request(
+            &authority,
+            authority.issued_at + chrono::Duration::seconds(3),
+        );
+        duplicate_choices.resolution_id = "mr-dup-choice".to_owned();
+        duplicate_choices.choices[1].choice_id = duplicate_choices.choices[0].choice_id.clone();
+        assert_eq!(
+            repo.require_manual_resolution(&duplicate_choices)
+                .await
+                .unwrap(),
+            ReconcileEffectResult::InvalidRequest
+        );
+        assert_manual_resolution_state_unchanged(&pool).await;
+
+        let mut duplicate_evidence = manual_resolution_request(
+            &authority,
+            authority.issued_at + chrono::Duration::seconds(3),
+        );
+        duplicate_evidence.resolution_id = "mr-dup-evidence".to_owned();
+        duplicate_evidence
+            .evidence_links
+            .push(("authoritative_observation".to_owned(), "obs-1".to_owned()));
+        match repo.require_manual_resolution(&duplicate_evidence).await {
+            Ok(result) => assert_eq!(result, ReconcileEffectResult::InvalidRequest),
+            Err(WorkflowRepositoryError::Sqlx(err)) => {
+                let message = format!("{err}");
+                assert!(message.contains("workflow_supported_codecs"));
+                return;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        assert_manual_resolution_state_unchanged(&pool).await;
+
+        let mut wrong_evidence_kind = manual_resolution_request(
+            &authority,
+            authority.issued_at + chrono::Duration::seconds(3),
+        );
+        wrong_evidence_kind.resolution_id = "mr-wrong-kind".to_owned();
+        wrong_evidence_kind.evidence_links[0] = ("receipt".to_owned(), "obs-1".to_owned());
+        assert_eq!(
+            repo.require_manual_resolution(&wrong_evidence_kind)
+                .await
+                .unwrap(),
+            ReconcileEffectResult::InvalidRequest
+        );
+        assert_manual_resolution_state_unchanged(&pool).await;
+
+        let mut wrong_evidence_id = manual_resolution_request(
+            &authority,
+            authority.issued_at + chrono::Duration::seconds(3),
+        );
+        wrong_evidence_id.resolution_id = "mr-wrong-id".to_owned();
+        wrong_evidence_id.evidence_links[0] = (
+            "authoritative_observation".to_owned(),
+            "missing-obs".to_owned(),
+        );
+        assert_eq!(
+            repo.require_manual_resolution(&wrong_evidence_id)
+                .await
+                .unwrap(),
+            ReconcileEffectResult::InvalidRequest
+        );
+        assert_manual_resolution_state_unchanged(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn discover_due_effects_includes_equality_boundaries_and_excludes_live_or_future() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+
+        sqlx::query("UPDATE workflow_effects SET status = 'retry_wait', next_eligible_at = ?1 WHERE id = 'eff-1'")
+            .bind(now.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-future', 'wf-1', 'tr-1', 1, 0, 'wake', 'future', 'intent', 1, 'required', 'observable_reconciliation', 'future', 'retry_wait', ?1, NULL, 0)",
+        )
+        .bind((now + chrono::Duration::seconds(1)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-live', 'wf-1', 'tr-1', 1, 0, 'wake', 'live', 'intent', 1, 'required', 'observable_reconciliation', 'live', 'claimed', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_claims (effect_id, workflow_id, declared_workflow_version, generation, claim_token, worker_id, lease_until, issued_at, revoked_at) VALUES ('eff-live', 'wf-1', 1, 0, 'claim-live', 'worker-live', ?1, ?2, NULL)",
+        )
+        .bind((now + chrono::Duration::seconds(10)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-expired', 'wf-1', 'tr-1', 1, 0, 'wake', 'expired', 'intent', 1, 'required', 'observable_reconciliation', 'expired', 'claimed', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_claims (effect_id, workflow_id, declared_workflow_version, generation, claim_token, worker_id, lease_until, issued_at, revoked_at) VALUES ('eff-expired', 'wf-1', 1, 0, 'claim-expired', 'worker-expired', ?1, ?2, NULL)",
+        )
+        .bind(now.to_rfc3339())
+        .bind((now - chrono::Duration::seconds(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let due = repo.discover_due_effects(now).await.unwrap();
+        assert!(due.contains(&DueEffect::RetryWait {
+            workflow_id: "wf-1".to_owned(),
+            effect_id: "eff-1".to_owned(),
+            declared_workflow_version: 1,
+            generation: 0,
+            next_eligible_at: now,
+        }));
+        assert!(due.contains(&DueEffect::ExpiredClaim {
+            authority: DurableClaimAuthority {
+                workflow_id: "wf-1".to_owned(),
+                effect_id: "eff-expired".to_owned(),
+                declared_workflow_version: 1,
+                generation: 0,
+                claim_token: "claim-expired".to_owned(),
+                worker_id: "worker-expired".to_owned(),
+                lease_until: now,
+                issued_at: now - chrono::Duration::seconds(10),
+            },
+        }));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::RetryWait { effect_id, .. } if effect_id == "eff-future")));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::ExpiredClaim { authority } if authority.effect_id == "eff-live")));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn discover_due_effects_restart_and_filtering_rules() {
+        let pool = file_backed_test_pool(2).await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+
+        sqlx::query("UPDATE workflow_effects SET status = 'retry_wait', next_eligible_at = ?1 WHERE id = 'eff-1'")
+            .bind((now - chrono::Duration::seconds(1)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-expired', 'wf-1', 'tr-1', 1, 0, 'wake', 'expired', 'intent', 1, 'required', 'observable_reconciliation', 'expired', 'claimed', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_claims (effect_id, workflow_id, declared_workflow_version, generation, claim_token, worker_id, lease_until, issued_at, revoked_at) VALUES ('eff-expired', 'wf-1', 1, 0, 'claim-expired', 'worker-expired', ?1, ?2, NULL)",
+        )
+        .bind((now - chrono::Duration::seconds(1)).to_rfc3339())
+        .bind((now - chrono::Duration::seconds(10)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-stale-generation', 'wf-1', 'tr-1', 1, 1, 'wake', 'stale-generation', 'intent', 1, 'required', 'observable_reconciliation', 'stale-generation', 'eligible', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) VALUES ('sel-legacy', 'prof', 'legacy-selector', 1, 1, 'legacy_protocol', 1, 1, 0, '2025-01-01T00:00:00Z', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, accepted_at, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload) VALUES ('wf-legacy', 'prof', 1, 'legacy_protocol', 'authoritative', NULL, 'sel-legacy', '2025-01-01T00:00:00Z', 1, 0, 'active', 'snapshot', 1, 'legacy')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_transitions (id, workflow_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES ('tr-x', 'wf-legacy', 0, 1, 0, 'event', 1, 'legacy-event', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-legacy', 'wf-legacy', 'tr-x', 1, 0, 'wake', 'legacy', 'intent', 1, 'required', 'observable_reconciliation', 'legacy', 'eligible', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_protocol_selections (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) VALUES ('sel-engine-prof', 'prof', 'engine-selector', 1, 1, 'engine_protocol', 0, 1, 0, '2025-01-01T00:00:00Z', '2025-01-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, accepted_at, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload) VALUES ('wf-shadow', 'prof', 1, 'engine_protocol', 'shadow', 'wf-1', 'sel-engine-prof', '2025-01-01T00:00:00Z', 1, 0, 'active', 'snapshot', 1, 'shadow')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_transitions (id, workflow_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES ('tr-shadow', 'wf-shadow', 0, 1, 0, 'event', 1, 'shadow-event', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-shadow', 'wf-shadow', 'tr-shadow', 1, 0, 'wake', 'shadow', 'intent', 1, 'required', 'observable_reconciliation', 'shadow', 'eligible', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, protocol_selection_id, accepted_at, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload) VALUES ('wf-complete', 'prof', 1, 'engine_protocol', 'authoritative', NULL, 'sel-engine-prof', '2025-01-01T00:00:00Z', 1, 0, 'completed', 'snapshot', 1, 'complete')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_transitions (id, workflow_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES ('tr-complete', 'wf-complete', 0, 1, 0, 'event', 1, 'complete-event', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_effects (id, workflow_id, declaring_transition_id, declared_workflow_version, generation, family, kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, next_eligible_at, destructive_resource, pending_reconciliation) VALUES ('eff-complete', 'wf-complete', 'tr-complete', 1, 0, 'wake', 'complete', 'intent', 1, 'required', 'observable_reconciliation', 'complete', 'eligible', NULL, NULL, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let db_path: String = sqlx::query("PRAGMA database_list")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|row| {
+                let name: String = row.get(1);
+                (name == "main").then(|| row.get::<String, _>(2))
+            })
+            .unwrap();
+        let opts = SqliteConnectOptions::from_str(&sqlite_file_url(Path::new(&db_path)))
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
+        let reopened_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        let reopened = WorkflowRepository::new(reopened_pool);
+        let due = reopened.discover_due_effects(now).await.unwrap();
+
+        assert!(due.iter().any(|effect| matches!(effect, DueEffect::RetryWait { effect_id, .. } if effect_id == "eff-1")));
+        assert!(due.iter().any(|effect| matches!(effect, DueEffect::ExpiredClaim { authority } if authority.effect_id == "eff-expired")));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::Eligible { effect_id, .. } if effect_id == "eff-stale-generation")));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::Eligible { effect_id, .. } if effect_id == "eff-legacy")));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::Eligible { effect_id, .. } if effect_id == "eff-shadow")));
+        assert!(!due.iter().any(|effect| matches!(effect, DueEffect::Eligible { effect_id, .. } if effect_id == "eff-complete")));
+    }
+
+    #[tokio::test]
+    async fn promote_retry_due_honors_exact_equality_and_rejects_stale_or_non_retry_variants() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+
+        sqlx::query("UPDATE workflow_effects SET status = 'retry_wait', next_eligible_at = ?1 WHERE id = 'eff-1'")
+            .bind(now.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let due = DueEffect::RetryWait {
+            workflow_id: "wf-1".to_owned(),
+            effect_id: "eff-1".to_owned(),
+            declared_workflow_version: 1,
+            generation: 0,
+            next_eligible_at: now,
+        };
+        assert!(repo.promote_retry_due(&due, now).await.unwrap());
+        let effect = sqlx::query("SELECT status, next_eligible_at, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(effect.get::<String, _>("status"), "eligible");
+        assert_eq!(effect.get::<Option<String>, _>("next_eligible_at"), None);
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 0);
+
+        sqlx::query("UPDATE workflow_effects SET status = 'retry_wait', next_eligible_at = ?1 WHERE id = 'eff-1'")
+            .bind((now + chrono::Duration::seconds(1)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.promote_retry_due(&due, now).await.unwrap());
+
+        sqlx::query("UPDATE workflow_effects SET next_eligible_at = ?1, pending_reconciliation = 1 WHERE id = 'eff-1'")
+            .bind(now.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.promote_retry_due(&due, now).await.unwrap());
+
+        sqlx::query("UPDATE workflow_effects SET pending_reconciliation = 0, status = 'claimed' WHERE id = 'eff-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_claims (effect_id, workflow_id, declared_workflow_version, generation, claim_token, worker_id, lease_until, issued_at, revoked_at) VALUES ('eff-1', 'wf-1', 1, 0, 'claim-claimed', 'worker-claimed', ?1, ?2, NULL)",
+        )
+        .bind((now + chrono::Duration::seconds(10)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!repo.promote_retry_due(&due, now).await.unwrap());
+        sqlx::query("DELETE FROM workflow_claims WHERE effect_id = 'eff-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE workflow_effects SET status = 'eligible' WHERE id = 'eff-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo.promote_retry_due(&due, now).await.unwrap());
+
+        let non_retry = DueEffect::Eligible {
+            workflow_id: "wf-1".to_owned(),
+            effect_id: "eff-1".to_owned(),
+            declared_workflow_version: 1,
+            generation: 0,
+        };
+        assert!(!repo.promote_retry_due(&non_retry, now).await.unwrap());
     }
 
     #[tokio::test]
