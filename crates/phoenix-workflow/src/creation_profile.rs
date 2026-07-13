@@ -345,6 +345,13 @@ impl WorkflowProfile for CreationProfile {
         matches!(inbox_payload, ReducerInboxPayload::Receipt(receipt) if receipt == event)
     }
 
+    fn decision_handles_owed_acceptance_suppression(
+        _event: &Self::OwedAcceptanceEvent,
+        _decision_event: &Self::Event,
+    ) -> bool {
+        false
+    }
+
     fn decision_handles_owed_acceptance(
         _event: &Self::OwedAcceptanceEvent,
         _decision_event: &Self::Event,
