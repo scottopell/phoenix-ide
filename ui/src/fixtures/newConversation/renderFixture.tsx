@@ -24,13 +24,23 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
   const workflowReady = Array.from(root.querySelectorAll('.workflow-card-content strong'))
     .some((element) => element.textContent === 'Chat in a fresh worktree');
   const projectSuggestionsReady = root.querySelectorAll('[aria-label="Suggested projects"]').length === 2;
+  const taskAvailabilityReady = Array.from(root.querySelectorAll('.workflow-card-content span'))
+    .some((element) => element.textContent === 'Pick a task file and approve the plan before Work mode.');
+  const branchMetadataReady = Array.from(root.querySelectorAll<HTMLButtonElement>('.new-conv-send'))
+    .every((button) => !button.disabled);
+  const metadataLoading = root.querySelector('.branch-combobox-loading') !== null
+    || Array.from(root.querySelectorAll('.workflow-card-content span'))
+      .some((element) => element.textContent === 'Loading tasks...');
 
   return directory?.value === scenario.cwd
     && model?.value === scenario.models.default
     && draft?.value === scenario.draft
     && directoryReady
     && workflowReady
-    && projectSuggestionsReady;
+    && projectSuggestionsReady
+    && taskAvailabilityReady
+    && branchMetadataReady
+    && !metadataLoading;
 }
 
 function NewConversationFixtureBody({ scenario }: Props) {
@@ -38,7 +48,12 @@ function NewConversationFixtureBody({ scenario }: Props) {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    const previousTheme = document.documentElement.getAttribute('data-theme');
     document.documentElement.dataset['theme'] = scenario.theme;
+    return () => {
+      if (previousTheme === null) document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.dataset['theme'] = previousTheme;
+    };
   }, [scenario.theme]);
   useEffect(() => {
     const root = rootRef.current;
