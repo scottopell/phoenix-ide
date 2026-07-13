@@ -8,6 +8,7 @@ import type { VirtualTranscriptRange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
+import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 
@@ -97,6 +98,7 @@ const virtualTranscriptMock = {
   scrollToTail: vi.fn(),
   captureVisibleAnchor: vi.fn(),
   measureOffsetForIndex: vi.fn(),
+  layoutRevision: vi.fn(),
   totalExtentChanged: null as ((height: number) => void) | null,
   pinnedChanged: null as ((pinned: boolean) => void) | null,
   rangeChanged: null as ((range: VirtualTranscriptRange | null) => void) | null,
@@ -108,6 +110,7 @@ beforeEach(() => {
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
+  virtualTranscriptMock.layoutRevision = vi.fn(() => 1);
   virtualTranscriptMock.totalExtentChanged = null;
   virtualTranscriptMock.pinnedChanged = null;
   virtualTranscriptMock.rangeChanged = null;
@@ -140,7 +143,7 @@ vi.mock('./VirtualTranscript', async () => {
       onRangeChange?: (range: VirtualTranscriptRange | null) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; measureOffsetForIndex: (index: number) => number | null }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; measureOffsetForIndex: (index: number) => number | null; layoutRevision: () => number }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -156,6 +159,7 @@ vi.mock('./VirtualTranscript', async () => {
         scrollToTail: virtualTranscriptMock.scrollToTail,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
         measureOffsetForIndex: virtualTranscriptMock.measureOffsetForIndex,
+        layoutRevision: virtualTranscriptMock.layoutRevision,
       }), []);
       useLayoutEffect(() => {
         scrollerRef?.(containerRef.current);
@@ -209,6 +213,13 @@ function makeRestoreAfterPrefixExpansionCommand(overrides: Partial<Extract<Histo
   };
 }
 
+
+function transcriptPositioningForCommand(command?: HistoryScrollCommand | null): TranscriptPositioningInput {
+  return command
+    ? { kind: 'positioning', command }
+    : { kind: 'idle', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } };
+}
+
 function makeJumpToMessageCommand(overrides: Partial<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }>> = {}): Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> {
   return {
     kind: 'jump_to_message',
@@ -239,7 +250,8 @@ describe('latest assistant expansion in compact mode', () => {
           onOpenFile={undefined}
           conversationId="conv-latest-expanded"
           slug="conv-latest-expanded"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -537,7 +549,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-skill"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -580,7 +593,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-ack"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -609,7 +623,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-ack"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -640,7 +655,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-a"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -663,7 +679,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-scroll-owner"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -720,7 +737,8 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-100"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -742,7 +760,8 @@ describe('MessageList', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-jumps"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -782,7 +801,8 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-delayed-jumps"
-      />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
     );
     const { container, rerender } = render(renderList());
     const scroller = container.querySelector<HTMLElement>('#messages')!;
@@ -817,7 +837,8 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId={conversationId}
-      />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
     );
     const { container, rerender } = render(renderList('conv-old'));
 
@@ -844,7 +865,8 @@ describe('MessageList', () => {
           onOpenFile={undefined}
           conversationId="conv-sysprompt"
           systemPrompt="SENTINEL SYSTEM PROMPT"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -881,8 +903,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
-          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -921,8 +942,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={historyScrollCommand}
-        currentHistoryView={historyScrollCommand?.view}
+        transcriptPositioning={transcriptPositioningForCommand(historyScrollCommand)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
@@ -958,8 +978,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
-          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -995,8 +1014,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
-          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -1027,8 +1045,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
-          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         />,
       ),
@@ -1052,8 +1069,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={historyScrollCommand}
-        currentHistoryView={currentHistoryView}
+        transcriptPositioning={transcriptPositioningForCommand(historyScrollCommand)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
@@ -1077,117 +1093,6 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
   });
 
-  it('supersedes stale same-conversation transcript-generation commands before physical scrolling or handled writes', () => {
-    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
-    const onHistoryScrollCommandHandled = vi.fn();
-    const renderList = (historyScrollCommand: HistoryScrollCommand, currentHistoryView: HistoryScrollCommand['view']) => withConvContext(
-      <MessageList
-        messages={messages}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-history"
-        historyScrollCommand={historyScrollCommand}
-        currentHistoryView={currentHistoryView}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    );
-
-    const oldView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const newView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
-    const stale = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: oldView });
-    const current = makeRestoreAfterPrefixExpansionCommand({ token: 2, view: newView });
-
-    const { rerender } = render(renderList(stale, newView));
-
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
-    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
-
-    rerender(renderList(current, newView));
-
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-  });
-
-  it('supersedes history commands when current view identity is unavailable', () => {
-    const oldView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: oldView });
-    const onHistoryScrollCommandHandled = vi.fn();
-
-    render(withConvContext(
-      <MessageList
-        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-history"
-        historyScrollCommand={command}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    ));
-
-    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
-  });
-
-  it('supersedes the active owner before rejecting a mismatched replacement command', () => {
-    const currentView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const staleView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
-    const first = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: currentView });
-    const replacement = makeRestoreAfterPrefixExpansionCommand({ token: 2, view: staleView });
-    const onHistoryScrollCommandHandled = vi.fn();
-    const renderList = (command: HistoryScrollCommand) => withConvContext(
-      <MessageList
-        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-history"
-        historyScrollCommand={command}
-        currentHistoryView={currentView}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    );
-
-    const { rerender } = render(renderList(first));
-    rerender(renderList(replacement));
-
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
-    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(1, 1, 'superseded', currentView);
-    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(2, 2, 'superseded', staleView);
-  });
-
-  it('supersedes an active restore when current view ownership disappears', () => {
-    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
-    const onHistoryScrollCommandHandled = vi.fn();
-    const renderList = (currentHistoryView?: HistoryScrollCommand['view']) => withConvContext(
-      <MessageList
-        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-history"
-        historyScrollCommand={command}
-        currentHistoryView={currentHistoryView}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    );
-
-    const { rerender } = render(renderList(view));
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
-
-    rerender(renderList(undefined));
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
-  });
-
   it('supersedes an active restore when its command disappears', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
@@ -1200,8 +1105,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={historyScrollCommand}
-        currentHistoryView={view}
+        transcriptPositioning={transcriptPositioningForCommand(historyScrollCommand)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     );
@@ -1210,34 +1114,6 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
 
     rerender(renderList(null));
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
-  });
-
-  it('supersedes the active owner exactly once when the conversation is replaced', () => {
-    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
-    const onHistoryScrollCommandHandled = vi.fn();
-    const renderList = (conversationId: string) => withConvContext(
-      <MessageList
-        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId={conversationId}
-        historyScrollCommand={command}
-        currentHistoryView={view}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    );
-
-    const { rerender } = render(renderList('conv-history'));
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
-
-    rerender(renderList('conv-history-replacement'));
-    rerender(renderList('conv-history-replacement'));
-
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
   });
@@ -1255,8 +1131,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={command}
-        currentHistoryView={view}
+        transcriptPositioning={transcriptPositioningForCommand(command)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     ));
@@ -1281,8 +1156,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={command}
-        currentHistoryView={view}
+        transcriptPositioning={transcriptPositioningForCommand(command)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     );
@@ -1299,35 +1173,6 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
-  it('supersedes a pending jump before rejecting a stale replacement command', () => {
-    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
-    const onHistoryScrollCommandHandled = vi.fn();
-    const currentView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
-    const staleView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
-    const renderList = (command: HistoryScrollCommand) => withConvContext(
-      <MessageList
-        messages={messages}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-history"
-        historyScrollCommand={command}
-        currentHistoryView={currentView}
-        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-      />,
-    );
-
-    const { rerender } = render(renderList(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view: currentView })));
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
-
-    rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view: staleView })));
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
-    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(1, 1, 'superseded', currentView);
-    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(2, 2, 'superseded', staleView);
-    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
-  });
-
   it('supersedes a pending jump exactly once when its command disappears', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const command = makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view });
@@ -1340,8 +1185,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-history"
-        historyScrollCommand={historyScrollCommand}
-        currentHistoryView={view}
+        transcriptPositioning={transcriptPositioningForCommand(historyScrollCommand)}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     );
@@ -1367,8 +1211,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })}
-          currentHistoryView={view}
+          transcriptPositioning={transcriptPositioningForCommand(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view }))}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         />,
       ),
@@ -1394,8 +1237,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId={conversationId}
-        historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
-        currentHistoryView={{ conversationId, generation: 1, transcriptGeneration: 1 }}
+        transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } }))}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
@@ -1428,8 +1270,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId={conversationId}
-        historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
-        currentHistoryView={{ conversationId, generation: 1, transcriptGeneration: 1 }}
+        transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } }))}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     );
@@ -1462,8 +1303,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-history"
-          historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
-          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -1497,7 +1337,8 @@ describe('history expansion feedback', () => {
           conversationId="conv-history"
           hasOlderMessages={false}
           olderHistoryError="Message target-message was not found"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1533,7 +1374,8 @@ describe('render-unit identity across state ticks', () => {
           onRetry={onRetry}
           onOpenFile={undefined}
           conversationId="conv-memo-identity"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
     const mountCount = agentRenderCounter.count;
@@ -1551,7 +1393,8 @@ describe('render-unit identity across state ticks', () => {
           onRetry={onRetry}
           onOpenFile={undefined}
           conversationId="conv-memo-identity"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
     expect(agentRenderCounter.count).toBe(mountCount);
@@ -1567,7 +1410,8 @@ describe('render-unit identity across state ticks', () => {
           onRetry={onRetry}
           onOpenFile={undefined}
           conversationId="conv-memo-identity"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
     expect(agentRenderCounter.count).toBeGreaterThan(mountCount);
@@ -1602,7 +1446,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-reSnap"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1635,7 +1480,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-no-yank"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1669,7 +1515,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-empty-first"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1689,7 +1536,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-empty-first"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1711,7 +1559,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-A"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1739,7 +1588,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-B"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1775,7 +1625,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-stranded-mount"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -1819,7 +1670,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-silent-strand"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -1865,7 +1717,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-scroll-only"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -1921,7 +1774,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-after-deferred-follow"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ));
     }],
   ])('revalidates deferred tail follow after %s', async (_name, transferOwnership) => {
@@ -1944,7 +1798,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-deferred-follow"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
       const scroller = container.querySelector<HTMLElement>('#messages')!;
@@ -1962,7 +1817,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-deferred-follow"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ));
       await waitFor(() => expect(releaseFrame).not.toBeNull());
 
@@ -1992,7 +1848,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-suppressed-unread"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -2029,7 +1886,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-engaged"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -2058,7 +1916,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-model-bias"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -2095,7 +1954,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-touch"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2138,7 +1998,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-momentum"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2193,7 +2054,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-pinned-tap"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2237,7 +2099,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-return-bottom-tap"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2287,7 +2150,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-ios-brake"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2349,7 +2213,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-touchmove-no-scroll"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2396,7 +2261,8 @@ describe('handleTotalListHeightChanged', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-atbottom-during-touchmove"
-          />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
         ),
       );
 
@@ -2436,7 +2302,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-touchcancel"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -2466,7 +2333,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-downward"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 
@@ -2499,7 +2367,8 @@ describe('handleTotalListHeightChanged', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-shrink"
-        />,
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
       ),
     );
 

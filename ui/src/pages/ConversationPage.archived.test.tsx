@@ -73,14 +73,14 @@ vi.mock('../components/ConversationNavStack', () => ({
     hasOlderMessages,
     onLoadOlderMessages,
     loadingOlderMessages,
-    historyScrollCommand,
+    transcriptPositioning,
     olderHistoryError,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
     onLoadOlderMessages?: () => void;
     loadingOlderMessages?: boolean;
-    historyScrollCommand?: { kind: string; token: number } | null;
+    transcriptPositioning?: { kind: 'idle' } | { kind: 'positioning'; command: { kind: string; token: number } };
     olderHistoryError?: string | null;
   }) => (
     <div>
@@ -102,7 +102,9 @@ vi.mock('../components/ConversationNavStack', () => ({
       )}
       <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
       <div data-testid="history-scroll-command">
-        {historyScrollCommand ? `${historyScrollCommand.kind}:${historyScrollCommand.token}` : 'none'}
+        {transcriptPositioning?.kind === 'positioning'
+          ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
+          : 'none'}
       </div>
       {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
     </div>

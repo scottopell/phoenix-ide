@@ -193,6 +193,10 @@ export function SharePage() {
           onOpenFile={undefined}
           enableMessageSidepanel={false}
           conversationId={conversation.id}
+          transcriptPositioning={{
+            kind: 'idle',
+            view: { conversationId: conversation.id, generation: 0, transcriptGeneration: 0 },
+          }}
         />
       </main>
     </div>

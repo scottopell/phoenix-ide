@@ -15,6 +15,7 @@ import {
   type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
+import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -1900,8 +1901,7 @@ function ConversationPageContent() {
             : historyExpansion.failure?.kind === 'anchor_not_found'
               ? 'Could not preserve the previous reading position.'
               : null}
-        historyScrollCommand={historyExpansion.pendingCommand}
-        currentHistoryView={historyExpansion.view}
+        transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
         onHistoryScrollCommandHandled={handleHistoryScrollCommand}
       />
       </RenderProfiler>

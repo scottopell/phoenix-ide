@@ -160,7 +160,7 @@ export function reduceTranscriptPositioning(
         return finishActive(state, 'applied');
       }
       if (event.actualOffset === null) return unchanged(state);
-      const expectedOffset = -state.active.command.viewportStartOffset;
+      const expectedOffset = state.active.command.viewportStartOffset;
       if (Math.abs(event.actualOffset - expectedOffset) > RESTORE_OFFSET_TOLERANCE_PX) {
         return unchanged(state);
       }
@@ -192,7 +192,12 @@ function reduceInputChanged(
     effects.push(...finished.effects);
   }
 
-  nextState = { ...nextState, currentView: nextView };
+  const viewChanged = nextState.currentView !== null && !sameHistoryView(nextState.currentView, nextView);
+  nextState = {
+    ...nextState,
+    currentView: nextView,
+    terminalCommandKeys: viewChanged ? new Set() : nextState.terminalCommandKeys,
+  };
 
   if (input.kind === 'idle') {
     return { state: nextState, effects };
@@ -278,7 +283,7 @@ function positionEffect(
     commandKey,
     targetIndex,
     align: 'start',
-    viewportStartOffset: -command.viewportStartOffset,
+    viewportStartOffset: command.viewportStartOffset,
   };
 }
 

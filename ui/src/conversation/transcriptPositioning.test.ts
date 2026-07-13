@@ -205,20 +205,20 @@ describe('transcript positioning reducer', () => {
     expect(effects).toEqual([]);
   });
 
-  it('positions restores with an inverted viewport offset and waits for the issued layout revision', () => {
+  it('positions restores with the signed viewport offset and waits for the issued layout revision', () => {
     const command = restore({ viewportStartOffset: 24 });
     const key = transcriptPositioningCommandKey(command);
     let [state] = start(command);
     let effects: TranscriptPositioningEffect[];
 
     [state, effects] = apply(state, { type: 'target_resolved', commandKey: key, targetIndex: 1 });
-    expect(effects).toEqual([{ type: 'position', command, commandKey: key, targetIndex: 1, align: 'start', viewportStartOffset: -24 }]);
+    expect(effects).toEqual([{ type: 'position', command, commandKey: key, targetIndex: 1, align: 'start', viewportStartOffset: 24 }]);
 
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: -24, layoutRevision: 99 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 99 });
     expect(effects).toEqual([]);
 
     [state] = apply(state, { type: 'position_issued', commandKey: key, targetIndex: 1, layoutRevision: 5 });
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: -24, layoutRevision: 4 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4 });
     expect(effects).toEqual([]);
     expect(state.active?.command).toBe(command);
   });
@@ -227,23 +227,23 @@ describe('transcript positioning reducer', () => {
     const command = restore({ viewportStartOffset: 24 });
     const key = transcriptPositioningCommandKey(command);
     const nonTerminalObservations = [
-      { range: null, actualOffset: -24, layoutRevision: 5 },
-      { range: { startIndex: 0, endIndex: 0 }, actualOffset: -24, layoutRevision: 5 },
+      { range: null, actualOffset: 24, layoutRevision: 5 },
+      { range: { startIndex: 0, endIndex: 0 }, actualOffset: 24, layoutRevision: 5 },
       { range: { startIndex: 1, endIndex: 1 }, actualOffset: null, layoutRevision: 5 },
-      { range: { startIndex: 1, endIndex: 1 }, actualOffset: -21.99, layoutRevision: 5 },
-      { range: { startIndex: 1, endIndex: 1 }, actualOffset: -24, layoutRevision: 4 },
+      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 21.99, layoutRevision: 5 },
+      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4 },
     ];
 
     for (const observation of nonTerminalObservations) {
-      let state = resolveAndIssue(command, 1, 5);
+      const state = resolveAndIssue(command, 1, 5);
       const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, ...observation });
       expect(effects).toEqual([]);
       expect(nextState.active?.command).toBe(command);
     }
 
     let state = resolveAndIssue(command, 1, 5);
-    let effects: TranscriptPositioningEffect[];
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: -22, layoutRevision: 5 });
+    const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 22, layoutRevision: 5 });
+    state = nextState;
     expect(effects).toEqual([{ type: 'finish', command, commandKey: key, result: 'applied' }]);
     expect(state.active).toBeNull();
   });

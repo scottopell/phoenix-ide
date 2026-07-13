@@ -5,6 +5,7 @@ import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
 import { MessageList, type MessageListHandle } from '../../components/MessageList';
 import type { HistoryScrollCommand } from '../../conversation/historyExpansion';
+import type { TranscriptPositioningInput } from '../../conversation/transcriptPositioning';
 import '../../index.css';
 import type { Message } from '../../api';
 import type { MessageListScenario } from './types';
@@ -103,6 +104,10 @@ export function MessageListFixture({ scenario }: Props) {
     });
   }, [data.conversationId, messages]);
 
+  const transcriptPositioning: TranscriptPositioningInput = historyScrollCommand
+    ? { kind: 'positioning', command: historyScrollCommand }
+    : { kind: 'idle', view: { conversationId: data.conversationId, generation: 1, transcriptGeneration: 1 } };
+
   const handleHistoryCommand = (token: number) => {
     if (token !== 1) return;
     requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -174,8 +179,7 @@ export function MessageListFixture({ scenario }: Props) {
                   onOpenFile={() => {}}
                   conversationId={data.conversationId}
                   slug={data.slug}
-                  historyScrollCommand={historyScrollCommand}
-                  currentHistoryView={{ conversationId: data.conversationId, generation: 1, transcriptGeneration: 1 }}
+                  transcriptPositioning={transcriptPositioning}
                   onHistoryScrollCommandHandled={handleHistoryCommand}
                 />
               </div>

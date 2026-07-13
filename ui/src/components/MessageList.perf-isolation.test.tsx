@@ -180,7 +180,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
               onOpenFile={undefined}
               conversationId="c1"
               slug={slug}
-            />
+
+              transcriptPositioning={{ kind: 'idle', view: { conversationId: 'c1', generation: 1, transcriptGeneration: 1 } }}/>
           </Profiler>
         </ConversationContext.Provider>
       );
@@ -266,7 +267,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
               onOpenFile={undefined}
               conversationId="c1"
               slug={slug}
-            />
+
+              transcriptPositioning={{ kind: 'idle', view: { conversationId: 'c1', generation: 1, transcriptGeneration: 1 } }}/>
           </Profiler>
         </ConversationContext.Provider>
       );

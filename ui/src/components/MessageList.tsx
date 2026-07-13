@@ -58,7 +58,14 @@ import {
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
-import type { HistoryScrollCommand, RestoreBasis } from '../conversation/historyExpansion';
+import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion';
+import {
+  initialTranscriptPositioningState,
+  reduceTranscriptPositioning,
+  type TranscriptPositioningEffect,
+  type TranscriptPositioningEvent,
+  type TranscriptPositioningInput,
+} from '../conversation/transcriptPositioning';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -71,7 +78,6 @@ const ChevronDown = () => (
   </svg>
 );
 
-const HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX = 2;
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -104,9 +110,8 @@ interface MessageListProps {
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
-  historyScrollCommand?: HistoryScrollCommand | null | undefined;
-  currentHistoryView?: HistoryScrollCommand['view'] | undefined;
-  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => void) | undefined;
+  transcriptPositioning: TranscriptPositioningInput;
+  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryView) => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -301,36 +306,6 @@ function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (
   return null;
 }
 
-type ActiveHistoryCommand = {
-  token: number;
-  view: HistoryScrollCommand['view'];
-  kind: HistoryScrollCommand['kind'];
-};
-
-function ownerForHistoryCommand(command: HistoryScrollCommand): ActiveHistoryCommand {
-  return { token: command.token, view: command.view, kind: command.kind };
-}
-
-function sameHistoryCommandKind(left: HistoryScrollCommand['kind'] | null, right: HistoryScrollCommand['kind'] | null): boolean {
-  return left !== null && right !== null && left === right;
-}
-
-function sameHistoryViewIdentity(left: HistoryScrollCommand['view'] | null, right: HistoryScrollCommand['view'] | null): boolean {
-  return left !== null
-    && right !== null
-    && left.conversationId === right.conversationId
-    && left.generation === right.generation
-    && left.transcriptGeneration === right.transcriptGeneration;
-}
-
-function sameHistoryCommandOwner(left: ActiveHistoryCommand | null, right: ActiveHistoryCommand | null): boolean {
-  return left !== null
-    && right !== null
-    && left.token === right.token
-    && sameHistoryCommandKind(left.kind, right.kind)
-    && sameHistoryViewIdentity(left.view, right.view);
-}
-
 function MessageListImpl({
   messages,
   pendingMessages,
@@ -350,8 +325,7 @@ function MessageListImpl({
   onLoadOlderMessages,
   loadingOlderMessages = false,
   olderHistoryError,
-  historyScrollCommand,
-  currentHistoryView,
+  transcriptPositioning,
   onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
@@ -525,7 +499,10 @@ function MessageListImpl({
   const tailFollowRafRef = useRef(0);
   const settleWatchTimerRef = useRef(0);
   const dispatchScrollEventRef = useRef<(event: ScrollEvent) => void>(() => {});
-  const cancelHistoryCommandRef = useRef<() => void>(() => {});
+  const transcriptPositioningStateRef = useRef(initialTranscriptPositioningState(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  ));
+  const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -645,20 +622,19 @@ function MessageListImpl({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
-      const releaseBeforeInteraction = () => cancelHistoryCommandRef.current();
       const onPointerDown = () => {
-        releaseBeforeInteraction();
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
       };
       const onTouchStart = () => {
-        releaseBeforeInteraction();
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
       const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
       const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
       const onWheel = (e: WheelEvent) => {
-        releaseBeforeInteraction();
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
       };
@@ -863,92 +839,81 @@ function MessageListImpl({
     [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
   );
 
-  const handledHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
-  const acknowledgedHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
-  const activeHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
-  const pendingHistoryAckRef = useRef<{ owner: ActiveHistoryCommand; targetIndex: number; viewportStartOffset: number | null } | null>(null);
   const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
 
-  const releaseContinuityRestoreSuppression = useCallback(() => {
-    continuityRestoreInFlightRef.current = false;
-  }, []);
-
-  const finishHistoryCommand = useCallback((owner: ActiveHistoryCommand, result: 'applied' | 'target_missing' | 'superseded') => {
-    if (sameHistoryCommandOwner(acknowledgedHistoryCommandRef.current, owner)) return;
-    acknowledgedHistoryCommandRef.current = owner;
-    if (sameHistoryCommandOwner(pendingHistoryAckRef.current?.owner ?? null, owner)) pendingHistoryAckRef.current = null;
-    if (sameHistoryCommandOwner(activeHistoryCommandRef.current, owner)) activeHistoryCommandRef.current = null;
-    if (owner.kind === 'restore_after_prefix_expansion') releaseContinuityRestoreSuppression();
-    onHistoryScrollCommandHandled?.(owner.token, result, owner.view);
-  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression]);
-
-  cancelHistoryCommandRef.current = () => {
-    const owner = activeHistoryCommandRef.current;
-    if (owner) finishHistoryCommand(owner, 'superseded');
-  };
-
-  useEffect(() => {
-    cancelHistoryCommandRef.current();
-    pendingHistoryAckRef.current = null;
-    handledHistoryCommandRef.current = null;
-    acknowledgedHistoryCommandRef.current = null;
-    lastVisibleRangeRef.current = null;
-    releaseContinuityRestoreSuppression();
-  }, [conversationId, releaseContinuityRestoreSuppression]);
-
-  useEffect(() => () => {
-    cancelHistoryCommandRef.current();
-  }, []);
-  useEffect(() => {
-    const incomingOwnerOrNull = historyScrollCommand ? ownerForHistoryCommand(historyScrollCommand) : null;
-    const activeOwner = activeHistoryCommandRef.current;
-    if (!sameHistoryCommandOwner(activeOwner, incomingOwnerOrNull) && activeOwner) {
-      finishHistoryCommand(activeOwner, 'superseded');
-    }
-    if (!historyScrollCommand) return;
-    const incomingOwner = ownerForHistoryCommand(historyScrollCommand);
-    if (!sameHistoryViewIdentity(historyScrollCommand.view, currentHistoryView ?? null)) {
-      finishHistoryCommand(incomingOwner, 'superseded');
-      return;
-    }
-    const handled = handledHistoryCommandRef.current;
-    if (sameHistoryCommandOwner(handled, incomingOwner)) return;
-    pendingHistoryAckRef.current = null;
-    activeHistoryCommandRef.current = incomingOwner;
-    handledHistoryCommandRef.current = incomingOwner;
-    acknowledgedHistoryCommandRef.current = null;
-    const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
-      ? historyScrollCommand.messageId
-      : historyScrollCommand.targetMessageId;
-    const index = findUnitIndexByMessageId(messageId);
-    if (index < 0) {
-      finishHistoryCommand(incomingOwner, 'target_missing');
-      return;
-    }
-    pendingHistoryAckRef.current = {
-      owner: incomingOwner,
-      targetIndex: index,
-      viewportStartOffset: historyScrollCommand.kind === 'restore_after_prefix_expansion'
-        ? historyScrollCommand.viewportStartOffset
-        : null,
-    };
-    if (historyScrollCommand.kind === 'jump_to_message') {
-      scrollToUnitIndex(index);
-    } else {
-      continuityRestoreInFlightRef.current = true;
-      transcriptRef.current?.scrollToIndex(index, 'start', historyScrollCommand.viewportStartOffset);
-    }
-    const lastVisibleRange = lastVisibleRangeRef.current;
-    if (lastVisibleRange && index >= lastVisibleRange.startIndex && index <= lastVisibleRange.endIndex) {
-      const actualOffset = historyScrollCommand.kind === 'restore_after_prefix_expansion'
-        ? transcriptRef.current?.measureOffsetForIndex(index) ?? null
-        : null;
-      if (historyScrollCommand.kind === 'jump_to_message'
-        || (actualOffset !== null && Math.abs(actualOffset - historyScrollCommand.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX)) {
-        finishHistoryCommand(incomingOwner, 'applied');
+  const applyTranscriptPositioningEffects = useCallback((effects: TranscriptPositioningEffect[]) => {
+    for (const effect of effects) {
+      switch (effect.type) {
+        case 'resolve_target': {
+          const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
+          dispatchTranscriptPositioningRef.current(
+            targetIndex < 0
+              ? { type: 'target_missing', commandKey: effect.commandKey }
+              : { type: 'target_resolved', commandKey: effect.commandKey, targetIndex },
+          );
+          break;
+        }
+        case 'position': {
+          const command = effect.command;
+          if (command.kind === 'jump_to_message') {
+            const unit = historicalUnits[effect.targetIndex];
+            if (unit) {
+              dispatchScrollEvent({ type: 'navigationJumped' });
+              clearHighlight();
+              pendingPulseRef.current = { conversationId, key: unit.key };
+              if (effect.viewportStartOffset === undefined) {
+                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
+              } else {
+                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+              }
+              pulseIfMounted(unit.key);
+            }
+          } else {
+            continuityRestoreInFlightRef.current = true;
+            transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+          }
+          const layoutRevision = transcriptRef.current?.layoutRevision() ?? 0;
+          dispatchTranscriptPositioningRef.current({
+            type: 'position_issued',
+            commandKey: effect.commandKey,
+            targetIndex: effect.targetIndex,
+            layoutRevision,
+          });
+          dispatchTranscriptPositioningRef.current({
+            type: 'physical_observed',
+            commandKey: effect.commandKey,
+            range: lastVisibleRangeRef.current,
+            actualOffset: command.kind === 'restore_after_prefix_expansion'
+              ? transcriptRef.current?.measureOffsetForIndex(effect.targetIndex) ?? null
+              : null,
+            layoutRevision,
+          });
+          break;
+        }
+        case 'finish':
+          if (effect.command.kind === 'restore_after_prefix_expansion') {
+            continuityRestoreInFlightRef.current = false;
+          }
+          onHistoryScrollCommandHandled?.(effect.command.token, effect.result, effect.command.view);
+          break;
       }
     }
-  }, [currentHistoryView, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, scrollToUnitIndex]);
+  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted]);
+
+  const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
+    const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
+    transcriptPositioningStateRef.current = next.state;
+    applyTranscriptPositioningEffects(next.effects);
+  }, [applyTranscriptPositioningEffects]);
+  dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
+
+  useEffect(() => {
+    dispatchTranscriptPositioning({ type: 'input_changed', input: transcriptPositioning });
+  }, [dispatchTranscriptPositioning, transcriptPositioning]);
+
+  useEffect(() => () => {
+    dispatchTranscriptPositioningRef.current({ type: 'executor_detached' });
+  }, []);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -990,23 +955,21 @@ function MessageListImpl({
     if (!range) return;
     firstVisibleUnitIndexRef.current = range.startIndex;
     lastVisibleRangeRef.current = range;
-    const pendingAck = pendingHistoryAckRef.current;
-    if (
-      pendingAck
-      && pendingAck.targetIndex >= range.startIndex
-      && pendingAck.targetIndex <= range.endIndex
-    ) {
-      if (pendingAck.viewportStartOffset === null) {
-        finishHistoryCommand(pendingAck.owner, 'applied');
-      } else {
-        const actualOffset = transcriptRef.current?.measureOffsetForIndex(pendingAck.targetIndex) ?? null;
-        if (actualOffset !== null && Math.abs(actualOffset - pendingAck.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX) {
-          finishHistoryCommand(pendingAck.owner, 'applied');
-        }
-      }
+    const active = transcriptPositioningStateRef.current.active;
+    const phase = transcriptPositioningStateRef.current.phase;
+    if (active && phase?.kind === 'awaiting_physical') {
+      dispatchTranscriptPositioningRef.current({
+        type: 'physical_observed',
+        commandKey: active.key,
+        range,
+        actualOffset: active.command.kind === 'restore_after_prefix_expansion'
+          ? transcriptRef.current?.measureOffsetForIndex(phase.targetIndex) ?? null
+          : null,
+        layoutRevision: transcriptRef.current?.layoutRevision() ?? 0,
+      });
     }
     onVisibleRangeChange?.(range);
-  }, [finishHistoryCommand, onVisibleRangeChange]);
+  }, [onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);

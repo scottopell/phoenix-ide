@@ -30,6 +30,7 @@ export interface VirtualTranscriptHandle {
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
   measureOffsetForIndex(index: number): number | null;
+  layoutRevision(): number;
 }
 
 export interface VirtualTranscriptProps<T> {
@@ -501,6 +502,9 @@ function VirtualTranscriptInner<T>(
       const offset = itemPhysicalOffset(current, index);
       if (offset === undefined) return null;
       return offset - current.viewportTop;
+    },
+    layoutRevision() {
+      return storeRef.current?.revision ?? 0;
     },
   }), [publish]);
 
