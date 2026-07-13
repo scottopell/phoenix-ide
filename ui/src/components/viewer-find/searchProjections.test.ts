@@ -5,6 +5,7 @@ import type { RenderUnit } from '../../conversation/renderUnits';
 import {
   buildAgentTextFragments,
   buildPatchOutputProjection,
+  buildReadFileOutputProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
@@ -234,6 +235,40 @@ describe('typed semantic display projections', () => {
       family: 'tmux',
       toolUseId: 'tmux-1',
     });
+  });
+
+  it('includes renderer-visible terminal status and exit labels', () => {
+    const bash = buildTerminalToolResultProjection(
+      'bash',
+      JSON.stringify({ status: 'kill_pending_kernel', exit_code: 1, truncated_before: true }),
+      undefined,
+    );
+    expect(bash.fullText).toContain('kill pending (kernel)');
+    expect(bash.fullText).toContain('[output truncated before this view]');
+
+    const tmux = buildTerminalToolResultProjection(
+      'tmux',
+      JSON.stringify({ status: 'exited', exit_code: 1, truncated: true }),
+      undefined,
+    );
+    expect(tmux.fullText).toContain('exit code 1');
+    expect(tmux.fullText).toContain('[output truncated]');
+  });
+
+  it('skips numbered read_file metadata while retaining legacy plain lines', () => {
+    const numbered = buildReadFileOutputProjection(
+      '     7\talpha\n     8\tbeta\n\n[12 more lines not shown. Use offset=9 to continue.]\n',
+      { path: 'src/foo.ts', offset: 7, limit: 2 },
+    );
+    const numberedLines = numbered.fragments.filter((fragment) => fragment.kind === 'line');
+    expect(numberedLines.map((fragment) => fragment.semanticText)).toEqual(['7\talpha', '8\tbeta']);
+    expect(numbered.fullText).not.toContain('more lines not shown');
+
+    const legacy = buildReadFileOutputProjection('plain alpha\nplain beta\n', { path: 'legacy.txt', offset: 4 });
+    expect(legacy.fragments.filter((fragment) => fragment.kind === 'line').map((fragment) => fragment.semanticText)).toEqual([
+      '4\tplain alpha',
+      '5\tplain beta',
+    ]);
   });
 
   it('keeps complete sub-agent outcomes searchable behind compact previews', () => {

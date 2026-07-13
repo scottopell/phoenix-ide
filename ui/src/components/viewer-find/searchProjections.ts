@@ -888,8 +888,13 @@ function buildReadFileProjectionFragments(
 
   const duplicateLineCounts = new Map<string, number>();
   const startLine = typeof input['offset'] === 'number' ? input['offset'] : 1;
-  for (const [lineIndex, rawLine] of text.split('\n').entries()) {
-    const renderedLine = parseReadFileRenderedLine(rawLine) ?? {
+  const rawLines = text.split('\n');
+  const hasNumberedLines = rawLines.some((line) => parseReadFileRenderedLine(line) !== null);
+  for (const [lineIndex, rawLine] of rawLines.entries()) {
+    const parsedLine = parseReadFileRenderedLine(rawLine);
+    if (hasNumberedLines && !parsedLine) continue;
+    if (!hasNumberedLines && rawLine === '' && lineIndex === rawLines.length - 1) continue;
+    const renderedLine = parsedLine ?? {
       lineNumber: startLine + lineIndex,
       content: rawLine,
     };
@@ -970,7 +975,7 @@ export function buildTerminalToolResultProjection(
     : family === 'console-logs'
       ? semanticConsoleLogsText(resultText)
       : family === 'bash' || family === 'tmux'
-        ? semanticStructuredResultText(resultText)
+        ? semanticStructuredResultText(resultText, family)
         : resultText;
   const fragmentId = `terminal-result:${family}`;
   const fragment: TerminalToolResultFragment = {
@@ -1014,9 +1019,36 @@ function semanticConsoleLogsText(resultText: string): string {
   }
 }
 
-function semanticStructuredResultText(resultText: string): string {
+function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux'): string {
   try {
-    return semanticObjectText(JSON.parse(resultText));
+    const parsed = JSON.parse(resultText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return semanticObjectText(parsed);
+    const record = parsed as Record<string, unknown>;
+    const semantic = semanticObjectText(record);
+    const visibleLabels: string[] = [];
+    const status = typeof record['status'] === 'string' ? record['status'] : '';
+    if (family === 'bash') {
+      const statusLabel = status === 'still_running'
+        ? 'still running'
+        : status === 'kill_pending_kernel'
+          ? 'kill pending (kernel)'
+          : status;
+      if (statusLabel) visibleLabels.push(statusLabel);
+      if ((status === 'exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
+        visibleLabels.push(`exit code ${String(record['exit_code'])}`);
+      }
+      if ((status === 'killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
+        visibleLabels.push(`signal ${String(record['signal_number'])}`);
+      }
+      if (record['truncated_before'] === true) visibleLabels.push('[output truncated before this view]');
+    } else {
+      if (status) visibleLabels.push(status);
+      if (record['exit_code'] !== null && record['exit_code'] !== undefined) {
+        visibleLabels.push(`exit code ${String(record['exit_code'])}`);
+      }
+      if (record['truncated'] === true) visibleLabels.push('[output truncated]');
+    }
+    return [...visibleLabels, semantic].filter(Boolean).join('\n');
   } catch {
     return resultText;
   }
