@@ -933,7 +933,7 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
             transition_id: "cancel-transition".to_owned(),
             expected_version: 1,
             expected_generation: 0,
-            contract_id: "wake-contract",
+            contract_id: "wake-contract".to_owned(),
             resource: bash(),
             resolved_at: Timestamp(1_015),
             committed_at: Utc.timestamp_opt(1_016, 0).single().unwrap(),
@@ -1087,7 +1087,7 @@ async fn cancellation_suppresses_only_linked_obligation_and_preserves_same_conve
             transition_id: "cancel-transition-scoped".to_owned(),
             expected_version: 1,
             expected_generation: 0,
-            contract_id: "wake-contract",
+            contract_id: "wake-contract".to_owned(),
             resource: bash(),
             resolved_at: Timestamp(1_030),
             committed_at: Utc.timestamp_opt(1_030, 0).single().unwrap(),
@@ -1121,16 +1121,16 @@ async fn cancellation_revokes_live_claim_and_rejects_wrong_effect_id() {
         transition_id: "cancel-transition".to_owned(),
         expected_version: 1,
         expected_generation: 0,
-        contract_id: "wake-contract",
+        contract_id: "wake-contract".to_owned(),
         resource: bash(),
         resolved_at: Timestamp(1_015),
         committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),
     };
     assert!(!adapter.cancel(&request).await.unwrap());
     request.observe_effect_id = "wake-observe:wake-workflow".to_owned();
-    request.contract_id = "wrong-contract";
+    request.contract_id = "wrong-contract".to_owned();
     assert!(!adapter.cancel(&request).await.unwrap());
-    request.contract_id = "wake-contract";
+    request.contract_id = "wake-contract".to_owned();
     request.resource = WakeResourceIdentity::Bash(BashResourceIdentity {
         work_scope: scope(),
         handle_id: "wrong-handle".to_owned(),
@@ -1179,7 +1179,7 @@ async fn cancellation_losing_to_terminal_receipt_rolls_back_without_cancel_event
             transition_id: "cancel-transition".to_owned(),
             expected_version: 1,
             expected_generation: 0,
-            contract_id: "wake-contract",
+            contract_id: "wake-contract".to_owned(),
             resource: bash(),
             resolved_at: Timestamp(1_015),
             committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),

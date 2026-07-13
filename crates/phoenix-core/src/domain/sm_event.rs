@@ -27,8 +27,9 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WakeObservationResult {
+    pub inbox_id: String,
     pub message_id: String,
-    pub result: ToolResult,
+    pub content: String,
 }
 
 /// Events that trigger state transitions

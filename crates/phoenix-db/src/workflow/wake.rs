@@ -113,7 +113,7 @@ pub struct WakeCancellationRequest {
     pub transition_id: String,
     pub expected_version: u64,
     pub expected_generation: u64,
-    pub contract_id: &'static str,
+    pub contract_id: String,
     pub resource: WakeResourceIdentity,
     pub resolved_at: Timestamp,
     pub committed_at: DateTime<Utc>,
@@ -135,6 +135,8 @@ type OwedToolResultRow = (
     Option<i64>,
     Option<String>,
     Option<String>,
+    String,
+    String,
 );
 
 impl<'a> WakeWorkflowAdapter<'a> {
@@ -150,7 +152,9 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let rows: Vec<OwedToolResultRow> = sqlx::query_as(
             "SELECT wi.id, b.registering_tool_use_id, r.resource_kind, r.status, \
              r.bash_status, r.bash_exit_code, r.bash_duration_ms, r.bash_signal_number, \
-             r.tmux_status, b.tmux_window_id \
+             r.tmux_status, b.tmux_window_id, \
+             (SELECT json_group_array(line) FROM (SELECT line FROM wake_terminal_receipt_bash_tail WHERE receipt_id = r.receipt_id ORDER BY ordinal)), \
+             (SELECT json_group_array(line) FROM (SELECT line FROM wake_terminal_receipt_tmux_tail WHERE receipt_id = r.receipt_id ORDER BY ordinal)) \
              FROM wake_runtime_obligations o \
              JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
              JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
@@ -174,7 +178,17 @@ impl<'a> WakeWorkflowAdapter<'a> {
                     signal_number,
                     tmux_status,
                     window_id,
+                    bash_tail_json,
+                    tmux_tail_json,
                 )| {
+                    let bash_tail: Vec<String> =
+                        serde_json::from_str(&bash_tail_json).map_err(|error| {
+                            WorkflowRepositoryError::CorruptState(error.to_string())
+                        })?;
+                    let tmux_tail: Vec<String> =
+                        serde_json::from_str(&tmux_tail_json).map_err(|error| {
+                            WorkflowRepositoryError::CorruptState(error.to_string())
+                        })?;
                     let output = serde_json::to_string(&serde_json::json!({
                         "status": bash_status.or(tmux_status).unwrap_or(status),
                         "resource_kind": resource_kind,
@@ -182,6 +196,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
                         "exit_code": exit_code,
                         "duration_ms": duration_ms,
                         "signal_number": signal_number,
+                        "final_tail": if bash_tail.is_empty() { tmux_tail } else { bash_tail },
                     }))
                     .map_err(|error| WorkflowRepositoryError::CorruptState(error.to_string()))?;
                     Ok((inbox_id, tool_use_id, output))
@@ -199,25 +214,32 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .map_err(Into::into)
     }
 
-    pub async fn accept_owed_for_conversation(
+    pub async fn accept_owed_items(
         &self,
         conversation_id: &str,
+        inbox_ids: &[String],
         accepted_at: DateTime<Utc>,
     ) -> WorkflowRepositoryResult<u64> {
+        if inbox_ids.is_empty() {
+            return Ok(0);
+        }
         let mut tx = self.repository.pool().begin().await?;
-        let result = sqlx::query(
-            "UPDATE wake_runtime_obligations SET status = 'accepted', resolved_at = ?1, terminal_reason = 'accepted' \
-             WHERE conversation_id = ?2 AND status = 'owed'",
-        )
-        .bind(accepted_at.to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
+        let encoded_ids = serde_json::to_string(inbox_ids)
+            .map_err(|error| WorkflowRepositoryError::CorruptState(error.to_string()))?;
         sqlx::query(
             "UPDATE wake_observation_inbox SET consumed_at = ?1 WHERE consumed_at IS NULL \
-             AND id IN (SELECT i.inbox_item_id FROM wake_runtime_obligation_items i \
-             JOIN wake_runtime_obligations o ON o.id = i.obligation_id \
-             WHERE o.conversation_id = ?2 AND o.status = 'accepted')",
+             AND id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(accepted_at.to_rfc3339())
+        .bind(&encoded_ids)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "UPDATE wake_runtime_obligations SET status = 'accepted', resolved_at = ?1, terminal_reason = 'accepted' \
+             WHERE conversation_id = ?2 AND status = 'owed' \
+             AND NOT EXISTS (SELECT 1 FROM wake_runtime_obligation_items i \
+             JOIN wake_observation_inbox wi ON wi.id = i.inbox_item_id \
+             WHERE i.obligation_id = wake_runtime_obligations.id AND wi.consumed_at IS NULL)",
         )
         .bind(accepted_at.to_rfc3339())
         .bind(conversation_id)
@@ -234,12 +256,64 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let exists = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(SELECT 1 FROM wake_workflow_bindings b \
              JOIN workflows w ON w.id = b.workflow_id \
-             WHERE b.conversation_id = ?1 AND w.status NOT IN ('completed', 'cancelled'))",
+             WHERE b.conversation_id = ?1 AND (w.status NOT IN ('completed', 'cancelled') \
+             OR EXISTS (SELECT 1 FROM wake_runtime_obligations o WHERE o.conversation_id = b.conversation_id AND o.status = 'owed')))",
         )
         .bind(conversation_id)
         .fetch_one(self.repository.pool())
         .await?;
         Ok(exists != 0)
+    }
+
+    pub async fn cancel_pending_for_conversation(
+        &self,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<u64> {
+        let workflow_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT b.workflow_id FROM wake_workflow_bindings b JOIN workflows w ON w.id = b.workflow_id \
+             WHERE b.conversation_id = ?1 AND w.status = 'active' ORDER BY b.workflow_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.repository.pool())
+        .await?;
+        let mut cancelled = 0;
+        for workflow_id in workflow_ids {
+            let binding = self.load_binding(&workflow_id).await?;
+            let observe_effect_id: String = sqlx::query_scalar(
+                "SELECT observe_effect_id FROM wake_workflow_bindings WHERE workflow_id = ?1",
+            )
+            .bind(&workflow_id)
+            .fetch_one(self.repository.pool())
+            .await?;
+            let state: (i64, i64) =
+                sqlx::query_as("SELECT version, generation FROM workflows WHERE id = ?1")
+                    .bind(&workflow_id)
+                    .fetch_one(self.repository.pool())
+                    .await?;
+            let request = WakeCancellationRequest {
+                workflow_id: workflow_id.clone(),
+                observe_effect_id,
+                reducer_inbox_id: format!("wake-cancel-inbox-{}", uuid::Uuid::new_v4()),
+                transition_id: format!("wake-cancel-transition-{}", uuid::Uuid::new_v4()),
+                expected_version: state.0.try_into().map_err(|_| {
+                    WorkflowRepositoryError::CorruptState("negative wake version".to_owned())
+                })?,
+                expected_generation: state.1.try_into().map_err(|_| {
+                    WorkflowRepositoryError::CorruptState("negative wake generation".to_owned())
+                })?,
+                contract_id: binding.contract_id,
+                resource: binding.resource,
+                resolved_at: Timestamp(now.timestamp().try_into().map_err(|_| {
+                    WorkflowRepositoryError::CorruptState(
+                        "wake cancellation timestamp out of range".to_owned(),
+                    )
+                })?),
+                committed_at: now,
+            };
+            cancelled += u64::from(self.cancel(&request).await?);
+        }
+        Ok(cancelled)
     }
 
     pub async fn rekey_scope_for_conversation(
@@ -765,7 +839,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
             return Ok(false);
         }
         let terminal = WakeTerminalPayload::Cancelled {
-            contract_id: request.contract_id.to_owned(),
+            contract_id: request.contract_id.clone(),
             resource: request.resource.clone(),
             reason: WakeCancellationReason::ExplicitCancel,
             resolved_at: request.resolved_at,
@@ -965,7 +1039,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
         )
         .bind(&cancellation_receipt_id)
         .bind(&request.workflow_id)
-        .bind(request.contract_id)
+        .bind(&request.contract_id)
         .bind(&request.observe_effect_id)
         .bind(match request.resource { WakeResourceIdentity::Bash(_) => "bash", WakeResourceIdentity::TmuxWindow(_) => "tmux_window" })
         .bind(terminal_resolved_at.to_rfc3339())

@@ -442,7 +442,7 @@ async fn wait_for_text_response(
             None
         };
         if let Some(status) = status {
-            if close_after_completion && observation.readiness_seen && !exited {
+            if close_after_completion && !exited {
                 disable_remain_on_exit(config_path, socket_path, &target.window_id).await;
             }
             let response = structured_response(

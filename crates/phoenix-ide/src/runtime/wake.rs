@@ -9,10 +9,7 @@ use std::{sync::Arc, time::Duration as StdDuration};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use phoenix_core::{
-    domain::{
-        db_schema::ToolResult,
-        sm_event::{Event, WakeObservationResult},
-    },
+    domain::sm_event::{Event, WakeObservationResult},
     work_scope::WorkScope,
 };
 use phoenix_db::workflow::{
@@ -459,15 +456,31 @@ async fn deliver_owed(
         .await
         .map_err(|error| error.to_string())?
     {
+        let conversation = manager
+            .db()
+            .get_conversation(&conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            conversation.state,
+            phoenix_core::domain::sm_state::ConvState::Idle
+        ) {
+            continue;
+        }
         let results = adapter
             .owed_tool_results(&conversation_id)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
-            .map(|(inbox_id, tool_use_id, output)| WakeObservationResult {
-                message_id: format!("wake-result-{inbox_id}"),
-                result: ToolResult::success(tool_use_id, output),
-            })
+            .map(
+                |(inbox_id, registering_tool_use_id, output)| WakeObservationResult {
+                    message_id: format!("wake-result-{inbox_id}"),
+                    content: format!(
+                    "Durable wait observation for registration {registering_tool_use_id}: {output}"
+                ),
+                    inbox_id,
+                },
+            )
             .collect();
         manager
             .send_event(&conversation_id, Event::WakeObservationReady { results })
@@ -625,7 +638,7 @@ async fn inspect_binding(
                         status: BashTerminalStatus::KillPendingKernel,
                         occurred_at: timestamp(observed_at)?,
                         exit_code: None,
-                        duration_ms: None,
+                        duration_ms: Some(0),
                         signal_number: None,
                         kill_signal_sent: None,
                         tail_start_offset: 0,

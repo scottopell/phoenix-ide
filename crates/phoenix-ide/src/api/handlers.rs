@@ -3695,6 +3695,22 @@ async fn cancel_conversation(
         }));
     }
 
+    if matches!(conversation.state, ConvState::Idle) {
+        let repository =
+            phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+        let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .cancel_pending_for_conversation(&id, chrono::Utc::now())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if cancelled > 0 {
+            state.runtime.kick_wake_worker();
+            return Ok(Json(CancelResponse {
+                ok: true,
+                no_op: false,
+            }));
+        }
+    }
+
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
         tracing::debug!(
             conv_id = %id,

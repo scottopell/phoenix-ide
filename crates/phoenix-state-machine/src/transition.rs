@@ -759,15 +759,9 @@ pub fn transition_core(
         (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
             let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
             for wake_result in results {
-                let result = &wake_result.result;
                 transition = transition.with_effect(Effect::PersistMessage {
-                    content: MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        false,
-                        result.images().to_vec(),
-                    ),
-                    display_data: result.display_data().cloned(),
+                    content: MessageContent::user(&wake_result.content),
+                    display_data: None,
                     usage_data: None,
                     message_id: wake_result.message_id.clone(),
                     idempotent: true,
