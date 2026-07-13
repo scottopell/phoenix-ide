@@ -166,6 +166,12 @@ pub enum AuthorityOutcome {
     StaleAuthority,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalResult {
+    pub outcome: AuthorityOutcome,
+    pub authority: Option<ClaimAuthority>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReducerInboxKind {
     ReceiptAccepted,
@@ -210,6 +216,10 @@ pub enum OwedAcceptanceDisposition {
 pub enum ResolutionStatus {
     Required,
     Resolved,
+    Suppressed {
+        transition: TransitionId,
+        reason: SuppressionReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,15 +294,31 @@ pub struct ProtocolSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NonEmptyExternalKey(String);
+
+impl NonEmptyExternalKey {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalAcceptanceKey {
     pub profile: ProfileRef,
-    pub authority_scope: String,
-    pub idempotency_key: String,
+    pub authority_scope: NonEmptyExternalKey,
+    pub idempotency_key: NonEmptyExternalKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAcceptanceReceipt<H> {
-    pub idempotency_key: String,
+    pub idempotency_key: NonEmptyExternalKey,
     pub workflow_id: WorkflowId,
     pub handle: H,
 }
@@ -379,6 +405,20 @@ pub trait WorkflowProfile {
     type ManualPayload: Clone + Eq + std::fmt::Debug;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool;
+
+    fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool;
+
+    fn decision_handles_inbox(
+        event: &ReducerInboxPayload<Self>,
+        decision_event: &Self::Event,
+    ) -> bool
+    where
+        Self: Sized;
+
+    fn decision_handles_owed_acceptance(
+        event: &Self::OwedAcceptanceEvent,
+        decision_event: &Self::Event,
+    ) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +492,18 @@ pub struct TransitionPlan<P: WorkflowProfile> {
 pub struct ReducerDecision<P: WorkflowProfile> {
     pub expected_workflow_version: Version,
     pub plan: TransitionPlan<P>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxDecisionBinding<P: WorkflowProfile> {
+    pub inbox: Vec<ReducerInboxEvent<P>>,
+    pub decision: ReducerDecision<P>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedAcceptanceDecisionBinding<P: WorkflowProfile> {
+    pub owed: OwedAcceptanceRecord<P::OwedAcceptanceEvent>,
+    pub decision: ReducerDecision<P>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
