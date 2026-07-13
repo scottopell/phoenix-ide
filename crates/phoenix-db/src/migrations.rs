@@ -2325,6 +2325,22 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         applied += 1;
     }
 
+    let projection_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('creation_shadow_projections')")
+            .fetch_all(pool)
+            .await?;
+    if !projection_columns.is_empty()
+        && !projection_columns
+            .iter()
+            .any(|name| name == "oracle_revision")
+    {
+        sqlx::query(
+            "ALTER TABLE creation_shadow_projections ADD COLUMN oracle_revision INTEGER NOT NULL DEFAULT 0 CHECK (oracle_revision >= 0)",
+        )
+        .execute(pool)
+        .await?;
+    }
+
     if applied > 0 {
         tracing::info!(applied, "Database migrations complete");
     }

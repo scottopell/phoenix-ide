@@ -1000,6 +1000,10 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
         ),
         (COMMIT_METADATA, AuthoritativeCreationStage::CommitMetadata),
     ];
+    if !oracle.intent.uses_worktree {
+        effects
+            .retain(|(id, _)| !matches!(*id, RESERVE_WORKTREE | MATERIALIZE_OR_RECONCILE_WORKTREE));
+    }
     match oracle.intent.kind {
         CreationKind::InitialTurn { .. } => effects.extend([
             (

@@ -156,16 +156,8 @@ impl CreationShadowCoordinator {
                 oracle.intent.job_id
             ),
         });
-        let current_conversation = self
-            .db
-            .get_conversation(&oracle.intent.conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let observed = observed_projection(
-            &current_conversation.state,
-            current_conversation.archived,
-            &oracle.status,
-        );
+        let observed =
+            observed_projection(&conversation.state, conversation.archived, &oracle.status);
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,
@@ -246,7 +238,7 @@ fn oracle_from_committed(
             idempotency_key: job.id,
             repository_path,
             worktree_path,
-            uses_worktree: job.intent.mode.as_deref() != Some("direct"),
+            uses_worktree: !matches!(conv_mode, Some(ConvMode::Direct)),
             branch_name,
             initial_text: job.intent.text,
             attachment_ids,
