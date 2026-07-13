@@ -48,7 +48,7 @@ When status or deployment encounters a stale nonterminal transaction, the system
 
 ### REQ-LDD-011 — Explicit candidate sources
 
-The local command shall deploy exact local `HEAD` after checks and compilation. The release command shall resolve one immutable published tag, select the host-architecture macOS asset, verify its `SHA256SUMS` entry and embedded identity, and shall not run repository checks, dependency installation, worktree mutation, or compilation.
+The local command shall deploy exact local `HEAD` after checks and compilation. The release command shall resolve one immutable published tag and its exact commit, select the host-architecture macOS asset, verify its `SHA256SUMS` entry and require its embedded git SHA to match that commit, and shall not run repository checks, dependency installation, worktree mutation, or compilation.
 
 ### REQ-LDD-012 — Unambiguous command surface
 

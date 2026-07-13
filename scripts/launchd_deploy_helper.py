@@ -40,6 +40,7 @@ class Manifest:
     source_kind: str
     source_commit: str
     release_tag: Optional[str]
+    release_commit: Optional[str]
     expected: Identity
     previous: Optional[Identity]
     candidate_binary: str
@@ -137,6 +138,7 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         "source_kind": manifest.source_kind,
         "source_commit": manifest.source_commit,
         "release_tag": manifest.release_tag,
+        "release_commit": manifest.release_commit,
         "expected_version": manifest.expected.version,
         "expected_git_sha": manifest.expected.git_sha,
         "created_at": manifest.created_at,
@@ -258,6 +260,24 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
     wait_for_identity(manifest, manifest.previous)
 
 
+def release_claim(manifest: Manifest) -> bool:
+    claim = Path(manifest.active_path)
+    try:
+        if claim.read_text().strip() != manifest.transaction_id:
+            return False
+        claim.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def request_helper_bootout(uid: int, helper_label: str) -> None:
+    subprocess.Popen(
+        ["launchctl", "bootout", f"gui/{uid}/{helper_label}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
 def activate(manifest: Manifest) -> str:
     lock_path = Path(manifest.lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +285,6 @@ def activate(manifest: Manifest) -> str:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            write_status(manifest, "rejected_concurrent", failure="another deployment owns the activation lock")
             raise ConcurrentDeploy("another deployment is already activating") from exc
 
         try:
@@ -311,25 +330,29 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("activate", nargs="?")
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--helper-label", required=True)
+    parser.add_argument("--uid", type=int, required=True)
     args = parser.parse_args()
-    manifest = Manifest.load(args.manifest)
+    manifest = None
     try:
+        manifest = Manifest.load(args.manifest)
+        if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
+            raise ActivationError("helper identity does not match the immutable manifest")
         state = activate(manifest)
         if state in TERMINAL_STATES:
-            shutil.rmtree(manifest.active_path, ignore_errors=True)
+            release_claim(manifest)
         print(state, flush=True)
-        subprocess.Popen(
-            ["launchctl", "bootout", f"gui/{manifest.uid}/{manifest.helper_label}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        )
         return 0 if state == "committed" else 1
     except ConcurrentDeploy as exc:
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        shutil.rmtree(manifest.active_path, ignore_errors=True)
+        if manifest is not None:
+            release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        request_helper_bootout(args.uid, args.helper_label)
 
 
 if __name__ == "__main__":

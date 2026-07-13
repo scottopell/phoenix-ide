@@ -7149,7 +7149,7 @@ def _release_asset_name() -> str:
         raise SystemExit(f"no published macOS release asset for host architecture {machine!r}") from exc
 
 
-def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str, str]:
+def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str, str, str]:
     if requested == "latest":
         view = subprocess.run(
             ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
@@ -7166,6 +7166,14 @@ def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str
         raise SystemExit("latest resolved to a prerelease; name an exact prerelease tag to opt in")
     if requested != "latest" and tag != requested:
         raise SystemExit(f"release resolution mismatch: requested {requested}, resolved {tag}")
+
+    commit_result = subprocess.run(
+        ["gh", "api", f"repos/scottopell/phoenix-ide/commits/{tag}", "--jq", ".sha"],
+        capture_output=True, text=True, check=True,
+    )
+    release_commit = commit_result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", release_commit):
+        raise SystemExit(f"release {tag} did not resolve to an immutable commit SHA")
 
     asset_name = _release_asset_name()
     subprocess.run(
@@ -7187,47 +7195,69 @@ def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str
         raise SystemExit(f"SHA256SUMS has no entry for {asset_name}")
     if _file_sha256(binary) != expected.lower():
         raise SystemExit(f"checksum mismatch for release asset {asset_name}")
+    binary.chmod(0o755)
     identity = _binary_identity(binary)
     expected_version = tag.removeprefix("v")
     if identity["version"] != expected_version:
         raise SystemExit(
             f"release {tag} embeds version {identity['version']}, expected {expected_version}"
         )
-    return binary, tag, identity["git_sha"]
+    if not release_commit.startswith(identity["git_sha"].removesuffix("-dirty")):
+        raise SystemExit(
+            f"release {tag} resolves to {release_commit}, but the asset embeds {identity['git_sha']}"
+        )
+    return binary, tag, identity["git_sha"], release_commit
+
+
+_DEPLOY_TERMINAL_STATES = {
+    "committed", "precondition_failed", "activation_failed_rolled_back",
+    "activation_failed_rollback_failed", "rejected_concurrent",
+}
+
+
+def _deploy_claim_owner() -> str | None:
+    try:
+        return LAUNCHD_DEPLOY_ACTIVE_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _release_launchd_deploy_claim(transaction_id: str) -> bool:
+    if _deploy_claim_owner() != transaction_id:
+        return False
+    try:
+        LAUNCHD_DEPLOY_ACTIVE_PATH.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def _claim_launchd_deploy(transaction_id: str) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
-    if LAUNCHD_DEPLOY_ACTIVE_PATH.exists() and LAUNCHD_DEPLOY_STATUS_PATH.exists():
-        try:
-            prior_state = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text()).get("state")
-            if prior_state in {
-                "committed", "precondition_failed", "activation_failed_rolled_back",
-                "activation_failed_rollback_failed", "rejected_concurrent",
-            }:
-                shutil.rmtree(LAUNCHD_DEPLOY_ACTIVE_PATH)
-        except (OSError, json.JSONDecodeError):
-            pass
-    try:
-        LAUNCHD_DEPLOY_ACTIVE_PATH.mkdir()
-    except FileExistsError as exc:
-        detail = ""
-        if LAUNCHD_DEPLOY_STATUS_PATH.exists():
+    for _attempt in range(2):
+        owner = _deploy_claim_owner()
+        if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
             try:
                 status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-                detail = f" Last state: {status.get('state', 'unknown')}."
-            except Exception:
+                if status.get("transaction_id") == owner and status.get("state") in _DEPLOY_TERMINAL_STATES:
+                    _release_launchd_deploy_claim(owner)
+            except (OSError, json.JSONDecodeError):
                 pass
-        raise SystemExit(
-            "another launchd deployment is active or needs recovery." + detail
-            + " Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
-        ) from exc
-    (LAUNCHD_DEPLOY_ACTIVE_PATH / "transaction-id").write_text(transaction_id + "\n")
-
-
-def _release_launchd_deploy_claim() -> None:
-    shutil.rmtree(LAUNCHD_DEPLOY_ACTIVE_PATH, ignore_errors=True)
+        try:
+            fd = os.open(LAUNCHD_DEPLOY_ACTIVE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(transaction_id + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            return
+        except FileExistsError:
+            continue
+    owner = _deploy_claim_owner() or "unknown"
+    raise SystemExit(
+        f"another launchd deployment ({owner}) is active or needs recovery. "
+        "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
+    )
 
 
 def _write_json_atomic(path: Path, value: dict) -> None:
@@ -7244,7 +7274,10 @@ def _write_json_atomic(path: Path, value: dict) -> None:
 def _helper_plist(label: str, helper: Path, manifest: Path, log_path: Path) -> bytes:
     return plistlib.dumps({
         "Label": label,
-        "ProgramArguments": ["/usr/bin/python3", str(helper), "activate", "--manifest", str(manifest)],
+        "ProgramArguments": [
+            "/usr/bin/python3", str(helper), "activate", "--manifest", str(manifest),
+            "--helper-label", label, "--uid", str(os.getuid()),
+        ],
         "RunAtLoad": True,
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),
@@ -7262,6 +7295,14 @@ def launchd_prod_deploy(release: str | None = None):
 
     transaction_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     _claim_launchd_deploy(transaction_id)
+    claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+        "transaction_id": transaction_id, "state": "preparing", "source_kind": None,
+        "source_commit": None, "release_commit": None, "release_tag": release,
+        "expected_version": None, "expected_git_sha": None,
+        "created_at": claimed_at, "updated_at": claimed_at,
+        "failure": None, "rollback_failure": None,
+    })
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     try:
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
@@ -7276,7 +7317,7 @@ def launchd_prod_deploy(release: str | None = None):
         staging.mkdir(parents=True)
         staging.chmod(0o700)
         if release:
-            binary, release_tag, source_commit = _prepare_release_candidate(release, staging)
+            binary, release_tag, source_commit, release_commit = _prepare_release_candidate(release, staging)
             source_kind = "published_release"
         else:
             binary = prod_build(target=None)
@@ -7285,6 +7326,7 @@ def launchd_prod_deploy(release: str | None = None):
                 ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
             ).stdout.strip()
             source_kind = "local_head"
+            release_commit = None
 
         candidate_binary = staging / "candidate-phoenix-ide"
         if binary != candidate_binary:
@@ -7342,6 +7384,7 @@ def launchd_prod_deploy(release: str | None = None):
             "source_kind": source_kind,
             "source_commit": source_commit,
             "release_tag": release_tag,
+            "release_commit": release_commit,
             "expected": identity,
             "previous": previous_identity,
             "candidate_binary": str(candidate_binary),
@@ -7369,7 +7412,7 @@ def launchd_prod_deploy(release: str | None = None):
         (staging / "manifest.json").chmod(0o400)
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
-            "source_commit": source_commit, "release_tag": release_tag,
+            "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
             "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
             "failure": None, "rollback_failure": None,
@@ -7386,8 +7429,19 @@ def launchd_prod_deploy(release: str | None = None):
         print(f"  Candidate: {identity['version']} ({identity['git_sha']})")
         print("  The Phoenix connection may close while the service is replaced.")
         print("  After reconnecting, run: ./dev.py prod status")
-    except BaseException:
-        _release_launchd_deploy_claim()
+    except BaseException as exc:
+        failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+            "transaction_id": transaction_id, "state": "precondition_failed",
+            "source_kind": locals().get("source_kind"), "source_commit": locals().get("source_commit"),
+            "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
+            "expected_version": locals().get("identity", {}).get("version"),
+            "expected_git_sha": locals().get("identity", {}).get("git_sha"),
+            "created_at": claimed_at, "updated_at": failed_at,
+            "failure": f"{type(exc).__name__}: preparation failed before handoff",
+            "rollback_failure": None,
+        })
+        _release_launchd_deploy_claim(transaction_id)
         raise
 
 
@@ -7401,6 +7455,8 @@ def _print_launchd_deploy_status() -> None:
         source = deploy.get("source_kind", "unknown")
         if deploy.get("release_tag"):
             source += f" {deploy['release_tag']}"
+        if deploy.get("release_commit"):
+            source += f" ({deploy['release_commit'][:12]})"
         print(f"    Source: {source}")
         print(f"    Expected: {deploy.get('expected_version', 'unknown')} ({deploy.get('expected_git_sha', 'unknown')})")
         print(f"    Updated: {deploy.get('updated_at', 'unknown')}")

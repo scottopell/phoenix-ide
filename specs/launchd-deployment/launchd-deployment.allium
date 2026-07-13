@@ -59,7 +59,7 @@ external entity TargetService {
 --   Previous artifacts are atomically restored and the previous identity runs.
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD, or release source is one resolved tag
---   with matching host asset, checksum and embedded identity.
+--   and commit with matching host asset, checksum and embedded git SHA.
 
 rule PrepareCandidate {
     when: DeploymentRequested(transaction)
