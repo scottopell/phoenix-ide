@@ -160,7 +160,9 @@ impl<'a> WakeWorkflowAdapter<'a> {
              JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
              JOIN wake_terminal_receipts r ON r.receipt_id = wi.terminal_receipt_id \
              JOIN wake_workflow_bindings b ON b.workflow_id = wi.workflow_id \
-             WHERE o.conversation_id = ?1 AND o.status = 'owed' ORDER BY wi.sequence",
+             WHERE o.id = (SELECT id FROM wake_runtime_obligations \
+             WHERE conversation_id = ?1 AND status = 'owed' ORDER BY created_at, id LIMIT 1) \
+             ORDER BY wi.sequence",
         )
         .bind(conversation_id)
         .fetch_all(self.repository.pool())
@@ -313,7 +315,45 @@ impl<'a> WakeWorkflowAdapter<'a> {
             };
             cancelled += u64::from(self.cancel(&request).await?);
         }
+        let owed_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT wi.id FROM wake_runtime_obligations o \
+             JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
+             JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
+             WHERE o.conversation_id = ?1 AND o.status = 'owed'",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.repository.pool())
+        .await?;
+        if !owed_ids.is_empty() {
+            self.accept_owed_items(conversation_id, &owed_ids, now)
+                .await?;
+            cancelled += 1;
+        }
         Ok(cancelled)
+    }
+
+    pub async fn transfer_conversation_owner(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) -> WorkflowRepositoryResult<u64> {
+        let mut tx = self.repository.pool().begin().await?;
+        let result = sqlx::query(
+            "UPDATE wake_workflow_bindings SET conversation_id = ?1 WHERE conversation_id = ?2",
+        )
+        .bind(successor_id)
+        .bind(predecessor_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_runtime_obligations SET conversation_id = ?1 WHERE conversation_id = ?2",
+        )
+        .bind(successor_id)
+        .bind(predecessor_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn rekey_scope_for_conversation(

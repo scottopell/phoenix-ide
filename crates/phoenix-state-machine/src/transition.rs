@@ -761,6 +761,10 @@ pub fn transition_core(
         }
 
         (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
+            let inbox_ids = results
+                .iter()
+                .map(|result| result.inbox_id.clone())
+                .collect();
             let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
             for wake_result in results {
                 transition = transition.with_effect(Effect::PersistMessage {
@@ -773,6 +777,7 @@ pub fn transition_core(
             }
             Ok(transition
                 .with_effect(Effect::PersistState)
+                .with_effect(Effect::AcceptWakeObservations { inbox_ids })
                 .with_effect(Effect::RequestLlm))
         }
 
@@ -6747,6 +6752,7 @@ mod tests {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
                 | Effect::PersistState
+                | Effect::AcceptWakeObservations { .. }
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }

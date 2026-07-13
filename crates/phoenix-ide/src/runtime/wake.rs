@@ -302,13 +302,22 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn normalized_registration_time() -> Result<(DateTime<Utc>, Timestamp), WakeRegistrarError> {
-    let registered_at = timestamp(Utc::now()).map_err(WakeRegistrarError::Persistence)?;
+    let now = Utc::now();
+    let registered_at = timestamp(now).map_err(WakeRegistrarError::Persistence)?;
     let seconds = i64::try_from(registered_at.0)
         .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
     let accepted_at = DateTime::<Utc>::from_timestamp(seconds, 0).ok_or_else(|| {
         WakeRegistrarError::Persistence("wake registration is out of range".to_owned())
     })?;
-    Ok((accepted_at, registered_at))
+    let accepted_at = if now.timestamp_subsec_nanos() == 0 {
+        accepted_at
+    } else {
+        accepted_at + Duration::seconds(1)
+    };
+    Ok((
+        accepted_at,
+        timestamp(accepted_at).map_err(WakeRegistrarError::Persistence)?,
+    ))
 }
 
 fn scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, WakeRegistrarError> {
