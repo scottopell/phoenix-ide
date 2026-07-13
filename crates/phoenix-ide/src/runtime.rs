@@ -18,6 +18,7 @@ mod recovery;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
+pub(crate) mod wake;
 
 #[cfg(test)]
 pub mod testing;
@@ -230,6 +231,8 @@ pub struct RuntimeManager {
     work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
     creation_kick_tx: tokio::sync::watch::Sender<u64>,
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    wake_kick_tx: tokio::sync::watch::Sender<u64>,
+    wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1229,6 +1232,7 @@ impl RuntimeManager {
         // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
+        let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         Self {
             db,
             llm_registry,
@@ -1263,6 +1267,8 @@ impl RuntimeManager {
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
             creation_kick_tx,
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
+            wake_kick_tx,
+            wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
         }
     }
 
@@ -2069,6 +2075,21 @@ impl RuntimeManager {
     pub fn kick_creation_worker(&self) {
         let next = self.creation_kick_tx.borrow().wrapping_add(1);
         let _ = self.creation_kick_tx.send(next);
+    }
+
+    pub async fn start_wake_worker(self: &Arc<Self>) {
+        let rx = self.wake_kick_rx.write().await.take();
+        let Some(rx) = rx else {
+            tracing::debug!("wake worker already started; skipping");
+            return;
+        };
+        tokio::spawn(crate::runtime::wake::run(Arc::clone(self), rx));
+        self.kick_wake_worker();
+    }
+
+    pub fn kick_wake_worker(&self) {
+        let next = self.wake_kick_tx.borrow().wrapping_add(1);
+        let _ = self.wake_kick_tx.send(next);
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

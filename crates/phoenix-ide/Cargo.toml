@@ -52,6 +52,7 @@ phoenix-tools = { path = "../phoenix-tools" }
 # SQLite persistence (conversations, messages, steering queues, migrations).
 # Extracted so the persistence layer is a leaf depending only on phoenix-core.
 phoenix-db = { path = "../phoenix-db" }
+phoenix-workflow = { path = "../phoenix-workflow" }
 
 # Pure conversation reducer (Elm-architecture state machine). Extracted so the
 # runtime/executor depend *down* onto the reducer + shared domain vocabulary.
