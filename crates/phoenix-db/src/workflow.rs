@@ -3556,7 +3556,12 @@ mod tests {
             std::thread::current().name().unwrap_or("unnamed"),
             uuid::Uuid::new_v4()
         );
-        let path = std::env::temp_dir().join(format!("phoenix-db-workflow-{unique}.sqlite"));
+        let temp_dir = tempfile::Builder::new()
+            .prefix("phoenix-db-workflow-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = temp_dir.join(format!("{unique}.sqlite"));
         let url = sqlite_file_url(&path);
         let opts = SqliteConnectOptions::from_str(&url)
             .unwrap()
