@@ -94,6 +94,12 @@ export function DiffView({
     queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
   }, [find]);
 
+  useEffect(() => {
+    if (open) return;
+    find.reset();
+    findPreviousFocusRef.current = null;
+  }, [find, open]);
+
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
     onOpen: openFind,

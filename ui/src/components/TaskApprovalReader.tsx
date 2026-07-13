@@ -272,8 +272,10 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
+  const findResetKey = useMemo(() => plan, [plan]);
+
   const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
-  const find = useViewerFind({ text: '' });
+  const find = useViewerFind({ text: '', resetKey: findResetKey });
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);

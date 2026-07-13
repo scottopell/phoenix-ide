@@ -315,6 +315,57 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('clears diff find state when open transitions false on the same mounted viewer', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hello' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open={false}
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(screen.queryByText('1 of 1')).not.toBeInTheDocument();
+  });
+
   it('does not open find behind an annotation dialog', () => {
     renderDiff(COMMITTED, '');
     fireEvent.click(screen.getByTestId('mock-line-click-committed:foo.txt'));

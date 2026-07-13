@@ -504,6 +504,7 @@ function addConversationSource(
 }
 
 function userMessageText(message: Message): string {
+  if (typeof message.content === 'string') return message.content;
   const content = message.content as { text?: string; files?: Array<{ original_name?: string }> };
   const parts: string[] = [];
   if (typeof content.text === 'string' && content.text.length > 0) parts.push(content.text);

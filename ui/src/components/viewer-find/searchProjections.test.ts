@@ -311,6 +311,25 @@ describe('buildConversationSearchProjection', () => {
     expect(buildConversationSearchProjection(units, '/skills/dogfood/SKILL.md').matches).toHaveLength(0);
     expect(buildConversationSearchProjection(units, 'Alpha walkthrough').matches).toHaveLength(0);
   });
+  it('includes legacy plain-string user message content in conversation search', () => {
+    const units: RenderUnit[] = [{
+      kind: 'user',
+      key: 'u1',
+      message: {
+        message_id: 'u1',
+        sequence_id: 1,
+        conversation_id: 'c1',
+        message_type: 'user',
+        content: 'Legacy alpha body',
+        created_at: '',
+      } as Message,
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'alpha');
+    expect(projection.sources.map((source) => source.text)).toEqual(['Legacy alpha body']);
+    expect(projection.matches).toHaveLength(1);
+  });
+
   it('projects canonical typed content across available render units exhaustively', () => {
     const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
       type: 'awaiting_sub_agents',
