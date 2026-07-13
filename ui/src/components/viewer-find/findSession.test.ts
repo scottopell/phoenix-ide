@@ -162,7 +162,7 @@ describe('findSession', () => {
     expect(result.state.status).toBe('open');
     if (result.state.status !== 'open') throw new Error('expected open state');
     expect(result.state.activeMatchId).toBe(beta.id);
-    expectReveal(result.commands[0], beta.id);
+    expect(result.commands).toEqual([]);
   });
 
   it('replace-results falls back to the nearest prior ordinal on shrink, insertion, reorder, and removal', () => {
