@@ -139,6 +139,7 @@ pub enum TmuxTerminalInspection {
     Live,
     Terminal {
         exit_code: i32,
+        occurred_at: Option<chrono::DateTime<chrono::Utc>>,
         final_tail: Vec<String>,
     },
     Missing,
@@ -1073,6 +1074,7 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
     if let Some(exit_code) = parse_exit_marker(&captured) {
         return TmuxTerminalInspection::Terminal {
             exit_code,
+            occurred_at: parse_occurred_at_marker(&captured),
             final_tail: captured
                 .lines()
                 .rev()
@@ -1082,6 +1084,14 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
         };
     }
     TmuxTerminalInspection::Live
+}
+
+fn parse_occurred_at_marker(output: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    const PREFIX: &str = "[phoenix] process exited at unix seconds ";
+    output.lines().rev().find_map(|line| {
+        let seconds = line.trim().strip_prefix(PREFIX)?.parse::<i64>().ok()?;
+        chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)
+    })
 }
 
 fn parse_exit_marker(output: &str) -> Option<i32> {

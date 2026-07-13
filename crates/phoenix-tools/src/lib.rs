@@ -25,8 +25,9 @@ pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, SandboxedBashTool, WorkScopeHandles as BashWorkScopeHandles,
+    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp,
+    BashTerminalInspection, BashTool, BashToolInput, SandboxedBashTool,
+    WorkScopeHandles as BashWorkScopeHandles,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,

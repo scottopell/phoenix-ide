@@ -498,7 +498,9 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     } else {
         "exit $code"
     };
-    format!("(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}")
+    format!(
+        "(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; echo \"[phoenix] process exited at unix seconds $(date +%s)\"; {after_exit}"
+    )
 }
 
 fn shell_quote(s: &str) -> String {
