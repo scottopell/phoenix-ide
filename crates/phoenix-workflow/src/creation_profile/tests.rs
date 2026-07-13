@@ -200,9 +200,9 @@ fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
         .collect::<BTreeSet<_>>();
     assert!(dependencies.contains(&(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME)));
     assert!(dependencies.contains(&(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS)));
-    assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE)));
+    assert!(dependencies.contains(&(RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE)));
+    assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, RELEASE_RESERVATION)));
     assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS)));
-    assert!(dependencies.contains(&(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION)));
     assert_eq!(plan.barriers[0].barrier_id, COMPENSATION_BARRIER_ID);
     assert_eq!(plan.barrier_members.len(), 5);
 
@@ -531,6 +531,7 @@ fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_eviden
     pending.runtime_evidence = CreationRuntimeEvidence {
         runtime_bootstrapped: true,
         initial_llm_dispatched: true,
+        initial_turn_busy: false,
     };
     let complete = project_authoritative_creation(&pending);
     assert_eq!(complete.completion, CompletionPrediction::Complete);

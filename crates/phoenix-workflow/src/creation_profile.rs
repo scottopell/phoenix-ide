@@ -90,6 +90,7 @@ pub enum CleanupOwnership {
 pub struct CreationRuntimeEvidence {
     pub runtime_bootstrapped: bool,
     pub initial_llm_dispatched: bool,
+    pub initial_turn_busy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,9 +689,9 @@ fn compensation_dependencies(owns_resources: bool) -> Vec<DependencyDecl> {
         vec![
             dependency(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME),
             dependency(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS),
-            dependency(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE),
+            dependency(RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE),
+            dependency(FINISH_CANCELLATION_OR_DELETION, RELEASE_RESERVATION),
             dependency(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS),
-            dependency(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION),
         ]
     } else {
         vec![
@@ -841,7 +842,11 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         ),
         AuthoritativeCreationStatus::Ready => (
             CreationProjectionStatus::Ready,
-            capabilities([true, true, true, false, false, true]),
+            if oracle.runtime_evidence.initial_turn_busy {
+                capabilities([true, true, true, true, false, false])
+            } else {
+                capabilities([true, true, true, false, false, true])
+            },
             completion_for_ready(oracle),
             CompensationPrediction::None,
             false,

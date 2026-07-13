@@ -214,10 +214,23 @@ fn oracle_from_committed(
                 .and_then(ConvMode::worktree_path)
                 .map(str::to_owned)
         })
+        .or_else(|| preserved_cwd.clone())
         .unwrap_or_else(|| job.intent.cwd.clone());
     let branch_name = conv_mode
         .and_then(ConvMode::branch_name)
         .map(str::to_owned)
+        .or_else(|| {
+            job.intent.mode.as_deref().and_then(|mode| {
+                (matches!(mode, "managed" | "auto") && job.intent.checkout_ref.is_none()).then(
+                    || {
+                        format!(
+                            "task-pending-{}",
+                            job.conversation_id.chars().take(8).collect::<String>()
+                        )
+                    },
+                )
+            })
+        })
         .or_else(|| job.intent.base_branch.clone())
         .unwrap_or_default();
     let kind = match &job.protocol.kind {
@@ -255,23 +268,33 @@ fn oracle_from_committed(
         runtime_evidence: CreationRuntimeEvidence {
             runtime_bootstrapped: runtime_bootstrapped(job.protocol.stage, conversation_state),
             initial_llm_dispatched,
+            initial_turn_busy: matches!(
+                conversation_state,
+                ConvState::LlmRequesting { .. }
+                    | ConvState::SeededLlmRequesting { .. }
+                    | ConvState::ToolExecuting { .. }
+                    | ConvState::AwaitingSubAgents { .. }
+                    | ConvState::AwaitingContinuation { .. }
+                    | ConvState::AwaitingRecovery { .. }
+                    | ConvState::CancellingTool { .. }
+                    | ConvState::CancellingSubAgents { .. }
+            ),
         },
     }
 }
 
-fn runtime_bootstrapped(checkpoint: CreationStage, state: &ConvState) -> bool {
-    checkpoint > CreationStage::BootstrapInitialTurn
-        || matches!(
-            state,
-            ConvState::LlmRequesting { .. }
-                | ConvState::SeededLlmRequesting { .. }
-                | ConvState::ToolExecuting { .. }
-                | ConvState::AwaitingSubAgents { .. }
-                | ConvState::AwaitingContinuation { .. }
-                | ConvState::AwaitingRecovery { .. }
-                | ConvState::CancellingTool { .. }
-                | ConvState::CancellingSubAgents { .. }
-        )
+fn runtime_bootstrapped(_checkpoint: CreationStage, state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::CancellingSubAgents { .. }
+    )
 }
 
 fn map_status(status: CreationStatus) -> AuthoritativeCreationStatus {
@@ -508,7 +531,7 @@ mod tests {
             CreationStage::BootstrapInitialTurn,
             &ConvState::LlmRequesting { attempt: 1 },
         ));
-        assert!(runtime_bootstrapped(
+        assert!(!runtime_bootstrapped(
             CreationStage::Finalize,
             &ConvState::CreationFailed {
                 job_id: "job".to_owned(),
