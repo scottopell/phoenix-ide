@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, type ConversationTextFragment, type ConversationTextFragmentRevealTarget } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -829,7 +829,7 @@ function CompactToolStripImpl({
 export interface AgentTextRevealRequest {
   unitKey: string;
   fragmentId: string;
-  revealTarget: ConversationTextFragmentRevealTarget;
+  revealTarget: ConversationFragmentRevealTarget;
   nonce: number;
 }
 
@@ -1870,82 +1870,49 @@ function ReadFileResultView({
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
-export function parseSearchOutput(text: string): {
-  hits: SearchHit[];
-  notes: string[];
-  noMatches: boolean;
-} {
-  const notes: string[] = [];
-  const hits: SearchHit[] = [];
-
-  if (text.trim() === 'No matches found.') {
-    return { hits, notes, noMatches: true };
-  }
-
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    if (line.startsWith('[') && line.trimEnd().endsWith(']')) {
-      notes.push(line.trim().slice(1, -1));
-      continue;
-    }
-    // Non-greedy path, then :digits:, then optional space, then content.
-    // Path can contain colons in unusual cases; backtracking will find the
-    // rightmost path/digits boundary that satisfies the digit run.
-    const m = /^(.+?):(\d+):\s?(.*)$/.exec(line);
-    if (m && m[1] !== undefined && m[2] !== undefined) {
-      hits.push({ path: m[1], lineNumber: parseInt(m[2], 10), content: m[3] ?? '' });
-    } else {
-      notes.push(line);
-    }
-  }
-  return { hits, notes, noMatches: false };
+export function parseSearchOutput(text: string) {
+  return buildSearchOutputProjection(text);
 }
 
 export function SearchResultsView({
   rawText,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
 }: {
   rawText: string;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
 }) {
-  const { hits, notes, noMatches } = useMemo(() => parseSearchOutput(rawText), [rawText]);
+  const parsed = useMemo(() => buildSearchOutputProjection(rawText, toolUseId ? { toolUseId } : {}), [rawText, toolUseId]);
 
-  if (noMatches) {
+  if (parsed.noMatches) {
     return (
       <div className="search-results">
-        <div className="search-results-empty">No matches found.</div>
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>No matches found.</div>
       </div>
     );
   }
 
-  if (hits.length === 0 && notes.length === 0) {
-    return <pre className="search-results-fallback">{rawText}</pre>;
-  }
-
-  const groups: Array<{ path: string; hits: SearchHit[] }> = [];
-  const seen = new Map<string, number>();
-  for (const hit of hits) {
-    const idx = seen.get(hit.path);
-    if (idx === undefined) {
-      seen.set(hit.path, groups.length);
-      groups.push({ path: hit.path, hits: [hit] });
-    } else {
-      groups[idx]!.hits.push(hit);
-    }
+  if (parsed.rawFallback) {
+    const fragment = parsed.fragments[0] ?? null;
+    const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
+    return <pre className="search-results-fallback" data-fragment-id={fragment?.fragmentId}>{highlight && fragment ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : rawText}</pre>;
   }
 
   return (
     <div className="search-results">
-      {hits.length > 0 && (
+      {parsed.hits.length > 0 && (
         <div className="search-results-header">
           <span className="search-results-count">
-            {hits.length} match{hits.length === 1 ? '' : 'es'} in {groups.length} file
-            {groups.length === 1 ? '' : 's'}
+            {parsed.hits.length} match{parsed.hits.length === 1 ? '' : 'es'} in {parsed.groups.length} file
+            {parsed.groups.length === 1 ? '' : 's'}
           </span>
         </div>
       )}
       <div className="search-results-list">
-        {groups.map((group) => (
+        {parsed.groups.map((group) => (
           <div key={group.path} className="search-results-file">
             {onOpenFile ? (
               <button
@@ -1955,7 +1922,7 @@ export function SearchResultsView({
                   onOpenFile(
                     group.path,
                     new Set([group.hits[0]!.lineNumber]),
-                    group.hits[0]!.lineNumber
+                    group.hits[0]!.lineNumber,
                   )
                 }
                 title="Open file"
@@ -1974,35 +1941,43 @@ export function SearchResultsView({
               </span>
             )}
             <div className="search-results-hits">
-              {group.hits.map((hit, i) =>
-                onOpenFile ? (
+              {group.hits.map((hit) => {
+                const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
+                const content = highlight
+                  ? renderHighlightedText(hit.fragment.semanticText, highlight.start, highlight.end)
+                  : <><span className="search-result-lineno">{hit.lineNumber}</span><span className="search-result-content">{hit.content || ' '}</span></>;
+                return onOpenFile ? (
                   <button
-                    key={i}
+                    key={hit.fragment.fragmentId}
                     type="button"
                     className="search-result-line search-result-line-clickable"
-                    onClick={() =>
-                      onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)
-                    }
+                    data-fragment-id={hit.fragment.fragmentId}
+                    onClick={() => onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)}
                   >
-                    <span className="search-result-lineno">{hit.lineNumber}</span>
-                    <span className="search-result-content">{hit.content || ' '}</span>
+                    {highlight ? (
+                      <span>{content}</span>
+                    ) : content}
                   </button>
                 ) : (
-                  <div key={i} className="search-result-line">
-                    <span className="search-result-lineno">{hit.lineNumber}</span>
-                    <span className="search-result-content">{hit.content || ' '}</span>
+                  <div key={hit.fragment.fragmentId} className="search-result-line" data-fragment-id={hit.fragment.fragmentId}>
+                    {highlight ? <span>{content}</span> : content}
                   </div>
-                )
-              )}
+                );
+              })}
             </div>
           </div>
         ))}
       </div>
-      {notes.length > 0 && (
+      {parsed.notes.length > 0 && (
         <div className="search-results-notes">
-          {notes.map((n, i) => (
-            <div key={i} className="search-results-note">{n}</div>
-          ))}
+          {parsed.notes.map(({ text, fragment }) => {
+            const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+            return (
+              <div key={fragment.fragmentId} className="search-results-note" data-fragment-id={fragment.fragmentId}>
+                {highlight ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : text}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -2183,18 +2158,23 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     () => (name === 'keyword_search' ? buildKeywordSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
     [name, resultText, toolId],
   );
-  const keywordSearchRevealKey = keywordSearchProjection?.fragments[0]?.revealTarget.key ?? null;
-  const keywordSearchActiveHighlight = activeHighlight?.fragmentId
-    && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+  const searchProjection = useMemo(
+    () => (name === 'search' ? buildSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
+  const toolRevealKey = (name === 'keyword_search' ? keywordSearchProjection?.fragments[0]?.revealTarget.key : searchProjection?.fragments[0]?.revealTarget.key) ?? null;
+  const toolActiveHighlight = activeHighlight?.fragmentId
+    && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
     ? activeHighlight
     : null;
 
   useEffect(() => {
     if (!revealRequest) return;
-    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search') return;
-    if (revealRequest.revealTarget.key !== keywordSearchRevealKey) return;
+    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search' && revealRequest.revealTarget.kind !== 'tool-result-search') return;
+    if (revealRequest.revealTarget.key !== toolRevealKey) return;
     onRevealHandled?.(revealRequest);
-  }, [keywordSearchRevealKey, onRevealHandled, revealRequest]);
+  }, [onRevealHandled, revealRequest, toolRevealKey]);
   
   // Check if this is an image result.
   // 1. Typed `images` channel (read_image — single source of truth, no
@@ -2350,9 +2330,9 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'browser_recent_console_logs' && !isError ? (
             <BrowserConsoleLogsView rawText={resultText} />
           ) : name === 'search' && !isError ? (
-            <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
+            <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : name === 'keyword_search' && !isError ? (
-            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={keywordSearchActiveHighlight} />
+            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

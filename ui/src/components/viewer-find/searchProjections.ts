@@ -79,16 +79,33 @@ export interface ConversationTextFragmentDisplay {
   summaryText: string;
 }
 
-export interface ConversationTextFragmentRevealTarget {
-  kind: 'agent-text' | 'tool-result-keyword-search';
+export interface SearchResultRevealTarget {
+  kind: 'tool-result-search';
+  key: string;
+  path?: string;
+  lineNumber?: number;
+}
+
+export interface KeywordSearchRevealTarget {
+  kind: 'tool-result-keyword-search';
   key: string;
 }
+
+export interface ConversationTextFragmentRevealTarget {
+  kind: 'agent-text';
+  key: string;
+}
+
+export type ConversationFragmentRevealTarget =
+  | ConversationTextFragmentRevealTarget
+  | SearchResultRevealTarget
+  | KeywordSearchRevealTarget;
 
 export interface ConversationTextFragment {
   fragmentId: string;
   semanticText: string;
   display: ConversationTextFragmentDisplay;
-  revealTarget: ConversationTextFragmentRevealTarget;
+  revealTarget: ConversationFragmentRevealTarget;
 }
 
 export interface KeywordSearchFragmentDisplay {
@@ -100,7 +117,7 @@ export interface KeywordSearchFragment {
   fragmentId: string;
   semanticText: string;
   display: KeywordSearchFragmentDisplay;
-  revealTarget: ConversationTextFragmentRevealTarget;
+  revealTarget: ConversationFragmentRevealTarget;
   kind: 'hit' | 'fallback' | 'empty';
   path?: string;
   explanation?: string;
@@ -112,6 +129,43 @@ export interface KeywordSearchOutputProjection {
   empty: boolean;
   fallbackText: string | null;
   fragments: KeywordSearchFragment[];
+}
+
+export interface SearchResultFragmentDisplay {
+  path: string;
+  lineNumber?: number;
+  content?: string;
+  note?: string;
+}
+
+export interface SearchResultFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: SearchResultFragmentDisplay;
+  revealTarget: SearchResultRevealTarget;
+  kind: 'hit' | 'note' | 'empty' | 'fallback';
+}
+
+export interface SearchHitProjection {
+  path: string;
+  lineNumber: number;
+  content: string;
+  fragment: SearchResultFragment;
+}
+
+export interface SearchGroupProjection {
+  path: string;
+  hits: SearchHitProjection[];
+}
+
+export interface SearchOutputProjection {
+  hits: SearchHitProjection[];
+  groups: SearchGroupProjection[];
+  notes: Array<{ text: string; fragment: SearchResultFragment }>;
+  noMatches: boolean;
+  rawFallback: boolean;
+  fallbackText: string | null;
+  fragments: SearchResultFragment[];
 }
 
 export interface ConversationHeaderSearchMatchTarget {
@@ -133,7 +187,7 @@ export interface ConversationSearchSource extends SearchableSource<ConversationS
   unitIndex: number;
   role: string;
   fragmentId?: string;
-  revealTarget?: ConversationTextFragmentRevealTarget;
+  revealTarget?: ConversationFragmentRevealTarget;
 }
 
 export type ConversationSearchProjection = SearchableSourceProjection<
@@ -634,6 +688,115 @@ function keywordSearchToolResultKey(blockId: string): string {
   return `keyword-search:${blockId}`;
 }
 
+function searchToolResultKey(blockId: string): string {
+  return `search:${blockId}`;
+}
+
+export function buildSearchOutputProjection(
+  text: string,
+  options: { toolUseId?: string | null } = {},
+): SearchOutputProjection {
+  const revealBase = {
+    kind: 'tool-result-search' as const,
+    key: searchToolResultKey(options.toolUseId ?? ''),
+  };
+  const trimmed = text.trim();
+  if (trimmed === 'No matches found.') {
+    const fragment: SearchResultFragment = {
+      fragmentId: 'search-empty',
+      semanticText: 'No matches found.',
+      display: { path: '', note: 'No matches found.' },
+      revealTarget: revealBase,
+      kind: 'empty',
+    };
+    return { hits: [], groups: [], notes: [], noMatches: true, rawFallback: false, fallbackText: null, fragments: [fragment] };
+  }
+
+  const notes: Array<{ text: string; fragment: SearchResultFragment }> = [];
+  const hits: SearchHitProjection[] = [];
+  let noteIndex = 0;
+  let hitIndex = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    if (line.startsWith('[') && line.trimEnd().endsWith(']')) {
+      const note = line.trim().slice(1, -1);
+      const fragment: SearchResultFragment = {
+        fragmentId: `search-note:${noteIndex}`,
+        semanticText: note,
+        display: { path: '', note },
+        revealTarget: revealBase,
+        kind: 'note',
+      };
+      notes.push({ text: note, fragment });
+      noteIndex += 1;
+      continue;
+    }
+    const m = /^(.+?):(\d+):\s?(.*)$/.exec(line);
+    if (m && m[1] !== undefined && m[2] !== undefined) {
+      const path = m[1];
+      const lineNumber = parseInt(m[2], 10);
+      const content = m[3] ?? '';
+      const semanticText = `${path}:${lineNumber}: ${content}`;
+      const fragment: SearchResultFragment = {
+        fragmentId: `search-hit:${encodeURIComponent(path)}:${lineNumber}:${hitIndex}`,
+        semanticText,
+        display: { path, lineNumber, content },
+        revealTarget: { ...revealBase, path, lineNumber },
+        kind: 'hit',
+      };
+      hits.push({ path, lineNumber, content, fragment });
+      hitIndex += 1;
+      continue;
+    }
+    const note = line;
+    const fragment: SearchResultFragment = {
+      fragmentId: `search-note:${noteIndex}`,
+      semanticText: note,
+      display: { path: '', note },
+      revealTarget: revealBase,
+      kind: 'note',
+    };
+    notes.push({ text: note, fragment });
+    noteIndex += 1;
+  }
+
+  if (hits.length === 0 && notes.length === 0) {
+    const fragment: SearchResultFragment = {
+      fragmentId: 'search-fallback',
+      semanticText: text,
+      display: { path: '', note: text },
+      revealTarget: revealBase,
+      kind: 'fallback',
+    };
+    return { hits: [], groups: [], notes: [], noMatches: false, rawFallback: true, fallbackText: text, fragments: [fragment] };
+  }
+
+  const groups: SearchGroupProjection[] = [];
+  const seen = new Map<string, number>();
+  for (const hit of hits) {
+    const idx = seen.get(hit.path);
+    if (idx === undefined) {
+      seen.set(hit.path, groups.length);
+      groups.push({ path: hit.path, hits: [hit] });
+    } else {
+      groups[idx]!.hits.push(hit);
+    }
+  }
+
+  return {
+    hits,
+    groups,
+    notes,
+    noMatches: false,
+    rawFallback: false,
+    fallbackText: null,
+    fragments: [
+      ...hits.map((hit) => hit.fragment),
+      ...notes.map((note) => note.fragment),
+    ],
+  };
+}
+
 export function buildKeywordSearchOutputProjection(
   text: string,
   options: { toolUseId?: string | null } = {},
@@ -756,6 +919,15 @@ function agentTurnSources(
       if (block.name === 'keyword_search') {
         for (const fragment of buildKeywordSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+      } else if (block.name === 'search') {
+        const searchProjection = buildSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {});
+        if (density === 'compact') {
+          for (const fragment of searchProjection.fragments) {
+            out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+          }
+        } else {
+          out.push({ role: `tool-use-result-${index}`, text: resultText });
         }
       } else if (detailsVisible) {
         out.push({ role: `tool-use-result-${index}`, text: resultText });

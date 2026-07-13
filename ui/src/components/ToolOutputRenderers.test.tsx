@@ -10,6 +10,7 @@ import {
   __readFileResultTestables,
 } from './MessageComponents';
 import { buildKeywordSearchOutputProjection } from './viewer-find';
+import { buildSearchOutputProjection } from './viewer-find/searchProjections';
 
 describe('parseSearchOutput', () => {
   it('parses path:lineno: content lines', () => {
@@ -22,8 +23,17 @@ describe('parseSearchOutput', () => {
     expect(noMatches).toBe(false);
     expect(notes).toEqual([]);
     expect(hits).toHaveLength(3);
-    expect(hits[0]).toEqual({ path: 'src/foo.rs', lineNumber: 12, content: 'fn hello() {}' });
+    expect(hits[0]).toMatchObject({ path: 'src/foo.rs', lineNumber: 12, content: 'fn hello() {}' });
     expect(hits[1]?.content).toBe('    println!("hi");');
+  });
+
+  it('shares builder parity with the typed search projection', () => {
+    const text = [
+      'src/foo.rs:12: fn hello() {}',
+      'src/foo.rs:34:     println!("hi");',
+      '[Results limited to 50 matches.]',
+    ].join('\n');
+    expect(parseSearchOutput(text)).toEqual(buildSearchOutputProjection(text));
   });
 
   it('recognizes the no-matches sentinel', () => {
@@ -42,8 +52,8 @@ describe('parseSearchOutput', () => {
     const { hits, notes } = parseSearchOutput(text);
     expect(hits).toHaveLength(1);
     expect(notes).toHaveLength(2);
-    expect(notes[0]).toMatch(/Results limited to 50/);
-    expect(notes[1]).toMatch(/Walk truncated/);
+    expect(notes[0]?.text).toMatch(/Results limited to 50/);
+    expect(notes[1]?.text).toMatch(/Walk truncated/);
   });
 
   it('handles paths with colons via backtracking', () => {
@@ -219,7 +229,7 @@ describe('SearchResultsView', () => {
   ].join('\n');
 
   it('groups hits by file with counts', () => {
-    render(<SearchResultsView rawText={text} onOpenFile={undefined} />);
+    render(<SearchResultsView rawText={text} onOpenFile={undefined} toolUseId="search-1" />);
     expect(screen.getByText(/3 matches in 2 files/)).toBeTruthy();
     expect(screen.getByText('2 hits')).toBeTruthy();
     expect(screen.getByText('1 hit')).toBeTruthy();
@@ -228,7 +238,7 @@ describe('SearchResultsView', () => {
 
   it('invokes onOpenFile with the right line on hit click', () => {
     const onOpenFile = vi.fn();
-    const { container } = render(<SearchResultsView rawText={text} onOpenFile={onOpenFile} />);
+    const { container } = render(<SearchResultsView rawText={text} onOpenFile={onOpenFile} toolUseId="search-1" />);
     const lines = container.querySelectorAll('.search-result-line-clickable');
     expect(lines.length).toBe(3);
     fireEvent.click(lines[1]!);
@@ -236,14 +246,35 @@ describe('SearchResultsView', () => {
   });
 
   it('renders no-matches sentinel as friendly empty state', () => {
-    render(<SearchResultsView rawText="No matches found." onOpenFile={undefined} />);
+    render(<SearchResultsView rawText="No matches found." onOpenFile={undefined} toolUseId="search-1" />);
     expect(screen.getByText('No matches found.')).toBeTruthy();
   });
 
   it('omits the clickable affordance when onOpenFile is undefined', () => {
-    const { container } = render(<SearchResultsView rawText={text} onOpenFile={undefined} />);
+    const { container } = render(<SearchResultsView rawText={text} onOpenFile={undefined} toolUseId="search-1" />);
     expect(container.querySelector('.search-result-line-clickable')).toBeNull();
     expect(container.querySelector('button.search-results-filepath')).toBeNull();
+  });
+
+  it('marks exact active search hit without duplicating line content', () => {
+    const projection = buildSearchOutputProjection(text, { toolUseId: 'search-1' });
+    const targetFragment = projection.hits[1]?.fragment;
+    expect(targetFragment).toBeTruthy();
+    const { container } = render(
+      <SearchResultsView
+        rawText={text}
+        onOpenFile={undefined}
+        toolUseId="search-1"
+        activeHighlight={{
+          fragmentId: targetFragment!.fragmentId,
+          start: targetFragment!.semanticText.indexOf('println!'),
+          end: targetFragment!.semanticText.indexOf('println!') + 'println!'.length,
+        }}
+      />
+    );
+    const activeMark = container.querySelector('.viewer-find-inline-match--active');
+    expect(activeMark?.textContent).toBe('println!');
+    expect(screen.getAllByText(/println!/)).toHaveLength(1);
   });
 });
 

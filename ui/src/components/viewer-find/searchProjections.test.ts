@@ -273,6 +273,29 @@ describe('buildConversationSearchProjection', () => {
     expect(target?.kind === 'unit-text' ? target.fragmentId : undefined).toContain('keyword-search-hit:');
   });
 
+  it('searches complete search-tool hits in compact display mode with typed reveal metadata', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'search-compact',
+      isFirstInTurn: true,
+      agent: agentMsg('search-compact', [
+        { type: 'tool_use', id: 'search-1', name: 'search', display: 'search docs', input: { pattern: 'needle' } },
+      ]),
+      toolResultsByUseId: new Map([
+        ['search-1', toolMsg('search-result', 'search-1', { result: 'src/hidden.ts:42: compact hidden needle explanation' })],
+      ]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'hidden needle', { density: 'compact' });
+    expect(projection.matches).toHaveLength(1);
+    const target = projection.matches[0]?.target;
+    expect(target?.kind).toBe('unit-text');
+    expect(target?.kind === 'unit-text' ? target.fragmentId : undefined).toContain('search-hit:');
+    expect(projection.sources.some((entry) => entry.fragmentId?.includes('search-hit:'))).toBe(true);
+    const matchSource = projection.sources.find((entry) => entry.fragmentId === (target?.kind === 'unit-text' ? target.fragmentId : undefined));
+    expect(matchSource?.revealTarget).toMatchObject({ kind: 'tool-result-search', key: 'search:search-1', path: 'src/hidden.ts', lineNumber: 42 });
+  });
+
   it('indexes full-density non-think tool details while compact still excludes them', () => {
     const units: RenderUnit[] = [
       {
