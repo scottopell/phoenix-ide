@@ -78,7 +78,7 @@ pub struct CodecRef {
     pub version: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SemanticAuthority {
     LegacyProtocol,
     EngineProtocol,
@@ -311,8 +311,25 @@ impl NonEmptyExternalKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExternalAcceptanceKey {
+pub struct ProtocolSelectionIdentity {
+    pub selector: &'static str,
+    pub authority: SemanticAuthority,
     pub profile: ProfileRef,
+}
+
+impl From<&ProtocolSelection> for ProtocolSelectionIdentity {
+    fn from(selection: &ProtocolSelection) -> Self {
+        Self {
+            selector: selection.selector,
+            authority: selection.authority,
+            profile: selection.profile.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExternalAcceptanceKey {
+    pub selection: ProtocolSelectionIdentity,
     pub authority_scope: NonEmptyExternalKey,
     pub idempotency_key: NonEmptyExternalKey,
 }
