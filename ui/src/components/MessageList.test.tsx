@@ -6,6 +6,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
+import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
@@ -43,8 +44,8 @@ const agentMessageProps = vi.hoisted(
     message: Message;
     forceExpandedText: boolean | undefined;
     isLatestAgentMessage: boolean | undefined;
-    revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } } | null;
-    activeHighlight?: { fragmentId: string; start: number; end: number } | null;
+    revealRequest?: AgentTextRevealRequest | null;
+    activeHighlight?: AgentTextHighlight | null;
   }>,
 );
 
@@ -57,9 +58,15 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } }) => void) | undefined }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null; onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined }) => {
       agentRenderCounter.count++;
-      agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight });
+      agentMessageProps.push({
+        message,
+        forceExpandedText,
+        isLatestAgentMessage,
+        ...(revealRequest !== undefined ? { revealRequest } : {}),
+        ...(activeHighlight !== undefined ? { activeHighlight } : {}),
+      });
       if (revealRequest && onRevealHandled) onRevealHandled(revealRequest);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
@@ -3064,7 +3071,7 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
   const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
   expect(renderedAgent?.message.message_id).toBe('agent-read-file');
   expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-read-1', lineNumber: 8 });
-  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('read-file-line:8:1');
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('read-file-line:second%20alpha%20line:0');
   expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
 });
 

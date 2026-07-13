@@ -351,9 +351,9 @@ describe('buildConversationSearchProjection', () => {
     }];
 
     const compactProjection = buildConversationSearchProjection(units, 'alpha', { density: 'compact' });
-    expect(compactProjection.matches).toHaveLength(5);
-    expect(compactProjection.sources.some((source) => source.text === 'src/foo.ts:7-8\n7\tconst alpha = 1;\n8\tsecond alpha line')).toBe(true);
-    const lineMatch = compactProjection.matches.find((match) => match.target.kind === 'unit-text' && match.target.fragmentId === 'read-file-line:8:1');
+    expect(compactProjection.matches).toHaveLength(3);
+    const lineMatch = compactProjection.matches.find((match) => match.target.kind === 'unit-text'
+      && match.target.fragmentId === 'read-file-line:second%20alpha%20line:0');
     expect(lineMatch).toBeTruthy();
     expect(compactProjection.sources.find((source) => source.fragmentId === 'read-file-path')?.revealTarget).toMatchObject({
       kind: 'tool-result-read-file',

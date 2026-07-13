@@ -105,15 +105,21 @@ export interface ReadFileRevealTarget {
   endLineNumber?: number;
 }
 
-export type ReadFileFragmentDisplay = ReadFileLineFragmentDisplay | ReadFilePathFragmentDisplay;
-
-export interface ReadFileFragment {
-  fragmentId: string;
-  semanticText: string;
-  display: ReadFileFragmentDisplay;
-  revealTarget: ReadFileRevealTarget;
-  kind: 'path' | 'line';
-}
+export type ReadFileFragment =
+  | {
+      fragmentId: string;
+      semanticText: string;
+      display: ReadFilePathFragmentDisplay;
+      revealTarget: ReadFileRevealTarget;
+      kind: 'path';
+    }
+  | {
+      fragmentId: string;
+      semanticText: string;
+      display: ReadFileLineFragmentDisplay;
+      revealTarget: ReadFileRevealTarget;
+      kind: 'line';
+    };
 
 export interface ReadFileOutputProjection {
   fragments: ReadonlyArray<ReadFileFragment>;
@@ -727,10 +733,6 @@ function searchToolResultKey(blockId: string): string {
   return `search:${blockId}`;
 }
 
-function readFileToolResultKey(blockId: string): string {
-  return `read-file:${blockId}`;
-}
-
 function readFileWindowLabel(input: Record<string, unknown>): string | null {
   const offset = typeof input['offset'] === 'number' ? input['offset'] : undefined;
   const limit = typeof input['limit'] === 'number' ? input['limit'] : undefined;
@@ -776,11 +778,13 @@ function buildReadFileProjectionFragments(
     });
   }
 
-  let canonicalLineOrdinal = 0;
+  const duplicateLineCounts = new Map<string, number>();
   for (const rawLine of text.split('\n')) {
     const renderedLine = parseReadFileRenderedLine(rawLine);
     if (!renderedLine) continue;
-    const fragmentId = `read-file-line:${renderedLine.lineNumber}:${canonicalLineOrdinal}`;
+    const duplicateIndex = duplicateLineCounts.get(renderedLine.content) ?? 0;
+    duplicateLineCounts.set(renderedLine.content, duplicateIndex + 1);
+    const fragmentId = `read-file-line:${encodeURIComponent(renderedLine.content)}:${duplicateIndex}`;
     fragments.push({
       fragmentId,
       semanticText: `${renderedLine.lineNumber}\t${renderedLine.content}`,
@@ -794,7 +798,6 @@ function buildReadFileProjectionFragments(
       },
       kind: 'line',
     });
-    canonicalLineOrdinal += 1;
   }
   return fragments;
 }
@@ -1048,9 +1051,6 @@ function agentTurnSources(
         const readFileProjection = buildReadFileOutputProjection(resultText, block.input ?? {}, block.id ? { toolUseId: block.id } : {});
         for (const fragment of readFileProjection.fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
-        }
-        if (density === 'compact' || detailsVisible) {
-          out.push({ role: `tool-use-result-${index}:full-text`, text: readFileProjection.fullText });
         }
       } else if (detailsVisible) {
         out.push({ role: `tool-use-result-${index}`, text: resultText });

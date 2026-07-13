@@ -89,7 +89,8 @@ describe('buildKeywordSearchOutputProjection parity', () => {
       'keyword-search-hit:%2Fabs%2Fpath%2Fto%2Fbar.rs%3A%20helper%20utilities%20referenced%20from%20foo:0',
     ]);
     expect(built.fragments.every((fragment) => fragment.revealTarget.kind === 'tool-result-keyword-search')).toBe(true);
-    expect(built.fragments.every((fragment) => fragment.revealTarget.key === 'keyword-search:tool-1')).toBe(true);
+    expect(built.fragments.every((fragment) => fragment.revealTarget.kind === 'tool-result-keyword-search'
+      && fragment.revealTarget.key === 'keyword-search:tool-1')).toBe(true);
   });
 
   it('builds a searchable fallback fragment for raw output', () => {
@@ -231,8 +232,8 @@ describe('buildReadFileOutputProjection parity', () => {
     expect(built.fullText).toBe('src/foo.ts:7-8\n7\tconst alpha = 1;\n8\tsecond alpha line');
     expect(built.fragments.map((fragment) => fragment.fragmentId)).toEqual([
       'read-file-path',
-      'read-file-line:7:0',
-      'read-file-line:8:1',
+      'read-file-line:const%20alpha%20%3D%201%3B:0',
+      'read-file-line:second%20alpha%20line:0',
     ]);
     expect(built.fragments[1]?.revealTarget).toMatchObject({
       kind: 'tool-result-read-file',
@@ -268,7 +269,8 @@ describe('ReadFileResultView', () => {
 
   it('highlights the exact active occurrence without duplicating content', () => {
     const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
-    const targetFragment = projection.fragments.find((fragment) => fragment.kind === 'line' && fragment.display.lineNumber === 8);
+    const targetFragment = projection.fragments.find((fragment) => fragment.kind === 'line'
+      && fragment.display.lineNumber === 8);
     expect(targetFragment).toBeTruthy();
     const start = targetFragment!.semanticText.indexOf('alpha');
     const { container } = render(
@@ -286,8 +288,9 @@ describe('ReadFileResultView', () => {
     );
     const activeMark = container.querySelector('.viewer-find-inline-match--active');
     expect(activeMark?.textContent).toBe('alpha');
-    expect(container.querySelectorAll('[data-fragment-id="read-file-line:8:1"]')).toHaveLength(1);
-    expect(container.querySelector('.search-result-line[data-fragment-id="read-file-line:8:1"]')?.textContent).toBe('8second alpha line');
+    expect(container.querySelectorAll(`[data-fragment-id="${targetFragment!.fragmentId}"]`)).toHaveLength(1);
+    expect(container.querySelector(`.search-result-line[data-fragment-id="${targetFragment!.fragmentId}"]`)?.textContent)
+      .toBe('8second alpha line');
   });
 });
 

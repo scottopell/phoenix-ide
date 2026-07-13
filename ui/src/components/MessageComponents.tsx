@@ -833,7 +833,7 @@ export interface AgentTextRevealRequest {
   nonce: number;
 }
 
-interface AgentTextHighlight {
+export interface AgentTextHighlight {
   fragmentId: string;
   start: number;
   end: number;
@@ -2248,7 +2248,14 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     () => (name === 'search' ? buildSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
     [name, resultText, toolId],
   );
-  const toolRevealKey = (name === 'keyword_search' ? keywordSearchProjection?.fragments[0]?.revealTarget.key : searchProjection?.fragments[0]?.revealTarget.key) ?? null;
+  const firstKeywordTarget = keywordSearchProjection?.fragments[0]?.revealTarget;
+  const firstSearchTarget = searchProjection?.fragments[0]?.revealTarget;
+  const toolRevealKey = name === 'keyword_search'
+    && firstKeywordTarget?.kind === 'tool-result-keyword-search'
+    ? firstKeywordTarget.key
+    : name === 'search' && firstSearchTarget?.kind === 'tool-result-search'
+      ? firstSearchTarget.key
+      : null;
   const readFileProjection = useMemo(
     () => (name === 'read_file' ? buildReadFileOutputProjection(resultText, input as Record<string, unknown>, { toolUseId: toolId }) : null),
     [input, name, resultText, toolId],
