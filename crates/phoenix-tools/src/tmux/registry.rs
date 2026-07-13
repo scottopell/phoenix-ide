@@ -770,6 +770,33 @@ impl TmuxRegistry {
         clear_killed_window(&socket_path, identity).await;
     }
 
+    pub async fn recover_wait_target(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Option<TmuxWindowIdentity> {
+        if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
+            return None;
+        }
+        let socket_path = self.derived_socket_path(work_scope);
+        if !matches!(probe(&socket_path).await, Ok(ProbeResult::Live)) {
+            return None;
+        }
+        let generation = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await?;
+        let identity = TmuxWindowIdentity {
+            work_scope: work_scope.clone(),
+            server_generation: generation,
+            window_id: window_id.to_owned(),
+        };
+        if matches!(
+            inspect_tmux_window(&socket_path, window_id).await,
+            TmuxTerminalInspection::Missing | TmuxTerminalInspection::Unavailable
+        ) {
+            return None;
+        }
+        Some(identity)
+    }
+
     pub async fn inspect_window(&self, identity: &TmuxWindowIdentity) -> TmuxTerminalInspection {
         match self.registered_windows.read().await.get(identity) {
             Some(RegisteredWindowState::Terminal(inspection)) => return inspection.clone(),

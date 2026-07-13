@@ -75,6 +75,8 @@ pub trait WakeRegistrar: Send + Sync {
         &self,
         registration: WakeRegistration,
     ) -> Result<WakeRegistrationReceipt, WakeRegistrarError>;
+
+    async fn cancel_registration(&self, conversation_id: &str) -> Result<(), WakeRegistrarError>;
 }
 
 pub struct DisabledWakeRegistrar;
@@ -85,6 +87,10 @@ impl WakeRegistrar for DisabledWakeRegistrar {
         &self,
         _registration: WakeRegistration,
     ) -> Result<WakeRegistrationReceipt, WakeRegistrarError> {
+        Err(WakeRegistrarError::Unavailable)
+    }
+
+    async fn cancel_registration(&self, _conversation_id: &str) -> Result<(), WakeRegistrarError> {
         Err(WakeRegistrarError::Unavailable)
     }
 }
@@ -195,6 +201,19 @@ impl Tool for WaitUntilTool {
                 return error_output(registration_error_id(&error), &error.to_string());
             }
         };
+        if ctx.cancel.is_cancelled() {
+            if let Err(error) = ctx
+                .wake_registrar()
+                .cancel_registration(&ctx.conversation_id)
+                .await
+            {
+                return error_output(registration_error_id(&error), &error.to_string());
+            }
+            return error_output(
+                "wake_registration_cancelled",
+                "tool execution was cancelled",
+            );
+        }
         success_output(json!({
             "status": "registered",
             "contract_id": receipt.contract_id,
@@ -242,13 +261,19 @@ async fn validate_target(
                     "target.window_id must be non-empty",
                 ));
             }
-            let Some(server) = ctx.tmux_registry().get_existing(&ctx.work_scope).await else {
-                return Err(error_output(
-                    "wake_unauthorized_handle",
-                    "tmux window is not owned by this work scope",
-                ));
-            };
-            let Some(server_generation) = server.read().await.server_generation.clone() else {
+            let recovered = ctx
+                .tmux_registry()
+                .recover_wait_target(&ctx.work_scope, window_id)
+                .await;
+            let server_generation =
+                if let Some(server) = ctx.tmux_registry().get_existing(&ctx.work_scope).await {
+                    server.read().await.server_generation.clone()
+                } else {
+                    recovered
+                        .as_ref()
+                        .map(|identity| identity.server_generation.clone())
+                };
+            let Some(server_generation) = server_generation else {
                 return Err(error_output(
                     "wake_unauthorized_handle",
                     "tmux server has no stable generation identity",
@@ -259,10 +284,11 @@ async fn validate_target(
                 server_generation: server_generation.clone(),
                 window_id: window_id.clone(),
             };
-            if !ctx
-                .tmux_registry()
-                .is_wait_targetable_window(&identity)
-                .await
+            if recovered.as_ref() != Some(&identity)
+                && !ctx
+                    .tmux_registry()
+                    .is_wait_targetable_window(&identity)
+                    .await
             {
                 return Err(error_output(
                     "wake_unauthorized_handle",
@@ -332,6 +358,12 @@ mod tests {
             };
             self.0.lock().await.push(registration);
             Ok(receipt)
+        }
+        async fn cancel_registration(
+            &self,
+            _conversation_id: &str,
+        ) -> Result<(), WakeRegistrarError> {
+            Ok(())
         }
     }
 

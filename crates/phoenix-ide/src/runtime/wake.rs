@@ -159,6 +159,15 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             }
         }
     }
+
+    async fn cancel_registration(&self, conversation_id: &str) -> Result<(), WakeRegistrarError> {
+        let repository = WorkflowRepository::new(self.manager.db().pool().clone());
+        WakeWorkflowAdapter::new(&repository)
+            .cancel_pending_for_conversation(conversation_id, Utc::now())
+            .await
+            .map(|_| ())
+            .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))
+    }
 }
 
 async fn existing_receipt(
@@ -476,7 +485,7 @@ async fn deliver_owed(
         ) {
             continue;
         }
-        let results = adapter
+        let results: Vec<WakeObservationResult> = adapter
             .owed_tool_results(&conversation_id)
             .await
             .map_err(|error| error.to_string())?
@@ -491,6 +500,9 @@ async fn deliver_owed(
                 },
             )
             .collect();
+        if results.is_empty() {
+            continue;
+        }
         manager
             .send_event(&conversation_id, Event::WakeObservationReady { results })
             .await
