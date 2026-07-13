@@ -271,6 +271,27 @@ describe('virtual transcript fixture scenarios', () => {
     expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios: reorderedScenarios })).toThrow(/changed order/);
   });
 
+  it('rejects scenario id and expectation kind mismatches in both schema and runtime adapter', () => {
+    const schema = readFixtureJson('schema.json') as JsonSchema;
+    const corpus = readFixtureJson('scenarios.json') as Record<string, unknown>;
+    const scenarios = [...(corpus['scenarios'] as Record<string, unknown>[])];
+    const source = scenarios[0]!;
+    const otherExpectation = (scenarios[1]!['expectation'] as Record<string, unknown>);
+    const mutatedScenario = {
+      ...source,
+      expectation: otherExpectation,
+    };
+    const mutatedCorpus = {
+      ...corpus,
+      scenarios: [mutatedScenario, ...scenarios.slice(1)],
+    };
+
+    expect(otherExpectation['kind']).not.toBe((source['expectation'] as Record<string, unknown>)['kind']);
+    expect(validateJsonSchema(mutatedCorpus, schema)).not.toEqual([]);
+    expect(() => parseVirtualTranscriptScenarioCorpus(mutatedCorpus))
+      .toThrow(/requires expectation kind restore_anchor_after_prefix_insertion, got preserve_anchor_across_resize/);
+  });
+
   it('covers the intended conformance corpus with stable ids and lookups', () => {
     expect(virtualTranscriptScenarios.map((scenario) => scenario.id)).toEqual(expectedIds);
     expect(new Set(expectedIds).size).toBe(expectedIds.length);

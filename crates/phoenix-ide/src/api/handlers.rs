@@ -2138,6 +2138,29 @@ enum StreamDbMessageSelection {
     None,
 }
 
+const STREAM_LAST_SEQUENCE_READ_FAILED: &str = "stream_last_sequence_read_failed";
+
+fn stream_last_sequence_read_failed(
+    conversation_id: &str,
+    error: impl std::fmt::Display,
+) -> AppError {
+    AppError::TypedInternal {
+        message: format!(
+            "failed to read last sequence id for conversation {conversation_id}: {error}"
+        ),
+        error_type: STREAM_LAST_SEQUENCE_READ_FAILED.to_string(),
+    }
+}
+
+async fn get_stream_last_sequence_id(
+    db: &crate::db::Database,
+    conversation_id: &str,
+) -> Result<i64, AppError> {
+    db.get_last_sequence_id(conversation_id)
+        .await
+        .map_err(|e| stream_last_sequence_read_failed(conversation_id, e))
+}
+
 #[derive(Debug, Deserialize)]
 struct LatestMessagesQuery {
     limit: Option<i64>,
@@ -2972,6 +2995,41 @@ fn stream_state_starts_runtime(state: &ConvState) -> bool {
     )
 }
 
+async fn read_stream_init_messages_with_tail(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    query: &StreamConversationQuery,
+    cursor_replay_served: bool,
+    attempt: usize,
+    last_sequence_id: Result<i64, AppError>,
+) -> Result<(i64, StreamDbMessageSelection, Vec<crate::db::Message>), AppError> {
+    let last_sequence_id = last_sequence_id?;
+    let mut db_message_selection = db_message_selection_for_stream(
+        cursor_replay_served,
+        query,
+        last_sequence_id,
+        db.get_conversation(conversation_id)
+            .await
+            .map_err(|e| AppError::NotFound(e.to_string()))?
+            .transcript_generation,
+    );
+    if attempt > 1 {
+        db_message_selection = StreamDbMessageSelection::Full;
+    }
+    let messages = match db_message_selection {
+        StreamDbMessageSelection::None => Vec::new(),
+        StreamDbMessageSelection::Full => db
+            .get_messages(conversation_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+        StreamDbMessageSelection::AfterFloor(after_floor) => db
+            .get_messages_after(conversation_id, after_floor)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    };
+    Ok((last_sequence_id, db_message_selection, messages))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -3033,31 +3091,15 @@ async fn stream_conversation(
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
         Box::pin(async move {
-            let last_sequence_id = db.get_last_sequence_id(id).await.unwrap_or(0);
-            let mut db_message_selection = db_message_selection_for_stream(
-                cursor_replay_served,
+            read_stream_init_messages_with_tail(
+                db,
+                id,
                 &query,
-                last_sequence_id,
-                db.get_conversation(id)
-                    .await
-                    .map_err(|e| AppError::NotFound(e.to_string()))?
-                    .transcript_generation,
-            );
-            if attempt > 1 {
-                db_message_selection = StreamDbMessageSelection::Full;
-            }
-            let messages = match db_message_selection {
-                StreamDbMessageSelection::None => Vec::new(),
-                StreamDbMessageSelection::Full => db
-                    .get_messages(id)
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?,
-                StreamDbMessageSelection::AfterFloor(after_floor) => db
-                    .get_messages_after(id, after_floor)
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?,
-            };
-            Ok((last_sequence_id, db_message_selection, messages))
+                cursor_replay_served,
+                attempt,
+                get_stream_last_sequence_id(db, id).await,
+            )
+            .await
         })
     })
     .await?;
@@ -6448,6 +6490,10 @@ pub(crate) enum AppError {
     /// 403 — the action is restricted to a caller on the server host.
     Forbidden(String),
     Internal(String),
+    TypedInternal {
+        message: String,
+        error_type: String,
+    },
     /// 409 — conflict (dirty worktree, merge conflicts, etc.). Boxed because
     /// `ConflictErrorResponse` is the largest variant and grew with
     /// `continuation_id` (REQ-BED-031) — boxing keeps `AppError` compact so
@@ -6492,6 +6538,17 @@ impl IntoResponse for AppError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse::new(msg.clone())),
+                )
+                    .into_response()
+            }
+            AppError::TypedInternal {
+                message,
+                error_type,
+            } => {
+                tracing::error!(error = %message, error_type = %error_type, "500 Internal Server Error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::typed(message, error_type)),
                 )
                     .into_response()
             }
@@ -8469,30 +8526,15 @@ pub(crate) mod hard_delete_cascade_tests {
             stable_transcript_read(state.runtime.db(), "stream-none-race", |db, id, attempt| {
                 let query = query.clone();
                 Box::pin(async move {
-                    let last_sequence_id = db.get_last_sequence_id(id).await.unwrap_or(0);
-                    let mut selection = db_message_selection_for_stream(
-                        true,
+                    let (_, selection, messages) = read_stream_init_messages_with_tail(
+                        db,
+                        id,
                         &query,
-                        last_sequence_id,
-                        db.get_conversation(id)
-                            .await
-                            .map_err(|e| AppError::NotFound(e.to_string()))?
-                            .transcript_generation,
-                    );
-                    if attempt > 1 {
-                        selection = StreamDbMessageSelection::Full;
-                    }
-                    let messages = match selection {
-                        StreamDbMessageSelection::None => Vec::new(),
-                        StreamDbMessageSelection::Full => db
-                            .get_messages(id)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                        StreamDbMessageSelection::AfterFloor(after_floor) => db
-                            .get_messages_after(id, after_floor)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                    };
+                        true,
+                        attempt,
+                        get_stream_last_sequence_id(db, id).await,
+                    )
+                    .await?;
                     Ok((selection, messages))
                 })
             })
@@ -8545,30 +8587,15 @@ pub(crate) mod hard_delete_cascade_tests {
             |db, id, attempt| {
                 let query = query.clone();
                 Box::pin(async move {
-                    let last_sequence_id = db.get_last_sequence_id(id).await.unwrap_or(0);
-                    let mut selection = db_message_selection_for_stream(
-                        false,
+                    let (_, selection, messages) = read_stream_init_messages_with_tail(
+                        db,
+                        id,
                         &query,
-                        last_sequence_id,
-                        db.get_conversation(id)
-                            .await
-                            .map_err(|e| AppError::NotFound(e.to_string()))?
-                            .transcript_generation,
-                    );
-                    if attempt > 1 {
-                        selection = StreamDbMessageSelection::Full;
-                    }
-                    let messages = match selection {
-                        StreamDbMessageSelection::None => Vec::new(),
-                        StreamDbMessageSelection::Full => db
-                            .get_messages(id)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                        StreamDbMessageSelection::AfterFloor(after_floor) => db
-                            .get_messages_after(id, after_floor)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                    };
+                        false,
+                        attempt,
+                        get_stream_last_sequence_id(db, id).await,
+                    )
+                    .await?;
                     Ok((selection, messages))
                 })
             },
@@ -8628,31 +8655,15 @@ pub(crate) mod hard_delete_cascade_tests {
             |db, id, attempt| {
                 let query = query.clone();
                 Box::pin(async move {
-                    let last_sequence_id = db.get_last_sequence_id(id).await.unwrap_or(0);
-                    let mut selection = db_message_selection_for_stream(
-                        false,
+                    read_stream_init_messages_with_tail(
+                        db,
+                        id,
                         &query,
-                        last_sequence_id,
-                        db.get_conversation(id)
-                            .await
-                            .map_err(|e| AppError::NotFound(e.to_string()))?
-                            .transcript_generation,
-                    );
-                    if attempt > 1 {
-                        selection = StreamDbMessageSelection::Full;
-                    }
-                    let messages = match selection {
-                        StreamDbMessageSelection::None => Vec::new(),
-                        StreamDbMessageSelection::Full => db
-                            .get_messages(id)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                        StreamDbMessageSelection::AfterFloor(after_floor) => db
-                            .get_messages_after(id, after_floor)
-                            .await
-                            .map_err(|e| AppError::Internal(e.to_string()))?,
-                    };
-                    Ok((last_sequence_id, selection, messages))
+                        false,
+                        attempt,
+                        get_stream_last_sequence_id(db, id).await,
+                    )
+                    .await
                 })
             },
         )
@@ -8667,6 +8678,64 @@ pub(crate) mod hard_delete_cascade_tests {
             messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[tokio::test]
+    async fn stream_init_tail_read_failure_aborts_before_db_message_selection() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "stream-tail-read-fails",
+                "tail-read-fails",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                "stream-tail-read-fails-msg-1",
+                "stream-tail-read-fails",
+                &crate::db::MessageContent::user("m1"),
+                None,
+                None,
+            )
+            .await
+            .expect("add message");
+
+        let result = read_stream_init_messages_with_tail(
+            state.runtime.db(),
+            "stream-tail-read-fails",
+            &StreamConversationQuery {
+                after_event_sequence: Some(1),
+                after_sequence: None,
+                init_mode: Some(StreamInitMode::MessagesAfterFloor),
+                after_message_floor: Some(1),
+                transcript_generation: Some(1),
+            },
+            true,
+            1,
+            Err(stream_last_sequence_read_failed(
+                "stream-tail-read-fails",
+                "fault-injected tail read failure",
+            )),
+        )
+        .await;
+
+        match result {
+            Err(AppError::TypedInternal {
+                message,
+                error_type,
+            }) => {
+                assert_eq!(error_type, STREAM_LAST_SEQUENCE_READ_FAILED);
+                assert!(message.contains("fault-injected tail read failure"));
+            }
+            other => panic!("expected typed stream tail failure, got {other:?}"),
+        }
     }
 
     #[test]

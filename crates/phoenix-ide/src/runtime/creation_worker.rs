@@ -1484,7 +1484,9 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
             ..
         })
         | AppError::NotFound(message) => (message, ErrorKind::InvalidRequest),
-        AppError::Internal(message) => (message, ErrorKind::ServerError),
+        AppError::Internal(message) | AppError::TypedInternal { message, .. } => {
+            (message, ErrorKind::ServerError)
+        }
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
     }
 }

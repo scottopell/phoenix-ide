@@ -17,6 +17,16 @@ const EXPECTED_SCENARIO_IDS = [
   'supersession',
 ] as const satisfies readonly VirtualTranscriptScenarioId[];
 
+const EXPECTED_EXPECTATION_KIND_BY_SCENARIO_ID = {
+  'prefix-insertion-within-tall-unit': 'restore_anchor_after_prefix_insertion',
+  'resize-above-anchor': 'preserve_anchor_across_resize',
+  'alias-navigation': 'resolve_alias_navigation',
+  'orphan-target': 'report_orphan_target',
+  'streaming-growth-reading': 'stream_append_without_reposition',
+  'streaming-growth-following': 'stream_append_and_follow_tail',
+  'supersession': 'supersede_restore_command',
+} as const satisfies Record<VirtualTranscriptScenarioId, VirtualTranscriptScenario['expectation']['kind']>;
+
 const UnitRoleSchema = v.picklist(['user', 'agent', 'tool', 'system']);
 const StringArraySchema = v.array(v.string());
 
@@ -158,6 +168,15 @@ export function parseVirtualTranscriptScenarioCorpus(raw: unknown): VirtualTrans
     throw new Error(
       `Virtual Transcript fixture metadata scenarioCount ${parsed.metadata.scenarioCount} does not match ${parsed.scenarios.length} scenarios`,
     );
+  }
+
+  for (const scenario of parsed.scenarios) {
+    const expectedKind = EXPECTED_EXPECTATION_KIND_BY_SCENARIO_ID[scenario.id];
+    if (scenario.expectation.kind !== expectedKind) {
+      throw new Error(
+        `Virtual Transcript fixture scenario ${scenario.id} requires expectation kind ${expectedKind}, got ${scenario.expectation.kind}`,
+      );
+    }
   }
 
   return parsed;

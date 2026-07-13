@@ -12,7 +12,7 @@
       "type": "array",
       "minItems": 7,
       "maxItems": 7,
-      "items": { "$ref": "#/$defs/scenario" },
+      "items": { "$ref": "#/$defs/scenarioVariant" },
       "allOf": [
         { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "prefix-insertion-within-tall-unit" } } }, "minContains": 1, "maxContains": 1 },
         { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "resize-above-anchor" } } }, "minContains": 1, "maxContains": 1 },
@@ -60,6 +60,80 @@
         "after": { "$ref": "#/$defs/snapshot" },
         "aliasLookups": { "type": "array", "items": { "$ref": "#/$defs/aliasLookup" } },
         "expectation": { "$ref": "#/$defs/expectation" }
+      }
+    },
+    "scenarioVariant": {
+      "oneOf": [
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/prefixInsertionWithinTallUnitScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/resizeAboveAnchorScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/aliasNavigationScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/orphanTargetScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/streamingGrowthReadingScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/streamingGrowthFollowingScenario" }] },
+        { "allOf": [{ "$ref": "#/$defs/scenario" }, { "$ref": "#/$defs/supersessionScenario" }] }
+      ]
+    },
+    "prefixInsertionWithinTallUnitScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "prefix-insertion-within-tall-unit" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "restore_anchor_after_prefix_insertion" } } }
+      }
+    },
+    "resizeAboveAnchorScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "resize-above-anchor" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "preserve_anchor_across_resize" } } }
+      }
+    },
+    "aliasNavigationScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "alias-navigation" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "resolve_alias_navigation" } } }
+      }
+    },
+    "orphanTargetScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "orphan-target" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "report_orphan_target" } } }
+      }
+    },
+    "streamingGrowthReadingScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "streaming-growth-reading" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "stream_append_without_reposition" } } }
+      }
+    },
+    "streamingGrowthFollowingScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "streaming-growth-following" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "stream_append_and_follow_tail" } } }
+      }
+    },
+    "supersessionScenario": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "expectation"],
+      "properties": {
+        "id": { "const": "supersession" },
+        "expectation": { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "supersede_restore_command" } } }
       }
     },
     "unit": {
