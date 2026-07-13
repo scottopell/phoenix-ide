@@ -2,10 +2,9 @@ import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MetaViewer } from './MetaViewer';
-import * as viewerFindModule from '../viewer-find/useViewerFind';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
-import { resetCodeViewMock } from './__testutils__/codeViewMock';
+import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
 
 vi.mock('mermaid', () => ({
   default: {
@@ -92,8 +91,7 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
 describe('MetaViewer payload routing', () => {
-  it('keeps useViewerFind in state-only mode while projection drives file matching', async () => {
-    const spy = vi.spyOn(viewerFindModule, 'useViewerFind');
+  it('drives file counts from the typed line projection', async () => {
     renderViewer({
       ...textCommon,
       kind: 'text',
@@ -104,9 +102,6 @@ describe('MetaViewer payload routing', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    expect(spy).toHaveBeenCalled();
-    expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ text: '' });
-    spy.mockRestore();
   });
 
   beforeEach(() => resetCodeViewMock());
@@ -572,12 +567,10 @@ describe('MetaViewer payload routing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'beta' } });
 
-    const originalLine = document.querySelector('[data-line="2"]') as HTMLElement;
-    originalLine.scrollIntoView = vi.fn();
-    await waitFor(() => expect(originalLine.scrollIntoView).toHaveBeenCalledTimes(1));
-
-    const insertedLine = document.querySelector('[data-line="3"]') as HTMLElement;
-    insertedLine.scrollIntoView = vi.fn();
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'line', id: 'file:/tmp/project/thing', lineNumber: 2, align: 'center', behavior: 'smooth',
+    }));
+    const scrollCount = codeViewMockState.scrollToCalls.length;
 
     rerender(
       <ReviewNotesProvider>
@@ -586,7 +579,7 @@ describe('MetaViewer payload routing', () => {
     );
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    expect(insertedLine.scrollIntoView).not.toHaveBeenCalled();
+    expect(codeViewMockState.scrollToCalls).toHaveLength(scrollCount);
   });
 
   it('falls back to line reveal for HTML source matches without explicit marks', async () => {

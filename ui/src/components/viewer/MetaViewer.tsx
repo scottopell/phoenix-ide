@@ -28,6 +28,7 @@ import {
   type FileSearchProjection,
   type FileSearchMatchTarget,
   type FindSessionCommand,
+  type FindSessionMatch,
 } from '../viewer-find';
 import type { SearchableSourceMatch } from '../viewer-find';
 import { NotesPanel } from './NotesPanel';
@@ -287,6 +288,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     onCommands: handleFindCommands,
   });
   const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const activeFindSurfaceKey = findSession?.surfaceKey ?? null;
+  const findSessionMatches = findSession?.matches ?? EMPTY_FIND_SESSION_MATCHES;
   const findQuery = findSession?.query ?? '';
   const shouldProjectFind = findEligible && findQuery.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
@@ -300,8 +304,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
   const activeFindMatch = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
-    () => (findSession ? findSession.matches.map((match) => match.target) : []),
-    [findSession],
+    () => findSessionMatches.map((match) => match.target),
+    [findSessionMatches],
   );
 
   const focusedRangeLines = useMemo(() => {
@@ -351,27 +355,19 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   });
 
   useEffect(() => {
-    if (findEligible || !findSession) return;
+    if (findEligible || !findOpen) return;
     sendFind({ type: 'close' });
-  }, [findEligible, findSession, sendFind]);
+  }, [findEligible, findOpen, sendFind]);
 
   useEffect(() => {
-    if (!findSession) return;
-    if (findSession.surfaceKey !== findSurfaceKey) {
-      sendFind({
-        type: 'replace-surface',
-        surface: {
-          key: findSurfaceKey,
-          query: '',
-          matches: [],
-          focusOrigin: document.activeElement instanceof HTMLElement ? document.activeElement : null,
-        },
-      });
+    if (!findOpen) return;
+    if (activeFindSurfaceKey !== findSurfaceKey) {
+      sendFind({ type: 'close' });
       return;
     }
     if (findQuery.length === 0) return;
     sendFind({ type: 'replace-results', matches: sessionMatches });
-  }, [findQuery, findSession, findSurfaceKey, sendFind, sessionMatches]);
+  }, [activeFindSurfaceKey, findOpen, findQuery, findSurfaceKey, sendFind, sessionMatches]);
 
   const handleFindQueryChange = useCallback((query: string) => {
     sendFind({ type: 'set-query', query });
@@ -487,7 +483,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const viewerMode = payload.kind === 'image' && imageTakeover ? 'takeover' : inline ? 'inline' : 'overlay';
   const shell = (
     <ViewerShell
-      closeOnEscape={!findSession}
+      closeOnEscape={!findOpen}
       onInnerEscape={closeFind}
       mode={viewerMode}
       ariaLabel={`File viewer: ${title}`}
@@ -549,6 +545,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   return payload.kind === 'image' && imageTakeover ? createPortal(shell, document.body) : shell;
 }
 
+const EMPTY_FIND_SESSION_MATCHES: readonly FindSessionMatch<FileSearchMatchTarget>[] = [];
 const EMPTY_SET: Set<number> = new Set();
 
 function renderBody(
