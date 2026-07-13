@@ -8,7 +8,7 @@ use phoenix_workflow::{
     creation_profile::{
         self, AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
         CapabilityAvailability, CompensationPrediction, CompletionPrediction, CreationCapabilities,
-        CreationEffectIntent, CreationProjectionStatus, EffectPrediction,
+        CreationEffectIntent, CreationEvent, CreationProjectionStatus, EffectPrediction,
     },
     SemanticAuthority,
 };
@@ -116,8 +116,8 @@ impl<'a> CreationShadowAdapter<'a> {
         update_divergence(
             &mut tx,
             config,
-            domain.projection.status,
             observed,
+            domain.projection.status,
             domain.projection.capabilities,
             projected_at,
         )
@@ -236,15 +236,16 @@ async fn upsert_anchor(
         "INSERT INTO workflows (id, profile_id, protocol_version, authority, execution_mode, \
          authoritative_workflow_id, protocol_selection_id, version, generation, status, \
          snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
-         VALUES (?1, ?2, ?3, 'legacy_protocol', 'authoritative', NULL, ?4, 0, ?5, 'active', \
-         'creation.authoritative_anchor', 1, '{}', ?6) \
-         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation",
+         VALUES (?1, ?2, ?3, 'legacy_protocol', 'authoritative', NULL, ?4, 0, ?5, ?6, \
+         'creation.authoritative_anchor', 1, '{}', ?7) \
+         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, status = excluded.status",
     )
     .bind(&config.authoritative_anchor_workflow_id)
     .bind(creation_profile::PROFILE_ID)
     .bind(i64::from(creation_profile::PROTOCOL_VERSION))
     .bind(SELECTION_ID)
     .bind(to_i64(oracle.generation)?)
+    .bind(anchor_status_sql(&oracle.status))
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await?;
@@ -336,14 +337,16 @@ async fn replace_graph(
         .execute(&mut **tx)
         .await?;
     let transition_id = format!("{}:projection", config.shadow_workflow_id);
+    let event_payload = redacted_event_payload(&domain.plan.event);
     sqlx::query(
         "INSERT INTO workflow_transitions (id, workflow_id, from_version, to_version, generation, \
          event_codec_family, event_codec_version, event_payload, committed_at) \
-         VALUES (?1, ?2, 0, 1, ?3, 'creation.event', 1, '{}', ?4)",
+         VALUES (?1, ?2, 0, 1, ?3, 'creation.event', 1, ?4, ?5)",
     )
     .bind(&transition_id)
     .bind(&config.shadow_workflow_id)
     .bind(to_i64(oracle.generation)?)
+    .bind(event_payload)
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await?;
@@ -642,14 +645,16 @@ async fn upsert_projection(
 async fn update_divergence(
     tx: &mut Transaction<'_, Sqlite>,
     config: &CreationShadowConfig,
-    expected: CreationProjectionStatus,
     observed: CreationShadowEvidence,
-    domain_capabilities: CreationCapabilities,
+    actual: CreationProjectionStatus,
+    actual_capabilities: CreationCapabilities,
     now: DateTime<Utc>,
 ) -> WorkflowRepositoryResult<()> {
-    let actual = match observed {
-        CreationShadowEvidence::ProjectionStatus(actual)
-        | CreationShadowEvidence::UserProjection { status: actual, .. } => actual,
+    let expected = match observed {
+        CreationShadowEvidence::ProjectionStatus(expected)
+        | CreationShadowEvidence::UserProjection {
+            status: expected, ..
+        } => expected,
     };
     if expected == actual {
         sqlx::query("UPDATE creation_shadow_divergences SET resolved_at = ?1 WHERE shadow_workflow_id = ?2 AND evidence_identity = 'projection_status' AND resolved_at IS NULL")
@@ -676,33 +681,33 @@ async fn update_divergence(
         for (identity, expected, actual) in [
             (
                 "capability_read",
-                allowed(domain_capabilities.read),
                 allowed(capabilities.read),
+                allowed(actual_capabilities.read),
             ),
             (
                 "capability_write",
-                allowed(domain_capabilities.write),
                 allowed(capabilities.write),
+                allowed(actual_capabilities.write),
             ),
             (
                 "capability_runtime",
-                allowed(domain_capabilities.runtime),
                 allowed(capabilities.runtime),
+                allowed(actual_capabilities.runtime),
             ),
             (
                 "capability_cancel",
-                allowed(domain_capabilities.cancel),
                 allowed(capabilities.cancel),
+                allowed(actual_capabilities.cancel),
             ),
             (
                 "capability_start_over",
-                allowed(domain_capabilities.start_over),
                 allowed(capabilities.start_over),
+                allowed(actual_capabilities.start_over),
             ),
             (
                 "capability_delete",
-                allowed(domain_capabilities.delete),
                 allowed(capabilities.delete),
+                allowed(actual_capabilities.delete),
             ),
         ] {
             update_boolean_divergence(tx, config, identity, expected, actual, now).await?;
@@ -729,6 +734,32 @@ async fn update_boolean_divergence(
             .bind(actual.to_string()).bind(now.to_rfc3339()).execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+fn redacted_event_payload(event: &CreationEvent) -> String {
+    let (kind, job_id) = match event {
+        CreationEvent::ShadowPlanProjected { job_id } => ("shadow_plan_projected", job_id),
+        CreationEvent::AuthoritativeProgressObserved { job_id, .. } => {
+            ("authoritative_progress_observed", job_id)
+        }
+        CreationEvent::CancellationOrDeletionProjected { job_id } => {
+            ("cancellation_or_deletion_projected", job_id)
+        }
+    };
+    serde_json::json!({ "kind": kind, "job_id": job_id }).to_string()
+}
+
+fn anchor_status_sql(value: &AuthoritativeCreationStatus) -> &'static str {
+    match value {
+        AuthoritativeCreationStatus::Accepted
+        | AuthoritativeCreationStatus::Claimed { .. }
+        | AuthoritativeCreationStatus::RetryScheduled { .. } => "active",
+        AuthoritativeCreationStatus::Cancelling => "cancelling",
+        AuthoritativeCreationStatus::Cancelled => "cancelled",
+        AuthoritativeCreationStatus::DeletionPending => "deletion_pending",
+        AuthoritativeCreationStatus::Ready => "completed",
+        AuthoritativeCreationStatus::Failed(_) => "failed",
+    }
 }
 
 fn authoritative_status_sql(value: &AuthoritativeCreationStatus) -> &'static str {

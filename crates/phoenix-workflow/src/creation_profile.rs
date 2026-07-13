@@ -471,7 +471,26 @@ pub fn adapt_authoritative_creation(
         snapshot_codec(),
         snapshot.clone(),
     )?;
-    let plan = if matches!(
+    let plan = if uses_compensation_plan(oracle) {
+        compensation_plan(oracle)
+    } else {
+        creation_plan(oracle, snapshot)
+    };
+    let mut projection = project_authoritative_creation(oracle);
+    projection.readiness_effects = plan
+        .barrier_members
+        .iter()
+        .map(|member| member.effect_id)
+        .collect();
+    Ok(CreationShadowAdapter {
+        workflow,
+        plan,
+        projection,
+    })
+}
+
+fn uses_compensation_plan(oracle: &AuthoritativeCreationOracle) -> bool {
+    matches!(
         oracle.status,
         AuthoritativeCreationStatus::Cancelling
             | AuthoritativeCreationStatus::DeletionPending
@@ -482,16 +501,7 @@ pub fn adapt_authoritative_creation(
             AuthoritativeCreationStatus::Failed(_),
             CleanupOwnership::OwnedResources
         )
-    ) {
-        compensation_plan(oracle)
-    } else {
-        creation_plan(oracle, snapshot)
-    };
-    Ok(CreationShadowAdapter {
-        workflow,
-        plan,
-        projection: project_authoritative_creation(oracle),
-    })
+    )
 }
 
 #[must_use]
@@ -504,6 +514,17 @@ pub fn creation_plan(
         CreationKind::SeededEmpty => None,
     };
     let mut effects = base_effects(&oracle.intent, oracle.generation);
+    effects.push(effect(
+        COMMIT_METADATA,
+        "commit_metadata",
+        CreationEffectIntent::CommitMetadata {
+            conversation_id: oracle.intent.conversation_id.clone(),
+            worktree_path: oracle.intent.worktree_path.clone(),
+        },
+        oracle.generation,
+        EffectAmbiguity::ObservableReconciliation,
+        None,
+    ));
     if let Some(message_id) = initial_turn {
         effects.push(effect(
             EXPAND_INITIAL_MESSAGE,
@@ -539,17 +560,6 @@ pub fn creation_plan(
             None,
         ));
     }
-    effects.push(effect(
-        COMMIT_METADATA,
-        "commit_metadata",
-        CreationEffectIntent::CommitMetadata {
-            conversation_id: oracle.intent.conversation_id.clone(),
-            worktree_path: oracle.intent.worktree_path.clone(),
-        },
-        oracle.generation,
-        EffectAmbiguity::ObservableReconciliation,
-        None,
-    ));
 
     let mut dependencies = vec![
         dependency(RESERVE_WORKTREE, RESOLVE_REPOSITORY),
@@ -560,8 +570,7 @@ pub fn creation_plan(
     ];
     if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
         dependencies.extend([
-            dependency(EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS),
-            dependency(BOOTSTRAP_RUNTIME, COMMIT_METADATA),
+            dependency(EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
             dependency(BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
             dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
         ]);
@@ -818,9 +827,34 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
             false,
         ),
     };
-    let readiness_effects = match &oracle.intent.kind {
-        CreationKind::InitialTurn { .. } => vec![BOOTSTRAP_RUNTIME, DISPATCH_INITIAL_LLM_REQUEST],
-        CreationKind::SeededEmpty => vec![COMMIT_METADATA],
+    let readiness_effects = if uses_compensation_plan(oracle) {
+        vec![
+            REVOKE_RUNTIME,
+            REMOVE_OWNED_WORKTREE,
+            RELEASE_RESERVATION,
+            DELETE_STAGED_ATTACHMENTS,
+            FINISH_CANCELLATION_OR_DELETION,
+        ]
+    } else {
+        match &oracle.intent.kind {
+            CreationKind::InitialTurn { .. } => vec![
+                RESOLVE_REPOSITORY,
+                RESERVE_WORKTREE,
+                MATERIALIZE_OR_RECONCILE_WORKTREE,
+                FINALIZE_ATTACHMENTS,
+                COMMIT_METADATA,
+                EXPAND_INITIAL_MESSAGE,
+                BOOTSTRAP_RUNTIME,
+                DISPATCH_INITIAL_LLM_REQUEST,
+            ],
+            CreationKind::SeededEmpty => vec![
+                RESOLVE_REPOSITORY,
+                RESERVE_WORKTREE,
+                MATERIALIZE_OR_RECONCILE_WORKTREE,
+                FINALIZE_ATTACHMENTS,
+                COMMIT_METADATA,
+            ],
+        }
     };
     CreationProjection {
         conversation_id: oracle.intent.conversation_id.clone(),

@@ -144,6 +144,27 @@ async fn persists_real_bounded_shadow_graph_without_authority_or_semantic_byte_d
         "creation-authoritative-anchor"
     );
     assert_eq!(workflow.get::<String, _>("snapshot_payload"), "{}");
+    let anchor_status: String = sqlx::query_scalar(
+        "SELECT status FROM workflows WHERE id = 'creation-authoritative-anchor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(anchor_status, "active");
+    let event_payload: String = sqlx::query_scalar(
+        "SELECT event_payload FROM workflow_transitions WHERE workflow_id = 'creation-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event_payload).unwrap(),
+        serde_json::json!({
+            "kind": "shadow_plan_projected",
+            "job_id": "job-shadow"
+        })
+    );
+    assert!(!event_payload.contains("semantic bytes"));
 
     let selection = sqlx::query("SELECT accepting, runtime_acceptance_enabled, external_acceptance_enabled FROM workflow_protocol_selections WHERE id = ?1")
         .bind(SELECTION_ID).fetch_one(&pool).await.unwrap();
@@ -186,6 +207,13 @@ async fn divergence_lifecycle_is_bounded_and_authoritative_job_never_mutates() {
             .unwrap();
     }
     assert_eq!(row_count(&pool, "creation_shadow_divergences").await, 1);
+    let values: (String, String) = sqlx::query_as(
+        "SELECT expected_value, actual_value FROM creation_shadow_divergences WHERE evidence_identity = 'projection_status' AND resolved_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(values, ("ready".to_owned(), "provisioning".to_owned()));
     adapter
         .persist_after_authoritative_commit(
             &oracle(),
@@ -249,6 +277,13 @@ async fn independent_user_capabilities_record_divergence() {
     .await
     .unwrap();
     assert_eq!(divergence, 1);
+    let values: (String, String) = sqlx::query_as(
+        "SELECT expected_value, actual_value FROM creation_shadow_divergences WHERE evidence_identity = 'capability_cancel' AND resolved_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(values, ("false".to_owned(), "true".to_owned()));
 }
 
 #[tokio::test]
@@ -273,6 +308,42 @@ async fn stale_status_or_stage_snapshot_is_rejected() {
         .await
         .is_err());
     assert_eq!(row_count(&pool, "creation_shadow_bindings").await, 0);
+}
+
+#[tokio::test]
+async fn authoritative_anchor_tracks_terminal_status() {
+    let pool = pool().await;
+    sqlx::query("UPDATE conversation_creation_jobs SET status = 'ready', stage = 'finalize', completed_at = '2025-01-02' WHERE id = 'job-shadow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut ready = oracle();
+    ready.status = AuthoritativeCreationStatus::Ready;
+    ready.stage = AuthoritativeCreationStage::Finalize;
+    ready.revision = u64::try_from(revision).unwrap();
+
+    CreationShadowAdapter::new(&WorkflowRepository::new(pool.clone()), &config())
+        .persist_after_authoritative_commit(
+            &ready,
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Ready),
+            Utc.timestamp_opt(2_150, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM workflows WHERE id = 'creation-authoritative-anchor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "completed");
 }
 
 #[tokio::test]

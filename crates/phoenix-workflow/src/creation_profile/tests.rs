@@ -91,10 +91,9 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
         (RESERVE_WORKTREE, RESOLVE_REPOSITORY),
         (MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
         (FINALIZE_ATTACHMENTS, MATERIALIZE_OR_RECONCILE_WORKTREE),
-        (EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS),
         (COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         (COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        (BOOTSTRAP_RUNTIME, COMMIT_METADATA),
+        (EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
         (BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
         (DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
     ] {
@@ -108,7 +107,12 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
     assert_eq!(adapter.plan.barrier_members.len(), 8);
     assert_eq!(
         adapter.projection.readiness_effects,
-        vec![BOOTSTRAP_RUNTIME, DISPATCH_INITIAL_LLM_REQUEST]
+        adapter
+            .plan
+            .barrier_members
+            .iter()
+            .map(|member| member.effect_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -140,6 +144,15 @@ fn seeded_empty_has_distinct_required_dag_without_expansion_or_dispatch() {
     assert!(!ids.contains(&DISPATCH_INITIAL_LLM_REQUEST));
     assert!(!ids.contains(&BOOTSTRAP_RUNTIME));
     assert_eq!(adapter.plan.barrier_members.len(), 5);
+    assert_eq!(
+        adapter.projection.readiness_effects,
+        adapter
+            .plan
+            .barrier_members
+            .iter()
+            .map(|member| member.effect_id)
+            .collect::<Vec<_>>()
+    );
     assert!(adapter
         .projection
         .effect_predictions
@@ -190,6 +203,18 @@ fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
     assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS)));
     assert_eq!(plan.barriers[0].barrier_id, COMPENSATION_BARRIER_ID);
     assert_eq!(plan.barrier_members.len(), 5);
+
+    let adapter = adapt_authoritative_creation(WorkflowId(13), WorkflowId(80), &oracle)
+        .expect("compensation adapter");
+    assert_eq!(
+        adapter.projection.readiness_effects,
+        adapter
+            .plan
+            .barrier_members
+            .iter()
+            .map(|member| member.effect_id)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
