@@ -137,6 +137,7 @@ export function WorkControlBar({
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
   );
+  const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
   const disposition = deriveWorkDisposition({
     convModeLabel,
     phaseType,
@@ -253,7 +254,7 @@ export function WorkControlBar({
 
       {/* FINISH zone */}
       <div className="work-actions-zone work-actions-zone--finish">
-        {disposition.showCleanUp && (
+        {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
           <>
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
@@ -276,7 +277,7 @@ export function WorkControlBar({
             <InfoHint text={cleanUpHintText(isBranch)} />
           </>
         )}
-        {disposition.showAbandon && (
+        {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
           <>
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}

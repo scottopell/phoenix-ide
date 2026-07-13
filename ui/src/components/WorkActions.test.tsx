@@ -708,6 +708,40 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
   });
 
+  it('suppresses terminal cleanup while multiple actionable associated PRs are ambiguous', () => {
+    const ambiguousHandle = prStatusHandle({
+      found: false,
+      work_change: { kind: 'clean' },
+    }, {
+      activeSelection: selection({
+        associated_prs: [
+          { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'task-123', feedback_status: 'open' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
+          { repo_owner: 'o', repo_name: 'r', pr_number: 55, title: 'Closed', url: 'https://gh/pr/55', state: 'CLOSED', draft: false, display_state: 'closed', base: 'main', head: 'old-branch', feedback_status: 'open' },
+        ],
+      }),
+      activePrSummary: null,
+      ambiguous: true,
+    });
+    delete ambiguousHandle.activeSelection.active_pr;
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={ambiguousHandle}
+      />,
+    );
+
+    expect(screen.getByTestId('view-diff-button')).toHaveTextContent('Workspace Diff');
+    expect(screen.getByTestId('active-pr-ambiguity-note')).toBeInTheDocument();
+    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 2 open/draft · 1 closed. Cleanup still applies only to this task branch.');
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+  });
+
   it('uses concise address-feedback copy and a full accessible target', () => {
     renderWithProviders(
       <WorkControlBar

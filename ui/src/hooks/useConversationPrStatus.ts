@@ -119,14 +119,6 @@ function selectionForCachedPr(cachedPr: CachedPrSummary | null | undefined): Ass
       head: cachedPr.head,
       feedback_status: cachedPr.feedback_status ?? 'open',
     }],
-    active_pr: {
-      pr: {
-        repo_owner: '',
-        repo_name: '',
-        pr_number: cachedPr.number,
-      },
-      provenance: 'inferred',
-    },
   };
 }
 

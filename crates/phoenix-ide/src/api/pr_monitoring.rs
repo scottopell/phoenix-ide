@@ -1072,8 +1072,9 @@ fn capture_pr_auto_fix_context_for_pr_item(
         PrMonitorError::Internal(format!("Failed to create PR context directory: {e}"))
     })?;
     let safe_ts = fetched_at.replace([':', '.'], "-");
+    let repo_slug = pr_context_repo_slug(&target.repo_owner, &target.repo_name);
     let rel_path = format!(
-        ".phoenix/pr-context/pr-{}-{safe_ts}.json",
+        ".phoenix/pr-context/pr-{repo_slug}-{}-{safe_ts}.json",
         artifact.pr.number
     );
     let path = worktree.join(&rel_path);
@@ -1082,7 +1083,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
     std::fs::write(&path, body).map_err(|e| {
         PrMonitorError::Internal(format!("Failed to write PR context artifact: {e}"))
     })?;
-    prune_pr_context_bundles(&dir, artifact.pr.number, PR_CONTEXT_RETAIN);
+    prune_pr_context_bundles(&dir, &repo_slug, artifact.pr.number, PR_CONTEXT_RETAIN);
 
     let message = phoenix_core::llm_language::pr_auto_fix_instruction(llm_language, &rel_path);
     let baseline = artifact.baseline();
@@ -1106,14 +1107,58 @@ fn capture_pr_auto_fix_context_for_pr_item(
 /// accumulate unbounded — one bundle per "Address PR feedback & CI" click.
 const PR_CONTEXT_RETAIN: usize = 3;
 
-/// Delete all but the newest `keep` context bundles for `pr_number` in `dir`.
-/// Bundles are named `pr-{n}-{ts}.json` with a lexicographically-sortable
-/// timestamp, so filename order is chronological order. The `pr-{n}-` prefix
-/// (trailing dash) keeps `pr-1-` from matching `pr-12-`. Best-effort: an
-/// unreadable directory or a failed unlink is logged at debug and skipped —
-/// pruning is hygiene, never load-bearing for the capture that triggered it.
-fn prune_pr_context_bundles(dir: &Path, pr_number: u64, keep: usize) {
-    let prefix = format!("pr-{pr_number}-");
+#[cfg(test)]
+mod pr_context_repo_slug_tests {
+    use super::pr_context_repo_slug;
+
+    #[test]
+    fn slugifies_repository_identity_for_filenames() {
+        assert_eq!(pr_context_repo_slug("Scott.Opell", "phoenix_ide"), "scott-opell--phoenix-ide");
+        assert_eq!(pr_context_repo_slug("", "Repo"), "repo");
+        assert_eq!(pr_context_repo_slug("", ""), "unknown-repo");
+    }
+}
+
+fn pr_context_repo_slug(repo_owner: &str, repo_name: &str) -> String {
+    fn sanitize(part: &str) -> String {
+        let mut out = String::with_capacity(part.len());
+        let mut last_was_sep = false;
+        for ch in part.chars() {
+            let safe = if ch.is_ascii_alphanumeric() {
+                last_was_sep = false;
+                Some(ch.to_ascii_lowercase())
+            } else if !last_was_sep {
+                last_was_sep = true;
+                Some('-')
+            } else {
+                None
+            };
+            if let Some(ch) = safe {
+                out.push(ch);
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    let owner = sanitize(repo_owner);
+    let name = sanitize(repo_name);
+    match (owner.is_empty(), name.is_empty()) {
+        (false, false) => format!("{owner}--{name}"),
+        (false, true) => owner,
+        (true, false) => name,
+        (true, true) => "unknown-repo".to_string(),
+    }
+}
+
+/// Delete all but the newest `keep` context bundles for `repo_slug` + `pr_number` in `dir`.
+/// Bundles are named `pr-{repo}-{n}-{ts}.json` with a lexicographically-sortable
+/// timestamp, so filename order is chronological order. The `pr-{repo}-{n}-`
+/// prefix (trailing dash) keeps neighboring repo/PR combinations distinct.
+/// Best-effort: an unreadable directory or a failed unlink is logged at debug
+/// and skipped — pruning is hygiene, never load-bearing for the capture that
+/// triggered it.
+fn prune_pr_context_bundles(dir: &Path, repo_slug: &str, pr_number: u64, keep: usize) {
+    let prefix = format!("pr-{repo_slug}-{pr_number}-");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -3198,6 +3243,7 @@ mod tests {
             &std::fs::read_to_string(temp.path().join(&response.artifact_path)).unwrap(),
         )
         .unwrap();
+        assert!(response.artifact_path.contains("pr-owner--repo-7-"));
         assert_eq!(artifact["manifest_version"], ARTIFACT_VERSION);
         assert_eq!(artifact["pr"]["number"], 7);
         assert_eq!(
@@ -3225,17 +3271,16 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_newest_n_per_pr_and_ignores_other_prs() {
+    fn prune_keeps_newest_n_per_repo_and_pr_and_ignores_other_bundles() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        // pr-12 has four bundles (ascending timestamps); pr-1 has one. The
-        // `pr-1-` prefix must not be pruned by a pr-12 pass and vice versa.
         for ts in ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"] {
-            std::fs::write(dir.join(format!("pr-12-{ts}.json")), "x").unwrap();
+            std::fs::write(dir.join(format!("pr-owner--repo-12-{ts}.json")), "x").unwrap();
         }
-        std::fs::write(dir.join("pr-1-2026-01-01.json"), "x").unwrap();
+        std::fs::write(dir.join("pr-owner--repo-1-2026-01-01.json"), "x").unwrap();
+        std::fs::write(dir.join("pr-other--repo-12-2026-01-04.json"), "x").unwrap();
 
-        prune_pr_context_bundles(dir, 12, 2);
+        prune_pr_context_bundles(dir, "owner--repo", 12, 2);
 
         let mut remaining: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -3245,9 +3290,10 @@ mod tests {
         assert_eq!(
             remaining,
             vec![
-                "pr-1-2026-01-01.json".to_string(),
-                "pr-12-2026-01-03.json".to_string(),
-                "pr-12-2026-01-04.json".to_string(),
+                "pr-other--repo-12-2026-01-04.json".to_string(),
+                "pr-owner--repo-1-2026-01-01.json".to_string(),
+                "pr-owner--repo-12-2026-01-03.json".to_string(),
+                "pr-owner--repo-12-2026-01-04.json".to_string(),
             ]
         );
     }
@@ -3256,7 +3302,7 @@ mod tests {
     fn prune_on_missing_dir_is_a_noop() {
         let temp = TempDir::new().unwrap();
         // Must not panic when the directory does not exist.
-        prune_pr_context_bundles(&temp.path().join("nope"), 1, 3);
+        prune_pr_context_bundles(&temp.path().join("nope"), "owner--repo", 1, 3);
     }
 
     #[test]

@@ -53,7 +53,8 @@ function Probe({ conversationId, cached }: { conversationId: string; cached?: Ca
   const refreshState = handle.state.status === 'ready' ? handle.state.prStatus.refresh.state : 'none';
   const associatedCount = handle.activeSelection?.associated_prs.length ?? 0;
   const activePrNumber = handle.activePrSummary?.pr_number ?? 'none';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span></div>;
+  const ambiguous = handle.ambiguous ? 'yes' : 'no';
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span></div>;
 }
 
 describe('useConversationPrStatus', () => {
@@ -96,6 +97,30 @@ describe('useConversationPrStatus', () => {
     expect(screen.getByTestId('pr-number')).toHaveTextContent('7');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 7');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
+    await waitFor(() => {
+      expect(getPrStatus).toHaveBeenCalledWith('conv-7');
+    });
+
+    fresh.resolve({ ...prStatus(8), title: 'Fresh PR 8' });
+    await waitFor(() => {
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('8');
+      expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
+    });
+  });
+
+  it('keeps cached PR selection display-only while the fresh status loads', async () => {
+    const fresh = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockReturnValue(fresh.promise);
+
+    render(<Probe conversationId="conv-7" cached={cachedPr(7)} />);
+
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('7');
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 7');
+    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
+    expect(screen.getByTestId('associated-count')).toHaveTextContent('1');
+    expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
+    expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
     await waitFor(() => {
       expect(getPrStatus).toHaveBeenCalledWith('conv-7');
     });
@@ -247,6 +272,25 @@ describe('useConversationPrStatus', () => {
     expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
+  });
+
+  it('keeps cached PR display-only after the fresh status request fails', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockRejectedValue(new Error('network failed'));
+
+    render(<Probe conversationId="conv-9" cached={cachedPr(9)} />);
+
+    await waitFor(() => {
+      expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
+    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
+    expect(screen.getByTestId('associated-count')).toHaveTextContent('1');
+    expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
+    expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
   });
 
 });
