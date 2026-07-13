@@ -449,14 +449,17 @@ function MessageListImpl({
     ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
     : null;
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
-  const activeFindHighlight = activeFindMatch?.target.kind === 'unit-text' && activeFindMatch.target.fragmentId
-    ? {
-        unitKey: activeFindMatch.target.unitKey,
-        fragmentId: activeFindMatch.target.fragmentId,
-        start: activeFindMatch.start,
-        end: activeFindMatch.end,
-      }
-    : null;
+  const activeFindHighlight = useMemo(
+    () => activeFindMatch?.target.kind === 'unit-text' && activeFindMatch.target.fragmentId
+      ? {
+          unitKey: activeFindMatch.target.unitKey,
+          fragmentId: activeFindMatch.target.fragmentId,
+          start: activeFindMatch.start,
+          end: activeFindMatch.end,
+        }
+      : null,
+    [activeFindMatch],
+  );
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;

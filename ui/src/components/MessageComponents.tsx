@@ -25,7 +25,7 @@ import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
 import { useIsDesktop } from '../hooks';
-import { useDensity, isSignificantText } from '../hooks/useDensity';
+import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -146,10 +146,6 @@ function usesGfmSyntax(text: string): boolean {
     || /www\.\S+/.test(text)
     || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
     || /\[\^[^\]]+\]/.test(text);
-}
-
-function containsMermaidFence(text: string): boolean {
-  return /(^|\n)```\s*mermaid(?:\s|\n|$)/i.test(text);
 }
 
 /** Format a tool execution duration for display in the tool block header.

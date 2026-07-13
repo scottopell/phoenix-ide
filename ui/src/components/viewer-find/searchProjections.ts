@@ -455,7 +455,7 @@ export function buildConversationSearchProjection(
           unitKind: source.unitKind,
           unitIndex: source.unitIndex,
           sourceId: source.id,
-          fragmentId: source.fragmentId,
+          ...(source.fragmentId ? { fragmentId: source.fragmentId } : {}),
           start: match.start,
           end: match.end,
         }),
