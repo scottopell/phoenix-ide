@@ -335,8 +335,10 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let value: Option<String> = sqlx::query_scalar(
             "SELECT MIN(b.expires_at) FROM wake_workflow_bindings b \
              JOIN workflows w ON w.id = b.workflow_id \
+             JOIN workflow_effects e ON e.id = b.observe_effect_id AND e.workflow_id = w.id \
              WHERE w.status = 'active' AND w.authority = 'engine_protocol' \
-               AND w.execution_mode = 'authoritative'",
+               AND w.execution_mode = 'authoritative' AND e.generation = w.generation \
+               AND e.status NOT IN ('receipted', 'invalidated')",
         )
         .fetch_one(self.repository.pool())
         .await?;
@@ -531,6 +533,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
     }
 
     /// Cancel by generation fencing and emit a reducer-only event. No owed acceptance is created.
+    #[allow(clippy::too_many_lines)]
     pub async fn cancel(
         &self,
         request: &WakeCancellationRequest,
@@ -548,6 +551,26 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let next_version = request.expected_version.checked_add(1).ok_or(
             WorkflowRepositoryError::VersionOutOfRange(request.expected_version),
         )?;
+        let current_snapshot: Option<String> =
+            sqlx::query_scalar(
+                "SELECT snapshot_payload FROM workflows WHERE id = ?1 AND version = ?2 \
+             AND generation = ?3 AND status = 'active' AND authority = 'engine_protocol' \
+             AND execution_mode = 'authoritative'",
+            )
+            .bind(&request.workflow_id)
+            .bind(i64::try_from(request.expected_version).map_err(|_| {
+                WorkflowRepositoryError::VersionOutOfRange(request.expected_version)
+            })?)
+            .bind(i64::try_from(request.expected_generation).map_err(|_| {
+                WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation)
+            })?)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(current_snapshot) = current_snapshot else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let cancelled_snapshot = cancellation_snapshot_json(&current_snapshot, &terminal)?;
         let updated =
             sqlx::query(
                 "UPDATE workflows SET version = ?1, generation = ?2, status = 'cancelled', \
@@ -565,7 +588,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
             )
             .bind(wake_profile::snapshot_codec().family)
             .bind(i64::from(wake_profile::snapshot_codec().version))
-            .bind(terminal_json(&terminal).to_string())
+            .bind(cancelled_snapshot.to_string())
             .bind(&request.workflow_id)
             .bind(i64::try_from(request.expected_version).map_err(|_| {
                 WorkflowRepositoryError::VersionOutOfRange(request.expected_version)
@@ -1069,6 +1092,29 @@ fn registration_receipt_payload(
 
 fn registration_receipt_json(intent: &WakeRegistrationIntent) -> Value {
     json!({"contract_id":intent.contract_id,"resource":resource_json(&intent.resource),"expires_at":intent.expires_at.0,"registering_tool_use_id":intent.registering_tool_use_id})
+}
+
+fn cancellation_snapshot_json(
+    current_snapshot: &str,
+    terminal: &WakeTerminalPayload,
+) -> WorkflowRepositoryResult<Value> {
+    let mut snapshot: Value = serde_json::from_str(current_snapshot).map_err(|error| {
+        WorkflowRepositoryError::CorruptState(format!(
+            "wake snapshot is not valid JSON during cancellation: {error}"
+        ))
+    })?;
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        WorkflowRepositoryError::CorruptState(
+            "wake snapshot is not an object during cancellation".to_owned(),
+        )
+    })?;
+    object.insert("terminal".to_owned(), terminal_json(terminal));
+    object.insert("cancelled".to_owned(), Value::Bool(true));
+    object.insert(
+        "runtime_availability".to_owned(),
+        Value::String("terminal".to_owned()),
+    );
+    Ok(snapshot)
 }
 
 fn registration_snapshot_json(intent: &WakeRegistrationIntent, fence_version: u64) -> Value {

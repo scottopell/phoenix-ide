@@ -140,6 +140,7 @@ pub enum TmuxTerminalInspection {
     Terminal {
         exit_code: i32,
         occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+        duration_ms: Option<u64>,
         final_tail: Vec<String>,
     },
     Missing,
@@ -509,7 +510,7 @@ impl TmuxRegistry {
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
-                let generation = ensure_server_generation(&server.socket_path).await;
+                let generation = ensure_server_generation(&server.socket_path).await?;
                 server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
                 reused_live = true;
@@ -523,6 +524,7 @@ impl TmuxRegistry {
                     &generation,
                 )
                 .await?;
+                verify_server_generation(&server.socket_path, &generation).await?;
                 server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
@@ -543,6 +545,7 @@ impl TmuxRegistry {
                     &generation,
                 )
                 .await?;
+                verify_server_generation(&server.socket_path, &generation).await?;
                 server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
@@ -680,7 +683,14 @@ impl TmuxRegistry {
             return TmuxTerminalInspection::Missing;
         }
 
-        let socket_path = self.derived_socket_path(&identity.work_scope);
+        // A scope rekey moves the registry entry but deliberately preserves its
+        // running server's original socket. Prefer that durable in-memory path;
+        // only derive when recovering after a Phoenix restart. This lookup is
+        // read-only and never materializes a missing inventory entry.
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
+        };
         match probe(&socket_path).await {
             Ok(ProbeResult::Live) => {}
             Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket) | Err(_) => {
@@ -1027,22 +1037,56 @@ fn new_server_generation() -> String {
     format!("srv-{nanos}-{}", uuid::Uuid::new_v4())
 }
 
-async fn ensure_server_generation(socket_path: &Path) -> String {
+async fn ensure_server_generation(socket_path: &Path) -> Result<String, TmuxError> {
     if let Some(generation) = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await {
-        return generation;
+        return Ok(generation);
     }
     let generation = new_server_generation();
-    run_tmux_quiet(
-        socket_path,
-        &[
+    let sock = socket_path.to_string_lossy().into_owned();
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
             "set-environment",
             "-g",
             SERVER_GENERATION_VAR,
             generation.as_str(),
-        ],
-    )
-    .await;
-    generation
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to install server generation: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!(
+                "tmux set-environment for server generation exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    verify_server_generation(socket_path, &generation).await?;
+    Ok(generation)
+}
+
+async fn verify_server_generation(socket_path: &Path, expected: &str) -> Result<(), TmuxError> {
+    let observed = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await;
+    if observed.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    Err(TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: format!(
+            "tmux server generation readback mismatch: expected {expected:?}, observed {observed:?}"
+        ),
+    })
 }
 
 async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTerminalInspection {
@@ -1075,6 +1119,7 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
         return TmuxTerminalInspection::Terminal {
             exit_code,
             occurred_at: parse_occurred_at_marker(&captured),
+            duration_ms: parse_duration_ms(&captured),
             final_tail: captured
                 .lines()
                 .rev()
@@ -1087,10 +1132,22 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
 }
 
 fn parse_occurred_at_marker(output: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    const PREFIX: &str = "[phoenix] process exited at unix seconds ";
+    parse_time_marker(output, "[phoenix] process exited at unix seconds ")
+}
+
+fn parse_duration_ms(output: &str) -> Option<u64> {
+    let started = parse_time_marker(output, "[phoenix] process started at unix seconds ")?;
+    let finished = parse_occurred_at_marker(output)?;
+    (finished - started).num_milliseconds().try_into().ok()
+}
+
+fn parse_time_marker(output: &str, prefix: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     output.lines().rev().find_map(|line| {
-        let seconds = line.trim().strip_prefix(PREFIX)?.parse::<i64>().ok()?;
-        chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)
+        let value = line.trim().strip_prefix(prefix)?;
+        let (seconds, fraction) = value.split_once('.').unwrap_or((value, "0"));
+        let seconds = seconds.parse::<i64>().ok()?;
+        let nanos = format!("{fraction:0<9}").get(..9)?.parse::<u32>().ok()?;
+        chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)
     })
 }
 
@@ -1238,6 +1295,26 @@ fn default_socket_dir() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn terminal_markers_parse_subsecond_precision_and_exact_duration() {
+        let output = "[phoenix] process started at unix seconds 1783936800.123456789\n\
+                      [phoenix] process exited with code 0\n\
+                      [phoenix] process exited at unix seconds 1783936801.357456789\n";
+        assert_eq!(
+            parse_occurred_at_marker(output),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_783_936_801, 357_456_789)
+        );
+        assert_eq!(parse_duration_ms(output), Some(1_234));
+    }
+
+    #[test]
+    fn terminal_duration_requires_both_durable_markers() {
+        assert_eq!(
+            parse_duration_ms("[phoenix] process exited at unix seconds 1783936801.357456789\n"),
+            None
+        );
+    }
 
     #[test]
     fn socket_path_for_worktree_is_deterministic() {
@@ -1454,6 +1531,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         reg.emit_lifecycle(&WorkScope::Conversation("conv-X".to_string()));
+    }
+
+    #[tokio::test]
+    async fn generation_installation_failure_is_fatal() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let missing_socket = tmp.path().join("missing.sock");
+        assert!(matches!(
+            ensure_server_generation(&missing_socket).await,
+            Err(TmuxError::SpawnFailed { .. })
+        ));
     }
 
     #[tokio::test]

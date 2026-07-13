@@ -294,6 +294,7 @@ fn classify_tmux(
         TmuxTerminalInspection::Terminal {
             exit_code,
             occurred_at: Some(occurred_at),
+            duration_ms: Some(duration_ms),
             final_tail,
         } if occurred_at <= binding.expires_at => {
             let evidence = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
@@ -301,7 +302,7 @@ fn classify_tmux(
                 status: TmuxTerminalStatus::ExitMarkerObserved,
                 occurred_at: timestamp(occurred_at)?,
                 exit_code: Some(exit_code),
-                duration_ms: None,
+                duration_ms: Some(duration_ms),
                 final_tail,
             });
             fired(binding, evidence, now)
@@ -392,6 +393,10 @@ mod tests {
 
     fn at(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).single().unwrap()
+    }
+
+    fn at_nanos(seconds: i64, nanos: u32) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, nanos).single().unwrap()
     }
 
     fn scope() -> WorkScopeIdentity {
@@ -528,6 +533,7 @@ mod tests {
         let inspection = || TmuxTerminalInspection::Terminal {
             exit_code: 0,
             occurred_at: None,
+            duration_ms: None,
             final_tail: vec!["done".to_owned()],
         };
         assert_eq!(
@@ -555,12 +561,64 @@ mod tests {
                 TmuxTerminalInspection::Terminal {
                     exit_code: 0,
                     occurred_at: Some(at(100)),
+                    duration_ms: Some(12_345),
                     final_tail: vec!["done".to_owned()],
                 },
                 at(105),
             )
             .unwrap(),
             InspectionDecision::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn tmux_subsecond_timestamp_obeys_exact_deadline_and_preserves_duration() {
+        let identity = TmuxResourceIdentity {
+            work_scope: scope(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let mut binding = binding(WakeResourceIdentity::TmuxWindow(identity.clone()));
+        binding.expires_at = at_nanos(100, 500_000_000);
+
+        let before = classify_tmux(
+            &binding,
+            &identity,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 0,
+                occurred_at: Some(at_nanos(100, 499_999_999)),
+                duration_ms: Some(321),
+                final_tail: vec![],
+            },
+            at(101),
+        )
+        .unwrap();
+        assert!(matches!(
+            before,
+            InspectionDecision::Terminal {
+                evidence: WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                    duration_ms: Some(321),
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let after = classify_tmux(
+            &binding,
+            &identity,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 0,
+                occurred_at: Some(at_nanos(100, 500_000_001)),
+                duration_ms: Some(321),
+                final_tail: vec![],
+            },
+            at(101),
+        )
+        .unwrap();
+        assert!(matches!(
+            after,
+            InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Expired { .. })
         ));
     }
 

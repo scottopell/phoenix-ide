@@ -486,6 +486,30 @@ async fn tmux_typed_observation_rejects_mismatched_resource() {
 }
 
 #[tokio::test]
+async fn next_deadline_excludes_receipted_and_invalidated_observe_effects() {
+    let (pool, repo) = registered(bash()).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert_eq!(
+        adapter.next_deadline().await.unwrap(),
+        Some(Utc.timestamp_opt(1_100, 0).single().unwrap())
+    );
+
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'receipted' WHERE id = 'wake-observe:wake-workflow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(adapter.next_deadline().await.unwrap(), None);
+
+    sqlx::query("UPDATE workflow_effects SET status = 'invalidated' WHERE id = 'wake-observe:wake-workflow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(adapter.next_deadline().await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn retry_promotes_only_the_exact_due_deadline() {
     let (_pool, repo) = registered(bash()).await;
     let claim = claimed(&repo).await;
@@ -555,6 +579,20 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
     assert_eq!(row.get::<String, _>("effect_status"), "invalidated");
     assert_eq!(row.get::<Option<String>, _>("receipt_id"), None);
     assert_eq!(row.get::<i64, _>("requires_runtime_acceptance"), 0);
+    let snapshot: String =
+        sqlx::query_scalar("SELECT snapshot_payload FROM workflows WHERE id = 'wake-workflow'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let snapshot: Value = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(snapshot["contract_id"], "wake-contract");
+    assert_eq!(snapshot["conversation_id"], "conv-wake");
+    assert_eq!(snapshot["registering_tool_use_id"], "tool-use");
+    assert_eq!(snapshot["cancelled"], true);
+    assert_eq!(snapshot["runtime_availability"], "terminal");
+    assert_eq!(snapshot["terminal"]["type"], "cancelled");
+    assert_eq!(snapshot["terminal"]["reason"], "explicit_cancel");
+    assert_eq!(snapshot["terminal"]["resolved_at"], 1_015);
     let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_owed_acceptance")
         .fetch_one(&pool)
         .await

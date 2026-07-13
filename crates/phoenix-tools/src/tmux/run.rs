@@ -498,8 +498,10 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     } else {
         "exit $code"
     };
+    let timestamp =
+        r#"if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "$EPOCHREALTIME"; else date +%s; fi"#;
     format!(
-        "(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; echo \"[phoenix] process exited at unix seconds $(date +%s)\"; {after_exit}"
+        "echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}"
     )
 }
 
@@ -699,6 +701,16 @@ mod tests {
             .await;
     }
 
+    #[test]
+    fn wrapper_records_portable_subsecond_start_and_finish_markers() {
+        let wrapper = shell_wrapper("true", false);
+        assert!(wrapper.contains("[phoenix] process started at unix seconds"));
+        assert!(wrapper.contains("[phoenix] process exited at unix seconds"));
+        assert!(wrapper.contains("EPOCHREALTIME"));
+        assert!(wrapper.contains("date +%s"));
+        assert!(!wrapper.contains("python"));
+    }
+
     #[tokio::test]
     async fn direct_conversations_run_in_immutable_working_dir() {
         if skip_unless_tmux() {
@@ -784,6 +796,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn quick_failure_leaves_inspectable_output_and_exit_marker() {
         if skip_unless_tmux() {
             return;
@@ -850,10 +863,48 @@ mod tests {
             registry.has_registered_window(&identity).await,
             "tmux_run must register the exact window identity"
         );
+        let inspection = registry.inspect_window(&identity).await;
+        assert!(
+            matches!(
+                inspection,
+                TmuxTerminalInspection::Terminal {
+                    exit_code: 7,
+                    duration_ms: Some(_),
+                    ..
+                }
+            ),
+            "inspection: {inspection:?}; pane: {pane}"
+        );
+        let rekeyed_scope = phoenix_core::work_scope::WorkScope::Worktree(
+            cwd_tmp
+                .path()
+                .join("approved-worktree")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(
+            registry
+                .rekey_scope(&identity.work_scope, &rekeyed_scope)
+                .await
+        );
+        let rekeyed_identity = TmuxWindowIdentity {
+            work_scope: rekeyed_scope.clone(),
+            ..identity
+        };
         assert!(matches!(
-            registry.inspect_window(&identity).await,
-            TmuxTerminalInspection::Terminal { exit_code: 7, .. }
+            registry.inspect_window(&rekeyed_identity).await,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 7,
+                duration_ms: Some(_),
+                ..
+            }
         ));
+        assert!(registry.get_existing(&rekeyed_scope).await.is_some());
+        assert_eq!(
+            registry.conversation_count().await,
+            1,
+            "inspection after rekey must use the preserved entry without materializing another"
+        );
 
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
@@ -1152,7 +1203,11 @@ mod tests {
         );
         assert!(matches!(
             restarted.inspect_window(&identity).await,
-            TmuxTerminalInspection::Terminal { exit_code: 3, .. }
+            TmuxTerminalInspection::Terminal {
+                exit_code: 3,
+                duration_ms: Some(_),
+                ..
+            }
         ));
         assert!(
             restarted.get_existing(&scope).await.is_none(),
