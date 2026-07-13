@@ -171,7 +171,8 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
     isolated_home = tmpdir / "home"
     isolated_config = tmpdir / "config"
     isolated_codex = tmpdir / "codex"
-    for path in (isolated_home, isolated_config, isolated_codex):
+    isolated_data = tmpdir / "data"
+    for path in (isolated_home, isolated_config, isolated_codex, isolated_data):
         path.mkdir(parents=True, exist_ok=True)
 
     # The mock server must not discover personal providers, credentials, or MCP
@@ -183,13 +184,19 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
             "USERPROFILE": str(isolated_home),
             "XDG_CONFIG_HOME": str(isolated_config),
             "CODEX_HOME": str(isolated_codex),
+            "PHOENIX_DATA_DIR": str(isolated_data),
             "PHOENIX_ENABLE_MOCK_MODEL": "1",
             "DEFAULT_MODEL": "mock",
             "PHOENIX_DB_PATH": str(tmpdir / "phoenix.db"),
             "PHOENIX_BIND_ADDR": "127.0.0.1",
+            "PHOENIX_LOG_STDOUT": "true",
+            "PHOENIX_TRACE_EXPORTER": "none",
             "RUST_LOG": env.get("E2E_RUST_LOG", "warn"),
         }
     )
+    for key in tuple(env):
+        if key.startswith(("DD_", "OTEL_")):
+            env.pop(key)
     for key in (
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
@@ -199,6 +206,7 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
         "PHOENIX_TLS",
         "PHOENIX_TLS_CERT_PATH",
         "PHOENIX_TLS_KEY_PATH",
+        "PHOENIX_LOG_FILE",
     ):
         env.pop(key, None)
     return env
@@ -752,6 +760,13 @@ class HarnessIsolationTests(unittest.TestCase):
                 "USERPROFILE": "/real/profile",
                 "XDG_CONFIG_HOME": "/real/config",
                 "CODEX_HOME": "/real/codex",
+                "PHOENIX_DATA_DIR": "/real/phoenix-data",
+                "PHOENIX_LOG_STDOUT": "false",
+                "PHOENIX_LOG_FILE": "/real/phoenix.log",
+                "PHOENIX_TRACE_EXPORTER": "datadog",
+                "DD_TRACE_ENABLED": "true",
+                "DD_TRACE_AGENT_URL": "http://real-agent:8126",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://real-collector:4318",
                 "ANTHROPIC_API_KEY": "secret",
                 "OPENAI_API_KEY": "secret",
                 "LLM_API_KEY_HELPER": "secret-helper",
@@ -764,11 +779,18 @@ class HarnessIsolationTests(unittest.TestCase):
             self.assertEqual(env["USERPROFILE"], str(tmpdir / "home"))
             self.assertEqual(env["XDG_CONFIG_HOME"], str(tmpdir / "config"))
             self.assertEqual(env["CODEX_HOME"], str(tmpdir / "codex"))
+            self.assertEqual(env["PHOENIX_DATA_DIR"], str(tmpdir / "data"))
+            self.assertEqual(env["PHOENIX_LOG_STDOUT"], "true")
+            self.assertEqual(env["PHOENIX_TRACE_EXPORTER"], "none")
             self.assertEqual(env["RUST_LOG"], "debug")
             self.assertEqual(env["DEFAULT_MODEL"], "mock")
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             self.assertNotIn("OPENAI_API_KEY", env)
             self.assertNotIn("LLM_API_KEY_HELPER", env)
+            self.assertNotIn("PHOENIX_LOG_FILE", env)
+            self.assertNotIn("DD_TRACE_ENABLED", env)
+            self.assertNotIn("DD_TRACE_AGENT_URL", env)
+            self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT", env)
 
     def test_literal_ping_is_accepted_without_json_parsing(self):
         self.assertFalse(_terminal_event("ping", "ping"))
