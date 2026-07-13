@@ -246,6 +246,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_wake_profile_tables",
         sql: MIGRATION_046,
     },
+    Migration {
+        version: 47,
+        name: "create_creation_shadow_tables",
+        sql: MIGRATION_047,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2070,9 +2075,12 @@ CREATE TABLE IF NOT EXISTS wake_shadow_parity (
     CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only'))
 );
 
+";
+
+const MIGRATION_047: &str = r"
 CREATE TABLE IF NOT EXISTS creation_shadow_bindings (
     shadow_workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE CASCADE,
-    authoritative_workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id) ON DELETE RESTRICT,
+    authoritative_workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id) ON DELETE CASCADE,
     creation_job_id TEXT NOT NULL UNIQUE REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
     CHECK (shadow_workflow_id <> authoritative_workflow_id)
 );
@@ -2130,6 +2138,24 @@ CREATE TABLE IF NOT EXISTS creation_shadow_divergences (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_creation_shadow_one_active_divergence
     ON creation_shadow_divergences(shadow_workflow_id, evidence_identity)
     WHERE resolved_at IS NULL;
+
+CREATE TRIGGER IF NOT EXISTS trg_creation_shadow_binding_delete_shadow
+AFTER DELETE ON creation_shadow_bindings
+BEGIN
+    DELETE FROM workflows WHERE id = OLD.shadow_workflow_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_creation_shadow_job_delete_anchor
+BEFORE DELETE ON conversation_creation_jobs
+WHEN EXISTS (SELECT 1 FROM creation_shadow_bindings WHERE creation_job_id = OLD.id)
+BEGIN
+    DELETE FROM workflows
+    WHERE id = (
+        SELECT authoritative_workflow_id
+        FROM creation_shadow_bindings
+        WHERE creation_job_id = OLD.id
+    );
+END;
 ";
 
 /// Run all pending migrations against the database.
@@ -2301,6 +2327,37 @@ mod tests {
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_044_upgrades_a_database_already_stamped_at_043() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::raw_sql(
+            "DROP TRIGGER trg_creation_shadow_job_delete_anchor;
+             DROP TRIGGER trg_creation_shadow_binding_delete_shadow;
+             DROP TABLE creation_shadow_divergences;
+             DROP TABLE creation_shadow_effect_predictions;
+             DROP TABLE creation_shadow_readiness_effects;
+             DROP TABLE creation_shadow_projections;
+             DROP TABLE creation_shadow_bindings;
+             DELETE FROM _migrations WHERE version = 44;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'creation_shadow_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 5);
     }
 
     /// A pre-stamped *highest* version must not suppress lower, un-stamped
@@ -3089,7 +3146,7 @@ mod tests {
     /// column on `conversations`. Existing rows default to NULL and the column
     /// should be queryable via `PRAGMA table_info` after migration.
     #[tokio::test]
-    async fn migrations_041_to_043_create_expected_tables() {
+    async fn migrations_041_to_044_create_expected_tables() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         run_pending_migrations(&pool).await.unwrap();
@@ -3124,6 +3181,11 @@ mod tests {
             "wake_runtime_obligations",
             "wake_runtime_obligation_items",
             "wake_shadow_parity",
+            "creation_shadow_bindings",
+            "creation_shadow_projections",
+            "creation_shadow_readiness_effects",
+            "creation_shadow_effect_predictions",
+            "creation_shadow_divergences",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name = ?1",

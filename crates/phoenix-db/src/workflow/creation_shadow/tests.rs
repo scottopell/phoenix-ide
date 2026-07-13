@@ -141,8 +141,9 @@ async fn persists_real_bounded_shadow_graph_without_authority_or_semantic_byte_d
     );
     assert_eq!(workflow.get::<String, _>("snapshot_payload"), "{}");
 
-    let selection = sqlx::query("SELECT runtime_acceptance_enabled, external_acceptance_enabled FROM workflow_protocol_selections WHERE id = ?1")
+    let selection = sqlx::query("SELECT accepting, runtime_acceptance_enabled, external_acceptance_enabled FROM workflow_protocol_selections WHERE id = ?1")
         .bind(SELECTION_ID).fetch_one(&pool).await.unwrap();
+    assert_eq!(selection.get::<i64, _>("accepting"), 0);
     assert_eq!(selection.get::<i64, _>("runtime_acceptance_enabled"), 0);
     assert_eq!(selection.get::<i64, _>("external_acceptance_enabled"), 0);
     assert_eq!(row_count(&pool, "workflow_claims").await, 0);
@@ -217,6 +218,118 @@ async fn divergence_lifecycle_is_bounded_and_authoritative_job_never_mutates() {
     for column in ["attempt", "generation"] {
         assert_eq!(before.get::<i64, _>(column), after.get::<i64, _>(column));
     }
+}
+
+#[tokio::test]
+async fn independent_user_capabilities_record_divergence() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let mut capabilities = creation_profile::project_authoritative_creation(&oracle()).capabilities;
+    capabilities.cancel = CapabilityAvailability::Forbidden;
+    CreationShadowAdapter::new(&repo, &config())
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::Provisioning,
+                capabilities,
+            },
+            Utc.timestamp_opt(2_050, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let divergence: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM creation_shadow_divergences WHERE evidence_identity = 'capability_cancel' AND resolved_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(divergence, 1);
+}
+
+#[tokio::test]
+async fn stale_status_or_stage_snapshot_is_rejected() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let persistence = config();
+    let adapter = CreationShadowAdapter::new(&repo, &persistence);
+    let stale = oracle();
+
+    sqlx::query("UPDATE conversation_creation_jobs SET status = 'ready', stage = 'finalize', completed_at = '2025-01-02' WHERE id = 'job-shadow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(adapter
+        .persist_after_authoritative_commit(
+            &stale,
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_100, 0).single().unwrap(),
+        )
+        .await
+        .is_err());
+    assert_eq!(row_count(&pool, "creation_shadow_bindings").await, 0);
+}
+
+#[tokio::test]
+async fn hard_delete_cascades_through_binding_to_both_workflow_graphs() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let persistence = config();
+    CreationShadowAdapter::new(&repo, &persistence)
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_200, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM conversations WHERE id = 'conv-shadow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(row_count(&pool, "creation_shadow_bindings").await, 0);
+    let workflows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflows WHERE id IN ('creation-shadow', 'creation-authoritative-anchor')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(workflows, 0);
+    assert_eq!(row_count(&pool, "workflow_effects").await, 0);
+    assert_eq!(row_count(&pool, "workflow_transitions").await, 0);
+}
+
+#[tokio::test]
+async fn cleanup_status_persists_compensation_graph() {
+    let pool = pool().await;
+    sqlx::query(
+        "UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = 'job-shadow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut cleanup = oracle();
+    cleanup.status = AuthoritativeCreationStatus::Cancelling;
+    let repo = WorkflowRepository::new(pool.clone());
+    CreationShadowAdapter::new(&repo, &config())
+        .persist_after_authoritative_commit(
+            &cleanup,
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Cancelled),
+            Utc.timestamp_opt(2_300, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let compensation: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = 'creation-shadow' AND role = 'compensation'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(compensation, 5);
 }
 
 #[tokio::test]

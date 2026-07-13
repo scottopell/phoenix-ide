@@ -270,12 +270,12 @@ fn status_table_maps_visibility_capabilities_and_predictions() {
         ),
         (
             AuthoritativeCreationStatus::Cancelling,
-            CreationProjectionStatus::Provisioning,
+            CreationProjectionStatus::Cancelled,
+            false,
             false,
             false,
             true,
-            false,
-            CompletionPrediction::Pending,
+            CompletionPrediction::Cancelled,
             CompensationPrediction::RequiredForCancellation,
         ),
         (
@@ -339,6 +339,32 @@ fn status_table_maps_visibility_capabilities_and_predictions() {
         assert_eq!(projection.capabilities.start_over, availability(start_over));
         assert_eq!(projection.completion, completion);
         assert_eq!(projection.compensation, compensation);
+    }
+}
+
+#[test]
+fn cleanup_states_adapt_to_compensation_graphs() {
+    let statuses = [
+        AuthoritativeCreationStatus::Cancelling,
+        AuthoritativeCreationStatus::DeletionPending,
+        AuthoritativeCreationStatus::Cancelled,
+        AuthoritativeCreationStatus::Failed(CreationFailure {
+            kind: "permanent".into(),
+            message: "cleanup still required".into(),
+        }),
+    ];
+    for status in statuses {
+        let mut oracle = oracle(CreationKind::SeededEmpty);
+        oracle.status = status;
+        let adapted =
+            adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &oracle).unwrap();
+        assert_eq!(adapted.plan.effects.len(), 5);
+        assert!(adapted
+            .plan
+            .effects
+            .iter()
+            .all(|effect| effect.role == crate::EffectRole::Compensation));
+        assert_eq!(adapted.plan.dependencies.len(), 5);
     }
 }
 

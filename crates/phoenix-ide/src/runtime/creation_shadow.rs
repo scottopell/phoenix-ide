@@ -1,7 +1,8 @@
 //! Best-effort production bridge from committed creation jobs to shadow diagnostics.
 
 use crate::db::{
-    ConvMode, ConversationCreationJob, CreationResourceReservation, Database, FileAttachment,
+    ConvMode, ConvState, ConversationCreationJob, CreationResourceReservation, Database,
+    FileAttachment,
 };
 use phoenix_core::domain::creation_protocol::{
     CreationKind as CoreCreationKind, CreationStage, CreationStatus,
@@ -15,7 +16,8 @@ use phoenix_db::workflow::{
 };
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
-    CreationFailure, CreationIntent, CreationKind, CreationProjectionStatus,
+    CapabilityAvailability, CreationCapabilities, CreationFailure, CreationIntent, CreationKind,
+    CreationProjectionStatus,
 };
 
 const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
@@ -75,7 +77,20 @@ impl CreationShadowCoordinator {
         };
         // Each task reads committed state only after entering its job gate, so a delayed task
         // cannot project an earlier stage over a newer projection. Unrelated jobs remain parallel.
-        let _guard = gate.lock().await;
+        let guard = gate.lock().await;
+        let result = self.sync_committed_job_while_gated(job_id).await;
+        drop(guard);
+        let mut gates = self.job_gates.lock().await;
+        if gates.get(job_id).is_some_and(|registered| {
+            std::sync::Arc::ptr_eq(registered, &gate)
+                && std::sync::Arc::strong_count(registered) == 2
+        }) {
+            gates.remove(job_id);
+        }
+        result
+    }
+
+    async fn sync_committed_job_while_gated(&self, job_id: &str) -> Result<(), String> {
         let job = self
             .db
             .get_conversation_creation_job(job_id)
@@ -100,21 +115,20 @@ impl CreationShadowCoordinator {
             .get_creation_resource_reservations(job_id)
             .await
             .map_err(|error| error.to_string())?;
-        let conv_mode = self
+        let conversation = self
             .db
             .get_conversation(&job.conversation_id)
             .await
-            .ok()
-            .map(|conversation| conversation.conv_mode);
+            .map_err(|error| error.to_string())?;
+        let conv_mode = &conversation.conv_mode;
         let oracle = oracle_from_committed(
             job,
             &files,
             usize::try_from(image_count).map_err(|_| "negative image count".to_string())?,
             &reservations,
-            conv_mode.as_ref(),
+            Some(conv_mode),
         );
-        let observed =
-            CreationShadowEvidence::ProjectionStatus(observed_projection(&oracle.status));
+        let observed = observed_projection(&conversation.state);
         let persistence = CreationShadowPersistence::Enabled(CreationShadowConfig {
             shadow_workflow_id: format!("creation-shadow:{}", oracle.intent.job_id),
             authoritative_anchor_workflow_id: format!(
@@ -232,16 +246,46 @@ fn map_stage(stage: CreationStage) -> AuthoritativeCreationStage {
     }
 }
 
-fn observed_projection(status: &AuthoritativeCreationStatus) -> CreationProjectionStatus {
-    match status {
-        AuthoritativeCreationStatus::Ready => CreationProjectionStatus::Ready,
-        AuthoritativeCreationStatus::Failed(_) => CreationProjectionStatus::Failed,
-        AuthoritativeCreationStatus::Cancelled => CreationProjectionStatus::Cancelled,
-        AuthoritativeCreationStatus::DeletionPending => CreationProjectionStatus::DeletionPending,
-        AuthoritativeCreationStatus::Accepted
-        | AuthoritativeCreationStatus::Claimed { .. }
-        | AuthoritativeCreationStatus::RetryScheduled { .. }
-        | AuthoritativeCreationStatus::Cancelling => CreationProjectionStatus::Provisioning,
+fn observed_projection(state: &ConvState) -> CreationShadowEvidence {
+    let (status, capabilities) = match state {
+        ConvState::Provisioning { .. } => (
+            CreationProjectionStatus::Provisioning,
+            creation_capabilities([true, false, false, true, false, true]),
+        ),
+        ConvState::CreationFailed { .. } => (
+            CreationProjectionStatus::Failed,
+            creation_capabilities([true, false, false, false, true, true]),
+        ),
+        ConvState::CreationCancelled { .. } => (
+            CreationProjectionStatus::Cancelled,
+            creation_capabilities([true, false, false, false, true, true]),
+        ),
+        _ => (
+            CreationProjectionStatus::Ready,
+            creation_capabilities([true, true, true, false, false, true]),
+        ),
+    };
+    CreationShadowEvidence::UserProjection {
+        status,
+        capabilities,
+    }
+}
+
+fn creation_capabilities(flags: [bool; 6]) -> CreationCapabilities {
+    let available = |allowed| {
+        if allowed {
+            CapabilityAvailability::Allowed
+        } else {
+            CapabilityAvailability::Forbidden
+        }
+    };
+    CreationCapabilities {
+        read: available(flags[0]),
+        write: available(flags[1]),
+        runtime: available(flags[2]),
+        cancel: available(flags[3]),
+        start_over: available(flags[4]),
+        delete: available(flags[5]),
     }
 }
 
@@ -265,6 +309,26 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn observed_projection_comes_from_visible_conversation_state() {
+        assert_eq!(
+            observed_projection(&ConvState::CreationCancelled {
+                job_id: "job".to_owned()
+            }),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::Cancelled,
+                capabilities: creation_capabilities([true, false, false, false, true, true]),
+            }
+        );
+        assert_eq!(
+            observed_projection(&ConvState::Idle),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::Ready,
+                capabilities: creation_capabilities([true, true, true, false, false, true]),
+            }
+        );
     }
 
     #[tokio::test]
@@ -302,6 +366,18 @@ mod tests {
         let transitions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = 'creation-shadow:job-shadow-runtime'")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_job_gate_is_released() {
+        let db = database().await;
+        insert_job(&db).await;
+        let coordinator = CreationShadowCoordinator::with_enabled(db, true);
+        coordinator
+            .sync_committed_job("job-shadow-runtime")
+            .await
+            .unwrap();
+        assert!(coordinator.job_gates.lock().await.is_empty());
     }
 
     #[tokio::test]

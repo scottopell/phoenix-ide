@@ -448,9 +448,20 @@ pub fn adapt_authoritative_creation(
         snapshot_codec(),
         snapshot.clone(),
     )?;
+    let plan = if matches!(
+        oracle.status,
+        AuthoritativeCreationStatus::Cancelling
+            | AuthoritativeCreationStatus::DeletionPending
+            | AuthoritativeCreationStatus::Cancelled
+            | AuthoritativeCreationStatus::Failed(_)
+    ) {
+        compensation_plan(oracle)
+    } else {
+        creation_plan(oracle, snapshot)
+    };
     Ok(CreationShadowAdapter {
         workflow,
-        plan: creation_plan(oracle, snapshot),
+        plan,
         projection: project_authoritative_creation(oracle),
     })
 }
@@ -725,16 +736,18 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
     let (status, capabilities, completion, compensation, hidden) = match &oracle.status {
         AuthoritativeCreationStatus::Accepted
         | AuthoritativeCreationStatus::Claimed { .. }
-        | AuthoritativeCreationStatus::RetryScheduled { .. }
-        | AuthoritativeCreationStatus::Cancelling => (
+        | AuthoritativeCreationStatus::RetryScheduled { .. } => (
             CreationProjectionStatus::Provisioning,
             capabilities([true, false, false, true, false, true]),
             CompletionPrediction::Pending,
-            if matches!(oracle.status, AuthoritativeCreationStatus::Cancelling) {
-                CompensationPrediction::RequiredForCancellation
-            } else {
-                CompensationPrediction::None
-            },
+            CompensationPrediction::None,
+            false,
+        ),
+        AuthoritativeCreationStatus::Cancelling => (
+            CreationProjectionStatus::Cancelled,
+            capabilities([true, false, false, false, true, true]),
+            CompletionPrediction::Cancelled,
+            CompensationPrediction::RequiredForCancellation,
             false,
         ),
         AuthoritativeCreationStatus::Failed(_) => (

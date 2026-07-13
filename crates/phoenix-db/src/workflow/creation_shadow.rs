@@ -6,8 +6,9 @@
 use chrono::{DateTime, Utc};
 use phoenix_workflow::{
     creation_profile::{
-        self, AuthoritativeCreationOracle, CapabilityAvailability, CompensationPrediction,
-        CompletionPrediction, CreationProjectionStatus, EffectPrediction,
+        self, AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
+        CapabilityAvailability, CompensationPrediction, CompletionPrediction, CreationCapabilities,
+        CreationProjectionStatus, EffectPrediction,
     },
     SemanticAuthority,
 };
@@ -36,6 +37,10 @@ pub enum CreationShadowPersistence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreationShadowEvidence {
     ProjectionStatus(CreationProjectionStatus),
+    UserProjection {
+        status: CreationProjectionStatus,
+        capabilities: CreationCapabilities,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +114,7 @@ impl<'a> CreationShadowAdapter<'a> {
             config,
             domain.projection.status,
             observed,
+            domain.projection.capabilities,
             projected_at,
         )
         .await?;
@@ -121,16 +127,17 @@ impl<'a> CreationShadowAdapter<'a> {
     }
 
     async fn ensure_protocol_selection(&self, now: DateTime<Utc>) -> WorkflowRepositoryResult<()> {
-        let existing: Option<(String, i64, i64, i64)> = sqlx::query_as(
-            "SELECT profile_id, protocol_version, runtime_acceptance_enabled, external_acceptance_enabled \
+        let existing: Option<(String, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT profile_id, protocol_version, accepting, runtime_acceptance_enabled, external_acceptance_enabled \
              FROM workflow_protocol_selections WHERE id = ?1",
         )
         .bind(SELECTION_ID)
         .fetch_optional(self.repository.pool())
         .await?;
-        if let Some((profile, version, runtime, external)) = existing {
+        if let Some((profile, version, accepting, runtime, external)) = existing {
             if profile == creation_profile::PROFILE_ID
                 && version == i64::from(creation_profile::PROTOCOL_VERSION)
+                && accepting == 0
                 && runtime == 0
                 && external == 0
             {
@@ -148,11 +155,11 @@ impl<'a> CreationShadowAdapter<'a> {
                 selector_version: 1,
                 protocol_version: creation_profile::PROTOCOL_VERSION,
                 authority: SemanticAuthority::LegacyProtocol,
-                accepting: true,
+                accepting: false,
                 runtime_acceptance_enabled: false,
                 external_acceptance_enabled: false,
                 registered_at: now,
-                drained_at: None,
+                drained_at: Some(now),
                 supported_codecs: [
                     "creation.snapshot",
                     "creation.event",
@@ -176,7 +183,7 @@ async fn verify_authoritative_job(
     oracle: &AuthoritativeCreationOracle,
 ) -> WorkflowRepositoryResult<()> {
     let row = sqlx::query(
-        "SELECT conversation_id, generation, attempt FROM conversation_creation_jobs WHERE id = ?1",
+        "SELECT conversation_id, generation, attempt, status, stage FROM conversation_creation_jobs WHERE id = ?1",
     )
     .bind(&oracle.intent.job_id)
     .fetch_optional(&mut **tx)
@@ -189,6 +196,8 @@ async fn verify_authoritative_job(
             != i64::try_from(oracle.generation)
                 .map_err(|_| WorkflowRepositoryError::GenerationOutOfRange(oracle.generation))?
         || row.get::<i64, _>("attempt") != i64::from(oracle.attempt)
+        || row.get::<String, _>("status") != authoritative_status_sql(&oracle.status)
+        || row.get::<String, _>("stage") != authoritative_stage_sql(oracle.stage)
     {
         return Err(WorkflowRepositoryError::CorruptState(
             "creation oracle does not match committed authoritative job".to_owned(),
@@ -411,9 +420,13 @@ async fn update_divergence(
     config: &CreationShadowConfig,
     expected: CreationProjectionStatus,
     observed: CreationShadowEvidence,
+    domain_capabilities: CreationCapabilities,
     now: DateTime<Utc>,
 ) -> WorkflowRepositoryResult<()> {
-    let CreationShadowEvidence::ProjectionStatus(actual) = observed;
+    let actual = match observed {
+        CreationShadowEvidence::ProjectionStatus(actual)
+        | CreationShadowEvidence::UserProjection { status: actual, .. } => actual,
+    };
     if expected == actual {
         sqlx::query("UPDATE creation_shadow_divergences SET resolved_at = ?1 WHERE shadow_workflow_id = ?2 AND evidence_identity = 'projection_status' AND resolved_at IS NULL")
             .bind(now.to_rfc3339()).bind(&config.shadow_workflow_id).execute(&mut **tx).await?;
@@ -435,7 +448,90 @@ async fn update_divergence(
             .bind(&config.shadow_workflow_id).bind(expected).bind(actual)
             .bind(now.to_rfc3339()).execute(&mut **tx).await?;
     }
+    if let CreationShadowEvidence::UserProjection { capabilities, .. } = observed {
+        for (identity, expected, actual) in [
+            (
+                "capability_read",
+                allowed(domain_capabilities.read),
+                allowed(capabilities.read),
+            ),
+            (
+                "capability_write",
+                allowed(domain_capabilities.write),
+                allowed(capabilities.write),
+            ),
+            (
+                "capability_runtime",
+                allowed(domain_capabilities.runtime),
+                allowed(capabilities.runtime),
+            ),
+            (
+                "capability_cancel",
+                allowed(domain_capabilities.cancel),
+                allowed(capabilities.cancel),
+            ),
+            (
+                "capability_start_over",
+                allowed(domain_capabilities.start_over),
+                allowed(capabilities.start_over),
+            ),
+            (
+                "capability_delete",
+                allowed(domain_capabilities.delete),
+                allowed(capabilities.delete),
+            ),
+        ] {
+            update_boolean_divergence(tx, config, identity, expected, actual, now).await?;
+        }
+    }
     Ok(())
+}
+
+async fn update_boolean_divergence(
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &CreationShadowConfig,
+    identity: &str,
+    expected: bool,
+    actual: bool,
+    now: DateTime<Utc>,
+) -> WorkflowRepositoryResult<()> {
+    if expected == actual {
+        sqlx::query("UPDATE creation_shadow_divergences SET resolved_at = ?1 WHERE shadow_workflow_id = ?2 AND evidence_identity = ?3 AND resolved_at IS NULL")
+            .bind(now.to_rfc3339()).bind(&config.shadow_workflow_id).bind(identity)
+            .execute(&mut **tx).await?;
+    } else {
+        sqlx::query("INSERT INTO creation_shadow_divergences (shadow_workflow_id, evidence_identity, expected_value, actual_value, recorded_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL) ON CONFLICT(shadow_workflow_id, evidence_identity) WHERE resolved_at IS NULL DO UPDATE SET expected_value=excluded.expected_value, actual_value=excluded.actual_value")
+            .bind(&config.shadow_workflow_id).bind(identity).bind(expected.to_string())
+            .bind(actual.to_string()).bind(now.to_rfc3339()).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+fn authoritative_status_sql(value: &AuthoritativeCreationStatus) -> &'static str {
+    match value {
+        AuthoritativeCreationStatus::Accepted => "accepted",
+        AuthoritativeCreationStatus::Claimed { .. } => "claimed",
+        AuthoritativeCreationStatus::RetryScheduled { .. } => "retry_scheduled",
+        AuthoritativeCreationStatus::Cancelling => "cancelling",
+        AuthoritativeCreationStatus::Cancelled => "cancelled",
+        AuthoritativeCreationStatus::DeletionPending => "deletion_pending",
+        AuthoritativeCreationStatus::Ready => "ready",
+        AuthoritativeCreationStatus::Failed(_) => "failed",
+    }
+}
+
+fn authoritative_stage_sql(value: AuthoritativeCreationStage) -> &'static str {
+    match value {
+        AuthoritativeCreationStage::ValidateIntent => "validate_intent",
+        AuthoritativeCreationStage::ResolveRepository => "resolve_repository",
+        AuthoritativeCreationStage::ReserveResources => "reserve_resources",
+        AuthoritativeCreationStage::MaterializeWorktree => "materialize_worktree",
+        AuthoritativeCreationStage::FinalizeAttachments => "finalize_attachments",
+        AuthoritativeCreationStage::ExpandInitialMessage => "expand_initial_message",
+        AuthoritativeCreationStage::CommitMetadata => "commit_metadata",
+        AuthoritativeCreationStage::BootstrapInitialTurn => "bootstrap_initial_turn",
+        AuthoritativeCreationStage::Finalize => "finalize",
+    }
 }
 
 fn effect_db_id(config: &CreationShadowConfig, id: u64) -> String {
