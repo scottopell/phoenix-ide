@@ -2449,7 +2449,9 @@ async fn align_slice_start_to_render_unit(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if previous.is_empty() {
-            return Err(render_unit_alignment_ceiling_error());
+            intervening.append(messages);
+            *messages = intervening;
+            return Ok(());
         }
         remaining_prefix_budget -= previous.len();
         let oldest_sequence = previous[0].sequence_id;
@@ -2467,7 +2469,19 @@ async fn align_slice_start_to_render_unit(
         intervening = older_intervening;
         before_sequence = oldest_sequence;
     }
-    Err(render_unit_alignment_ceiling_error())
+
+    let has_uncollected_older = if intervening.is_empty() {
+        has_messages_before(db, conversation_id, messages).await?
+    } else {
+        has_messages_before(db, conversation_id, &intervening).await?
+    };
+    if has_uncollected_older {
+        return Err(render_unit_alignment_ceiling_error());
+    }
+
+    intervening.append(messages);
+    *messages = intervening;
+    Ok(())
 }
 
 async fn has_messages_before(
@@ -7324,6 +7338,206 @@ pub(crate) mod hard_delete_cascade_tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[tokio::test]
+    async fn system_user_transcript_preserves_full_latest_and_before_boundaries() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-system-user", "system-user", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "system-user-system",
+                "conv-system-user",
+                &crate::db::MessageContent::system("preamble"),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "system-user-user",
+                "conv-system-user",
+                &crate::db::MessageContent::user("prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("user");
+
+        let Json(full) = get_conversation(
+            State(state.clone()),
+            Path("conv-system-user".to_string()),
+            Query(GetConversationQuery {
+                after_sequence: None,
+            }),
+        )
+        .await
+        .expect("full conversation");
+        assert_eq!(
+            full.messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state.clone()),
+            Path("conv-system-user".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(latest.has_older_messages);
+
+        let Json(before) = get_conversation_messages(
+            State(state),
+            Path("conv-system-user".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: Some(2),
+                after_message_sequence: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("before");
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(!before.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_preserves_standalone_prefix_at_transcript_start() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-standalone-prefix",
+                "standalone-prefix",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "standalone-prefix-system",
+                "conv-standalone-prefix",
+                &crate::db::MessageContent::system("preamble"),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "standalone-prefix-tool",
+                "conv-standalone-prefix",
+                &crate::db::MessageContent::tool("orphan-tool", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-standalone-prefix".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_accepts_exact_ceiling_when_no_older_rows_exist() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-exact-ceiling-prefix",
+                "history-exact-ceiling-prefix",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        for idx in 0..MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES {
+            let content = if idx == 0 {
+                crate::db::MessageContent::system("preamble")
+            } else {
+                crate::db::MessageContent::tool("orphan-tool", format!("tool output {idx}"), false)
+            };
+            state
+                .db
+                .add_message(
+                    &format!("exact-ceiling-prefix-{idx}"),
+                    "conv-history-exact-ceiling-prefix",
+                    &content,
+                    None,
+                    None,
+                )
+                .await
+                .expect("add message");
+        }
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-history-exact-ceiling-prefix".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("exact-ceiling aligned slice should be accepted");
+
+        assert_eq!(
+            latest.messages.len(),
+            MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES
+        );
+        assert_eq!(latest.messages.first().map(|m| m.sequence_id), Some(1));
+        assert_eq!(
+            latest.messages.last().map(|m| m.sequence_id),
+            Some(
+                i64::try_from(MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES).expect("ceiling fits i64")
+            )
+        );
+        assert!(!latest.has_older_messages);
     }
 
     #[tokio::test]

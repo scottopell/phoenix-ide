@@ -18,6 +18,8 @@ entity TranscriptView {
     rendered_start: Integer
     rendered_end: Integer
     active_transaction: PositionTransaction?
+    terminal_token: String?
+    terminal_generation: Integer?
 }
 
 entity PhysicalAnchor {
@@ -32,6 +34,13 @@ entity PositionTransaction {
     kind: TransactionKind
     anchor: PhysicalAnchor?
     target_key: String?
+}
+
+entity TerminalTransactionResult {
+    view: TranscriptView
+    token: String
+    generation: Integer
+    result: TransactionResult
 }
 
 surface VirtualTranscript {
@@ -57,6 +66,10 @@ rule ViewReplacementSupersedesActiveTransactionBeforeDiscardingPhysicalState {
     when: ViewReplaced(view, generation, ordered_keys)
     requires: generation > view.generation
     requires: view.active_transaction != null
+    requires: view.terminal_token = null
+        or view.terminal_generation = null
+        or view.terminal_token != view.active_transaction.token
+        or view.terminal_generation != view.active_transaction.generation
     ensures: CommandFinished(
         view,
         view.active_transaction.token,
@@ -66,6 +79,14 @@ rule ViewReplacementSupersedesActiveTransactionBeforeDiscardingPhysicalState {
     ensures: view.generation = generation
     ensures: view.ordered_keys = ordered_keys
     ensures: view.measured_keys = {}
+    ensures: TerminalTransactionResult(
+        view: view,
+        token: view.active_transaction.token,
+        generation: view.active_transaction.generation,
+        result: superseded
+    ).created()
+    ensures: view.terminal_token = view.active_transaction.token
+    ensures: view.terminal_generation = view.active_transaction.generation
     ensures: view.active_transaction = null
 }
 
@@ -109,6 +130,24 @@ rule CommandReplacementSupersedesPriorTransaction {
         or token? != view.active_transaction.token
         or generation? != view.active_transaction.generation
         or kind? != view.active_transaction.kind
+    requires: view.terminal_token = null
+        or view.terminal_generation = null
+        or view.terminal_token != view.active_transaction.token
+        or view.terminal_generation != view.active_transaction.generation
+    ensures: CommandFinished(
+        view,
+        view.active_transaction.token,
+        view.active_transaction.generation,
+        superseded
+    ).emitted()
+    ensures: TerminalTransactionResult(
+        view: view,
+        token: view.active_transaction.token,
+        generation: view.active_transaction.generation,
+        result: superseded
+    ).created()
+    ensures: view.terminal_token = view.active_transaction.token
+    ensures: view.terminal_generation = view.active_transaction.generation
     ensures: view.active_transaction = null
 }
 
@@ -143,6 +182,18 @@ rule MatchingCommandFinishTerminatesOwnership {
     requires: token = view.active_transaction.token
     requires: generation = view.active_transaction.generation
     requires: result in { applied, target_missing, superseded }
+    requires: view.terminal_token = null
+        or view.terminal_generation = null
+        or view.terminal_token != token
+        or view.terminal_generation != generation
+    ensures: TerminalTransactionResult(
+        view: view,
+        token: token,
+        generation: generation,
+        result: result
+    ).created()
+    ensures: view.terminal_token = token
+    ensures: view.terminal_generation = generation
     ensures: view.active_transaction = null
 }
 
@@ -151,6 +202,7 @@ rule StaleCommandFinishCannotTerminateOwnership {
     requires: view.active_transaction = null
         or token != view.active_transaction.token
         or generation != view.active_transaction.generation
+        or (view.terminal_token = token and view.terminal_generation = generation)
     ensures: view.active_transaction = view.active_transaction
 }
 
@@ -166,7 +218,25 @@ rule ExplicitSupersessionRequiresTerminalResult {
     when: TransactionSuperseded(view, token)
     requires: view.active_transaction != null
     requires: view.active_transaction.token = token
-    ensures: view.active_transaction = view.active_transaction
+    requires: view.terminal_token = null
+        or view.terminal_generation = null
+        or view.terminal_token != view.active_transaction.token
+        or view.terminal_generation != view.active_transaction.generation
+    ensures: CommandFinished(
+        view,
+        view.active_transaction.token,
+        view.active_transaction.generation,
+        superseded
+    ).emitted()
+    ensures: TerminalTransactionResult(
+        view: view,
+        token: view.active_transaction.token,
+        generation: view.active_transaction.generation,
+        result: superseded
+    ).created()
+    ensures: view.terminal_token = view.active_transaction.token
+    ensures: view.terminal_generation = view.active_transaction.generation
+    ensures: view.active_transaction = null
 }
 
 invariant OrderedKeysAreUnique {
