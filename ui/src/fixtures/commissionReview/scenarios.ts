@@ -100,7 +100,7 @@ function inlineFixture(kind: CommissionReviewScenarioKind): CommissionReviewFixt
     return { message, toolResults: new Map([[toolUseId, result]]) };
   }
 
-  if (kind === 'inline-findings') {
+  if (kind === 'inline-findings' || kind === 'viewer-findings') {
     const result = toolMessage(toolUseId, JSON.stringify({ ok: true }));
     result.display_data = commissionReviewDisplayData({
       status: 'success',
@@ -142,7 +142,7 @@ function inlineFixture(kind: CommissionReviewScenarioKind): CommissionReviewFixt
     return { message, toolResults: new Map([[toolUseId, result]]) };
   }
 
-  if (kind === 'inline-partial') {
+  if (kind === 'inline-partial' || kind === 'viewer-partial') {
     const result = toolMessage(toolUseId, JSON.stringify({ ok: true }));
     result.display_data = commissionReviewDisplayData({
       status: 'partial',

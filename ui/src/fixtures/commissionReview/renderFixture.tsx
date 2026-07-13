@@ -1,6 +1,7 @@
 import { MemoryRouter } from 'react-router-dom';
 import { AgentMessage } from '../../components/MessageComponents';
 import { CommissionReviewApproval } from '../../components/CommissionReviewApproval';
+import { CommissionReviewViewer } from '../../features/commissionReview/CommissionReviewViewer';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { ThemeContext } from '../../hooks/useTheme';
 import '../../index.css';
@@ -40,6 +41,13 @@ export function CommissionReviewFixture({ scenario }: Props) {
                   scope={data.approval.scope}
                   onApprove={() => {}}
                   onReject={() => {}}
+                />
+              ) : scenario.kind.startsWith('viewer-') ? (
+                <CommissionReviewViewer
+                  sequenceId={data.inline.message.sequence_id}
+                  messages={[data.inline.message, ...data.inline.toolResults.values()]}
+                  onClose={() => {}}
+                  inline
                 />
               ) : (
                 <div className="message-list-fixture-shell tool-results-fixture-shell">

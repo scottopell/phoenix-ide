@@ -42,6 +42,8 @@ import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, 
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
+import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
+import { formatCommissionReviewInput, parseCommissionReviewDisplayData, parseCommissionReviewInput } from '../features/commissionReview/model';
 import './MessageComponents.css';
 
 const CheckIcon = () => (
@@ -194,207 +196,7 @@ export function formatMessageTime(isoStr: string): string {
 
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
-const COMMISSION_REVIEW_FINDINGS_PREVIEW_LIMIT = 5;
 
-type CommissionReviewInput = {
-  brief: string;
-  focus?: string | undefined;
-};
-
-type CommissionReviewFinding = {
-  severity: 'critical' | 'high' | 'medium' | 'low';
-  confidence?: string | undefined;
-  file: string;
-  line?: number | undefined;
-  symbol?: string | undefined;
-  title: string;
-  rationale: string;
-  suggestedFix?: string | undefined;
-};
-
-type CommissionReviewDisplayData = {
-  kind: 'commission_review';
-  status: 'success' | 'partial' | 'failed' | 'skipped' | 'rejected';
-  reviewStatus: string;
-  findingsStatus: string;
-  findingsTrust: string;
-  retryRecommendation: string;
-  findingSummary: { total: number; critical: number; high: number; medium: number; low: number };
-  warningsSummary: string[];
-  summary: {
-    target: { kind?: string | undefined; repoRoot: string; base: string; head: string; dirty?: boolean | undefined };
-    filesChanged: number;
-    filesReviewed: number;
-    insertions: number;
-    deletions: number;
-    elapsedMs: number;
-    reviewerSummary?: string | undefined;
-  };
-  unreviewed: Array<{ file: string; reason?: string | undefined }>;
-  findings: CommissionReviewFinding[];
-  warnings: Array<{ kind?: string | undefined; message: string; file?: string | undefined }>;
-};
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
-}
-
-function asNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function asStringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.map(asString).filter((v): v is string => !!v) : [];
-}
-
-function severityRank(severity: CommissionReviewFinding['severity']): number {
-  switch (severity) {
-    case 'critical': return 0;
-    case 'high': return 1;
-    case 'medium': return 2;
-    case 'low': return 3;
-  }
-}
-
-function formatCommissionReviewInput(input: Record<string, unknown>): { display: string; isMultiline: boolean } {
-  const brief = asString(input['brief']) ?? '<missing brief>';
-  const focus = asString(input['focus']);
-  const lines = [`brief: ${brief}`];
-  if (focus) lines.push(`focus: ${focus}`);
-  return { display: lines.join('\n'), isMultiline: true };
-}
-
-function parseCommissionReviewInput(input: Record<string, unknown>): CommissionReviewInput | null {
-  const brief = asString(input['brief']);
-  if (!brief) return null;
-  return { brief, focus: asString(input['focus']) };
-}
-
-function parseCommissionReviewDisplayData(value: unknown): CommissionReviewDisplayData | null {
-  const record = asRecord(value);
-  if (!record || record['kind'] !== 'commission_review') return null;
-
-  const summary = asRecord(record['summary']);
-  const target = asRecord(summary?.['target']);
-  const findingSummary = asRecord(record['finding_summary']);
-  if (!summary || !target || !findingSummary) return null;
-
-  const status = asString(record['status']);
-  const validStatuses: CommissionReviewDisplayData['status'][] = ['success', 'partial', 'failed', 'skipped', 'rejected'];
-  const reviewStatus = asString(record['review_status']);
-  const findingsStatus = asString(record['findings_status']);
-  const findingsTrust = asString(record['findings_trust']);
-  const retryRecommendation = asString(record['retry_recommendation']);
-  const repoRoot = asString(target['repo_root']);
-  const base = asString(target['base']);
-  const head = asString(target['head']);
-  const filesChanged = asNumber(summary['files_changed']);
-  const filesReviewed = asNumber(summary['files_reviewed']);
-  const insertions = asNumber(summary['insertions']);
-  const deletions = asNumber(summary['deletions']);
-  const elapsedMs = asNumber(summary['elapsed_ms']);
-  const total = asNumber(findingSummary['total']);
-  const critical = asNumber(findingSummary['critical']);
-  const high = asNumber(findingSummary['high']);
-  const medium = asNumber(findingSummary['medium']);
-  const low = asNumber(findingSummary['low']);
-
-  if (!status || !validStatuses.includes(status as CommissionReviewDisplayData['status']) || !reviewStatus || !findingsStatus || !findingsTrust || !retryRecommendation || !repoRoot || !base || !head) return null;
-  if ([filesChanged, filesReviewed, insertions, deletions, elapsedMs, total, critical, high, medium, low].some((v) => v === undefined)) return null;
-
-  const findings: CommissionReviewFinding[] = [];
-  if (Array.isArray(record['findings'])) {
-    for (const entry of record['findings']) {
-      const item = asRecord(entry);
-      if (!item) continue;
-      const severity = asString(item['severity']);
-      const file = asString(item['file']);
-      const title = asString(item['title']);
-      const rationale = asString(item['rationale']);
-      if (!severity || !file || !title || !rationale) continue;
-      if (!['critical', 'high', 'medium', 'low'].includes(severity)) continue;
-      findings.push({
-        severity: severity as CommissionReviewFinding['severity'],
-        confidence: asString(item['confidence']),
-        file,
-        line: asNumber(item['line']),
-        symbol: asString(item['symbol']),
-        title,
-        rationale,
-        suggestedFix: asString(item['suggested_fix']),
-      });
-    }
-  }
-
-  const unreviewed: CommissionReviewDisplayData['unreviewed'] = [];
-  if (Array.isArray(record['unreviewed'])) {
-    for (const entry of record['unreviewed']) {
-      const item = asRecord(entry);
-      const file = asString(item?.['file']);
-      if (file) unreviewed.push({ file, reason: asString(item?.['reason']) });
-    }
-  }
-
-  const warnings: CommissionReviewDisplayData['warnings'] = [];
-  if (Array.isArray(record['warnings'])) {
-    for (const entry of record['warnings']) {
-      const item = asRecord(entry);
-      const message = asString(item?.['message']);
-      if (message) warnings.push({ kind: asString(item?.['kind']), message, file: asString(item?.['file']) });
-    }
-  }
-
-  return {
-    kind: 'commission_review',
-    status: status as CommissionReviewDisplayData['status'],
-    reviewStatus,
-    findingsStatus,
-    findingsTrust,
-    retryRecommendation,
-    findingSummary: { total: total!, critical: critical!, high: high!, medium: medium!, low: low! },
-    warningsSummary: asStringArray(record['warnings_summary']),
-    summary: {
-      target: { kind: asString(target['kind']), repoRoot, base, head, dirty: target['dirty'] === true },
-      filesChanged: filesChanged!,
-      filesReviewed: filesReviewed!,
-      insertions: insertions!,
-      deletions: deletions!,
-      elapsedMs: elapsedMs!,
-      reviewerSummary: asString(summary['reviewer_summary']),
-    },
-    unreviewed,
-    findings,
-    warnings,
-  };
-}
-
-function commissionReviewOutcomeLabel(data: CommissionReviewDisplayData): string {
-  switch (data.status) {
-    case 'success': return data.findingSummary.total > 0 ? 'Findings' : 'Clean';
-    case 'partial': return 'Partial';
-    case 'failed': return 'Failed';
-    case 'rejected': return 'Rejected';
-    case 'skipped': return 'Clean';
-  }
-}
-
-function commissionReviewOutcomeClass(data: CommissionReviewDisplayData): string {
-  switch (data.status) {
-    case 'success': return data.findingSummary.total > 0 ? 'has-findings' : 'clean';
-    case 'partial': return 'partial';
-    case 'failed': return 'failed';
-    case 'rejected': return 'rejected';
-    case 'skipped': return 'clean';
-  }
-}
-
-function formatLabel(value: string): string {
-  return value.replace(/_/g, ' ');
-}
 
 /**
  * Strip model artifacts from think tool thoughts:
@@ -1077,6 +879,7 @@ interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -1097,7 +900,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1355,6 +1158,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   block={block}
                   result={result}
                   onOpenFile={onOpenFile}
+                  onOpenCommissionReview={onOpenCommissionReview}
+                  requestSequenceId={message.sequence_id}
                   workScopeKey={workScopeKey}
                   knownResultIds={knownResultIds}
                   toolStartedAtMs={toolStartedAtMs}
@@ -1422,6 +1227,8 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
+  requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
@@ -1582,135 +1389,6 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   return null;
 }
 
-function CommissionReviewInputView({ input }: { input: CommissionReviewInput }) {
-  return (
-    <div className="commission-review-input" aria-label="Commission review request">
-      <div className="commission-review-input-row">
-        <span className="commission-review-input-label">brief</span>
-        <div className="commission-review-input-value">{input.brief}</div>
-      </div>
-      {input.focus && (
-        <div className="commission-review-input-row">
-          <span className="commission-review-input-label">focus</span>
-          <div className="commission-review-input-value">{input.focus}</div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CommissionReviewResultView({ data }: { data: CommissionReviewDisplayData }) {
-  const outcomeClass = commissionReviewOutcomeClass(data);
-  const outcomeLabel = commissionReviewOutcomeLabel(data);
-  const findingsPreview = [...data.findings]
-    .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
-    .slice(0, COMMISSION_REVIEW_FINDINGS_PREVIEW_LIMIT);
-  const remainingFindings = Math.max(0, data.findings.length - findingsPreview.length);
-  const severityBadges = ( [
-    ['critical', data.findingSummary.critical],
-    ['high', data.findingSummary.high],
-    ['medium', data.findingSummary.medium],
-    ['low', data.findingSummary.low],
-  ] satisfies Array<[CommissionReviewFinding['severity'], number]>).filter((entry) => entry[1] > 0);
-  const coverageLabel = `${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed`;
-
-  return (
-    <section className={`commission-review-result ${outcomeClass}`} aria-label="Commission review summary">
-      <div className="commission-review-summary-header">
-        <div>
-          <div className="commission-review-summary-title">Commission review</div>
-          <div className="commission-review-summary-subtitle">
-            {formatLabel(data.reviewStatus)} · trust {formatLabel(data.findingsTrust)}
-          </div>
-        </div>
-        <div className={`commission-review-outcome-pill ${outcomeClass}`}>{outcomeLabel}</div>
-      </div>
-
-      <div className="commission-review-metrics" role="list" aria-label="Commission review metrics">
-        <div className="commission-review-metric" role="listitem"><span>elapsed</span><strong>{formatToolDuration(data.summary.elapsedMs)}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>coverage</span><strong>{coverageLabel}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>changes</span><strong>+{data.summary.insertions} / -{data.summary.deletions}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>findings</span><strong>{data.findingSummary.total}</strong></div>
-      </div>
-
-      <div className="commission-review-target">
-        <div className="commission-review-target-branch">{data.summary.target.base} → {data.summary.target.head}</div>
-        <div className="commission-review-target-repo">{data.summary.target.repoRoot}</div>
-      </div>
-
-      {data.summary.reviewerSummary && (
-        <p className="commission-review-reviewer-summary">{data.summary.reviewerSummary}</p>
-      )}
-
-      {severityBadges.length > 0 && (
-        <div className="commission-review-severity-row" aria-label="Finding counts by severity">
-          {severityBadges.map(([severity, count]) => (
-            <span key={severity} className={`commission-review-severity-badge ${severity}`}>
-              {severity} {count}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {(data.warningsSummary.length > 0 || data.unreviewed.length > 0 || data.retryRecommendation !== 'do_not_retry') && (
-        <div className="commission-review-callouts">
-          {data.warningsSummary.length > 0 && (
-            <div className="commission-review-callout warning">
-              <div className="commission-review-callout-title">Warnings</div>
-              <ul>
-                {data.warningsSummary.map((warning) => <li key={warning}>{warning}</li>)}
-              </ul>
-            </div>
-          )}
-          {data.unreviewed.length > 0 && (
-            <div className="commission-review-callout coverage-gap">
-              <div className="commission-review-callout-title">Unreviewed files</div>
-              <ul>
-                {data.unreviewed.slice(0, 3).map((entry) => <li key={entry.file}>{entry.file}{entry.reason ? ` · ${formatLabel(entry.reason)}` : ''}</li>)}
-              </ul>
-              {data.unreviewed.length > 3 && <div className="commission-review-more">+{data.unreviewed.length - 3} more files</div>}
-            </div>
-          )}
-          {data.retryRecommendation !== 'do_not_retry' && (
-            <div className="commission-review-callout retry">
-              <div className="commission-review-callout-title">Retry guidance</div>
-              <p>{formatLabel(data.retryRecommendation)}</p>
-            </div>
-          )}
-        </div>
-      )}
-
-      {findingsPreview.length > 0 ? (
-        <div className="commission-review-findings">
-          <div className="commission-review-findings-header">Top findings</div>
-          <ol>
-            {findingsPreview.map((finding, index) => (
-              <li key={`${finding.file}-${finding.line ?? 'na'}-${finding.title}-${index}`} className={`commission-review-finding ${finding.severity}`}>
-                <div className="commission-review-finding-header">
-                  <span className={`commission-review-severity-badge ${finding.severity}`}>{finding.severity}</span>
-                  <strong>{finding.title}</strong>
-                  {finding.confidence && <span className="commission-review-finding-confidence">{formatLabel(finding.confidence)} confidence</span>}
-                </div>
-                <div className="commission-review-finding-location">
-                  {finding.file}
-                  {finding.line !== undefined ? `:${finding.line}` : ''}
-                  {finding.symbol ? ` · ${finding.symbol}` : ''}
-                </div>
-                <p>{finding.rationale}</p>
-                {finding.suggestedFix && <p className="commission-review-suggested-fix">Fix: {finding.suggestedFix}</p>}
-              </li>
-            ))}
-          </ol>
-          {remainingFindings > 0 && <div className="commission-review-more">+{remainingFindings} more findings not shown</div>}
-        </div>
-      ) : (
-        <div className="commission-review-empty-findings">
-          {data.status === 'failed' ? 'No actionable findings were produced.' : 'No findings reported.'}
-        </div>
-      )}
-    </section>
-  );
-}
 
 function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
   const { openInspect } = useViewerSlotCommands();
@@ -2458,7 +2136,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2699,7 +2377,12 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
               onOpenFile={onOpenFile}
             />
           ) : hasStructuredCommissionReview && commissionReviewDisplayData ? (
-            <CommissionReviewResultView data={commissionReviewDisplayData} />
+            <CommissionReviewSummaryCard
+              data={commissionReviewDisplayData}
+              formatDuration={formatToolDuration}
+              requestSequenceId={requestSequenceId}
+              onOpenFullReview={onOpenCommissionReview}
+            />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

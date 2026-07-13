@@ -4,6 +4,8 @@ import { commissionReviewFixtureData, commissionReviewScenarios, getCommissionRe
 const expectedIds = [
   'approval-full-dark',
   'approval-missing-optional-dark',
+  'viewer-findings-dark',
+  'viewer-partial-light',
   'inline-running-dark',
   'inline-clean-dark',
   'inline-findings-dark',
@@ -21,7 +23,7 @@ const expectedIds = [
 ] as const;
 
 describe('commission review fixture scenarios', () => {
-  it('declares the full approval + inline matrix across both themes', () => {
+  it('declares the full approval, inline, and viewer matrix', () => {
     expect(commissionReviewScenarios.map(({ id }) => id)).toEqual(expectedIds);
     expect(new Set(expectedIds).size).toBe(expectedIds.length);
   });

@@ -43,7 +43,8 @@ export type ViewerSlot =
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; scopeKey: string; handleId: string }
-  | { kind: 'message'; sequenceId: number };
+  | { kind: 'message'; sequenceId: number }
+  | { kind: 'commission-review'; requestSequenceId: number };
 
 /** The slot's imperative surface. Identity-stable across slot / browser-session
  *  changes, so a command-only consumer (a button that opens a viewer) does not
@@ -58,6 +59,8 @@ export interface ViewerSlotCommands {
   openInspect: (scopeKey: string, handleId: string) => void;
   /** Open a finalized chat message in the annotatable markdown viewer. */
   openMessage: (sequenceId: number) => void;
+  /** Open a commission review request/result pair by request agent message sequence id. */
+  openCommissionReview: (requestSequenceId: number) => void;
   close: () => void;
 }
 
@@ -86,6 +89,7 @@ const END_LINE_PARAM = 'endLine';
 const SCOPE_PARAM = 'scope';
 const HANDLE_PARAM = 'handle';
 const MESSAGE_PARAM = 'message';
+const REVIEW_PARAM = 'review';
 
 /** The full set of slot-owned search params. Every transition clears all of
  *  them and writes only the ones its kind needs, so a stale param from a prior
@@ -101,6 +105,7 @@ const SLOT_PARAMS = [
   SCOPE_PARAM,
   HANDLE_PARAM,
   MESSAGE_PARAM,
+  REVIEW_PARAM,
 ] as const;
 
 function clearSlotParams(next: URLSearchParams) {
@@ -169,6 +174,11 @@ function deriveSlot(
       const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
       if (sequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
       return { slot: { kind: 'message', sequenceId }, malformed: false };
+    }
+    case 'commission-review': {
+      const requestSequenceId = parseMessageParam(searchParams.get(REVIEW_PARAM));
+      if (requestSequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
+      return { slot: { kind: 'commission-review', requestSequenceId }, malformed: false };
     }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
@@ -296,6 +306,17 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     });
   }, [setPatchContext, writeUrl]);
 
+  const openCommissionReview = useCallback((requestSequenceId: number) => {
+    const validSequenceId = Number.isSafeInteger(requestSequenceId) && requestSequenceId > 0 ? requestSequenceId : undefined;
+    if (validSequenceId === undefined) return;
+    setPatchContext(null);
+    writeUrl((next) => {
+      clearSlotParams(next);
+      next.set(VIEWER_PARAM, 'commission-review');
+      next.set(REVIEW_PARAM, String(validSequenceId));
+    });
+  }, [setPatchContext, writeUrl]);
+
   // Clear the URL to the empty slot. `clearStorage` distinguishes an explicit
   // user close (clears the last-viewer entry so navigating back doesn't reopen)
   // from a system-driven close like the browser-session falling edge (which
@@ -344,7 +365,15 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     if (!isEntry) return;
     if (!scopeKey) return;
     if (location.key === 'default') return;
-    if (searchParams.has(VIEWER_PARAM) || searchParams.has(FILE_PARAM) || searchParams.has(ROOT_PARAM) || searchParams.has(DIFF_PRESENTATION_PARAM) || searchParams.has(DIFF_TARGET_PARAM)) return;
+    if (
+      searchParams.has(VIEWER_PARAM)
+      || searchParams.has(FILE_PARAM)
+      || searchParams.has(ROOT_PARAM)
+      || searchParams.has(DIFF_PRESENTATION_PARAM)
+      || searchParams.has(DIFF_TARGET_PARAM)
+      || searchParams.has(MESSAGE_PARAM)
+      || searchParams.has(REVIEW_PARAM)
+    ) return;
     const stored = getLastViewer(scopeKey);
     if (!stored) return;
     setSearchParams(new URLSearchParams(stored), { replace: true });
@@ -381,8 +410,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const commands = useMemo<ViewerSlotCommands>(
-    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, close }),
-    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, close],
+    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, close }),
+    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, close],
   );
 
   return (

@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '../api';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { MessageViewer } from './MessageViewer';
-
 function agentTextMessage(sequenceId: number, text: string): Message {
   return {
     message_id: `agent-${sequenceId}`,

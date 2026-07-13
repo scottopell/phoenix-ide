@@ -10,7 +10,7 @@ import { api, ConflictError, type ConversationState, type Message, type ForkProp
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
-import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { buildRenderUnits } from '../conversation/renderUnits';
 
 let mockDensity: 'full' | 'compact' = 'full';
@@ -72,6 +72,14 @@ function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Mes
 function LocationProbe() {
   const location = useLocation();
   return <div data-testid="location-search">{location.search}</div>;
+}
+
+let latestViewerSlot: ReturnType<typeof useViewerSlot> | null = null;
+
+function ViewerSlotCapture() {
+  const slot = useViewerSlot();
+  latestViewerSlot = slot;
+  return null;
 }
 
 
@@ -192,6 +200,10 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
 }
 
 describe('commission review tool rendering', () => {
+    beforeEach(() => {
+      latestViewerSlot = null;
+    });
+
   it('formats the commission review request input inline instead of raw json', () => {
     render(
       <MemoryRouter>
@@ -215,6 +227,85 @@ describe('commission review tool rendering', () => {
     expect(screen.getByText('Independent review before merge to validate the refactor.')).toBeInTheDocument();
     expect(screen.getByText('Concurrency and edge-case handling')).toBeInTheDocument();
     expect(screen.queryByText(/"brief"/)).not.toBeInTheDocument();
+  });
+
+  it('renders a clean structured summary for successful reviews with no findings', () => {
+    const result = toolMessage('tool-commission-review-clean', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-clean', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-clean',
+            name: 'commission_review',
+            input: { brief: 'Review before merge' },
+          }])}
+          toolResults={new Map([['tool-commission-review-clean', result]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByLabelText('Commission review summary')).toHaveTextContent('Clean');
+    expect(screen.queryByText('0/3 files reviewed')).not.toBeInTheDocument();
+    expect(screen.getByText('3/3 files reviewed')).toBeInTheDocument();
+    expect(screen.getByText('No correctness issues found in the reviewed diff.')).toBeInTheDocument();
+    expect(screen.getByText('No findings reported.')).toBeInTheDocument();
+  });
+
+  it('renders an inline Open full review action when the request message sequence id is available', async () => {
+    const result = toolMessage('tool-commission-review-open', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData();
+
+    render(
+      <MemoryRouter initialEntries={['/c/test-conv']}>
+        <ViewerSlotProvider scopeKey="test-conv" browserSessionActive={false}>
+          <AgentMessage
+            message={agentMessage('agent-commission-review-open', [{
+              type: 'tool_use',
+              id: 'tool-commission-review-open',
+              name: 'commission_review',
+              input: { brief: 'Review before merge' },
+            }])}
+            toolResults={new Map([['tool-commission-review-open', result]])}
+            onOpenFile={undefined}
+            onOpenCommissionReview={(requestSequenceId) => latestViewerSlot?.openCommissionReview(requestSequenceId)}
+          />
+          <ViewerSlotCapture />
+          <LocationProbe />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open full review' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-search')).toHaveTextContent('?viewer=commission-review&review=1');
+    });
+  });
+
+  it('hides the inline Open full review action when the request message sequence id is unavailable', () => {
+    const result = toolMessage('tool-commission-review-no-open', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-no-open', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-no-open',
+            name: 'commission_review',
+            input: { brief: 'Review before merge' },
+          }])}
+          toolResults={new Map([['tool-commission-review-no-open', result]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Open full review' })).not.toBeInTheDocument();
   });
 
   it('renders a clean structured summary for successful reviews with no findings', () => {

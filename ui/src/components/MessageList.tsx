@@ -109,6 +109,7 @@ interface MessageListProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   systemPrompt?: string | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
@@ -164,6 +165,7 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
 }
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+type OnOpenCommissionReview = ((requestSequenceId: number) => void) | undefined;
 
 function activeToolUseIdFromState(convState: ConversationState): string | undefined {
   if (convState.type !== 'tool_executing' && convState.type !== 'cancelling_tool') return undefined;
@@ -174,6 +176,7 @@ function activeToolUseIdFromState(convState: ConversationState): string | undefi
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
+  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
@@ -218,6 +221,7 @@ function renderHistoricalUnit(
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
+          onOpenCommissionReview={onOpenCommissionReview}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
@@ -264,6 +268,7 @@ function renderUnit(
   unit: RenderUnit,
   slug: string | undefined,
   onOpenFile: OnOpenFile,
+  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
@@ -277,7 +282,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
+  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
 }
 
 interface SystemPromptHeaderProps {
@@ -331,6 +336,7 @@ function MessageListImpl({
   onRetry,
   onCancelSteering,
   onOpenFile,
+  onOpenCommissionReview,
   systemPrompt,
   conversationId,
   slug,
@@ -1042,10 +1048,10 @@ function MessageListImpl({
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
-        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
+        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
+    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

@@ -14,6 +14,12 @@ ApprovalFullDark.storyName = 'approval-full-dark';
 export const ApprovalMissingOptionalDark = storyFor('approval-missing-optional-dark');
 ApprovalMissingOptionalDark.storyName = 'approval-missing-optional-dark';
 
+export const ViewerFindingsDark = storyFor('viewer-findings-dark');
+ViewerFindingsDark.storyName = 'viewer-findings-dark';
+
+export const ViewerPartialLight = storyFor('viewer-partial-light');
+ViewerPartialLight.storyName = 'viewer-partial-light';
+
 export const InlineRunningDark = storyFor('inline-running-dark');
 InlineRunningDark.storyName = 'inline-running-dark';
 

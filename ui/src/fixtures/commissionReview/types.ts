@@ -35,6 +35,20 @@ export const commissionReviewScenarioDefinitions = [
     theme: 'dark',
   },
   {
+    id: 'viewer-findings-dark',
+    title: 'Viewer / findings / dark',
+    description: 'Full commission review viewer with all findings and status detail.',
+    kind: 'viewer-findings',
+    theme: 'dark',
+  },
+  {
+    id: 'viewer-partial-light',
+    title: 'Viewer / partial / light',
+    description: 'Full commission review viewer with warnings and coverage gaps.',
+    kind: 'viewer-partial',
+    theme: 'light',
+  },
+  {
     id: 'inline-running-dark',
     title: 'Inline / running / dark',
     description: 'Commission review tool call still running inline.',
@@ -139,6 +153,8 @@ export const commissionReviewScenarioDefinitions = [
   kind:
     | 'approval-full'
     | 'approval-missing-optional'
+    | 'viewer-findings'
+    | 'viewer-partial'
     | 'inline-running'
     | 'inline-clean'
     | 'inline-findings'

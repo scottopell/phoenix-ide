@@ -97,6 +97,9 @@ const ProcessInspectorPanel = lazy(() =>
 const MessageViewer = lazy(() =>
   import('../components/MessageViewer').then((m) => ({ default: m.MessageViewer })),
 );
+const CommissionReviewViewer = lazy(() =>
+  import('../features/commissionReview/CommissionReviewViewer').then((m) => ({ default: m.CommissionReviewViewer })),
+);
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
@@ -362,12 +365,15 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const inspectOpen = inspectSlot !== null;
   const messageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const messageOpen = messageSlot !== null;
+  const commissionReviewSlot = viewerSlot.slot.kind === 'commission-review' ? viewerSlot.slot : null;
+  const commissionReviewOpen = commissionReviewSlot !== null;
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
   const handleCloseInspector = viewerSlot.close;
   const handleCloseMessageViewer = viewerSlot.close;
   const handleOpenBrowserView = viewerSlot.openBrowser;
   const handleOpenMessageViewer = viewerSlot.openMessage;
+  const handleOpenCommissionReview = viewerSlot.openCommissionReview;
   // ConversationPage was previously snapshotting `isDesktop` at mount and
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
@@ -1688,6 +1694,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const inspectViewerOpen = !isArchived && inspectOpen;
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
   const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
+  const commissionReviewViewerOpen = canOpenMessageSidepanel && commissionReviewOpen;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -1810,6 +1817,20 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         </div>
       );
     }
+    if (commissionReviewViewerOpen && commissionReviewSlot) {
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <CommissionReviewViewer
+              sequenceId={commissionReviewSlot.requestSequenceId}
+              messages={viewableMessages}
+              onClose={handleCloseMessageViewer}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
   }
 
   // Terminal cleanup (Clean up / Abandon) for a Work/Branch
@@ -1889,7 +1910,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen || commissionReviewViewerOpen);
 
   const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
     <>
@@ -1963,6 +1984,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         onRetry={handleRetry}
         onCancelSteering={isArchived ? undefined : handleCancelSteering}
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
+        onOpenCommissionReview={isArchived ? undefined : handleOpenCommissionReview}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         enableMessageSidepanel={canOpenMessageSidepanel}
@@ -2511,6 +2533,15 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           />
         </Suspense>
       )}
+      {commissionReviewViewerOpen && commissionReviewSlot && !showSplitPaneViewer && (
+        <Suspense fallback={null}>
+          <CommissionReviewViewer
+            sequenceId={commissionReviewSlot.requestSequenceId}
+            messages={viewableMessages}
+            onClose={handleCloseMessageViewer}
+          />
+        </Suspense>
+      )}
       {showSplitPaneViewer && (
         <>
           <div
@@ -2589,6 +2620,13 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
                   onSendNotes={handleSendNotes}
+                  inline
+                />
+              ) : commissionReviewViewerOpen && commissionReviewSlot ? (
+                <CommissionReviewViewer
+                  sequenceId={commissionReviewSlot.requestSequenceId}
+                  messages={viewableMessages}
+                  onClose={handleCloseMessageViewer}
                   inline
                 />
               ) : null}

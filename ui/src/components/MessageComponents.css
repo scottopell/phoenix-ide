@@ -61,6 +61,22 @@
   align-items: start;
 }
 
+.commission-review-open-button {
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 40%, var(--border-color));
+  border-radius: 6px;
+  color: var(--accent-blue);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent-blue) 9%, transparent);
+  cursor: pointer;
+}
+
+.commission-review-open-button:hover {
+  background: color-mix(in srgb, var(--accent-blue) 16%, transparent);
+}
+
 .commission-review-summary-title {
   font-size: 13px;
   font-weight: 700;

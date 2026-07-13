@@ -1,0 +1,91 @@
+.commission-review-viewer {
+  padding: 20px;
+}
+
+.commission-review-viewer-state {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 28px;
+  border: 1px solid var(--border-color, #2f3542);
+  border-radius: 14px;
+  background: var(--panel-bg, rgb(255 255 255 / 4%));
+}
+
+.commission-review-viewer-state h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.commission-review-viewer-state p {
+  margin: 0;
+  color: var(--text-secondary, #a0a8b8);
+}
+
+.commission-review-viewer-raw {
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--bg-tertiary, rgb(0 0 0 / 22%));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.commission-review-result--full {
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.commission-review-summary-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.commission-review-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.commission-review-status-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgb(127 127 127 / 8%);
+}
+
+.commission-review-status-grid span {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary, #a0a8b8);
+}
+
+.commission-review-detail-block {
+  margin-top: 16px;
+}
+
+.commission-review-warning-list {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.commission-review-warning-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.commission-review-warning-list code {
+  width: fit-content;
+}
