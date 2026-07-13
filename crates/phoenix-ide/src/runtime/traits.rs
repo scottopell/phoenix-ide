@@ -181,6 +181,10 @@ pub trait StateStore: Send + Sync {
         Ok(())
     }
 
+    async fn accept_owed_wakes(&self, _conv_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Read the conversation's clear watermark for stale tool-result clearing
     /// (specs/stale-tool-results). Returns 0 when nothing has been cleared yet.
     async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String>;
@@ -794,6 +798,15 @@ impl StateStore for DatabaseStorage {
         let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
             .rekey_scope_for_conversation(conv_id, old_scope, new_scope)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_owed_wakes(&self, conv_id: &str) -> Result<(), String> {
+        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .accept_owed_for_conversation(conv_id, chrono::Utc::now())
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

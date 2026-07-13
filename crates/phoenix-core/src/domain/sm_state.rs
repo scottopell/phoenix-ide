@@ -176,9 +176,14 @@ pub struct QuestionMetadata {
     pub source: Option<String>,
 }
 
+const fn default_wait_until_seconds() -> u64 {
+    600
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitUntilInput {
     pub target: WaitUntilTargetInput,
+    #[serde(default = "default_wait_until_seconds")]
     pub max_wait_seconds: u64,
 }
 

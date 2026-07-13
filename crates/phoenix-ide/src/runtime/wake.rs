@@ -8,7 +8,13 @@ use std::{sync::Arc, time::Duration as StdDuration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::{
+    domain::{
+        db_schema::ToolResult,
+        sm_event::{Event, WakeObservationResult},
+    },
+    work_scope::WorkScope,
+};
 use phoenix_db::workflow::{
     wake::{
         ClaimedWakeEffect, WakeBinding, WakeObservationRequest, WakeTerminalReceiptRequest,
@@ -383,7 +389,7 @@ fn duration_until(deadline: DateTime<Utc>, now: DateTime<Utc>) -> StdDuration {
 }
 
 pub(crate) async fn drain_due<F>(
-    manager: &RuntimeManager,
+    manager: &Arc<RuntimeManager>,
     worker_id: &str,
     mut now: F,
 ) -> Result<(), String>
@@ -439,6 +445,36 @@ where
             continue;
         };
         process_claim(manager, &adapter, claim, item_now).await?;
+    }
+    deliver_owed(manager, &adapter).await?;
+    Ok(())
+}
+
+async fn deliver_owed(
+    manager: &Arc<RuntimeManager>,
+    adapter: &WakeWorkflowAdapter<'_>,
+) -> Result<(), String> {
+    for conversation_id in adapter
+        .owed_conversations()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let results = adapter
+            .owed_tool_results(&conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(inbox_id, tool_use_id, output)| WakeObservationResult {
+                message_id: format!("wake-result-{inbox_id}"),
+                result: ToolResult::success(tool_use_id, output),
+            })
+            .collect();
+        manager
+            .send_event(&conversation_id, Event::WakeObservationReady { results })
+            .await
+            .map_err(|error| {
+                format!("failed to deliver owed wake for {conversation_id}: {error}")
+            })?;
     }
     Ok(())
 }
@@ -582,6 +618,24 @@ async fn inspect_binding(
                     });
                     fired(binding, evidence, now)
                 }
+                BashTerminalInspection::KillPendingKernel { observed_at } => fired(
+                    binding,
+                    WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                        identity: identity.clone(),
+                        status: BashTerminalStatus::KillPendingKernel,
+                        occurred_at: timestamp(observed_at)?,
+                        exit_code: None,
+                        duration_ms: None,
+                        signal_number: None,
+                        kill_signal_sent: None,
+                        tail_start_offset: 0,
+                        tail_end_offset: 0,
+                        tail_truncated_before: false,
+                        tail_offsets: Vec::new(),
+                        final_tail: Vec::new(),
+                    }),
+                    now,
+                ),
                 BashTerminalInspection::Unknown => forgotten(binding, now),
                 BashTerminalInspection::Live | BashTerminalInspection::Terminal { .. }
                     if deadline_reached =>
@@ -918,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_processes_one_snapshot_and_refreshes_time_per_item() {
-        let manager = manager_with_due_wakes(2).await;
+        let manager = Arc::new(manager_with_due_wakes(2).await);
         let times = [at(1_001), at(1_002), at(1_003)];
         let mut calls = 0;
         drain_due(&manager, "worker", || {

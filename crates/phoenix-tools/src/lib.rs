@@ -701,6 +701,7 @@ impl ToolRegistry {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.push(Arc::new(SandboxedBashTool));
+        tools.extend(parent_wake_tools());
         if policy.allow_top_level_spawn_agents() {
             tools.extend(parent_coordination_tools(agents));
         } else {
@@ -1094,6 +1095,7 @@ mod tests {
             sandbox_policy(),
         ));
         assert!(work.contains("bash"));
+        assert!(work.contains("wait_until"));
         assert!(work.contains("browser_wait_for_selector"));
         assert!(work.contains("patch"));
         assert!(!work.contains("tmux_run"));

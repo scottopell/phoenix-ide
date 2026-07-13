@@ -11,6 +11,8 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
+use phoenix_core::domain::db_schema::{MessageContent, ToolOutcome};
+
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{
     CancelCause, CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent,
@@ -754,6 +756,28 @@ pub fn transition_core(
             handle_core_sub_agents(state, event)
         }
 
+        (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
+            let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
+            for wake_result in results {
+                let result = &wake_result.result;
+                transition = transition.with_effect(Effect::PersistMessage {
+                    content: MessageContent::tool_with_images(
+                        &result.tool_use_id,
+                        result.output(),
+                        false,
+                        result.images().to_vec(),
+                    ),
+                    display_data: result.display_data().cloned(),
+                    usage_data: None,
+                    message_id: wake_result.message_id.clone(),
+                    idempotent: true,
+                });
+            }
+            Ok(transition
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestLlm))
+        }
+
         // Context Continuation (REQ-BED-019 through REQ-BED-024)
         (CoreState::AwaitingContinuation { .. }, CoreEvent::LlmError { .. })
         | (CoreState::AwaitingContinuation { .. }, CoreEvent::RetryTimeout { .. })
@@ -978,7 +1002,7 @@ fn handle_core_tool_complete(
             result,
         } if tool_use_id == current_tool.id
             && matches!(current_tool.input, ToolInput::WaitUntil(_))
-            && remaining_tools.is_empty()
+            && matches!(result.outcome, ToolOutcome::Success { .. })
             && pending_sub_agents.is_empty() =>
         {
             let mut all_results = completed_results.clone();
@@ -1106,6 +1130,7 @@ fn handle_core_tool_complete(
         | CoreEvent::ContinuationResponse { .. }
         | CoreEvent::ContinuationFailed { .. }
         | CoreEvent::UserTriggerContinuation
+        | CoreEvent::WakeObservationReady { .. }
         | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -5250,7 +5275,6 @@ mod tests {
     #[test]
     fn test_subagent_sole_propose_task_rejected_not_stalled() {
         use crate::state::{ContextExhaustionBehavior, ProposeTaskInput, ToolInput};
-        use phoenix_core::domain::db_schema::ToolOutcome;
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let subagent_ctx = ConvContext {

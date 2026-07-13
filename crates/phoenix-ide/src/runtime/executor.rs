@@ -2600,6 +2600,8 @@ where
                 }
             }
 
+            let is_wake_observation = matches!(current_event, Event::WakeObservationReady { .. });
+
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
@@ -2622,6 +2624,11 @@ where
             };
 
             let generated_events = self.apply_transition_result(result).await?;
+            if is_wake_observation {
+                self.storage
+                    .accept_owed_wakes(&self.context.conversation_id)
+                    .await?;
+            }
             events_to_process.extend(generated_events);
         }
 

@@ -182,6 +182,9 @@ impl WorkScopeHandles {
 pub enum BashTerminalInspection {
     Unknown,
     Live,
+    KillPendingKernel {
+        observed_at: chrono::DateTime<chrono::Utc>,
+    },
     Terminal {
         observed_at: chrono::DateTime<chrono::Utc>,
         exit_code: Option<i32>,
@@ -366,7 +369,15 @@ impl BashHandleRegistry {
         };
         let state = handle.state().await;
         match state.as_ref() {
-            super::handle::HandleState::Live(_) => BashTerminalInspection::Live,
+            super::handle::HandleState::Live(_) => {
+                if handle.is_kill_pending_kernel().await {
+                    BashTerminalInspection::KillPendingKernel {
+                        observed_at: chrono::Utc::now(),
+                    }
+                } else {
+                    BashTerminalInspection::Live
+                }
+            }
             super::handle::HandleState::Tombstoned(tomb) => BashTerminalInspection::Terminal {
                 observed_at: chrono::DateTime::<chrono::Utc>::from(tomb.finished_at),
                 exit_code: tomb.exit_code,

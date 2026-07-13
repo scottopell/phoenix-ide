@@ -227,6 +227,7 @@ async fn validate_target(
                     "bash handle is not owned by this work scope",
                 )),
                 crate::BashTerminalInspection::Live
+                | crate::BashTerminalInspection::KillPendingKernel { .. }
                 | crate::BashTerminalInspection::Terminal { .. } => {
                     Ok(WakeRegistrationTarget::Bash {
                         handle_id: handle_id.clone(),

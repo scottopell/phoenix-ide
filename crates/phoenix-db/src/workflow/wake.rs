@@ -124,10 +124,107 @@ pub struct WakeWorkflowAdapter<'a> {
     repository: &'a WorkflowRepository,
 }
 
+type OwedToolResultRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
 impl<'a> WakeWorkflowAdapter<'a> {
     #[must_use]
     pub const fn new(repository: &'a WorkflowRepository) -> Self {
         Self { repository }
+    }
+
+    pub async fn owed_tool_results(
+        &self,
+        conversation_id: &str,
+    ) -> WorkflowRepositoryResult<Vec<(String, String, String)>> {
+        let rows: Vec<OwedToolResultRow> = sqlx::query_as(
+            "SELECT wi.id, b.registering_tool_use_id, r.resource_kind, r.status, \
+             r.bash_status, r.bash_exit_code, r.bash_duration_ms, r.bash_signal_number, \
+             r.tmux_status, b.tmux_window_id \
+             FROM wake_runtime_obligations o \
+             JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
+             JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
+             JOIN wake_terminal_receipts r ON r.receipt_id = wi.terminal_receipt_id \
+             JOIN wake_workflow_bindings b ON b.workflow_id = wi.workflow_id \
+             WHERE o.conversation_id = ?1 AND o.status = 'owed' ORDER BY wi.sequence",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.repository.pool())
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    inbox_id,
+                    tool_use_id,
+                    resource_kind,
+                    status,
+                    bash_status,
+                    exit_code,
+                    duration_ms,
+                    signal_number,
+                    tmux_status,
+                    window_id,
+                )| {
+                    let output = serde_json::to_string(&serde_json::json!({
+                        "status": bash_status.or(tmux_status).unwrap_or(status),
+                        "resource_kind": resource_kind,
+                        "window_id": window_id,
+                        "exit_code": exit_code,
+                        "duration_ms": duration_ms,
+                        "signal_number": signal_number,
+                    }))
+                    .map_err(|error| WorkflowRepositoryError::CorruptState(error.to_string()))?;
+                    Ok((inbox_id, tool_use_id, output))
+                },
+            )
+            .collect()
+    }
+
+    pub async fn owed_conversations(&self) -> WorkflowRepositoryResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT conversation_id FROM wake_runtime_obligations WHERE status = 'owed' ORDER BY conversation_id",
+        )
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn accept_owed_for_conversation(
+        &self,
+        conversation_id: &str,
+        accepted_at: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<u64> {
+        let mut tx = self.repository.pool().begin().await?;
+        let result = sqlx::query(
+            "UPDATE wake_runtime_obligations SET status = 'accepted', resolved_at = ?1, terminal_reason = 'accepted' \
+             WHERE conversation_id = ?2 AND status = 'owed'",
+        )
+        .bind(accepted_at.to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_observation_inbox SET consumed_at = ?1 WHERE consumed_at IS NULL \
+             AND id IN (SELECT i.inbox_item_id FROM wake_runtime_obligation_items i \
+             JOIN wake_runtime_obligations o ON o.id = i.obligation_id \
+             WHERE o.conversation_id = ?2 AND o.status = 'accepted')",
+        )
+        .bind(accepted_at.to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn has_pending_for_conversation(
