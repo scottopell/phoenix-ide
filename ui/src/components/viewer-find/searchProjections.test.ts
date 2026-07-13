@@ -322,7 +322,7 @@ describe('buildConversationSearchProjection', () => {
         message_type: 'user',
         content: 'Legacy alpha body',
         created_at: '',
-      } as Message,
+      } as unknown as Message,
     }];
 
     const projection = buildConversationSearchProjection(units, 'alpha');
