@@ -23,6 +23,7 @@
     "qa:sidebar": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-sidebar.mjs",
     "qa:task-approval": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-task-approval.mjs",
     "qa:mobile-conversation-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-mobile-conversation-list.mjs",
+    "qa:new-conversation": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-new-conversation.mjs",
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",
     "qa:work-actions": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-work-actions.mjs",
     "qa:tool-results": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-tool-results.mjs",

@@ -2557,6 +2557,16 @@ def cmd_qa_mobile_conversation_list() -> None:
     )
 
 
+def cmd_qa_new_conversation() -> None:
+    """Capture the new-conversation page at desktop and mobile sizes."""
+    subprocess.run(
+        ["pnpm", "qa:new-conversation"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 def cmd_qa_message_list() -> None:
     """Capture message list Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -7566,6 +7576,7 @@ def main():
     qa_sub.add_parser("sidebar", help="Capture sidebar Ladle screenshots")
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
+    qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
@@ -7677,6 +7688,8 @@ def main():
             cmd_qa_task_approval()
         elif args.qa_command == "mobile-conversation-list":
             cmd_qa_mobile_conversation_list()
+        elif args.qa_command == "new-conversation":
+            cmd_qa_new_conversation()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
         elif args.qa_command == "tool-results":
