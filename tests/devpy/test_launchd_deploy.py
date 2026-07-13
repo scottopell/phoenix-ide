@@ -278,14 +278,14 @@ class PreparationTests(unittest.TestCase):
     def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
             asset.write_bytes(b"release")
             digest = self.dev._file_sha256(asset)
             (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
-            release_commit = "abc123" + "0" * 34
+            release_commit = "abc123def456" + "0" * 28
             run.side_effect = [
                 subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
                 subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
@@ -294,13 +294,13 @@ class PreparationTests(unittest.TestCase):
             binary, tag, sha, commit = self.dev._prepare_release_candidate("latest", staging)
             self.assertEqual(asset, binary)
             self.assertTrue(binary.stat().st_mode & 0o100)
-        self.assertEqual(("v1.2.3", "abc123", release_commit), (tag, sha, commit))
+        self.assertEqual(("v1.2.3", "abc123def456", release_commit), (tag, sha, commit))
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
 
     def test_release_rejects_asset_from_different_commit(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "bad123"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "bad123bad123"}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
@@ -312,6 +312,23 @@ class PreparationTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
             with self.assertRaisesRegex(SystemExit, "asset embeds"):
+                self.dev._prepare_release_candidate("latest", staging)
+
+    def test_release_rejects_truncated_embedded_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "a"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, "abc123def456" + "0" * 28 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "malformed git identity"):
                 self.dev._prepare_release_candidate("latest", staging)
 
     def test_claim_release_is_transaction_owned(self):
@@ -430,6 +447,8 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("phoenix_ide-aarch64-apple-darwin", workflow)
         self.assertIn("phoenix_ide-x86_64-apple-darwin", workflow)
         self.assertIn("SHA256SUMS", workflow)
+        self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
 
     def test_socket_activation_shape_is_preserved(self):
         plist = self.dev.generate_launchd_plist("1.0.0", path_override="/usr/bin")

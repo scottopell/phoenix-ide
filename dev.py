@@ -7233,6 +7233,10 @@ def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str
         )
     if identity["git_sha"].endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
+    if not re.fullmatch(r"[0-9a-f]{12}", identity["git_sha"]):
+        raise SystemExit(
+            f"release {tag} asset embeds malformed git identity {identity['git_sha']!r}; expected 12 lowercase hex characters"
+        )
     if not release_commit.startswith(identity["git_sha"]):
         raise SystemExit(
             f"release {tag} resolves to {release_commit}, but the asset embeds {identity['git_sha']}"
