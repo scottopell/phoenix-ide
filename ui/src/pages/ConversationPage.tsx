@@ -184,6 +184,31 @@ async function getConversationMetaForRoute(routeSegment: string) {
 
 export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
+  const navigate = useNavigate();
+  const [routeChecked, setRouteChecked] = useState(routePrefix === '/global');
+
+  useEffect(() => {
+    if (routePrefix === '/global' || !slug) {
+      setRouteChecked(true);
+      return;
+    }
+    let cancelled = false;
+    api.getGlobalCoordinator()
+      .then(({ conversation }) => {
+        if (cancelled) return;
+        if (slug === conversation.id || slug === conversation.slug) {
+          navigate(`/global/${conversation.id}`, { replace: true });
+        } else {
+          setRouteChecked(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setRouteChecked(true);
+      });
+    return () => { cancelled = true; };
+  }, [navigate, routePrefix, slug]);
+
+  if (!routeChecked) return null;
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,

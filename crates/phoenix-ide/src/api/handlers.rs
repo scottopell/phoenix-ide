@@ -116,7 +116,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/global/open-work", get(global_read::open_work))
         .route(
             "/api/global/coordinator",
-            get(get_coordinator).post(get_coordinator),
+            get(get_existing_coordinator).post(ensure_coordinator),
         )
         .route("/api/global/resolve", post(global_read::resolve_reference))
         .route(
@@ -805,7 +805,26 @@ async fn cached_pr_summaries_for_conversations(
         .collect())
 }
 
-async fn get_coordinator(
+async fn get_existing_coordinator(
+    State(state): State<AppState>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let conversation_id = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))?;
+    let conversation = state
+        .db
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ConversationResponse {
+        conversation: conversation_to_json(&state, &conversation, None),
+    }))
+}
+
+async fn ensure_coordinator(
     State(state): State<AppState>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let llm_language = state

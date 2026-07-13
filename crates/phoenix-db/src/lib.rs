@@ -2614,11 +2614,26 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn preview_roots(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT cwd FROM conversations WHERE cwd IS NOT NULL AND cwd != ''
+            "WITH RECURSIVE coordinator_chain(id) AS (
+                 SELECT conversation_id FROM coordinator WHERE singleton = 1
+                 UNION
+                 SELECT c.id
+                 FROM conversations c
+                 JOIN coordinator_chain cc ON c.continued_in_conv_id = cc.id
+                 UNION
+                 SELECT c.continued_in_conv_id
+                 FROM conversations c
+                 JOIN coordinator_chain cc ON c.id = cc.id
+                 WHERE c.continued_in_conv_id IS NOT NULL
+             )
+             SELECT cwd FROM conversations
+               WHERE cwd IS NOT NULL AND cwd != ''
+                 AND id NOT IN (SELECT id FROM coordinator_chain)
              UNION
              SELECT cm_worktree_path FROM conversations
                WHERE cm_worktree_path IS NOT NULL
-                 AND cm_worktree_path != ''",
+                 AND cm_worktree_path != ''
+                 AND id NOT IN (SELECT id FROM coordinator_chain)",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -13324,6 +13339,10 @@ mod tests {
         assert!(!listed_ids.contains(&coordinator.id));
         assert!(!listed_ids.contains(&continuation.id));
         assert!(!listed_ids.contains(&second.id));
+        let preview_roots = db.preview_roots().await.unwrap();
+        assert!(!preview_roots.contains(&coordinator.cwd));
+        assert!(!preview_roots.contains(&continuation.cwd));
+        assert!(!preview_roots.contains(&second.cwd));
     }
 
     // ------------------------------------------------------------------
