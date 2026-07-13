@@ -46,6 +46,7 @@ vi.mock('../api', () => {
       listDirectory: vi.fn(),
       listGitBranches: vi.fn(),
       getProjectTaskAvailability: vi.fn(),
+      getProjects: vi.fn(),
       listProjectTasks: vi.fn(),
       createConversation: vi.fn(),
       listConversations: vi.fn().mockResolvedValue([]),
@@ -135,6 +136,7 @@ describe('/new workflow modes', () => {
     vi.mocked(api.listDirectory).mockResolvedValue({ entries: [] });
     vi.mocked(api.listGitBranches).mockResolvedValue({ branches, current: 'feature/demo', default_branch: 'main' });
     vi.mocked(api.getProjectTaskAvailability).mockResolvedValue({ available: true });
+    vi.mocked(api.getProjects).mockResolvedValue([]);
     vi.mocked(api.listProjectTasks).mockResolvedValue({ tasks: [task] });
     vi.mocked(api.createConversation).mockResolvedValue({
       id: 'c1',

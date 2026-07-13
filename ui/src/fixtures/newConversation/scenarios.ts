@@ -6,10 +6,28 @@ export const newConversationScenarios = [
     theme: 'dark',
     cwd: '/Users/alex/projects/phoenix-ide',
     draft: 'Refine the mobile new-conversation layout while keeping the desktop workflow compact.',
-    recentDirs: [
-      '/Users/alex/projects/phoenix-ide',
-      '/Users/alex/projects/design-system',
-      '/Users/alex/projects/agent-tools',
+    projects: [
+      {
+        id: 'project-phoenix',
+        canonical_path: '/Users/alex/projects/phoenix-ide',
+        main_ref: 'main',
+        created_at: '2026-07-10T10:00:00Z',
+        conversation_count: 12,
+      },
+      {
+        id: 'project-design',
+        canonical_path: '/Users/alex/projects/design-system',
+        main_ref: 'main',
+        created_at: '2026-07-12T10:00:00Z',
+        conversation_count: 5,
+      },
+      {
+        id: 'project-tools',
+        canonical_path: '/Users/alex/projects/agent-tools',
+        main_ref: 'main',
+        created_at: '2026-07-11T10:00:00Z',
+        conversation_count: 3,
+      },
     ],
     models: {
       models: [

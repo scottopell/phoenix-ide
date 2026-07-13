@@ -64,6 +64,16 @@ safety features, letting users choose their level of structure.
 
 ---
 
+### REQ-PROJ-001A: Suggest Known Projects for New Conversations
+
+WHEN the user opens the new-conversation page
+THE SYSTEM SHALL obtain project suggestions from the server's known project records
+AND rank projects with more active conversations ahead of projects with fewer active conversations
+AND use project recency to order projects with equal active-conversation counts
+AND allow the user to select a suggested project's canonical path as the conversation working directory
+
+---
+
 ### REQ-PROJ-002: Default Conversation Mode Selection
 
 WHEN a conversation is created for any directory

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
+import type { GitBranchEntry, ImageData, ModelsResponse, Project, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -10,9 +10,8 @@ import { useCreateConversationWithStore } from '../conversation';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
-const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const MAX_RECENT = 5;
+const MAX_PROJECT_SUGGESTIONS = 5;
 
 function readNewConversationDraft(): string {
   try {
@@ -136,16 +135,12 @@ function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' |
   }
 }
 
-function getRecentDirs(): string[] {
-  try {
-    return JSON.parse(localStorage.getItem(RECENT_DIRS_KEY) || '[]');
-  } catch { return []; }
-}
-
-function addRecentDir(dir: string) {
-  const recent = getRecentDirs().filter(d => d !== dir);
-  recent.unshift(dir);
-  localStorage.setItem(RECENT_DIRS_KEY, JSON.stringify(recent.slice(0, MAX_RECENT)));
+export function suggestedProjectDirs(projects: Project[]): string[] {
+  return projects
+    .toSorted((a, b) => b.conversation_count - a.conversation_count
+      || Date.parse(b.created_at) - Date.parse(a.created_at))
+    .slice(0, MAX_PROJECT_SUGGESTIONS)
+    .map((project) => project.canonical_path);
 }
 
 export function useCreateConversation(navigate: (path: string) => void) {
@@ -166,7 +161,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
+  const [projectDirs, setProjectDirs] = useState<string[]>([]);
   // Only the user's deliberate choice is stored; the active workflow is derived
   // from this plus git status via effectiveWorkflow. null = follow the default.
   const [workflowOverride, setWorkflowOverride] = useState<NewConversationWorkflow | null>(null);
@@ -221,6 +216,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCwd(env.home_dir);
       }
     }).catch(console.error);
+    api.getProjects()
+      .then((projects) => setProjectDirs(suggestedProjectDirs(projects)))
+      .catch((error) => console.warn('Failed to load project suggestions:', error));
     return () => { unsub(); };
   }, []);
 
@@ -526,8 +524,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
         submission.checkoutRef,
         clientConversationId,
       );
-      addRecentDir(trimmedCwd);
-      setRecentDirs(getRecentDirs());
       setDraft('');
       setImages([]);
       setFiles([]);
@@ -586,7 +582,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     branchSearch,
     setBranchSearch,
     branchSearchLoading,
-    recentDirs,
+    projectDirs,
     addImages,
     removeImage,
     addFiles,

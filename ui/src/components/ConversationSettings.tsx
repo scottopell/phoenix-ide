@@ -18,8 +18,8 @@ interface ConversationSettingsProps {
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
-  /** Recent project directories for quick selection */
-  recentDirs?: string[];
+  /** Server-known project directories for quick selection */
+  projectDirs?: string[];
   /** Is the selected directory a git repo? (for mode preview) */
   isGitDir?: boolean | null;
   /** Error message to display */
@@ -76,7 +76,7 @@ export function ConversationSettings({
   models,
   showAllModels,
   setShowAllModels,
-  recentDirs,
+  projectDirs,
   isGitDir,
   error,
   workflow = { kind: 'direct' },
@@ -218,9 +218,9 @@ export function ConversationSettings({
       <LlmStatusBanner models={models} />
       {error && <div className="new-conv-error">{error}</div>}
 
-      {recentDirs && recentDirs.length > 0 && (
-        <div className="new-conv-recent">
-          {recentDirs.map(dir => {
+      {projectDirs && projectDirs.length > 0 && (
+        <div className="new-conv-recent" aria-label="Suggested projects">
+          {projectDirs.map(dir => {
             const label = dir.split('/').filter(Boolean).pop() || dir;
             const isSelected = cwd.trim() === dir;
             return (

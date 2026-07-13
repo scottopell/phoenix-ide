@@ -59,6 +59,7 @@ for on-demand remote search (5-minute TTL).
 | Requirement | Status | Notes |
 |-------------|--------|-----------|
 | **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-001A:** Suggest Known Projects for New Conversations | ✅ Complete | `/new` consumes `/api/projects`, ranks by active conversation count then project recency, and offers canonical paths as quick selections |
 | **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_task tool; task 13009 — `task_file` may be any `.md` file, taskmd naming is one accepted form (`crate::task_source::TaskSource`) |
 | **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch to the chosen execution branch, promote+commit the agent's task file on it |
@@ -96,7 +97,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
 | **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
 
-**Progress:** of 33 active requirements, 27 complete, 1 partial (REQ-PROJ-012 — its
+**Progress:** of 34 active requirements, 28 complete, 1 partial (REQ-PROJ-012 — its
 Explore gateway ships but the writing-mode fork path is spec-only), and 5 (REQ-PROJ-033..037,
 task forks + fork-proposal Request Changes) specified but not yet implemented.
 REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by

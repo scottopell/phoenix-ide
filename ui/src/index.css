@@ -3689,10 +3689,14 @@ pre:hover .copy-btn {
 .directory-picker {
   display: flex;
   flex-direction: column;
+  width: 100%;
+  min-width: 0;
 }
 
 .path-input-container {
   position: relative;
+  width: 100%;
+  min-width: 0;
 }
 
 .directory-picker input {
@@ -5855,7 +5859,7 @@ html * {
   flex-direction: column;
 }
 
-/* Recent project chips */
+/* Suggested project chips */
 .new-conv-recent {
   display: flex;
   flex-wrap: wrap;
@@ -7019,6 +7023,10 @@ html * {
     padding: 16px;
     justify-content: flex-start;
     padding-top: 20px;
+  }
+
+  .new-conv-content > .settings-field {
+    width: 100%;
   }
 
   .new-conv-settings-card {

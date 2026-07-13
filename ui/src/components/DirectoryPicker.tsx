@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import { Folder, ChevronRight, ChevronLeft } from 'lucide-react';
 import { api } from '../api';
 import { Skeleton } from './Skeleton';
@@ -65,6 +65,15 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
   onStatusChangeRef.current = onStatusChange;
   const onGitStatusChangeRef = useRef(onGitStatusChange);
   onGitStatusChangeRef.current = onGitStatusChange;
+
+  const scrollPathToEnd = useCallback(() => {
+    const input = inputRef.current;
+    if (input) input.scrollLeft = input.scrollWidth;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (document.activeElement !== inputRef.current) scrollPathToEnd();
+  }, [value, scrollPathToEnd]);
 
   // Cache fetched entries by parent path to avoid redundant API calls
   const cachedParentRef = useRef<string>('');
@@ -257,11 +266,12 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
   }, []);
 
   const handleBlur = useCallback(() => {
+    scrollPathToEnd();
     blurTimeoutRef.current = setTimeout(() => {
       setShowDropdown(false);
       setSelectedIndex(-1);
     }, 150);
-  }, []);
+  }, [scrollPathToEnd]);
 
   // Cleanup on unmount
   useEffect(() => {

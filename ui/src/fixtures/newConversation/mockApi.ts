@@ -5,6 +5,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
   const original = {
     getEnv: api.getEnv,
     getProjectTaskAvailability: api.getProjectTaskAvailability,
+    getProjects: api.getProjects,
     listArchivedConversations: api.listArchivedConversations,
     listConversations: api.listConversations,
     listDirectory: api.listDirectory,
@@ -18,6 +19,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
 
   api.getEnv = async () => ({ home_dir: '/Users/alex' });
   api.getProjectTaskAvailability = async () => ({ available: true });
+  api.getProjects = async () => scenario.projects;
   api.listArchivedConversations = async () => [];
   api.listConversations = async () => [];
   api.listDirectory = async () => ({ entries: [] });
@@ -35,6 +37,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
   return () => {
     api.getEnv = original.getEnv;
     api.getProjectTaskAvailability = original.getProjectTaskAvailability;
+    api.getProjects = original.getProjects;
     api.listArchivedConversations = original.listArchivedConversations;
     api.listConversations = original.listConversations;
     api.listDirectory = original.listDirectory;

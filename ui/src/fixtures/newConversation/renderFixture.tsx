@@ -14,7 +14,6 @@ const STORAGE_KEYS = [
   'phoenix-last-cwd',
   'phoenix-last-model',
   'phoenix-new-conversation-draft',
-  'phoenix-recent-dirs',
 ] as const;
 
 function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): boolean {
@@ -24,12 +23,14 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
   const directoryReady = root.querySelector('.status-ok') !== null;
   const workflowReady = Array.from(root.querySelectorAll('.workflow-card-content strong'))
     .some((element) => element.textContent === 'Chat in a fresh worktree');
+  const projectSuggestionsReady = root.querySelectorAll('[aria-label="Suggested projects"]').length === 2;
 
   return directory?.value === scenario.cwd
     && model?.value === scenario.models.default
     && draft?.value === scenario.draft
     && directoryReady
-    && workflowReady;
+    && workflowReady
+    && projectSuggestionsReady;
 }
 
 function NewConversationFixtureBody({ scenario }: Props) {
@@ -70,7 +71,6 @@ export function NewConversationFixture({ scenario }: Props) {
     localStorage.setItem('phoenix-last-cwd', scenario.cwd);
     localStorage.setItem('phoenix-last-model', scenario.models.default);
     localStorage.setItem('phoenix-new-conversation-draft', scenario.draft);
-    localStorage.setItem('phoenix-recent-dirs', JSON.stringify(scenario.recentDirs));
     setInstalled(true);
 
     return () => {

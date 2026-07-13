@@ -16,6 +16,11 @@ describe('NewConversationFixture', () => {
     });
 
     expect(screen.getAllByDisplayValue(scenario.cwd)).toHaveLength(2);
+    const suggestions = screen.getAllByLabelText('Suggested projects');
+    expect(suggestions).toHaveLength(2);
+    expect(suggestions[0]).toHaveTextContent('phoenix-ide');
+    expect(suggestions[0]).toHaveTextContent('design-system');
+    expect(suggestions[0]).toHaveTextContent('agent-tools');
     expect(screen.getAllByDisplayValue(scenario.draft)).toHaveLength(2);
     expect(screen.getAllByText('Chat in a fresh worktree')).toHaveLength(2);
     expect(screen.getAllByRole('button', { name: 'Send' })).toHaveLength(2);

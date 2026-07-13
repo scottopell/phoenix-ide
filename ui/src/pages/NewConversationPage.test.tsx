@@ -21,6 +21,7 @@ vi.mock('../api', () => ({
   api: {
     listModels: vi.fn().mockResolvedValue({ models: [{ id: 'claude-3-5-sonnet' }], default: 'claude-3-5-sonnet' }),
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
+    getProjects: vi.fn().mockResolvedValue([]),
     validateCwd: vi.fn().mockResolvedValue({ valid: true }),
     listDirectory: vi.fn().mockResolvedValue({ entries: [] }),
     listConversations: vi.fn().mockResolvedValue([]),
