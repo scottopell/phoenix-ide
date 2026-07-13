@@ -511,7 +511,7 @@ function addConversationSource(
     unitKind,
     unitIndex,
     role,
-    fragmentId,
+    ...(fragmentId ? { fragmentId } : {}),
     text,
     target: {
       kind: 'unit-text',
@@ -519,7 +519,7 @@ function addConversationSource(
       unitKind,
       unitIndex,
       sourceId: `${unitKey}:${role}:${out.length}`,
-      fragmentId,
+      ...(fragmentId ? { fragmentId } : {}),
       start: 0,
       end: 0,
     },

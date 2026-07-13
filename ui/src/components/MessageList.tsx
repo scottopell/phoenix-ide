@@ -230,9 +230,9 @@ function renderHistoricalUnit(
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
           unitKey={unit.key}
-          revealRequest={revealRequest}
-          activeHighlight={activeHighlight}
-          onRevealHandled={onRevealHandled}
+          {...(revealRequest ? { revealRequest } : {})}
+          {...(activeHighlight ? { activeHighlight } : {})}
+          {...(onRevealHandled ? { onRevealHandled } : {})}
         />
       );
     case 'system': {

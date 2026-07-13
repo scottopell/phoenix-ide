@@ -717,31 +717,6 @@ function QueuedUserMessageImpl({
 // Compact-density helpers
 // ============================================================================
 
-const COMPACT_TEXT_PREVIEW_LIMIT = 140;
-
-/** First non-empty line of a text block, collapsed to single-line whitespace
- *  and ellipsized — the faded one-liner shown for compact prose that hides
- *  content. */
-function firstLineSummary(text: string, maxLen = COMPACT_TEXT_PREVIEW_LIMIT): string {
-  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
-  const flat = firstLine.replace(/\s+/g, ' ').trim();
-  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
-}
-
-function shouldCollapseCompactText(text: string): boolean {
-  if (containsMermaidFence(text)) return false;
-  if (isSignificantText(text)) return false;
-
-  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
-  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
-  const fullFlat = text.replace(/\s+/g, ' ').trim();
-
-  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
-  const truncatesFirstLine = firstLineFlat.length > COMPACT_TEXT_PREVIEW_LIMIT;
-
-  return hidesAdditionalLines || truncatesFirstLine;
-}
-
 function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
   if (start < 0 || end <= start || start >= text.length) return text;
   return (
@@ -896,7 +871,10 @@ interface AgentMessageProps {
 export const AgentMessage = memo(AgentMessageImpl);
 
 function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
-  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  const blocks = useMemo(
+    () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
+    [message.content],
+  );
   const timestamp = message.created_at;
   const { theme } = useTheme();
   const { density } = useDensity();
