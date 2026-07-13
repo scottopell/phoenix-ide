@@ -8,8 +8,9 @@ import {
   SearchResultsView,
   KeywordSearchView,
   __readFileResultTestables,
+  ReadFileResultView,
 } from './MessageComponents';
-import { buildKeywordSearchOutputProjection } from './viewer-find';
+import { buildKeywordSearchOutputProjection, buildReadFileOutputProjection } from './viewer-find';
 import { buildSearchOutputProjection } from './viewer-find/searchProjections';
 
 describe('parseSearchOutput', () => {
@@ -217,6 +218,76 @@ describe('BrowserConsoleLogsView', () => {
     const { container } = render(<BrowserConsoleLogsView rawText="not json at all" />);
     const pre = container.querySelector('pre.console-logs-fallback');
     expect(pre?.textContent).toBe('not json at all');
+  });
+});
+
+describe('buildReadFileOutputProjection parity', () => {
+  it('builds typed path and line fragments from the canonical renderer text', () => {
+    const text = [
+      '     7\tconst alpha = 1;',
+      '     8\tsecond alpha line',
+    ].join('\n');
+    const built = buildReadFileOutputProjection(text, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
+    expect(built.fullText).toBe('src/foo.ts:7-8\n7\tconst alpha = 1;\n8\tsecond alpha line');
+    expect(built.fragments.map((fragment) => fragment.fragmentId)).toEqual([
+      'read-file-path',
+      'read-file-line:7:0',
+      'read-file-line:8:1',
+    ]);
+    expect(built.fragments[1]?.revealTarget).toMatchObject({
+      kind: 'tool-result-read-file',
+      toolUseId: 'read-1',
+      lineNumber: 7,
+      startLineNumber: 7,
+      endLineNumber: 7,
+    });
+  });
+});
+
+describe('ReadFileResultView', () => {
+  const readText = [
+    '     7\tconst alpha = 1;',
+    '     8\tsecond alpha line',
+  ].join('\n');
+
+  it('renders the input path/window and numbered lines via the shared builder', () => {
+    render(
+      <ReadFileResultView
+        rawText={readText}
+        input={{ path: 'src/foo.ts', offset: 7, limit: 2 }}
+        onOpenFile={undefined}
+        toolUseId="read-1"
+      />,
+    );
+    expect(screen.getByText('src/foo.ts:7-8')).toBeInTheDocument();
+    expect(screen.getByText('7')).toBeInTheDocument();
+    expect(screen.getByText('const alpha = 1;')).toBeInTheDocument();
+    expect(screen.getByText('8')).toBeInTheDocument();
+    expect(screen.getByText('second alpha line')).toBeInTheDocument();
+  });
+
+  it('highlights the exact active occurrence without duplicating content', () => {
+    const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
+    const targetFragment = projection.fragments.find((fragment) => fragment.kind === 'line' && fragment.display.lineNumber === 8);
+    expect(targetFragment).toBeTruthy();
+    const start = targetFragment!.semanticText.indexOf('alpha');
+    const { container } = render(
+      <ReadFileResultView
+        rawText={readText}
+        input={{ path: 'src/foo.ts', offset: 7, limit: 2 }}
+        onOpenFile={undefined}
+        toolUseId="read-1"
+        activeHighlight={{
+          fragmentId: targetFragment!.fragmentId,
+          start,
+          end: start + 'alpha'.length,
+        }}
+      />,
+    );
+    const activeMark = container.querySelector('.viewer-find-inline-match--active');
+    expect(activeMark?.textContent).toBe('alpha');
+    expect(container.querySelectorAll('[data-fragment-id="read-file-line:8:1"]')).toHaveLength(1);
+    expect(container.querySelector('.search-result-line[data-fragment-id="read-file-line:8:1"]')?.textContent).toBe('8second alpha line');
   });
 });
 

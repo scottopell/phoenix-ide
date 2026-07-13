@@ -39,7 +39,13 @@ function PushScopeOnMount({ scopeId, children }: { scopeId: string; children: Re
 // identity regression test (task 58044) asserts state ticks don't bump it.
 const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
 const agentMessageProps = vi.hoisted(
-  () => [] as Array<{ message: Message; forceExpandedText: boolean | undefined; isLatestAgentMessage: boolean | undefined }>,
+  () => [] as Array<{
+    message: Message;
+    forceExpandedText: boolean | undefined;
+    isLatestAgentMessage: boolean | undefined;
+    revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } } | null;
+    activeHighlight?: { fragmentId: string; start: number; end: number } | null;
+  }>,
 );
 
 vi.mock('./MessageComponents', async () => {
@@ -51,9 +57,9 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search'; key: string } } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search'; key: string } }) => void) | undefined }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search' | 'tool-result-search' | 'tool-result-read-file'; key?: string; toolUseId?: string; lineNumber?: number; startLineNumber?: number; endLineNumber?: number } }) => void) | undefined }) => {
       agentRenderCounter.count++;
-      agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
+      agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight });
       if (revealRequest && onRevealHandled) onRevealHandled(revealRequest);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
@@ -3015,6 +3021,52 @@ describe('handleTotalListHeightChanged', () => {
 
 
 
+
+it('find navigation carries read_file fragment reveal target for offscreen navigation', async () => {
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-read-file',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-read-1',
+        name: 'read_file',
+        display: 'read src/foo.ts',
+        input: { path: 'src/foo.ts', offset: 7, limit: 2 },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-read-1', result: '     7\tconst alpha = 1;\n     8\tsecond alpha line' },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-read-file"
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'second alpha' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+  await waitFor(() => {
+    const call = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
+  expect(renderedAgent?.message.message_id).toBe('agent-read-file');
+  expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-read-1', lineNumber: 8 });
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('read-file-line:8:1');
+  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+});
 
 it('find navigation carries keyword_search fragment reveal target for offscreen navigation', async () => {
   const messages: Message[] = [

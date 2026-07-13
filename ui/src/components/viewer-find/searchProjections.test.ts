@@ -339,6 +339,28 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.matches[0]?.target.sourceId).toContain('agent-text-0');
   });
 
+  it('includes full read_file logical content in compact mode while keeping stable typed fragments', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'a1',
+      isFirstInTurn: true,
+      agent: agentMsg('a1', [
+        { type: 'tool_use', id: 'tool-read', name: 'read_file', display: 'read alpha', input: { path: 'src/foo.ts', offset: 7, limit: 2 } },
+      ]),
+      toolResultsByUseId: new Map([['tool-read', toolMsg('t1', 'tool-read', { result: '     7\tconst alpha = 1;\n     8\tsecond alpha line' })]]),
+    }];
+
+    const compactProjection = buildConversationSearchProjection(units, 'alpha', { density: 'compact' });
+    expect(compactProjection.matches).toHaveLength(5);
+    expect(compactProjection.sources.some((source) => source.text === 'src/foo.ts:7-8\n7\tconst alpha = 1;\n8\tsecond alpha line')).toBe(true);
+    const lineMatch = compactProjection.matches.find((match) => match.target.kind === 'unit-text' && match.target.fragmentId === 'read-file-line:8:1');
+    expect(lineMatch).toBeTruthy();
+    expect(compactProjection.sources.find((source) => source.fragmentId === 'read-file-path')?.revealTarget).toMatchObject({
+      kind: 'tool-result-read-file',
+      toolUseId: 'tool-read',
+    });
+  });
+
   it('includes expanded system prompt text in transcript projection', () => {
     const projection = buildConversationSearchProjection([], 'alpha directive', {
       systemPrompt: 'alpha directive\nsecondary line',

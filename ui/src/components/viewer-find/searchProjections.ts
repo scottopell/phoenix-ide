@@ -86,6 +86,40 @@ export interface SearchResultRevealTarget {
   lineNumber?: number;
 }
 
+export interface ReadFileLineFragmentDisplay {
+  lineNumber: number;
+  content: string;
+}
+
+export interface ReadFilePathFragmentDisplay {
+  path: string;
+  windowLabel?: string;
+}
+
+export interface ReadFileRevealTarget {
+  kind: 'tool-result-read-file';
+  toolUseId: string;
+  fragmentId: string;
+  lineNumber?: number;
+  startLineNumber?: number;
+  endLineNumber?: number;
+}
+
+export type ReadFileFragmentDisplay = ReadFileLineFragmentDisplay | ReadFilePathFragmentDisplay;
+
+export interface ReadFileFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: ReadFileFragmentDisplay;
+  revealTarget: ReadFileRevealTarget;
+  kind: 'path' | 'line';
+}
+
+export interface ReadFileOutputProjection {
+  fragments: ReadonlyArray<ReadFileFragment>;
+  fullText: string;
+}
+
 export interface KeywordSearchRevealTarget {
   kind: 'tool-result-keyword-search';
   key: string;
@@ -99,7 +133,8 @@ export interface ConversationTextFragmentRevealTarget {
 export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
   | SearchResultRevealTarget
-  | KeywordSearchRevealTarget;
+  | KeywordSearchRevealTarget
+  | ReadFileRevealTarget;
 
 export interface ConversationTextFragment {
   fragmentId: string;
@@ -692,6 +727,88 @@ function searchToolResultKey(blockId: string): string {
   return `search:${blockId}`;
 }
 
+function readFileToolResultKey(blockId: string): string {
+  return `read-file:${blockId}`;
+}
+
+function readFileWindowLabel(input: Record<string, unknown>): string | null {
+  const offset = typeof input['offset'] === 'number' ? input['offset'] : undefined;
+  const limit = typeof input['limit'] === 'number' ? input['limit'] : undefined;
+  if (offset === undefined && limit === undefined) return null;
+  const start = offset ?? 1;
+  if (limit === undefined) return `${start}+`;
+  const end = start + Math.max(limit, 0) - 1;
+  return `${start}-${end}`;
+}
+
+function parseReadFileRenderedLine(line: string): { lineNumber: number; content: string } | null {
+  const match = /^(\s*)(\d+)\t(.*)$/.exec(line);
+  if (!match?.[2]) return null;
+  return {
+    lineNumber: Number.parseInt(match[2], 10),
+    content: match[3] ?? '',
+  };
+}
+
+function buildReadFileProjectionFragments(
+  text: string,
+  input: Record<string, unknown>,
+  options: { toolUseId?: string | null } = {},
+): ReadFileFragment[] {
+  const path = typeof input['path'] === 'string' ? input['path'] : '';
+  const revealBase = {
+    kind: 'tool-result-read-file' as const,
+    toolUseId: options.toolUseId ?? '',
+  };
+  const fragments: ReadFileFragment[] = [];
+  const windowLabel = readFileWindowLabel(input);
+  if (path.length > 0) {
+    const pathText = windowLabel ? `${path}:${windowLabel}` : path;
+    fragments.push({
+      fragmentId: 'read-file-path',
+      semanticText: pathText,
+      display: { path, ...(windowLabel ? { windowLabel } : {}) },
+      revealTarget: {
+        ...revealBase,
+        fragmentId: 'read-file-path',
+      },
+      kind: 'path',
+    });
+  }
+
+  let canonicalLineOrdinal = 0;
+  for (const rawLine of text.split('\n')) {
+    const renderedLine = parseReadFileRenderedLine(rawLine);
+    if (!renderedLine) continue;
+    const fragmentId = `read-file-line:${renderedLine.lineNumber}:${canonicalLineOrdinal}`;
+    fragments.push({
+      fragmentId,
+      semanticText: `${renderedLine.lineNumber}\t${renderedLine.content}`,
+      display: renderedLine,
+      revealTarget: {
+        ...revealBase,
+        fragmentId,
+        lineNumber: renderedLine.lineNumber,
+        startLineNumber: renderedLine.lineNumber,
+        endLineNumber: renderedLine.lineNumber,
+      },
+      kind: 'line',
+    });
+    canonicalLineOrdinal += 1;
+  }
+  return fragments;
+}
+
+export function buildReadFileOutputProjection(
+  text: string,
+  input: Record<string, unknown>,
+  options: { toolUseId?: string | null } = {},
+): ReadFileOutputProjection {
+  const fragments = buildReadFileProjectionFragments(text, input, options);
+  const fullText = fragments.map((fragment) => fragment.semanticText).join('\n');
+  return { fragments, fullText };
+}
+
 export function buildSearchOutputProjection(
   text: string,
   options: { toolUseId?: string | null } = {},
@@ -926,6 +1043,14 @@ function agentTurnSources(
         const searchProjection = buildSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {});
         for (const fragment of searchProjection.fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+      } else if (block.name === 'read_file') {
+        const readFileProjection = buildReadFileOutputProjection(resultText, block.input ?? {}, block.id ? { toolUseId: block.id } : {});
+        for (const fragment of readFileProjection.fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+        if (density === 'compact' || detailsVisible) {
+          out.push({ role: `tool-use-result-${index}:full-text`, text: readFileProjection.fullText });
         }
       } else if (detailsVisible) {
         out.push({ role: `tool-use-result-${index}`, text: resultText });

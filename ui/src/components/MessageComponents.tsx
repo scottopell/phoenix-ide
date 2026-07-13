@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -1874,6 +1874,84 @@ export function parseSearchOutput(text: string) {
   return buildSearchOutputProjection(text);
 }
 
+export function ReadFileResultView({
+  rawText,
+  input,
+  onOpenFile,
+  toolUseId,
+  activeHighlight = null,
+}: {
+  rawText: string;
+  input: Record<string, unknown>;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
+}) {
+  const parsed = useMemo(
+    () => buildReadFileOutputProjection(rawText, input, toolUseId ? { toolUseId } : {}),
+    [rawText, input, toolUseId],
+  );
+  const pathFragment = parsed.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const lineFragments = parsed.fragments.filter((fragment) => fragment.kind === 'line');
+  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
+
+  return (
+    <div className="read-file-results">
+      {pathFragment && (
+        onOpenFile ? (
+          <button
+            type="button"
+            className="search-results-filepath"
+            data-fragment-id={pathFragment.fragmentId}
+            onClick={() => onOpenFile(pathFragment.display.path, new Set(), 0)}
+            title="Open file"
+          >
+            {pathHighlight ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end) : pathFragment.semanticText}
+          </button>
+        ) : (
+          <div className="search-results-filepath search-results-filepath-static" data-fragment-id={pathFragment.fragmentId}>
+            {pathHighlight ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end) : pathFragment.semanticText}
+          </div>
+        )
+      )}
+      <div className="search-results-hits">
+        {lineFragments.map((fragment) => {
+          const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+          const lineNumber = fragment.display.lineNumber;
+          const lineContent = fragment.display.content || ' ';
+          const lineNumberText = String(lineNumber);
+          const contentStart = lineNumberText.length + 1;
+          const body = (
+            <>
+              <span className="search-result-lineno">
+                {keywordFieldHighlight(highlight, 0, lineNumberText)}
+              </span>
+              <span className="search-result-content">
+                {keywordFieldHighlight(highlight, contentStart, lineContent)}
+              </span>
+            </>
+          );
+          return onOpenFile && pathFragment ? (
+            <button
+              key={fragment.fragmentId}
+              type="button"
+              className="search-result-line search-result-line-clickable"
+              data-fragment-id={fragment.fragmentId}
+              onClick={() => onOpenFile(pathFragment.display.path, new Set([lineNumber]), lineNumber)}
+            >
+              {body}
+            </button>
+          ) : (
+            <div key={fragment.fragmentId} className="search-result-line" data-fragment-id={fragment.fragmentId}>
+              {body}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function SearchResultsView({
   rawText,
   onOpenFile,
@@ -2171,18 +2249,28 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     [name, resultText, toolId],
   );
   const toolRevealKey = (name === 'keyword_search' ? keywordSearchProjection?.fragments[0]?.revealTarget.key : searchProjection?.fragments[0]?.revealTarget.key) ?? null;
+  const readFileProjection = useMemo(
+    () => (name === 'read_file' ? buildReadFileOutputProjection(resultText, input as Record<string, unknown>, { toolUseId: toolId }) : null),
+    [input, name, resultText, toolId],
+  );
   const toolActiveHighlight = activeHighlight?.fragmentId
     && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
-      || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
+      || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
     ? activeHighlight
     : null;
 
   useEffect(() => {
     if (!revealRequest) return;
+    if (revealRequest.revealTarget.kind === 'tool-result-read-file') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      onRevealHandled?.(revealRequest);
+      return;
+    }
     if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search' && revealRequest.revealTarget.kind !== 'tool-result-search') return;
     if (revealRequest.revealTarget.key !== toolRevealKey) return;
     onRevealHandled?.(revealRequest);
-  }, [onRevealHandled, revealRequest, toolRevealKey]);
+  }, [onRevealHandled, revealRequest, toolId, toolRevealKey]);
   
   // Check if this is an image result.
   // 1. Typed `images` channel (read_image — single source of truth, no
@@ -2341,6 +2429,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
             <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : name === 'keyword_search' && !isError ? (
             <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
+          ) : name === 'read_file' && !isError ? (
+            <ReadFileResultView rawText={resultText} input={input as Record<string, unknown>} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
