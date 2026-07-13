@@ -1251,6 +1251,30 @@ describe('skill command rendering', () => {
     expect(onOpenFile).toHaveBeenCalledWith('/Users/test/.claude/skills/agent-browser/SKILL.md', new Set(), 0);
     expect(screen.getByText('Browser Automation with agent-browser')).toHaveClass('skill-tool-snippet');
   });
+
+  it('marks active skill result text through the skill renderer', () => {
+    const resultText = 'Base directory for this skill: /tmp/skill\n# Unique skill token';
+    const fragmentId = 'terminal-result:opaque';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-skill-find', [{
+            type: 'tool_use', id: 'tool-skill-find', name: 'skill', input: { skill_name: 'demo' },
+          }])}
+          toolResults={new Map([['tool-skill-find', toolMessage('tool-skill-find', resultText)]])}
+          onOpenFile={undefined}
+          activeHighlight={{
+            owner: 'tool-result',
+            toolUseId: 'tool-skill-find',
+            fragmentId,
+            start: resultText.indexOf('Unique'),
+            end: resultText.indexOf('Unique') + 'Unique'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('Unique');
+  });
 });
 
 describe('agent message file paths', () => {
@@ -2231,6 +2255,25 @@ describe('compact tool summaries', () => {
 
     expect(container.querySelector('[data-tool-id="read-a"] .viewer-find-inline-match--active')).toBeNull();
     expect(container.querySelector('[data-tool-id="read-b"] .viewer-find-inline-match--active')?.textContent).toBe('same');
+  });
+
+  it('does not parse the read_file truncation notice as a source line', () => {
+    mockDensity = 'full';
+    const longLine = `     1\t${'x'.repeat(5100)}`;
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-long-read', [
+            { type: 'tool_use', id: 'long-read', name: 'read_file', input: { path: 'long.ts', offset: 1, limit: 1 } },
+          ])}
+          toolResults={new Map([['long-read', toolMessage('long-read', longLine)]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelectorAll('.tool-output-truncation')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-fragment-id^="read-file-line:"]')).toHaveLength(1);
+    expect(container.querySelector('[data-fragment-id^="read-file-line:"]')?.textContent).not.toContain('more chars');
   });
 });
 

@@ -334,6 +334,18 @@ describe('TaskApprovalReader shared find integration', () => {
     });
   });
 
+  it('marks indexed level-four headings and bare fenced code', async () => {
+    renderTaskApprovalReader('#### Deep heading token\n\n```\nbareFenceToken\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+
+    fireEvent.change(input, { target: { value: 'heading token' } });
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.closest('h4')).not.toBeNull());
+
+    fireEvent.change(input, { target: { value: 'bareFenceToken' } });
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.closest('pre')).not.toBeNull());
+  });
+
   it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {
     renderTaskApprovalReader('# Plan\n\nfoo  bar');
 

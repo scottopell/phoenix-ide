@@ -571,18 +571,19 @@ export function TaskApprovalReader({
             h1: annotatable('h1', 'heading'),
             h2: annotatable('h2', 'heading'),
             h3: annotatable('h3', 'heading'),
+            h4: annotatable('h4', 'heading'),
+            h5: annotatable('h5', 'heading'),
+            h6: annotatable('h6', 'heading'),
             td: annotatable('td', 'tableCell'),
             th: annotatable('th', 'tableCell'),
             li: annotatable('li'),
             blockquote: annotatable('blockquote'),
             code: ({
-              inline,
               className,
               children,
               node,
               ...props
             }: {
-              inline?: boolean;
               className?: string;
               children?: React.ReactNode;
               node?: {
@@ -596,37 +597,46 @@ export function TaskApprovalReader({
               const language = match?.[1]?.toLowerCase();
               const codeText = String(children).replace(/\n$/, '');
               const lineNumber = node?.position?.start?.line ?? 0;
-              const codeBlockId = claimDisplayBlock(lineNumber, node?.position?.start?.offset, 'code');
+              const startOffset = node?.position?.start?.offset;
+              const codeBlock = startOffset === undefined
+                ? undefined
+                : markdownDisplayBlocks.find((block) =>
+                    block.kind === 'code'
+                    && block.sourceRange.start <= startOffset
+                    && startOffset < block.sourceRange.end);
+              const codeBlockId = codeBlock?.id ?? `markdown:inline-code:${startOffset ?? lineNumber}`;
               const codeMatches = matchesByBlockId.get(codeBlockId) ?? [];
-              if (!inline && language === 'mermaid') {
+              const isBlockCode = codeBlock !== undefined;
+              if (isBlockCode && language === 'mermaid') {
                 return (
                   <div ref={(element) => registerBlockRef(codeBlockId, element)}>
                     <MermaidDiagram code={String(children)} />
                   </div>
                 );
               }
-              return !inline && match ? (
-                <div ref={(element) => registerBlockRef(codeBlockId, element)}>
-                  {codeMatches.length > 0 ? (
-                    <pre className={`language-${match[1]}`}>
-                      <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
-                    </pre>
-                  ) : (
-                    <SyntaxHighlighter
-                      style={oneDark}
-                      language={match[1]}
-                      PreTag="div"
-                      {...props}
-                    >
-                      {codeText}
-                    </SyntaxHighlighter>
-                  )}
-                </div>
-              ) : (
-                <code className={className} {...props}>
-                  {children}
-                </code>
-              );
+              if (isBlockCode) {
+                return (
+                  <div ref={(element) => registerBlockRef(codeBlockId, element)}>
+                    {codeMatches.length > 0 ? (
+                      <pre className={match ? `language-${match[1]}` : undefined}>
+                        <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
+                      </pre>
+                    ) : match ? (
+                      <SyntaxHighlighter
+                        style={oneDark}
+                        language={match[1]}
+                        PreTag="div"
+                        {...props}
+                      >
+                        {codeText}
+                      </SyntaxHighlighter>
+                    ) : (
+                      <pre><code {...props}>{codeText}</code></pre>
+                    )}
+                  </div>
+                );
+              }
+              return <code className={className} {...props}>{children}</code>;
             },
           } as unknown as Components
         }

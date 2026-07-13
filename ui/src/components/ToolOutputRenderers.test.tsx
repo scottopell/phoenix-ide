@@ -375,6 +375,18 @@ describe('SearchResultsView', () => {
     render(<SearchResultsView rawText="No matches found." onOpenFile={undefined} toolUseId="search-1" />);
     expect(screen.getByText('No matches found.')).toBeTruthy();
   });
+  it('marks the active occurrence in the no-matches state', () => {
+    const { container } = render(
+      <SearchResultsView
+        rawText="No matches found."
+        onOpenFile={undefined}
+        toolUseId="search-1"
+        activeHighlight={{ fragmentId: 'search-empty', start: 3, end: 10 }}
+      />,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('matches');
+  });
+
 
   it('omits the clickable affordance when onOpenFile is undefined', () => {
     const { container } = render(<SearchResultsView rawText={text} onOpenFile={undefined} toolUseId="search-1" />);
@@ -477,6 +489,18 @@ describe('KeywordSearchView', () => {
     render(<KeywordSearchView rawText="No relevant files found" onOpenFile={undefined} />);
     expect(screen.getByText('No relevant files found.')).toBeTruthy();
   });
+  it('marks the active occurrence in the empty results state', () => {
+    const { container } = render(
+      <KeywordSearchView
+        rawText="No relevant files found"
+        onOpenFile={undefined}
+        toolUseId="keyword-1"
+        activeHighlight={{ fragmentId: 'keyword-search-empty', start: 3, end: 11 }}
+      />,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('relevant');
+  });
+
 });
 
 

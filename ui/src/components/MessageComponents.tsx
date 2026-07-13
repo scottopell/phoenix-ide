@@ -428,6 +428,7 @@ function SkillToolBlock({
   inflightElapsedSeconds,
   onOpenFile,
   toolId,
+  activeHighlight,
 }: {
   input: Record<string, unknown>;
   resultText: string;
@@ -438,11 +439,23 @@ function SkillToolBlock({
   inflightElapsedSeconds: number;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   toolId: string;
+  activeHighlight?: AgentTextHighlight | null;
 }) {
+
   const details = extractSkillResultDetails(resultText);
   const sourcePath = details.source ? `${details.source}/SKILL.md` : undefined;
   const status = result == null ? 'loading' : isError ? 'failed' : 'loaded';
   const statusClass = result == null ? 'pending' : isError ? 'error' : 'success';
+
+  if (activeHighlight) {
+    return (
+      <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+        <pre className="tool-block-output-content" data-fragment-id={activeHighlight.fragmentId}>
+          {renderHighlightedText(resultText, activeHighlight.start, activeHighlight.end)}
+        </pre>
+      </div>
+    );
+  }
 
   return (
     <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
@@ -2039,7 +2052,11 @@ export function SearchResultsView({
   if (parsed.noMatches) {
     return (
       <div className="search-results">
-        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>No matches found.</div>
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>
+          {activeHighlight?.fragmentId === parsed.fragments[0]?.fragmentId && parsed.fragments[0]
+            ? renderHighlightedText(parsed.fragments[0].semanticText, activeHighlight!.start, activeHighlight!.end)
+            : 'No matches found.'}
+        </div>
       </div>
     );
   }
@@ -2190,7 +2207,11 @@ export function KeywordSearchView({
   if (parsed.empty) {
     return (
       <div className="keyword-search-results">
-        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>No relevant files found.</div>
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>
+          {activeHighlight?.fragmentId === parsed.fragments[0]?.fragmentId && parsed.fragments[0]
+            ? renderHighlightedText(parsed.fragments[0].semanticText, activeHighlight!.start, activeHighlight!.end)
+            : 'No relevant files found.'}
+        </div>
       </div>
     );
   }
@@ -2451,6 +2472,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
       : resultText;
   }, [resultText]);
 
+  const cappedResultText = useMemo(() => resultText.slice(0, 5000), [resultText]);
+
   // Preview for collapsed state: show first 3 lines faded. Split once, derive both.
   const lines = useMemo(() => resultText.split('\n'), [resultText]);
   const previewLines = lines.slice(0, 3);
@@ -2485,6 +2508,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
         inflightElapsedSeconds={inflightElapsedSeconds}
         onOpenFile={onOpenFile}
         toolId={toolId}
+        activeHighlight={toolActiveHighlight}
       />
     );
   }
@@ -2561,7 +2585,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'read_file' && !isError ? (
             <>
               <ReadFileResultView
-                rawText={toolActiveHighlight ? resultText : displayResult}
+                rawText={toolActiveHighlight ? resultText : cappedResultText}
                 input={input as Record<string, unknown>}
                 onOpenFile={onOpenFile}
                 toolUseId={toolId}
