@@ -1113,7 +1113,10 @@ mod pr_context_repo_slug_tests {
 
     #[test]
     fn slugifies_repository_identity_for_filenames() {
-        assert_eq!(pr_context_repo_slug("Scott.Opell", "phoenix_ide"), "scott-opell--phoenix-ide");
+        assert_eq!(
+            pr_context_repo_slug("Scott.Opell", "phoenix_ide"),
+            "scott-opell--phoenix-ide"
+        );
         assert_eq!(pr_context_repo_slug("", "Repo"), "repo");
         assert_eq!(pr_context_repo_slug("", ""), "unknown-repo");
     }
