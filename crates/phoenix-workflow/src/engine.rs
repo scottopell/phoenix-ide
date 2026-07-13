@@ -267,6 +267,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 if let Some(lock) = &mut claim.resource_lock {
                     lock.lease_until = new_lease_until;
                 }
+                if let Some(attempt) = effect
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| same_claim_identity(&attempt.authority, authority))
+                {
+                    attempt.authority = claim.clone();
+                }
                 RenewalResult {
                     outcome: AuthorityOutcome::Authorized,
                     authority: Some(claim.clone()),
@@ -500,7 +507,19 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             event_codec: receipt_event_codec,
             requires_runtime_acceptance: P::receipt_requires_runtime_acceptance(&receipt_event),
             payload: ReducerInboxPayload::Receipt(receipt_event),
-            delivery_status: DeliveryStatus::Pending,
+            delivery_status: if matches!(
+                self.status,
+                WorkflowStatus::Cancelled
+                    | WorkflowStatus::DeletionPending
+                    | WorkflowStatus::Completed
+                    | WorkflowStatus::Failed
+            ) {
+                DeliveryStatus::Suppressed {
+                    reason: SuppressionReason::LifecycleTerminal,
+                }
+            } else {
+                DeliveryStatus::Pending
+            },
             consumed_by: None,
         };
         self.reducer_inbox.insert(inbox_id, reducer_event);
@@ -559,9 +578,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     ) -> ReconciliationOutcome<P> {
         if self.ensure_executable().is_err()
             || permitted_choices.is_empty()
-            || permitted_choices
-                .iter()
-                .any(|choice| choice.codec.family.is_empty())
+            || permitted_choices.iter().any(|choice| {
+                choice.codec.family.is_empty()
+                    || choice.receipt_codec.family.is_empty()
+                    || choice.receipt_event_codec.family.is_empty()
+            })
         {
             return stale_reconciliation_outcome();
         }
@@ -640,7 +661,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         let mut replacement = self.clone();
         let receipt_record = replacement.apply_manual_resolution(
             resolution_id,
-            expected_workflow_version,
             resolved_by,
             &existing,
             choice,
@@ -696,6 +716,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             .iter()
             .map(|inbox| inbox.id)
             .collect::<Vec<_>>();
+        if inbox_ids.iter().copied().collect::<BTreeSet<_>>().len() != inbox_ids.len() {
+            return Err(EngineError::InvalidInbox);
+        }
         let mut replacement = self.clone();
         for linked_inbox in &binding.inbox {
             let Some(inbox) = replacement.reducer_inbox.get(&linked_inbox.id) else {
@@ -707,7 +730,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 });
             };
             if !same_inbox_event(inbox, linked_inbox)
-                || inbox.delivery_status == DeliveryStatus::Consumed
+                || inbox.delivery_status != DeliveryStatus::Pending
                 || !P::decision_handles_inbox(&inbox.payload, &decision.plan.event)
             {
                 return Ok(AtomicInboxConsumeResult {
@@ -1126,7 +1149,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         consumed_inbox_ids: &[ReducerInboxId],
     ) -> Result<(), EngineError> {
         if !self.binding.accepted_protocol().runtime_acceptance_enabled {
-            if plan.owed_acceptances.is_some() {
+            if plan.owed_acceptances.is_some()
+                || consumed_inbox_ids.iter().any(|inbox_id| {
+                    self.reducer_inbox
+                        .get(inbox_id)
+                        .is_some_and(|event| event.requires_runtime_acceptance)
+                })
+            {
                 return Err(EngineError::InvalidInbox);
             }
             return Ok(());
@@ -1199,7 +1228,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     fn apply_manual_resolution(
         &mut self,
         resolution_id: ManualResolutionId,
-        expected_workflow_version: Version,
         resolved_by: &'static str,
         existing: &ManualResolutionRecord<P>,
         choice: &ManualChoice<P>,
@@ -1230,7 +1258,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             id: ReceiptId(self.next_receipt_id),
             authority: manual_receipt_authority(
                 self.binding.workflow_id(),
-                expected_workflow_version,
+                self.effects[&existing.effect_id].declared_workflow_version,
                 self.generation,
                 existing.effect_id,
             ),
@@ -1653,6 +1681,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             && claim.effect_id == authority.effect_id
             && claim.claim_token == authority.claim_token
             && claim.worker_id == authority.worker_id
+            && claim.lease_until == authority.lease_until
             && claim.resource_lock == authority.resource_lock
             && effect.destructive_lock == authority.resource_lock
             && authority.generation == self.generation
@@ -1666,27 +1695,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
 }
 
 fn same_claim_identity(left: &ClaimAuthority, right: &ClaimAuthority) -> bool {
-    left.workflow_id == right.workflow_id
-        && left.declared_workflow_version == right.declared_workflow_version
-        && left.generation == right.generation
-        && left.effect_id == right.effect_id
-        && left.claim_token == right.claim_token
-        && left.worker_id == right.worker_id
-        && left.resource_lock.as_ref().map(|lock| {
-            (
-                lock.resource,
-                lock.worker_id,
-                lock.claim_token,
-                lock.generation,
-            )
-        }) == right.resource_lock.as_ref().map(|lock| {
-            (
-                lock.resource,
-                lock.worker_id,
-                lock.claim_token,
-                lock.generation,
-            )
-        })
+    left == right
 }
 
 fn same_inbox_payload<P: WorkflowProfile>(

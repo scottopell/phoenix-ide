@@ -230,6 +230,7 @@ pub struct WakeRegistrationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeRegistrationEvent {
     Registered,
+    TerminalProjected { terminal: Box<WakeTerminalPayload> },
     CancelRequested,
     Continued,
     RuntimeAccepted { terminal: Box<WakeTerminalPayload> },
@@ -354,13 +355,12 @@ impl WorkflowProfile for WakeProfile {
             ReducerInboxPayload::Receipt(WakeTerminalPayload::Cancelled { .. }) => {
                 *decision_event == WakeRegistrationEvent::CancelRequested
             }
-            ReducerInboxPayload::Receipt(_) => {
-                matches!(
-                    decision_event,
-                    WakeRegistrationEvent::Registered
-                        | WakeRegistrationEvent::RuntimeAccepted { .. }
-                )
-            }
+            ReducerInboxPayload::Receipt(terminal) => matches!(
+                decision_event,
+                WakeRegistrationEvent::TerminalProjected {
+                    terminal: projected,
+                } if projected.as_ref() == terminal
+            ),
             ReducerInboxPayload::Barrier(_) => *decision_event == WakeRegistrationEvent::Registered,
         }
     }
@@ -829,7 +829,7 @@ pub fn manual_choices(terminal: &WakeTerminalPayload) -> Vec<ManualChoice<WakePr
             receipt_event: terminal.clone(),
         },
         ManualChoice {
-            kind: ManualChoiceKind::Adopt,
+            kind: ManualChoiceKind::Suppress,
             codec: manual_codec(),
             payload: WakeManualPayload::Suppress,
             receipt_codec: terminal_codec(),
