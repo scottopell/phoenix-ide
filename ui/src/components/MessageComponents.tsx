@@ -2327,11 +2327,14 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
   // status / running state / label rather than show the raw JSON.
   const bashResponse = useMemo(() => (name === 'bash' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
   const tmuxResponse = useMemo(() => (name === 'tmux' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
+  const profileAction = name === 'browser_profile' && typeof input['action'] === 'string' ? input['action'] : null;
   const terminalResultFamily: TerminalToolResultFamily = name === 'bash' || name === 'tmux'
     ? name
-    : name === 'browser_profile'
-      ? 'browser-profile'
-      : 'opaque';
+    : name === 'browser_recent_console_logs'
+      ? 'console-logs'
+      : profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
+        ? 'browser-profile'
+        : 'opaque';
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;

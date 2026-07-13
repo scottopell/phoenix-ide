@@ -147,7 +147,7 @@ export interface SubAgentCardFragment {
   kind: 'subagent-card';
 }
 
-export type TerminalToolResultFamily = 'bash' | 'tmux' | 'browser-profile' | 'opaque';
+export type TerminalToolResultFamily = 'bash' | 'tmux' | 'browser-profile' | 'console-logs' | 'opaque';
 
 export interface TerminalToolResultRevealTarget {
   kind: 'tool-result-terminal';
@@ -967,9 +967,11 @@ export function buildTerminalToolResultProjection(
 ): { fragments: readonly [TerminalToolResultFragment]; fullText: string } {
   const semanticText = family === 'browser-profile' && displayData
     ? semanticObjectText(displayData)
-    : family === 'bash' || family === 'tmux'
-      ? semanticStructuredResultText(resultText)
-      : resultText;
+    : family === 'console-logs'
+      ? semanticConsoleLogsText(resultText)
+      : family === 'bash' || family === 'tmux'
+        ? semanticStructuredResultText(resultText)
+        : resultText;
   const fragmentId = `terminal-result:${family}`;
   const fragment: TerminalToolResultFragment = {
     fragmentId,
@@ -984,6 +986,32 @@ export function buildTerminalToolResultProjection(
     kind: 'terminal-result',
   };
   return { fragments: [fragment], fullText: semanticText };
+}
+
+function semanticConsoleLogsText(resultText: string): string {
+  const trimmed = resultText.trim();
+  if (trimmed.startsWith('Logs written to ')) return trimmed;
+  try {
+    const parsed = JSON.parse(resultText);
+    if (!Array.isArray(parsed)) return resultText;
+    const entries = parsed.filter((entry): entry is { level: string; text: string } =>
+      entry !== null
+      && typeof entry === 'object'
+      && typeof (entry as { level?: unknown }).level === 'string'
+      && typeof (entry as { text?: unknown }).text === 'string');
+    if (entries.length === 0) return '(no console entries)';
+    const counts = new Map<string, number>();
+    for (const entry of entries) counts.set(entry.level, (counts.get(entry.level) ?? 0) + 1);
+    const header = [
+      `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`,
+      ...['error', 'warning', 'info', 'log', 'debug']
+        .filter((level) => counts.has(level))
+        .map((level) => `${counts.get(level)} ${level}`),
+    ];
+    return [...header, ...entries.flatMap((entry) => [entry.level, entry.text])].join('\n');
+  } catch {
+    return resultText;
+  }
 }
 
 function semanticStructuredResultText(resultText: string): string {
@@ -1235,6 +1263,15 @@ export function buildAgentTextFragments(
   return out;
 }
 
+const STRUCTURED_BROWSER_PROFILE_ACTIONS = new Set([
+  'run_scenario',
+  'heap_snapshot',
+  'metrics',
+  'cpu_stop',
+  'cpu_summary',
+  'trace_stop',
+]);
+
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
@@ -1259,8 +1296,17 @@ function agentTurnSources(
       const resultText = toolResultText(toolResult);
       const resultContent = toolResult.content as ToolResultContent | undefined;
       const isError = resultContent?.is_error === true || typeof resultContent?.error === 'string';
+      const profileAction = block.name === 'browser_profile' && typeof block.input?.['action'] === 'string'
+        ? block.input['action']
+        : null;
+      const structuredProfile = profileAction !== null && STRUCTURED_BROWSER_PROFILE_ACTIONS.has(profileAction);
       if (isError) {
-        for (const fragment of buildTerminalToolResultProjection('opaque', resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
+        const errorFamily: TerminalToolResultFamily = block.name === 'bash' || block.name === 'tmux'
+          ? block.name
+          : structuredProfile && profileAction === 'run_scenario'
+            ? 'browser-profile'
+            : 'opaque';
+        for (const fragment of buildTerminalToolResultProjection(errorFamily, resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
         return;
@@ -1293,9 +1339,11 @@ function agentTurnSources(
       } else {
         const family: TerminalToolResultFamily = block.name === 'bash' || block.name === 'tmux'
           ? block.name
-          : block.name === 'browser_profile'
-            ? 'browser-profile'
-            : 'opaque';
+          : block.name === 'browser_recent_console_logs'
+            ? 'console-logs'
+            : structuredProfile
+              ? 'browser-profile'
+              : 'opaque';
         for (const fragment of buildTerminalToolResultProjection(family, resultText, toolResult?.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }

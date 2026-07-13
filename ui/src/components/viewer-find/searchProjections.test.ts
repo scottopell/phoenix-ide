@@ -269,6 +269,36 @@ describe('typed semantic display projections', () => {
   });
 });
 
+describe('browser tool semantic projection parity', () => {
+  it('uses raw visible output for generic browser profile actions', () => {
+    const projection = buildTerminalToolResultProjection('opaque', 'CPU throttle set to 4x', { rate: 4 }, { toolUseId: 'profile-1' });
+    expect(projection.fullText).toBe('CPU throttle set to 4x');
+  });
+
+  it('keeps blocked run-scenario fields and error text searchable', () => {
+    const projection = buildTerminalToolResultProjection(
+      'browser-profile',
+      'Scenario blocked before measurement',
+      { blocked_step: 2, reason: 'selector missing', error: 'Scenario blocked before measurement' },
+      { toolUseId: 'profile-2' },
+    );
+    expect(projection.fullText).toContain('blocked step: 2');
+    expect(projection.fullText).toContain('reason: selector missing');
+    expect(projection.fullText).toContain('error: Scenario blocked before measurement');
+  });
+
+  it('normalizes console-log entries, empty labels, and visible tallies', () => {
+    const logs = buildTerminalToolResultProjection(
+      'console-logs',
+      JSON.stringify([{ level: 'error', text: 'boom' }, { level: 'log', text: 'ready' }]),
+      undefined,
+      { toolUseId: 'logs-1' },
+    );
+    expect(logs.fullText).toBe('2 entries\n1 error\n1 log\nerror\nboom\nlog\nready');
+    expect(buildTerminalToolResultProjection('console-logs', '[]', undefined).fullText).toBe('(no console entries)');
+  });
+});
+
 describe('buildPatchOutputProjection', () => {
   it('keeps semantic identity stable while carrying the current canonical diff as display text', () => {
     const before = buildPatchOutputProjection('--- a/x\n+++ b/x\n-old\n+new', { toolUseId: 'patch-1' });
