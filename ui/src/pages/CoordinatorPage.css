@@ -11,16 +11,16 @@
 }
 
 .coordinator-page {
-  padding: 24px;
-  width: 100%;
-  height: 100%;
-  box-sizing: border-box;
-  color: var(--text-primary);
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 16px;
+  width: 100%;
+  height: 100%;
+  padding: 20px 24px 24px;
   overflow: hidden;
+  box-sizing: border-box;
+  color: var(--text-primary);
 }
 
 .coordinator-header,
@@ -33,6 +33,45 @@
   align-items: flex-start;
 }
 
+.coordinator-header {
+  align-items: center;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.coordinator-header h1 {
+  font-size: 24px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+.coordinator-header p {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.coordinator-actions button,
+.coordinator-item-actions button,
+.coordinator-open-work > button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.coordinator-actions button:hover,
+.coordinator-item-actions button:hover,
+.coordinator-open-work > button:hover {
+  border-color: var(--accent-blue);
+  background: var(--bg-tertiary);
+}
+
 .coordinator-header,
 .coordinator-error,
 .coordinator-sr-only {
@@ -43,17 +82,22 @@
 .coordinator-fleet-pane {
   min-height: 0;
   overflow: auto;
+  scrollbar-gutter: stable;
 }
 
 .coordinator-conversation {
   grid-column: 1;
   grid-row: 3;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-primary);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
 }
 
 .coordinator-fleet-pane {
   grid-column: 2;
   grid-row: 3;
-  padding-right: 4px;
+  padding: 2px 6px 16px 2px;
 }
 
 .coordinator-conversation #app {
@@ -95,7 +139,29 @@
 }
 
 .coordinator-open-work {
-  margin-top: 24px;
+  margin: 0;
+}
+
+.coordinator-section-title {
+  align-items: baseline;
+  padding: 2px 2px 10px;
+}
+
+.coordinator-section-title h2 {
+  font-size: 18px;
+  letter-spacing: -0.01em;
+}
+
+.coordinator-section-title > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.coordinator-open-work > p {
+  margin: 0 2px 14px;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .coordinator-conversation-card {
@@ -119,11 +185,30 @@
 }
 
 .coordinator-project {
+  padding: 14px;
+  margin-top: 10px;
   border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 16px;
-  margin-top: 12px;
+  border-radius: 10px;
   background: var(--bg-secondary);
+}
+
+.coordinator-project-header {
+  align-items: baseline;
+}
+
+.coordinator-project h3 {
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+}
+
+.coordinator-path {
+  margin-top: 2px;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .coordinator-project-count {
@@ -138,10 +223,29 @@
 }
 
 .coordinator-item {
+  padding: 11px 12px;
   border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 12px;
+  border-radius: 8px;
   background: var(--bg-primary);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.coordinator-item:hover {
+  border-color: color-mix(in srgb, var(--accent-blue) 45%, var(--border-color));
+  box-shadow: 0 1px 3px rgb(0 0 0 / 8%);
+}
+
+.coordinator-item-title-row > a {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-decoration: none;
+}
+
+.coordinator-item-title-row > a:hover {
+  color: var(--accent-blue);
+  text-decoration: underline;
 }
 
 .coordinator-item-main {
@@ -161,8 +265,10 @@
 .coordinator-signals span,
 .coordinator-work-meta span {
   border: 1px solid var(--border-color);
+  padding: 2px 7px;
   border-radius: 999px;
-  padding: 2px 8px;
+  background: var(--bg-secondary);
+  line-height: 1.35;
 }
 
 .coordinator-state-pill {
@@ -185,14 +291,18 @@
 
 .coordinator-item-actions {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex: 0 0 auto;
+  flex-direction: row;
+  gap: 6px;
 }
 
 .coordinator-item-details {
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 @media (width <= 900px) {
@@ -200,6 +310,15 @@
     display: block;
     height: auto;
     overflow: auto;
+  }
+
+  .coordinator-header {
+    align-items: flex-start;
+    padding-bottom: 12px;
+  }
+
+  .coordinator-fleet-pane {
+    padding: 18px 0 0;
   }
 
   .coordinator-conversation {
