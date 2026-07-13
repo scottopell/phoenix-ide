@@ -193,6 +193,11 @@ LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
+LAUNCHD_DEPLOY_DIR = Path.home() / ".phoenix-ide" / "deploy"
+LAUNCHD_DEPLOY_STATUS_PATH = LAUNCHD_DEPLOY_DIR / "status.json"
+LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
+LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
+LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # Dev ports are assigned deterministically from the worktree path hash. Keep
@@ -224,13 +229,12 @@ TLS_BUNDLE_DIR = DB_DIR / "tls-bundles"
 TLS_INSTALL_DIR = DB_DIR / "tls"
 
 
-def write_deployed_sha():
-    """Write the current HEAD SHA to ~/.phoenix-ide/deployed.sha."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT, capture_output=True, text=True,
-    )
-    sha = result.stdout.strip()
+def write_deployed_sha(sha: str | None = None):
+    """Record an explicitly selected SHA, or local HEAD for non-launchd modes."""
+    if sha is None:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
+        ).stdout.strip()
     if sha:
         PROD_SHA_PATH.parent.mkdir(parents=True, exist_ok=True)
         PROD_SHA_PATH.write_text(sha + "\n")
@@ -5881,51 +5885,24 @@ def check_systemd_available() -> bool:
         return False
 
 
-def prod_build(version: str | None = None, strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
-    """Build a production binary from a git tag or HEAD.
-
-    Uses a separate git worktree to avoid disturbing the main working directory.
-    Returns path to the built binary.
-
-    Args:
-        version: Git tag or None for HEAD
-        strip: Whether to strip debug symbols (default True, False for debugging)
-        target: Cargo build target, or None for native host architecture
-    """
-    # Determine what to build
-    if version:
-        # Check if tag exists
-        result = subprocess.run(
-            ["git", "rev-parse", f"refs/tags/{version}"],
-            cwd=ROOT, capture_output=True
-        )
-        if result.returncode != 0:
-            print(f"Tag '{version}' not found", file=sys.stderr)
-            sys.exit(1)
-        ref = version
-        print(f"Building from tag: {version}")
-    else:
-        # Use current HEAD commit
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT, capture_output=True, text=True
-        )
-        commit = result.stdout.strip()
-        version = f"dev-{commit[:8]}"
-        ref = commit
-        # Warn if there are uncommitted changes — they won't be included in the build.
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=ROOT, capture_output=True, text=True
-        ).stdout.strip()
-        if dirty:
-            print(f"⚠ Warning: uncommitted changes will NOT be included in the build:")
-            for line in dirty.splitlines()[:10]:
-                print(f"    {line}")
-            if len(dirty.splitlines()) > 10:
-                print(f"    ... and {len(dirty.splitlines()) - 10} more")
-            print()
-        print(f"Building from HEAD: {version}")
+def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
+    """Build the production binary from the invoking checkout's exact HEAD."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+    )
+    commit = result.stdout.strip()
+    ref = commit
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True
+    ).stdout.strip()
+    if dirty:
+        print("⚠ Warning: uncommitted changes will NOT be included in the build:")
+        for line in dirty.splitlines()[:10]:
+            print(f"    {line}")
+        if len(dirty.splitlines()) > 10:
+            print(f"    ... and {len(dirty.splitlines()) - 10} more")
+        print()
+    print(f"Building from HEAD: {commit[:12]}")
     
     # Set up or update the build worktree
     worktree = PROD_BUILD_WORKTREE
@@ -6169,7 +6146,7 @@ def native_prod_deploy(version: str | None = None):
     _preflight_prod_bind_auth(systemd_env, socket_activated=True)
 
     # Build
-    binary = prod_build(version)
+    binary = prod_build()
     
     # Determine version string for display
     if version is None:
@@ -6614,7 +6591,7 @@ def prod_daemon_deploy():
     _preflight_prod_bind_auth(daemon_preflight_env, socket_activated=False)
 
     # Build binary (keep debug symbols for debugging)
-    binary = prod_build(version=None, strip=False)
+    binary = prod_build(strip=False)
 
     # Set up environment
     env = os.environ.copy()
@@ -7121,92 +7098,322 @@ def _launchd_stop_if_loaded():
     time.sleep(1)
 
 
-def launchd_prod_deploy(version: str | None = None):
-    """Build and deploy to production via launchd (native macOS)."""
-    # Refuse before building if the deploy would expose an unauthenticated server.
-    # The launchd service runs with the plist's EnvironmentVariables: those baked
-    # from .phoenix-ide.env at deploy time PLUS any set later via `./dev.py prod
-    # set`. The preflight must honour the existing plist overrides too.
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _binary_identity(binary: Path) -> dict[str, str]:
+    result = subprocess.run(
+        [str(binary), "--build-identity"], capture_output=True, text=True, timeout=10, check=True
+    )
+    try:
+        identity = json.loads(result.stdout)
+        version = identity["version"]
+        git_sha = identity["git_sha"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SystemExit("candidate binary did not report a valid embedded build identity") from exc
+    if not isinstance(version, str) or not version or not isinstance(git_sha, str) or not git_sha or git_sha == "unknown":
+        raise SystemExit("candidate binary has an incomplete embedded build identity")
+    return {"version": version, "git_sha": git_sha}
+
+
+def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
+    import ssl
+    import urllib.request
+    try:
+        url = _prod_local_health_url(env).replace("/version", "/api/version")
+        context = ssl._create_unverified_context() if tls_enabled_from_env(env) else None
+        with urllib.request.urlopen(url, timeout=2, context=context) as response:
+            value = json.load(response)
+        return {"version": str(value["version"]), "git_sha": str(value["git_sha"])}
+    except Exception:
+        return None
+
+
+def _release_asset_name() -> str:
+    import platform
+    machine = platform.machine().lower()
+    mapping = {
+        "arm64": "phoenix_ide-aarch64-apple-darwin",
+        "aarch64": "phoenix_ide-aarch64-apple-darwin",
+        "x86_64": "phoenix_ide-x86_64-apple-darwin",
+        "amd64": "phoenix_ide-x86_64-apple-darwin",
+    }
+    try:
+        return mapping[machine]
+    except KeyError as exc:
+        raise SystemExit(f"no published macOS release asset for host architecture {machine!r}") from exc
+
+
+def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str, str]:
+    if requested == "latest":
+        view = subprocess.run(
+            ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
+            capture_output=True, text=True, check=True,
+        )
+    else:
+        view = subprocess.run(
+            ["gh", "release", "view", requested, "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
+            capture_output=True, text=True, check=True,
+        )
+    release = json.loads(view.stdout)
+    tag = release["tagName"]
+    if requested == "latest" and release.get("isPrerelease"):
+        raise SystemExit("latest resolved to a prerelease; name an exact prerelease tag to opt in")
+    if requested != "latest" and tag != requested:
+        raise SystemExit(f"release resolution mismatch: requested {requested}, resolved {tag}")
+
+    asset_name = _release_asset_name()
+    subprocess.run(
+        ["gh", "release", "download", tag, "--repo", "scottopell/phoenix-ide", "--dir", str(staging),
+         "--pattern", asset_name, "--pattern", "SHA256SUMS"],
+        check=True,
+    )
+    binary = staging / asset_name
+    sums = staging / "SHA256SUMS"
+    if not binary.is_file() or not sums.is_file():
+        raise SystemExit(f"release {tag} is missing {asset_name} or SHA256SUMS")
+    entries = {}
+    for line in sums.read_text().splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            entries[fields[1].lstrip("*")] = fields[0]
+    expected = entries.get(asset_name)
+    if not expected:
+        raise SystemExit(f"SHA256SUMS has no entry for {asset_name}")
+    if _file_sha256(binary) != expected.lower():
+        raise SystemExit(f"checksum mismatch for release asset {asset_name}")
+    identity = _binary_identity(binary)
+    expected_version = tag.removeprefix("v")
+    if identity["version"] != expected_version:
+        raise SystemExit(
+            f"release {tag} embeds version {identity['version']}, expected {expected_version}"
+        )
+    return binary, tag, identity["git_sha"]
+
+
+def _claim_launchd_deploy(transaction_id: str) -> None:
+    LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    LAUNCHD_DEPLOY_DIR.chmod(0o700)
+    if LAUNCHD_DEPLOY_ACTIVE_PATH.exists() and LAUNCHD_DEPLOY_STATUS_PATH.exists():
+        try:
+            prior_state = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text()).get("state")
+            if prior_state in {
+                "committed", "precondition_failed", "activation_failed_rolled_back",
+                "activation_failed_rollback_failed", "rejected_concurrent",
+            }:
+                shutil.rmtree(LAUNCHD_DEPLOY_ACTIVE_PATH)
+        except (OSError, json.JSONDecodeError):
+            pass
+    try:
+        LAUNCHD_DEPLOY_ACTIVE_PATH.mkdir()
+    except FileExistsError as exc:
+        detail = ""
+        if LAUNCHD_DEPLOY_STATUS_PATH.exists():
+            try:
+                status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+                detail = f" Last state: {status.get('state', 'unknown')}."
+            except Exception:
+                pass
+        raise SystemExit(
+            "another launchd deployment is active or needs recovery." + detail
+            + " Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
+        ) from exc
+    (LAUNCHD_DEPLOY_ACTIVE_PATH / "transaction-id").write_text(transaction_id + "\n")
+
+
+def _release_launchd_deploy_claim() -> None:
+    shutil.rmtree(LAUNCHD_DEPLOY_ACTIVE_PATH, ignore_errors=True)
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    with temporary.open("w") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _helper_plist(label: str, helper: Path, manifest: Path, log_path: Path) -> bytes:
+    return plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": ["/usr/bin/python3", str(helper), "activate", "--manifest", str(manifest)],
+        "RunAtLoad": True,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    }, fmt=plistlib.FMT_XML)
+
+
+def launchd_prod_deploy(release: str | None = None):
+    """Prepare a candidate, then hand transactional activation to launchd."""
+    import uuid
+
     launchd_env: dict[str, str] = {}
     _load_env_file(launchd_env)
     launchd_env.update(_launchd_override_env())
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
-    # Build native macOS binary
-    binary = prod_build(version, target=None)
-
-    # Determine version string
-    if version is None:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=ROOT, capture_output=True, text=True,
+    transaction_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    _claim_launchd_deploy(transaction_id)
+    staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    try:
+        transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
+        transactions_dir.mkdir(parents=True, exist_ok=True)
+        old_transactions = sorted(
+            (path for path in transactions_dir.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
         )
-        version = f"dev-{result.stdout.strip()}"
+        for old in old_transactions[5:]:
+            shutil.rmtree(old, ignore_errors=True)
+        staging.mkdir(parents=True)
+        staging.chmod(0o700)
+        if release:
+            binary, release_tag, source_commit = _prepare_release_candidate(release, staging)
+            source_kind = "published_release"
+        else:
+            binary = prod_build(target=None)
+            release_tag = None
+            source_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+            ).stdout.strip()
+            source_kind = "local_head"
 
-    # Install log rotation config (idempotent; sudo only if missing/stale)
-    _ensure_newsyslog_config()
+        candidate_binary = staging / "candidate-phoenix-ide"
+        if binary != candidate_binary:
+            shutil.copy2(binary, candidate_binary)
+        candidate_binary.chmod(0o755)
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(candidate_binary)],
+            check=True,
+        )
+        subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
+        identity = _binary_identity(candidate_binary)
+        if not release and not identity["git_sha"].startswith(source_commit[:12]):
+            raise SystemExit(
+                f"local candidate identity {identity['git_sha']} does not match selected HEAD {source_commit[:12]}"
+            )
+        source_commit = identity["git_sha"]
 
-    # Stop existing service
-    _launchd_stop_if_loaded()
+        env_overrides: dict[str, str] = {}
+        env_file = _load_env_file(env_overrides)
+        if env_file:
+            print(f"  Loaded env from {env_file}")
+        path_str, path_source = capture_login_shell_path()
+        print_launchd_path_report(path_str, path_source)
+        plist_content = generate_launchd_plist(identity["version"], extra_env=env_overrides, path_override=path_str)
+        candidate_plist = staging / "candidate.plist"
+        candidate_plist.write_text(plist_content)
+        candidate_plist.chmod(0o600)
+        subprocess.run(["plutil", "-lint", str(candidate_plist)], check=True, capture_output=True)
 
-    # Install binary
-    LAUNCHD_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    dest = LAUNCHD_INSTALL_DIR / "phoenix-ide"
-    # Remove first to avoid "text file busy" if somehow still running
-    dest.unlink(missing_ok=True)
-    import shutil
-    shutil.copy2(str(binary), str(dest))
-    dest.chmod(0o755)
+        rollback_binary = staging / "rollback-phoenix-ide"
+        rollback_plist = staging / "rollback.plist"
+        target_binary = LAUNCHD_INSTALL_DIR / "phoenix-ide"
+        if target_binary.exists() != LAUNCHD_PLIST_PATH.exists():
+            raise SystemExit("production binary/plist rollback inputs are incomplete; refusing disruption")
+        if target_binary.exists():
+            shutil.copy2(target_binary, rollback_binary)
+            shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
+            rollback_plist.chmod(0o600)
+        previous_identity = _current_prod_identity(launchd_env)
+        if target_binary.exists() and previous_identity is None:
+            raise SystemExit("running production identity is unavailable; refusing an unverifiable rollback")
 
-    # Ad-hoc codesign with a stable identifier so macOS remembers FDA grants
-    # across redeploys (the linker's default signature changes every build)
-    subprocess.run(
-        ["codesign", "--force", "--sign", "-", "--identifier", LAUNCHD_LABEL, str(dest)],
-        check=True,
-    )
+        helper = staging / "activate.py"
+        shutil.copy2(ROOT / "scripts" / "launchd_deploy_helper.py", helper)
+        helper.chmod(0o700)
+        helper_log = LAUNCHD_DEPLOY_DIR / "activation.log"
+        helper_label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
+        helper_plist = staging / "helper.plist"
+        helper_plist.write_bytes(_helper_plist(helper_label, helper, staging / "manifest.json", helper_log))
+        helper_plist.chmod(0o600)
+        subprocess.run(["plutil", "-lint", str(helper_plist)], check=True, capture_output=True)
 
-    # Load .phoenix-ide.env and LLM configuration
-    env_overrides: dict[str, str] = {}
-    env_file = _load_env_file(env_overrides)
-    if env_file:
-        print(f"  Loaded env from {env_file}")
+        manifest = {
+            "transaction_id": transaction_id,
+            "source_kind": source_kind,
+            "source_commit": source_commit,
+            "release_tag": release_tag,
+            "expected": identity,
+            "previous": previous_identity,
+            "candidate_binary": str(candidate_binary),
+            "candidate_binary_sha256": _file_sha256(candidate_binary),
+            "candidate_plist": str(candidate_plist),
+            "candidate_plist_sha256": _file_sha256(candidate_plist),
+            "rollback_binary": str(rollback_binary) if rollback_binary.exists() else None,
+            "rollback_binary_sha256": _file_sha256(rollback_binary) if rollback_binary.exists() else None,
+            "rollback_plist": str(rollback_plist) if rollback_plist.exists() else None,
+            "rollback_plist_sha256": _file_sha256(rollback_plist) if rollback_plist.exists() else None,
+            "target_binary": str(target_binary),
+            "target_plist": str(LAUNCHD_PLIST_PATH),
+            "label": LAUNCHD_LABEL,
+            "helper_label": helper_label,
+            "uid": os.getuid(),
+            "health_url": _prod_local_health_url(launchd_env).replace("/version", "/api/version"),
+            "health_insecure_tls": tls_enabled_from_env(launchd_env),
+            "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH),
+            "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
+            "deployed_sha_path": str(PROD_SHA_PATH),
+            "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        _write_json_atomic(staging / "manifest.json", manifest)
+        (staging / "manifest.json").chmod(0o400)
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+            "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
+            "source_commit": source_commit, "release_tag": release_tag,
+            "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
+            "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
+            "failure": None, "rollback_failure": None,
+        })
+        _ensure_newsyslog_config()
+        result = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
+        print("\n✓ Activation handed to an independent launchd helper")
+        print(f"  Transaction: {transaction_id}")
+        print(f"  Candidate: {identity['version']} ({identity['git_sha']})")
+        print("  The Phoenix connection may close while the service is replaced.")
+        print("  After reconnecting, run: ./dev.py prod status")
+    except BaseException:
+        _release_launchd_deploy_claim()
+        raise
 
-    # Capture login-shell PATH so the launchd service sees user-installed
-    # tools (uv, gh, node, …). launchd's default PATH is just
-    # /usr/bin:/bin:/usr/sbin:/sbin and bash -c is non-interactive, so without
-    # this the bash tool can't find anything in Homebrew/MacPorts/Volta/cargo.
-    path_str, path_source = capture_login_shell_path()
-    print_launchd_path_report(path_str, path_source)
 
-    # Generate and write plist
-    plist_content = generate_launchd_plist(version, extra_env=env_overrides, path_override=path_str)
-    LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAUNCHD_PLIST_PATH.write_text(plist_content)
 
-    # Bootstrap (load + start) the service
-    uid = os.getuid()
-    t0 = time.monotonic()
-    result = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0 and "already bootstrapped" not in result.stderr:
-        print(f"ERROR: launchctl bootstrap failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    health_version, elapsed = _wait_for_health(t0, env_overrides, timeout_secs=20.0)
-    if health_version is None:
-        print("WARNING: Server started but health check failed after 20s", file=sys.stderr)
-
-    write_deployed_sha()
-    llm_mode = _llm_mode_summary(env_overrides)
-    print(f"\n✓ Deployed {version} to production (launchd)")
-    print(f"  Version: {health_version or 'unknown'}")
-    print(f"  Startup: {elapsed:.1f}s")
-    print(f"  Database: {PROD_DB_PATH}")
-    print(f"  Logs: {LAUNCHD_LOG_PATH}")
-    print(f"  LLM: {llm_mode}")
-    print(f"  URL: {_prod_display_url(env_overrides)}")
+def _print_launchd_deploy_status() -> None:
+    if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
+        return
+    try:
+        deploy = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
+        print(f"  Last deploy: {deploy.get('state', 'unknown')} ({deploy.get('transaction_id', 'unknown')})")
+        source = deploy.get("source_kind", "unknown")
+        if deploy.get("release_tag"):
+            source += f" {deploy['release_tag']}"
+        print(f"    Source: {source}")
+        print(f"    Expected: {deploy.get('expected_version', 'unknown')} ({deploy.get('expected_git_sha', 'unknown')})")
+        print(f"    Updated: {deploy.get('updated_at', 'unknown')}")
+        if deploy.get("failure"):
+            print(f"    Failure: {deploy['failure']}")
+        if deploy.get("rollback_failure"):
+            print(f"    Rollback failure: {deploy['rollback_failure']}")
+        if deploy.get("state") in {"prepared", "activating"}:
+            age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
+            if age.total_seconds() > 120:
+                print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
+    except Exception as exc:
+        print(f"  Last deploy: unreadable status ({type(exc).__name__})")
 
 
 def launchd_prod_status():
@@ -7220,6 +7427,7 @@ def launchd_prod_status():
     if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
         print("Production: not loaded")
         print(f"  Run './dev.py prod deploy' to start")
+        _print_launchd_deploy_status()
         return
 
     # Parse state and pid from launchctl print output
@@ -7237,12 +7445,13 @@ def launchd_prod_status():
 
     print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
 
-    # Health check
-    try:
-        _open_prod_health(timeout=2).close()
-        print(f"  Health: OK")
-    except Exception:
-        print(f"  Health: not responding")
+    identity = _current_prod_identity(_repo_env())
+    if identity:
+        print(f"  Version: {identity['version']} ({identity['git_sha']})")
+    else:
+        print("  Health: not responding")
+
+    _print_launchd_deploy_status()
 
     if sha := read_deployed_sha():
         print(f"  Commit: {sha}")
@@ -7329,31 +7538,32 @@ def launchd_prod_override_unset(name: str):
     print(f"  Service reloaded")
 
 
-def cmd_prod_build(version: str | None = None):
-    """Build production binary from git tag."""
+def cmd_prod_build():
+    """Build the production binary from local HEAD."""
     if sys.platform == "darwin":
-        prod_build(version, target=None)
+        prod_build(target=None)
     elif sys.platform == "linux":
-        prod_build(version)
+        prod_build()
     else:
         print(f"Unsupported platform: {sys.platform}", file=sys.stderr)
         sys.exit(1)
 
 
-def cmd_prod_deploy(version: str | None = None, pretty: bool = False):
-    """Build and deploy to production (auto-detects environment)."""
-    print("Running pre-deploy checks...\n")
-    # Deploys always run the full suite — never gate by changed paths.
-    cmd_check(gate=False, pretty=pretty)
-    print()
-
+def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
+    """Deploy local HEAD or an immutable published release."""
     env = detect_prod_env()
+    if release and env != "launchd":
+        raise SystemExit("--release deployment is supported only by native macOS launchd")
+    if not release:
+        print("Running pre-deploy checks...\n")
+        cmd_check(gate=False, pretty=pretty)
+        print()
 
     if env == "launchd":
-        launchd_prod_deploy(version)
+        launchd_prod_deploy(release)
 
     elif env == "native":
-        native_prod_deploy(version)
+        native_prod_deploy()
 
     elif env == "daemon":
         print("Detected: No systemd (daemon mode)")
@@ -7621,10 +7831,17 @@ def main():
     # prod
     prod_parser = sub.add_parser("prod", help="Production deployment")
     prod_sub = prod_parser.add_subparsers(dest="prod_command", required=True)
-    build_parser = prod_sub.add_parser("build", help="Build production binary from git tag")
-    build_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
-    deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
-    deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
+    prod_sub.add_parser("build", help="Build production binary from local HEAD")
+    deploy_parser = prod_sub.add_parser(
+        "deploy",
+        help="Deploy local HEAD, or use --release TAG|latest for a published macOS release",
+        epilog="Positional versions were removed; use --release vX.Y.Z (there is no local build-from-tag mode).",
+    )
+    deploy_parser.add_argument(
+        "--release", metavar="TAG|latest",
+        help="Install an immutable published GitHub release without checks or compilation",
+    )
+    deploy_parser.add_argument("legacy_version", nargs="?", help=argparse.SUPPRESS)
     deploy_parser.add_argument(
         "--pretty", action="store_true", default=False,
         help="Render the pre-deploy check as a live lane table",
@@ -7732,9 +7949,14 @@ def main():
             cmd_tls_install(args.bundle, install_dir=args.install_dir, env_file=args.env_file)
     elif args.command == "prod":
         if args.prod_command == "build":
-            cmd_prod_build(args.version)
+            cmd_prod_build()
         elif args.prod_command == "deploy":
-            cmd_prod_deploy(args.version, pretty=pretty)
+            if args.legacy_version:
+                parser.error(
+                    f"positional deploy version {args.legacy_version!r} was removed; "
+                    "use 'prod deploy --release vX.Y.Z' (local build-from-tag no longer exists)"
+                )
+            cmd_prod_deploy(args.release, pretty=pretty)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

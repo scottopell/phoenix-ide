@@ -1,0 +1,150 @@
+-- allium: 3
+-- Native macOS launchd deployment lifecycle
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-012
+
+config {
+    transition_timeout_seconds: Integer = 30
+    health_timeout_seconds: Integer = 30
+    stale_after_seconds: Integer = 120
+}
+
+enum SourceKind { local_head | published_release }
+enum TransactionState {
+    preparing | prepared | activating | committed |
+    precondition_failed | activation_failed_rolled_back |
+    activation_failed_rollback_failed | rejected_concurrent
+}
+
+value RuntimeIdentity {
+    version: String
+    git_sha: String
+}
+
+entity DeployTransaction {
+    id: String
+    source_kind: SourceKind
+    source_commit: String
+    release_tag: String?
+    expected: RuntimeIdentity
+    previous: RuntimeIdentity?
+    state: TransactionState
+    created_at: Timestamp
+    updated_at: Timestamp
+    failure: String?
+    rollback_failure: String?
+}
+
+external entity TargetService {
+    label: String
+    loaded: Boolean
+    running_pid: Integer?
+    identity: RuntimeIdentity?
+}
+
+-- Helpers
+--
+-- preparation_complete(transaction) -> Boolean
+--   Candidate binary, plist, rollback inputs, hashes, signature, manifest and
+--   embedded identity are valid and host-resident; persisted metadata contains
+--   no plist environment values.
+-- activation_claim_available() -> Boolean
+--   No active or unresolved deployment owns the host-level claim.
+-- helper_is_launchd_owned(transaction) -> Boolean
+--   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
+-- atomic_candidate_install(transaction) -> Boolean
+--   Fsynced destination-filesystem artifacts replace targets by rename.
+-- exact_identity_running(service, identity) -> Boolean
+--   The job has a PID and /api/version equals both identity fields.
+-- exact_previous_restored(transaction, service) -> Boolean
+--   Previous artifacts are atomically restored and the previous identity runs.
+-- selected_source_is_valid(transaction) -> Boolean
+--   Local source is exact checked HEAD, or release source is one resolved tag
+--   with matching host asset, checksum and embedded identity.
+
+rule PrepareCandidate {
+    when: DeploymentRequested(transaction)
+    requires: activation_claim_available()
+    requires: selected_source_is_valid(transaction)
+    ensures: transaction.state = prepared
+    ensures: preparation_complete(transaction)
+}
+
+rule RejectConcurrentDeployment {
+    when: DeploymentRequested(transaction)
+    requires: not activation_claim_available()
+    ensures: transaction.state = rejected_concurrent
+    ensures: ProductionArtifactsUnchanged(transaction)
+    ensures: TargetServiceUnchanged(transaction)
+}
+
+rule HandoffActivation {
+    when: transaction: DeployTransaction.state transitions_to prepared
+    requires: preparation_complete(transaction)
+    ensures: helper_is_launchd_owned(transaction)
+    ensures: ActivationHandedOff(transaction)
+
+    @guidance
+        -- Bootstrap the distinct one-shot helper and report handoff before the
+        -- target LaunchAgent is stopped. The initiating process may then end.
+}
+
+rule ActivateCandidate {
+    when: ActivationHelperStarted(transaction)
+    requires: transaction.state = prepared
+    requires: helper_is_launchd_owned(transaction)
+    requires: preparation_complete(transaction)
+    ensures: transaction.state = activating
+    ensures: atomic_candidate_install(transaction)
+
+    @guidance
+        -- Revalidate hashes, acquire the host lock, check bootout/bootstrap
+        -- results, and poll launchd state and PID to bounded deadlines.
+}
+
+rule CommitVerifiedCandidate {
+    when: CandidateRuntimeObserved(transaction, service)
+    requires: transaction.state = activating
+    requires: exact_identity_running(service, transaction.expected)
+    ensures: transaction.state = committed
+    ensures: DeployedShaWritten(transaction.source_commit)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule RollBackFailedActivation {
+    when: ActivationFailed(transaction, service, failure)
+    requires: transaction.state = activating
+    requires: exact_previous_restored(transaction, service)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: transaction.failure = failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule PreserveRollbackFailure {
+    when: RollbackFailed(transaction, failure, rollback_failure)
+    requires: transaction.state = activating
+    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: transaction.failure = failure
+    ensures: transaction.rollback_failure = rollback_failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule ReportStaleTransaction {
+    when: DeploymentStatusRequested(transaction)
+    requires: transaction.state = prepared or transaction.state = activating
+    requires: TransactionAgeSeconds(transaction) > stale_after_seconds
+    ensures: StaleRecoveryGuidanceShown(transaction)
+    ensures: not transaction.state = committed
+}
+
+invariant CommitRequiresExactIdentity {
+    for transaction in DeployTransactions:
+        transaction.state = committed implies CandidateIdentityVerified(transaction)
+}
+
+invariant DisruptionRequiresPreparedHandoff {
+    for transaction in DeployTransactions:
+        TargetStopRequested(transaction) implies
+            preparation_complete(transaction) and helper_is_launchd_owned(transaction)
+}

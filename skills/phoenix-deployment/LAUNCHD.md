@@ -1,6 +1,6 @@
 # Native launchd Deployment Details
 
-Applies when: macOS. This is the only macOS production mode — `./dev.py prod deploy` builds a native (host-arch) binary and installs it as a per-user launchd agent.
+Applies when: macOS. This is the only macOS production mode. `./dev.py prod deploy` checks and builds local `HEAD`; `./dev.py prod deploy --release vX.Y.Z` or `--release latest` installs a checksummed host-architecture GitHub release without local compilation.
 
 ## Runtime details
 
@@ -15,6 +15,20 @@ Applies when: macOS. This is the only macOS production mode — `./dev.py prod d
 | Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — daily at 00:00, 14 generations, bzip2, copy-truncate (no size threshold) |
 
 The binary is ad-hoc codesigned (`codesign --sign -`) on each deploy so the OS will run it.
+
+## Transaction ownership
+
+Preparation completes while the existing service remains healthy: candidate identity/signature, plist validation, destination-filesystem staging, and rollback snapshots. Activation is then bootstrapped as a distinct one-shot LaunchAgent under `~/.phoenix-ide/deploy/`. It does not depend on the initiating Phoenix process, terminal, WebSocket, worktree, or network.
+
+The initiating connection is expected to close when the target LaunchAgent is unloaded. Successful handoff is printed first. After reconnecting, inspect the durable result with:
+
+```bash
+./dev.py prod status
+cat ~/.phoenix-ide/deploy/status.json
+cat ~/.phoenix-ide/deploy/activation.log
+```
+
+Status includes source kind/tag, expected version/SHA, terminal outcome, and rollback failure if any. It never includes plist environment values.
 
 ## Socket activation
 
@@ -77,7 +91,8 @@ tail -f ~/.phoenix-ide/prod.log                       # Follow live logs
 
 ## If the deploy fails
 
-- `launchctl bootstrap failed` → a stale instance may still be loaded; `./dev.py prod stop` then redeploy. The deploy already does a `bootout` first, so this is rare.
-- Health check fails after 10s → check `~/.phoenix-ide/prod.log` for a startup error (bad env file, port in use, DB migration failure).
-- `./dev.py check` failure → deploy aborts before touching production; fix tests/lint first.
-- Do NOT manually `launchctl load/unload` the plist — use `./dev.py prod deploy/stop`.
+- Preparation or handoff failure leaves the running service untouched.
+- Activation failure after disruption automatically attempts to restore and exactly verify the previous binary and plist. `activation_failed_rolled_back` means production was restored; `activation_failed_rollback_failed` requires operator attention.
+- A stale `prepared` or `activating` status is reported by `./dev.py prod status`. Inspect the activation log and confirm no `com.phoenix-ide.deploy.*` helper is running before removing `~/.phoenix-ide/deploy/active` and retrying.
+- `./dev.py check` failure applies only to local-HEAD deployment and aborts before staging. Published-release deployment deliberately skips repository checks and compilation.
+- Do not manually `launchctl load/unload` the production plist. Use the production commands and durable status evidence.

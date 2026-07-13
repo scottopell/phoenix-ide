@@ -54,71 +54,101 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build-and-release:
+  build-linux:
     needs: gate
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install musl toolchain
-        run: sudo apt-get install -y musl-tools
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        # Reads packageManager from ui/package.json — single source of truth.
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+      - run: sudo apt-get install -y musl-tools
+      - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: lts/*
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build UI
-        run: pnpm install --frozen-lockfile && pnpm run build
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile && pnpm run build
         working-directory: ui
-
-      # Two artifacts from one tag:
-      #   - `release-min` (LTO + opt-z + stripped) is the primary download.
-      #   - `release` (full debug symbols) is the `-debug` variant for users who
-      #     want core-dump symbolication of a running instance.
-      # Only release.yml pays this 2x build cost, and it fires only on a version
-      # bump — never on a routine CI push.
-      - name: Build main (stripped) binary
-        run: cargo build --profile release-min --target x86_64-unknown-linux-musl
-        env:
-          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-
-      - name: Build debug (symbol-rich) binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
-        env:
-          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-
-      - name: Rename binaries
+      - name: Build Linux binaries
         run: |
-          cp target/x86_64-unknown-linux-musl/release-min/phoenix_ide \
-             phoenix_ide-x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/phoenix_ide \
-             phoenix_ide-x86_64-unknown-linux-musl-debug
+          cargo build --profile release-min --target x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release-min/phoenix_ide phoenix_ide-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/phoenix_ide phoenix_ide-x86_64-unknown-linux-musl-debug
+        env:
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-assets
+          path: phoenix_ide-x86_64-unknown-linux-musl*
 
-      - name: Create release and upload binaries
+  build-macos:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: phoenix_ide-aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            asset: phoenix_ide-x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile && pnpm run build
+        working-directory: ui
+      - name: Build native macOS binary
+        run: |
+          cargo build --profile release-min --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release-min/phoenix_ide" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: [gate, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release-assets'
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'macos-*'
+          merge-multiple: true
+      - name: Publish one checksummed asset set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          sha256sum phoenix_ide-* > SHA256SUMS
           gh release create "${{ needs.gate.outputs.tag }}" \
+            --repo scottopell/phoenix-ide \
             --title "${{ needs.gate.outputs.tag }}" \
             --generate-notes \
-            phoenix_ide-x86_64-unknown-linux-musl \
-            phoenix_ide-x86_64-unknown-linux-musl-debug
+            phoenix_ide-* SHA256SUMS

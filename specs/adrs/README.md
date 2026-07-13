@@ -21,6 +21,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [007](007_conversation-creation-uses-fenced-reconciliation.md) | Conversation creation uses fenced reconciliation | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-004, REQ-CCR-005, REQ-CCR-007, REQ-CCR-008, REQ-CCR-010 |
 | [008](008_multi-pr-selection-uses-durable-branch-observations.md) | Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting | Accepted | REQ-PRA-000, REQ-PRA-000a, REQ-PRA-000b, REQ-PRA-000c, REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c |
 | [009](009_shared-demand-driven-resource-observations.md) | Native process metrics use shared demand-driven observation generations | Accepted | REQ-DEPLOY-007a, REQ-PINSP-004, REQ-PINSP-008, REQ-WSUI-006, REQ-WSUI-010 |
+| [010](010_launchd-deployment-uses-independent-transaction-helper.md) | launchd deployment uses an independent transaction helper | Accepted | REQ-LDD-001 through REQ-LDD-010 |
 
 ## For agents: which decisions bind your task
 
@@ -40,6 +41,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
+| Specifying native macOS self-deployment, activation, or rollback | 010 |
 
 ## Decision dependencies
 
@@ -54,7 +56,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-006 (Wake contracts are persisted conversation-scoped terminal waits)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
-      └── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      └── ADR-010 (launchd deployment uses an independent transaction helper)
 ```
 
 ## Conventions

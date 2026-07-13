@@ -547,6 +547,11 @@ fn sandbox_exec_arg() -> Option<String> {
     }
 }
 
+fn build_identity_requested() -> bool {
+    let mut args = std::env::args().skip(1);
+    matches!(args.next().as_deref(), Some("--build-identity")) && args.next().is_none()
+}
+
 /// Start the Phoenix HTTP server with the production composition root.
 ///
 /// # Errors
@@ -558,6 +563,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // `phx` symlink (or `phoenix_ide suggest …`), run the thin suggestion
     // client and exit instead of starting the server. Branch before logging
     // setup so the client's stdout stays clean (OSC 8 links only).
+    if build_identity_requested() {
+        println!(
+            "{{\"version\":\"{}\",\"git_sha\":\"{}\"}}",
+            env!("CARGO_PKG_VERSION"),
+            env!("PHOENIX_GIT_SHA")
+        );
+        return Ok(());
+    }
+
     if phx_cli::is_cli_invocation() {
         std::process::exit(phx_cli::run().await);
     }
