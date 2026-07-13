@@ -126,6 +126,38 @@ export interface ReadFileOutputProjection {
   fullText: string;
 }
 
+export interface SubAgentCardRevealTarget {
+  kind: 'subagent-card';
+  toolUseId: string;
+  agentId: string;
+  fragmentId: string;
+}
+
+export interface SubAgentCardFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: { agentId: string; task: string; outcomeText: string };
+  revealTarget: SubAgentCardRevealTarget;
+  kind: 'subagent-card';
+}
+
+export type TerminalToolResultFamily = 'bash' | 'tmux' | 'browser-profile' | 'opaque';
+
+export interface TerminalToolResultRevealTarget {
+  kind: 'tool-result-terminal';
+  toolUseId: string;
+  fragmentId: string;
+  family: TerminalToolResultFamily;
+}
+
+export interface TerminalToolResultFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: { family: TerminalToolResultFamily };
+  revealTarget: TerminalToolResultRevealTarget;
+  kind: 'terminal-result';
+}
+
 export interface PatchRevealTarget {
   kind: 'tool-result-patch';
   toolUseId: string;
@@ -160,7 +192,9 @@ export type ConversationFragmentRevealTarget =
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
   | ReadFileRevealTarget
-  | PatchRevealTarget;
+  | PatchRevealTarget
+  | TerminalToolResultRevealTarget
+  | SubAgentCardRevealTarget;
 
 export interface ConversationTextFragment {
   fragmentId: string;
@@ -835,6 +869,86 @@ export function buildReadFileOutputProjection(
   return { fragments, fullText };
 }
 
+export function buildSubAgentCardFragments(displayData: unknown, toolUseId = ''): readonly SubAgentCardFragment[] {
+  if (!displayData || typeof displayData !== 'object') return [];
+  const data = displayData as Record<string, unknown>;
+  if (data['type'] !== 'subagent_summary' || !Array.isArray(data['results'])) return [];
+  return data['results'].flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const result = entry as Record<string, unknown>;
+    const agentId = typeof result['agent_id'] === 'string' ? result['agent_id'] : '';
+    const task = typeof result['task'] === 'string' ? result['task'] : '';
+    const outcomeText = semanticSubAgentOutcome(result['outcome']);
+    if (!agentId || (!task && !outcomeText)) return [];
+    const fragmentId = `subagent-card:${agentId}`;
+    return [{
+      fragmentId,
+      semanticText: [task, outcomeText].filter(Boolean).join('\n'),
+      display: { agentId, task, outcomeText },
+      revealTarget: { kind: 'subagent-card' as const, toolUseId, agentId, fragmentId },
+      kind: 'subagent-card' as const,
+    }];
+  });
+}
+
+function semanticSubAgentOutcome(outcome: unknown): string {
+  if (!outcome || typeof outcome !== 'object') return '';
+  const value = outcome as Record<string, unknown>;
+  for (const key of ['result', 'error', 'partial_result']) {
+    if (typeof value[key] === 'string') return value[key];
+  }
+  return '';
+}
+
+export function buildTerminalToolResultProjection(
+  family: TerminalToolResultFamily,
+  resultText: string,
+  displayData: unknown,
+  options: { toolUseId?: string | null } = {},
+): { fragments: readonly [TerminalToolResultFragment]; fullText: string } {
+  const semanticText = family === 'browser-profile' && displayData
+    ? semanticObjectText(displayData)
+    : family === 'bash' || family === 'tmux'
+      ? semanticStructuredResultText(resultText)
+      : resultText;
+  const fragmentId = `terminal-result:${family}`;
+  const fragment: TerminalToolResultFragment = {
+    fragmentId,
+    semanticText,
+    display: { family },
+    revealTarget: {
+      kind: 'tool-result-terminal',
+      toolUseId: options.toolUseId ?? '',
+      fragmentId,
+      family,
+    },
+    kind: 'terminal-result',
+  };
+  return { fragments: [fragment], fullText: semanticText };
+}
+
+function semanticStructuredResultText(resultText: string): string {
+  try {
+    return semanticObjectText(JSON.parse(resultText));
+  } catch {
+    return resultText;
+  }
+}
+
+function semanticObjectText(value: unknown, label?: string): string {
+  if (value === null || value === undefined) return label ? `${label}: ${String(value)}` : String(value);
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => semanticObjectText(entry, label ? `${label} ${index + 1}` : String(index + 1))).join('\n');
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([key, entry]) => semanticObjectText(entry, key.replaceAll('_', ' ')))
+      .filter(Boolean)
+      .join('\n');
+  }
+  return label ? `${label}: ${String(value)}` : String(value);
+}
+
 export function buildPatchOutputProjection(
   diff: string,
   options: { toolUseId?: string | null } = {},
@@ -1081,7 +1195,12 @@ function agentTurnSources(
       if (detailsVisible) out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
       const toolResult = toolResultsByUseId.get(block.id ?? '');
       const resultText = toolResultText(toolResult);
-      if (block.name === 'keyword_search') {
+      const subAgentFragments = buildSubAgentCardFragments(toolResult?.display_data, block.id ?? '');
+      if (subAgentFragments.length > 0) {
+        for (const fragment of subAgentFragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+      } else if (block.name === 'keyword_search') {
         for (const fragment of buildKeywordSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
@@ -1101,8 +1220,15 @@ function agentTurnSources(
         for (const fragment of buildPatchOutputProjection(patchDiff, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
-      } else if (detailsVisible) {
-        out.push({ role: `tool-use-result-${index}`, text: resultText });
+      } else {
+        const family: TerminalToolResultFamily = block.name === 'bash' || block.name === 'tmux'
+          ? block.name
+          : block.name === 'browser_profile'
+            ? 'browser-profile'
+            : 'opaque';
+        for (const fragment of buildTerminalToolResultProjection(family, resultText, toolResult?.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
       }
     }
   });

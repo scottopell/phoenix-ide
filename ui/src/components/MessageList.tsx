@@ -1245,6 +1245,8 @@ function MessageListImpl({
                 || activeFindRevealTarget?.kind === 'tool-result-keyword-search'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'
                 || activeFindRevealTarget?.kind === 'tool-result-patch'
+                || activeFindRevealTarget?.kind === 'tool-result-terminal'
+                || activeFindRevealTarget?.kind === 'subagent-card'
               )
               ? { fragmentId: activeFindHighlight.fragmentId, start: activeFindHighlight.start, end: activeFindHighlight.end }
               : null

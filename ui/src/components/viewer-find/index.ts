@@ -35,6 +35,8 @@ export {
   buildKeywordSearchOutputProjection,
   buildPatchOutputProjection,
   buildReadFileOutputProjection,
+  buildSubAgentCardFragments,
+  buildTerminalToolResultProjection,
   type BlockSearchMatchTarget,
   type BlockSearchProjection,
   type BlockSearchSource,
@@ -60,6 +62,11 @@ export {
   type SearchableSource,
   type SearchableSourceMatch,
   type SearchableSourceProjection,
+  type SubAgentCardFragment,
+  type SubAgentCardRevealTarget,
+  type TerminalToolResultFamily,
+  type TerminalToolResultFragment,
+  type TerminalToolResultRevealTarget,
 } from './searchProjections';
 export { useFindSession, type UseFindSessionOptions } from './useFindSession';
 export { useViewerFindKeyboardShortcut } from './useViewerFindKeyboardShortcut';

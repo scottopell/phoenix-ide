@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -1956,6 +1956,22 @@ export function ReadFileResultView({
   );
 }
 
+export function TerminalToolResultHighlight({
+  semanticText,
+  fragmentId,
+  activeHighlight,
+}: {
+  semanticText: string;
+  fragmentId: string;
+  activeHighlight: AgentTextHighlight;
+}) {
+  return (
+    <pre className="tool-block-output-content" data-fragment-id={fragmentId}>
+      {renderHighlightedText(semanticText, activeHighlight.start, activeHighlight.end)}
+    </pre>
+  );
+}
+
 export function PatchResultView({
   diff,
   toolUseId,
@@ -2263,10 +2279,18 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
   // status / running state / label rather than show the raw JSON.
   const bashResponse = useMemo(() => (name === 'bash' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
   const tmuxResponse = useMemo(() => (name === 'tmux' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
-
+  const terminalResultFamily: TerminalToolResultFamily = name === 'bash' || name === 'tmux'
+    ? name
+    : name === 'browser_profile'
+      ? 'browser-profile'
+      : 'opaque';
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;
+  const terminalProjection = useMemo(
+    () => buildTerminalToolResultProjection(terminalResultFamily, resultText, result?.display_data, { toolUseId: toolId }),
+    [result?.display_data, resultText, terminalResultFamily, toolId],
+  );
   const resultLength = resultText.length;
   const keywordSearchProjection = useMemo(
     () => (name === 'keyword_search' ? buildKeywordSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
@@ -2292,11 +2316,17 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     () => (name === 'patch' ? buildPatchOutputProjection(resultText, { toolUseId: toolId }) : null),
     [name, resultText, toolId],
   );
+  const subAgentFragments = useMemo(
+    () => buildSubAgentCardFragments(result?.display_data, toolId),
+    [result?.display_data, toolId],
+  );
   const toolActiveHighlight = activeHighlight?.fragmentId
     && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
-      || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
+      || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || terminalProjection.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
     ? activeHighlight
     : null;
 
@@ -2362,6 +2392,20 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
         setOutputExpanded(true);
         return;
       }
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-terminal') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      if (!outputExpanded) {
+        setOutputExpanded(true);
+        return;
+      }
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'subagent-card') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
       onRevealHandled?.(revealRequest);
       return;
     }
@@ -2450,7 +2494,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
-          {imageResult ? (
+          {toolActiveHighlight?.fragmentId === terminalProjection.fragments[0].fragmentId ? (
+            <TerminalToolResultHighlight
+              semanticText={terminalProjection.fullText}
+              fragmentId={terminalProjection.fragments[0].fragmentId}
+              activeHighlight={toolActiveHighlight}
+            />
+          ) : imageResult ? (
             // Image result: render as image
             <div className="tool-block-image-output">
               <img
@@ -2559,7 +2609,11 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
 
       {/* Sub-agent summary (when subagents complete and update this tool result) */}
       {result?.display_data && isSubAgentSummaryData(result.display_data) && (
-        <SubAgentSummary results={result.display_data.results} />
+        <SubAgentSummary
+          results={result.display_data.results}
+          revealRequest={revealRequest?.revealTarget.kind === 'subagent-card' ? revealRequest : null}
+          activeHighlight={toolActiveHighlight}
+        />
       )}
 
       {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
@@ -2772,16 +2826,40 @@ function ChildConversationActivity({ agentId, expanded, running, finalResult }: 
   return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
 }
 
-function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
+function SubAgentActivityCard({
+  agentId,
+  task,
+  outcome,
+  revealRequest = null,
+  activeHighlight = null,
+}: {
+  agentId: string;
+  task: string;
+  outcome: SubAgentResult['outcome'] | null;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: AgentTextHighlight | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const status = statusKindFromOutcome(outcome);
   const statusClass = status.replace('_', '-');
   const running = status === 'running';
   const resultText = outcome ? getOutcomeText(outcome) : '';
+  const fragmentId = `subagent-card:${agentId}`;
+  const isActive = activeHighlight?.fragmentId === fragmentId;
+  useEffect(() => {
+    if (revealRequest?.revealTarget.kind !== 'subagent-card' || revealRequest.revealTarget.agentId !== agentId) return;
+    setExpanded(true);
+  }, [agentId, revealRequest]);
+  const semanticText = [task, resultText].filter(Boolean).join('\n');
 
   return (
-    <div className={`subagent-item activity ${statusClass}`}>
+    <div className={`subagent-item activity ${statusClass}`} data-fragment-id={fragmentId}>
       <div className="subagent-item-header">
+        {isActive && activeHighlight ? (
+          <div className="subagent-result">
+            {renderHighlightedText(semanticText, activeHighlight.start, activeHighlight.end)}
+          </div>
+        ) : null}
         <button
           type="button"
           className="subagent-expand-button"
@@ -2789,22 +2867,24 @@ function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; tas
           aria-expanded={expanded}
         >
           <span className="subagent-icon"><SubAgentStatusIcon status={status} /></span>
-          <span className="subagent-label" title={task}>{truncate(task, 72)}</span>
+          {!isActive && <span className="subagent-label" title={task}>{truncate(task, 72)}</span>}
           <span className="subagent-activity-count">activity</span>
           <span className={`subagent-status ${statusClass}`}>{getStatusLabel(status)}</span>
           <span className="subagent-expand-toggle">{expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}</span>
         </button>
         <OpenConversationButton agentId={agentId} task={task} />
       </div>
-      {resultText && !expanded && (
+      {!isActive && resultText && !expanded && (
         <div className="subagent-result preview">{truncate(resultText, 180)}</div>
       )}
-      <ChildConversationActivity
-        agentId={agentId}
-        expanded={expanded}
-        running={running}
-        finalResult={resultText ? { text: resultText, statusClass } : undefined}
-      />
+      {!isActive && (
+        <ChildConversationActivity
+          agentId={agentId}
+          expanded={expanded}
+          running={running}
+          finalResult={resultText ? { text: resultText, statusClass } : undefined}
+        />
+      )}
     </div>
   );
 }
@@ -2826,12 +2906,20 @@ function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
 }
 
 /** Single completed sub-agent row with expandable conversation view */
-function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
-  return <SubAgentActivityCard agentId={result.agent_id} task={result.task} outcome={result.outcome} />;
+function SubAgentSummaryRow({ result, revealRequest, activeHighlight }: { result: SubAgentResult; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
+  return (
+    <SubAgentActivityCard
+      agentId={result.agent_id}
+      task={result.task}
+      outcome={result.outcome}
+      {...(revealRequest !== undefined ? { revealRequest } : {})}
+      {...(activeHighlight !== undefined ? { activeHighlight } : {})}
+    />
+  );
 }
 
 /** Persistent summary of completed subagents (shown in spawn_agents tool result) */
-function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
+function SubAgentSummary({ results, revealRequest = null, activeHighlight = null }: { results: SubAgentResult[]; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
   const successCount = results.filter(r => r.outcome.type === 'success').length;
   const timeoutCount = results.filter(r => r.outcome.type === 'timed_out').length;
   const failCount = results.filter(r => r.outcome.type === 'failure').length;
@@ -2848,7 +2936,7 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
       </div>
       <div className="subagent-summary-list">
         {results.map((result) => (
-          <SubAgentSummaryRow key={result.agent_id} result={result} />
+          <SubAgentSummaryRow key={result.agent_id} result={result} revealRequest={revealRequest} activeHighlight={activeHighlight} />
         ))}
       </div>
     </div>
