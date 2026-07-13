@@ -152,6 +152,39 @@ describe('conversation message history clients', () => {
     );
   });
 
+  it('throws MessageSliceAlignmentError for typed bad-request latest-message alignment failures', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        error: 'Aligned message slice exceeds the server response ceiling of 100 messages',
+        error_type: 'message_slice_render_unit_ceiling_exceeded',
+      }),
+    } as unknown as Response);
+
+    await expect(api.getConversationMessagesLatest('conv/id', 25)).rejects.toMatchObject({
+      name: 'MessageSliceAlignmentError',
+      message: 'Aligned message slice exceeds the server response ceiling of 100 messages',
+    });
+  });
+
+  it('does not throw MessageSliceAlignmentError for unrelated latest-message failures', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({
+        error: 'database offline',
+      }),
+    } as unknown as Response);
+
+    await expect(api.getConversationMessagesLatest('conv/id', 25)).rejects.toMatchObject({
+      name: 'Error',
+      message: 'database offline',
+    });
+  });
+
   it('GETs messages before a sequence using before_message_sequence', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({

@@ -301,6 +301,36 @@ describe('history expansion reducer', () => {
     }).failure).toBeNull();
   });
 
+  it('clears an anchor-not-found failure when the deep-link target changes', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, true),
+      failure: {
+        kind: 'anchor_not_found' as const,
+        anchorMessageId: 'anchor-1',
+      },
+    };
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'target_changed', targetMessageId: 'm2',
+    }).failure).toBeNull();
+  });
+
+  it('clears an anchor-not-found failure when the deep-link target clears', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, true),
+      failure: {
+        kind: 'anchor_not_found' as const,
+        anchorMessageId: 'anchor-1',
+      },
+    };
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'target_changed', targetMessageId: null,
+    }).failure).toBeNull();
+  });
+
   it('failure leaves tail coverage usable and cannot retry itself', () => {
     const currentView = view('a', 1);
     const request = deepLinkRequest(currentView);

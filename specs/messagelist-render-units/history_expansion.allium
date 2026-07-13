@@ -172,6 +172,7 @@ rule ChangedDeepLinkClearsStaleFailure {
     when: DeepLinkTargetChanged(view, target_message_id)
     requires: view.failure != null
     requires: view.failure.kind = request_failed
+        or view.failure.kind = anchor_not_found
         or view.failure.kind = target_not_found and view.failure.target_message_id != target_message_id
     ensures: view.failure = null
 }

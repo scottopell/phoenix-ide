@@ -2424,12 +2424,18 @@ fn build_messages_around_response(
 }
 
 fn message_starts_render_unit(message: &crate::db::Message) -> bool {
-    matches!(
-        message.message_type,
-        crate::db::MessageType::User
+    match (&message.message_type, &message.content) {
+        (
+            crate::db::MessageType::User
             | crate::db::MessageType::Agent
-            | crate::db::MessageType::Skill
-    )
+            | crate::db::MessageType::Skill,
+            _,
+        ) => true,
+        (crate::db::MessageType::System, crate::db::MessageContent::System(content)) => {
+            !content.text.trim().is_empty()
+        }
+        _ => false,
+    }
 }
 
 const RENDER_UNIT_BACKFILL_CHUNK_SIZE: i64 = 64;
@@ -7326,7 +7332,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn latest_message_slice_preserves_standalone_rows_between_owner_and_tools() {
+    async fn latest_message_slice_starts_at_non_empty_system_render_unit() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let state = make_test_state().await;
@@ -7394,8 +7400,9 @@ pub(crate) mod hard_delete_cascade_tests {
                 .iter()
                 .map(|m| m.sequence_id)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![2, 3]
         );
+        assert!(latest.has_older_messages);
     }
 
     #[tokio::test]
@@ -7481,6 +7488,216 @@ pub(crate) mod hard_delete_cascade_tests {
                 .map(|m| m.sequence_id)
                 .collect::<Vec<_>>(),
             vec![1]
+        );
+        assert!(!before.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn non_empty_system_message_is_a_render_unit_boundary_for_latest_and_before_slices() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-non-empty-system-boundary",
+                "non-empty-system-boundary",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "boundary-agent",
+                "conv-non-empty-system-boundary",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-boundary".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent");
+        state
+            .db
+            .add_message(
+                "boundary-tool",
+                "conv-non-empty-system-boundary",
+                &crate::db::MessageContent::tool("tool-boundary", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+        state
+            .db
+            .add_message(
+                "boundary-system",
+                "conv-non-empty-system-boundary",
+                &crate::db::MessageContent::system("checkpoint"),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "boundary-user",
+                "conv-non-empty-system-boundary",
+                &crate::db::MessageContent::user("next prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("user");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state.clone()),
+            Path("conv-non-empty-system-boundary".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(latest.has_older_messages);
+
+        let Json(before) = get_conversation_messages(
+            State(state),
+            Path("conv-non-empty-system-boundary".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: Some(4),
+                after_message_sequence: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("before");
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(before.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_system_message_remains_non_boundary_for_latest_and_before_slices() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-whitespace-system-non-boundary",
+                "whitespace-system-non-boundary",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "whitespace-agent",
+                "conv-whitespace-system-non-boundary",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-whitespace".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent");
+        state
+            .db
+            .add_message(
+                "whitespace-tool",
+                "conv-whitespace-system-non-boundary",
+                &crate::db::MessageContent::tool("tool-whitespace", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+        state
+            .db
+            .add_message(
+                "whitespace-system",
+                "conv-whitespace-system-non-boundary",
+                &crate::db::MessageContent::system("   "),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "whitespace-user",
+                "conv-whitespace-system-non-boundary",
+                &crate::db::MessageContent::user("next prompt"),
+                None,
+                None,
+            )
+            .await
+            .expect("user");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state.clone()),
+            Path("conv-whitespace-system-non-boundary".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(latest.has_older_messages);
+
+        let Json(before) = get_conversation_messages(
+            State(state),
+            Path("conv-whitespace-system-non-boundary".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: Some(4),
+                after_message_sequence: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("before");
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
         );
         assert!(!before.has_older_messages);
     }

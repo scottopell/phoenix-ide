@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -771,7 +771,19 @@ function ConversationPageContent() {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
             const metadata = await getConversationMetaForRoute(slug);
             if (cancelled) return;
-            const latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+            let latestWindow;
+            try {
+              latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+            } catch (error) {
+              if (!(error instanceof MessageSliceAlignmentError)) throw error;
+              const full = await getConversationForRoute(slug);
+              latestWindow = {
+                messages: full.messages,
+                has_older_messages: false,
+                server_message_tail: latestMessageSequenceId(full.messages),
+                transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
+              };
+            }
             const metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? latestWindow.transcript_generation;
             if (metadataTranscriptGeneration !== latestWindow.transcript_generation) {
               throw new Error('Conversation transcript changed while loading');

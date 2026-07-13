@@ -780,6 +780,13 @@ export class NotFoundError extends Error {
   }
 }
 
+export class MessageSliceAlignmentError extends Error {
+  constructor(message = 'Aligned message slice exceeds the server response ceiling') {
+    super(message);
+    this.name = 'MessageSliceAlignmentError';
+  }
+}
+
 /** Lifecycle status of a decoupled task fork proposal (REQ-PROJ-034 / 037).
  *  `pending` is the only reviewable state; the other three are terminal
  *  resolutions and withdraw the Review affordance. Mirrors the Rust
@@ -1542,7 +1549,13 @@ export const api = {
     const resp = await fetch(
       `/api/conversations/${encodeURIComponent(id)}/messages/latest?${params}`,
     );
-    if (!resp.ok) throw new Error('Failed to fetch latest conversation messages');
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (error.error_type === 'message_slice_render_unit_ceiling_exceeded') {
+        throw new MessageSliceAlignmentError(error.error);
+      }
+      throw new Error(error.error ?? 'Failed to fetch latest conversation messages');
+    }
     return resp.json();
   },
 

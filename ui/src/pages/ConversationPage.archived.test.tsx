@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, type Conversation, type Message } from '../api';
+import { api, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { cacheDB } from '../cache';
 
@@ -512,6 +512,135 @@ describe('ConversationPage archived read-only rendering', () => {
       afterMessageFloor: 2,
       transcriptGeneration: 1,
     });
+  });
+
+  it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {
+    const mismatchConversation = makeConversation({ transcript_generation: 2 });
+    const staleLatestWindowMessage = {
+      ...catchUpMessage,
+      message_id: 'm-stale-latest-window',
+      sequence_id: 2,
+      content: [{ type: 'text', text: 'stale latest-window message' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: mismatchConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [staleLatestWindowMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+
+    vi.mocked(cacheDB.putReplicaMeta).mockClear();
+    vi.mocked(cacheDB.putMessages).mockClear();
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('Conversation transcript changed while loading')).toBeInTheDocument();
+    expect(screen.queryByText('stale latest-window message')).not.toBeInTheDocument();
+    expect(cacheDB.putMessages).not.toHaveBeenCalledWith([staleLatestWindowMessage]);
+    expect(cacheDB.putReplicaMeta).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a full archived conversation fetch when cold latest-window load hits MessageSliceAlignmentError', async () => {
+    const archivedConversation = makeConversation({ archived: true, transcript_generation: 3 });
+    const fallbackMessage = {
+      ...catchUpMessage,
+      message_id: 'm-fallback',
+      sequence_id: 2,
+      content: [{ type: 'text', text: 'full fetch fallback message' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: archivedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockRejectedValue(
+      new MessageSliceAlignmentError('Aligned message slice exceeds the server response ceiling of 100 messages'),
+    );
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: archivedConversation,
+      messages: [historyMessage, fallbackMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('full fetch fallback message')).toBeInTheDocument();
+    expect(screen.getByTestId('history-message-count')).toHaveTextContent('2');
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('no');
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    await waitFor(() => expect(api.getConversationBySlug).toHaveBeenCalledWith(slug));
+  });
+
+  it('does not fall back to a full fetch for unrelated latest-window cold-load failures', async () => {
+    const archivedConversation = makeConversation({ archived: true, transcript_generation: 3 });
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: archivedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockRejectedValue(new Error('database offline'));
+    vi.mocked(api.getConversationBySlug).mockClear();
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('database offline')).toBeInTheDocument();
+    expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
   it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {

@@ -104,6 +104,7 @@ export function reduceHistoryExpansion(
       const staleCommand = state.pendingCommand?.kind === 'jump_to_message'
         && state.pendingCommand.targetMessageId !== event.targetMessageId;
       const staleFailure = state.failure?.kind === 'request_failed'
+        || state.failure?.kind === 'anchor_not_found'
         || (state.failure?.kind === 'target_not_found'
           && state.failure.targetMessageId !== event.targetMessageId);
       if (!staleRequest && !staleCommand && !staleFailure) return state;
