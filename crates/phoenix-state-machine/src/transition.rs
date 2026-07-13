@@ -4575,6 +4575,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         };
 
         let result = handle_context_exhaustion(
@@ -4644,6 +4645,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         }
     }
 
@@ -4969,6 +4971,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         };
 
         let result = transition(
@@ -5078,6 +5081,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -5133,6 +5137,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         };
 
         // Non-retryable error at attempt 1 → immediate failure
@@ -5194,6 +5199,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
             work_scope_worktree: None,
         };
 

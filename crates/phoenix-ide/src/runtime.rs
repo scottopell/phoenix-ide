@@ -2627,6 +2627,7 @@ impl RuntimeManager {
                 .is_coordinator_conversation(conversation_id)
                 .await
                 .map_err(|e| e.to_string())?;
+        context.is_coordinator = is_coordinator;
         if is_coordinator {
             context.persona = Some(
                 "You are Phoenix Coordinator, the single durable conversation for helping the user run their fleet of Phoenix conversations. Use the deterministic fleet projection for current status and the global history tools for evidence. You are read-only: analyze and recommend, but never claim to mutate projects, tasks, files, or other conversations. Cite historical and source-specific claims with the stable app-local links or @conv/@chain/@work references returned by tools. You operate only when the user sends a turn; do not imply background monitoring."

@@ -33,7 +33,9 @@ export function CoordinatorPage() {
     Promise.all([api.ensureGlobalCoordinator(), api.getGlobalOpenWork()])
       .then(([coordinator, work]) => {
         setOpenWork(work);
-        if (!slug) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+        if (slug !== coordinator.conversation.id) {
+          navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+        }
         setError(null);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))

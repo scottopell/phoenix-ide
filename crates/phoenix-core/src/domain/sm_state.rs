@@ -2134,6 +2134,8 @@ pub struct ConvContext {
     /// agent (see `specs/agents/`). Replaces the base preamble in the system
     /// prompt (REQ-AG-006). Only ever set for sub-agents.
     pub persona: Option<String>,
+    /// True only for the singleton global Coordinator runtime.
+    pub is_coordinator: bool,
 }
 
 /// Default context window for unknown models (conservative)
@@ -2165,6 +2167,7 @@ impl ConvContext {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         }
     }
 
@@ -2194,6 +2197,7 @@ impl ConvContext {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
             persona: None,
+            is_coordinator: false,
         }
     }
 }

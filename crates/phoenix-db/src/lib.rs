@@ -2551,6 +2551,7 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
+               AND c.id != COALESCE((SELECT conversation_id FROM coordinator WHERE singleton = 1), '')
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -13259,6 +13260,12 @@ mod tests {
             .is_coordinator_conversation(&continuation.id)
             .await
             .unwrap());
+        assert!(!db
+            .list_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|conversation| conversation.id == continuation.id));
     }
 
     // ------------------------------------------------------------------

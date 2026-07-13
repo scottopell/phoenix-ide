@@ -4338,6 +4338,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
+        let is_coordinator = self.context.is_coordinator;
         let explore_bash = self.context.explore_bash;
 
         // Token streaming channel (REQ-BED-025).
@@ -4466,15 +4467,22 @@ where
 
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
-            let system_prompt = build_system_prompt(
-                &working_dir,
-                &tasks_dir_name,
-                is_sub_agent,
-                mode_context.as_ref(),
-                llm_language,
-                persona.as_deref(),
-                explore_bash_capability,
-            );
+            let system_prompt = if is_coordinator {
+                crate::system_prompt::build_coordinator_system_prompt(
+                    llm_language,
+                    persona.as_deref().unwrap_or("You are Phoenix Coordinator."),
+                )
+            } else {
+                build_system_prompt(
+                    &working_dir,
+                    &tasks_dir_name,
+                    is_sub_agent,
+                    mode_context.as_ref(),
+                    llm_language,
+                    persona.as_deref(),
+                    explore_bash_capability,
+                )
+            };
 
             // Build request — normalize messages against current tool set
             let tool_names: std::collections::HashSet<&str> =

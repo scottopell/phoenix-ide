@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
@@ -21,14 +21,18 @@ vi.mock('../api', async () => {
 
 vi.mock('./ConversationPage', () => ({ ConversationPage: () => <div>Shared conversation runtime</div> }));
 
-function renderPage() {
+function renderPage(initialEntry = '/global/conv-coordinator') {
   return render(
-    <MemoryRouter initialEntries={['/global/conv-coordinator']}>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
         <Route path="/global/:slug" element={<CoordinatorPage />} />
       </Routes>
     </MemoryRouter>,
   );
+}
+
+function CurrentPath() {
+  return <div>{useLocation().pathname}</div>;
 }
 
 const coordinatorConversation = (): Conversation => ({
@@ -105,6 +109,18 @@ describe('CoordinatorPage', () => {
     expect(screen.getByText('Fix coordinator page')).toBeInTheDocument();
     expect(screen.getByText('TASK 08700')).toBeInTheDocument();
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
+  });
+
+  it('replaces a stale Coordinator continuation URL with the singleton route', async () => {
+    render(
+      <MemoryRouter initialEntries={['/global/stale-coordinator']}>
+        <Routes>
+          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('/global/conv-coordinator')).toBeInTheDocument();
   });
 
   it('expands a fleet row to reveal audit detail and copies the durable reference', async () => {
