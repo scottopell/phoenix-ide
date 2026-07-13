@@ -736,10 +736,7 @@ fn status_refresh_from_prs(
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     let checks = if matches!(display_state, PrDisplayState::Open) {
         match client.pr_checks(&gh_pr_target(repo, pr.number)) {
-            Ok(checks) => capture_checks(
-                &checks,
-                capture_log_snippets(client, &gh_pr_target(repo, pr.number), &checks),
-            ),
+            Ok(checks) => capture_checks(&checks, Vec::new()),
             Err(error) => {
                 tracing::debug!(pr = pr.number, error = %error.message, "gh pr checks could not run");
                 unknown_checks()
@@ -785,13 +782,7 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
             Err(error) => Err((*error).clone()),
         };
         match checks_result {
-            Ok(checks) => {
-                let target = repo.as_ref().expect("checks require resolved repository");
-                capture_checks(
-                    &checks,
-                    capture_log_snippets(client, &gh_pr_target(target, pr.number), &checks),
-                )
-            }
+            Ok(checks) => capture_checks(&checks, Vec::new()),
             Err(e) => {
                 tracing::debug!(pr = pr.number, error = %e.message, "gh pr checks could not run");
                 unknown_checks()
@@ -1110,14 +1101,18 @@ mod pr_context_repo_slug_tests {
 
     #[test]
     fn slugifies_repository_identity_for_filenames() {
-        assert_eq!(
-            pr_context_repo_slug("Scott.Opell", "phoenix_ide"),
-            "scott-opell--phoenix-ide"
+        assert!(pr_context_repo_slug("Scott.Opell", "phoenix_ide")
+            .starts_with("scott-opell--phoenix-ide-"));
+        assert!(pr_context_repo_slug("", "Repo").starts_with("repo-"));
+        assert!(pr_context_repo_slug("", "").starts_with("unknown-repo-"));
+        assert_ne!(
+            pr_context_repo_slug("a.b", "repo"),
+            pr_context_repo_slug("a-b", "repo")
         );
-        assert_eq!(pr_context_repo_slug("", "Repo"), "repo");
-        assert_eq!(pr_context_repo_slug("", ""), "unknown-repo");
     }
 }
+
+use std::hash::{Hash, Hasher};
 
 fn pr_context_repo_slug(repo_owner: &str, repo_name: &str) -> String {
     fn sanitize(part: &str) -> String {
@@ -1142,12 +1137,17 @@ fn pr_context_repo_slug(repo_owner: &str, repo_name: &str) -> String {
 
     let owner = sanitize(repo_owner);
     let name = sanitize(repo_name);
-    match (owner.is_empty(), name.is_empty()) {
+    let readable = match (owner.is_empty(), name.is_empty()) {
         (false, false) => format!("{owner}--{name}"),
         (false, true) => owner,
         (true, false) => name,
         (true, true) => "unknown-repo".to_string(),
-    }
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo_owner.to_ascii_lowercase().hash(&mut hasher);
+    "/".hash(&mut hasher);
+    repo_name.to_ascii_lowercase().hash(&mut hasher);
+    format!("{readable}-{:016x}", hasher.finish())
 }
 
 /// Delete all but the newest `keep` context bundles for `repo_slug` + `pr_number` in `dir`.
@@ -3272,7 +3272,10 @@ mod tests {
             &std::fs::read_to_string(temp.path().join(&response.artifact_path)).unwrap(),
         )
         .unwrap();
-        assert!(response.artifact_path.contains("pr-owner--repo-7-"));
+        assert!(
+            response.artifact_path.contains("pr-owner--repo-")
+                && response.artifact_path.contains("-7-")
+        );
         assert_eq!(artifact["manifest_version"], ARTIFACT_VERSION);
         assert_eq!(artifact["pr"]["number"], 7);
         assert_eq!(

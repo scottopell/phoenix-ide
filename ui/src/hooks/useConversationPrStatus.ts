@@ -132,7 +132,24 @@ function publicStateForScope(
 ): ConversationPrStatusState {
   if (!scopeKey) return { status: 'disabled', prStatus: null };
   if (internalState.scopeKey === scopeKey) {
-    if (shouldShowCachedSeed(internalState, cachedSeed)) return { status: 'ready', prStatus: cachedSeed };
+    if (shouldShowCachedSeed(internalState, cachedSeed) && cachedSeed) {
+      const liveSelection = internalState.status === 'ready'
+        ? selectionFromPrStatus(internalState.prStatus)
+        : null;
+      return {
+        status: 'ready',
+        prStatus: liveSelection
+          ? {
+              ...cachedSeed,
+              associated_prs: liveSelection.associated_prs,
+              ...(liveSelection.active_pr ? { active_pr: liveSelection.active_pr } : {}),
+              ...(liveSelection.latest_observed_branch
+                ? { latest_observed_branch: liveSelection.latest_observed_branch }
+                : {}),
+            }
+          : cachedSeed,
+      };
+    }
     return internalState;
   }
   if (cachedSeed) return { status: 'ready', prStatus: cachedSeed };
@@ -258,9 +275,12 @@ export function useConversationPrStatus({
   }, [scopeKey, refresh]);
 
   const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
-  const activeSelection = publicState.status === 'ready'
+  const liveSelection = internalState.scopeKey === scopeKey && internalState.status === 'ready'
+    ? selectionFromPrStatus(internalState.prStatus)
+    : null;
+  const activeSelection = liveSelection ?? (publicState.status === 'ready'
     ? (selectionFromPrStatus(publicState.prStatus) ?? cachedSelection)
-    : cachedSelection;
+    : cachedSelection);
 
   const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {
     if (!scopeKey || !conversationId) return;
