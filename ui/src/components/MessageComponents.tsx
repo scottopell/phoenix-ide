@@ -36,15 +36,13 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
+import { buildAgentTextFragments, type ConversationTextFragment } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
-import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
-import { formatCommissionReviewInput, parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
-import './MessageComponents.css';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -197,7 +195,6 @@ export function formatMessageTime(isoStr: string): string {
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 
-
 /**
  * Strip model artifacts from think tool thoughts:
  * - Remove optional opening <thinking> wrapper
@@ -279,9 +276,6 @@ function bashInputCopyText(input: Record<string, unknown>): string {
 }
 
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
-  if (name === 'commission_review') {
-    return formatCommissionReviewInput(input);
-  }
   switch (name) {
     case 'bash': {
       if (isBashToolInput(input)) {
@@ -748,6 +742,17 @@ function shouldCollapseCompactText(text: string): boolean {
   return hidesAdditionalLines || truncatesFirstLine;
 }
 
+function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
+  if (start < 0 || end <= start || start >= text.length) return text;
+  return (
+    <>
+      {text.slice(0, start)}
+      <mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(start, Math.min(end, text.length))}</mark>
+      {text.slice(Math.min(end, text.length))}
+    </>
+  );
+}
+
 /**
  * A fully-rendered assistant prose block. Memoized so a turn's completed
  * prose is not re-parsed through ReactMarkdown every time the parent
@@ -757,24 +762,6 @@ function shouldCollapseCompactText(text: string): boolean {
  * a memoized map, so a shallow prop compare bails for unchanged text.
  * Mirrors the per-block memoization StreamingMessage uses for the same reason.
  */
-const AgentTextBlock = memo(function AgentTextBlock({
-  text,
-  remarkPlugins,
-  components,
-}: {
-  text: string;
-  remarkPlugins: typeof REMARK_PLUGINS;
-  components: React.ComponentProps<typeof ReactMarkdown>['components'];
-}) {
-  return (
-    <div className="agent-text-block">
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-        {text}
-      </ReactMarkdown>
-    </div>
-  );
-});
-
 /**
  * An assistant text block that, in compact mode, has content hidden by its
  * preview. Renders as a faded clickable one-liner that expands to the full
@@ -785,37 +772,30 @@ const CollapsibleText = memo(CollapsibleTextImpl);
 
 function CollapsibleTextImpl({
   text,
-  remarkPlugins,
-  components,
+  summary,
+  expanded,
+  onExpand,
 }: {
   text: string;
-  remarkPlugins: typeof REMARK_PLUGINS;
-  components: React.ComponentProps<typeof ReactMarkdown>['components'];
+  summary: string;
+  expanded: boolean;
+  onExpand: () => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
-
   if (expanded) {
-    return (
-      <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-          {text}
-        </ReactMarkdown>
-      </div>
-    );
+    return <div className="agent-text-block">{text}</div>;
   }
 
-  const summary = firstLineSummary(text);
   return (
     <div
       className="agent-text-collapsed"
       role="button"
       tabIndex={0}
       title={summary}
-      onClick={() => setExpanded(true)}
+      onClick={onExpand}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          setExpanded(true);
+          onExpand();
         }
       }}
     >
@@ -875,11 +855,22 @@ function CompactToolStripImpl({
 // Agent Message Components
 // ============================================================================
 
+export interface AgentTextRevealRequest {
+  unitKey: string;
+  fragmentId: string;
+  nonce: number;
+}
+
+interface AgentTextHighlight {
+  fragmentId: string;
+  start: number;
+  end: number;
+}
+
 interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
-  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -896,11 +887,15 @@ interface AgentMessageProps {
    */
   forceExpandedText?: boolean;
   isLatestAgentMessage?: boolean;
+  unitKey?: string;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: AgentTextHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1019,6 +1014,67 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     } satisfies Components;
   }, [onOpenFile, filePathCopyContext, filePathRootDir, syntaxStyle]);
 
+  const textFragments = useMemo(
+    () => buildAgentTextFragments(blocks, density, { forceExpandedText }),
+    [blocks, density, forceExpandedText],
+  );
+  const [expandedFragmentIds, setExpandedFragmentIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    if (!revealRequest || revealRequest.unitKey !== unitKey) return;
+    setExpandedFragmentIds((current) => {
+      if (current.has(revealRequest.fragmentId)) return current;
+      const next = new Set(current);
+      next.add(revealRequest.fragmentId);
+      return next;
+    });
+    onRevealHandled?.(revealRequest);
+  }, [onRevealHandled, revealRequest, unitKey]);
+
+  const expandFragment = useCallback((fragmentId: string) => {
+    setExpandedFragmentIds((current) => {
+      if (current.has(fragmentId)) return current;
+      const next = new Set(current);
+      next.add(fragmentId);
+      return next;
+    });
+  }, []);
+
+  const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
+    const remarkPlugins = usesGfmSyntax(fragment.semanticText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
+    const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
+    const highlight = activeHighlight?.fragmentId === fragment.fragmentId
+      ? activeHighlight
+      : null;
+    const content = highlight
+      ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
+      : fragment.semanticText;
+    if (!expanded) {
+      return (
+        <CollapsibleText
+          key={fragment.fragmentId}
+          text={fragment.semanticText}
+          summary={fragment.display.summaryText}
+          expanded={false}
+          onExpand={() => expandFragment(fragment.fragmentId)}
+        />
+      );
+    }
+    return (
+      <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
+        <div className="agent-text-block">
+          <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+            {typeof content === 'string' ? content : fragment.semanticText}
+          </ReactMarkdown>
+          {typeof content !== 'string' && <div className="viewer-find-inline-highlight" data-active-fragment-highlight>{content}</div>}
+        </div>
+      </div>
+    );
+  }, [activeHighlight, expandFragment, expandedFragmentIds, forceExpandedText, markdownComponents]);
+  const textFragmentById = useMemo(
+    () => new Map(textFragments.map((fragment) => [fragment.fragmentId, fragment])),
+    [textFragments],
+  );
+
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
     if (block.type === 'text') {
@@ -1088,31 +1144,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
           let stripEmitted = false;
           return blocks.map((block, i) => {
             if (block.type === 'text') {
-              // Skip empty text blocks - they produce empty bubbles
-              if (!block.text || block.text.trim() === '') {
+              const fragment = textFragmentById.get(`agent-text-${i}`);
+              if (!fragment || fragment.semanticText.trim() === '') {
                 return null;
               }
-              const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
-              // Compact: only previews that hide content fold to an expandable one-liner.
-              // Substantial prose (>= threshold) always renders full.
-              if (compact && !forceExpandedText && shouldCollapseCompactText(block.text)) {
-                return (
-                  <CollapsibleText
-                    key={i}
-                    text={block.text}
-                    remarkPlugins={remarkPlugins}
-                    components={markdownComponents}
-                  />
-                );
-              }
-              return (
-                <AgentTextBlock
-                  key={i}
-                  text={block.text}
-                  remarkPlugins={remarkPlugins}
-                  components={markdownComponents}
-                />
-              );
+              return renderTextFragment(fragment);
             } else if (block.type === 'tool_use') {
               // `think` renders as a subtle inline aside, not the full tool-block
               // shell — it's model reasoning, not an action. Collapsed by default,
@@ -1158,8 +1194,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
                   block={block}
                   result={result}
                   onOpenFile={onOpenFile}
-                  onOpenCommissionReview={onOpenCommissionReview}
-                  requestSequenceId={message.sequence_id}
                   workScopeKey={workScopeKey}
                   knownResultIds={knownResultIds}
                   toolStartedAtMs={toolStartedAtMs}
@@ -1227,8 +1261,6 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
-  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
-  requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
@@ -1388,7 +1420,6 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   }
   return null;
 }
-
 
 function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
   const { openInspect } = useViewerSlotCommands();
@@ -2136,7 +2167,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2310,13 +2341,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   const bashCopyTitle = name === 'bash' && isBashToolInput(input as Record<string, unknown>) && (input as BashToolInput).op !== 'run'
     ? 'Copy operation'
     : 'Copy command';
-  const commissionReviewDisplayData = name === 'commission_review'
-    ? parseCommissionReviewResult(result?.display_data, resultText)
-    : null;
-  const commissionReviewInput = name === 'commission_review'
-    ? parseCommissionReviewInput(input as Record<string, unknown>)
-    : null;
-  const hasStructuredCommissionReview = commissionReviewDisplayData !== null;
 
   return (
     <div className="tool-block" data-tool-id={toolId}>
@@ -2327,14 +2351,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       </div>
 
       {/* Tool input - always visible */}
-      {name === 'commission_review' && commissionReviewInput ? (
-        <CommissionReviewInputView input={commissionReviewInput} />
-      ) : (
-        <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-          {inputDisplay}
-          <CopyButton text={rawInput} title={bashCopyTitle} />
-        </div>
-      )}
+      <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
+        {inputDisplay}
+        <CopyButton text={rawInput} title={bashCopyTitle} />
+      </div>
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
@@ -2375,13 +2395,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
               rawText={resultText}
               metadata={readFileMetadata}
               onOpenFile={onOpenFile}
-            />
-          ) : hasStructuredCommissionReview && commissionReviewDisplayData ? (
-            <CommissionReviewSummaryCard
-              data={commissionReviewDisplayData}
-              formatDuration={formatToolDuration}
-              requestSequenceId={requestSequenceId}
-              onOpenFullReview={onOpenCommissionReview}
             />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse

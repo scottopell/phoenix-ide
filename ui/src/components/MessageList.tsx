@@ -29,6 +29,7 @@ import {
   UserMessage,
   QueuedUserMessage,
   AgentMessage,
+  type AgentTextRevealRequest,
   SubAgentStatus,
   SkillCommandText,
   formatMessageTime,
@@ -109,7 +110,6 @@ interface MessageListProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   systemPrompt?: string | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
@@ -166,7 +166,6 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
 }
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-type OnOpenCommissionReview = ((requestSequenceId: number) => void) | undefined;
 
 function activeToolUseIdFromState(convState: ConversationState): string | undefined {
   if (convState.type !== 'tool_executing' && convState.type !== 'cancelling_tool') return undefined;
@@ -177,13 +176,15 @@ function activeToolUseIdFromState(convState: ConversationState): string | undefi
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
-  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
   isLatestAgentMessage: boolean,
+  revealRequest: AgentTextRevealRequest | null,
+  activeHighlight: { fragmentId: string; start: number; end: number } | null,
+  onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
@@ -222,13 +223,16 @@ function renderHistoricalUnit(
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
-          onOpenCommissionReview={onOpenCommissionReview}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
+          unitKey={unit.key}
+          revealRequest={revealRequest}
+          activeHighlight={activeHighlight}
+          onRevealHandled={onRevealHandled}
         />
       );
     case 'system': {
@@ -269,13 +273,15 @@ function renderUnit(
   unit: RenderUnit,
   slug: string | undefined,
   onOpenFile: OnOpenFile,
-  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
   isLatestAgentMessage: boolean,
+  revealRequest: AgentTextRevealRequest | null,
+  activeHighlight: { fragmentId: string; start: number; end: number } | null,
+  onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
@@ -283,7 +289,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
+  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled);
 }
 
 interface SystemPromptHeaderProps {
@@ -337,7 +343,6 @@ function MessageListImpl({
   onRetry,
   onCancelSteering,
   onOpenFile,
-  onOpenCommissionReview,
   systemPrompt,
   conversationId,
   slug,
@@ -443,6 +448,15 @@ function MessageListImpl({
   const activeFindMatchKey = activeFindMatch
     ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
     : null;
+  const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
+  const activeFindHighlight = activeFindMatch?.target.kind === 'unit-text' && activeFindMatch.target.fragmentId
+    ? {
+        unitKey: activeFindMatch.target.unitKey,
+        fragmentId: activeFindMatch.target.fragmentId,
+        start: activeFindMatch.start,
+        end: activeFindMatch.end,
+      }
+    : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;
@@ -451,6 +465,9 @@ function MessageListImpl({
     } catch {
       return null;
     }
+  }, []);
+  const handleRevealHandled = useCallback((request: AgentTextRevealRequest) => {
+    setPendingRevealRequest((current) => (current?.nonce === request.nonce ? null : current));
   }, []);
   const openFind = useCallback(() => {
     findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1101,6 +1118,9 @@ function MessageListImpl({
       return () => timers.forEach(clearTimeout);
     }
     const unitMatch = match.target;
+    if (unitMatch.fragmentId) {
+      setPendingRevealRequest({ unitKey: unitMatch.unitKey, fragmentId: unitMatch.fragmentId, nonce: Date.now() });
+    }
     transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
@@ -1108,6 +1128,10 @@ function MessageListImpl({
       clearFindRowMatches();
       row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
       row.scrollIntoView({ block: 'center' });
+      if (unitMatch.fragmentId) {
+        const fragment = row.querySelector(`[data-fragment-id="${CSS.escape(unitMatch.fragmentId)}"]`);
+        fragment?.scrollIntoView({ block: 'center' });
+      }
     }, delay));
     return () => timers.forEach(clearTimeout);
   }, [activeFindMatchKey, clearFindRowMatches, dispatchScrollEvent, findRowByKey]);
@@ -1157,10 +1181,25 @@ function MessageListImpl({
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
-        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
+        {renderUnit(
+          unit,
+          slug,
+          onOpenFile,
+          filePathRootDir,
+          onRetry,
+          onCancelSteering,
+          workScopeKey,
+          activeToolUseId,
+          unit.kind === 'agent_turn' && unit.key === latestAgentKey,
+          pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
+          activeFindHighlight && activeFindHighlight.unitKey === unit.key
+            ? { fragmentId: activeFindHighlight.fragmentId, start: activeFindHighlight.start, end: activeFindHighlight.end }
+            : null,
+          handleRevealHandled,
+        )}
       </div>
     ),
-    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

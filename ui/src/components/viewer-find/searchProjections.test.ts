@@ -3,6 +3,7 @@ import type { ContentBlock, ConversationState, Message } from '../../api';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import {
+  buildAgentTextFragments,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
@@ -199,6 +200,25 @@ describe('buildDiffSearchProjection', () => {
       startColumn: 0,
       endColumn: 4,
     });
+  });
+});
+
+describe('buildAgentTextFragments', () => {
+  it('preserves semantic text for compact-collapsed assistant fragments', () => {
+    const blocks = [{ type: 'text', text: 'first line\nhidden second line alpha' }] as const;
+    const fragments = buildAgentTextFragments(blocks, 'compact');
+    expect(fragments).toHaveLength(1);
+    expect(fragments[0]?.fragmentId).toBe('agent-text-0');
+    expect(fragments[0]?.semanticText).toBe('first line\nhidden second line alpha');
+    expect(fragments[0]?.display.mode).toBe('compact-collapsed');
+    expect(fragments[0]?.display.summaryText).toBe('first line');
+  });
+
+  it('force-expands latest assistant fragments without changing semantic text', () => {
+    const blocks = [{ type: 'text', text: 'first line\nhidden second line alpha' }] as const;
+    const fragments = buildAgentTextFragments(blocks, 'compact', { forceExpandedText: true });
+    expect(fragments[0]?.display.mode).toBe('full');
+    expect(fragments[0]?.semanticText).toBe('first line\nhidden second line alpha');
   });
 });
 

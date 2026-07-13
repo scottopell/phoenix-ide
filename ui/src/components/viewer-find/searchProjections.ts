@@ -69,8 +69,21 @@ export interface ConversationUnitSearchMatchTarget {
   unitKind: RenderUnit['kind'];
   unitIndex: number;
   sourceId: string;
+  fragmentId?: string;
   start: number;
   end: number;
+}
+
+export interface ConversationTextFragmentDisplay {
+  mode: 'full' | 'compact-collapsed';
+  summaryText: string;
+}
+
+export interface ConversationTextFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: ConversationTextFragmentDisplay;
+  revealRequestKey: string;
 }
 
 export interface ConversationHeaderSearchMatchTarget {
@@ -91,6 +104,7 @@ export interface ConversationSearchSource extends SearchableSource<ConversationS
   unitKind: RenderUnit['kind'];
   unitIndex: number;
   role: string;
+  fragmentId?: string;
 }
 
 export type ConversationSearchProjection = SearchableSourceProjection<
@@ -399,7 +413,8 @@ export function buildConversationSearchProjection(
             unit.kind,
             unit.key,
             source.role,
-            visibleConversationText(source.text, density, { forceExpanded: source.forceExpanded }),
+            source.text,
+            source.fragmentId,
           );
         }
         break;
@@ -440,6 +455,7 @@ export function buildConversationSearchProjection(
           unitKind: source.unitKind,
           unitIndex: source.unitIndex,
           sourceId: source.id,
+          fragmentId: source.fragmentId,
           start: match.start,
           end: match.end,
         }),
@@ -485,6 +501,7 @@ function addConversationSource(
   unitKey: string,
   role: string,
   text: string,
+  fragmentId?: string,
 ): void {
   if (text.length === 0) return;
   out.push({
@@ -494,6 +511,7 @@ function addConversationSource(
     unitKind,
     unitIndex,
     role,
+    fragmentId,
     text,
     target: {
       kind: 'unit-text',
@@ -501,6 +519,7 @@ function addConversationSource(
       unitKind,
       unitIndex,
       sourceId: `${unitKey}:${role}:${out.length}`,
+      fragmentId,
       start: 0,
       end: 0,
     },
@@ -551,16 +570,6 @@ function isHiddenSystemMessage(message: Message): boolean {
   return displayData?.hidden === true;
 }
 
-function visibleConversationText(
-  text: string,
-  density: 'full' | 'compact',
-  options: { forceExpanded?: boolean | undefined } = {},
-): string {
-  if (options.forceExpanded) return text;
-  if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
-  return firstLineSummary(text);
-}
-
 function visibleStreamingText(buffer: StreamingBuffer | null | undefined): string {
   return buffer?.text ?? '';
 }
@@ -589,21 +598,43 @@ function toolResultText(result: Message | undefined): string {
   return content?.content || content?.result || content?.error || '';
 }
 
+export function buildAgentTextFragments(
+  blocks: readonly ContentBlock[],
+  density: 'full' | 'compact',
+  options: { forceExpandedText?: boolean | undefined } = {},
+): ConversationTextFragment[] {
+  const out: ConversationTextFragment[] = [];
+  blocks.forEach((block, index) => {
+    if (block.type !== 'text') return;
+    const semanticText = block.text ?? '';
+    const fragmentId = `agent-text-${index}`;
+    const collapsed = !options.forceExpandedText && density === 'compact' && shouldCollapseCompactText(semanticText);
+    out.push({
+      fragmentId,
+      semanticText,
+      revealRequestKey: fragmentId,
+      display: collapsed
+        ? { mode: 'compact-collapsed', summaryText: firstLineSummary(semanticText) }
+        : { mode: 'full', summaryText: semanticText },
+    });
+  });
+  return out;
+}
+
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
-): Array<{ role: string; text: string; forceExpanded?: boolean }> {
+): Array<{ role: string; text: string; fragmentId?: string }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const out: Array<{ role: string; text: string; forceExpanded?: boolean }> = [];
+  const out: Array<{ role: string; text: string; fragmentId?: string }> = [];
+  for (const fragment of buildAgentTextFragments(blocks, density, { forceExpandedText })) {
+    out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId });
+  }
   blocks.forEach((block, index) => {
-    if (block.type === 'text') {
-      out.push({ role: `agent-text-${index}`, text: block.text ?? '', forceExpanded: forceExpandedText });
-      return;
-    }
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
@@ -611,7 +642,6 @@ function agentTurnSources(
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
         out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
       }
-      return;
     }
   });
   return out;

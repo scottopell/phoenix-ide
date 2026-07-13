@@ -56,6 +56,9 @@ vi.mock('../api', async (importOriginal) => {
 beforeEach(() => {
   mockDensity = 'full';
 });
+afterEach(() => {
+  mockDensity = 'full';
+});
 
 function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Message {
   return {
@@ -3077,5 +3080,52 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     });
     // A genuine resolution never surfaces a conflict error.
     expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('AgentMessage compact find reveal', () => {
+  it('expands a hidden compact fragment on reveal and marks the exact occurrence', async () => {
+    mockDensity = 'compact';
+    const message = agentMessage('agent-find', [
+      { type: 'text', text: 'first line\nhidden second line alpha target' },
+    ]);
+    const toolResults = new Map<string, Message>();
+    const onRevealHandled = vi.fn();
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={toolResults}
+          unitKey="unit-find"
+          revealRequest={null}
+          activeHighlight={null}
+          onRevealHandled={onRevealHandled}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('button', { name: 'first line' })).toHaveTextContent('first line');
+    expect(screen.queryByText('hidden second line alpha target')).toBeNull();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={toolResults}
+          unitKey="unit-find"
+          revealRequest={{ unitKey: 'unit-find', fragmentId: 'agent-text-0', nonce: 1 }}
+          activeHighlight={{ fragmentId: 'agent-text-0', start: 30, end: 42 }}
+          onRevealHandled={onRevealHandled}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalled());
+    expect(screen.getByText(/hidden second line alpha/)).toBeInTheDocument();
+    const highlight = document.querySelector('.viewer-find-inline-match--active');
+    expect(highlight).not.toBeNull();
+    expect(highlight).toHaveTextContent('alpha target');
   });
 });

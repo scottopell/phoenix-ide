@@ -51,10 +51,11 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string }) => void) | undefined }) => {
       agentRenderCounter.count++;
       agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
-      return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
+      if (revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
       <div data-testid="subagent-status-mock">
@@ -3013,3 +3014,31 @@ describe('handleTotalListHeightChanged', () => {
 });
 
 
+
+
+it('find navigation requests reveal for compact hidden assistant second-line matches', async () => {
+  const messages: Message[] = [
+    { ...makeMessage(1, 'agent'), message_id: 'agent-hidden', content: [{ type: 'text', text: 'first line\nhidden second line alpha target' }] },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-reveal"
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'alpha target' } });
+
+  await waitFor(() => {
+    const highlighted = document.querySelector('[data-highlight-fragment="agent-text-0"]');
+    expect(highlighted).not.toBeNull();
+  });
+  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+});
