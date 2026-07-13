@@ -24,32 +24,32 @@ use super::{
 fn scope() -> WorkScopeIdentity {
     WorkScopeIdentity {
         kind: WorkScopeKind::Conversation,
-        stable_key: "conv-7",
+        stable_key: "conv-7".into(),
     }
 }
 
-fn bash_identity(handle_id: &'static str) -> WakeResourceIdentity {
+fn bash_identity(handle_id: impl Into<String>) -> WakeResourceIdentity {
     WakeResourceIdentity::Bash(BashResourceIdentity {
         work_scope: scope(),
-        handle_id,
+        handle_id: handle_id.into(),
     })
 }
 
-fn tmux_identity(window_id: &'static str) -> WakeResourceIdentity {
+fn tmux_identity(window_id: impl Into<String>) -> WakeResourceIdentity {
     WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
         work_scope: scope(),
-        server_generation: "srv-1",
-        window_id,
+        server_generation: "srv-1".into(),
+        window_id: window_id.into(),
     })
 }
 
 fn registration_intent(resource: WakeResourceIdentity) -> WakeRegistrationIntent {
     WakeRegistrationIntent {
-        contract_id: "contract-1",
-        conversation_id: "conv-7",
+        contract_id: "contract-1".into(),
+        conversation_id: "conv-7".into(),
         registration_scope: scope(),
         resource,
-        registering_tool_use_id: "tool-9",
+        registering_tool_use_id: "tool-9".into(),
         registered_at: Timestamp(5),
         expires_at: Timestamp(20),
     }
@@ -65,6 +65,43 @@ fn workflow() -> WorkflowState<WakeProfile> {
         super::registration_snapshot(&intent, Version(3)),
     )
     .expect("accepting protocol")
+}
+
+#[test]
+fn persistence_domain_accepts_runtime_owned_strings() {
+    let dynamic = |value: &str| value.to_owned();
+    let intent = WakeRegistrationIntent {
+        contract_id: dynamic("contract-runtime"),
+        conversation_id: dynamic("conversation-runtime"),
+        registration_scope: WorkScopeIdentity {
+            kind: WorkScopeKind::Worktree,
+            stable_key: dynamic("worktree-runtime"),
+        },
+        resource: WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+            work_scope: WorkScopeIdentity {
+                kind: WorkScopeKind::Worktree,
+                stable_key: dynamic("worktree-runtime"),
+            },
+            server_generation: dynamic("generation-runtime"),
+            window_id: dynamic("window-runtime"),
+        }),
+        registering_tool_use_id: dynamic("tool-runtime"),
+        registered_at: Timestamp(5),
+        expires_at: Timestamp(20),
+    };
+
+    let snapshot = super::registration_snapshot(&intent, Version(4));
+    let receipt = registration_receipt(&intent);
+    let continuation = continuation_from_snapshot(&snapshot, vec![], vec![], 9);
+
+    assert_eq!(snapshot.contract_id, "contract-runtime");
+    assert_eq!(snapshot.conversation_id, "conversation-runtime");
+    assert_eq!(receipt.registering_tool_use_id, "tool-runtime");
+    assert_eq!(continuation.pending_contract, "contract-runtime");
+    assert_eq!(
+        snapshot.resource.work_scope().stable_key,
+        "worktree-runtime"
+    );
 }
 
 #[test]
@@ -122,8 +159,8 @@ fn registration_receipt_and_barrier_round_trip_preserve_contract_resource_and_de
 fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
     let bash = bash_identity("b-1");
     let bash_evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
-        identity: match bash {
-            WakeResourceIdentity::Bash(identity) => identity,
+        identity: match &bash {
+            WakeResourceIdentity::Bash(identity) => identity.clone(),
             WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
         },
         status: BashTerminalStatus::Killed,
@@ -131,33 +168,33 @@ fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
         exit_code: None,
         duration_ms: Some(100),
         signal_number: Some(15),
-        kill_signal_sent: Some("TERM"),
-        final_tail: vec!["line 1", "line 2"],
+        kill_signal_sent: Some("TERM".into()),
+        final_tail: vec!["line 1".into(), "line 2".into()],
     });
-    assert!(evidence_matches_resource(&bash_evidence, bash));
+    assert!(evidence_matches_resource(&bash_evidence, &bash));
 
     let tmux = tmux_identity("win-3");
     let tmux_evidence = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
-        identity: match tmux {
-            WakeResourceIdentity::TmuxWindow(identity) => identity,
+        identity: match &tmux {
+            WakeResourceIdentity::TmuxWindow(identity) => identity.clone(),
             WakeResourceIdentity::Bash(_) => unreachable!(),
         },
         status: TmuxTerminalStatus::ExitMarkerObserved,
         occurred_at: Timestamp(11),
         exit_code: Some(0),
         duration_ms: Some(77),
-        final_tail: vec!["done"],
+        final_tail: vec!["done".into()],
     });
-    assert!(evidence_matches_resource(&tmux_evidence, tmux));
-    assert!(!evidence_matches_resource(&tmux_evidence, bash));
+    assert!(evidence_matches_resource(&tmux_evidence, &tmux));
+    assert!(!evidence_matches_resource(&tmux_evidence, &bash));
 }
 
 #[test]
 fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
     let resource = bash_identity("b-9");
     let fired_evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
-        identity: match resource {
-            WakeResourceIdentity::Bash(identity) => identity,
+        identity: match &resource {
+            WakeResourceIdentity::Bash(identity) => identity.clone(),
             WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
         },
         status: BashTerminalStatus::Exited,
@@ -166,11 +203,11 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
         duration_ms: Some(44),
         signal_number: None,
         kill_signal_sent: None,
-        final_tail: vec!["ok"],
+        final_tail: vec!["ok".into()],
     });
     let fired = terminal_payload_from_evidence(
         "contract-1",
-        resource,
+        resource.clone(),
         fired_evidence.clone(),
         Timestamp(20),
     )
@@ -178,19 +215,19 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
     assert!(matches!(
         fired,
         WakeTerminalPayload::Fired {
-            contract_id: "contract-1",
+            contract_id,
             resource: found,
             evidence,
             resolved_at: Timestamp(19)
-        } if found == resource && evidence == fired_evidence
+        } if contract_id == "contract-1" && found == resource && evidence == fired_evidence
     ));
 
     let expired = terminal_payload_from_evidence(
         "contract-1",
-        resource,
+        resource.clone(),
         WakeTerminalEvidence::Bash(BashTerminalEvidence {
-            identity: match resource {
-                WakeResourceIdentity::Bash(identity) => identity,
+            identity: match &resource {
+                WakeResourceIdentity::Bash(identity) => identity.clone(),
                 WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
             },
             status: BashTerminalStatus::Exited,
@@ -199,7 +236,7 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
             duration_ms: None,
             signal_number: None,
             kill_signal_sent: None,
-            final_tail: vec!["late"],
+            final_tail: vec!["late".into()],
         }),
         Timestamp(20),
     )
@@ -207,15 +244,15 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
     assert!(matches!(
         expired,
         WakeTerminalPayload::Expired {
-            contract_id: "contract-1",
+            contract_id,
             resource: found,
             resolved_at: Timestamp(20)
-        } if found == resource
+        } if contract_id == "contract-1" && found == resource
     ));
 
     let forgotten = forgotten_terminal_payload(
         "contract-1",
-        resource,
+        resource.clone(),
         WakeForgottenReason::HandleMissing,
         Timestamp(20),
     );
@@ -231,10 +268,10 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
 #[test]
 fn receipt_comparison_requires_exact_identity_and_exact_deadline_equality() {
     let expected = WakeRegistrationReceipt {
-        contract_id: "contract-1",
+        contract_id: "contract-1".into(),
         resource: bash_identity("b-12"),
         expires_at: Timestamp(20),
-        registering_tool_use_id: "tool-9",
+        registering_tool_use_id: "tool-9".into(),
     };
     let equal = compare_receipts(&expected, &expected.clone());
     assert!(equal.equal);
@@ -341,11 +378,11 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
     let authority = claim.authority.expect("authority");
     let attempt = claim.attempt.expect("attempt");
     let terminal = terminal_payload_from_evidence(
-        intent.contract_id,
-        intent.resource,
+        intent.contract_id.clone(),
+        intent.resource.clone(),
         WakeTerminalEvidence::Bash(BashTerminalEvidence {
-            identity: match intent.resource {
-                WakeResourceIdentity::Bash(identity) => identity,
+            identity: match &intent.resource {
+                WakeResourceIdentity::Bash(identity) => identity.clone(),
                 WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
             },
             status: BashTerminalStatus::Exited,
@@ -372,7 +409,7 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
     assert_eq!(workflow.snapshot.terminal, None);
     assert_eq!(
         cancellation_request(&workflow, Timestamp(6)),
-        WakeCancellationOutcome::AlreadyTerminal(terminal)
+        WakeCancellationOutcome::AlreadyTerminal(Box::new(terminal))
     );
 }
 
@@ -507,14 +544,14 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
             WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
                 identity: TmuxResourceIdentity {
                     work_scope: scope(),
-                    server_generation: "srv-1",
-                    window_id: "win-14",
+                    server_generation: "srv-1".into(),
+                    window_id: "win-14".into(),
                 },
                 status: TmuxTerminalStatus::ExitMarkerObserved,
                 occurred_at: Timestamp(5),
                 exit_code: Some(0),
                 duration_ms: Some(10),
-                final_tail: vec!["done"],
+                final_tail: vec!["done".into()],
             }),
         ),
         AuthorityOutcome::Authorized
@@ -525,14 +562,14 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
         WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
             identity: TmuxResourceIdentity {
                 work_scope: scope(),
-                server_generation: "srv-1",
-                window_id: "win-14",
+                server_generation: "srv-1".into(),
+                window_id: "win-14".into(),
             },
             status: TmuxTerminalStatus::ExitMarkerObserved,
             occurred_at: Timestamp(5),
             exit_code: Some(0),
             duration_ms: Some(10),
-            final_tail: vec!["done"],
+            final_tail: vec!["done".into()],
         }),
         Timestamp(20),
     )
@@ -582,15 +619,15 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: BashResourceIdentity {
             work_scope: scope(),
-            handle_id: "b-15",
+            handle_id: "b-15".into(),
         },
         status: BashTerminalStatus::KillPendingKernel,
         occurred_at: Timestamp(6),
         exit_code: None,
         duration_ms: Some(20),
         signal_number: Some(9),
-        kill_signal_sent: Some("KILL"),
-        final_tail: vec!["hung"],
+        kill_signal_sent: Some("KILL".into()),
+        final_tail: vec!["hung".into()],
     });
     assert_eq!(
         workflow.record_observation(
