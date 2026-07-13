@@ -401,9 +401,10 @@ pub struct DependencyDecl {
     pub depends_on_effect_id: EffectId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarrierDecl {
     pub barrier_id: BarrierId,
+    pub reducer_event_codec: CodecRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,11 +423,13 @@ pub struct EffectInvalidationDecl {
 pub struct OwedAcceptanceDecl<E> {
     pub reducer_inbox_id: ReducerInboxId,
     pub source_kind: &'static str,
+    pub event_codec: CodecRef,
     pub event: E,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionPlan<P: WorkflowProfile> {
+    pub next_status: WorkflowStatus,
     pub snapshot: P::Snapshot,
     pub snapshot_codec: CodecRef,
     pub event: P::Event,
@@ -453,7 +456,17 @@ pub struct CancellationRequest<P: WorkflowProfile> {
     pub event: P::Event,
     pub event_codec: CodecRef,
     pub invalidations: Vec<EffectInvalidationDecl>,
+    pub reducer_inbox_events: Vec<ReducerInboxDecl<P>>,
     pub compensation_plan: TransitionPlan<P>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducerInboxDecl<P: WorkflowProfile> {
+    pub effect_id: Option<EffectId>,
+    pub barrier_id: Option<BarrierId>,
+    pub kind: ReducerInboxKind,
+    pub event_codec: CodecRef,
+    pub payload: ReducerInboxPayload<P>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,6 +521,7 @@ pub struct ReceiptRecord<R> {
     pub authority: ClaimAuthority,
     pub attempt_id: Option<AttemptId>,
     pub origin: ReceiptOrigin,
+    pub receipt_codec: CodecRef,
     pub receipt: R,
     pub generation: Generation,
 }
@@ -518,6 +532,7 @@ pub struct ReducerInboxEvent<P: WorkflowProfile> {
     pub effect_id: Option<EffectId>,
     pub barrier_id: Option<BarrierId>,
     pub kind: ReducerInboxKind,
+    pub event_codec: CodecRef,
     pub payload: ReducerInboxPayload<P>,
     pub delivery_status: DeliveryStatus,
     pub consumed_by: Option<TransitionId>,
@@ -606,7 +621,10 @@ where
 pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_codec: CodecRef,
     pub transition_event: P::Event,
+    pub next_status: WorkflowStatus,
+    pub receipt_codec: CodecRef,
     pub receipt: P::Receipt,
+    pub receipt_event_codec: CodecRef,
     pub receipt_event: P::ReceiptReducerEvent,
 }
 
@@ -646,6 +664,7 @@ pub struct OwedAcceptanceRecord<E> {
     pub id: OwedAcceptanceId,
     pub reducer_inbox_id: ReducerInboxId,
     pub source_kind: &'static str,
+    pub event_codec: CodecRef,
     pub event: E,
     pub disposition: OwedAcceptanceDisposition,
 }
@@ -661,7 +680,10 @@ pub struct DrainProof {
     pub profile: ProfileRef,
     pub protocol: ProtocolSelection,
     pub selector: &'static str,
+    pub query_identity: &'static str,
+    pub query_version: u32,
     pub authority: Option<SemanticAuthority>,
+    pub complete: bool,
     pub categories: BTreeMap<&'static str, DrainCategoryEvidence>,
 }
 
@@ -682,12 +704,22 @@ pub struct ShadowDivergenceRecord {
     pub kind: ShadowDivergenceKind,
     pub severity: DivergenceSeverity,
     pub action: DivergenceAction,
+    pub resolution: ShadowDivergenceResolution,
     pub evidence_identity: String,
     pub profile_detail_kind: String,
     pub expected_codec: Option<CodecRef>,
     pub expected_payload: Option<String>,
     pub actual_codec: Option<CodecRef>,
     pub actual_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShadowDivergenceResolution {
+    Unresolved,
+    Resolved {
+        action: DivergenceAction,
+        resolved_by: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,6 +742,7 @@ pub struct BarrierState<P: WorkflowProfile> {
     pub barrier_id: BarrierId,
     pub status: BarrierStatus,
     pub required_members: BTreeMap<EffectId, ReceiptFamily>,
+    pub reducer_event_codec: CodecRef,
     pub reducer_event: P::BarrierEvent,
 }
 
@@ -798,6 +831,7 @@ fn clone_reducer_inbox_event<P: WorkflowProfile>(
         effect_id: event.effect_id,
         barrier_id: event.barrier_id,
         kind: event.kind,
+        event_codec: event.event_codec.clone(),
         payload: match &event.payload {
             ReducerInboxPayload::Receipt(payload) => ReducerInboxPayload::Receipt(payload.clone()),
             ReducerInboxPayload::Barrier(payload) => ReducerInboxPayload::Barrier(payload.clone()),
@@ -855,6 +889,7 @@ fn clone_barrier_state<P: WorkflowProfile>(barrier: &BarrierState<P>) -> Barrier
         barrier_id: barrier.barrier_id,
         status: barrier.status,
         required_members: barrier.required_members.clone(),
+        reducer_event_codec: barrier.reducer_event_codec.clone(),
         reducer_event: barrier.reducer_event.clone(),
     }
 }

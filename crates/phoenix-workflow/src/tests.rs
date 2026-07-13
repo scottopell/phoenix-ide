@@ -85,6 +85,7 @@ fn effect_with_ambiguity(
 
 fn plan() -> TransitionPlan<TestProfile> {
     TransitionPlan {
+        next_status: WorkflowStatus::Active,
         snapshot: "next",
         snapshot_codec: codec("snapshot"),
         event: "evt",
@@ -99,6 +100,7 @@ fn plan() -> TransitionPlan<TestProfile> {
         }],
         barriers: vec![BarrierDecl {
             barrier_id: BarrierId(10),
+            reducer_event_codec: codec("barrier"),
         }],
         barrier_members: vec![
             BarrierMemberDecl {
@@ -135,7 +137,10 @@ fn workflow() -> WorkflowState<TestProfile> {
 
 #[test]
 fn validates_happy_path_plan() {
-    assert_eq!(validate_plan(&plan(), &barrier_events()), Ok(()));
+    assert_eq!(
+        validate_plan(WorkflowStatus::Active, &plan(), &barrier_events()),
+        Ok(())
+    );
 }
 
 #[test]
@@ -144,7 +149,7 @@ fn rejects_duplicate_effect_ids() {
     plan.effects
         .push(effect(1, EffectRole::Required, Generation(0)));
     assert_eq!(
-        validate_plan(&plan, &barrier_events()),
+        validate_plan(WorkflowStatus::Active, &plan, &barrier_events()),
         Err(PlanError::DuplicateEffectId(EffectId(1)))
     );
 }
@@ -157,7 +162,7 @@ fn rejects_dependency_cycles() {
         depends_on_effect_id: EffectId(2),
     });
     assert_eq!(
-        validate_plan(&plan, &barrier_events()),
+        validate_plan(WorkflowStatus::Active, &plan, &barrier_events()),
         Err(PlanError::DependencyCycle)
     );
 }
@@ -391,10 +396,48 @@ fn observations_and_receipts_require_matching_attempt() {
         Timestamp(2),
         Some(AttemptId(999)),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     assert_eq!(accepted.outcome, AuthorityOutcome::StaleAuthority);
+}
+
+#[test]
+fn receipt_and_reducer_event_codecs_are_persisted_independently() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority issued");
+    let attempt = claim.attempt.expect("attempt created");
+    let accepted = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        codec("receipt"),
+        "done",
+        codec("receipt-event"),
+        "receipt-event",
+    );
+
+    assert_eq!(
+        accepted.receipt.expect("receipt persisted").receipt_codec,
+        codec("receipt")
+    );
+    assert_eq!(
+        workflow.reducer_inbox[&accepted.receipt_inbox_ids[0]].event_codec,
+        codec("receipt-event")
+    );
 }
 
 #[test]
@@ -470,7 +513,9 @@ fn barrier_satisfaction_returns_all_events() {
         Timestamp(1),
         Some(first_attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done-1",
+        codec("receipt-event"),
         "receipt-event-1",
     );
     let second = workflow.claim_effect(EffectId(2), "worker-b", Timestamp(1), LeaseExpiry(10));
@@ -481,7 +526,9 @@ fn barrier_satisfaction_returns_all_events() {
         Timestamp(2),
         Some(second_attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done-2",
+        codec("receipt-event"),
         "receipt-event-2",
     );
     assert_eq!(accepted.reducer_events.len(), 1);
@@ -530,7 +577,10 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -547,7 +597,10 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -565,7 +618,10 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -625,7 +681,10 @@ fn manual_resolution_version_has_matching_transition_history() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -657,11 +716,14 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let inbox_id = accepted.receipt_inbox_ids[0];
     let mut consume_plan = TransitionPlan {
+        next_status: WorkflowStatus::Active,
         snapshot: "accepted",
         snapshot_codec: codec("snapshot"),
         event: "consume",
@@ -674,6 +736,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         owed_acceptances: Some(vec![OwedAcceptanceDecl {
             reducer_inbox_id: inbox_id,
             source_kind: "wake",
+            event_codec: codec("runtime-event"),
             event: "runtime-event",
         }]),
     };
@@ -698,6 +761,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
     consume_plan.owed_acceptances = Some(vec![OwedAcceptanceDecl {
         reducer_inbox_id: ReducerInboxId(999),
         source_kind: "wake",
+        event_codec: codec("runtime-event"),
         event: "runtime-event",
     }]);
     let rejected = workflow.consume_reducer_inbox_atomically(
@@ -726,6 +790,7 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
     let compensation_plan = TransitionPlan {
+        next_status: WorkflowStatus::Active,
         snapshot: "cancelled",
         snapshot_codec: codec("snapshot"),
         event: "cancel",
@@ -734,6 +799,7 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
         dependencies: vec![],
         barriers: vec![BarrierDecl {
             barrier_id: BarrierId(11),
+            reducer_event_codec: codec("barrier"),
         }],
         barrier_members: vec![BarrierMemberDecl {
             barrier_id: BarrierId(11),
@@ -755,6 +821,7 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
+                reducer_inbox_events: vec![],
                 compensation_plan,
             },
             &cancel_events,
@@ -812,7 +879,9 @@ fn invalid_cancellation_plan_does_not_mutate_state() {
             invalidations: vec![EffectInvalidationDecl {
                 effect_id: EffectId(1),
             }],
+            reducer_inbox_events: vec![],
             compensation_plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
                 snapshot: "cancelled",
                 snapshot_codec: codec("snapshot"),
                 event: "cancel",
@@ -821,6 +890,7 @@ fn invalid_cancellation_plan_does_not_mutate_state() {
                 dependencies: vec![],
                 barriers: vec![BarrierDecl {
                     barrier_id: BarrierId(11),
+                    reducer_event_codec: codec("barrier"),
                 }],
                 barrier_members: vec![],
                 invalidations: vec![],
@@ -862,7 +932,9 @@ fn stale_cancellation_cas_does_not_mutate_state() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
+                reducer_inbox_events: vec![],
                 compensation_plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "cancelled",
                     snapshot_codec: codec("snapshot"),
                     event: "cancel",
@@ -871,6 +943,7 @@ fn stale_cancellation_cas_does_not_mutate_state() {
                     dependencies: vec![],
                     barriers: vec![BarrierDecl {
                         barrier_id: BarrierId(11),
+                        reducer_event_codec: codec("barrier"),
                     }],
                     barrier_members: vec![BarrierMemberDecl {
                         barrier_id: BarrierId(11),
@@ -927,7 +1000,10 @@ fn invalid_manual_resolution_does_not_mutate_state() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -988,7 +1064,9 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Manual,
+        codec("receipt"),
         "receipt",
+        codec("receipt-event"),
         "manual-receipt-event",
     );
     assert_eq!(rejected.outcome, AuthorityOutcome::StaleAuthority);
@@ -1018,7 +1096,10 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -1048,7 +1129,9 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let inbox_id = accepted.receipt_inbox_ids[0];
@@ -1058,6 +1141,7 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
         &ReducerDecision {
             expected_workflow_version: Version(1),
             plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
                 snapshot: "accepted",
                 snapshot_codec: codec("snapshot"),
                 event: "consume",
@@ -1071,11 +1155,13 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
                     OwedAcceptanceDecl {
                         reducer_inbox_id: inbox_id,
                         source_kind: "wake",
+                        event_codec: codec("runtime-event"),
                         event: "runtime-event-a",
                     },
                     OwedAcceptanceDecl {
                         reducer_inbox_id: inbox_id,
                         source_kind: "wake",
+                        event_codec: codec("runtime-event"),
                         event: "runtime-event-b",
                     },
                 ]),
@@ -1092,6 +1178,7 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
         &ReducerDecision {
             expected_workflow_version: Version(1),
             plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
                 snapshot: "accepted",
                 snapshot_codec: codec("snapshot"),
                 event: "consume",
@@ -1204,7 +1291,9 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let inbox_id = receipt.receipt_inbox_ids[0];
@@ -1213,6 +1302,7 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
         &ReducerDecision {
             expected_workflow_version: Version(1),
             plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
                 snapshot: "consumed",
                 snapshot_codec: codec("snapshot"),
                 event: "consume",
@@ -1225,6 +1315,7 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
                 owed_acceptances: Some(vec![OwedAcceptanceDecl {
                     reducer_inbox_id: inbox_id,
                     source_kind: "wake",
+                    event_codec: codec("runtime-event"),
                     event: "runtime-event",
                 }]),
             },
@@ -1284,6 +1375,7 @@ fn cas_conflict_wins_before_plan_validation_in_versioned_paths() {
                 event: "cancel",
                 event_codec: codec("event"),
                 invalidations: vec![],
+                reducer_inbox_events: vec![],
                 compensation_plan: invalid,
             },
             &barrier_events(),
@@ -1312,7 +1404,9 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let inbox_id = receipt.receipt_inbox_ids[0];
@@ -1322,6 +1416,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
             &ReducerDecision {
                 expected_workflow_version: Version(1),
                 plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "accepted",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
@@ -1334,6 +1429,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
                     owed_acceptances: Some(vec![OwedAcceptanceDecl {
                         reducer_inbox_id: inbox_id,
                         source_kind: "wake",
+                        event_codec: codec("runtime-event"),
                         event: "runtime-event",
                     }]),
                 },
@@ -1345,6 +1441,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
     let decision = ReducerDecision {
         expected_workflow_version: workflow.version,
         plan: TransitionPlan {
+            next_status: WorkflowStatus::Active,
             snapshot: "runtime-accepted",
             snapshot_codec: codec("snapshot"),
             event: "accept",
@@ -1390,7 +1487,9 @@ fn suppression_persists_typed_disposition() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let inbox_id = accepted.receipt_inbox_ids[0];
@@ -1400,6 +1499,7 @@ fn suppression_persists_typed_disposition() {
             &ReducerDecision {
                 expected_workflow_version: Version(1),
                 plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "accepted",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
@@ -1412,6 +1512,7 @@ fn suppression_persists_typed_disposition() {
                     owed_acceptances: Some(vec![OwedAcceptanceDecl {
                         reducer_inbox_id: inbox_id,
                         source_kind: "wake",
+                        event_codec: codec("runtime-event"),
                         event: "runtime-event",
                     }]),
                 },
@@ -1426,6 +1527,7 @@ fn suppression_persists_typed_disposition() {
             &ReducerDecision {
                 expected_workflow_version: Version(2),
                 plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "suppressed",
                     snapshot_codec: codec("snapshot"),
                     event: "suppress",
@@ -1472,6 +1574,7 @@ fn reject_unknown_and_receipted_invalidations() {
             &ReducerDecision {
                 expected_workflow_version: Version(1),
                 plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "next",
                     snapshot_codec: codec("snapshot"),
                     event: "evt",
@@ -1501,7 +1604,9 @@ fn reject_unknown_and_receipted_invalidations() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     assert_eq!(
@@ -1509,6 +1614,7 @@ fn reject_unknown_and_receipted_invalidations() {
             &ReducerDecision {
                 expected_workflow_version: Version(1),
                 plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "next",
                     snapshot_codec: codec("snapshot"),
                     event: "evt",
@@ -1634,7 +1740,10 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -1672,7 +1781,10 @@ fn shadow_mutation_apis_reject_manual_resolution() {
         ManualResolutionCommit {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
             receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
             receipt_event: "manual-receipt-event",
         },
     );
@@ -1699,7 +1811,9 @@ fn cancel_only_invalidates_active_like_effects() {
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
+        codec("receipt"),
         "done",
+        codec("receipt-event"),
         "receipt-event",
     );
     let _ = workflow
@@ -1713,7 +1827,9 @@ fn cancel_only_invalidates_active_like_effects() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
+                reducer_inbox_events: vec![],
                 compensation_plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
                     snapshot: "cancelled",
                     snapshot_codec: codec("snapshot"),
                     event: "cancel",
@@ -1752,6 +1868,10 @@ fn drain_proof_uses_exact_categories() {
         assert!(proof.categories.contains_key(category));
     }
     assert_eq!(proof.selector, "selector-v1");
+    assert_eq!(proof.query_identity, "phoenix.workflow.drain");
+    assert_eq!(proof.query_version, 1);
+    assert!(proof.complete);
+    assert_eq!(proof.categories.len(), exact_drain_categories().len());
 }
 
 #[test]
@@ -1767,7 +1887,6 @@ fn shadow_divergence_is_recorded_without_authority() {
     )
     .expect("accepting protocol");
     workflow.record_shadow_divergence(
-        WorkflowId(1),
         ShadowDivergenceKind::Snapshot,
         "snap-1".to_string(),
         ShadowComparisonEvidence {
@@ -1780,8 +1899,34 @@ fn shadow_divergence_is_recorded_without_authority() {
     );
     assert_eq!(workflow.shadow_divergences.len(), 1);
     assert_eq!(
+        workflow.shadow_divergences[0].authoritative_workflow_id,
+        WorkflowId(1)
+    );
+    assert_eq!(
+        workflow.shadow_divergences[0].shadow_workflow_id,
+        WorkflowId(2)
+    );
+    assert_eq!(
         workflow.shadow_divergences[0].action,
         DivergenceAction::HaltAcceptance
+    );
+    assert_eq!(
+        drain_proof(&workflow).categories["blocking_divergences"].count,
+        1
+    );
+    let divergence_id = workflow.shadow_divergences[0].id;
+    assert!(workflow.resolve_shadow_divergence(divergence_id, "operator-a"));
+    assert!(!workflow.resolve_shadow_divergence(divergence_id, "operator-b"));
+    assert!(matches!(
+        workflow.shadow_divergences[0].resolution,
+        ShadowDivergenceResolution::Resolved {
+            action: DivergenceAction::HaltAcceptance,
+            resolved_by: "operator-a"
+        }
+    ));
+    assert_eq!(
+        drain_proof(&workflow).categories["blocking_divergences"].count,
+        0
     );
 }
 
@@ -1843,12 +1988,45 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
             .outcome,
         AuthorityOutcome::StaleAuthority
     );
+    let reconciliation_attempt = takeover.attempt.expect("reconciliation attempt issued");
+    let mut receipt_path = sim.workflow.clone();
+    assert_eq!(
+        receipt_path
+            .accept_receipt(
+                &reconciliation,
+                Timestamp(10),
+                Some(reconciliation_attempt.id),
+                ReceiptOrigin::Execution,
+                codec("receipt"),
+                "done",
+                codec("receipt-event"),
+                "receipt-event",
+            )
+            .outcome,
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        receipt_path
+            .accept_receipt(
+                &reconciliation,
+                Timestamp(10),
+                Some(reconciliation_attempt.id),
+                ReceiptOrigin::Reconciliation,
+                codec("receipt"),
+                "done",
+                codec("receipt-event"),
+                "receipt-event",
+            )
+            .outcome,
+        AuthorityOutcome::Authorized
+    );
     assert_eq!(
         sim.workflow
             .schedule_retry(&reconciliation, Timestamp(10), Timestamp(15))
             .outcome,
         AuthorityOutcome::Authorized
     );
+    assert!(!sim.workflow.effects[&EffectId(1)].pending_reconciliation);
 }
 
 #[test]
@@ -1924,20 +2102,21 @@ proptest! {
             })
             .collect::<Vec<_>>();
         let plan: TransitionPlan<TestProfile> = TransitionPlan {
+            next_status: WorkflowStatus::Active,
             snapshot: "next",
             snapshot_codec: codec("snapshot"),
             event: "evt",
             event_codec: codec("event"),
             effects,
             dependencies: dependencies.clone(),
-            barriers: vec![BarrierDecl { barrier_id: BarrierId(10) }],
+            barriers: vec![BarrierDecl { barrier_id: BarrierId(10), reducer_event_codec: codec("barrier") }],
             barrier_members: vec![
                 BarrierMemberDecl { barrier_id: BarrierId(10), effect_id: EffectId(1), receipt_family: ReceiptFamily::CurrentGenerationEffect },
             ],
             invalidations: vec![],
             owed_acceptances: None,
         };
-        let result = validate_plan(&plan, &BTreeMap::from([(BarrierId(10), "barrier")]));
+        let result = validate_plan(WorkflowStatus::Active, &plan, &BTreeMap::from([(BarrierId(10), "barrier")]));
         let has_two_cycle = dependencies.iter().any(|left| {
             dependencies.iter().any(|right| {
                 left.effect_id == right.depends_on_effect_id && left.depends_on_effect_id == right.effect_id
