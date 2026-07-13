@@ -84,6 +84,28 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     expect(screen.getByRole('dialog', { name: 'PR #88 Diff' })).toBeInTheDocument();
   });
 
+  it('refetches an open active PR diff when the selected PR identity changes', async () => {
+    vi.mocked(api.getActivePrDiff)
+      .mockResolvedValueOnce({ ...payloadFor('PR12'), label: 'PR #12 Diff', kind: 'active_pr' })
+      .mockResolvedValueOnce({ ...payloadFor('PR34'), label: 'PR #34 Diff', kind: 'active_pr' });
+    const view = (identity: string) => (
+      <ReviewNotesProvider>
+        <ConversationDiffViewer
+          conversationId="conv-1"
+          target="active_pr"
+          activePrIdentity={identity}
+          onClose={vi.fn()}
+          onSendNotes={vi.fn()}
+        />
+      </ReviewNotesProvider>
+    );
+    const { rerender } = render(view('acme/repo#12'));
+    await screen.findByRole('dialog', { name: 'PR #12 Diff' });
+    rerender(view('acme/repo#34'));
+    await screen.findByRole('dialog', { name: 'PR #34 Diff' });
+    await waitFor(() => expect(api.getActivePrDiff).toHaveBeenCalledTimes(2));
+  });
+
   it('shows active PR diff retry context and retries after an error', async () => {
     (api.getActivePrDiff as ReturnType<typeof vi.fn>)
       .mockRejectedValueOnce(new Error('Failed to fetch PR diff'))

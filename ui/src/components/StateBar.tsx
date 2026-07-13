@@ -977,7 +977,7 @@ export function StateBar({
 
   const prStatusContent = (
     <>
-      {(prStatusHandle?.activePrSummary || !prStatusHandle?.activeSelection) && prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+      {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
       {prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
       {prHint && !prLoading && (
         <span

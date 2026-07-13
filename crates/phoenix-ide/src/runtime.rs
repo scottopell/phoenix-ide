@@ -1585,8 +1585,10 @@ impl RuntimeManager {
             .into_iter()
             .flat_map(|(branch, refresh)| {
                 refresh.observations.into_iter().filter(move |observation| {
-                    branch.repository_identity
-                        == format!("{}/{}", observation.repo_owner, observation.repo_name)
+                    branch.repository_identity.eq_ignore_ascii_case(&format!(
+                        "{}/{}",
+                        observation.repo_owner, observation.repo_name
+                    ))
                 })
             })
             .collect();

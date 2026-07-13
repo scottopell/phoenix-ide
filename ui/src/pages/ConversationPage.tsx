@@ -223,12 +223,23 @@ function ConversationPageContent() {
     cachedPr: conversation?.cached_pr,
   });
   const refreshPrStatus = prStatusHandle.refresh;
+  const activePrIdentity = prStatusHandle.activeSelection?.active_pr
+    ? `${prStatusHandle.activeSelection.active_pr.pr.repo_owner}/${prStatusHandle.activeSelection.active_pr.pr.repo_name}#${prStatusHandle.activeSelection.active_pr.pr.pr_number}`
+    : null;
 
-  const lastWorkScopeRevision = useRef(workScopeInventory);
+  const terminalBashHandlesRef = useRef<Set<string> | null>(null);
   useEffect(() => {
-    if (lastWorkScopeRevision.current === workScopeInventory) return;
-    lastWorkScopeRevision.current = workScopeInventory;
-    if (confirmedLive) void refreshPrStatus();
+    const terminalHandles = new Set(
+      (workScopeInventory?.bash ?? [])
+        .filter((handle) => handle.state === 'tombstoned')
+        .map((handle) => handle.handle_id),
+    );
+    const previous = terminalBashHandlesRef.current;
+    terminalBashHandlesRef.current = terminalHandles;
+    if (!previous || !confirmedLive) return;
+    if ([...terminalHandles].some((handleId) => !previous.has(handleId))) {
+      void refreshPrStatus();
+    }
   }, [workScopeInventory, confirmedLive, refreshPrStatus]);
 
   useEffect(() => {
@@ -1451,6 +1462,7 @@ function ConversationPageContent() {
             <ConversationDiffViewer
               conversationId={conversationId}
               target={diffTarget}
+              activePrIdentity={activePrIdentity}
               onClose={handleCloseDiff}
               onSendNotes={handleSendNotes}
               inline
@@ -2133,6 +2145,7 @@ function ConversationPageContent() {
           <ConversationDiffViewer
             conversationId={conversationId}
             target={diffTarget}
+            activePrIdentity={activePrIdentity}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
             takeover
@@ -2144,6 +2157,7 @@ function ConversationPageContent() {
           <ConversationDiffViewer
             conversationId={conversationId}
             target={diffTarget}
+            activePrIdentity={activePrIdentity}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
@@ -2227,6 +2241,7 @@ function ConversationPageContent() {
                 <ConversationDiffViewer
                   conversationId={conversationId}
                   target={diffTarget}
+                  activePrIdentity={activePrIdentity}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
                   inline

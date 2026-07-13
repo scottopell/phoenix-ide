@@ -23,6 +23,7 @@ interface ConversationDiffViewerProps {
   inline?: boolean | undefined;
   takeover?: boolean | undefined;
   target?: 'workspace' | 'active_pr' | undefined;
+  activePrIdentity?: string | null | undefined;
 }
 
 /**
@@ -39,6 +40,7 @@ export function ConversationDiffViewer({
   inline,
   takeover,
   target = 'workspace',
+  activePrIdentity = null,
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
@@ -59,7 +61,7 @@ export function ConversationDiffViewer({
       else setState({ status: 'error', message: result.message, conversationId });
     });
     return () => { cancelled = true; };
-  }, [conversationId, loadDiff]);
+  }, [conversationId, activePrIdentity, loadDiff]);
 
   // Treat a resolved state from a previous conversation as still-loading until
   // the effect refetches for the current conversationId.
