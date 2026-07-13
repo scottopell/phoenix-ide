@@ -720,6 +720,12 @@ async fn pr_status_response_for_missing_worktree(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let envelope =
         selection_envelope_for_scope_from_snapshot(associated.clone(), active.clone(), observed);
+    let compatibility_primary = state
+        .runtime
+        .db()
+        .primary_work_scope_pr_association(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let mut response = match active.and_then(|state| state.selection) {
         Some(selection) => {
             let Some(pr) = associated.into_iter().find(|pr| {
@@ -740,7 +746,16 @@ async fn pr_status_response_for_missing_worktree(
                 attempted_at,
             )
         }
-        None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+        None => compatibility_primary.map_or_else(
+            || PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+            |pr| {
+                crate::api::pr_monitoring::stale_response(
+                    pr,
+                    PrUnavailableReason::NotGitRepo,
+                    attempted_at,
+                )
+            },
+        ),
     };
     response.work_change = WorkChangeSummary::Unavailable {
         reason: "worktree path is not a directory".to_string(),

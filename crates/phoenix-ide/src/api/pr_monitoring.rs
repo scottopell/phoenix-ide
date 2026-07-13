@@ -623,23 +623,20 @@ fn get_pr_status_for_repo_branch_with_client(
             };
         }
     };
-    status_refresh_from_prs(
-        client,
-        prs,
-        &GhRepoView {
-            owner: GhRepoOwner {
-                login: repository_identity
-                    .split_once('/')
-                    .map_or("", |(owner, _)| owner)
-                    .to_string(),
-            },
-            name: repository_identity
+    let requested_repo = GhRepoView {
+        owner: GhRepoOwner {
+            login: repository_identity
                 .split_once('/')
-                .map_or("", |(_, repo)| repo)
+                .map_or("", |(owner, _)| owner)
                 .to_string(),
         },
-        attempted_at,
-    )
+        name: repository_identity
+            .split_once('/')
+            .map_or("", |(_, repo)| repo)
+            .to_string(),
+    };
+    let canonical_repo = client.repo_view().unwrap_or(requested_repo);
+    status_refresh_from_prs(client, prs, &canonical_repo, attempted_at)
 }
 
 pub(crate) fn get_pr_status_for_branch_with_deadline(
@@ -2661,6 +2658,23 @@ mod tests {
                 .is_empty(),
             "branch capture should not relabel after a default-repo PR refetch"
         );
+    }
+
+    #[test]
+    fn repo_branch_refresh_persists_canonical_repo_identity() {
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
+            repo: Ok(repo_named("CanonicalOwner", "CanonicalRepo")),
+            ..FakeGh::default()
+        };
+        let refresh = get_pr_status_for_repo_branch_with_client(
+            &gh,
+            "requestedowner/requestedrepo",
+            "feature",
+        );
+        assert_eq!(refresh.observations.len(), 1);
+        assert_eq!(refresh.observations[0].repo_owner, "CanonicalOwner");
+        assert_eq!(refresh.observations[0].repo_name, "CanonicalRepo");
     }
 
     #[test]
