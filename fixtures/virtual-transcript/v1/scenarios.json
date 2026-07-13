@@ -1,0 +1,980 @@
+{
+  "schemaVersion": "virtual-transcript.scenarios.v1",
+  "metadata": {
+    "name": "Virtual Transcript conformance corpus",
+    "version": 1,
+    "unit": "css_px",
+    "scenarioCount": 7
+  },
+  "scenarios": [
+    {
+      "id": "prefix-insertion-within-tall-unit",
+      "title": "Restore reader anchor after prefix insertion while scrolled inside a tall unit",
+      "story": "The reader is partway through a tall transcript unit when earlier history loads above it, and the anchor row stays at the same visual position.",
+      "tags": [
+        "continuity",
+        "prefix-load",
+        "tall-unit"
+      ],
+      "before": {
+        "revision": "prefix-before",
+        "transcriptGeneration": 4,
+        "units": [
+          {
+            "key": "m-040",
+            "role": "agent",
+            "canonicalMessageId": "msg-040",
+            "estimatedExtent": 64,
+            "measuredExtent": 64,
+            "text": "Earlier summary",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-041",
+            "role": "agent",
+            "canonicalMessageId": "msg-041",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Earlier summary",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-042",
+            "role": "agent",
+            "canonicalMessageId": "msg-042",
+            "estimatedExtent": 320,
+            "measuredExtent": 320,
+            "text": "Tall reasoning block that spans several viewport heights.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-043",
+            "role": "agent",
+            "canonicalMessageId": "msg-043",
+            "estimatedExtent": 88,
+            "measuredExtent": 88,
+            "text": "Anchor message that should stay pinned after history loads.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-044",
+            "role": "agent",
+            "canonicalMessageId": "msg-044",
+            "estimatedExtent": 104,
+            "measuredExtent": 104,
+            "text": "Later reply",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 360,
+          "extent": 180
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 2,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-043"
+        }
+      },
+      "after": {
+        "revision": "prefix-after",
+        "transcriptGeneration": 5,
+        "units": [
+          {
+            "key": "m-036",
+            "role": "agent",
+            "canonicalMessageId": "msg-036",
+            "estimatedExtent": 76,
+            "measuredExtent": 76,
+            "text": "Newly loaded prefix 1",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-037",
+            "role": "agent",
+            "canonicalMessageId": "msg-037",
+            "estimatedExtent": 68,
+            "measuredExtent": 68,
+            "text": "Newly loaded prefix 2",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-038",
+            "role": "agent",
+            "canonicalMessageId": "msg-038",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Newly loaded prefix 3",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-040",
+            "role": "agent",
+            "canonicalMessageId": "msg-040",
+            "estimatedExtent": 64,
+            "measuredExtent": 64,
+            "text": "Earlier summary",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-041",
+            "role": "agent",
+            "canonicalMessageId": "msg-041",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Earlier summary",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-042",
+            "role": "agent",
+            "canonicalMessageId": "msg-042",
+            "estimatedExtent": 320,
+            "measuredExtent": 320,
+            "text": "Tall reasoning block that spans several viewport heights.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-043",
+            "role": "agent",
+            "canonicalMessageId": "msg-043",
+            "estimatedExtent": 88,
+            "measuredExtent": 88,
+            "text": "Anchor message that should stay pinned after history loads.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-044",
+            "role": "agent",
+            "canonicalMessageId": "msg-044",
+            "estimatedExtent": 104,
+            "measuredExtent": 104,
+            "text": "Later reply",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 588,
+          "extent": 180
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 5,
+          "endIndex": 6
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-043"
+        }
+      },
+      "expectation": {
+        "kind": "restore_anchor_after_prefix_insertion",
+        "anchorMessageId": "msg-043",
+        "anchorKey": "m-043",
+        "previousAnchorOffset": 456,
+        "nextAnchorOffset": 684,
+        "insertedKeys": [
+          "m-036",
+          "m-037",
+          "m-038"
+        ],
+        "preservedViewportDelta": 228
+      }
+    },
+    {
+      "id": "resize-above-anchor",
+      "title": "Hold the same anchor when measured content above it grows",
+      "story": "Images and wrapped content finish measuring above the reader anchor, and the viewport shifts just enough to keep the anchored message in place.",
+      "tags": [
+        "continuity",
+        "resize",
+        "measurement"
+      ],
+      "before": {
+        "revision": "resize-before",
+        "transcriptGeneration": 8,
+        "units": [
+          {
+            "key": "m-090",
+            "role": "agent",
+            "canonicalMessageId": "msg-090",
+            "estimatedExtent": 90,
+            "measuredExtent": 90,
+            "text": "Prelude",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-091",
+            "role": "agent",
+            "canonicalMessageId": "msg-091",
+            "estimatedExtent": 110,
+            "measuredExtent": 110,
+            "text": "Measured item above anchor before image decode.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-092",
+            "role": "agent",
+            "canonicalMessageId": "msg-092",
+            "estimatedExtent": 70,
+            "measuredExtent": 70,
+            "text": "Second measured item above anchor before image decode.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-093",
+            "role": "agent",
+            "canonicalMessageId": "msg-093",
+            "estimatedExtent": 120,
+            "measuredExtent": 120,
+            "text": "Anchor row stays in place while earlier rows resize.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-094",
+            "role": "agent",
+            "canonicalMessageId": "msg-094",
+            "estimatedExtent": 80,
+            "measuredExtent": 80,
+            "text": "Reply after anchor",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 225,
+          "extent": 160
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 2,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-093"
+        }
+      },
+      "after": {
+        "revision": "resize-after",
+        "transcriptGeneration": 8,
+        "units": [
+          {
+            "key": "m-090",
+            "role": "agent",
+            "canonicalMessageId": "msg-090",
+            "estimatedExtent": 90,
+            "measuredExtent": 90,
+            "text": "Prelude",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-091",
+            "role": "agent",
+            "canonicalMessageId": "msg-091",
+            "estimatedExtent": 110,
+            "measuredExtent": 180,
+            "text": "Measured item above anchor after image decode.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-092",
+            "role": "agent",
+            "canonicalMessageId": "msg-092",
+            "estimatedExtent": 70,
+            "measuredExtent": 130,
+            "text": "Second measured item above anchor after image decode.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-093",
+            "role": "agent",
+            "canonicalMessageId": "msg-093",
+            "estimatedExtent": 120,
+            "measuredExtent": 120,
+            "text": "Anchor row stays in place while earlier rows resize.",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-094",
+            "role": "agent",
+            "canonicalMessageId": "msg-094",
+            "estimatedExtent": 80,
+            "measuredExtent": 80,
+            "text": "Reply after anchor",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 355,
+          "extent": 160
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 2,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-093"
+        }
+      },
+      "expectation": {
+        "kind": "preserve_anchor_across_resize",
+        "anchorMessageId": "msg-093",
+        "anchorKey": "m-093",
+        "previousAnchorOffset": 270,
+        "nextAnchorOffset": 400,
+        "resizedKeys": [
+          "m-091",
+          "m-092"
+        ],
+        "preservedViewportDelta": 130
+      }
+    },
+    {
+      "id": "alias-navigation",
+      "title": "Navigate to a target through alias resolution",
+      "story": "A saved deep link points at a historical alias id, and the transcript resolves it to the canonical row before scrolling there.",
+      "tags": [
+        "navigation",
+        "alias"
+      ],
+      "before": {
+        "revision": "alias-navigation",
+        "transcriptGeneration": 3,
+        "units": [
+          {
+            "key": "m-200",
+            "role": "agent",
+            "canonicalMessageId": "msg-200",
+            "estimatedExtent": 70,
+            "measuredExtent": 70,
+            "text": "Conversation intro",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-201",
+            "role": "agent",
+            "canonicalMessageId": "msg-201",
+            "estimatedExtent": 92,
+            "measuredExtent": 92,
+            "text": "Canonical target message",
+            "aliasMessageIds": [
+              "alias-msg-201",
+              "legacy-anchor-201"
+            ]
+          },
+          {
+            "key": "m-202",
+            "role": "agent",
+            "canonicalMessageId": "msg-202",
+            "estimatedExtent": 96,
+            "measuredExtent": 96,
+            "text": "Follow-up after canonical target",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 150,
+          "extent": 120
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 2
+        }
+      },
+      "after": {
+        "revision": "alias-navigation",
+        "transcriptGeneration": 3,
+        "units": [
+          {
+            "key": "m-200",
+            "role": "agent",
+            "canonicalMessageId": "msg-200",
+            "estimatedExtent": 70,
+            "measuredExtent": 70,
+            "text": "Conversation intro",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-201",
+            "role": "agent",
+            "canonicalMessageId": "msg-201",
+            "estimatedExtent": 92,
+            "measuredExtent": 92,
+            "text": "Canonical target message",
+            "aliasMessageIds": [
+              "alias-msg-201",
+              "legacy-anchor-201"
+            ]
+          },
+          {
+            "key": "m-202",
+            "role": "agent",
+            "canonicalMessageId": "msg-202",
+            "estimatedExtent": 96,
+            "measuredExtent": 96,
+            "text": "Follow-up after canonical target",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 150,
+          "extent": 120
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 2
+        }
+      },
+      "aliasLookups": [
+        {
+          "requestedMessageId": "alias-msg-201",
+          "resolvedMessageKey": "m-201"
+        },
+        {
+          "requestedMessageId": "legacy-anchor-201",
+          "resolvedMessageKey": "m-201"
+        },
+        {
+          "requestedMessageId": "msg-201",
+          "resolvedMessageKey": "m-201"
+        }
+      ],
+      "expectation": {
+        "kind": "resolve_alias_navigation",
+        "requestedMessageId": "alias-msg-201",
+        "resolvedMessageKey": "m-201",
+        "targetIndex": 1,
+        "targetOffset": 70
+      }
+    },
+    {
+      "id": "orphan-target",
+      "title": "Surface an orphan target when no transcript row matches the request",
+      "story": "A deep link asks for a message id that is no longer present, and the transcript reports a missing target instead of jumping unpredictably.",
+      "tags": [
+        "navigation",
+        "failure"
+      ],
+      "before": {
+        "revision": "orphan-target",
+        "transcriptGeneration": 3,
+        "units": [
+          {
+            "key": "m-200",
+            "role": "agent",
+            "canonicalMessageId": "msg-200",
+            "estimatedExtent": 70,
+            "measuredExtent": 70,
+            "text": "Conversation intro",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-201",
+            "role": "agent",
+            "canonicalMessageId": "msg-201",
+            "estimatedExtent": 92,
+            "measuredExtent": 92,
+            "text": "Canonical target message",
+            "aliasMessageIds": [
+              "alias-msg-201",
+              "legacy-anchor-201"
+            ]
+          },
+          {
+            "key": "m-202",
+            "role": "agent",
+            "canonicalMessageId": "msg-202",
+            "estimatedExtent": 96,
+            "measuredExtent": 96,
+            "text": "Follow-up after canonical target",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 150,
+          "extent": 120
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 2
+        }
+      },
+      "after": {
+        "revision": "orphan-target",
+        "transcriptGeneration": 3,
+        "units": [
+          {
+            "key": "m-200",
+            "role": "agent",
+            "canonicalMessageId": "msg-200",
+            "estimatedExtent": 70,
+            "measuredExtent": 70,
+            "text": "Conversation intro",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-201",
+            "role": "agent",
+            "canonicalMessageId": "msg-201",
+            "estimatedExtent": 92,
+            "measuredExtent": 92,
+            "text": "Canonical target message",
+            "aliasMessageIds": [
+              "alias-msg-201",
+              "legacy-anchor-201"
+            ]
+          },
+          {
+            "key": "m-202",
+            "role": "agent",
+            "canonicalMessageId": "msg-202",
+            "estimatedExtent": 96,
+            "measuredExtent": 96,
+            "text": "Follow-up after canonical target",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 150,
+          "extent": 120
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 2
+        }
+      },
+      "aliasLookups": [
+        {
+          "requestedMessageId": "missing-msg-999",
+          "resolvedMessageKey": null
+        }
+      ],
+      "expectation": {
+        "kind": "report_orphan_target",
+        "requestedMessageId": "missing-msg-999",
+        "reason": "target_missing"
+      }
+    },
+    {
+      "id": "streaming-growth-reading",
+      "title": "Append streamed content without displacing an active reader",
+      "story": "New transcript rows stream in while the user is reading older content, and the viewport stays fixed on the reader anchor instead of following the tail.",
+      "tags": [
+        "streaming",
+        "reading"
+      ],
+      "before": {
+        "revision": "stream-reading-before",
+        "transcriptGeneration": 11,
+        "units": [
+          {
+            "key": "m-300",
+            "role": "agent",
+            "canonicalMessageId": "msg-300",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Earlier stream block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-301",
+            "role": "agent",
+            "canonicalMessageId": "msg-301",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Older stable block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-302",
+            "role": "agent",
+            "canonicalMessageId": "msg-302",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Reader anchor block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-303",
+            "role": "agent",
+            "canonicalMessageId": "msg-303",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Latest finalized block",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 120,
+          "extent": 168
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-302"
+        }
+      },
+      "after": {
+        "revision": "stream-reading-after",
+        "transcriptGeneration": 12,
+        "units": [
+          {
+            "key": "m-300",
+            "role": "agent",
+            "canonicalMessageId": "msg-300",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Earlier stream block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-301",
+            "role": "agent",
+            "canonicalMessageId": "msg-301",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Older stable block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-302",
+            "role": "agent",
+            "canonicalMessageId": "msg-302",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Reader anchor block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-303",
+            "role": "agent",
+            "canonicalMessageId": "msg-303",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Latest finalized block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-304",
+            "role": "agent",
+            "canonicalMessageId": "msg-304",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Fresh streamed block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-305",
+            "role": "agent",
+            "canonicalMessageId": "msg-305",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Newest streamed block",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 120,
+          "extent": 168
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-302"
+        }
+      },
+      "expectation": {
+        "kind": "stream_append_without_reposition",
+        "appendedKeys": [
+          "m-304",
+          "m-305"
+        ],
+        "preservedViewportOffset": 120
+      }
+    },
+    {
+      "id": "streaming-growth-following",
+      "title": "Follow tail growth when the reader is already pinned to the end",
+      "story": "New transcript rows stream in while the user is following the live tail, and the viewport advances so the newest content remains visible.",
+      "tags": [
+        "streaming",
+        "follow-tail"
+      ],
+      "before": {
+        "revision": "stream-following-before",
+        "transcriptGeneration": 11,
+        "units": [
+          {
+            "key": "m-300",
+            "role": "agent",
+            "canonicalMessageId": "msg-300",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Earlier stream block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-301",
+            "role": "agent",
+            "canonicalMessageId": "msg-301",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Older stable block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-302",
+            "role": "agent",
+            "canonicalMessageId": "msg-302",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Reader anchor block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-303",
+            "role": "agent",
+            "canonicalMessageId": "msg-303",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Latest finalized block",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 168,
+          "extent": 168
+        },
+        "followTail": true,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 3
+        }
+      },
+      "after": {
+        "revision": "stream-following-after",
+        "transcriptGeneration": 12,
+        "units": [
+          {
+            "key": "m-300",
+            "role": "agent",
+            "canonicalMessageId": "msg-300",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Earlier stream block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-301",
+            "role": "agent",
+            "canonicalMessageId": "msg-301",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Older stable block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-302",
+            "role": "agent",
+            "canonicalMessageId": "msg-302",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Reader anchor block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-303",
+            "role": "agent",
+            "canonicalMessageId": "msg-303",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Latest finalized block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-304",
+            "role": "agent",
+            "canonicalMessageId": "msg-304",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Fresh streamed block",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-305",
+            "role": "agent",
+            "canonicalMessageId": "msg-305",
+            "estimatedExtent": 84,
+            "measuredExtent": 84,
+            "text": "Newest streamed block",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 336,
+          "extent": 168
+        },
+        "followTail": true,
+        "visibleRange": {
+          "startIndex": 3,
+          "endIndex": 5
+        }
+      },
+      "expectation": {
+        "kind": "stream_append_and_follow_tail",
+        "appendedKeys": [
+          "m-304",
+          "m-305"
+        ],
+        "previousViewportOffset": 168,
+        "nextViewportOffset": 336,
+        "nextViewportEnd": 504,
+        "totalExtent": 504
+      }
+    },
+    {
+      "id": "supersession",
+      "title": "Drop an older restore command when a newer one supersedes it",
+      "story": "A newer restore command arrives before the older one applies, and the transcript scrolls only to the latest anchor while treating the prior request as superseded.",
+      "tags": [
+        "continuity",
+        "supersession"
+      ],
+      "before": {
+        "revision": "supersession-before",
+        "transcriptGeneration": 6,
+        "units": [
+          {
+            "key": "m-400",
+            "role": "agent",
+            "canonicalMessageId": "msg-400",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Earlier context",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-401",
+            "role": "agent",
+            "canonicalMessageId": "msg-401",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Older anchor request target",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-402",
+            "role": "agent",
+            "canonicalMessageId": "msg-402",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Newer anchor request target",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-403",
+            "role": "agent",
+            "canonicalMessageId": "msg-403",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Later context",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 72,
+          "extent": 144
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 0,
+          "endIndex": 2
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-401"
+        }
+      },
+      "after": {
+        "revision": "supersession-after",
+        "transcriptGeneration": 6,
+        "units": [
+          {
+            "key": "m-400",
+            "role": "agent",
+            "canonicalMessageId": "msg-400",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Earlier context",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-401",
+            "role": "agent",
+            "canonicalMessageId": "msg-401",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Older anchor request target",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-402",
+            "role": "agent",
+            "canonicalMessageId": "msg-402",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Newer anchor request target",
+            "aliasMessageIds": []
+          },
+          {
+            "key": "m-403",
+            "role": "agent",
+            "canonicalMessageId": "msg-403",
+            "estimatedExtent": 72,
+            "measuredExtent": 72,
+            "text": "Later context",
+            "aliasMessageIds": []
+          }
+        ],
+        "viewport": {
+          "offset": 144,
+          "extent": 144
+        },
+        "followTail": false,
+        "visibleRange": {
+          "startIndex": 1,
+          "endIndex": 3
+        },
+        "readingAnchor": {
+          "kind": "message",
+          "messageId": "msg-402"
+        }
+      },
+      "expectation": {
+        "kind": "supersede_restore_command",
+        "supersededMessageId": "msg-401",
+        "winningMessageId": "msg-402",
+        "winningMessageKey": "m-402",
+        "targetIndex": 2
+      }
+    }
+  ]
+}

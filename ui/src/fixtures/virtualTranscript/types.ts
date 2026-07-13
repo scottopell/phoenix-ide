@@ -7,6 +7,19 @@ export type VirtualTranscriptScenarioId =
   | 'streaming-growth-following'
   | 'supersession';
 
+export interface VirtualTranscriptCorpusMetadata {
+  name: string;
+  version: 1;
+  unit: 'css_px';
+  scenarioCount: number;
+}
+
+export interface VirtualTranscriptScenarioCorpus {
+  schemaVersion: 'virtual-transcript.scenarios.v1';
+  metadata: VirtualTranscriptCorpusMetadata;
+  scenarios: readonly VirtualTranscriptScenario[];
+}
+
 export type VirtualTranscriptUnitRole = 'user' | 'agent' | 'tool' | 'system';
 
 export interface VirtualTranscriptUnit {

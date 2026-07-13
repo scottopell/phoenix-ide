@@ -1,7 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildTranscriptLayout } from '../../conversation/virtualTranscriptLayout';
 import {
   getVirtualTranscriptScenario,
+  parseVirtualTranscriptScenarioCorpus,
+  virtualTranscriptCorpusMetadata,
   virtualTranscriptScenarios,
 } from './scenarios';
 import type {
@@ -20,6 +24,91 @@ const expectedIds: VirtualTranscriptScenarioId[] = [
   'streaming-growth-following',
   'supersession',
 ];
+
+const fixtureRoot = resolve(__dirname, '../../../../fixtures/virtual-transcript/v1');
+
+interface JsonSchema {
+  const?: unknown;
+  enum?: unknown[];
+  type?: string | string[];
+  required?: string[];
+  additionalProperties?: boolean;
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  oneOf?: JsonSchema[];
+  minimum?: number;
+  exclusiveMinimum?: number;
+  minItems?: number;
+  maxItems?: number;
+  $ref?: string;
+}
+
+function readFixtureJson(fileName: string): unknown {
+  return JSON.parse(readFileSync(resolve(fixtureRoot, fileName), 'utf8'));
+}
+
+function resolveRef(schema: JsonSchema, ref: string): JsonSchema {
+  const prefix = '#/$defs/';
+  if (!ref.startsWith(prefix)) throw new Error(`Unsupported schema ref ${ref}`);
+  const defs = (schema as JsonSchema & { $defs?: Record<string, JsonSchema> }).$defs;
+  const resolved = defs?.[ref.slice(prefix.length)];
+  if (!resolved) throw new Error(`Unknown schema ref ${ref}`);
+  return resolved;
+}
+
+function validateJsonSchema(value: unknown, rootSchema: JsonSchema, schema: JsonSchema = rootSchema, path = '$'): string[] {
+  if (schema.$ref) return validateJsonSchema(value, rootSchema, resolveRef(rootSchema, schema.$ref), path);
+  if ('const' in schema && value !== schema.const) return [`${path}: expected const ${JSON.stringify(schema.const)}`];
+  if (schema.enum && !schema.enum.includes(value)) return [`${path}: expected one of ${schema.enum.join(', ')}`];
+
+  const allowedTypes = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (allowedTypes.length > 0) {
+    const actualType = value === null ? 'null' : Array.isArray(value) ? 'array' : Number.isInteger(value) ? 'integer' : typeof value;
+    if (!allowedTypes.some((type) => type === actualType || (type === 'number' && actualType === 'integer'))) {
+      return [`${path}: expected type ${allowedTypes.join(' | ')}, got ${actualType}`];
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (schema.minimum !== undefined && value < schema.minimum) return [`${path}: expected >= ${schema.minimum}`];
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) return [`${path}: expected > ${schema.exclusiveMinimum}`];
+  }
+
+  if (Array.isArray(value)) {
+    const errors: string[] = [];
+    if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${path}: expected at least ${schema.minItems} items`);
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) errors.push(`${path}: expected at most ${schema.maxItems} items`);
+    if (schema.items) {
+      value.forEach((item, index) => errors.push(...validateJsonSchema(item, rootSchema, schema.items!, `${path}[${index}]`)));
+    }
+    return errors;
+  }
+
+  if (schema.oneOf) {
+    const matches = schema.oneOf.filter((option) => validateJsonSchema(value, rootSchema, option, path).length === 0);
+    return matches.length === 1 ? [] : [`${path}: expected exactly one matching oneOf branch, got ${matches.length}`];
+  }
+
+  if (schema.properties || schema.required || schema.additionalProperties === false) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [`${path}: expected object`];
+    const record = value as Record<string, unknown>;
+    const errors: string[] = [];
+    for (const key of schema.required ?? []) {
+      if (!(key in record)) errors.push(`${path}.${key}: missing required property`);
+    }
+    for (const [key, childValue] of Object.entries(record)) {
+      const childSchema = schema.properties?.[key];
+      if (!childSchema) {
+        if (schema.additionalProperties === false) errors.push(`${path}.${key}: unexpected property`);
+        continue;
+      }
+      errors.push(...validateJsonSchema(childValue, rootSchema, childSchema, `${path}.${key}`));
+    }
+    return errors;
+  }
+
+  return [];
+}
 
 function layoutFor(units: readonly VirtualTranscriptUnit[]) {
   return buildTranscriptLayout({
@@ -136,6 +225,31 @@ function assertScenarioExpectation(scenario: VirtualTranscriptScenario) {
 }
 
 describe('virtual transcript fixture scenarios', () => {
+  it('ships portable JSON that validates against the draft 2020-12 schema', () => {
+    const schema = readFixtureJson('schema.json') as JsonSchema;
+    const corpus = readFixtureJson('scenarios.json');
+
+    expect((schema as JsonSchema & { $schema?: string }).$schema).toBe('https://json-schema.org/draft/2020-12/schema');
+    expect(validateJsonSchema(corpus, schema)).toEqual([]);
+    expect(virtualTranscriptCorpusMetadata).toEqual({
+      name: 'Virtual Transcript conformance corpus',
+      version: 1,
+      unit: 'css_px',
+      scenarioCount: expectedIds.length,
+    });
+  });
+
+  it('rejects a corpus with the wrong schema version or scenario ids', () => {
+    const corpus = readFixtureJson('scenarios.json') as Record<string, unknown>;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, schemaVersion: 'virtual-transcript.scenarios.v2' }))
+      .toThrow();
+
+    const scenarios = [...(corpus['scenarios'] as Record<string, unknown>[])];
+    scenarios[0] = { ...scenarios[0], id: 'unexpected-id' };
+    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios })).toThrow();
+  });
+
   it('covers the intended conformance corpus with stable ids and lookups', () => {
     expect(virtualTranscriptScenarios.map((scenario) => scenario.id)).toEqual(expectedIds);
     expect(new Set(expectedIds).size).toBe(expectedIds.length);

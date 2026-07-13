@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phoenix-ide.local/fixtures/virtual-transcript/v1/schema.json",
+  "title": "Virtual Transcript conformance scenarios v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "metadata", "scenarios"],
+  "properties": {
+    "schemaVersion": { "const": "virtual-transcript.scenarios.v1" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "scenarios": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/scenario" }
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "unit", "scenarioCount"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "const": 1 },
+        "unit": { "const": "css_px" },
+        "scenarioCount": { "const": 7 }
+      }
+    },
+    "scenarioId": {
+      "enum": [
+        "prefix-insertion-within-tall-unit",
+        "resize-above-anchor",
+        "alias-navigation",
+        "orphan-target",
+        "streaming-growth-reading",
+        "streaming-growth-following",
+        "supersession"
+      ]
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "story", "tags", "before", "after", "expectation"],
+      "properties": {
+        "id": { "$ref": "#/$defs/scenarioId" },
+        "title": { "type": "string" },
+        "story": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "before": { "$ref": "#/$defs/snapshot" },
+        "after": { "$ref": "#/$defs/snapshot" },
+        "aliasLookups": { "type": "array", "items": { "$ref": "#/$defs/aliasLookup" } },
+        "expectation": { "$ref": "#/$defs/expectation" }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "role", "canonicalMessageId", "aliasMessageIds", "estimatedExtent", "text"],
+      "properties": {
+        "key": { "type": "string" },
+        "role": { "enum": ["user", "agent", "tool", "system"] },
+        "canonicalMessageId": { "type": "string" },
+        "aliasMessageIds": { "type": "array", "items": { "type": "string" } },
+        "estimatedExtent": { "type": "number", "minimum": 0 },
+        "measuredExtent": { "type": "number", "minimum": 0 },
+        "text": { "type": "string" }
+      }
+    },
+    "viewport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "extent"],
+      "properties": {
+        "offset": { "type": "number", "minimum": 0 },
+        "extent": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "readingAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "messageId"],
+      "properties": {
+        "kind": { "const": "message" },
+        "messageId": { "type": "string" }
+      }
+    },
+    "visibleRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startIndex", "endIndex"],
+      "properties": {
+        "startIndex": { "type": "integer", "minimum": 0 },
+        "endIndex": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "transcriptGeneration", "units", "viewport", "followTail", "visibleRange"],
+      "properties": {
+        "revision": { "type": "string" },
+        "transcriptGeneration": { "type": "integer", "minimum": 0 },
+        "units": { "type": "array", "items": { "$ref": "#/$defs/unit" } },
+        "viewport": { "$ref": "#/$defs/viewport" },
+        "readingAnchor": { "$ref": "#/$defs/readingAnchor" },
+        "followTail": { "type": "boolean" },
+        "visibleRange": { "$ref": "#/$defs/visibleRange" }
+      }
+    },
+    "aliasLookup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestedMessageId", "resolvedMessageKey"],
+      "properties": {
+        "requestedMessageId": { "type": "string" },
+        "resolvedMessageKey": { "type": ["string", "null"] }
+      }
+    },
+    "expectation": {
+      "oneOf": [
+        { "$ref": "#/$defs/restoreAnchorAfterPrefixInsertion" },
+        { "$ref": "#/$defs/preserveAnchorAcrossResize" },
+        { "$ref": "#/$defs/resolveAliasNavigation" },
+        { "$ref": "#/$defs/reportOrphanTarget" },
+        { "$ref": "#/$defs/streamAppendWithoutReposition" },
+        { "$ref": "#/$defs/streamAppendAndFollowTail" },
+        { "$ref": "#/$defs/supersedeRestoreCommand" }
+      ]
+    },
+    "stringArray": { "type": "array", "items": { "type": "string" } },
+    "restoreAnchorAfterPrefixInsertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "anchorMessageId", "anchorKey", "previousAnchorOffset", "nextAnchorOffset", "insertedKeys", "preservedViewportDelta"],
+      "properties": {
+        "kind": { "const": "restore_anchor_after_prefix_insertion" },
+        "anchorMessageId": { "type": "string" },
+        "anchorKey": { "type": "string" },
+        "previousAnchorOffset": { "type": "number" },
+        "nextAnchorOffset": { "type": "number" },
+        "insertedKeys": { "$ref": "#/$defs/stringArray" },
+        "preservedViewportDelta": { "type": "number" }
+      }
+    },
+    "preserveAnchorAcrossResize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "anchorMessageId", "anchorKey", "previousAnchorOffset", "nextAnchorOffset", "resizedKeys", "preservedViewportDelta"],
+      "properties": {
+        "kind": { "const": "preserve_anchor_across_resize" },
+        "anchorMessageId": { "type": "string" },
+        "anchorKey": { "type": "string" },
+        "previousAnchorOffset": { "type": "number" },
+        "nextAnchorOffset": { "type": "number" },
+        "resizedKeys": { "$ref": "#/$defs/stringArray" },
+        "preservedViewportDelta": { "type": "number" }
+      }
+    },
+    "resolveAliasNavigation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "requestedMessageId", "resolvedMessageKey", "targetIndex", "targetOffset"],
+      "properties": {
+        "kind": { "const": "resolve_alias_navigation" },
+        "requestedMessageId": { "type": "string" },
+        "resolvedMessageKey": { "type": "string" },
+        "targetIndex": { "type": "integer", "minimum": 0 },
+        "targetOffset": { "type": "number" }
+      }
+    },
+    "reportOrphanTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "requestedMessageId", "reason"],
+      "properties": {
+        "kind": { "const": "report_orphan_target" },
+        "requestedMessageId": { "type": "string" },
+        "reason": { "const": "target_missing" }
+      }
+    },
+    "streamAppendWithoutReposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "appendedKeys", "preservedViewportOffset"],
+      "properties": {
+        "kind": { "const": "stream_append_without_reposition" },
+        "appendedKeys": { "$ref": "#/$defs/stringArray" },
+        "preservedViewportOffset": { "type": "number" }
+      }
+    },
+    "streamAppendAndFollowTail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "appendedKeys", "previousViewportOffset", "nextViewportOffset", "nextViewportEnd", "totalExtent"],
+      "properties": {
+        "kind": { "const": "stream_append_and_follow_tail" },
+        "appendedKeys": { "$ref": "#/$defs/stringArray" },
+        "previousViewportOffset": { "type": "number" },
+        "nextViewportOffset": { "type": "number" },
+        "nextViewportEnd": { "type": "number" },
+        "totalExtent": { "type": "number" }
+      }
+    },
+    "supersedeRestoreCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "supersededMessageId", "winningMessageId", "winningMessageKey", "targetIndex"],
+      "properties": {
+        "kind": { "const": "supersede_restore_command" },
+        "supersededMessageId": { "type": "string" },
+        "winningMessageId": { "type": "string" },
+        "winningMessageKey": { "type": "string" },
+        "targetIndex": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
