@@ -115,6 +115,113 @@ async fn claimed(repo: &WorkflowRepository) -> ClaimedWakeEffect {
 }
 
 #[tokio::test]
+async fn terminal_evidence_rejects_a_fired_receipt_with_different_evidence_atomically() {
+    let (pool, repo) = registered(bash()).await;
+    let claim = claimed(&repo).await;
+    let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
+        identity: match bash() {
+            WakeResourceIdentity::Bash(identity) => identity,
+            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+        },
+        status: BashTerminalStatus::Exited,
+        occurred_at: Timestamp(1_020),
+        exit_code: Some(0),
+        duration_ms: Some(20_000),
+        signal_number: None,
+        kill_signal_sent: None,
+        final_tail: vec!["observed".to_owned()],
+    });
+    let mut receipt_evidence = evidence.clone();
+    let WakeTerminalEvidence::Bash(receipt_bash_evidence) = &mut receipt_evidence else {
+        unreachable!()
+    };
+    receipt_bash_evidence.final_tail = vec!["different".to_owned()];
+
+    let result = WakeWorkflowAdapter::new(&repo)
+        .record_terminal_evidence(
+            &WakeObservationRequest {
+                observation_id: "mismatched-observation".to_owned(),
+                authority: claim.authority.clone(),
+                attempt_id: claim.attempt_id.clone(),
+                evidence,
+                recorded_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+            },
+            &WakeTerminalReceiptRequest {
+                receipt_id: "mismatched-receipt".to_owned(),
+                reducer_inbox_id: "mismatched-inbox".to_owned(),
+                authority: claim.authority,
+                attempt_id: claim.attempt_id,
+                terminal: WakeTerminalPayload::Fired {
+                    contract_id: "wake-contract".to_owned(),
+                    resource: bash(),
+                    evidence: receipt_evidence,
+                    resolved_at: Timestamp(1_021),
+                },
+                accepted_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+                origin: DurableReceiptOrigin::Execution,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, AcceptReceiptResult::StaleAuthority);
+    let writes: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM workflow_observations WHERE id = 'mismatched-observation') \
+              + (SELECT COUNT(*) FROM workflow_receipts WHERE id = 'mismatched-receipt') \
+              + (SELECT COUNT(*) FROM workflow_reducer_inbox WHERE id = 'mismatched-inbox')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(writes, 0);
+}
+
+#[tokio::test]
+async fn terminal_evidence_requires_a_fired_receipt() {
+    let (_pool, repo) = registered(bash()).await;
+    let claim = claimed(&repo).await;
+    let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
+        identity: match bash() {
+            WakeResourceIdentity::Bash(identity) => identity,
+            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+        },
+        status: BashTerminalStatus::Exited,
+        occurred_at: Timestamp(1_020),
+        exit_code: Some(0),
+        duration_ms: None,
+        signal_number: None,
+        kill_signal_sent: None,
+        final_tail: Vec::new(),
+    });
+    let result = WakeWorkflowAdapter::new(&repo)
+        .record_terminal_evidence(
+            &WakeObservationRequest {
+                observation_id: "observation".to_owned(),
+                authority: claim.authority.clone(),
+                attempt_id: claim.attempt_id.clone(),
+                evidence,
+                recorded_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+            },
+            &WakeTerminalReceiptRequest {
+                receipt_id: "receipt".to_owned(),
+                reducer_inbox_id: "inbox".to_owned(),
+                authority: claim.authority,
+                attempt_id: claim.attempt_id,
+                terminal: WakeTerminalPayload::Expired {
+                    contract_id: "wake-contract".to_owned(),
+                    resource: bash(),
+                    resolved_at: Timestamp(1_021),
+                },
+                accepted_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+                origin: DurableReceiptOrigin::Execution,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, AcceptReceiptResult::StaleAuthority);
+}
+
+#[tokio::test]
 async fn registration_selects_protocol_is_retryable_and_installs_exact_deadline_intent() {
     let (pool, repo) = registered(bash()).await;
     let adapter = WakeWorkflowAdapter::new(&repo);
@@ -232,37 +339,39 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
         final_tail: vec!["done".to_owned()],
     });
     let adapter = WakeWorkflowAdapter::new(&repo);
-    let recorded = adapter
-        .record_observation(&WakeObservationRequest {
-            observation_id: "wake-observation".to_owned(),
-            authority: claim.authority.clone(),
-            attempt_id: claim.attempt_id.clone(),
-            evidence: evidence.clone(),
-            recorded_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(recorded, RecordObservationResult::Recorded { .. }));
-
-    let terminal = WakeTerminalPayload::Fired {
-        contract_id: "wake-contract".to_owned(),
-        resource: bash(),
-        evidence,
-        resolved_at: Timestamp(1_020),
+    let observation = WakeObservationRequest {
+        observation_id: "wake-observation".to_owned(),
+        authority: claim.authority.clone(),
+        attempt_id: claim.attempt_id.clone(),
+        evidence: evidence.clone(),
+        recorded_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+    };
+    let receipt = WakeTerminalReceiptRequest {
+        receipt_id: "wake-receipt".to_owned(),
+        reducer_inbox_id: "wake-inbox".to_owned(),
+        authority: claim.authority,
+        attempt_id: claim.attempt_id,
+        terminal: WakeTerminalPayload::Fired {
+            contract_id: "wake-contract".to_owned(),
+            resource: bash(),
+            evidence,
+            resolved_at: Timestamp(1_020),
+        },
+        accepted_at: Utc.timestamp_opt(1_022, 0).single().unwrap(),
+        origin: DurableReceiptOrigin::Execution,
     };
     let accepted = adapter
-        .accept_terminal_receipt(&WakeTerminalReceiptRequest {
-            receipt_id: "wake-receipt".to_owned(),
-            reducer_inbox_id: "wake-inbox".to_owned(),
-            authority: claim.authority,
-            attempt_id: claim.attempt_id,
-            terminal,
-            accepted_at: Utc.timestamp_opt(1_022, 0).single().unwrap(),
-            origin: DurableReceiptOrigin::Execution,
-        })
+        .record_terminal_evidence(&observation, &receipt)
         .await
         .unwrap();
     assert!(matches!(accepted, AcceptReceiptResult::Accepted { .. }));
+    let observation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_observations WHERE id = 'wake-observation' AND authoritative = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(observation_count, 1);
     let state = sqlx::query(
         "SELECT e.status, i.requires_runtime_acceptance, i.delivery_status \
          FROM workflow_effects e JOIN workflow_reducer_inbox i ON i.workflow_id = e.workflow_id \

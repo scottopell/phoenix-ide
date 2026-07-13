@@ -78,6 +78,13 @@ pub struct ClaimedWakeEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeBinding {
+    pub contract_id: String,
+    pub resource: WakeResourceIdentity,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeObservationRequest {
     pub observation_id: String,
     pub authority: DurableClaimAuthority,
@@ -307,6 +314,35 @@ impl<'a> WakeWorkflowAdapter<'a> {
             .collect())
     }
 
+    pub async fn load_binding(&self, workflow_id: &str) -> WorkflowRepositoryResult<WakeBinding> {
+        let row = sqlx::query(
+            "SELECT contract_id, expires_at FROM wake_workflow_bindings WHERE workflow_id = ?1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(self.repository.pool())
+        .await?
+        .ok_or_else(|| {
+            WorkflowRepositoryError::CorruptState("wake workflow has no typed binding".to_owned())
+        })?;
+        Ok(WakeBinding {
+            contract_id: row.get("contract_id"),
+            resource: self.load_resource(workflow_id).await?,
+            expires_at: parse_datetime(&row.get::<String, _>("expires_at"))?,
+        })
+    }
+
+    pub async fn next_deadline(&self) -> WorkflowRepositoryResult<Option<DateTime<Utc>>> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(b.expires_at) FROM wake_workflow_bindings b \
+             JOIN workflows w ON w.id = b.workflow_id \
+             WHERE w.status = 'active' AND w.authority = 'engine_protocol' \
+               AND w.execution_mode = 'authoritative'",
+        )
+        .fetch_one(self.repository.pool())
+        .await?;
+        value.map(|value| parse_datetime(&value)).transpose()
+    }
+
     pub async fn claim(
         &self,
         due: &DueEffect,
@@ -321,7 +357,29 @@ impl<'a> WakeWorkflowAdapter<'a> {
                 effect_id,
                 ..
             } => (workflow_id, effect_id),
-            DueEffect::RetryWait { .. } | DueEffect::ExpiredClaim { .. } => return Ok(None),
+            DueEffect::RetryWait { .. } => return Ok(None),
+            DueEffect::ExpiredClaim { authority } => {
+                return match self
+                    .repository
+                    .take_over_expired_claim(&super::DurableClaimTakeover {
+                        authority: authority.clone(),
+                        replacement_claim_token: claim_token,
+                        replacement_worker_id: worker_id,
+                        lease_until,
+                        now,
+                    })
+                    .await?
+                {
+                    super::TakeOverExpiredClaimResult::Claimed { authority, attempt } => {
+                        Ok(Some(ClaimedWakeEffect {
+                            authority,
+                            attempt_id: attempt.attempt_id,
+                        }))
+                    }
+                    super::TakeOverExpiredClaimResult::Ineligible
+                    | super::TakeOverExpiredClaimResult::StaleAuthority => Ok(None),
+                };
+            }
         };
         match self
             .repository
@@ -341,6 +399,64 @@ impl<'a> WakeWorkflowAdapter<'a> {
             })),
             ClaimEffectResult::Ineligible | ClaimEffectResult::Contended => Ok(None),
         }
+    }
+
+    pub async fn record_terminal_evidence(
+        &self,
+        observation: &WakeObservationRequest,
+        receipt: &WakeTerminalReceiptRequest,
+    ) -> WorkflowRepositoryResult<AcceptReceiptResult> {
+        let WakeTerminalPayload::Fired {
+            resource, evidence, ..
+        } = &receipt.terminal
+        else {
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        };
+        if observation.authority != receipt.authority
+            || observation.attempt_id != receipt.attempt_id
+            || &observation.evidence != evidence
+            || observation.evidence.identity() != *resource
+        {
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+        let binding = self
+            .load_binding(&observation.authority.workflow_id)
+            .await?;
+        if observation.evidence.identity() != binding.resource {
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+        self.repository
+            .record_observation_and_accept_receipt(
+                &DurableObservationRecord {
+                    observation_id: observation.observation_id.clone(),
+                    authority: observation.authority.clone(),
+                    attempt_id: observation.attempt_id.clone(),
+                    payload: payload(
+                        wake_profile::terminal_codec(),
+                        evidence_json(&observation.evidence),
+                    )?,
+                    observed_at: timestamp(observation.evidence.occurred_at())?,
+                    recorded_at: observation.recorded_at,
+                },
+                &DurableAcceptReceiptRequest {
+                    receipt_id: receipt.receipt_id.clone(),
+                    reducer_inbox_id: receipt.reducer_inbox_id.clone(),
+                    authority: receipt.authority.clone(),
+                    now: receipt.accepted_at,
+                    attempt_id: Some(receipt.attempt_id.clone()),
+                    origin: receipt.origin,
+                    receipt: payload(
+                        wake_profile::terminal_codec(),
+                        terminal_json(&receipt.terminal),
+                    )?,
+                    reducer_event: payload(
+                        wake_profile::terminal_codec(),
+                        terminal_json(&receipt.terminal),
+                    )?,
+                    wake_terminal_projection: Some(terminal_projection(&receipt.terminal)?),
+                },
+            )
+            .await
     }
 
     pub async fn record_observation(
@@ -1134,6 +1250,12 @@ fn due_effect_id(due: &DueEffect) -> &str {
         DueEffect::Eligible { effect_id, .. } | DueEffect::RetryWait { effect_id, .. } => effect_id,
         DueEffect::ExpiredClaim { authority } => &authority.effect_id,
     }
+}
+
+fn parse_datetime(value: &str) -> WorkflowRepositoryResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| WorkflowRepositoryError::CorruptState("invalid wake timestamp".to_owned()))
 }
 
 fn timestamp(value: Timestamp) -> WorkflowRepositoryResult<DateTime<Utc>> {
