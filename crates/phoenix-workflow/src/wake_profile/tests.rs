@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    AuthorityOutcome, ClaimOutcome, CommitOutcome, EffectStatus, LeaseExpiry, ReducerInboxId,
-    ReducerInboxKind, ReducerInboxPayload, Timestamp, Version, WorkflowId, WorkflowProfile,
-    WorkflowState,
+    AuthorityOutcome, ClaimOutcome, CommitOutcome, EffectStatus, LeaseExpiry, ManualChoiceKind,
+    ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, Timestamp, Version, WorkflowId,
+    WorkflowProfile, WorkflowState,
 };
 
 use super::{
@@ -722,4 +722,43 @@ fn manual_choices_export_expected_codec_payloads_and_terminal_receipts() {
     assert!(choices
         .iter()
         .all(|choice| choice.receipt_event == terminal));
+}
+
+#[test]
+fn terminal_receipt_requires_exact_terminal_projection_event() {
+    let terminal = forgotten_terminal_payload(
+        "contract-1",
+        bash_identity("b-terminal"),
+        WakeForgottenReason::HandleMissing,
+        Timestamp(12),
+    );
+    let inbox = ReducerInboxPayload::Receipt(terminal.clone());
+
+    assert!(!WakeProfile::decision_handles_inbox(
+        &inbox,
+        &super::WakeRegistrationEvent::Registered,
+    ));
+    assert!(WakeProfile::decision_handles_inbox(
+        &inbox,
+        &super::WakeRegistrationEvent::TerminalProjected {
+            terminal: Box::new(terminal),
+        },
+    ));
+}
+
+#[test]
+fn suppress_manual_choice_is_typed_as_suppress() {
+    let terminal = forgotten_terminal_payload(
+        "contract-1",
+        bash_identity("b-suppress"),
+        WakeForgottenReason::HandleMissing,
+        Timestamp(12),
+    );
+    let choices = manual_choices(&terminal);
+    let suppress = choices
+        .iter()
+        .find(|choice| choice.payload == WakeManualPayload::Suppress)
+        .expect("suppress choice");
+
+    assert_eq!(suppress.kind, ManualChoiceKind::Suppress);
 }
