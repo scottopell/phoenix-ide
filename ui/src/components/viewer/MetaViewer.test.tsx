@@ -2,6 +2,7 @@ import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MetaViewer } from './MetaViewer';
+import * as viewerFindModule from '../viewer-find/useViewerFind';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
 import { resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -91,6 +92,23 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
 describe('MetaViewer payload routing', () => {
+  it('keeps useViewerFind in state-only mode while projection drives file matching', async () => {
+    const spy = vi.spyOn(viewerFindModule, 'useViewerFind');
+    renderViewer({
+      ...textCommon,
+      kind: 'text',
+      content: 'alpha\nbeta',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ text: '' });
+    spy.mockRestore();
+  });
+
   beforeEach(() => resetCodeViewMock());
 
   it('routes a markdown payload to rendered markdown', () => {

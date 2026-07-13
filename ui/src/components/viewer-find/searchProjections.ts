@@ -530,8 +530,6 @@ function skillMessageText(message: Message): string {
       .filter((part) => part.length > 0)
       .join(' ');
   if (trigger.length > 0) parts.push(trigger);
-  if (typeof content.source === 'string' && content.source.length > 0) parts.push(content.source);
-  if (typeof content.snippet === 'string' && content.snippet.length > 0) parts.push(content.snippet);
   for (const file of content.files ?? []) {
     if (typeof file.original_name === 'string' && file.original_name.length > 0) parts.push(file.original_name);
   }

@@ -287,6 +287,30 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.sources[0]?.text).toBe('alpha directive\nsecondary line');
     expect(projection.matches[0]?.target.kind).toBe('header-text');
   });
+
+  it('keeps skill transcript matches to visible inline trigger and file chips', () => {
+    const units: RenderUnit[] = [{
+      kind: 'skill',
+      key: 's1',
+      message: {
+        ...skillMsg('s1', 'Skill alpha'),
+        content: {
+          text: 'Skill alpha',
+          name: 'dogfood',
+          trigger: '/dogfood alpha --trace',
+          args: 'alpha --trace',
+          source: '/skills/dogfood/SKILL.md',
+          snippet: 'Alpha walkthrough',
+          files: [{ original_name: 'alpha.txt', media_type: 'text/plain', size_bytes: 5, stored_path: '/tmp/alpha.txt' }],
+        } as unknown as Message['content'],
+      },
+    }];
+
+    expect(buildConversationSearchProjection(units, '/dogfood alpha --trace').matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, 'alpha.txt').matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, '/skills/dogfood/SKILL.md').matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'Alpha walkthrough').matches).toHaveLength(0);
+  });
   it('projects canonical typed content across available render units exhaustively', () => {
     const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
       type: 'awaiting_sub_agents',
@@ -331,7 +355,7 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.sources.map((source) => [source.unitKind, source.role, source.text])).toEqual([
       ['user', 'user-message', 'User alpha\nalpha.txt'],
       ['pending_user', 'pending-user-message', 'Pending alpha\nqueued-alpha.md'],
-      ['skill', 'skill-message', '/dogfood alpha --trace\n/skills/dogfood/SKILL.md\nAlpha walkthrough\nalpha.txt'],
+      ['skill', 'skill-message', '/dogfood alpha --trace\nalpha.txt'],
       ['system', 'system-message', 'System alpha'],
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-name-1', 'search'],
@@ -348,7 +372,6 @@ describe('buildConversationSearchProjection', () => {
       'user',
       'pending_user',
       'pending_user',
-      'skill',
       'skill',
       'skill',
       'system',

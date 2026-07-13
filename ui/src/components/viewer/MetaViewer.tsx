@@ -236,7 +236,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const findEligible = (textLike && !htmlPreview) || largeFallback;
   const findSourceText = findEligible ? content : '';
-  const find = useViewerFind({ text: findSourceText, resetKey: findResetKey });
+  const find = useViewerFind({ text: '', resetKey: findResetKey });
   const shouldProjectFind = findEligible && find.isOpen && find.query.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
     () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),

@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DiffView } from './DiffView';
+import * as searchProjectionModule from '../viewer-find/searchProjections';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
 
@@ -54,6 +55,18 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getAllByText('committed').length).toBeGreaterThan(0);
     const addNoteButton = screen.getByRole('button', { name: 'Add note to line' });
     expect(addNoteButton).toHaveAttribute('data-utility-button');
+  });
+
+  it('reuses the memoized diff projection when a new query navigates to its first match', async () => {
+    const spy = vi.spyOn(searchProjectionModule, 'buildDiffSearchProjection');
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hello' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
   });
 
   it('lets DiffView opt out of shell-owned scrolling so CodeView owns the scroll container', () => {
@@ -168,26 +181,27 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
   });
 
-  it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
+  it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', async () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
     const input = screen.getByRole('textbox', { name: 'Find in viewer' });
     fireEvent.change(input, { target: { value: 'bar' } });
 
-    expect(codeViewMockState.scrollToCalls).toEqual([
-      { type: 'item', id: 'uncommitted:bar.txt', align: 'start', behavior: 'smooth' },
-    ]);
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
 
     fireEvent.change(input, { target: { value: 'hello' } });
-    expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
       type: 'line',
       id: 'committed:foo.txt',
       lineNumber: 1,
       side: 'additions',
       align: 'center',
       behavior: 'smooth',
-    });
+    }));
   });
 
   it('marks non-active diff header matches distinctly while keeping the exact colon-containing header active', () => {

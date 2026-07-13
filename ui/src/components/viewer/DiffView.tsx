@@ -10,7 +10,7 @@
  * drops the entire pile. Jump-to-line uses Pierre's typed scroll target.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Columns2, Rows3 } from 'lucide-react';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
@@ -149,12 +149,13 @@ export function DiffView({
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
-    const nextProjection = query.length > 0
-      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog)
-      : { sources: [], matches: [] };
-    const target = nextProjection.matches[0]?.target;
+  }, [find]);
+
+  useEffect(() => {
+    if (!find.isOpen || find.query.length === 0 || find.requestedActiveIndex >= 0) return;
+    const target = findProjection.matches[0]?.target;
     if (target) navigateFindTarget(target);
-  }, [find, commitLog, committedDiff, navigateFindTarget, uncommittedDiff]);
+  }, [find.isOpen, find.query, find.requestedActiveIndex, findProjection.matches, navigateFindTarget]);
 
   const handleFindNext = useCallback(() => {
     const nextIndex = findProjection.matches.length === 0
