@@ -272,7 +272,7 @@ async fn upsert_shadow_workflow(
     .bind(&config.authoritative_anchor_workflow_id)
     .bind(SELECTION_ID)
     .bind(to_i64(oracle.generation)?)
-    .bind(status_sql(domain.workflow.status))
+    .bind(status_sql(domain.plan.next_status))
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await?;

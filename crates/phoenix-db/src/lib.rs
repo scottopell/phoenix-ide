@@ -697,6 +697,31 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
+async fn insert_creation_shadow_evidence_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &InsertConversationCreationJob,
+    accepted_at: &str,
+) -> DbResult<()> {
+    let attachment_count = job
+        .intent
+        .files
+        .len()
+        .saturating_add(job.intent.images.len());
+    let attachment_count = i64::try_from(attachment_count)
+        .map_err(|_| DbError::Serialization("attachment count exceeds i64".to_string()))?;
+    sqlx::query(
+        "INSERT INTO creation_shadow_creation_evidence
+         (creation_job_id, cwd, attachment_count, accepted_at) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(&job.id)
+    .bind(&job.intent.cwd)
+    .bind(attachment_count)
+    .bind(accepted_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -2773,6 +2798,7 @@ impl Database {
         .await?;
         insert_creation_job_files_tx(&mut tx, job).await?;
         insert_creation_job_images_tx(&mut tx, job).await?;
+        insert_creation_shadow_evidence_tx(&mut tx, job, &now_str).await?;
         tx.commit().await?;
         self.get_conversation_creation_job(&job.id).await
     }
@@ -2882,6 +2908,7 @@ impl Database {
         .await?;
         insert_creation_job_files_tx(&mut tx, job).await?;
         insert_creation_job_images_tx(&mut tx, job).await?;
+        insert_creation_shadow_evidence_tx(&mut tx, job, &now_str).await?;
 
         tx.commit().await?;
         let title = schema::title_from_slug(&actual_slug);
@@ -4036,6 +4063,23 @@ impl Database {
             .await?;
         tx.commit().await?;
         Ok(CreationCasOutcome::Applied)
+    }
+
+    /// Load immutable creation diagnostics captured in the acceptance transaction.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the evidence row cannot be loaded.
+    pub async fn get_creation_shadow_evidence(&self, job_id: &str) -> DbResult<(String, usize)> {
+        let (cwd, attachment_count): (String, i64) = sqlx::query_as(
+            "SELECT cwd, attachment_count FROM creation_shadow_creation_evidence WHERE creation_job_id = ?1",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let attachment_count = usize::try_from(attachment_count).map_err(|_| {
+            DbError::Serialization("negative creation shadow attachment count".to_owned())
+        })?;
+        Ok((cwd, attachment_count))
     }
 
     /// Update conversation state, stamping `state_updated_at = now()`.
@@ -8469,6 +8513,57 @@ mod tests {
                 .status,
             CreationStatus::Ready
         ));
+    }
+
+    #[tokio::test]
+    async fn immutable_shadow_evidence_survives_creation_completion_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-shadow-evidence", "conv-shadow-evidence").await;
+        let before = db
+            .get_creation_shadow_evidence("job-shadow-evidence")
+            .await
+            .unwrap();
+        assert_eq!(before, ("/tmp".to_owned(), 0));
+
+        let now = Utc::now();
+        let claim = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claim else {
+            panic!("creation must be claimed");
+        };
+        let CreationStatus::Claimed(authority) = job.protocol.status else {
+            panic!("claim must carry authority");
+        };
+        assert_eq!(
+            db.complete_conversation_creation_job("job-shadow-evidence", &authority, now)
+                .await
+                .unwrap(),
+            CreationCasOutcome::Applied
+        );
+
+        assert_eq!(
+            db.get_creation_shadow_evidence("job-shadow-evidence")
+                .await
+                .unwrap(),
+            before
+        );
+        let intent: String = sqlx::query_scalar(
+            "SELECT intent_json FROM conversation_creation_jobs WHERE id = 'job-shadow-evidence'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let intent: serde_json::Value = serde_json::from_str(&intent).unwrap();
+        assert_eq!(intent["cwd"], "");
+        assert_eq!(intent["text"], "");
+        assert_eq!(intent["images"], serde_json::json!([]));
     }
 
     #[tokio::test]

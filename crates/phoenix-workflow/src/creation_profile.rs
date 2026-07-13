@@ -80,6 +80,18 @@ pub enum AuthoritativeCreationStatus {
     Failed(CreationFailure),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOwnership {
+    None,
+    OwnedResources,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CreationRuntimeEvidence {
+    pub runtime_bootstrapped: bool,
+    pub initial_llm_dispatched: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeCreationOracle {
     pub intent: CreationIntent,
@@ -89,6 +101,8 @@ pub struct AuthoritativeCreationOracle {
     pub generation: u64,
     /// Committed source revision for monotonic diagnostic projection writes.
     pub revision: u64,
+    pub cleanup_ownership: CleanupOwnership,
+    pub runtime_evidence: CreationRuntimeEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -462,7 +476,12 @@ pub fn adapt_authoritative_creation(
         AuthoritativeCreationStatus::Cancelling
             | AuthoritativeCreationStatus::DeletionPending
             | AuthoritativeCreationStatus::Cancelled
-            | AuthoritativeCreationStatus::Failed(_)
+    ) || matches!(
+        (&oracle.status, oracle.cleanup_ownership),
+        (
+            AuthoritativeCreationStatus::Failed(_),
+            CleanupOwnership::OwnedResources
+        )
     ) {
         compensation_plan(oracle)
     } else {
@@ -556,7 +575,7 @@ pub fn creation_plan(
         })
         .collect();
     TransitionPlan {
-        next_status: workflow_status(&oracle.status),
+        next_status: workflow_status(oracle),
         snapshot,
         snapshot_codec: snapshot_codec(),
         event: CreationEvent::ShadowPlanProjected {
@@ -726,7 +745,7 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
         })
         .collect();
     TransitionPlan {
-        next_status: workflow_status(&oracle.status),
+        next_status: workflow_status(oracle),
         snapshot: snapshot(oracle),
         snapshot_codec: snapshot_codec(),
         event: CreationEvent::CancellationOrDeletionProjected {
@@ -794,7 +813,7 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         AuthoritativeCreationStatus::Ready => (
             CreationProjectionStatus::Ready,
             capabilities([true, true, true, false, false, true]),
-            CompletionPrediction::Complete,
+            completion_for_ready(oracle),
             CompensationPrediction::None,
             false,
         ),
@@ -813,6 +832,19 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         completion,
         compensation,
         hidden,
+    }
+}
+
+fn completion_for_ready(oracle: &AuthoritativeCreationOracle) -> CompletionPrediction {
+    match oracle.intent.kind {
+        CreationKind::SeededEmpty => CompletionPrediction::Complete,
+        CreationKind::InitialTurn { .. }
+            if oracle.runtime_evidence.runtime_bootstrapped
+                && oracle.runtime_evidence.initial_llm_dispatched =>
+        {
+            CompletionPrediction::Complete
+        }
+        CreationKind::InitialTurn { .. } => CompletionPrediction::Pending,
     }
 }
 
@@ -888,6 +920,20 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
                     EXPAND_INITIAL_MESSAGE | BOOTSTRAP_RUNTIME | DISPATCH_INITIAL_LLM_REQUEST
                 ) {
                 EffectPrediction::Omitted
+            } else if id == BOOTSTRAP_RUNTIME {
+                if oracle.runtime_evidence.runtime_bootstrapped {
+                    EffectPrediction::Completed
+                } else {
+                    EffectPrediction::Eligible
+                }
+            } else if id == DISPATCH_INITIAL_LLM_REQUEST {
+                if oracle.runtime_evidence.initial_llm_dispatched {
+                    EffectPrediction::Completed
+                } else if oracle.runtime_evidence.runtime_bootstrapped {
+                    EffectPrediction::Eligible
+                } else {
+                    EffectPrediction::Blocked
+                }
             } else if oracle.stage > stage
                 || matches!(oracle.status, AuthoritativeCreationStatus::Ready)
             {
@@ -902,15 +948,20 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
         .collect()
 }
 
-const fn workflow_status(status: &AuthoritativeCreationStatus) -> WorkflowStatus {
-    match status {
+fn workflow_status(oracle: &AuthoritativeCreationOracle) -> WorkflowStatus {
+    match &oracle.status {
+        AuthoritativeCreationStatus::Ready
+            if completion_for_ready(oracle) == CompletionPrediction::Complete =>
+        {
+            WorkflowStatus::Completed
+        }
         AuthoritativeCreationStatus::Accepted
         | AuthoritativeCreationStatus::Claimed { .. }
-        | AuthoritativeCreationStatus::RetryScheduled { .. } => WorkflowStatus::Active,
+        | AuthoritativeCreationStatus::RetryScheduled { .. }
+        | AuthoritativeCreationStatus::Ready => WorkflowStatus::Active,
         AuthoritativeCreationStatus::Cancelling => WorkflowStatus::Cancelling,
         AuthoritativeCreationStatus::Cancelled => WorkflowStatus::Cancelled,
         AuthoritativeCreationStatus::DeletionPending => WorkflowStatus::DeletionPending,
-        AuthoritativeCreationStatus::Ready => WorkflowStatus::Completed,
         AuthoritativeCreationStatus::Failed(_) => WorkflowStatus::Failed,
     }
 }

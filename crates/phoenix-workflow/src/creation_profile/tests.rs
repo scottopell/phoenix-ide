@@ -9,12 +9,13 @@ use crate::{
 use super::{
     adapt_authoritative_creation, compensation_plan, project_authoritative_creation,
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
-    CapabilityAvailability, CompensationPrediction, CompletionPrediction, CreationFailure,
-    CreationKind, CreationProjectionStatus, EffectPrediction, WorktreeReconciliationClassification,
-    BOOTSTRAP_RUNTIME, COMMIT_METADATA, COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS,
-    DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS,
-    FINISH_CANCELLATION_OR_DELETION, MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION,
-    REMOVE_OWNED_WORKTREE, RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
+    CapabilityAvailability, CleanupOwnership, CompensationPrediction, CompletionPrediction,
+    CreationFailure, CreationKind, CreationProjectionStatus, CreationRuntimeEvidence,
+    EffectPrediction, WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME, COMMIT_METADATA,
+    COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS, DISPATCH_INITIAL_LLM_REQUEST,
+    EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS, FINISH_CANCELLATION_OR_DELETION,
+    MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE,
+    RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
 };
 
 fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
@@ -35,6 +36,8 @@ fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
         attempt: 2,
         generation: 3,
         revision: 7,
+        cleanup_ownership: CleanupOwnership::None,
+        runtime_evidence: CreationRuntimeEvidence::default(),
     }
 }
 
@@ -360,10 +363,6 @@ fn cleanup_states_adapt_to_compensation_graphs() {
         AuthoritativeCreationStatus::Cancelling,
         AuthoritativeCreationStatus::DeletionPending,
         AuthoritativeCreationStatus::Cancelled,
-        AuthoritativeCreationStatus::Failed(CreationFailure {
-            kind: "permanent".into(),
-            message: "cleanup still required".into(),
-        }),
     ];
     for status in statuses {
         let mut oracle = oracle(CreationKind::SeededEmpty);
@@ -378,6 +377,61 @@ fn cleanup_states_adapt_to_compensation_graphs() {
             .all(|effect| effect.role == crate::EffectRole::Compensation));
         assert_eq!(adapted.plan.dependencies.len(), 5);
     }
+}
+
+#[test]
+fn failed_jobs_only_adapt_to_compensation_when_cleanup_resources_are_owned() {
+    let mut failed = oracle(CreationKind::SeededEmpty);
+    failed.status = AuthoritativeCreationStatus::Failed(CreationFailure {
+        kind: "validation".into(),
+        message: "failed before reservation".into(),
+    });
+    let without_resources =
+        adapt_authoritative_creation(WorkflowId(21), WorkflowId(91), &failed).unwrap();
+    assert!(without_resources
+        .plan
+        .effects
+        .iter()
+        .all(|effect| effect.role == EffectRole::Required));
+
+    failed.cleanup_ownership = CleanupOwnership::OwnedResources;
+    let with_resources =
+        adapt_authoritative_creation(WorkflowId(22), WorkflowId(92), &failed).unwrap();
+    assert!(with_resources
+        .plan
+        .effects
+        .iter()
+        .all(|effect| effect.role == EffectRole::Compensation));
+}
+
+#[test]
+fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_evidence() {
+    let mut pending = oracle(CreationKind::InitialTurn {
+        message_id: "message-1".into(),
+    });
+    pending.stage = AuthoritativeCreationStage::Finalize;
+    pending.status = AuthoritativeCreationStatus::Ready;
+    let projection = project_authoritative_creation(&pending);
+    let predictions = projection
+        .effect_predictions
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(predictions[&BOOTSTRAP_RUNTIME], EffectPrediction::Eligible);
+    assert_eq!(
+        predictions[&DISPATCH_INITIAL_LLM_REQUEST],
+        EffectPrediction::Blocked
+    );
+    assert_eq!(projection.completion, CompletionPrediction::Pending);
+
+    pending.runtime_evidence = CreationRuntimeEvidence {
+        runtime_bootstrapped: true,
+        initial_llm_dispatched: true,
+    };
+    let complete = project_authoritative_creation(&pending);
+    assert_eq!(complete.completion, CompletionPrediction::Complete);
+    assert!(complete
+        .effect_predictions
+        .contains(&(DISPATCH_INITIAL_LLM_REQUEST, EffectPrediction::Completed)));
 }
 
 proptest! {

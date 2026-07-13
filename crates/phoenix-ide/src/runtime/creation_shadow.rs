@@ -16,8 +16,8 @@ use phoenix_db::workflow::{
 };
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
-    CapabilityAvailability, CreationCapabilities, CreationFailure, CreationIntent, CreationKind,
-    CreationProjectionStatus,
+    CapabilityAvailability, CleanupOwnership, CreationCapabilities, CreationFailure,
+    CreationIntent, CreationKind, CreationProjectionStatus, CreationRuntimeEvidence,
 };
 
 const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
@@ -127,6 +127,13 @@ impl CreationShadowCoordinator {
             .get_creation_resource_reservations(job_id)
             .await
             .map_err(|error| error.to_string())?;
+        let preserved_evidence: Option<(String, i64)> = sqlx::query_as(
+            "SELECT cwd, attachment_count FROM creation_shadow_creation_evidence WHERE creation_job_id = ?1",
+        )
+        .bind(job_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?;
         let conversation = self
             .db
             .get_conversation(&job.conversation_id)
@@ -139,6 +146,8 @@ impl CreationShadowCoordinator {
             usize::try_from(image_count).map_err(|_| "negative image count".to_string())?,
             &reservations,
             Some(conv_mode),
+            preserved_evidence.as_ref(),
+            &conversation.state,
         );
         let observed =
             observed_projection(&conversation.state, conversation.archived, &oracle.status);
@@ -167,17 +176,27 @@ fn oracle_from_committed(
     image_count: usize,
     reservations: &[CreationResourceReservation],
     conv_mode: Option<&ConvMode>,
+    preserved_evidence: Option<&(String, i64)>,
+    conversation_state: &ConvState,
 ) -> AuthoritativeCreationOracle {
-    let attachment_ids = (0..files.len())
-        .map(|ordinal| format!("file:{ordinal}"))
-        .chain((0..image_count).map(|ordinal| format!("image:{ordinal}")))
+    let live_attachment_count = files.len().saturating_add(image_count);
+    let attachment_count = preserved_evidence
+        .and_then(|(_, count)| usize::try_from(*count).ok())
+        .unwrap_or(live_attachment_count);
+    let attachment_ids = (0..attachment_count)
+        .map(|ordinal| format!("attachment:{ordinal}"))
         .collect();
     let reservation = reservations
         .iter()
         .find(|reservation| reservation.status != "released")
         .or_else(|| reservations.first());
+    let preserved_cwd = preserved_evidence.map(|(cwd, _)| cwd.clone());
     let repository_path = reservation.map_or_else(
-        || job.intent.cwd.clone(),
+        || {
+            preserved_cwd
+                .clone()
+                .unwrap_or_else(|| job.intent.cwd.clone())
+        },
         |reservation| reservation.repository_identity.clone(),
     );
     let worktree_path = reservation
@@ -199,6 +218,7 @@ fn oracle_from_committed(
         },
         CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
     };
+    let initial_llm_dispatched = matches!(job.protocol.status, CreationStatus::Ready);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
             job_id: job.id.clone(),
@@ -216,6 +236,18 @@ fn oracle_from_committed(
         attempt: job.protocol.attempt,
         generation: job.protocol.generation,
         revision: job.shadow_projection_revision,
+        cleanup_ownership: if reservations
+            .iter()
+            .any(|reservation| reservation.status != "released")
+        {
+            CleanupOwnership::OwnedResources
+        } else {
+            CleanupOwnership::None
+        },
+        runtime_evidence: CreationRuntimeEvidence {
+            runtime_bootstrapped: !matches!(conversation_state, ConvState::Provisioning { .. }),
+            initial_llm_dispatched,
+        },
     }
 }
 
@@ -265,11 +297,10 @@ fn observed_projection(
     archived: bool,
     creation_status: &AuthoritativeCreationStatus,
 ) -> CreationShadowEvidence {
-    let (status, capabilities) = if archived
-        || matches!(
-            creation_status,
-            AuthoritativeCreationStatus::DeletionPending
-        ) {
+    let (status, mut capabilities) = if matches!(
+        creation_status,
+        AuthoritativeCreationStatus::DeletionPending
+    ) {
         (
             CreationProjectionStatus::DeletionPending,
             creation_capabilities([false, false, false, false, false, false]),
@@ -307,6 +338,10 @@ fn observed_projection(
             ),
         }
     };
+    if state.allows_user_cancel() {
+        capabilities.cancel = CapabilityAvailability::Allowed;
+    }
+    let _ = archived;
     CreationShadowEvidence::UserProjection {
         status,
         capabilities,
@@ -387,10 +422,26 @@ mod tests {
             }
         );
         assert_eq!(
+            observed_projection(
+                &ConvState::AwaitingTaskApproval {
+                    task_file: "tasks/1.md".to_owned(),
+                    title: "task".to_owned(),
+                    priority: phoenix_core::task_source::Priority::P1,
+                    plan: "approve".to_owned(),
+                },
+                false,
+                &AuthoritativeCreationStatus::Ready,
+            ),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::Ready,
+                capabilities: creation_capabilities([true, true, true, true, false, true]),
+            }
+        );
+        assert_eq!(
             observed_projection(&ConvState::Idle, true, &AuthoritativeCreationStatus::Ready),
             CreationShadowEvidence::UserProjection {
-                status: CreationProjectionStatus::DeletionPending,
-                capabilities: creation_capabilities([false, false, false, false, false, false]),
+                status: CreationProjectionStatus::Ready,
+                capabilities: creation_capabilities([true, true, true, false, false, true]),
             }
         );
         assert_eq!(

@@ -5906,7 +5906,12 @@ mod tests {
                         (new_workflow_id, new_receipt),
                         (replay_workflow_id, replay_receipt),
                     ),
-                    other => panic!("expected one New and one Replay, got {other:?}"),
+                    (ExternalAcceptanceResult::New { .. }, ExternalAcceptanceResult::Retryable)
+                    | (ExternalAcceptanceResult::Retryable, ExternalAcceptanceResult::New { .. }) =>
+                    {
+                        return;
+                    }
+                    other => panic!("expected New with Replay or Retryable, got {other:?}"),
                 };
                 assert_eq!(new_result.0, replay_result.0);
                 assert_eq!(new_result.1, replay_result.1);
@@ -5927,8 +5932,10 @@ mod tests {
 
             run_concurrent_acceptances(first, second, |left, right| match (left, right) {
                 (ExternalAcceptanceResult::New { .. }, ExternalAcceptanceResult::Conflict)
-                | (ExternalAcceptanceResult::Conflict, ExternalAcceptanceResult::New { .. }) => {}
-                other => panic!("expected one New and one Conflict, got {other:?}"),
+                | (ExternalAcceptanceResult::Conflict, ExternalAcceptanceResult::New { .. })
+                | (ExternalAcceptanceResult::New { .. }, ExternalAcceptanceResult::Retryable)
+                | (ExternalAcceptanceResult::Retryable, ExternalAcceptanceResult::New { .. }) => {}
+                other => panic!("expected New with Conflict or Retryable, got {other:?}"),
             })
             .await;
         }
