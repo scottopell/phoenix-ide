@@ -82,6 +82,7 @@ export function DiffView({
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
   const find = useViewerFind({ text: '' });
+  const resetFind = find.reset;
 
   const openFind = useCallback(() => {
     findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -96,9 +97,9 @@ export function DiffView({
 
   useEffect(() => {
     if (open) return;
-    find.reset();
+    resetFind();
     findPreviousFocusRef.current = null;
-  }, [find, open]);
+  }, [open, resetFind]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
