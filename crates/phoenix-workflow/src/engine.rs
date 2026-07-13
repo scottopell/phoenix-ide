@@ -185,6 +185,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if self.binding.execution_mode() == ExecutionMode::Shadow {
             return denied_claim();
         }
+        if workflow_status_is_terminal(self.status) {
+            return ineligible_claim();
+        }
         if !lease_until.is_live_at(now) {
             return ineligible_claim();
         }
@@ -292,6 +295,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         lease_until: LeaseExpiry,
     ) -> ClaimResult {
+        if workflow_status_is_terminal(self.status) {
+            return ineligible_claim();
+        }
         if !lease_until.is_live_at(now) || self.crashed_workers.contains(&worker_id) {
             return denied_claim();
         }
@@ -1407,6 +1413,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     }
 
     fn suppress_cancellation_work(&mut self, transition: TransitionId) {
+        for inbox in self.reducer_inbox.values_mut() {
+            if inbox.delivery_status == DeliveryStatus::Pending {
+                inbox.delivery_status = DeliveryStatus::Suppressed {
+                    reason: SuppressionReason::Cancelled,
+                };
+            }
+        }
         for resolution in self.manual_resolutions.values_mut() {
             if resolution.status == ResolutionStatus::Required {
                 resolution.status = ResolutionStatus::Suppressed {

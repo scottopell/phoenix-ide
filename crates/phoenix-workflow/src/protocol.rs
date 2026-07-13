@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use crate::types::{
     DeliveryStatus, DivergenceSeverity, DrainCategoryEvidence, DrainProof, EffectRole,
     EffectStatus, ExternalAcceptanceBinding, ExternalAcceptanceKey, ExternalAcceptanceOutcome,
-    ExternalAcceptanceReceipt, NonEmptyExternalKey, ProtocolSelection, ResolutionStatus,
-    ShadowDivergenceResolution, WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
+    ExternalAcceptanceReceipt, NonEmptyExternalKey, ProtocolSelection, ProtocolSelectionIdentity,
+    ResolutionStatus, ShadowDivergenceResolution, WorkflowId, WorkflowProfile, WorkflowState,
+    WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +42,7 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
             return ExternalAcceptanceOutcome::Unsupported;
         };
         let key = ExternalAcceptanceKey {
-            profile: selection.profile.clone(),
+            selection: ProtocolSelectionIdentity::from(selection),
             authority_scope,
             idempotency_key: idempotency_key.clone(),
         };

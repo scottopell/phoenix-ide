@@ -18,6 +18,7 @@ pub enum PlanError {
     MissingEffectKind(EffectId),
     CompensationOutsideCancellation(EffectId),
     NonCompensationInCancellation(EffectId),
+    TerminalPlanDeclaresEffects(WorkflowStatus),
     EffectFamilyAmbiguityMismatch {
         family: &'static str,
     },
@@ -93,6 +94,13 @@ pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
 ) -> Result<(), PlanError> {
     validate_plan_codecs(plan)?;
+    if matches!(
+        plan.next_status,
+        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+    ) && !plan.effects.is_empty()
+    {
+        return Err(PlanError::TerminalPlanDeclaresEffects(plan.next_status));
+    }
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;
     validate_dependencies(plan, &effect_ids)?;
