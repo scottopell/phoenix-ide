@@ -1225,7 +1225,6 @@ mod existing_message_recovery_tests {
 #[allow(clippy::items_after_test_module)]
 mod repository_lock_tests {
     use super::RepositoryMutationLock;
-    use std::process::Command;
     use std::sync::mpsc;
     use std::time::Duration;
 
