@@ -883,7 +883,7 @@ function MessageListImpl({
   useEffect(() => {
     const handled = handledHistoryCommandRef.current;
     if (!historyScrollCommand || (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view))) return;
-    if (currentHistoryView && !sameHistoryView(historyScrollCommand.view, currentHistoryView)) {
+    if (!sameHistoryView(historyScrollCommand.view, currentHistoryView ?? null)) {
       finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'superseded');
       return;
     }

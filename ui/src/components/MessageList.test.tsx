@@ -1101,6 +1101,28 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
+  it('supersedes history commands when current view identity is unavailable', () => {
+    const oldView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: oldView });
+    const onHistoryScrollCommandHandled = vi.fn();
+
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    ));
+
+    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
+  });
+
   it('clears suppressed continuity on conversation change', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
