@@ -1,6 +1,27 @@
 export { FindBar, type FindBarProps } from './FindBar';
 export { findLiteralMatches, type ViewerFindMatch, type ViewerFindResult } from './literalMatch';
 export {
+  createMatchId,
+  type FindSessionCommand,
+  type FindSessionMatch,
+  type FindSessionOpenState,
+  type FindSessionState,
+  type MatchId,
+  type ReduceFindSessionResult,
+  type SearchableSurface,
+  type SearchableSurfaceKey,
+  closeFindSession,
+  createClosedFindSession,
+  nextFindSessionMatch,
+  openFindSession,
+  previousFindSessionMatch,
+  reduceFindSession,
+  replaceFindSessionResults,
+  resetFindSession,
+  setFindSessionQueryAndResults,
+  activateFindSessionMatch,
+} from './findSession';
+export {
   buildBlockSearchProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
