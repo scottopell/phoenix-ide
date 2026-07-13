@@ -38,6 +38,7 @@ export type TranscriptPositioningEvent =
       range: TranscriptVisibleRange | null;
       actualOffset: number | null;
       layoutRevision: number;
+      targetMeasured: boolean;
     }
   | { type: 'user_interrupted' }
   | { type: 'executor_detached' };
@@ -153,7 +154,8 @@ export function reduceTranscriptPositioning(
       }
       if (state.phase.issuedLayoutRevision === UNISSUED_LAYOUT_REVISION
         || event.layoutRevision < state.phase.issuedLayoutRevision
-        || !rangeContains(event.range, state.phase.targetIndex)) {
+        || !rangeContains(event.range, state.phase.targetIndex)
+        || !event.targetMeasured) {
         return unchanged(state);
       }
       if (state.active.command.kind === 'jump_to_message') {

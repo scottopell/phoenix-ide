@@ -9,6 +9,7 @@ import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
+  historyMergeEventCursorFloor,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
@@ -901,7 +902,7 @@ function ConversationPageContent() {
             : { type: 'idle' },
         contextWindow: { used: result.context_window_size || 0 },
         transcriptGeneration: responseTranscriptGeneration,
-        eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+        eventCursorFloor: historyMergeEventCursorFloor(request),
         snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
       });
       dispatchHistoryExpansion({

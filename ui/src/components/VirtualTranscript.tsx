@@ -28,6 +28,7 @@ export interface VirtualTranscriptPhysicalSnapshot {
   layoutRevision: number;
   targetIndex?: number;
   targetOffset?: number | null;
+  targetMeasured?: boolean;
 }
 
 export type VirtualTranscriptRangeChange = VirtualTranscriptPhysicalSnapshot;
@@ -121,13 +122,14 @@ function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number)
     visibleRange: normalizeRange(visibleRange),
     viewportTop: store.viewportTop,
     layoutRevision: store.revision,
-  } satisfies Omit<VirtualTranscriptPhysicalSnapshot, 'targetIndex' | 'targetOffset'>;
+  } satisfies Omit<VirtualTranscriptPhysicalSnapshot, 'targetIndex' | 'targetOffset' | 'targetMeasured'>;
   if (targetIndex === undefined) return baseSnapshot;
   const offset = itemPhysicalOffset(store, targetIndex);
   return {
     ...baseSnapshot,
     targetIndex,
     targetOffset: offset === undefined ? null : offset - store.viewportTop,
+    targetMeasured: store.measuredExtents.has(store.keys[targetIndex] ?? ''),
   };
 }
 
@@ -572,7 +574,7 @@ function VirtualTranscriptInner<T>(
             visibleRange: null,
             viewportTop: 0,
             layoutRevision: 0,
-            ...(targetIndex === undefined ? {} : { targetIndex, targetOffset: null }),
+            ...(targetIndex === undefined ? {} : { targetIndex, targetOffset: null, targetMeasured: false }),
           };
     },
   }), [publish]);

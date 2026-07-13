@@ -19,6 +19,10 @@ export type ActiveHistoryRequest = {
   intent: HistoryIntent;
 };
 
+export function historyMergeEventCursorFloor(request: ActiveHistoryRequest): number {
+  return request.snapshotStartedAtEventSeq;
+}
+
 export type HistoryCommandToken = number;
 
 export type HistoryScrollCommand =

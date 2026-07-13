@@ -169,7 +169,7 @@ describe('transcript positioning reducer', () => {
 
     [state, effects] = apply(state, { type: 'position_issued', commandKey: firstKey, targetIndex: 2, layoutRevision: 7 });
     expect(effects).toEqual([]);
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: firstKey, range: { startIndex: 2, endIndex: 2 }, actualOffset: null, layoutRevision: 7 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: firstKey, range: { startIndex: 2, endIndex: 2 }, actualOffset: null, layoutRevision: 7, targetMeasured: true });
     expect(effects).toEqual([]);
     expect(state.active?.command).toBe(second);
   });
@@ -214,11 +214,11 @@ describe('transcript positioning reducer', () => {
     [state, effects] = apply(state, { type: 'target_resolved', commandKey: key, targetIndex: 1 });
     expect(effects).toEqual([{ type: 'position', command, commandKey: key, targetIndex: 1, align: 'start', viewportStartOffset: 24 }]);
 
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 99 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 99, targetMeasured: true });
     expect(effects).toEqual([]);
 
     [state] = apply(state, { type: 'position_issued', commandKey: key, targetIndex: 1, layoutRevision: 5 });
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4, targetMeasured: true });
     expect(effects).toEqual([]);
     expect(state.active?.command).toBe(command);
   });
@@ -227,22 +227,22 @@ describe('transcript positioning reducer', () => {
     const command = restore({ viewportStartOffset: 24 });
     const key = transcriptPositioningCommandKey(command);
     const nonTerminalObservations = [
-      { range: null, actualOffset: 24, layoutRevision: 5 },
-      { range: { startIndex: 0, endIndex: 0 }, actualOffset: 24, layoutRevision: 5 },
-      { range: { startIndex: 1, endIndex: 1 }, actualOffset: null, layoutRevision: 5 },
-      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 21.99, layoutRevision: 5 },
-      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4 },
+      { range: null, actualOffset: 24, layoutRevision: 5, targetMeasured: true },
+      { range: { startIndex: 0, endIndex: 0 }, actualOffset: 24, layoutRevision: 5, targetMeasured: true },
+      { range: { startIndex: 1, endIndex: 1 }, actualOffset: null, layoutRevision: 5, targetMeasured: true },
+      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 21.99, layoutRevision: 5, targetMeasured: true },
+      { range: { startIndex: 1, endIndex: 1 }, actualOffset: 24, layoutRevision: 4, targetMeasured: true },
     ];
 
     for (const observation of nonTerminalObservations) {
       const state = resolveAndIssue(command, 1, 5);
-      const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, ...observation });
+      const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, ...observation, targetMeasured: true });
       expect(effects).toEqual([]);
       expect(nextState.active?.command).toBe(command);
     }
 
     let state = resolveAndIssue(command, 1, 5);
-    const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 22, layoutRevision: 5 });
+    const [nextState, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 22, layoutRevision: 5, targetMeasured: true });
     state = nextState;
     expect(effects).toEqual([{ type: 'finish', command, commandKey: key, result: 'applied' }]);
     expect(state.active).toBeNull();
@@ -254,10 +254,10 @@ describe('transcript positioning reducer', () => {
     let state = resolveAndIssue(command, 1, 5);
     let effects: TranscriptPositioningEffect[];
 
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 0, endIndex: 0 }, actualOffset: null, layoutRevision: 5 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 0, endIndex: 0 }, actualOffset: null, layoutRevision: 5, targetMeasured: true });
     expect(effects).toEqual([]);
 
-    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 1000, layoutRevision: 5 });
+    [state, effects] = apply(state, { type: 'physical_observed', commandKey: key, range: { startIndex: 1, endIndex: 1 }, actualOffset: 1000, layoutRevision: 5, targetMeasured: true });
     expect(effects).toEqual([{ type: 'finish', command, commandKey: key, result: 'applied' }]);
   });
 

@@ -93,7 +93,7 @@ surface TranscriptPositioningReducer {
         TargetResolved(state, command_key, target_index)
         TargetMissing(state, command_key)
         PositionIssued(state, command_key, target_index, layout_revision)
-        PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+        PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision, target_measured)
         UserInterrupted(state)
         ExecutorDetached(state)
 
@@ -410,13 +410,14 @@ rule PositionIssuedRecordsAuthoritativeRevision {
 }
 
 rule JumpCompletesWhenIssuedTargetIsVisible {
-    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, _, layout_revision)
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, _, layout_revision, target_measured)
     requires: state.active != null
     requires: state.active.command_key = command_key
     requires: state.active.command.kind = jump_to_message
     requires: state.phase.kind = awaiting_physical
     requires: state.phase.issued_layout_revision != null
     requires: layout_revision >= state.phase.issued_layout_revision
+    requires: target_measured = true
     requires: range_present = true
     requires: range_start <= state.phase.target_index
     requires: state.phase.target_index <= range_end
@@ -439,13 +440,14 @@ rule JumpCompletesWhenIssuedTargetIsVisible {
 }
 
 rule RestoreCompletesWhenIssuedVisibleOffsetConforms {
-    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision, target_measured)
     requires: state.active != null
     requires: state.active.command_key = command_key
     requires: state.active.command.kind = restore_after_prefix_expansion
     requires: state.phase.kind = awaiting_physical
     requires: state.phase.issued_layout_revision != null
     requires: layout_revision >= state.phase.issued_layout_revision
+    requires: target_measured = true
     requires: range_present = true
     requires: range_start <= state.phase.target_index
     requires: state.phase.target_index <= range_end
@@ -540,7 +542,7 @@ rule StalePositionIssuedIsNoOp {
 }
 
 rule NonConformingPhysicalObservationIsNoOp {
-    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision, target_measured)
     requires: state.active = null
         or state.active.command_key != command_key
         or state.phase = null
@@ -550,6 +552,7 @@ rule NonConformingPhysicalObservationIsNoOp {
         or range_present = false
         or range_start > state.phase.target_index
         or range_end < state.phase.target_index
+        or target_measured = false
         or state.active.command.kind = restore_after_prefix_expansion and actual_offset = null
         or state.active.command.kind = restore_after_prefix_expansion and absolute(actual_offset - state.active.command.viewport_start_offset) > config.restore_offset_tolerance_px
     ensures: state.active = state.active

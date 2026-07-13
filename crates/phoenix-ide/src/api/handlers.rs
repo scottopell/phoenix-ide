@@ -2423,19 +2423,51 @@ fn build_messages_around_response(
     }
 }
 
-fn message_starts_render_unit(message: &crate::db::Message) -> bool {
-    match (&message.message_type, &message.content) {
-        (
-            crate::db::MessageType::User
-            | crate::db::MessageType::Agent
-            | crate::db::MessageType::Skill,
-            _,
-        ) => true,
-        (crate::db::MessageType::System, crate::db::MessageContent::System(content)) => {
-            !content.text.trim().is_empty()
-        }
-        _ => false,
+fn message_is_non_empty_system(message: &crate::db::Message) -> bool {
+    matches!(
+        (&message.message_type, &message.content),
+        (crate::db::MessageType::System, crate::db::MessageContent::System(content))
+            if !content.text.trim().is_empty()
+    )
+}
+
+fn stable_render_unit_start_index(
+    messages: &[crate::db::Message],
+    target_sequence: i64,
+    reached_transcript_start: bool,
+) -> Option<usize> {
+    let target_index = messages
+        .iter()
+        .position(|message| message.sequence_id == target_sequence)?;
+    let target = &messages[target_index];
+    if matches!(
+        target.message_type,
+        crate::db::MessageType::User | crate::db::MessageType::Skill
+    ) {
+        return Some(target_index);
     }
+
+    let reset_index = messages[..target_index].iter().rposition(|message| {
+        matches!(
+            message.message_type,
+            crate::db::MessageType::User | crate::db::MessageType::Skill
+        )
+    });
+    if reset_index.is_none() && !reached_transcript_start {
+        return None;
+    }
+    let segment_start = reset_index.map_or(0, |index| index + 1);
+    let segment = &messages[segment_start..=target_index];
+    if let Some(agent_offset) = segment
+        .iter()
+        .position(|message| matches!(message.message_type, crate::db::MessageType::Agent))
+    {
+        return Some(segment_start + agent_offset);
+    }
+    if let Some(system_offset) = segment.iter().position(message_is_non_empty_system) {
+        return Some(segment_start + system_offset);
+    }
+    reset_index.or(Some(segment_start))
 }
 
 const RENDER_UNIT_BACKFILL_CHUNK_SIZE: i64 = 64;
@@ -2457,7 +2489,11 @@ async fn align_slice_start_to_render_unit(
     let Some(first) = messages.first() else {
         return Ok(());
     };
-    if message_starts_render_unit(first) {
+    let target_sequence = first.sequence_id;
+    if matches!(
+        first.message_type,
+        crate::db::MessageType::User | crate::db::MessageType::Skill
+    ) {
         return Ok(());
     }
 
@@ -2479,21 +2515,27 @@ async fn align_slice_start_to_render_unit(
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if previous.is_empty() {
             intervening.append(messages);
-            *messages = intervening;
+            let boundary_index =
+                stable_render_unit_start_index(&intervening, target_sequence, true).unwrap_or(0);
+            *messages = intervening.split_off(boundary_index);
             return Ok(());
         }
         remaining_prefix_budget -= previous.len();
         let oldest_sequence = previous[0].sequence_id;
 
-        if let Some(owner_index) = previous.iter().rposition(message_starts_render_unit) {
-            let mut prefix = previous.into_iter().skip(owner_index).collect::<Vec<_>>();
-            prefix.append(&mut intervening);
-            prefix.append(messages);
-            *messages = prefix;
+        let mut candidate = previous;
+        candidate.append(&mut intervening);
+        candidate.append(messages);
+
+        if let Some(boundary_index) =
+            stable_render_unit_start_index(&candidate, target_sequence, false)
+        {
+            let aligned = candidate.split_off(boundary_index);
+            *messages = aligned;
             return Ok(());
         }
 
-        let mut older_intervening = previous;
+        let mut older_intervening = candidate;
         older_intervening.append(&mut intervening);
         intervening = older_intervening;
         before_sequence = oldest_sequence;
@@ -2509,7 +2551,9 @@ async fn align_slice_start_to_render_unit(
     }
 
     intervening.append(messages);
-    *messages = intervening;
+    let boundary_index =
+        stable_render_unit_start_index(&intervening, target_sequence, true).unwrap_or(0);
+    *messages = intervening.split_off(boundary_index);
     Ok(())
 }
 
@@ -7332,15 +7376,15 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn latest_message_slice_starts_at_non_empty_system_render_unit() {
+    async fn latest_message_slice_backfills_agent_run_across_tool_and_continuation_agent_rows() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let state = make_test_state().await;
         state
             .db
             .create_conversation(
-                "conv-standalone-owner",
-                "standalone-owner",
+                "conv-agent-run-backfill",
+                "agent-run-backfill",
                 "/tmp",
                 true,
                 None,
@@ -7351,10 +7395,10 @@ pub(crate) mod hard_delete_cascade_tests {
         state
             .db
             .add_message(
-                "standalone-agent",
-                "conv-standalone-owner",
+                "run-agent-1",
+                "conv-agent-run-backfill",
                 &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
-                    id: "tool-standalone".to_string(),
+                    id: "tool-run".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({}),
                 }]),
@@ -7362,33 +7406,35 @@ pub(crate) mod hard_delete_cascade_tests {
                 None,
             )
             .await
-            .expect("agent");
+            .expect("agent 1");
         state
             .db
             .add_message(
-                "standalone-system",
-                "conv-standalone-owner",
-                &crate::db::MessageContent::system("checkpoint"),
-                None,
-                None,
-            )
-            .await
-            .expect("system");
-        state
-            .db
-            .add_message(
-                "standalone-tool",
-                "conv-standalone-owner",
-                &crate::db::MessageContent::tool("tool-standalone", "output", false),
+                "run-tool",
+                "conv-agent-run-backfill",
+                &crate::db::MessageContent::tool("tool-run", "output", false),
                 None,
                 None,
             )
             .await
             .expect("tool");
+        state
+            .db
+            .add_message(
+                "run-agent-2",
+                "conv-agent-run-backfill",
+                &crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "final".to_string(),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent 2");
 
         let Json(latest) = get_conversation_messages_latest(
             State(state),
-            Path("conv-standalone-owner".to_string()),
+            Path("conv-agent-run-backfill".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
         .await
@@ -7400,9 +7446,96 @@ pub(crate) mod hard_delete_cascade_tests {
                 .iter()
                 .map(|m| m.sequence_id)
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![1, 2, 3]
         );
-        assert!(latest.has_older_messages);
+        assert!(!latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_keeps_non_empty_system_inside_agent_run() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-agent-run-system",
+                "agent-run-system",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "run-system-agent-1",
+                "conv-agent-run-system",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-run-system".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent 1");
+        state
+            .db
+            .add_message(
+                "run-system-system",
+                "conv-agent-run-system",
+                &crate::db::MessageContent::system("checkpoint"),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "run-system-tool",
+                "conv-agent-run-system",
+                &crate::db::MessageContent::tool("tool-run-system", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+        state
+            .db
+            .add_message(
+                "run-system-agent-2",
+                "conv-agent-run-system",
+                &crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "final".to_string(),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent 2");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-agent-run-system".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(!latest.has_older_messages);
     }
 
     #[tokio::test]
@@ -7492,16 +7625,17 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(!before.has_older_messages);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn non_empty_system_message_is_a_render_unit_boundary_for_latest_and_before_slices() {
+    async fn user_and_skill_boundaries_stop_agent_run_backfill() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let state = make_test_state().await;
         state
             .db
             .create_conversation(
-                "conv-non-empty-system-boundary",
-                "non-empty-system-boundary",
+                "conv-boundary-stops-backfill",
+                "boundary-stops-backfill",
                 "/tmp",
                 true,
                 None,
@@ -7512,10 +7646,10 @@ pub(crate) mod hard_delete_cascade_tests {
         state
             .db
             .add_message(
-                "boundary-agent",
-                "conv-non-empty-system-boundary",
+                "stop-agent-1",
+                "conv-boundary-stops-backfill",
                 &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
-                    id: "tool-boundary".to_string(),
+                    id: "tool-stop".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({}),
                 }]),
@@ -7523,13 +7657,13 @@ pub(crate) mod hard_delete_cascade_tests {
                 None,
             )
             .await
-            .expect("agent");
+            .expect("agent 1");
         state
             .db
             .add_message(
-                "boundary-tool",
-                "conv-non-empty-system-boundary",
-                &crate::db::MessageContent::tool("tool-boundary", "output", false),
+                "stop-tool",
+                "conv-boundary-stops-backfill",
+                &crate::db::MessageContent::tool("tool-stop", "output", false),
                 None,
                 None,
             )
@@ -7538,29 +7672,47 @@ pub(crate) mod hard_delete_cascade_tests {
         state
             .db
             .add_message(
-                "boundary-system",
-                "conv-non-empty-system-boundary",
-                &crate::db::MessageContent::system("checkpoint"),
-                None,
-                None,
-            )
-            .await
-            .expect("system");
-        state
-            .db
-            .add_message(
-                "boundary-user",
-                "conv-non-empty-system-boundary",
+                "stop-user",
+                "conv-boundary-stops-backfill",
                 &crate::db::MessageContent::user("next prompt"),
                 None,
                 None,
             )
             .await
             .expect("user");
+        state
+            .db
+            .add_message(
+                "stop-skill",
+                "conv-boundary-stops-backfill",
+                &crate::db::MessageContent::Skill(crate::db::SkillContent {
+                    name: "skill".to_string(),
+                    body: "/skill body".to_string(),
+                    trigger: "/skill".to_string(),
+                    files: vec![],
+                }),
+                None,
+                None,
+            )
+            .await
+            .expect("skill");
+        state
+            .db
+            .add_message(
+                "stop-agent-2",
+                "conv-boundary-stops-backfill",
+                &crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "final".to_string(),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent 2");
 
         let Json(latest) = get_conversation_messages_latest(
             State(state.clone()),
-            Path("conv-non-empty-system-boundary".to_string()),
+            Path("conv-boundary-stops-backfill".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
         .await
@@ -7571,15 +7723,15 @@ pub(crate) mod hard_delete_cascade_tests {
                 .iter()
                 .map(|m| m.sequence_id)
                 .collect::<Vec<_>>(),
-            vec![4]
+            vec![5]
         );
         assert!(latest.has_older_messages);
 
         let Json(before) = get_conversation_messages(
             State(state),
-            Path("conv-non-empty-system-boundary".to_string()),
+            Path("conv-boundary-stops-backfill".to_string()),
             Query(MessageHistoryQuery {
-                before_message_sequence: Some(4),
+                before_message_sequence: Some(5),
                 after_message_sequence: None,
                 limit: Some(1),
             }),
@@ -7592,9 +7744,95 @@ pub(crate) mod hard_delete_cascade_tests {
                 .iter()
                 .map(|m| m.sequence_id)
                 .collect::<Vec<_>>(),
-            vec![3]
+            vec![4]
         );
         assert!(before.has_older_messages);
+    }
+
+    #[test]
+    fn stable_render_unit_start_matches_ui_conceptual_sequences() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let now = chrono::Utc::now();
+        let messages = vec![
+            crate::db::Message {
+                sequence_id: 1,
+                message_id: "u1".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::user("prompt"),
+                message_type: crate::db::MessageType::User,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+            crate::db::Message {
+                sequence_id: 2,
+                message_id: "a1".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "first".to_string(),
+                }]),
+                message_type: crate::db::MessageType::Agent,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+            crate::db::Message {
+                sequence_id: 3,
+                message_id: "sys".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::system("checkpoint"),
+                message_type: crate::db::MessageType::System,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+            crate::db::Message {
+                sequence_id: 4,
+                message_id: "a2".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "second".to_string(),
+                }]),
+                message_type: crate::db::MessageType::Agent,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+            crate::db::Message {
+                sequence_id: 5,
+                message_id: "skill".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::Skill(crate::db::SkillContent {
+                    name: "skill".to_string(),
+                    body: "/skill body".to_string(),
+                    trigger: "/skill".to_string(),
+                    files: vec![],
+                }),
+                message_type: crate::db::MessageType::Skill,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+            crate::db::Message {
+                sequence_id: 6,
+                message_id: "a3".to_string(),
+                conversation_id: "conv".to_string(),
+                content: crate::db::MessageContent::agent(vec![ContentBlock::Text {
+                    text: "third".to_string(),
+                }]),
+                message_type: crate::db::MessageType::Agent,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+        ];
+
+        assert_eq!(stable_render_unit_start_index(&messages, 2, true), Some(1));
+        assert_eq!(stable_render_unit_start_index(&messages, 3, true), Some(1));
+        assert_eq!(stable_render_unit_start_index(&messages, 4, true), Some(1));
+        assert_eq!(stable_render_unit_start_index(&messages, 5, true), Some(4));
+        assert_eq!(stable_render_unit_start_index(&messages, 6, true), Some(5));
     }
 
     #[tokio::test]

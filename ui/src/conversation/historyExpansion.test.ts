@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  historyMergeEventCursorFloor,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type ActiveHistoryRequest,
@@ -27,6 +28,12 @@ const deepLinkRequest = (currentView: HistoryView, token = 1): ActiveHistoryRequ
 });
 
 describe('history expansion reducer', () => {
+  it('keeps full-history merge replay anchored to the request-start cursor', () => {
+    const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: 17 };
+
+    expect(historyMergeEventCursorFloor(request)).toBe(17);
+  });
+
   it('rejects an A generation 1 response after A generation 3 replaces it', () => {
     const a1 = view('a', 1);
     const a3 = view('a', 3);

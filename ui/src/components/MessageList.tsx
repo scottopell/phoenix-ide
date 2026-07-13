@@ -924,6 +924,7 @@ function MessageListImpl({
               ? physicalSnapshot.targetOffset ?? null
               : null,
             layoutRevision: physicalSnapshot.layoutRevision,
+            targetMeasured: physicalSnapshot.targetMeasured ?? false,
           });
           break;
         }
@@ -1023,6 +1024,7 @@ function MessageListImpl({
           ? physicalSnapshot.targetOffset ?? null
           : null,
         layoutRevision: physicalSnapshot.layoutRevision,
+        targetMeasured: physicalSnapshot.targetMeasured ?? false,
       });
     }
     if (visibleRange) onVisibleRangeChange?.(visibleRange);
