@@ -862,7 +862,11 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         readiness_effects,
         status,
         capabilities,
-        effect_predictions: effect_predictions(oracle),
+        effect_predictions: if uses_compensation_plan(oracle) {
+            compensation_effect_predictions(oracle)
+        } else {
+            effect_predictions(oracle)
+        },
         completion,
         compensation,
         hidden,
@@ -899,6 +903,31 @@ const fn capabilities(flags: [bool; 6]) -> CreationCapabilities {
         start_over: availability(flags[4]),
         delete: availability(flags[5]),
     }
+}
+
+fn compensation_effect_predictions(
+    oracle: &AuthoritativeCreationOracle,
+) -> Vec<(EffectId, EffectPrediction)> {
+    let completed = matches!(oracle.status, AuthoritativeCreationStatus::Cancelled);
+    [
+        (REVOKE_RUNTIME, EffectPrediction::Eligible),
+        (DELETE_STAGED_ATTACHMENTS, EffectPrediction::Blocked),
+        (REMOVE_OWNED_WORKTREE, EffectPrediction::Blocked),
+        (RELEASE_RESERVATION, EffectPrediction::Blocked),
+        (FINISH_CANCELLATION_OR_DELETION, EffectPrediction::Blocked),
+    ]
+    .into_iter()
+    .map(|(effect, prediction)| {
+        (
+            effect,
+            if completed {
+                EffectPrediction::Completed
+            } else {
+                prediction
+            },
+        )
+    })
+    .collect()
 }
 
 fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, EffectPrediction)> {

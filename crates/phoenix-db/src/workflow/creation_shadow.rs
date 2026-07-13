@@ -40,6 +40,7 @@ pub enum CreationShadowEvidence {
     UserProjection {
         status: CreationProjectionStatus,
         capabilities: CreationCapabilities,
+        hidden: bool,
     },
 }
 
@@ -119,6 +120,7 @@ impl<'a> CreationShadowAdapter<'a> {
             observed,
             domain.projection.status,
             domain.projection.capabilities,
+            domain.projection.hidden,
             projected_at,
         )
         .await?;
@@ -145,6 +147,24 @@ impl<'a> CreationShadowAdapter<'a> {
                 && runtime == 0
                 && external == 0
             {
+                for family in [
+                    "creation.snapshot",
+                    "creation.authoritative_anchor",
+                    "creation.diagnostic_sink",
+                    "creation.event",
+                    "creation.intent",
+                    "creation.barrier",
+                ] {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO workflow_profile_codecs \
+                         (selection_id, codec_family, codec_version) VALUES (?1, ?2, ?3)",
+                    )
+                    .bind(SELECTION_ID)
+                    .bind(family)
+                    .bind(i64::from(creation_profile::PROTOCOL_VERSION))
+                    .execute(self.repository.pool())
+                    .await?;
+                }
                 return Ok(());
             }
             return Err(WorkflowRepositoryError::CorruptState(
@@ -166,6 +186,8 @@ impl<'a> CreationShadowAdapter<'a> {
                 drained_at: Some(now),
                 supported_codecs: [
                     "creation.snapshot",
+                    "creation.authoritative_anchor",
+                    "creation.diagnostic_sink",
                     "creation.event",
                     "creation.intent",
                     "creation.barrier",
@@ -648,6 +670,7 @@ async fn update_divergence(
     observed: CreationShadowEvidence,
     actual: CreationProjectionStatus,
     actual_capabilities: CreationCapabilities,
+    actual_hidden: bool,
     now: DateTime<Utc>,
 ) -> WorkflowRepositoryResult<()> {
     let expected = match observed {
@@ -677,7 +700,14 @@ async fn update_divergence(
             .bind(&config.shadow_workflow_id).bind(expected).bind(actual)
             .bind(now.to_rfc3339()).execute(&mut **tx).await?;
     }
-    if let CreationShadowEvidence::UserProjection { capabilities, .. } = observed {
+    if let CreationShadowEvidence::UserProjection {
+        capabilities,
+        hidden,
+        ..
+    } = observed
+    {
+        update_boolean_divergence(tx, config, "projection_hidden", hidden, actual_hidden, now)
+            .await?;
         for (identity, expected, actual) in [
             (
                 "capability_read",

@@ -218,6 +218,35 @@ fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
 }
 
 #[test]
+fn compensation_projection_predicts_every_selected_effect() {
+    let mut oracle = oracle(CreationKind::SeededEmpty);
+    oracle.status = AuthoritativeCreationStatus::DeletionPending;
+    let adapter = adapt_authoritative_creation(WorkflowId(13), WorkflowId(80), &oracle)
+        .expect("compensation adapter");
+    let ids = adapter
+        .plan
+        .effects
+        .iter()
+        .map(|effect| effect.effect_id)
+        .collect::<BTreeSet<_>>();
+    let predictions = adapter
+        .projection
+        .effect_predictions
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(predictions.keys().copied().collect::<BTreeSet<_>>(), ids);
+    assert_eq!(
+        predictions.get(&REVOKE_RUNTIME),
+        Some(&EffectPrediction::Eligible)
+    );
+    assert_eq!(
+        predictions.get(&FINISH_CANCELLATION_OR_DELETION),
+        Some(&EffectPrediction::Blocked)
+    );
+}
+
+#[test]
 fn adapter_has_no_execution_or_semantic_authority_leakage() {
     let mut adapter = adapt_authoritative_creation(
         WorkflowId(12),

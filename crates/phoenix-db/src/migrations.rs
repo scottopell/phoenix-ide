@@ -261,6 +261,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "preserve_creation_shadow_acceptance_evidence",
         sql: MIGRATION_049,
     },
+    Migration {
+        version: 50,
+        name: "fence_creation_shadow_reservation_updates",
+        sql: MIGRATION_050,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2243,6 +2248,18 @@ SELECT j.id, c.cwd,
        j.accepted_at
 FROM conversation_creation_jobs j
 JOIN conversations c ON c.id = j.conversation_id;
+";
+
+const MIGRATION_050: &str = r"
+CREATE TRIGGER creation_reservation_shadow_revision_after_status_update
+AFTER UPDATE OF status ON conversation_creation_resource_reservations
+FOR EACH ROW
+WHEN OLD.status = 'cleanup_required' AND NEW.status = 'released'
+BEGIN
+    UPDATE conversation_creation_jobs
+    SET shadow_projection_revision = shadow_projection_revision + 1
+    WHERE id = NEW.job_id;
+END;
 ";
 
 /// Run all pending migrations against the database.

@@ -245,10 +245,25 @@ fn oracle_from_committed(
             CleanupOwnership::None
         },
         runtime_evidence: CreationRuntimeEvidence {
-            runtime_bootstrapped: !matches!(conversation_state, ConvState::Provisioning { .. }),
+            runtime_bootstrapped: runtime_bootstrapped(job.protocol.stage, conversation_state),
             initial_llm_dispatched,
         },
     }
+}
+
+fn runtime_bootstrapped(checkpoint: CreationStage, state: &ConvState) -> bool {
+    checkpoint > CreationStage::BootstrapInitialTurn
+        || matches!(
+            state,
+            ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::CancellingSubAgents { .. }
+        )
 }
 
 fn map_status(status: CreationStatus) -> AuthoritativeCreationStatus {
@@ -341,10 +356,10 @@ fn observed_projection(
     if state.allows_user_cancel() {
         capabilities.cancel = CapabilityAvailability::Allowed;
     }
-    let _ = archived;
     CreationShadowEvidence::UserProjection {
         status,
         capabilities,
+        hidden: archived,
     }
 }
 
@@ -401,6 +416,7 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Cancelled,
                 capabilities: creation_capabilities([true, false, false, false, true, true]),
+                hidden: false,
             }
         );
         assert_eq!(
@@ -408,6 +424,7 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Ready,
                 capabilities: creation_capabilities([true, true, true, false, false, true]),
+                hidden: false,
             }
         );
         assert_eq!(
@@ -419,6 +436,7 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Ready,
                 capabilities: creation_capabilities([true, true, true, true, false, false]),
+                hidden: false,
             }
         );
         assert_eq!(
@@ -435,6 +453,7 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Ready,
                 capabilities: creation_capabilities([true, true, true, true, false, true]),
+                hidden: false,
             }
         );
         assert_eq!(
@@ -442,6 +461,7 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Ready,
                 capabilities: creation_capabilities([true, true, true, false, false, true]),
+                hidden: true,
             }
         );
         assert_eq!(
@@ -453,8 +473,39 @@ mod tests {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::DeletionPending,
                 capabilities: creation_capabilities([false, false, false, false, false, false]),
+                hidden: false,
             }
         );
+    }
+
+    #[test]
+    fn terminal_pre_bootstrap_shells_do_not_count_as_runtime_bootstrapped() {
+        assert!(!runtime_bootstrapped(
+            CreationStage::ValidateIntent,
+            &ConvState::CreationFailed {
+                job_id: "job".to_owned(),
+                error: "failed".to_owned(),
+                error_kind: crate::db::ErrorKind::ServerError,
+            },
+        ));
+        assert!(!runtime_bootstrapped(
+            CreationStage::ResolveRepository,
+            &ConvState::CreationCancelled {
+                job_id: "job".to_owned(),
+            },
+        ));
+        assert!(runtime_bootstrapped(
+            CreationStage::BootstrapInitialTurn,
+            &ConvState::LlmRequesting { attempt: 1 },
+        ));
+        assert!(runtime_bootstrapped(
+            CreationStage::Finalize,
+            &ConvState::CreationFailed {
+                job_id: "job".to_owned(),
+                error: "late failure".to_owned(),
+                error_kind: crate::db::ErrorKind::ServerError,
+            },
+        ));
     }
 
     #[tokio::test]

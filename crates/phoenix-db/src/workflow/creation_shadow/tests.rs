@@ -171,6 +171,15 @@ async fn persists_real_bounded_shadow_graph_without_authority_or_semantic_byte_d
     assert_eq!(selection.get::<i64, _>("accepting"), 0);
     assert_eq!(selection.get::<i64, _>("runtime_acceptance_enabled"), 0);
     assert_eq!(selection.get::<i64, _>("external_acceptance_enabled"), 0);
+    let codecs: Vec<String> = sqlx::query_scalar(
+        "SELECT codec_family FROM workflow_profile_codecs WHERE selection_id = ?1 ORDER BY codec_family",
+    )
+    .bind(SELECTION_ID)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(codecs.contains(&"creation.authoritative_anchor".to_owned()));
+    assert!(codecs.contains(&"creation.diagnostic_sink".to_owned()));
     assert_eq!(row_count(&pool, "workflow_claims").await, 0);
     assert_eq!(row_count(&pool, "workflow_attempts").await, 0);
     assert_eq!(row_count(&pool, "workflow_effects").await, 8);
@@ -264,6 +273,7 @@ async fn independent_user_capabilities_record_divergence() {
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Provisioning,
                 capabilities,
+                hidden: false,
             },
             Utc.timestamp_opt(2_050, 0).single().unwrap(),
         )
@@ -284,6 +294,84 @@ async fn independent_user_capabilities_record_divergence() {
     .await
     .unwrap();
     assert_eq!(values, ("false".to_owned(), "true".to_owned()));
+}
+
+#[tokio::test]
+async fn hidden_visibility_records_independent_divergence() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let mut deletion = oracle();
+    sqlx::query(
+        "UPDATE conversation_creation_jobs SET status = 'deletion_pending', deletion_requested_at = '2025-01-02' WHERE id = 'job-shadow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    deletion.status = AuthoritativeCreationStatus::DeletionPending;
+    deletion.revision = sqlx::query_scalar::<_, i64>(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let capabilities = creation_profile::project_authoritative_creation(&deletion).capabilities;
+
+    CreationShadowAdapter::new(&repo, &config())
+        .persist_after_authoritative_commit(
+            &deletion,
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::DeletionPending,
+                capabilities,
+                hidden: false,
+            },
+            Utc.timestamp_opt(2_075, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let values: (String, String) = sqlx::query_as(
+        "SELECT expected_value, actual_value FROM creation_shadow_divergences WHERE evidence_identity = 'projection_hidden' AND resolved_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(values, ("false".to_owned(), "true".to_owned()));
+}
+
+#[tokio::test]
+async fn reservation_release_advances_shadow_projection_revision() {
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO conversation_creation_resource_reservations \
+         (id, job_id, generation, resource_identity, repository_identity, status, created_at, updated_at) \
+         VALUES ('reservation-shadow', 'job-shadow', 1, '/repo/wt', '/repo', 'cleanup_required', '2025-01-01', '2025-01-01')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before: i64 = sqlx::query_scalar(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE conversation_creation_resource_reservations SET status = 'released' WHERE id = 'reservation-shadow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let after: i64 = sqlx::query_scalar(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before + 1);
 }
 
 #[tokio::test]
