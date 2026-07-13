@@ -400,6 +400,8 @@ pub struct ConversationCreationJob {
     #[serde(default)]
     pub message_id: Option<String>,
     pub protocol: crate::domain::creation_protocol::CreationProtocolState,
+    /// Monotonic committed revision used by diagnostic projections; independent of retries.
+    pub shadow_projection_revision: u64,
     pub intent: ConversationCreationIntent,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
