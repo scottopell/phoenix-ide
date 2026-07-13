@@ -725,19 +725,100 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(request.committed_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        let effect_already_receipted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM workflow_receipts WHERE effect_id = ?1)",
+        )
+        .bind(&request.observe_effect_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let cancellation_receipt_id = format!("wake-cancel-receipt:{}", request.workflow_id);
+        if !effect_already_receipted {
+            sqlx::query(
+                "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, \
+              codec_family, codec_version, payload, origin, accepted_at) \
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, 'reconciliation', ?9)",
+            )
+            .bind(&cancellation_receipt_id)
+            .bind(&request.observe_effect_id)
+            .bind(&request.workflow_id)
+            .bind(i64::try_from(request.expected_version).map_err(|_| {
+                WorkflowRepositoryError::VersionOutOfRange(request.expected_version)
+            })?)
+            .bind(i64::try_from(request.expected_generation).map_err(|_| {
+                WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation)
+            })?)
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(terminal_json(&terminal).to_string())
+            .bind(request.committed_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
             "INSERT INTO workflow_reducer_inbox \
              (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
               event_payload, requires_runtime_acceptance, delivery_status, consumed_by_transition_id) \
-             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, 0, 'pending', NULL)",
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 0, 'pending', NULL)",
         )
         .bind(&request.reducer_inbox_id)
         .bind(&request.workflow_id)
+        .bind(&cancellation_receipt_id)
         .bind(wake_profile::terminal_codec().family)
         .bind(i64::from(wake_profile::terminal_codec().version))
         .bind(terminal_json(&terminal).to_string())
         .execute(&mut *tx)
         .await?;
+            sqlx::query(
+            "INSERT INTO wake_terminal_receipts \
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, \
+              resolved_at, cancellation_reason) VALUES (?1, ?2, ?3, ?4, ?5, 'cancelled', ?6, 'explicit_cancel')",
+        )
+        .bind(&cancellation_receipt_id)
+        .bind(&request.workflow_id)
+        .bind(request.contract_id)
+        .bind(&request.observe_effect_id)
+        .bind(match request.resource { WakeResourceIdentity::Bash(_) => "bash", WakeResourceIdentity::TmuxWindow(_) => "tmux_window" })
+        .bind(request.committed_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+            let sequence: i64 = sqlx::query_scalar(
+                "INSERT INTO wake_inbox_sequences (conversation_id, last_sequence) \
+             SELECT conversation_id, 1 FROM wake_workflow_bindings WHERE workflow_id = ?1 \
+             ON CONFLICT(conversation_id) DO UPDATE SET last_sequence = last_sequence + 1 \
+             RETURNING last_sequence",
+            )
+            .bind(&request.workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+            "INSERT INTO wake_observation_inbox \
+             (id, workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, committed_at, consumed_at) \
+             SELECT ?1, workflow_id, contract_id, ?2, conversation_id, ?3, ?4, NULL \
+             FROM wake_workflow_bindings WHERE workflow_id = ?5",
+        )
+        .bind(&request.reducer_inbox_id)
+        .bind(&cancellation_receipt_id)
+        .bind(sequence)
+        .bind(request.committed_at.to_rfc3339())
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        }
+        if effect_already_receipted {
+            sqlx::query(
+                "INSERT INTO workflow_reducer_inbox \
+                 (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
+                  event_payload, requires_runtime_acceptance, delivery_status, consumed_by_transition_id) \
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, 0, 'pending', NULL)",
+            )
+            .bind(&request.reducer_inbox_id)
+            .bind(&request.workflow_id)
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(terminal_json(&terminal).to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(true)
     }

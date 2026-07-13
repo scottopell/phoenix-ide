@@ -96,6 +96,9 @@ pub struct WakeRegistrationReceipt {
     pub registering_tool_use_id: String,
 }
 
+/// Maximum number of committed wake observations carried by one runtime acceptance.
+pub const MAX_ACCEPTANCE_BATCH_ITEMS: u64 = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BashTerminalStatus {
     Exited,

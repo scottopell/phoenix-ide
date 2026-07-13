@@ -1921,7 +1921,7 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
                     AND tmux_status IS NOT NULL
                     AND tmux_occurred_at IS NOT NULL
                     AND tmux_server_generation IS NOT NULL
-                    AND (tmux_status = 'window_killed' OR tmux_duration_ms IS NOT NULL)
+                    AND (tmux_status = 'window_killed' OR tmux_exit_code IS NOT NULL)
                     AND bash_status IS NULL
                     AND bash_occurred_at IS NULL
                     AND bash_exit_code IS NULL

@@ -192,7 +192,14 @@ fresh server."#
             &parsed.args,
             &ctx.work_scope,
             server_generation.as_deref(),
-        );
+            &socket_path,
+        )
+        .await;
+        if let Some(identity) = killed_identity.as_ref() {
+            ctx.tmux_registry()
+                .preserve_terminal_before_kill(identity)
+                .await;
+        }
         let mut full_args: Vec<String> = vec![
             "-f".into(),
             config_path.to_string_lossy().into(),
@@ -224,10 +231,11 @@ fresh server."#
     }
 }
 
-fn killed_registered_window_identity(
+async fn killed_registered_window_identity(
     args: &[String],
     work_scope: &phoenix_core::work_scope::WorkScope,
     server_generation: Option<&str>,
+    socket_path: &std::path::Path,
 ) -> Option<TmuxWindowIdentity> {
     if args.first().map(String::as_str) != Some("kill-window") {
         return None;
@@ -235,11 +243,35 @@ fn killed_registered_window_identity(
     let target = args
         .windows(2)
         .find(|pair| pair[0] == "-t")
-        .map(|pair| pair[1].clone())?;
+        .map(|pair| pair[1].as_str())?;
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &socket_path.to_string_lossy(),
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{window_id}",
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let window_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if window_id.is_empty() {
+        return None;
+    }
     Some(TmuxWindowIdentity {
         work_scope: work_scope.clone(),
         server_generation: server_generation?.to_owned(),
-        window_id: target,
+        window_id,
     })
 }
 
@@ -424,7 +456,7 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BashHandleRegistry, BrowserSessionManager};
+    use crate::{tmux::run::TmuxRunTool, BashHandleRegistry, BrowserSessionManager};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -716,6 +748,38 @@ mod tests {
             .env_remove("TMUX")
             .status()
             .await;
+    }
+
+    #[tokio::test]
+    async fn kill_window_name_marks_canonical_registered_identity() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
+        let ctx = ctx_with_registry_for("conv-kill-name", registry.clone());
+        let server = ctx.tmux().await.unwrap();
+        let generation = server.read().await.server_generation.clone().unwrap();
+        let create = TmuxRunTool
+            .run(
+                json!({"cmd":"sleep 10","name":"named-target","keep_open_on_exit":true}),
+                ctx.clone(),
+            )
+            .await;
+        let created = parse_response(&create);
+        let identity = TmuxWindowIdentity {
+            work_scope: ctx.work_scope.clone(),
+            server_generation: generation,
+            window_id: created["window_id"].as_str().unwrap().to_owned(),
+        };
+        let killed = TmuxTool
+            .run(json!({"args":["kill-window","-t","named-target"]}), ctx)
+            .await;
+        assert!(killed.is_success());
+        assert!(matches!(
+            registry.inspect_window(&identity).await,
+            TmuxTerminalInspection::WindowKilled { .. }
+        ));
     }
 
     #[tokio::test]

@@ -334,7 +334,7 @@ fn classify_tmux(
         TmuxTerminalInspection::Terminal {
             exit_code,
             occurred_at: Some(occurred_at),
-            duration_ms: Some(duration_ms),
+            duration_ms,
             final_tail,
         } if occurred_at <= binding.expires_at => {
             let evidence = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
@@ -342,14 +342,14 @@ fn classify_tmux(
                 status: TmuxTerminalStatus::ExitMarkerObserved,
                 occurred_at: timestamp(occurred_at)?,
                 exit_code: Some(exit_code),
-                duration_ms: Some(duration_ms),
+                duration_ms,
                 final_tail,
             });
             fired(binding, evidence, now)
         }
+        TmuxTerminalInspection::Unavailable if now >= binding.expires_at => forgotten(binding, now),
         TmuxTerminalInspection::Missing => forgotten(binding, now),
         TmuxTerminalInspection::Live
-        | TmuxTerminalInspection::Unavailable
         | TmuxTerminalInspection::WindowKilled { .. }
         | TmuxTerminalInspection::Terminal { .. }
             if now >= binding.expires_at =>
@@ -591,6 +591,58 @@ mod tests {
             .unwrap(),
             InspectionDecision::RetryAt(at(51))
         );
+    }
+
+    #[test]
+    fn tmux_exit_occurrence_beats_deadline_without_duration() {
+        let identity = TmuxResourceIdentity {
+            work_scope: scope(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let binding = binding(WakeResourceIdentity::TmuxWindow(identity.clone()));
+        let decision = classify_tmux(
+            &binding,
+            &identity,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 0,
+                occurred_at: Some(at(99)),
+                duration_ms: None,
+                final_tail: vec!["done".to_owned()],
+            },
+            at(100),
+        )
+        .unwrap();
+        assert!(matches!(
+            decision,
+            InspectionDecision::Terminal {
+                evidence: WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                    duration_ms: None,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tmux_unavailable_at_deadline_is_forgotten() {
+        let identity = TmuxResourceIdentity {
+            work_scope: scope(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let binding = binding(WakeResourceIdentity::TmuxWindow(identity.clone()));
+        assert!(matches!(
+            classify_tmux(
+                &binding,
+                &identity,
+                TmuxTerminalInspection::Unavailable,
+                at(100),
+            )
+            .unwrap(),
+            InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten { .. })
+        ));
     }
 
     #[test]

@@ -440,6 +440,9 @@ async fn wait_for_text_response(
             None
         };
         if let Some(status) = status {
+            if close_after_completion && observation.readiness_seen && !exited {
+                disable_remain_on_exit(config_path, socket_path, &target.window_id).await;
+            }
             let response = structured_response(
                 status,
                 target,
@@ -467,6 +470,25 @@ async fn wait_for_text_response(
             }
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
+    }
+}
+
+async fn disable_remain_on_exit(config_path: &Path, socket_path: &Path, window_id: &str) {
+    if let Err(error) = run_tmux_cli(
+        config_path,
+        socket_path,
+        &[
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            window_id.to_owned(),
+            "remain-on-exit".to_owned(),
+            "off".to_owned(),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(%error, %window_id, "tmux_run: failed to restore remain-on-exit after readiness");
     }
 }
 
@@ -1069,6 +1091,60 @@ mod tests {
         assert!(
             !capture.success(),
             "window should be killed after observation"
+        );
+        kill_socket(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn keep_closed_after_readiness_does_not_retain_later_exit() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-long-after-ready",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo READY; sleep 0.2",
+                    "name": "tmux-run-long-after-ready",
+                    "keep_open_on_exit": false,
+                    "readiness": {"mode":"wait_for_text","text":"READY","timeout_seconds":5}
+                }),
+                ctx,
+            )
+            .await;
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "ready");
+        assert_eq!(v["exit_code"], Value::Null);
+        let window_id = v["window_id"].as_str().unwrap();
+        let sock = socket_tmp
+            .path()
+            .join("conv-tmux-run-long-after-ready.sock");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let status = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &sock.to_string_lossy(),
+                "has-session",
+                "-t",
+                window_id,
+            ])
+            .env_remove("TMUX")
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !status.success(),
+            "window must disappear when the command later exits"
         );
         kill_socket(&sock).await;
     }

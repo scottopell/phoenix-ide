@@ -2572,10 +2572,14 @@ async fn accept_new_receipt_in_transaction(
         .fetch_one(&mut *tx)
         .await?;
         let existing_obligation: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM wake_runtime_obligations \
-             WHERE conversation_id = ?1 AND status = 'owed' ORDER BY created_at LIMIT 1",
+            "SELECT o.id FROM wake_runtime_obligations o \
+             WHERE o.conversation_id = ?1 AND o.status = 'owed' \
+               AND (SELECT COUNT(*) FROM wake_runtime_obligation_items i WHERE i.obligation_id = o.id) < ?2 \
+             ORDER BY o.created_at LIMIT 1",
         )
         .bind(&conversation_id)
+        .bind(i64::try_from(phoenix_workflow::wake_profile::MAX_ACCEPTANCE_BATCH_ITEMS)
+            .expect("wake acceptance batch bound fits SQLite"))
         .fetch_optional(&mut *tx)
         .await?;
         let obligation_id = if let Some(id) = existing_obligation {

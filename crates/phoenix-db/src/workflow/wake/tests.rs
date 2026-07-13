@@ -829,7 +829,10 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
     assert_eq!(row.get::<String, _>("workflow_status"), "cancelled");
     assert_eq!(row.get::<i64, _>("generation"), 1);
     assert_eq!(row.get::<String, _>("effect_status"), "invalidated");
-    assert_eq!(row.get::<Option<String>, _>("receipt_id"), None);
+    assert_eq!(
+        row.get::<Option<String>, _>("receipt_id"),
+        Some("wake-cancel-receipt:wake-workflow".to_owned())
+    );
     assert_eq!(row.get::<i64, _>("requires_runtime_acceptance"), 0);
     let snapshot: String =
         sqlx::query_scalar("SELECT snapshot_payload FROM workflows WHERE id = 'wake-workflow'")
@@ -845,6 +848,25 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
     assert_eq!(snapshot["terminal"]["type"], "cancelled");
     assert_eq!(snapshot["terminal"]["reason"], "explicit_cancel");
     assert_eq!(snapshot["terminal"]["resolved_at"], 1_015);
+    let projection: (String, String, String) = sqlx::query_as(
+        "SELECT r.status, r.cancellation_reason, i.terminal_receipt_id \
+         FROM wake_terminal_receipts r JOIN wake_observation_inbox i \
+           ON i.terminal_receipt_id = r.receipt_id \
+         WHERE i.id = 'cancel-inbox'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projection.0, "cancelled");
+    assert_eq!(projection.1, "explicit_cancel");
+    assert_eq!(projection.2, "wake-cancel-receipt:wake-workflow");
+    let runtime_obligations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM wake_runtime_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runtime_obligations, 0, "cancellation must not auto-resume");
+
     let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_owed_acceptance")
         .fetch_one(&pool)
         .await
