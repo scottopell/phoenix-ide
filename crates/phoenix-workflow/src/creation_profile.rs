@@ -520,9 +520,17 @@ fn creation_dependencies(oracle: &AuthoritativeCreationOracle) -> Vec<Dependency
         ]
     };
     if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
+        dependencies.retain(|dependency| dependency.effect_id != COMMIT_METADATA);
+        dependencies.push(dependency(EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS));
+        if oracle.intent.uses_worktree {
+            dependencies.push(dependency(
+                EXPAND_INITIAL_MESSAGE,
+                MATERIALIZE_OR_RECONCILE_WORKTREE,
+            ));
+        }
         dependencies.extend([
-            dependency(EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
-            dependency(BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+            dependency(COMMIT_METADATA, EXPAND_INITIAL_MESSAGE),
+            dependency(BOOTSTRAP_RUNTIME, COMMIT_METADATA),
             dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
         ]);
     }

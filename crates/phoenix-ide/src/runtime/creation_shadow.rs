@@ -144,7 +144,7 @@ impl CreationShadowCoordinator {
             .await
             .map_err(|error| error.to_string())?;
         let conv_mode = &conversation.conv_mode;
-        let oracle = oracle_from_committed(
+        let mut oracle = oracle_from_committed(
             job,
             &files,
             usize::try_from(image_count).map_err(|_| "negative image count".to_string())?,
@@ -160,8 +160,17 @@ impl CreationShadowCoordinator {
                 oracle.intent.job_id
             ),
         });
-        let observed =
-            observed_projection(&conversation.state, conversation.archived, &oracle.status);
+        let visible = self
+            .db
+            .get_conversation(&oracle.intent.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        oracle.runtime_evidence.initial_llm_dispatched =
+            initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
+        oracle.runtime_evidence.runtime_bootstrapped =
+            runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
+        oracle.runtime_evidence.ready_capabilities = Some(capabilities_for_state(&visible.state));
+        let observed = observed_projection(&visible.state, visible.archived, &oracle.status);
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,
@@ -284,6 +293,32 @@ fn oracle_from_committed(
     }
 }
 
+fn initial_llm_dispatched_from_projection(
+    status: &AuthoritativeCreationStatus,
+    state: &ConvState,
+) -> bool {
+    matches!(status, AuthoritativeCreationStatus::Ready) || active_runtime_evidence(state)
+}
+
+fn runtime_bootstrapped_from_projection(
+    status: &AuthoritativeCreationStatus,
+    state: &ConvState,
+) -> bool {
+    matches!(status, AuthoritativeCreationStatus::Ready)
+        || matches!(
+            state,
+            ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::CancellingSubAgents { .. }
+                | ConvState::Idle
+        )
+}
+
 fn initial_llm_dispatched(status: &CreationStatus, state: &ConvState) -> bool {
     matches!(status, CreationStatus::Ready) || active_runtime_evidence(state)
 }
@@ -295,7 +330,7 @@ fn uses_worktree(
 ) -> bool {
     !reservations.is_empty()
         || conv_mode.is_some_and(|mode| mode.worktree_path().is_some())
-        || matches!(requested_mode, Some("managed" | "branch"))
+        || matches!(requested_mode, Some("managed" | "auto" | "branch"))
 }
 
 fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
@@ -543,8 +578,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_without_committed_worktree_evidence_is_direct() {
-        assert!(!uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
+    fn auto_intends_worktree_before_resource_evidence_exists() {
+        assert!(uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
     }
 
     #[test]
