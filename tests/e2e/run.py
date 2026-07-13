@@ -116,7 +116,7 @@ def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int):
     log_file = log_path.open("w")
     proc = subprocess.Popen(
         [str(BINARY)],
-        cwd=ROOT,
+        cwd=tmpdir,
         env=attempt_env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -337,6 +337,63 @@ def _timeout_diagnostic(base_url: str, conv_id: str) -> str:
         return f"final state unavailable ({type(error).__name__}: {error})"
 
 
+def _has_agent_after_message(messages: list[dict], message_id: str) -> bool:
+    user_index = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message.get("message_type") == "user"
+            and message.get("message_id") == message_id
+        ),
+        None,
+    )
+    return user_index is not None and any(
+        message.get("message_type") == "agent"
+        for message in messages[user_index + 1 :]
+    )
+
+
+async def _snapshot_has_agent_after_message(
+    client: httpx.AsyncClient,
+    base_url: str,
+    conv_id: str,
+    message_id: str,
+) -> bool:
+    response = await client.get(f"{base_url}/api/conversations/{conv_id}")
+    response.raise_for_status()
+    snapshot = response.json()
+    conversation = snapshot["conversation"]
+    state = _state_str(conversation.get("state"))
+    if state == "error":
+        state_data = conversation.get("state_data") or {}
+        raise RuntimeError(f"conversation error: {state_data.get('message')}")
+    return state == "idle" and _has_agent_after_message(
+        snapshot.get("messages") or [], message_id
+    )
+
+
+async def _stream_first_turn_async(base_url: str, conv_id: str, timeout: float) -> None:
+    url = f"{base_url}/api/conversations/{conv_id}/stream"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            async with aconnect_sse(client, "GET", url) as source:
+                async for event in source.aiter_sse():
+                    if _terminal_event(event.event, event.data):
+                        return
+            raise RuntimeError("SSE stream closed before the first turn completed")
+
+
+def _stream_first_turn(base_url: str, conv_id: str, timeout: float) -> None:
+    try:
+        asyncio.run(_stream_first_turn_async(base_url, conv_id, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        diagnostic = _timeout_diagnostic(base_url, conv_id)
+        raise TimeoutError(
+            f"first-turn SSE did not reach terminal in {timeout:g}s ({diagnostic})"
+        ) from error
+
+
 async def _send_chat_and_stream_async(
     base_url: str,
     conv_id: str,
@@ -357,13 +414,16 @@ async def _send_chat_and_stream_async(
                 # the continuation barrier.
                 _terminal_event(init.event, init.data)
 
+                message_id = str(uuid.uuid4())
                 response = await client.post(
                     chat_url,
-                    json={"text": text, "images": [], "message_id": str(uuid.uuid4())},
+                    json={"text": text, "images": [], "message_id": message_id},
                 )
                 response.raise_for_status()
                 async for event in events:
-                    if _terminal_event(event.event, event.data):
+                    if _terminal_event(event.event, event.data) and await _snapshot_has_agent_after_message(
+                        client, base_url, conv_id, message_id
+                    ):
                         return
             raise RuntimeError("SSE stream closed before the continuation completed")
 
@@ -471,13 +531,8 @@ def _user_message_images(message: dict) -> list[dict]:
 
 def scenario_text_streaming(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:plain_text]] hello")
-    final = _poll_to_idle_with_messages(
-        base_url,
-        conv["id"],
-        lambda messages: "analyzed the situation" in _agent_text(messages),
-        "plain-text response",
-        timeout=SCENARIO_TIMEOUT_SECONDS,
-    )
+    _stream_first_turn(base_url, conv["id"], SCENARIO_TIMEOUT_SECONDS)
+    final = _get_conv(base_url, conv["id"])
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, f"unexpected assistant text: {text[:200]!r}"
 
@@ -770,6 +825,25 @@ class HarnessIsolationTests(unittest.TestCase):
             }
         )
         self.assertFalse(_terminal_event("init", data))
+
+    def test_agent_response_is_tied_to_exact_user_message(self):
+        messages = [
+            {"message_type": "user", "message_id": "first"},
+            {"message_type": "agent", "message_id": "agent-first"},
+            {"message_type": "user", "message_id": "second"},
+        ]
+        self.assertTrue(_has_agent_after_message(messages, "first"))
+        self.assertFalse(_has_agent_after_message(messages, "second"))
+        self.assertFalse(_has_agent_after_message(messages, "missing"))
+
+    def test_agent_response_after_exact_user_message_is_detected(self):
+        messages = [
+            {"message_type": "user", "message_id": "first"},
+            {"message_type": "agent", "message_id": "agent-first"},
+            {"message_type": "user", "message_id": "second"},
+            {"message_type": "agent", "message_id": "agent-second"},
+        ]
+        self.assertTrue(_has_agent_after_message(messages, "second"))
 
     def test_malformed_typed_event_has_actionable_error(self):
         with self.assertRaisesRegex(ValueError, "malformed JSON.*state_change"):
