@@ -139,7 +139,7 @@ describe('history expansion reducer', () => {
     })).toBe(state);
   });
 
-  it('manual retry is explicit and uses a fresh token', () => {
+  it('manual retry with a retained deep-link failure intent clears and replaces the failure', () => {
     const currentView = view('a', 1);
     const first = deepLinkRequest(currentView, 1);
     let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
@@ -152,7 +152,24 @@ describe('history expansion reducer', () => {
     const retry = deepLinkRequest(currentView, 2);
     state = reduceHistoryExpansion(state, { type: 'request_started', request: retry });
     expect(state).not.toBe(beforeRetry);
-    expect(state.activeRequest?.token).toBe(2);
+    expect(state.activeRequest).toEqual(retry);
+    expect(state.failure).toBeNull();
+  });
+
+  it('manual retry with a retained manual-expansion failure intent clears and replaces the failure', () => {
+    const currentView = view('a', 1);
+    const first = manualRequest(currentView, 1);
+    let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: first,
+    });
+    state = reduceHistoryExpansion(state, {
+      type: 'history_failed', requestToken: 1, view: currentView, transcriptGeneration: currentView.transcriptGeneration, message: 'offline',
+    });
+    const retry = manualRequest(currentView, 2);
+
+    state = reduceHistoryExpansion(state, { type: 'request_started', request: retry });
+
+    expect(state.activeRequest).toEqual(retry);
     expect(state.failure).toBeNull();
   });
 

@@ -175,6 +175,7 @@ export function MessageListFixture({ scenario }: Props) {
                   conversationId={data.conversationId}
                   slug={data.slug}
                   historyScrollCommand={historyScrollCommand}
+                  currentHistoryView={{ conversationId: data.conversationId, generation: 1, transcriptGeneration: 1 }}
                   onHistoryScrollCommandHandled={handleHistoryCommand}
                 />
               </div>

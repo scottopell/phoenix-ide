@@ -1901,6 +1901,7 @@ function ConversationPageContent() {
               ? 'Could not preserve the previous reading position.'
               : null}
         historyScrollCommand={historyExpansion.pendingCommand}
+        currentHistoryView={historyExpansion.view}
         onHistoryScrollCommandHandled={handleHistoryScrollCommand}
       />
       </RenderProfiler>

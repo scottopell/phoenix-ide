@@ -69,7 +69,6 @@ surface HistoryExpansionController {
         HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
         HistoryLoadFailed(view, request_token, view_generation, transcript_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
-        ExplicitRetryRequested(view, request_token, snapshot_event_seq)
         StreamingTailAdvanced(view)
 }
 
@@ -145,6 +144,28 @@ rule ManualExpansionStartsOneRequest {
     when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.failure = null
+    requires: restore_basis in { reader_anchor, following_tail }
+    requires: restore_basis = following_tail
+        or anchor_message_id != null and viewport_start_offset != null
+    ensures: view.active_request = HistoryRequest(
+        view: view,
+        token: request_token,
+        intent: manual_expand,
+        restore_basis: restore_basis,
+        message_id: anchor_message_id,
+        viewport_start_offset: viewport_start_offset,
+        snapshot_started_at_event_seq: snapshot_event_seq
+    )
+    ensures: view.failure = null
+}
+
+rule ManualExpansionRetryClearsAndReplacesFailure {
+    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+    requires: view.coverage = tail
+    requires: view.active_request = null
+    requires: view.failure != null
+    requires: view.failure.kind = request_failed
     requires: restore_basis in { reader_anchor, following_tail }
     requires: restore_basis = following_tail
         or anchor_message_id != null and viewport_start_offset != null
@@ -164,6 +185,25 @@ rule DeepLinkStartsOneCoverageRequest {
     when: DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.failure = null
+    ensures: view.active_request = HistoryRequest(
+        view: view,
+        token: request_token,
+        intent: deep_link,
+        restore_basis: target_message,
+        message_id: target_message_id,
+        viewport_start_offset: null,
+        snapshot_started_at_event_seq: snapshot_event_seq
+    )
+    ensures: view.failure = null
+}
+
+rule DeepLinkRetryClearsAndReplacesFailure {
+    when: DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
+    requires: view.coverage = tail
+    requires: view.active_request = null
+    requires: view.failure != null
+    requires: view.failure.kind = request_failed
     ensures: view.active_request = HistoryRequest(
         view: view,
         token: request_token,

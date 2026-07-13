@@ -871,6 +871,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onOpenFile={undefined}
           conversationId="conv-history"
           historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -910,6 +911,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onOpenFile={undefined}
         conversationId="conv-history"
         historyScrollCommand={historyScrollCommand}
+        currentHistoryView={historyScrollCommand?.view}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
@@ -946,6 +948,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onOpenFile={undefined}
           conversationId="conv-history"
           historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -982,6 +985,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onOpenFile={undefined}
           conversationId="conv-history"
           historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,
@@ -1013,6 +1017,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onOpenFile={undefined}
           conversationId="conv-history"
           historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         />,
       ),
@@ -1027,6 +1032,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
     const onVisibleRangeChange = vi.fn();
+    const currentHistoryView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const renderList = (historyScrollCommand: HistoryScrollCommand) => withConvContext(
       <MessageList
         messages={messages}
@@ -1036,18 +1042,19 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onOpenFile={undefined}
         conversationId="conv-history"
         historyScrollCommand={historyScrollCommand}
+        currentHistoryView={currentHistoryView}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
     );
 
-    const { container, rerender } = render(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 1, messageId: 'msg-2' })));
+    const { container, rerender } = render(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 1, messageId: 'msg-2', view: currentHistoryView })));
     const scroller = container.querySelector<HTMLElement>('#messages')!;
 
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
-    rerender(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 2, messageId: 'msg-3' })));
+    rerender(renderList(makeRestoreAfterPrefixExpansionCommand({ token: 2, messageId: 'msg-3', view: currentHistoryView })));
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
@@ -1057,6 +1064,41 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start', -24);
+  });
+
+  it('supersedes stale same-conversation transcript-generation commands before physical scrolling or handled writes', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (historyScrollCommand: HistoryScrollCommand, currentHistoryView: HistoryScrollCommand['view']) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={historyScrollCommand}
+        currentHistoryView={currentHistoryView}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const oldView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const newView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
+    const stale = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: oldView });
+    const current = makeRestoreAfterPrefixExpansionCommand({ token: 2, view: newView });
+
+    const { rerender } = render(renderList(stale, newView));
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
+    expect(virtualTranscriptMock.scrollToIndex).not.toHaveBeenCalled();
+
+    rerender(renderList(current, newView));
+
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
   it('clears suppressed continuity on conversation change', () => {
@@ -1072,6 +1114,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onOpenFile={undefined}
         conversationId={conversationId}
         historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
+        currentHistoryView={{ conversationId, generation: 1, transcriptGeneration: 1 }}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
         onVisibleRangeChange={onVisibleRangeChange}
       />,
@@ -1100,6 +1143,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
         onOpenFile={undefined}
         conversationId={conversationId}
         historyScrollCommand={makeRestoreAfterPrefixExpansionCommand({ token, view: { conversationId, generation: 1, transcriptGeneration: 1 } })}
+        currentHistoryView={{ conversationId, generation: 1, transcriptGeneration: 1 }}
         onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
       />,
     );
@@ -1133,6 +1177,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
           onOpenFile={undefined}
           conversationId="conv-history"
           historyScrollCommand={makeRestoreAfterPrefixExpansionCommand()}
+          currentHistoryView={{ conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 }}
           onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
           onVisibleRangeChange={onVisibleRangeChange}
         />,

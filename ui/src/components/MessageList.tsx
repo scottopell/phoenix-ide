@@ -105,6 +105,7 @@ interface MessageListProps {
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   historyScrollCommand?: HistoryScrollCommand | null | undefined;
+  currentHistoryView?: HistoryScrollCommand['view'] | undefined;
   onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => void) | undefined;
 }
 
@@ -320,6 +321,7 @@ function MessageListImpl({
   loadingOlderMessages = false,
   olderHistoryError,
   historyScrollCommand,
+  currentHistoryView,
   onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
@@ -881,6 +883,10 @@ function MessageListImpl({
   useEffect(() => {
     const handled = handledHistoryCommandRef.current;
     if (!historyScrollCommand || (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view))) return;
+    if (currentHistoryView && !sameHistoryView(historyScrollCommand.view, currentHistoryView)) {
+      finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'superseded');
+      return;
+    }
     const activeContinuityToken = continuityRestoreTokenRef.current;
     const activeContinuityView = continuityRestoreViewRef.current;
     if (activeContinuityToken !== null
@@ -925,7 +931,7 @@ function MessageListImpl({
         finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'applied');
       }
     }
-  }, [findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, sameHistoryView, scrollToUnitIndex]);
+  }, [currentHistoryView, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, sameHistoryView, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
