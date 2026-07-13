@@ -21,6 +21,12 @@ pub enum WorkflowRepositoryError {
     GenerationOutOfRange(u64),
     #[error("invalid workflow plan: {0}")]
     InvalidPlan(&'static str),
+    #[error("protocol selection {existing_selection_id} already accepts profile {profile_id}; requested {requested_selection_id} is incompatible")]
+    ProtocolSelectionIncompatible {
+        requested_selection_id: String,
+        existing_selection_id: String,
+        profile_id: String,
+    },
     #[error("corrupt durable workflow state: {0}")]
     CorruptState(String),
     #[error("rollback test failpoint triggered at {0:?}")]
@@ -387,6 +393,12 @@ pub enum AcceptReceiptResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableBashTailLine {
+    pub offset: u64,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableWakeTerminalProjection {
     pub contract_id: String,
     pub resource_kind: String,
@@ -398,7 +410,10 @@ pub struct DurableWakeTerminalProjection {
     pub bash_duration_ms: Option<u64>,
     pub bash_signal_number: Option<i32>,
     pub bash_kill_signal_sent: Option<String>,
-    pub bash_tail: Vec<String>,
+    pub bash_tail_start_offset: Option<u64>,
+    pub bash_tail_end_offset: Option<u64>,
+    pub bash_tail_truncated_before: Option<bool>,
+    pub bash_tail: Vec<DurableBashTailLine>,
     pub tmux_status: Option<String>,
     pub tmux_occurred_at: Option<DateTime<Utc>>,
     pub tmux_server_generation: Option<String>,
@@ -2283,7 +2298,7 @@ async fn record_observation_in_transaction(
            AND declared_workflow_version = ?4 AND generation = ?5 \
            AND claim_token = ?6 AND claim_worker_id = ?7 \
            AND claim_lease_until = ?8 AND claim_issued_at = ?9 \
-           AND status = 'begun'",
+           AND status IN ('begun', 'observation_recorded')",
     )
     .bind(&observation.attempt_id)
     .bind(&observation.authority.effect_id)
@@ -2695,82 +2710,100 @@ async fn satisfy_newly_ready_barriers(
 async fn load_receipt_for_effect<'e, E>(
     executor: E,
     effect_id: &str,
-) -> WorkflowRepositoryResult<Option<DurableReceiptAcceptance>>
+) -> WorkflowRepositoryResult<Option<(DurableReceiptAcceptance, DurablePayload)>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     let row = sqlx::query(
-        "SELECT id, workflow_id, declared_workflow_version, generation, effect_id, claim_token, \
-                claim_worker_id, claim_lease_until, claim_issued_at, attempt_id, codec_family, \
-                codec_version, payload, origin, accepted_at \
-         FROM workflow_receipts WHERE effect_id = ?1",
+        "SELECT r.id, r.workflow_id, r.declared_workflow_version, r.generation, r.effect_id, \
+                r.claim_token, r.claim_worker_id, r.claim_lease_until, r.claim_issued_at, \
+                r.attempt_id, r.codec_family, r.codec_version, r.payload, r.origin, r.accepted_at, \
+                i.event_codec_family, i.event_codec_version, i.event_payload \
+         FROM workflow_receipts r \
+         JOIN workflow_reducer_inbox i ON i.receipt_id = r.id AND i.workflow_id = r.workflow_id \
+         WHERE r.effect_id = ?1",
     )
     .bind(effect_id)
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.map(|row| DurableReceiptAcceptance {
-        receipt_id: row.get("id"),
-        authority: DurableClaimAuthority {
-            workflow_id: row.get("workflow_id"),
-            declared_workflow_version: row
-                .get::<i64, _>("declared_workflow_version")
-                .try_into()
-                .expect("declared workflow version fits u64"),
-            generation: row
-                .get::<i64, _>("generation")
-                .try_into()
-                .expect("generation fits u64"),
-            effect_id: row.get("effect_id"),
-            claim_token: row
-                .get::<Option<String>, _>("claim_token")
-                .unwrap_or_default(),
-            worker_id: row
-                .get::<Option<String>, _>("claim_worker_id")
-                .unwrap_or_default(),
-            lease_until: row
-                .get::<Option<String>, _>("claim_lease_until")
-                .map_or_else(epoch_utc, |value| {
-                    DateTime::parse_from_rfc3339(&value)
-                        .expect("claim lease_until is valid RFC3339")
-                        .with_timezone(&Utc)
-                }),
-            issued_at: row.get::<Option<String>, _>("claim_issued_at").map_or_else(
-                epoch_utc,
-                |value| {
-                    DateTime::parse_from_rfc3339(&value)
-                        .expect("claim issued_at is valid RFC3339")
-                        .with_timezone(&Utc)
-                },
-            ),
-        },
-        attempt_id: row
-            .get::<Option<String>, _>("attempt_id")
-            .unwrap_or_default(),
-        payload: DurablePayload {
-            codec: DurableCodecRef {
-                family: row.get("codec_family"),
-                version: row
-                    .get::<i64, _>("codec_version")
+    Ok(row.map(|row| {
+        let receipt = DurableReceiptAcceptance {
+            receipt_id: row.get("id"),
+            authority: DurableClaimAuthority {
+                workflow_id: row.get("workflow_id"),
+                declared_workflow_version: row
+                    .get::<i64, _>("declared_workflow_version")
                     .try_into()
-                    .expect("codec version fits u32"),
+                    .expect("declared workflow version fits u64"),
+                generation: row
+                    .get::<i64, _>("generation")
+                    .try_into()
+                    .expect("generation fits u64"),
+                effect_id: row.get("effect_id"),
+                claim_token: row
+                    .get::<Option<String>, _>("claim_token")
+                    .unwrap_or_default(),
+                worker_id: row
+                    .get::<Option<String>, _>("claim_worker_id")
+                    .unwrap_or_default(),
+                lease_until: row
+                    .get::<Option<String>, _>("claim_lease_until")
+                    .map_or_else(epoch_utc, |value| {
+                        DateTime::parse_from_rfc3339(&value)
+                            .expect("claim lease_until is valid RFC3339")
+                            .with_timezone(&Utc)
+                    }),
+                issued_at: row.get::<Option<String>, _>("claim_issued_at").map_or_else(
+                    epoch_utc,
+                    |value| {
+                        DateTime::parse_from_rfc3339(&value)
+                            .expect("claim issued_at is valid RFC3339")
+                            .with_timezone(&Utc)
+                    },
+                ),
             },
-            payload: row.get("payload"),
-        },
-        origin: parse_receipt_origin_sql(row.get::<String, _>("origin").as_str())
-            .expect("workflow_receipts.origin is constrained to known values"),
-        accepted_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("accepted_at"))
-            .expect("accepted_at is valid RFC3339")
-            .with_timezone(&Utc),
+            attempt_id: row
+                .get::<Option<String>, _>("attempt_id")
+                .unwrap_or_default(),
+            payload: DurablePayload {
+                codec: DurableCodecRef {
+                    family: row.get("codec_family"),
+                    version: row
+                        .get::<i64, _>("codec_version")
+                        .try_into()
+                        .expect("codec version fits u32"),
+                },
+                payload: row.get("payload"),
+            },
+            origin: parse_receipt_origin_sql(row.get::<String, _>("origin").as_str())
+                .expect("workflow_receipts.origin is constrained to known values"),
+            accepted_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("accepted_at"))
+                .expect("accepted_at is valid RFC3339")
+                .with_timezone(&Utc),
+        };
+        let reducer_event = DurablePayload {
+            codec: DurableCodecRef {
+                family: row.get("event_codec_family"),
+                version: row
+                    .get::<i64, _>("event_codec_version")
+                    .try_into()
+                    .expect("event codec version fits u32"),
+            },
+            payload: row.get("event_payload"),
+        };
+        (receipt, reducer_event)
     }))
 }
 
 fn compare_existing_receipt(
-    existing: DurableReceiptAcceptance,
+    existing: (DurableReceiptAcceptance, DurablePayload),
     request: &DurableAcceptReceiptRequest,
 ) -> AcceptReceiptResult {
+    let (existing, reducer_event) = existing;
     if existing.origin == request.origin
         && existing.payload == request.receipt
+        && reducer_event == request.reducer_event
         && existing.attempt_id == request.attempt_id.clone().unwrap_or_default()
     {
         AcceptReceiptResult::AlreadyReceipted { receipt: existing }
@@ -3066,24 +3099,31 @@ async fn insert_wake_terminal_projection(
         "INSERT INTO wake_terminal_receipts \
          (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, \
           bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms, bash_signal_number, \
-          bash_kill_signal_sent, tmux_status, tmux_occurred_at, tmux_server_generation, tmux_exit_code, \
-          tmux_duration_ms, forgotten_reason, cancellation_reason) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+          bash_kill_signal_sent, bash_tail_start_offset, bash_tail_end_offset, bash_tail_truncated_before, \
+          tmux_status, tmux_occurred_at, tmux_server_generation, tmux_exit_code, tmux_duration_ms, \
+          forgotten_reason, cancellation_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
     )
     .bind(&request.receipt_id).bind(&request.authority.workflow_id).bind(&projection.contract_id)
     .bind(&request.authority.effect_id).bind(&projection.resource_kind).bind(&projection.status)
     .bind(projection.resolved_at.to_rfc3339()).bind(&projection.bash_status)
     .bind(projection.bash_occurred_at.map(|value| value.to_rfc3339())).bind(projection.bash_exit_code)
     .bind(projection.bash_duration_ms.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("bash duration exceeds SQLite range".to_owned()))?)
-    .bind(projection.bash_signal_number).bind(&projection.bash_kill_signal_sent).bind(&projection.tmux_status)
+    .bind(projection.bash_signal_number).bind(&projection.bash_kill_signal_sent)
+    .bind(projection.bash_tail_start_offset.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("bash tail start offset exceeds SQLite range".to_owned()))?)
+    .bind(projection.bash_tail_end_offset.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("bash tail end offset exceeds SQLite range".to_owned()))?)
+    .bind(projection.bash_tail_truncated_before).bind(&projection.tmux_status)
     .bind(projection.tmux_occurred_at.map(|value| value.to_rfc3339())).bind(&projection.tmux_server_generation)
     .bind(projection.tmux_exit_code)
     .bind(projection.tmux_duration_ms.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::CorruptState("tmux duration exceeds SQLite range".to_owned()))?)
     .bind(&projection.forgotten_reason).bind(&projection.cancellation_reason)
     .execute(&mut *tx).await?;
     for (ordinal, line) in projection.bash_tail.iter().enumerate() {
-        sqlx::query("INSERT INTO wake_terminal_receipt_bash_tail (receipt_id, ordinal, stream, offset, line) VALUES (?1, ?2, NULL, NULL, ?3)")
-            .bind(&request.receipt_id).bind(i64::try_from(ordinal).expect("tail ordinal fits i64")).bind(line)
+        sqlx::query("INSERT INTO wake_terminal_receipt_bash_tail (receipt_id, ordinal, stream, offset, line) VALUES (?1, ?2, NULL, ?3, ?4)")
+            .bind(&request.receipt_id)
+            .bind(i64::try_from(ordinal).expect("tail ordinal fits i64"))
+            .bind(i64::try_from(line.offset).map_err(|_| WorkflowRepositoryError::CorruptState("bash tail line offset exceeds SQLite range".to_owned()))?)
+            .bind(&line.line)
             .execute(&mut *tx).await?;
     }
     for (ordinal, line) in projection.tmux_tail.iter().enumerate() {
@@ -4326,6 +4366,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_authoritative_observations_on_the_same_attempt_are_recorded() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+        let (authority, attempt) = match repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap()
+        {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claim, got {other:?}")
+            }
+        };
+        let first = observation(
+            &authority,
+            &attempt.attempt_id,
+            now + chrono::Duration::seconds(1),
+        );
+        let mut second = observation(
+            &authority,
+            &attempt.attempt_id,
+            now + chrono::Duration::seconds(2),
+        );
+        second.observation_id = "obs-2".to_owned();
+        second.payload.payload = "observed-again".to_owned();
+
+        assert!(matches!(
+            repo.record_observation(&first).await.unwrap(),
+            RecordObservationResult::Recorded { .. }
+        ));
+        assert!(matches!(
+            repo.record_observation(&second).await.unwrap(),
+            RecordObservationResult::Recorded { .. }
+        ));
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM workflow_observations WHERE attempt_id = ?1 ORDER BY recorded_at, id",
+        )
+        .bind(&attempt.attempt_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ids, vec!["obs-1".to_owned(), "obs-2".to_owned()]);
+    }
+
+    #[tokio::test]
     async fn record_observation_and_accept_receipt_rolls_back_every_write_after_receipt_failpoint()
     {
         let pool = test_pool().await;
@@ -4723,6 +4810,28 @@ mod tests {
         conflicting.receipt.payload = "other".to_owned();
         let conflict = repo.accept_receipt(&conflicting).await.unwrap();
         assert_eq!(conflict, AcceptReceiptResult::Conflict);
+
+        let mut changed_reducer_codec = receipt_request(
+            &authority,
+            Some(&attempt.attempt_id),
+            now + chrono::Duration::seconds(1),
+        );
+        changed_reducer_codec.reducer_event.codec.version = 2;
+        assert_eq!(
+            repo.accept_receipt(&changed_reducer_codec).await.unwrap(),
+            AcceptReceiptResult::Conflict
+        );
+
+        let mut changed_reducer_payload = receipt_request(
+            &authority,
+            Some(&attempt.attempt_id),
+            now + chrono::Duration::seconds(1),
+        );
+        changed_reducer_payload.reducer_event.payload = "changed-event".to_owned();
+        assert_eq!(
+            repo.accept_receipt(&changed_reducer_payload).await.unwrap(),
+            AcceptReceiptResult::Conflict
+        );
 
         let attempt_status: String =
             sqlx::query_scalar("SELECT status FROM workflow_attempts WHERE id = ?1")

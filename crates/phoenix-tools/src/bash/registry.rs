@@ -188,7 +188,10 @@ pub enum BashTerminalInspection {
         signal_number: Option<i32>,
         duration_ms: u64,
         kill_signal_sent: Option<phoenix_core::domain::kill_signal::KillSignal>,
-        tails: Vec<String>,
+        tail_start_offset: u64,
+        tail_end_offset: u64,
+        tail_truncated_before: bool,
+        tails: Vec<super::ring::RingLine>,
     },
 }
 
@@ -370,11 +373,13 @@ impl BashHandleRegistry {
                 signal_number: tomb.signal_number,
                 duration_ms: tomb.duration_ms,
                 kill_signal_sent: tomb.kill_signal_sent,
-                tails: tomb
+                tail_start_offset: tomb
                     .final_tail
-                    .iter()
-                    .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
-                    .collect(),
+                    .first()
+                    .map_or(tomb.next_offset_at_exit, |line| line.offset),
+                tail_end_offset: tomb.next_offset_at_exit,
+                tail_truncated_before: tomb.final_tail.first().is_some_and(|line| line.offset > 0),
+                tails: tomb.final_tail.clone(),
             },
         }
     }

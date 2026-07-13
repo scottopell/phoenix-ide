@@ -258,6 +258,9 @@ async fn inspect_binding(
                     signal_number,
                     duration_ms,
                     kill_signal_sent,
+                    tail_start_offset,
+                    tail_end_offset,
+                    tail_truncated_before,
                     tails,
                 } if observed_at <= binding.expires_at => {
                     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
@@ -272,19 +275,26 @@ async fn inspect_binding(
                         duration_ms: Some(duration_ms),
                         signal_number,
                         kill_signal_sent: kill_signal_sent.map(|signal| signal.as_str().to_owned()),
-                        final_tail: tails,
+                        tail_start_offset,
+                        tail_end_offset,
+                        tail_truncated_before,
+                        tail_offsets: tails.iter().map(|line| line.offset).collect(),
+                        final_tail: tails
+                            .iter()
+                            .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+                            .collect(),
                     });
                     fired(binding, evidence, now)
                 }
-                BashTerminalInspection::Unknown if deadline_reached => forgotten(binding, now),
+                BashTerminalInspection::Unknown => forgotten(binding, now),
                 BashTerminalInspection::Live | BashTerminalInspection::Terminal { .. }
                     if deadline_reached =>
                 {
                     expired(binding, now)
                 }
-                BashTerminalInspection::Unknown
-                | BashTerminalInspection::Live
-                | BashTerminalInspection::Terminal { .. } => retry(binding, now),
+                BashTerminalInspection::Live | BashTerminalInspection::Terminal { .. } => {
+                    retry(binding, now)
+                }
             }
         }
         WakeResourceIdentity::TmuxWindow(identity) => {
@@ -337,8 +347,9 @@ fn classify_tmux(
             });
             fired(binding, evidence, now)
         }
-        TmuxTerminalInspection::Missing if now >= binding.expires_at => forgotten(binding, now),
+        TmuxTerminalInspection::Missing => forgotten(binding, now),
         TmuxTerminalInspection::Live
+        | TmuxTerminalInspection::Unavailable
         | TmuxTerminalInspection::WindowKilled { .. }
         | TmuxTerminalInspection::Terminal { .. }
             if now >= binding.expires_at =>
@@ -347,8 +358,8 @@ fn classify_tmux(
         }
         // A terminal marker without its durable occurrence timestamp is not
         // evidence that may outrank the exact deadline.
-        TmuxTerminalInspection::Missing
-        | TmuxTerminalInspection::Live
+        TmuxTerminalInspection::Live
+        | TmuxTerminalInspection::Unavailable
         | TmuxTerminalInspection::WindowKilled { .. }
         | TmuxTerminalInspection::Terminal { .. } => retry(binding, now),
     }
@@ -535,24 +546,51 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn missing_is_forgotten_only_by_the_typed_deadline_decision() {
-        let binding = binding(WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+    #[tokio::test]
+    async fn bash_missing_is_forgotten_immediately_before_deadline() {
+        let manager = manager_with_due_wakes(0).await;
+        let binding = binding(WakeResourceIdentity::Bash(BashResourceIdentity {
             work_scope: scope(),
-            server_generation: "generation".to_owned(),
-            window_id: "@1".to_owned(),
+            handle_id: "missing".to_owned(),
         }));
+
         assert!(matches!(
-            retry(&binding, at(99)).unwrap(),
-            InspectionDecision::RetryAt(value) if value == at(100)
-        ));
-        assert!(matches!(
-            forgotten(&binding, at(100)).unwrap(),
+            inspect_binding(&manager, &binding, at(50)).await.unwrap(),
             InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten {
                 reason: WakeForgottenReason::HandleMissing,
+                resolved_at: Timestamp(50),
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn tmux_missing_is_forgotten_immediately_while_unavailable_retries() {
+        let identity = TmuxResourceIdentity {
+            work_scope: scope(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let binding = binding(WakeResourceIdentity::TmuxWindow(identity.clone()));
+
+        assert!(matches!(
+            classify_tmux(&binding, &identity, TmuxTerminalInspection::Missing, at(50)).unwrap(),
+            InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten {
+                reason: WakeForgottenReason::HandleMissing,
+                resolved_at: Timestamp(50),
+                ..
+            })
+        ));
+        assert_eq!(
+            classify_tmux(
+                &binding,
+                &identity,
+                TmuxTerminalInspection::Unavailable,
+                at(50),
+            )
+            .unwrap(),
+            InspectionDecision::RetryAt(at(51))
+        );
     }
 
     #[test]
@@ -702,6 +740,10 @@ mod tests {
             duration_ms: None,
             signal_number: None,
             kill_signal_sent: None,
+            tail_start_offset: 0,
+            tail_end_offset: 0,
+            tail_truncated_before: false,
+            tail_offsets: Vec::new(),
             final_tail: Vec::new(),
         });
         assert!(matches!(

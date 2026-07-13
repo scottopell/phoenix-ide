@@ -114,6 +114,62 @@ async fn claimed(repo: &WorkflowRepository) -> ClaimedWakeEffect {
         .expect("wake effect claimed")
 }
 
+async fn terminalize_bash(
+    repo: &WorkflowRepository,
+    claim: ClaimedWakeEffect,
+    workflow_id: &str,
+    contract_id: &str,
+    receipt_id: &str,
+    inbox_id: &str,
+) {
+    let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
+        identity: match bash() {
+            WakeResourceIdentity::Bash(identity) => identity,
+            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+        },
+        status: BashTerminalStatus::Exited,
+        occurred_at: Timestamp(1_020),
+        exit_code: Some(0),
+        duration_ms: Some(20),
+        signal_number: None,
+        kill_signal_sent: None,
+        tail_start_offset: 0,
+        tail_end_offset: 0,
+        tail_truncated_before: false,
+        tail_offsets: vec![],
+        final_tail: vec![],
+    });
+    assert!(matches!(
+        WakeWorkflowAdapter::new(repo)
+            .record_terminal_evidence(
+                &WakeObservationRequest {
+                    observation_id: format!("observation-{workflow_id}"),
+                    authority: claim.authority.clone(),
+                    attempt_id: claim.attempt_id.clone(),
+                    evidence: evidence.clone(),
+                    recorded_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+                },
+                &WakeTerminalReceiptRequest {
+                    receipt_id: receipt_id.to_owned(),
+                    reducer_inbox_id: inbox_id.to_owned(),
+                    authority: claim.authority,
+                    attempt_id: claim.attempt_id,
+                    terminal: WakeTerminalPayload::Fired {
+                        contract_id: contract_id.to_owned(),
+                        resource: bash(),
+                        evidence,
+                        resolved_at: Timestamp(1_020),
+                    },
+                    accepted_at: Utc.timestamp_opt(1_021, 0).single().unwrap(),
+                    origin: DurableReceiptOrigin::Execution,
+                },
+            )
+            .await
+            .unwrap(),
+        AcceptReceiptResult::Accepted { .. }
+    ));
+}
+
 #[tokio::test]
 async fn terminal_evidence_rejects_a_fired_receipt_with_different_evidence_atomically() {
     let (pool, repo) = registered(bash()).await;
@@ -129,6 +185,10 @@ async fn terminal_evidence_rejects_a_fired_receipt_with_different_evidence_atomi
         duration_ms: Some(20_000),
         signal_number: None,
         kill_signal_sent: None,
+        tail_start_offset: 0,
+        tail_end_offset: 1,
+        tail_truncated_before: false,
+        tail_offsets: vec![0],
         final_tail: vec!["observed".to_owned()],
     });
     let mut receipt_evidence = evidence.clone();
@@ -191,6 +251,10 @@ async fn terminal_evidence_requires_a_fired_receipt() {
         duration_ms: None,
         signal_number: None,
         kill_signal_sent: None,
+        tail_start_offset: 0,
+        tail_end_offset: 0,
+        tail_truncated_before: false,
+        tail_offsets: Vec::new(),
         final_tail: Vec::new(),
     });
     let result = WakeWorkflowAdapter::new(&repo)
@@ -219,6 +283,51 @@ async fn terminal_evidence_requires_a_fired_receipt() {
         .await
         .unwrap();
     assert_eq!(result, AcceptReceiptResult::StaleAuthority);
+}
+
+#[tokio::test]
+async fn ensure_protocol_selection_reports_existing_accepting_selection_without_altering_it() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let competing = DurableProtocolSelectionRegistration {
+        selection_id: "wake-competing".to_owned(),
+        profile_id: phoenix_workflow::wake_profile::PROFILE_ID.to_owned(),
+        selector_identity: "competing-selector".to_owned(),
+        selector_version: 9,
+        protocol_version: phoenix_workflow::wake_profile::PROTOCOL_VERSION,
+        authority: phoenix_workflow::SemanticAuthority::EngineProtocol,
+        accepting: true,
+        runtime_acceptance_enabled: true,
+        external_acceptance_enabled: true,
+        registered_at: Utc.timestamp_opt(900, 0).single().unwrap(),
+        drained_at: None,
+        supported_codecs: vec![],
+        executor_kinds: vec![],
+    };
+    repo.register_protocol_selection(&competing).await.unwrap();
+
+    let error = WakeWorkflowAdapter::new(&repo)
+        .ensure_protocol_selection(Utc.timestamp_opt(1_000, 0).single().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkflowRepositoryError::ProtocolSelectionIncompatible {
+            requested_selection_id,
+            existing_selection_id,
+            profile_id,
+        } if requested_selection_id == SELECTION_ID
+            && existing_selection_id == "wake-competing"
+            && profile_id == phoenix_workflow::wake_profile::PROFILE_ID
+    ));
+
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT id, accepting, selector_version FROM workflow_protocol_selections ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![("wake-competing".to_owned(), 1, 9)]);
 }
 
 #[tokio::test]
@@ -419,7 +528,11 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
         duration_ms: Some(20_000),
         signal_number: None,
         kill_signal_sent: None,
-        final_tail: vec!["done".to_owned()],
+        tail_start_offset: 41,
+        tail_end_offset: 57,
+        tail_truncated_before: true,
+        tail_offsets: vec![41, 49],
+        final_tail: vec!["first".to_owned(), "second".to_owned()],
     });
     let adapter = WakeWorkflowAdapter::new(&repo);
     let observation = WakeObservationRequest {
@@ -472,7 +585,8 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
         .unwrap();
     assert_eq!(claim_count, 0);
     let terminal_projection = sqlx::query(
-        "SELECT contract_id, resource_kind, status, bash_status, bash_duration_ms \
+        "SELECT contract_id, resource_kind, status, bash_status, bash_duration_ms, \
+                bash_tail_start_offset, bash_tail_end_offset, bash_tail_truncated_before \
          FROM wake_terminal_receipts WHERE receipt_id = 'wake-receipt'",
     )
     .fetch_one(&pool)
@@ -495,13 +609,29 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
         terminal_projection.get::<i64, _>("bash_duration_ms"),
         20_000
     );
-    let tail: String = sqlx::query_scalar(
-        "SELECT line FROM wake_terminal_receipt_bash_tail WHERE receipt_id = 'wake-receipt' AND ordinal = 0",
+    assert_eq!(
+        terminal_projection.get::<i64, _>("bash_tail_start_offset"),
+        41
+    );
+    assert_eq!(
+        terminal_projection.get::<i64, _>("bash_tail_end_offset"),
+        57
+    );
+    assert_eq!(
+        terminal_projection.get::<i64, _>("bash_tail_truncated_before"),
+        1
+    );
+    let tail: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT ordinal, offset, line FROM wake_terminal_receipt_bash_tail \
+         WHERE receipt_id = 'wake-receipt' ORDER BY ordinal",
     )
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(tail, "done");
+    assert_eq!(
+        tail,
+        vec![(0, 41, "first".to_owned()), (1, 49, "second".to_owned())]
+    );
     let wake_inbox = sqlx::query(
         "SELECT workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, consumed_at \
          FROM wake_observation_inbox WHERE id = 'wake-inbox'",
@@ -720,6 +850,109 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
         .await
         .unwrap();
     assert_eq!(owed, 0);
+}
+
+#[tokio::test]
+async fn cancellation_suppresses_only_linked_obligation_and_preserves_same_conversation_peer() {
+    let (pool, repo) = registered(bash()).await;
+    let first_claim = claimed(&repo).await;
+    terminalize_bash(
+        &repo,
+        first_claim,
+        "wake-workflow",
+        "wake-contract",
+        "receipt-first",
+        "inbox-first",
+    )
+    .await;
+
+    let mut second = registration(bash());
+    second.idempotency_key = "register-second".to_owned();
+    second.intent_fingerprint = "fingerprint-second".to_owned();
+    second.workflow_id = "wake-workflow-second".to_owned();
+    second.transition_id = "wake-transition-second".to_owned();
+    second.binding_id = "wake-binding-second".to_owned();
+    second.intent.contract_id = "wake-contract-second".to_owned();
+    second.fence_version = 2;
+    assert!(matches!(
+        WakeWorkflowAdapter::new(&repo)
+            .register(&second)
+            .await
+            .unwrap(),
+        WakeRegistrationResult::New { .. }
+    ));
+    let second_claim = claimed(&repo).await;
+    terminalize_bash(
+        &repo,
+        second_claim,
+        "wake-workflow-second",
+        "wake-contract-second",
+        "receipt-second",
+        "inbox-second",
+    )
+    .await;
+
+    sqlx::query("UPDATE workflows SET status = 'active', version = 1, generation = 0 WHERE id = 'wake-workflow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'eligible' WHERE id = 'wake-observe:wake-workflow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM wake_runtime_obligations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO wake_runtime_obligations \
+         (id, conversation_id, snapshot_upper_bound, status, created_at) VALUES \
+         ('obligation-first', 'conv-wake', 1, 'owed', '1970-01-01T00:17:01+00:00'), \
+         ('obligation-second', 'conv-wake', 2, 'owed', '1970-01-01T00:17:02+00:00')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO wake_runtime_obligation_items (obligation_id, ordinal, inbox_item_id) VALUES \
+         ('obligation-first', 0, 'inbox-first'), \
+         ('obligation-second', 0, 'inbox-second')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(WakeWorkflowAdapter::new(&repo)
+        .cancel(&WakeCancellationRequest {
+            workflow_id: "wake-workflow".to_owned(),
+            observe_effect_id: "wake-observe:wake-workflow".to_owned(),
+            reducer_inbox_id: "cancel-inbox-scoped".to_owned(),
+            transition_id: "cancel-transition-scoped".to_owned(),
+            expected_version: 1,
+            expected_generation: 0,
+            contract_id: "wake-contract",
+            resource: bash(),
+            resolved_at: Timestamp(1_030),
+            committed_at: Utc.timestamp_opt(1_030, 0).single().unwrap(),
+        })
+        .await
+        .unwrap());
+
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM wake_runtime_obligations ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            ("obligation-first".to_owned(), "suppressed".to_owned()),
+            ("obligation-second".to_owned(), "owed".to_owned()),
+        ]
+    );
 }
 
 #[tokio::test]

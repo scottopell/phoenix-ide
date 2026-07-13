@@ -185,6 +185,10 @@ fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
         duration_ms: Some(100),
         signal_number: Some(15),
         kill_signal_sent: Some("TERM".into()),
+        tail_start_offset: 0,
+        tail_end_offset: 1,
+        tail_truncated_before: false,
+        tail_offsets: vec![0],
         final_tail: vec!["line 1".into(), "line 2".into()],
     });
     assert!(evidence_matches_resource(&bash_evidence, &bash));
@@ -221,6 +225,10 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
         duration_ms: Some(44),
         signal_number: None,
         kill_signal_sent: None,
+        tail_start_offset: 0,
+        tail_end_offset: 1,
+        tail_truncated_before: false,
+        tail_offsets: vec![0],
         final_tail: vec!["ok".into()],
     });
     let fired = terminal_payload_from_evidence(
@@ -257,6 +265,10 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
             duration_ms: None,
             signal_number: None,
             kill_signal_sent: None,
+            tail_start_offset: 0,
+            tail_end_offset: 1,
+            tail_truncated_before: false,
+            tail_offsets: vec![0],
             final_tail: vec!["late".into()],
         }),
         Timestamp(20),
@@ -415,6 +427,10 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
             duration_ms: Some(5),
             signal_number: None,
             kill_signal_sent: None,
+            tail_start_offset: 0,
+            tail_end_offset: 1,
+            tail_truncated_before: false,
+            tail_offsets: vec![0],
             final_tail: vec![],
         }),
         intent.expires_at,
@@ -648,6 +664,10 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         duration_ms: Some(20),
         signal_number: Some(9),
         kill_signal_sent: Some("KILL".into()),
+        tail_start_offset: 0,
+        tail_end_offset: 1,
+        tail_truncated_before: false,
+        tail_offsets: vec![0],
         final_tail: vec!["hung".into()],
     });
     assert_eq!(

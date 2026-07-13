@@ -156,6 +156,7 @@ pub enum TmuxTerminalInspection {
         final_tail: Vec<String>,
     },
     Missing,
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -732,7 +733,7 @@ impl TmuxRegistry {
             };
         }
         if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
-            return TmuxTerminalInspection::Missing;
+            return TmuxTerminalInspection::Unavailable;
         }
 
         // A scope rekey moves the registry entry but deliberately preserves its
@@ -745,9 +746,10 @@ impl TmuxRegistry {
         };
         match probe(&socket_path).await {
             Ok(ProbeResult::Live) => {}
-            Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket) | Err(_) => {
+            Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket) => {
                 return TmuxTerminalInspection::Missing;
             }
+            Err(_) => return TmuxTerminalInspection::Unavailable,
         }
         let Some(observed_generation) = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await
         else {
@@ -1238,7 +1240,7 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
         .output()
         .await;
     let Ok(output) = output else {
-        return TmuxTerminalInspection::Missing;
+        return TmuxTerminalInspection::Unavailable;
     };
     if !output.status.success() {
         return TmuxTerminalInspection::Missing;
@@ -1260,7 +1262,7 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
         .output()
         .await;
     let Ok(pane_state) = pane_state else {
-        return TmuxTerminalInspection::Missing;
+        return TmuxTerminalInspection::Unavailable;
     };
     if !pane_state.status.success() {
         return TmuxTerminalInspection::Missing;
@@ -1277,16 +1279,19 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
                 exit_code,
                 occurred_at: parse_occurred_at_marker(&captured),
                 duration_ms: parse_duration_ms(&captured),
-                final_tail: captured
-                    .lines()
-                    .rev()
-                    .take(20)
-                    .map(str::to_string)
-                    .collect(),
+                final_tail: terminal_tail(&captured),
             };
         }
     }
     TmuxTerminalInspection::Live
+}
+
+fn terminal_tail(output: &str) -> Vec<String> {
+    let lines: Vec<_> = output.lines().collect();
+    lines[lines.len().saturating_sub(20)..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
 }
 
 fn parse_occurred_at_marker(output: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1485,11 +1490,19 @@ mod tests {
         };
         assert_eq!(
             registry.inspect_window(&wrong_generation).await,
-            TmuxTerminalInspection::Missing
+            TmuxTerminalInspection::Unavailable
         );
         assert_eq!(
             registry.inspect_window(&wrong_window).await,
-            TmuxTerminalInspection::Missing
+            TmuxTerminalInspection::Unavailable
+        );
+    }
+
+    #[test]
+    fn terminal_tail_preserves_three_line_chronology() {
+        assert_eq!(
+            terminal_tail("first\nsecond\nthird\n"),
+            ["first", "second", "third"]
         );
     }
 

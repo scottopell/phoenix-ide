@@ -130,6 +130,10 @@ pub struct BashTerminalEvidence {
     pub duration_ms: Option<u64>,
     pub signal_number: Option<i32>,
     pub kill_signal_sent: Option<String>,
+    pub tail_start_offset: u64,
+    pub tail_end_offset: u64,
+    pub tail_truncated_before: bool,
+    pub tail_offsets: Vec<u64>,
     pub final_tail: Vec<String>,
 }
 

@@ -25,11 +25,12 @@ use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
     AcceptReceiptResult, ClaimEffectResult, DueEffect, DurableAcceptReceiptRequest,
-    DurableBarrierMemberRecord, DurableBarrierRecord, DurableClaimAuthority, DurableClaimRequest,
-    DurableCodecRef, DurableEffectRecord, DurableObservationRecord, DurablePayload,
-    DurableProtocolSelectionRegistration, DurableReceiptOrigin, DurableWakeTerminalProjection,
-    DurableWorkflowTransitionCommit, ExternalAcceptanceResult, ReconcileEffectResult,
-    RecordObservationResult, WorkflowRepository, WorkflowRepositoryError, WorkflowRepositoryResult,
+    DurableBarrierMemberRecord, DurableBarrierRecord, DurableBashTailLine, DurableClaimAuthority,
+    DurableClaimRequest, DurableCodecRef, DurableEffectRecord, DurableObservationRecord,
+    DurablePayload, DurableProtocolSelectionRegistration, DurableReceiptOrigin,
+    DurableWakeTerminalProjection, DurableWorkflowTransitionCommit, ExternalAcceptanceResult,
+    ReconcileEffectResult, RecordObservationResult, WorkflowRepository, WorkflowRepositoryError,
+    WorkflowRepositoryResult,
 };
 
 pub const SELECTION_ID: &str = "wake-v1";
@@ -188,8 +189,34 @@ impl<'a> WakeWorkflowAdapter<'a> {
         {
             Ok(()) => Ok(()),
             Err(WorkflowRepositoryError::Sqlx(error)) if is_unique_constraint(&error) => {
-                // Another registrar may have won. Re-read and verify rather than assuming parity.
-                Box::pin(self.ensure_protocol_selection(registered_at)).await
+                let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
+                    "SELECT id, profile_id, protocol_version, external_acceptance_enabled \
+                     FROM workflow_protocol_selections \
+                     WHERE id = ?1 OR (profile_id = ?2 AND accepting = 1) \
+                     ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                )
+                .bind(SELECTION_ID)
+                .bind(wake_profile::PROFILE_ID)
+                .fetch_optional(self.repository.pool())
+                .await?;
+                match existing {
+                    Some((id, profile, version, external))
+                        if id == SELECTION_ID
+                            && profile == wake_profile::PROFILE_ID
+                            && version == i64::from(wake_profile::PROTOCOL_VERSION)
+                            && external == 1 =>
+                    {
+                        Ok(())
+                    }
+                    Some((id, profile, _, _)) => {
+                        Err(WorkflowRepositoryError::ProtocolSelectionIncompatible {
+                            requested_selection_id: SELECTION_ID.to_owned(),
+                            existing_selection_id: id,
+                            profile_id: profile,
+                        })
+                    }
+                    None => Err(WorkflowRepositoryError::Sqlx(error)),
+                }
             }
             Err(error) => Err(error),
         }
@@ -664,8 +691,19 @@ impl<'a> WakeWorkflowAdapter<'a> {
         sqlx::query(
             "UPDATE wake_runtime_obligations \
              SET status = 'suppressed', resolved_at = ?1, terminal_reason = 'lifecycle_terminal' \
-             WHERE conversation_id = (SELECT conversation_id FROM wake_workflow_bindings WHERE workflow_id = ?2) \
-               AND status = 'owed'",
+             WHERE status = 'owed' \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM wake_runtime_obligation_items oi \
+                   JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
+                   WHERE oi.obligation_id = wake_runtime_obligations.id \
+                     AND wi.workflow_id <> ?2\
+               ) \
+               AND EXISTS (\
+                   SELECT 1 FROM wake_runtime_obligation_items oi \
+                   JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
+                   WHERE oi.obligation_id = wake_runtime_obligations.id \
+                     AND wi.workflow_id = ?2\
+               )",
         )
         .bind(request.committed_at.to_rfc3339())
         .bind(&request.workflow_id)
@@ -1209,7 +1247,7 @@ fn observe_intent_json(intent: &ObserveHandleIntent) -> Value {
 fn evidence_json(evidence: &WakeTerminalEvidence) -> Value {
     match evidence {
         WakeTerminalEvidence::Bash(value) => {
-            json!({"type":"bash","identity":resource_json(&WakeResourceIdentity::Bash(value.identity.clone())),"status":bash_status(value.status),"occurred_at":value.occurred_at.0,"exit_code":value.exit_code,"duration_ms":value.duration_ms,"signal_number":value.signal_number,"kill_signal_sent":value.kill_signal_sent,"final_tail":value.final_tail})
+            json!({"type":"bash","identity":resource_json(&WakeResourceIdentity::Bash(value.identity.clone())),"status":bash_status(value.status),"occurred_at":value.occurred_at.0,"exit_code":value.exit_code,"duration_ms":value.duration_ms,"signal_number":value.signal_number,"kill_signal_sent":value.kill_signal_sent,"tail_start_offset":value.tail_start_offset,"tail_end_offset":value.tail_end_offset,"tail_truncated_before":value.tail_truncated_before,"tail_offsets":value.tail_offsets,"final_tail":value.final_tail})
         }
         WakeTerminalEvidence::TmuxWindow(value) => {
             json!({"type":"tmux_window","identity":resource_json(&WakeResourceIdentity::TmuxWindow(value.identity.clone())),"status":tmux_status(value.status),"occurred_at":value.occurred_at.0,"exit_code":value.exit_code,"duration_ms":value.duration_ms,"final_tail":value.final_tail})
@@ -1246,6 +1284,9 @@ fn terminal_projection(
         bash_duration_ms: None,
         bash_signal_number: None,
         bash_kill_signal_sent: None,
+        bash_tail_start_offset: None,
+        bash_tail_end_offset: None,
+        bash_tail_truncated_before: None,
         bash_tail: vec![],
         tmux_status: None,
         tmux_occurred_at: None,
@@ -1267,7 +1308,21 @@ fn terminal_projection(
                 projection
                     .bash_kill_signal_sent
                     .clone_from(&value.kill_signal_sent);
-                projection.bash_tail.clone_from(&value.final_tail);
+                projection.bash_tail_start_offset = Some(value.tail_start_offset);
+                projection.bash_tail_end_offset = Some(value.tail_end_offset);
+                projection.bash_tail_truncated_before = Some(value.tail_truncated_before);
+                if value.tail_offsets.len() != value.final_tail.len() {
+                    return Err(WorkflowRepositoryError::CorruptState(
+                        "bash tail offsets and lines have different lengths".to_owned(),
+                    ));
+                }
+                projection.bash_tail = value
+                    .tail_offsets
+                    .iter()
+                    .copied()
+                    .zip(value.final_tail.iter().cloned())
+                    .map(|(offset, line)| DurableBashTailLine { offset, line })
+                    .collect();
             }
             WakeTerminalEvidence::TmuxWindow(value) => {
                 projection.tmux_status = Some(tmux_status(value.status).to_owned());

@@ -1874,6 +1874,9 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
     bash_duration_ms INTEGER,
     bash_signal_number INTEGER,
     bash_kill_signal_sent TEXT,
+    bash_tail_start_offset INTEGER,
+    bash_tail_end_offset INTEGER,
+    bash_tail_truncated_before INTEGER,
     tmux_status TEXT,
     tmux_occurred_at TEXT,
     tmux_server_generation TEXT,
@@ -1893,6 +1896,10 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
     CHECK (bash_status IS NULL OR bash_status IN ('exited', 'killed', 'kill_pending_kernel')),
     CHECK (tmux_status IS NULL OR tmux_status IN ('exit_marker_observed', 'window_killed')),
     CHECK (bash_kill_signal_sent IS NULL OR bash_kill_signal_sent IN ('TERM', 'KILL')),
+    CHECK (bash_tail_start_offset IS NULL OR bash_tail_start_offset >= 0),
+    CHECK (bash_tail_end_offset IS NULL OR bash_tail_end_offset >= bash_tail_start_offset),
+    CHECK (bash_tail_truncated_before IS NULL OR bash_tail_truncated_before IN (0, 1)),
+    CHECK ((resource_kind = 'bash' AND status = 'fired') = (bash_tail_start_offset IS NOT NULL AND bash_tail_end_offset IS NOT NULL AND bash_tail_truncated_before IS NOT NULL)),
     CHECK (forgotten_reason IS NULL OR forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart')),
     CHECK (cancellation_reason IS NULL OR cancellation_reason IN ('explicit_cancel')),
     CHECK (
@@ -3787,8 +3794,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO wake_terminal_receipts \
-             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms) \
-             VALUES ('rcpt', 'wf', 'contract-tail', 'eff', 'bash', 'fired', 'now', 'exited', 'now', 0, 10)",
+             (receipt_id, workflow_id, contract_id, observe_effect_id, resource_kind, status, resolved_at, bash_status, bash_occurred_at, bash_exit_code, bash_duration_ms, bash_tail_start_offset, bash_tail_end_offset, bash_tail_truncated_before) \
+             VALUES ('rcpt', 'wf', 'contract-tail', 'eff', 'bash', 'fired', 'now', 'exited', 'now', 0, 10, 0, 0, 0)",
         )
         .execute(&pool)
         .await
