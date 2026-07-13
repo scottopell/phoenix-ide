@@ -30,6 +30,7 @@ export interface FileSearchMatchTarget {
   lineNumber: number;
   startColumn: number;
   endColumn: number;
+  matchOrdinal: number;
 }
 
 export interface FileSearchSource extends SearchableSource<FileSearchMatchTarget> {
@@ -132,11 +133,12 @@ export function buildFileSearchProjection(content: string, query: string): FileS
     lineStart = newline + 1;
     lineNumber += 1;
   }
-  return { sources, matches: projectMatches(sources, query, (source, match) => ({
+  return { sources, matches: projectMatches(sources, query, (source, match, matchOrdinal) => ({
     kind: 'file-line',
     lineNumber: source.lineNumber,
     startColumn: match.start,
     endColumn: match.end,
+    matchOrdinal,
   })) };
 }
 
@@ -644,18 +646,20 @@ function sortJsonValue(value: unknown): unknown {
 function projectMatches<TTarget, TSource extends SearchableSource<TTarget>>(
   sources: readonly TSource[],
   query: string,
-  buildTarget: (source: TSource, match: ViewerFindMatch) => TTarget,
+  buildTarget: (source: TSource, match: ViewerFindMatch, matchOrdinal: number) => TTarget,
 ): SearchableSourceMatch<TTarget>[] {
   const out: SearchableSourceMatch<TTarget>[] = [];
+  let matchOrdinal = 0;
   for (const source of sources) {
     for (const match of findLiteralMatches(source.text, query).matches) {
       out.push({
         sourceId: source.id,
         sourceText: source.text,
-        target: buildTarget(source, match),
+        target: buildTarget(source, match, matchOrdinal),
         start: match.start,
         end: match.end,
       });
+      matchOrdinal += 1;
     }
   }
   return out;

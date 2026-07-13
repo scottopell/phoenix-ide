@@ -541,7 +541,7 @@ describe('MetaViewer payload routing', () => {
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
   });
 
-  it('resets find state when the viewed content identity changes under the same path', async () => {
+  it('replaces results when the viewed content changes under the same path and kind', async () => {
     const { rerender } = render(
       <ReviewNotesProvider>
         <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta' }} />
@@ -558,7 +558,35 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('alpha'));
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+  });
+
+  it('preserves the semantic active match when lines are inserted before it on the same path without extra scrolls', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta\ngamma' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'beta' } });
+
+    const originalLine = document.querySelector('[data-line="2"]') as HTMLElement;
+    originalLine.scrollIntoView = vi.fn();
+    await waitFor(() => expect(originalLine.scrollIntoView).toHaveBeenCalledTimes(1));
+
+    const insertedLine = document.querySelector('[data-line="3"]') as HTMLElement;
+    insertedLine.scrollIntoView = vi.fn();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'intro\nalpha\nbeta\ngamma' }} />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    expect(insertedLine.scrollIntoView).not.toHaveBeenCalled();
   });
 
   it('falls back to line reveal for HTML source matches without explicit marks', async () => {

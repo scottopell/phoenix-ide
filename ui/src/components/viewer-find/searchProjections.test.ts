@@ -84,8 +84,8 @@ describe('buildFileSearchProjection', () => {
       { lineNumber: 3, text: '' },
     ]);
     expect(projection.matches.map((match) => match.target)).toEqual([
-      { kind: 'file-line', lineNumber: 1, startColumn: 0, endColumn: 5 },
-      { kind: 'file-line', lineNumber: 2, startColumn: 5, endColumn: 10 },
+      { kind: 'file-line', lineNumber: 1, startColumn: 0, endColumn: 5, matchOrdinal: 0 },
+      { kind: 'file-line', lineNumber: 2, startColumn: 5, endColumn: 10, matchOrdinal: 1 },
     ]);
   });
 });
