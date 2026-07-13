@@ -1101,7 +1101,7 @@ async fn reconcile_worktrees(db: &Database) {
             // Hygiene only — does not depend on or affect the conv row.
             if pruned_roots.insert(root.clone()) {
                 let root_path = std::path::PathBuf::from(root);
-                if let Err(e) = std::process::Command::new("git")
+                if let Err(e) = phoenix_core::git::command()
                     .args(["worktree", "prune"])
                     .current_dir(&root_path)
                     .output()
@@ -1150,7 +1150,7 @@ async fn reconcile_worktrees(db: &Database) {
 /// `reconcile_project_main_refs` to decide whether a stored `main_ref` on a
 /// no-remote repo is a valid (keep) or broken (repair) value.
 fn local_branch_exists(repo_path: &std::path::Path, branch: &str) -> bool {
-    std::process::Command::new("git")
+    phoenix_core::git::command()
         .args([
             "rev-parse",
             "--verify",
@@ -1312,7 +1312,7 @@ mod reconcile_worktrees_tests {
                 "-q",
             ][..],
         ] {
-            let status = std::process::Command::new("git")
+            let status = phoenix_core::git::command()
                 .args(args)
                 .current_dir(&root)
                 .status()
@@ -1584,7 +1584,7 @@ mod reconcile_main_ref_tests {
                 "-q",
             ][..],
         ] {
-            let status = std::process::Command::new("git")
+            let status = phoenix_core::git::command()
                 .args(args)
                 .current_dir(&root)
                 .status()
@@ -1598,7 +1598,7 @@ mod reconcile_main_ref_tests {
     /// an authoritative remote default without any network. `branch` need not be
     /// the checked-out branch — reconciliation reads only the remote signal.
     fn set_remote_default(repo: &std::path::Path, branch: &str) {
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args([
                 "symbolic-ref",
                 "refs/remotes/origin/HEAD",
@@ -1639,7 +1639,7 @@ mod reconcile_main_ref_tests {
 
     /// Create a real local branch (off HEAD) without checking it out.
     fn create_branch(repo: &std::path::Path, branch: &str) {
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["branch", branch])
             .current_dir(repo)
             .status()

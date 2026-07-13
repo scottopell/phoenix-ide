@@ -1232,7 +1232,7 @@ mod repository_lock_tests {
     #[test]
     fn repository_mutation_lock_serializes_live_holders() {
         let repo = tempfile::tempdir().unwrap();
-        let status = Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["init", "--quiet"])
             .current_dir(repo.path())
             .status()
