@@ -133,7 +133,7 @@ describe('VirtualTranscript', () => {
     const indexes = rowIndexes();
     expect(indexes).toEqual([0, 1, 2, 3, 4, 5]);
     expect(indexes.length).toBeLessThan(100);
-    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 5 });
+    expect(ranges.at(-1)?.renderedRange).toEqual({ startIndex: 0, endIndex: 5 });
     expect(ranges.at(-1)?.layoutRevision).toBeGreaterThan(0);
 
     const scroller = document.querySelector('.virtual-transcript');
@@ -246,14 +246,14 @@ describe('VirtualTranscript', () => {
       />,
     );
 
-    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 4 });
+    expect(ranges.at(-1)?.renderedRange).toEqual({ startIndex: 0, endIndex: 4 });
 
     const scroller = document.querySelector('.virtual-transcript')!;
     act(() => {
       resizeObservers.at(-1)?.triggerEntries([[scroller, 60]]);
     });
 
-    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 2 });
+    expect(ranges.at(-1)?.renderedRange).toEqual({ startIndex: 0, endIndex: 2 });
     expect(rowIndexes()).toEqual([0, 1, 2]);
   });
 
@@ -338,10 +338,11 @@ describe('VirtualTranscript', () => {
     expect(scrollTopOf(scroller)).toBe(30);
     expect(ref.current?.measureOffsetForIndex(0)).toBe(0);
 
-    const snapshot = ref.current?.physicalSnapshot();
-    expect(snapshot?.range).toEqual({ startIndex: 0, endIndex: 9 });
+    const snapshot = ref.current?.physicalSnapshot(0);
+    expect(snapshot?.renderedRange).toEqual({ startIndex: 0, endIndex: 9 });
+    expect(snapshot?.targetOffset).toBe(0);
     expect(ref.current?.measureOffsetForIndexAtSnapshot(0, snapshot!)).toBe(0);
-    expect(ref.current?.measureOffsetForIndexAtSnapshot(0, { ...snapshot!, layoutRevision: snapshot!.layoutRevision - 1 })).toBeNull();
+    expect(ref.current?.measureOffsetForIndexAtSnapshot(1, snapshot!)).toBeNull();
 
     const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
     act(() => resizeObservers[0]!.triggerEntries([[header, 60]]));

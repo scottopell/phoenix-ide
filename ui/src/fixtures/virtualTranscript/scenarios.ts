@@ -29,20 +29,23 @@ const EXPECTED_EXPECTATION_KIND_BY_SCENARIO_ID = {
 
 const UnitRoleSchema = v.picklist(['user', 'agent', 'tool', 'system']);
 const StringArraySchema = v.array(v.string());
+const NonNegativeNumberSchema = v.pipe(v.number(), v.minValue(0));
+const PositiveNumberSchema = v.pipe(v.number(), v.minValue(0), v.notValue(0));
+const NonNegativeIntegerSchema = v.pipe(v.number(), v.integer(), v.minValue(0));
 
 const UnitSchema = v.strictObject({
   key: v.string(),
   role: UnitRoleSchema,
   canonicalMessageId: v.string(),
   aliasMessageIds: StringArraySchema,
-  estimatedExtent: v.number(),
-  measuredExtent: v.optional(v.number()),
+  estimatedExtent: NonNegativeNumberSchema,
+  measuredExtent: v.optional(NonNegativeNumberSchema),
   text: v.string(),
 });
 
 const ViewportSchema = v.strictObject({
-  offset: v.number(),
-  extent: v.number(),
+  offset: NonNegativeNumberSchema,
+  extent: PositiveNumberSchema,
 });
 
 const ReadingAnchorSchema = v.strictObject({
@@ -51,13 +54,13 @@ const ReadingAnchorSchema = v.strictObject({
 });
 
 const VisibleRangeSchema = v.strictObject({
-  startIndex: v.number(),
-  endIndex: v.number(),
+  startIndex: NonNegativeIntegerSchema,
+  endIndex: NonNegativeIntegerSchema,
 });
 
 const SnapshotSchema = v.strictObject({
   revision: v.string(),
-  transcriptGeneration: v.number(),
+  transcriptGeneration: NonNegativeNumberSchema,
   units: v.array(UnitSchema),
   viewport: ViewportSchema,
   readingAnchor: v.optional(ReadingAnchorSchema),
@@ -93,8 +96,8 @@ const ExpectationSchema = v.variant('kind', [
     kind: v.literal('resolve_alias_navigation'),
     requestedMessageId: v.string(),
     resolvedMessageKey: v.string(),
-    targetIndex: v.number(),
-    targetOffset: v.number(),
+    targetIndex: NonNegativeIntegerSchema,
+    targetOffset: NonNegativeNumberSchema,
   }),
   v.strictObject({
     kind: v.literal('report_orphan_target'),
@@ -119,7 +122,7 @@ const ExpectationSchema = v.variant('kind', [
     supersededMessageId: v.string(),
     winningMessageId: v.string(),
     winningMessageKey: v.string(),
-    targetIndex: v.number(),
+    targetIndex: NonNegativeIntegerSchema,
   }),
 ]);
 
@@ -140,7 +143,7 @@ const ScenarioCorpusSchema = v.strictObject({
     name: v.string(),
     version: v.literal(1),
     unit: v.literal('css_px'),
-    scenarioCount: v.number(),
+    scenarioCount: NonNegativeIntegerSchema,
   }),
   scenarios: v.array(ScenarioSchema),
 });

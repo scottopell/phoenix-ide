@@ -27,6 +27,10 @@ const expectedIds: VirtualTranscriptScenarioId[] = [
 
 const fixtureRoot = resolve(__dirname, '../../../../fixtures/virtual-transcript/v1');
 
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 interface JsonSchema {
   const?: unknown;
   enum?: unknown[];
@@ -342,5 +346,37 @@ describe('virtual transcript fixture scenarios', () => {
       .toBe(byId.get('orphan-target')!.before.transcriptGeneration);
     expect(byId.get('supersession')?.after.transcriptGeneration)
       .toBe(byId.get('supersession')!.before.transcriptGeneration);
+  });
+});
+
+
+describe('virtual transcript scenario valibot numeric constraints', () => {
+  it('rejects negative extents, offsets, generations, indexes, and counts that JSON Schema forbids', () => {
+    const corpus = clone(readFixtureJson('scenarios.json')) as Record<string, unknown>;
+    const scenarios = corpus['scenarios'] as Array<Record<string, unknown>>;
+    const firstScenario = scenarios[0]!;
+    const before = firstScenario['before'] as Record<string, unknown>;
+    const viewport = before['viewport'] as Record<string, unknown>;
+    viewport['offset'] = -1;
+    before['transcriptGeneration'] = -1;
+    (before['units'] as Array<Record<string, unknown>>)[0]!['estimatedExtent'] = -5;
+    (before['visibleRange'] as Record<string, unknown>)['startIndex'] = -1;
+    ((firstScenario['expectation'] as Record<string, unknown>))['targetIndex'] = -1;
+    ((corpus['metadata'] as Record<string, unknown>))['scenarioCount'] = -1;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).toThrow();
+  });
+
+  it('rejects fractional indexes/counts and zero viewport extent where JSON Schema requires integers/positive extent', () => {
+    const corpus = clone(readFixtureJson('scenarios.json')) as Record<string, unknown>;
+    const scenarios = corpus['scenarios'] as Array<Record<string, unknown>>;
+    const aliasScenario = scenarios.find((scenario) => scenario['id'] === 'alias-navigation')!;
+    const expectation = aliasScenario['expectation'] as Record<string, unknown>;
+    expectation['targetIndex'] = 1.5;
+    ((corpus['metadata'] as Record<string, unknown>))['scenarioCount'] = 7.25;
+    ((((aliasScenario['after'] as Record<string, unknown>)['visibleRange'] as Record<string, unknown>)))['endIndex'] = 2.5;
+    ((((aliasScenario['after'] as Record<string, unknown>)['viewport'] as Record<string, unknown>)))['extent'] = 0;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).toThrow();
   });
 });

@@ -655,10 +655,8 @@ function MessageListImpl({
           const active = transcriptPositioningStateRef.current.active;
           const phase = transcriptPositioningStateRef.current.phase;
           if (active?.command.kind === 'restore_after_prefix_expansion' && phase?.kind === 'awaiting_physical') {
-            const snapshot = transcriptRef.current?.physicalSnapshot() ?? null;
-            const actualOffset = snapshot
-              ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(phase.targetIndex, snapshot) ?? null
-              : null;
+            const snapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? null;
+            const actualOffset = snapshot?.targetOffset ?? null;
             if (actualOffset !== null && Math.abs(actualOffset - active.command.viewportStartOffset) > RESTORE_OFFSET_TOLERANCE_PX) {
               dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
             }
@@ -896,9 +894,9 @@ function MessageListImpl({
             continuityRestoreInFlightRef.current = true;
             transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
           }
-          const physicalSnapshot = transcriptRef.current?.physicalSnapshot()
+          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(effect.targetIndex)
             ?? lastPhysicalSnapshotRef.current
-            ?? { range: null, layoutRevision: 0 };
+            ?? { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 0, targetIndex: effect.targetIndex, targetOffset: null };
           lastPhysicalSnapshotRef.current = physicalSnapshot;
           dispatchTranscriptPositioningRef.current({
             type: 'position_issued',
@@ -909,9 +907,9 @@ function MessageListImpl({
           dispatchTranscriptPositioningRef.current({
             type: 'physical_observed',
             commandKey: effect.commandKey,
-            range: physicalSnapshot.range,
+            range: physicalSnapshot.visibleRange,
             actualOffset: command.kind === 'restore_after_prefix_expansion'
-              ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(effect.targetIndex, physicalSnapshot) ?? null
+              ? physicalSnapshot.targetOffset ?? null
               : null,
             layoutRevision: physicalSnapshot.layoutRevision,
           });
@@ -981,24 +979,25 @@ function MessageListImpl({
   }, [activeScope, findOpen, findScopeId]);
 
   const handleRangeChanged = useCallback((snapshot: VirtualTranscriptRangeChange) => {
-    const range = snapshot.range;
+    const visibleRange = snapshot.visibleRange;
+    const renderedRange = snapshot.renderedRange;
     lastPhysicalSnapshotRef.current = snapshot;
-    if (!range) return;
-    firstVisibleUnitIndexRef.current = range.startIndex;
+    if (!visibleRange && !renderedRange) return;
+    firstVisibleUnitIndexRef.current = visibleRange?.startIndex ?? renderedRange!.startIndex;
     const active = transcriptPositioningStateRef.current.active;
     const phase = transcriptPositioningStateRef.current.phase;
     if (active && phase?.kind === 'awaiting_physical') {
       dispatchTranscriptPositioningRef.current({
         type: 'physical_observed',
         commandKey: active.key,
-        range,
+        range: visibleRange,
         actualOffset: active.command.kind === 'restore_after_prefix_expansion'
-          ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(phase.targetIndex, snapshot) ?? null
+          ? (snapshot.targetIndex === phase.targetIndex ? snapshot.targetOffset ?? null : null)
           : null,
         layoutRevision: snapshot.layoutRevision,
       });
     }
-    onVisibleRangeChange?.(range);
+    if (renderedRange) onVisibleRangeChange?.(renderedRange);
   }, [onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {

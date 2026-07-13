@@ -20,8 +20,14 @@ export interface VirtualTranscriptRange {
 }
 
 export interface VirtualTranscriptPhysicalSnapshot {
-  range: VirtualTranscriptRange | null;
+  /** Inclusive rows mounted in the DOM, including overscan-only rows. */
+  renderedRange: VirtualTranscriptRange | null;
+  /** Inclusive rows with positive-area intersection with the viewport. */
+  visibleRange: VirtualTranscriptRange | null;
+  viewportTop: number;
   layoutRevision: number;
+  targetIndex?: number;
+  targetOffset?: number | null;
 }
 
 export type VirtualTranscriptRangeChange = VirtualTranscriptPhysicalSnapshot;
@@ -39,7 +45,7 @@ export interface VirtualTranscriptHandle {
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
-  physicalSnapshot(): VirtualTranscriptPhysicalSnapshot;
+  physicalSnapshot(targetIndex?: number): VirtualTranscriptPhysicalSnapshot;
 }
 
 export interface VirtualTranscriptProps<T> {
@@ -96,18 +102,41 @@ function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange |
   return range ? { startIndex: range.startIndex, endIndex: range.endIndex } : null;
 }
 
-function physicalSnapshot<T>(store: PhysicalStore<T>): VirtualTranscriptPhysicalSnapshot {
-  return {
-    range: normalizeRange(store.range),
+function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
+  return store.layout.rangeForViewport({
+    viewportOffset: rowViewportOffset(store),
+    viewportExtent: store.viewportExtent,
+    overscanExtent: 0,
+  });
+}
+
+function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
+  const visibleRange = computeVisibleRange(store);
+  const baseSnapshot = {
+    renderedRange: normalizeRange(store.range),
+    visibleRange: normalizeRange(visibleRange),
+    viewportTop: store.viewportTop,
     layoutRevision: store.revision,
+  } satisfies Omit<VirtualTranscriptPhysicalSnapshot, 'targetIndex' | 'targetOffset'>;
+  if (targetIndex === undefined) return baseSnapshot;
+  const offset = itemPhysicalOffset(store, targetIndex);
+  return {
+    ...baseSnapshot,
+    targetIndex,
+    targetOffset: offset === undefined ? null : offset - store.viewportTop,
   };
 }
 
-function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number): number | null {
+function synchronizedPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
   store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
-  const offset = itemPhysicalOffset(store, index);
-  if (offset === undefined) return null;
-  return offset - store.viewportTop;
+  store.viewportExtent = store.scroller?.clientHeight ?? store.viewportExtent;
+  recompute(store);
+  return buildPhysicalSnapshot(store, targetIndex);
+}
+
+function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number): number | null {
+  const snapshot = synchronizedPhysicalSnapshot(store, index);
+  return snapshot.targetIndex === index ? snapshot.targetOffset ?? null : null;
 }
 
 function resolveKeys<T>(
@@ -473,7 +502,7 @@ function VirtualTranscriptInner<T>(
   }, []);
 
   useLayoutEffect(() => {
-    onRangeChange?.(physicalSnapshot(store));
+    onRangeChange?.(buildPhysicalSnapshot(store));
   }, [onRangeChange, store, store.range, store.revision]);
 
   useLayoutEffect(() => {
@@ -524,16 +553,23 @@ function VirtualTranscriptInner<T>(
       return measureOffsetForIndexInStore(current, index);
     },
     measureOffsetForIndexAtSnapshot(index, snapshot) {
-      const current = storeRef.current;
-      if (!current || current.revision !== snapshot.layoutRevision) return null;
-      return measureOffsetForIndexInStore(current, index);
+      if (snapshot.targetIndex !== index) return null;
+      return snapshot.targetOffset ?? null;
     },
     layoutRevision() {
       return storeRef.current?.revision ?? 0;
     },
-    physicalSnapshot() {
+    physicalSnapshot(targetIndex) {
       const current = storeRef.current;
-      return current ? physicalSnapshot(current) : { range: null, layoutRevision: 0 };
+      return current
+        ? synchronizedPhysicalSnapshot(current, targetIndex)
+        : {
+            renderedRange: null,
+            visibleRange: null,
+            viewportTop: 0,
+            layoutRevision: 0,
+            ...(targetIndex === undefined ? {} : { targetIndex, targetOffset: null }),
+          };
     },
   }), [publish]);
 
