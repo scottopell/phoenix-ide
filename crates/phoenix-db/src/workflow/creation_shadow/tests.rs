@@ -476,6 +476,7 @@ async fn cleanup_status_persists_compensation_graph() {
     .unwrap();
     let mut cleanup = oracle();
     cleanup.status = AuthoritativeCreationStatus::Cancelling;
+    cleanup.cleanup_ownership = CleanupOwnership::OwnedResources;
     cleanup.revision = sqlx::query_scalar::<_, i64>(
         "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
     )
@@ -532,6 +533,7 @@ async fn replacement_removes_old_forward_graph_before_compensation_graph() {
     .unwrap();
     let mut cleanup = oracle();
     cleanup.status = AuthoritativeCreationStatus::Cancelling;
+    cleanup.cleanup_ownership = CleanupOwnership::OwnedResources;
     cleanup.revision = u64::try_from(revision).unwrap();
     adapter
         .persist_after_authoritative_commit(

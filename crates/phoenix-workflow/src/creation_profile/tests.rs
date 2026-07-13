@@ -172,6 +172,7 @@ fn seeded_empty_has_distinct_required_dag_without_expansion_or_dispatch() {
 fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
     let mut oracle = oracle(CreationKind::SeededEmpty);
     oracle.status = AuthoritativeCreationStatus::DeletionPending;
+    oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
     let plan = compensation_plan(&oracle);
     let ids = plan
         .effects
@@ -453,6 +454,7 @@ fn cleanup_states_adapt_to_compensation_graphs() {
     for status in statuses {
         let mut oracle = oracle(CreationKind::SeededEmpty);
         oracle.status = status;
+        oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
         let adapted =
             adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &oracle).unwrap();
         assert_eq!(adapted.plan.effects.len(), 5);
@@ -463,6 +465,23 @@ fn cleanup_states_adapt_to_compensation_graphs() {
             .all(|effect| effect.role == crate::EffectRole::Compensation));
         assert_eq!(adapted.plan.dependencies.len(), 5);
     }
+}
+
+#[test]
+fn early_cancellation_omits_unowned_resource_cleanup() {
+    let mut oracle = oracle(CreationKind::SeededEmpty);
+    oracle.status = AuthoritativeCreationStatus::Cancelling;
+    oracle.cleanup_ownership = CleanupOwnership::None;
+    let adapted = adapt_authoritative_creation(WorkflowId(21), WorkflowId(91), &oracle).unwrap();
+    let ids = adapted
+        .plan
+        .effects
+        .iter()
+        .map(|effect| effect.effect_id)
+        .collect::<BTreeSet<_>>();
+    assert!(!ids.contains(&REMOVE_OWNED_WORKTREE));
+    assert!(!ids.contains(&RELEASE_RESERVATION));
+    assert_eq!(ids.len(), 3);
 }
 
 #[test]

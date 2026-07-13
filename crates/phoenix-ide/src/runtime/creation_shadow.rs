@@ -158,6 +158,16 @@ impl CreationShadowCoordinator {
                 oracle.intent.job_id
             ),
         });
+        let current_conversation = self
+            .db
+            .get_conversation(&oracle.intent.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if current_conversation.state != conversation.state
+            || current_conversation.archived != conversation.archived
+        {
+            return Ok(());
+        }
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,
@@ -355,6 +365,8 @@ fn observed_projection(
     };
     if state.allows_user_cancel() {
         capabilities.cancel = CapabilityAvailability::Allowed;
+    } else {
+        capabilities.cancel = CapabilityAvailability::Forbidden;
     }
     CreationShadowEvidence::UserProjection {
         status,

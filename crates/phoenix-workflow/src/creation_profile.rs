@@ -683,6 +683,24 @@ const fn dependency(effect_id: EffectId, depends_on_effect_id: EffectId) -> Depe
 }
 
 #[must_use]
+fn compensation_dependencies(owns_resources: bool) -> Vec<DependencyDecl> {
+    if owns_resources {
+        vec![
+            dependency(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME),
+            dependency(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS),
+            dependency(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE),
+            dependency(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS),
+            dependency(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION),
+        ]
+    } else {
+        vec![
+            dependency(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME),
+            dependency(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS),
+        ]
+    }
+}
+
+#[must_use]
 pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan<CreationProfile> {
     let generation = oracle.generation;
     let intents = [
@@ -730,8 +748,12 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
             None,
         ),
     ];
+    let owns_resources = oracle.cleanup_ownership == CleanupOwnership::OwnedResources;
     let effects = intents
         .into_iter()
+        .filter(|(id, ..)| {
+            owns_resources || !matches!(*id, REMOVE_OWNED_WORKTREE | RELEASE_RESERVATION)
+        })
         .map(|(id, kind, intent, resource)| {
             let mut declaration = effect(
                 id,
@@ -762,13 +784,7 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
         },
         event_codec: event_codec(),
         effects,
-        dependencies: vec![
-            dependency(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME),
-            dependency(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS),
-            dependency(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE),
-            dependency(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS),
-            dependency(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION),
-        ],
+        dependencies: compensation_dependencies(owns_resources),
         barriers: vec![BarrierDecl {
             barrier_id: COMPENSATION_BARRIER_ID,
             reducer_event_codec: barrier_codec(),
@@ -802,7 +818,11 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
             CreationProjectionStatus::Failed,
             capabilities([true, false, false, false, true, true]),
             CompletionPrediction::Failed,
-            CompensationPrediction::None,
+            if oracle.cleanup_ownership == CleanupOwnership::OwnedResources {
+                CompensationPrediction::RequiredForCancellation
+            } else {
+                CompensationPrediction::None
+            },
             false,
         ),
         AuthoritativeCreationStatus::Cancelled => (
@@ -909,6 +929,7 @@ fn compensation_effect_predictions(
     oracle: &AuthoritativeCreationOracle,
 ) -> Vec<(EffectId, EffectPrediction)> {
     let completed = matches!(oracle.status, AuthoritativeCreationStatus::Cancelled);
+    let owns_resources = oracle.cleanup_ownership == CleanupOwnership::OwnedResources;
     [
         (REVOKE_RUNTIME, EffectPrediction::Eligible),
         (DELETE_STAGED_ATTACHMENTS, EffectPrediction::Blocked),
@@ -917,6 +938,9 @@ fn compensation_effect_predictions(
         (FINISH_CANCELLATION_OR_DELETION, EffectPrediction::Blocked),
     ]
     .into_iter()
+    .filter(|(effect, _)| {
+        owns_resources || !matches!(*effect, REMOVE_OWNED_WORKTREE | RELEASE_RESERVATION)
+    })
     .map(|(effect, prediction)| {
         (
             effect,
