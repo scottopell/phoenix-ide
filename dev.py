@@ -6540,9 +6540,10 @@ def _prod_display_url(env: dict[str, str] | None = None) -> str:
 
 
 def _prod_local_health_url(env: dict[str, str] | None = None) -> str:
-    env = env or _repo_env()
+    env = _repo_env() if env is None else env
     scheme = "https" if tls_enabled_from_env(env) else "http"
-    return f"{scheme}://localhost:{PROD_PORT}/version"
+    port = env.get("PHOENIX_PORT", str(PROD_PORT))
+    return f"{scheme}://localhost:{port}/version"
 
 
 def _open_prod_health(env: dict[str, str] | None = None, timeout: float = 5.0):
@@ -7202,7 +7203,9 @@ def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str
         raise SystemExit(
             f"release {tag} embeds version {identity['version']}, expected {expected_version}"
         )
-    if not release_commit.startswith(identity["git_sha"].removesuffix("-dirty")):
+    if identity["git_sha"].endswith("-dirty"):
+        raise SystemExit(f"release {tag} asset embeds a dirty git identity")
+    if not release_commit.startswith(identity["git_sha"]):
         raise SystemExit(
             f"release {tag} resolves to {release_commit}, but the asset embeds {identity['git_sha']}"
         )
@@ -7317,7 +7320,8 @@ def launchd_prod_deploy(release: str | None = None):
         staging.mkdir(parents=True)
         staging.chmod(0o700)
         if release:
-            binary, release_tag, source_commit, release_commit = _prepare_release_candidate(release, staging)
+            binary, release_tag, embedded_commit, release_commit = _prepare_release_candidate(release, staging)
+            source_commit = release_commit
             source_kind = "published_release"
         else:
             binary = prod_build(target=None)
@@ -7338,11 +7342,12 @@ def launchd_prod_deploy(release: str | None = None):
         )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
         identity = _binary_identity(candidate_binary)
-        if not release and not identity["git_sha"].startswith(source_commit[:12]):
+        if release and identity["git_sha"] != embedded_commit:
+            raise SystemExit("staged release identity changed after signing")
+        if not release and not source_commit.startswith(identity["git_sha"].removesuffix("-dirty")):
             raise SystemExit(
                 f"local candidate identity {identity['git_sha']} does not match selected HEAD {source_commit[:12]}"
             )
-        source_commit = identity["git_sha"]
 
         env_overrides: dict[str, str] = {}
         env_file = _load_env_file(env_overrides)
@@ -7367,7 +7372,12 @@ def launchd_prod_deploy(release: str | None = None):
             rollback_plist.chmod(0o600)
         previous_identity = _current_prod_identity(launchd_env)
         if target_binary.exists() and previous_identity is None:
-            raise SystemExit("running production identity is unavailable; refusing an unverifiable rollback")
+            try:
+                previous_identity = _binary_identity(target_binary)
+            except (OSError, subprocess.SubprocessError, SystemExit) as exc:
+                raise SystemExit(
+                    "installed production identity is unavailable; refusing an unverifiable rollback"
+                ) from exc
 
         helper = staging / "activate.py"
         shutil.copy2(ROOT / "scripts" / "launchd_deploy_helper.py", helper)
@@ -7400,8 +7410,8 @@ def launchd_prod_deploy(release: str | None = None):
             "label": LAUNCHD_LABEL,
             "helper_label": helper_label,
             "uid": os.getuid(),
-            "health_url": _prod_local_health_url(launchd_env).replace("/version", "/api/version"),
-            "health_insecure_tls": tls_enabled_from_env(launchd_env),
+            "health_url": _prod_local_health_url(env_overrides).replace("/version", "/api/version"),
+            "health_insecure_tls": tls_enabled_from_env(env_overrides),
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH),
             "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH),

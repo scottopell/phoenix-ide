@@ -76,6 +76,28 @@ def make_manifest(root: Path, *, expected=None, previous=None):
 
 
 class ActivationTests(unittest.TestCase):
+    def test_missing_service_text_is_treated_as_unloaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            result = subprocess.CompletedProcess([], 0, "", "Could not find service")
+            launchctl = helper.Launchctl(manifest, run=mock.Mock(return_value=result))
+            self.assertEqual(("not_loaded", None), launchctl.inspect())
+
+    def test_bootout_timeout_marks_disruption_and_triggers_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = mock.Mock()
+            launchctl.disruption_started = False
+            def stop():
+                launchctl.disruption_started = True
+                raise helper.ActivationError("teardown timeout")
+            launchctl.stop.side_effect = stop
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "restore") as restore:
+                state = helper.activate(manifest)
+            self.assertEqual("activation_failed_rolled_back", state)
+            restore.assert_called_once_with(manifest, launchctl)
+
     def setUp(self):
         FakeLaunchctl.events = []
         FakeLaunchctl.fail_start = False
@@ -196,6 +218,9 @@ class ActivationTests(unittest.TestCase):
                  mock.patch.object(helper, "request_helper_bootout") as bootout:
                 self.assertEqual(1, helper.main())
             bootout.assert_called_once_with(manifest.uid, manifest.helper_label)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("rejected_concurrent", status["state"])
+            self.assertFalse(Path(manifest.active_path).exists())
 
 
 
@@ -271,6 +296,40 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual("first", self.dev._deploy_claim_owner())
             with self.assertRaisesRegex(SystemExit, "first"):
                 self.dev._claim_launchd_deploy("second")
+
+    def test_release_rejects_dirty_embedded_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123-dirty"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, "abc123" + "0" * 34 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "dirty git identity"):
+                self.dev._prepare_release_candidate("latest", staging)
+
+    def test_candidate_health_url_uses_candidate_tls_and_port(self):
+        env = {"PHOENIX_TLS": "auto", "PHOENIX_PORT": "9443"}
+        self.assertEqual("https://localhost:9443/version", self.dev._prod_local_health_url(env))
+
+    def test_stopped_install_identity_falls_back_to_binary_probe(self):
+        with mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.0.0", "git_sha": "oldsha"}) as probe:
+            identity = self.dev._current_prod_identity({}) or self.dev._binary_identity(Path("installed"))
+        self.assertEqual({"version": "1.0.0", "git_sha": "oldsha"}, identity)
+        probe.assert_called_once_with(Path("installed"))
+
+    def test_local_source_commit_stays_full_for_deployed_sha_comparison(self):
+        full_sha = "abc123" + "0" * 34
+        embedded = "abc123"
+        self.assertTrue(full_sha.startswith(embedded.removesuffix("-dirty")))
+        self.assertNotEqual(full_sha, embedded)
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

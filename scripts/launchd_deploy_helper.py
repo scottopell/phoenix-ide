@@ -167,10 +167,12 @@ class Launchctl:
         self.run = run
         self.domain = f"gui/{manifest.uid}"
         self.target = f"{self.domain}/{manifest.label}"
+        self.disruption_started = False
 
     def inspect(self) -> tuple[str, Optional[int]]:
         result = self.run(["launchctl", "print", self.target], capture_output=True, text=True)
-        if result.returncode != 0:
+        output = result.stdout + "\n" + result.stderr
+        if result.returncode != 0 or "Could not find service" in output:
             return "not_loaded", None
         state = "unknown"
         pid = None
@@ -201,6 +203,7 @@ class Launchctl:
         result = self.run(["launchctl", "bootout", self.domain, self.manifest.target_plist], capture_output=True, text=True)
         if result.returncode != 0:
             raise ActivationError(f"launchctl bootout failed with exit {result.returncode}")
+        self.disruption_started = True
         self.wait(lambda state, pid: state == "not_loaded" and pid is None, time.monotonic() + self.manifest.transition_timeout_secs, "teardown")
         return old_pid
 
@@ -314,6 +317,7 @@ def activate(manifest: Manifest) -> str:
             return "committed"
         except Exception as activation_exc:
             failure = str(activation_exc)
+            disrupted = disrupted or launchctl.disruption_started
             if not disrupted:
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
@@ -344,6 +348,9 @@ def main() -> int:
         print(state, flush=True)
         return 0 if state == "committed" else 1
     except ConcurrentDeploy as exc:
+        if manifest is not None:
+            write_status(manifest, "rejected_concurrent", failure=str(exc))
+            release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
