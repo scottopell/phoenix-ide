@@ -87,6 +87,7 @@ export interface ConversationTextFragmentDisplay {
 export interface SearchResultRevealTarget {
   kind: 'tool-result-search';
   key: string;
+  toolUseId: string;
   path?: string;
   lineNumber?: number;
 }
@@ -185,6 +186,7 @@ export interface PatchOutputProjection {
 export interface KeywordSearchRevealTarget {
   kind: 'tool-result-keyword-search';
   key: string;
+  toolUseId: string;
 }
 
 export interface ConversationTextFragmentRevealTarget {
@@ -1032,6 +1034,7 @@ export function buildSearchOutputProjection(
   const revealBase = {
     kind: 'tool-result-search' as const,
     key: searchToolResultKey(options.toolUseId ?? ''),
+    toolUseId: options.toolUseId ?? '',
   };
   const trimmed = text.trim();
   if (trimmed === 'No matches found.') {
@@ -1140,6 +1143,7 @@ export function buildKeywordSearchOutputProjection(
   const revealTarget = {
     kind: 'tool-result-keyword-search' as const,
     key: keywordSearchToolResultKey(options.toolUseId ?? ''),
+    toolUseId: options.toolUseId ?? '',
   };
   if (
     trimmed === '' ||
@@ -1251,7 +1255,16 @@ function agentTurnSources(
       const detailsVisible = densityToolDetailsVisible(block.name, density);
       if (detailsVisible) out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
       const toolResult = toolResultsByUseId.get(block.id ?? '');
+      if (!toolResult) return;
       const resultText = toolResultText(toolResult);
+      const resultContent = toolResult.content as ToolResultContent | undefined;
+      const isError = resultContent?.is_error === true || typeof resultContent?.error === 'string';
+      if (isError) {
+        for (const fragment of buildTerminalToolResultProjection('opaque', resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+        return;
+      }
       const subAgentFragments = buildSubAgentCardFragments(toolResult?.display_data, block.id ?? '');
       if (subAgentFragments.length > 0) {
         for (const fragment of subAgentFragments) {

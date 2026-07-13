@@ -1245,12 +1245,14 @@ function MessageListImpl({
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (
                 activeFindRevealTarget?.kind === 'agent-text'
-                || activeFindRevealTarget?.kind === 'tool-result-search'
-                || activeFindRevealTarget?.kind === 'tool-result-keyword-search'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'
                 || activeFindRevealTarget?.kind === 'tool-result-patch'
                 || activeFindRevealTarget?.kind === 'tool-result-terminal'
                 || activeFindRevealTarget?.kind === 'subagent-card'
+                || (activeFindRevealTarget && 'key' in activeFindRevealTarget && (
+                  activeFindRevealTarget.kind === 'tool-result-search'
+                  || activeFindRevealTarget.kind === 'tool-result-keyword-search'
+                ))
               )
               ? activeFindHighlight
               : null

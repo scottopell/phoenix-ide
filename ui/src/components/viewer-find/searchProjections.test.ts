@@ -442,6 +442,47 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('does not synthesize result fragments before a tool result exists', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'pending-tool',
+      isFirstInTurn: true,
+      agent: agentMsg('pending-tool', [
+        { type: 'tool_use', id: 'pending-read', name: 'read_file', display: 'read pending', input: { path: 'pending.ts' } },
+      ]),
+      toolResultsByUseId: new Map(),
+    }];
+
+    expect(buildConversationSearchProjection(units, 'pending.ts', { density: 'compact' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'No matches found.', { density: 'compact' }).matches).toHaveLength(0);
+  });
+
+  it('keeps failed read_file output as an opaque error fragment', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'failed-read',
+      isFirstInTurn: true,
+      agent: agentMsg('failed-read', [
+        { type: 'tool_use', id: 'failed-read-tool', name: 'read_file', display: 'read missing', input: { path: 'missing.ts' } },
+      ]),
+      toolResultsByUseId: new Map([[
+        'failed-read-tool',
+        toolMsg('failed-result', 'failed-read-tool', { error: 'permission denied', is_error: true }),
+      ]]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'permission denied', { density: 'compact' });
+    expect(projection.matches).toHaveLength(1);
+    const source = projection.sources.find((candidate) => candidate.id === projection.matches[0]?.target.sourceId);
+    expect(source?.fragmentId).toBe('terminal-result:opaque');
+    expect(source?.revealTarget).toMatchObject({
+      kind: 'tool-result-terminal',
+      toolUseId: 'failed-read-tool',
+      family: 'opaque',
+    });
+    expect(projection.sources.some((candidate) => candidate.fragmentId === 'read-file-path')).toBe(false);
+  });
+
   it('includes expanded system prompt text in transcript projection', () => {
     const projection = buildConversationSearchProjection([], 'alpha directive', {
       systemPrompt: 'alpha directive\nsecondary line',
