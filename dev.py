@@ -7287,6 +7287,17 @@ def _helper_plist(label: str, helper: Path, manifest: Path, log_path: Path) -> b
     }, fmt=plistlib.FMT_XML)
 
 
+def _report_launchd_handoff(transaction_id: str, identity: dict[str, str]) -> None:
+    try:
+        print("\n✓ Activation handed to an independent launchd helper")
+        print(f"  Transaction: {transaction_id}")
+        print(f"  Candidate: {identity['version']} ({identity['git_sha']})")
+        print("  The Phoenix connection may close while the service is replaced.")
+        print("  After reconnecting, run: ./dev.py prod status")
+    except BrokenPipeError:
+        pass
+
+
 def launchd_prod_deploy(release: str | None = None):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
@@ -7434,11 +7445,6 @@ def launchd_prod_deploy(release: str | None = None):
         )
         if result.returncode != 0:
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
-        print("\n✓ Activation handed to an independent launchd helper")
-        print(f"  Transaction: {transaction_id}")
-        print(f"  Candidate: {identity['version']} ({identity['git_sha']})")
-        print("  The Phoenix connection may close while the service is replaced.")
-        print("  After reconnecting, run: ./dev.py prod status")
     except BaseException as exc:
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
@@ -7453,6 +7459,7 @@ def launchd_prod_deploy(release: str | None = None):
         })
         _release_launchd_deploy_claim(transaction_id)
         raise
+    _report_launchd_handoff(transaction_id, identity)
 
 
 

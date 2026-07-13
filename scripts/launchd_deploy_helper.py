@@ -248,18 +248,27 @@ def wait_for_identity(manifest: Manifest, expected: Identity) -> None:
 
 
 def restore(manifest: Manifest, launchctl: Launchctl) -> None:
-    rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
-    rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
     try:
         launchctl.stop()
     except ActivationError:
         pass
+    if manifest.previous is None:
+        if manifest.rollback_binary is not None or manifest.rollback_plist is not None:
+            raise ActivationError("first-install rollback inputs are inconsistent")
+        Path(manifest.target_binary).unlink(missing_ok=True)
+        Path(manifest.target_plist).unlink(missing_ok=True)
+        fsync_dir(Path(manifest.target_binary).parent)
+        fsync_dir(Path(manifest.target_plist).parent)
+        state, pid = launchctl.inspect()
+        if state != "not_loaded" or pid is not None:
+            raise ActivationError("failed first-install candidate remains loaded")
+        return
+    rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+    rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
     atomic_install(rollback_binary, Path(manifest.target_binary), 0o755)
     atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
     old_pid = launchctl.inspect()[1]
     launchctl.start(old_pid)
-    if manifest.previous is None:
-        raise ActivationError("rollback identity is unavailable")
     wait_for_identity(manifest, manifest.previous)
 
 

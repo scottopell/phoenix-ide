@@ -122,6 +122,25 @@ class ActivationTests(unittest.TestCase):
             self.assertTrue(any(call.args[0] == Path(manifest.target_binary).parent for call in fsync_dir.call_args_list))
             self.assertEqual(b"new binary", Path(manifest.target_binary).read_bytes())
 
+    def test_failed_first_install_stops_candidate_and_removes_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root, previous=None)
+            manifest = helper.dataclasses.replace(
+                manifest, previous=None, rollback_binary=None, rollback_binary_sha256=None,
+                rollback_plist=None, rollback_plist_sha256=None,
+            )
+            launchctl = FakeLaunchctl(manifest)
+            launchctl.inspect = lambda: ("not_loaded", None) if FakeLaunchctl.events.count("stop") >= 2 else ("running", 100)
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("bad health")):
+                state = helper.activate(manifest)
+            self.assertEqual("activation_failed_rolled_back", state)
+            self.assertEqual(["stop", "start", "stop"], FakeLaunchctl.events)
+            self.assertFalse(Path(manifest.target_binary).exists())
+            self.assertFalse(Path(manifest.target_plist).exists())
+            self.assertFalse(Path(manifest.deployed_sha_path).exists())
+
     def test_wrong_version_rolls_back_and_has_distinct_status(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -228,6 +247,12 @@ class PreparationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dev = load(ROOT / "dev.py", "devpy_launchd_deploy_test")
+
+    def test_broken_pipe_after_handoff_does_not_release_claim(self):
+        with mock.patch("builtins.print", side_effect=BrokenPipeError), \
+             mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
+            self.dev._report_launchd_handoff("tx", {"version": "1.0.0", "git_sha": "abc123"})
+        release.assert_not_called()
 
     def test_positional_version_is_rejected_with_release_guidance(self):
         result = subprocess.run(
