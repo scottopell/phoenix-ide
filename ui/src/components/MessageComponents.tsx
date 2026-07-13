@@ -2437,7 +2437,18 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'keyword_search' && !isError ? (
             <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : name === 'read_file' && !isError ? (
-            <ReadFileResultView rawText={resultText} input={input as Record<string, unknown>} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
+            <>
+              <ReadFileResultView
+                rawText={toolActiveHighlight ? resultText : displayResult}
+                input={input as Record<string, unknown>}
+                onOpenFile={onOpenFile}
+                toolUseId={toolId}
+                activeHighlight={toolActiveHighlight}
+              />
+              {!toolActiveHighlight && resultText.length > 5000 && (
+                <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>
+              )}
+            </>
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
