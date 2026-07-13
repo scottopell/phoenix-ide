@@ -441,7 +441,7 @@ mod tests {
                     registered_at: Timestamp(1_000),
                     expires_at: Timestamp(1_100),
                 },
-                fence_version: 1,
+                fence_version: u64::try_from(index + 1).expect("test fence fits u64"),
                 accepted_at: at(1_000),
             };
             assert!(matches!(

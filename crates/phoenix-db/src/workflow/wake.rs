@@ -276,6 +276,10 @@ impl<'a> WakeWorkflowAdapter<'a> {
             return Ok(WakeRegistrationResult::NotAccepting);
         }
 
+        if !advance_registration_fence(&mut tx, request).await? {
+            tx.rollback().await?;
+            return Ok(WakeRegistrationResult::Retryable);
+        }
         insert_registration_core(&mut tx, request, &receipt, &snapshot, &commit).await?;
         fail_registration(
             &mut tx,
@@ -602,7 +606,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
             tx.rollback().await?;
             return Ok(false);
         }
-        sqlx::query(
+        let invalidated = sqlx::query(
             "UPDATE workflow_effects SET status = 'invalidated' WHERE id = ?1 AND workflow_id = ?2 \
              AND generation = ?3 AND status NOT IN ('receipted', 'invalidated')",
         )
@@ -611,6 +615,22 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(i64::try_from(request.expected_generation).map_err(|_| WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation))?)
         .execute(&mut *tx)
         .await?;
+        if invalidated.rows_affected() != 1 {
+            let already_terminal: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM workflow_effects \
+                 WHERE id = ?1 AND workflow_id = ?2 AND generation = ?3 \
+                   AND status IN ('receipted', 'invalidated'))",
+            )
+            .bind(&request.observe_effect_id)
+            .bind(&request.workflow_id)
+            .bind(i64::try_from(request.expected_generation).map_err(|_| {
+                WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation)
+            })?)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.rollback().await?;
+            return Ok(!already_terminal);
+        }
         sqlx::query(
             "INSERT INTO workflow_transitions \
              (id, workflow_id, from_version, to_version, generation, event_codec_family, \
@@ -843,20 +863,42 @@ async fn insert_registration_transition(
     Ok(())
 }
 
+async fn advance_registration_fence(
+    tx: &mut Transaction<'_, Sqlite>,
+    request: &WakeRegistrationRequest,
+) -> WorkflowRepositoryResult<bool> {
+    let expected = i64::try_from(request.fence_version)
+        .map_err(|_| WorkflowRepositoryError::VersionOutOfRange(request.fence_version))?;
+    let next =
+        request
+            .fence_version
+            .checked_add(1)
+            .ok_or(WorkflowRepositoryError::VersionOutOfRange(
+                request.fence_version,
+            ))?;
+    let next = i64::try_from(next)
+        .map_err(|_| WorkflowRepositoryError::VersionOutOfRange(request.fence_version))?;
+    let advanced = sqlx::query(
+        "INSERT INTO wake_registration_fences (conversation_id, version, status) \
+         VALUES (?1, ?2, 'open') \
+         ON CONFLICT(conversation_id) DO UPDATE SET version = excluded.version \
+         WHERE wake_registration_fences.version = ?3 \
+           AND wake_registration_fences.status = 'open'",
+    )
+    .bind(&request.intent.conversation_id)
+    .bind(next)
+    .bind(expected)
+    .execute(&mut **tx)
+    .await?;
+    Ok(advanced.rows_affected() == 1)
+}
+
 async fn insert_wake_binding(
     tx: &mut Transaction<'_, Sqlite>,
     request: &WakeRegistrationRequest,
 ) -> WorkflowRepositoryResult<()> {
     let fence_version = i64::try_from(request.fence_version)
         .map_err(|_| WorkflowRepositoryError::VersionOutOfRange(request.fence_version))?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO wake_registration_fences (conversation_id, version, status) \
-         VALUES (?1, ?2, 'open')",
-    )
-    .bind(&request.intent.conversation_id)
-    .bind(fence_version)
-    .execute(&mut **tx)
-    .await?;
     let (
         resource_kind,
         bash_scope_kind,
@@ -936,27 +978,27 @@ async fn validate_registration_invariant(
          JOIN workflow_barrier_members m ON m.barrier_id = b.id AND m.effect_id = e.id \
          JOIN wake_workflow_bindings wb ON wb.workflow_id = w.id AND wb.observe_effect_id = e.id \
          JOIN wake_registration_fences f ON f.conversation_id = wb.conversation_id \
-              AND f.version = wb.registration_fence_version \
          WHERE w.id = ?1 AND w.profile_id = ?2 AND w.protocol_version = ?3 \
            AND w.authority = 'engine_protocol' AND w.execution_mode = 'authoritative' \
-           AND w.protocol_selection_id = ?4 AND w.version = 1 AND w.generation = 0 AND w.status = 'active' \
-           AND w.snapshot_codec_family = ?5 AND w.snapshot_codec_version = ?6 AND w.snapshot_payload = ?7 \
+           AND w.protocol_selection_id = ?4 \
            AND t.id = ?8 AND t.from_version = 0 AND t.to_version = 1 AND t.generation = 0 \
            AND t.event_codec_family = ?9 AND t.event_codec_version = ?10 AND t.event_payload = ?11 \
            AND e.id = ?12 AND e.declared_workflow_version = 1 AND e.generation = 0 \
            AND e.family = ?13 AND e.kind = ?14 AND e.codec_family = ?15 AND e.codec_version = ?16 \
            AND e.role = 'required' AND e.ambiguity_policy = 'observable_reconciliation' \
-           AND e.intent_payload = ?17 AND e.status = 'eligible' AND e.next_eligible_at IS NULL \
-           AND b.id = ?18 AND b.declaring_workflow_version = 1 AND b.status = 'waiting' \
+           AND e.intent_payload = ?17 \
+           AND b.id = ?18 AND b.declaring_workflow_version = 1 \
            AND b.event_codec_family = ?19 AND b.event_codec_version = ?20 AND b.event_payload = ?21 \
            AND m.receipt_family = 'current_generation_effect' AND wb.contract_id = ?22 \
            AND wb.conversation_id = ?23 AND wb.registration_scope_kind = ?24 \
            AND wb.registration_scope_stable_key = ?25 AND wb.registering_tool_use_id = ?26 \
            AND wb.registered_at = ?27 AND wb.expires_at = ?28 AND wb.registration_fence_version = ?29 \
-           AND wb.lifecycle_fence_status = 'open' AND f.status = 'open')",
+           AND f.version >= wb.registration_fence_version + 1)",
     )
     .bind(&request.workflow_id).bind(wake_profile::PROFILE_ID)
     .bind(i64::from(wake_profile::PROTOCOL_VERSION)).bind(SELECTION_ID)
+    // Keep the original parameter numbering stable while mutable workflow snapshot fields
+    // are deliberately excluded from replay validation.
     .bind(&snapshot.codec.family).bind(i64::from(snapshot.codec.version)).bind(&snapshot.payload)
     .bind(&commit.transition_id).bind(&commit.event.codec.family).bind(i64::from(commit.event.codec.version)).bind(&commit.event.payload)
     .bind(&effect.effect_id).bind(&effect.family).bind(&effect.kind).bind(&effect.codec.family)

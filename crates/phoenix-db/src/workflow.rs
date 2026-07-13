@@ -1183,6 +1183,7 @@ impl WorkflowRepository {
             return Ok(RenewClaimResult::StaleAuthority);
         }
 
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflow_claims \
              SET lease_until = ?1 \
@@ -1206,13 +1207,44 @@ impl WorkflowRepository {
         .bind(renewal.authority.lease_until.to_rfc3339())
         .bind(renewal.authority.issued_at.to_rfc3339())
         .bind(renewal.now.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if updated.rows_affected() != 1 {
+            tx.rollback().await?;
             return Ok(RenewClaimResult::StaleAuthority);
         }
 
+        let attempt_updated = sqlx::query(
+            "UPDATE workflow_attempts SET claim_lease_until = ?1 \
+             WHERE effect_id = ?2 AND workflow_id = ?3 AND declared_workflow_version = ?4 \
+               AND generation = ?5 AND claim_token = ?6 AND claim_worker_id = ?7 \
+               AND claim_lease_until = ?8 AND claim_issued_at = ?9 \
+               AND status IN ('begun', 'observation_recorded')",
+        )
+        .bind(renewal.lease_until.to_rfc3339())
+        .bind(&renewal.authority.effect_id)
+        .bind(&renewal.authority.workflow_id)
+        .bind(to_i64(
+            renewal.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            renewal.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&renewal.authority.claim_token)
+        .bind(&renewal.authority.worker_id)
+        .bind(renewal.authority.lease_until.to_rfc3339())
+        .bind(renewal.authority.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        if attempt_updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(RenewClaimResult::StaleAuthority);
+        }
+
+        tx.commit().await?;
         let mut authority = renewal.authority.clone();
         authority.lease_until = renewal.lease_until;
         Ok(RenewClaimResult::Renewed { authority })
@@ -2400,6 +2432,41 @@ async fn accept_new_receipt_in_transaction(
     .execute(&mut *tx)
     .await?;
 
+    if let Some(projection) = &request.wake_terminal_projection {
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO wake_inbox_sequences (conversation_id, last_sequence) \
+             SELECT conversation_id, 1 FROM wake_workflow_bindings WHERE workflow_id = ?1 \
+             ON CONFLICT(conversation_id) DO UPDATE SET last_sequence = last_sequence + 1 \
+             RETURNING last_sequence",
+        )
+        .bind(&request.authority.workflow_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO wake_observation_inbox \
+             (id, workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, committed_at, consumed_at) \
+             SELECT ?1, b.workflow_id, b.contract_id, ?2, b.conversation_id, ?3, ?4, NULL \
+             FROM wake_workflow_bindings b WHERE b.workflow_id = ?5",
+        )
+        .bind(&request.reducer_inbox_id)
+        .bind(&request.receipt_id)
+        .bind(sequence)
+        .bind(request.now.to_rfc3339())
+        .bind(&request.authority.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        let stored_contract: String =
+            sqlx::query_scalar("SELECT contract_id FROM wake_observation_inbox WHERE id = ?1")
+                .bind(&request.reducer_inbox_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if stored_contract != projection.contract_id {
+            return Err(WorkflowRepositoryError::CorruptState(
+                "wake observation inbox contract projection mismatch".to_owned(),
+            ));
+        }
+    }
+
     Ok(AcceptReceiptResult::Accepted {
         receipt: DurableReceiptAcceptance {
             receipt_id: request.receipt_id.clone(),
@@ -2687,7 +2754,7 @@ async fn codec_supported_by_workflow(
     let exists: Option<i64> = sqlx::query_scalar(
         "SELECT 1 \
          FROM workflows w \
-         JOIN workflow_supported_codecs c ON c.selection_id = w.protocol_selection_id \
+         JOIN workflow_profile_codecs c ON c.selection_id = w.protocol_selection_id \
          WHERE w.id = ?1 AND c.codec_family = ?2 AND c.codec_version = ?3",
     )
     .bind(workflow_id)
@@ -3865,9 +3932,36 @@ mod tests {
             .unwrap();
         assert_eq!(shortened, RenewClaimResult::StaleAuthority);
 
+        let renewed_until = now + chrono::Duration::seconds(60);
+        let renewed = repo
+            .renew_claim(&DurableClaimRenewal {
+                authority: authority.clone(),
+                now: now + chrono::Duration::seconds(5),
+                lease_until: renewed_until,
+            })
+            .await
+            .unwrap();
+        let RenewClaimResult::Renewed {
+            authority: renewed_authority,
+        } = renewed
+        else {
+            panic!("expected renewed authority");
+        };
+        assert_eq!(renewed_authority.lease_until, renewed_until);
+        let leases: (String, String) = sqlx::query_as(
+            "SELECT c.lease_until, a.claim_lease_until FROM workflow_claims c \
+             JOIN workflow_attempts a ON a.effect_id = c.effect_id \
+             WHERE c.effect_id = 'eff-1' AND a.status = 'begun'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leases.0, renewed_until.to_rfc3339());
+        assert_eq!(leases.1, renewed_until.to_rfc3339());
+
         let pre_expiry = repo
             .take_over_expired_claim(&DurableClaimTakeover {
-                authority: authority.clone(),
+                authority: renewed_authority,
                 replacement_claim_token: "claim-2".to_owned(),
                 replacement_worker_id: "worker-2".to_owned(),
                 now: now + chrono::Duration::seconds(29),
@@ -4649,16 +4743,15 @@ mod tests {
 
         let now = authority.issued_at + chrono::Duration::seconds(3);
         let request = manual_resolution_request(&authority, now);
-        let result = match repo.require_manual_resolution(&request).await {
-            Ok(result) => result,
-            Err(WorkflowRepositoryError::Sqlx(err)) => {
-                let message = format!("{err}");
-                assert!(message.contains("workflow_supported_codecs"));
-                return;
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
-        };
+        let result = repo.require_manual_resolution(&request).await.unwrap();
         assert_eq!(result, ReconcileEffectResult::ManualResolutionRequired);
+        let codec_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_profile_codecs WHERE selection_id = 'sel-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(codec_table_count > 0);
 
         let effect = sqlx::query(
             "SELECT status, next_eligible_at, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",

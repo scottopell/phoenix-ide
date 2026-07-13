@@ -271,6 +271,74 @@ async fn registration_selects_protocol_is_retryable_and_installs_exact_deadline_
 }
 
 #[tokio::test]
+async fn registration_fence_is_a_shared_compare_and_increment_gate() {
+    let (pool, repo) = registered(bash()).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM wake_registration_fences WHERE conversation_id = 'conv-wake'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2
+    );
+
+    let mut stale = registration(tmux());
+    stale.idempotency_key = "stale-key".to_owned();
+    stale.intent_fingerprint = "stale-fingerprint".to_owned();
+    stale.workflow_id = "stale-workflow".to_owned();
+    stale.transition_id = "stale-transition".to_owned();
+    stale.binding_id = "stale-binding".to_owned();
+    stale.intent.contract_id = "stale-contract".to_owned();
+    assert_eq!(
+        adapter.register(&stale).await.unwrap(),
+        WakeRegistrationResult::Retryable
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflows")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    stale.fence_version = 2;
+    assert!(matches!(
+        adapter.register(&stale).await.unwrap(),
+        WakeRegistrationResult::New { .. }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM wake_registration_fences WHERE conversation_id = 'conv-wake'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn registration_replay_accepts_progressed_effect_state() {
+    let (pool, repo) = registered(bash()).await;
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'retry_wait', next_eligible_at = '1970-01-01T00:18:00+00:00' \
+         WHERE id = 'wake-observe:wake-workflow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        WakeWorkflowAdapter::new(&repo)
+            .register(&registration(bash()))
+            .await
+            .unwrap(),
+        WakeRegistrationResult::Replay { .. }
+    ));
+}
+
+#[tokio::test]
 async fn registration_replay_rejects_an_incomplete_invariant_without_repair() {
     let (pool, repo) = registered(bash()).await;
     sqlx::query("DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'")
@@ -322,6 +390,7 @@ async fn registration_failpoints_roll_back_every_registration_row() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
     let (pool, repo) = registered(bash()).await;
     let claim = claimed(&repo).await;
@@ -419,6 +488,22 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
     .await
     .unwrap();
     assert_eq!(tail, "done");
+    let wake_inbox = sqlx::query(
+        "SELECT workflow_id, contract_id, terminal_receipt_id, conversation_id, sequence, consumed_at \
+         FROM wake_observation_inbox WHERE id = 'wake-inbox'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(wake_inbox.get::<String, _>("workflow_id"), "wake-workflow");
+    assert_eq!(wake_inbox.get::<String, _>("contract_id"), "wake-contract");
+    assert_eq!(
+        wake_inbox.get::<String, _>("terminal_receipt_id"),
+        "wake-receipt"
+    );
+    assert_eq!(wake_inbox.get::<String, _>("conversation_id"), "conv-wake");
+    assert_eq!(wake_inbox.get::<i64, _>("sequence"), 1);
+    assert_eq!(wake_inbox.get::<Option<String>, _>("consumed_at"), None);
 }
 
 #[tokio::test]
@@ -598,4 +683,46 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
         .await
         .unwrap();
     assert_eq!(owed, 0);
+}
+
+#[tokio::test]
+async fn cancellation_losing_to_terminal_receipt_rolls_back_without_cancel_event() {
+    let (pool, repo) = registered(bash()).await;
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'receipted' WHERE id = 'wake-observe:wake-workflow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cancelled = WakeWorkflowAdapter::new(&repo)
+        .cancel(&WakeCancellationRequest {
+            workflow_id: "wake-workflow".to_owned(),
+            observe_effect_id: "wake-observe:wake-workflow".to_owned(),
+            reducer_inbox_id: "cancel-inbox".to_owned(),
+            transition_id: "cancel-transition".to_owned(),
+            expected_version: 1,
+            expected_generation: 0,
+            contract_id: "wake-contract",
+            resource: bash(),
+            resolved_at: Timestamp(1_015),
+            committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(!cancelled);
+    let state: (String, i64) =
+        sqlx::query_as("SELECT status, generation FROM workflows WHERE id = 'wake-workflow'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("active".to_owned(), 0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workflow_reducer_inbox WHERE id = 'cancel-inbox'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
 }

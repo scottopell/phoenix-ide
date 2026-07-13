@@ -493,15 +493,15 @@ fn derived_window_name(cmd: &str) -> String {
 }
 
 fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
-    let after_exit = if keep_open_on_exit {
-        "exec ${SHELL:-/bin/bash} -i"
+    let retain_dead_pane = if keep_open_on_exit {
+        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on >/dev/null 2>&1 || exit 125;"
     } else {
-        "exit $code"
+        ""
     };
     let timestamp =
         r#"if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "$EPOCHREALTIME"; else date +%s; fi"#;
     format!(
-        "echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}"
+        "{retain_dead_pane} echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; exit $code"
     )
 }
 

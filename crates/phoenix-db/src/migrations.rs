@@ -1749,10 +1749,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_shadow_divergence_one_active
 
 const MIGRATION_046: &str = r"
 CREATE TABLE IF NOT EXISTS wake_registration_fences (
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
     status TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, version),
+    UNIQUE (conversation_id, version),
     CHECK (status IN ('open', 'closed')),
     CHECK (version >= 0)
 );
@@ -1779,8 +1779,8 @@ CREATE TABLE IF NOT EXISTS wake_workflow_bindings (
     lifecycle_fence_status TEXT NOT NULL,
     UNIQUE (contract_id, workflow_id),
     UNIQUE (contract_id, workflow_id, observe_effect_id),
-    FOREIGN KEY (conversation_id, registration_fence_version)
-        REFERENCES wake_registration_fences(conversation_id, version)
+    FOREIGN KEY (conversation_id)
+        REFERENCES wake_registration_fences(conversation_id)
         ON DELETE RESTRICT,
     FOREIGN KEY (observe_effect_id, workflow_id)
         REFERENCES workflow_effects(id, workflow_id)
@@ -1808,6 +1808,19 @@ CREATE TABLE IF NOT EXISTS wake_workflow_bindings (
         AND tmux_window_id IS NOT NULL)
     )
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_wake_binding_registration_fence_insert
+BEFORE INSERT ON wake_workflow_bindings
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM wake_registration_fences f
+    WHERE f.conversation_id = NEW.conversation_id
+      AND f.version IN (NEW.registration_fence_version, NEW.registration_fence_version + 1)
+      AND f.status = 'open'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'registration_fence_version must name the immediately consumed open fence');
+END;
 
 CREATE TRIGGER IF NOT EXISTS trg_wake_binding_observe_effect_insert
 BEFORE INSERT ON wake_workflow_bindings
@@ -1979,6 +1992,11 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipt_tmux_tail (
     PRIMARY KEY (receipt_id, ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS wake_inbox_sequences (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS wake_observation_inbox (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
@@ -1988,6 +2006,7 @@ CREATE TABLE IF NOT EXISTS wake_observation_inbox (
     sequence INTEGER NOT NULL,
     committed_at TEXT NOT NULL,
     consumed_at TEXT,
+    UNIQUE (conversation_id, sequence),
     UNIQUE (id, contract_id, terminal_receipt_id, conversation_id),
     FOREIGN KEY (contract_id, workflow_id)
         REFERENCES wake_workflow_bindings(contract_id, workflow_id)
