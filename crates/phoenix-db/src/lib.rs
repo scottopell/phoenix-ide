@@ -6601,33 +6601,35 @@ impl Database {
         &self,
         message_id: &str,
         display_data: &serde_json::Value,
-    ) -> DbResult<()> {
+    ) -> DbResult<i64> {
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
+        let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
              SET display_data = ?1
-             WHERE message_id = ?2",
+             WHERE message_id = ?2
+             RETURNING conversation_id",
         )
         .bind(&display_str)
         .bind(message_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
+        let Some(conversation_id) = conversation_id else {
             tx.rollback().await?;
             return Err(DbError::MessageNotFound(message_id.to_string()));
-        }
-        sqlx::query(
+        };
+        let transcript_generation: i64 = sqlx::query_scalar(
             "UPDATE conversations
              SET transcript_generation = transcript_generation + 1
-             WHERE id = (SELECT conversation_id FROM messages WHERE message_id = ?1)",
+             WHERE id = ?1
+             RETURNING transcript_generation",
         )
-        .bind(message_id)
-        .execute(&mut *tx)
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(transcript_generation)
     }
 
     /// Update the `content` text field inside a tool result message's JSON.
@@ -6641,28 +6643,30 @@ impl Database {
         &self,
         message_id: &str,
         new_content: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<i64> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
+        let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
              SET content = json_set(content, '$.content', ?1)
-             WHERE message_id = ?2",
+             WHERE message_id = ?2
+             RETURNING conversation_id",
         )
         .bind(new_content)
         .bind(message_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
+        let Some(conversation_id) = conversation_id else {
             tx.rollback().await?;
             return Err(DbError::MessageNotFound(message_id.to_string()));
-        }
-        sqlx::query(
+        };
+        let transcript_generation: i64 = sqlx::query_scalar(
             "UPDATE conversations
              SET transcript_generation = transcript_generation + 1
-             WHERE id = (SELECT conversation_id FROM messages WHERE message_id = ?1)",
+             WHERE id = ?1
+             RETURNING transcript_generation",
         )
-        .bind(message_id)
-        .execute(&mut *tx)
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
         // Re-index the mutated message so the retrieval index reflects the new
@@ -6685,7 +6689,7 @@ impl Database {
                 );
             }
         }
-        Ok(())
+        Ok(transcript_generation)
     }
 
     /// Insert one row into `turn_usage` for token accounting.
@@ -11141,11 +11145,13 @@ mod tests {
         .unwrap();
 
         let before = db.get_conversation("conv-display").await.unwrap();
-        db.update_message_display_data("display-1", &serde_json::json!({ "hidden": true }))
+        let generation = db
+            .update_message_display_data("display-1", &serde_json::json!({ "hidden": true }))
             .await
             .unwrap();
         let after = db.get_conversation("conv-display").await.unwrap();
 
+        assert_eq!(generation, before.transcript_generation + 1);
         assert_eq!(
             after.transcript_generation,
             before.transcript_generation + 1
@@ -11169,11 +11175,13 @@ mod tests {
         .unwrap();
 
         let before = db.get_conversation("conv-tool").await.unwrap();
-        db.update_tool_message_content("tool-1", "omega")
+        let generation = db
+            .update_tool_message_content("tool-1", "omega")
             .await
             .unwrap();
         let after = db.get_conversation("conv-tool").await.unwrap();
 
+        assert_eq!(generation, before.transcript_generation + 1);
         assert_eq!(
             after.transcript_generation,
             before.transcript_generation + 1

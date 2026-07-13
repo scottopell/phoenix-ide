@@ -167,6 +167,7 @@ mod tests {
             SseEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 content,
                 duration_ms,
@@ -175,6 +176,7 @@ mod tests {
                     "type": "message_updated",
                     "sequence_id": sequence_id,
                     "message_id": message_id,
+                    "transcript_generation": transcript_generation,
                     "display_data": display_data,
                     "content": content,
                 });
@@ -598,6 +600,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 7,
             message_id: "msg-abc".to_string(),
+            transcript_generation: 3,
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,
@@ -611,6 +614,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 9,
             message_id: "msg-def".to_string(),
+            transcript_generation: 4,
             display_data: None,
             content: Some(MessageContent::Agent(vec![ContentBlock::Text {
                 text: "updated".to_string(),
@@ -625,6 +629,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 11,
             message_id: "msg-xyz".to_string(),
+            transcript_generation: 5,
             display_data: None,
             content: None,
             duration_ms: None,
@@ -638,6 +643,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 12,
             message_id: "msg-tool-result".to_string(),
+            transcript_generation: 6,
             display_data: None,
             content: None,
             duration_ms: Some(1234),
@@ -649,6 +655,11 @@ mod tests {
             typed.get("duration_ms"),
             Some(&json!(1234)),
             "duration_ms must be present on the wire"
+        );
+        assert_eq!(
+            typed.get("transcript_generation"),
+            Some(&json!(6)),
+            "transcript_generation must be present on the wire"
         );
     }
 
@@ -1038,6 +1049,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 42,
             message_id: "msg-abc".to_string(),
+            transcript_generation: 9,
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,

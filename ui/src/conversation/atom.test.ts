@@ -78,6 +78,7 @@ describe('conversationReducer', () => {
       expect(next.conversationId).toBe('conv-1');
       expect(next.messages).toHaveLength(2);
       expect(next.lastAppliedEventSeq).toBe(5);
+      expect(next.transcriptCoverage).toBe('complete');
       expect(next.streamingBuffer).toBeNull();
     });
 
@@ -140,6 +141,7 @@ describe('conversationReducer', () => {
 
       expect(next.messages.map((message) => message.sequence_id)).toEqual([51]);
       expect(next.transcriptGeneration).toBe(3);
+      expect(next.transcriptCoverage).toBe('tail');
     });
 
     it('replaces a suffix snapshot on reconnect when local transcript generation is unknown', () => {
@@ -159,6 +161,62 @@ describe('conversationReducer', () => {
 
       expect(next.messages.map((message) => message.sequence_id)).toEqual([51]);
       expect(next.transcriptGeneration).toBe(3);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('marks suffix init as tail after empty local state even when generation matches', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        transcriptGeneration: 3,
+        transcriptCoverage: 'complete',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('marks full init as complete', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40)],
+        transcriptGeneration: 3,
+        transcriptCoverage: 'tail',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(1), makeMessage(2)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.transcriptCoverage).toBe('complete');
+    });
+
+    it('preserves known complete coverage on reconnect suffix init', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        messages: [makeMessage(1), makeMessage(2)],
+        transcriptGeneration: 3,
+        transcriptCoverage: 'complete',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(3)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2, 3]);
+      expect(next.transcriptCoverage).toBe('complete');
     });
 
     it('replaces a REST tail when the SSE transcript generation changed', () => {
@@ -176,6 +234,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages.map((message) => message.sequence_id)).toEqual([1]);
+      expect(next.transcriptCoverage).toBe('complete');
     });
 
     it('clears streaming buffer on init', () => {
@@ -880,12 +939,14 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 43,
         messageId: original.message_id,
+        transcriptGeneration: 3,
         displayData: summaryDisplayData,
       });
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
       expect(next.lastAppliedEventSeq).toBe(43);
+      expect(next.transcriptGeneration).toBe(3);
     });
 
     it('stores a pending patch when message_id is unknown', () => {
@@ -899,6 +960,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: 'nonexistent-id',
+        transcriptGeneration: 7,
         displayData: { type: 'whatever' },
       });
 
@@ -910,6 +972,7 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 0,
         patches: [{ eventSeq: 11, displayData: { type: 'whatever' } }],
       });
+      expect(next.transcriptGeneration).toBe(7);
     });
 
     it('merges content and display_data independently', () => {
@@ -929,11 +992,13 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 8,
         displayData: { type: 'new_display' },
       });
 
       expect((next.messages[0]!.display_data as { type: string }).type).toBe('new_display');
       expect((next.messages[0]!.content as { text: string }).text).toBe('original content');
+      expect(next.transcriptGeneration).toBe(8);
     });
 
     // Task 02675 acceptance: duplicate message_updated events → state reflects
@@ -953,6 +1018,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
@@ -960,6 +1026,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
 
@@ -981,6 +1048,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
@@ -988,6 +1056,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
 
@@ -1014,6 +1083,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 25,
         messageId: 'late-msg',
+        transcriptGeneration: 11,
         displayData: { type: 'deferred' },
         durationMs: 321,
       });
@@ -1044,6 +1114,7 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 25,
         patches: [],
       });
+      expect(patched.transcriptGeneration).toBe(11);
     });
 
     it('stale pending/live patches are no-ops once a newer patch has already applied', () => {
@@ -1065,6 +1136,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 35,
         messageId: 'msg-stale',
+        transcriptGeneration: 12,
         displayData: { type: 'newer' },
       });
       const created = dispatch(withPending, {
@@ -1098,6 +1170,7 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 35,
         patches: [],
       });
+      expect(withPending.transcriptGeneration).toBe(12);
     });
 
     it('merges durationMs into display_data, preserving existing keys', () => {
@@ -1117,6 +1190,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 21,
         messageId: original.message_id,
+        transcriptGeneration: 13,
         durationMs: 4567,
       });
 
@@ -1126,6 +1200,7 @@ describe('conversationReducer', () => {
       // existing keys survive
       expect(dd['bash']).toEqual([{ tool_use_id: 'abc', display: 'ls' }]);
       expect(next.lastAppliedEventSeq).toBe(21);
+      expect(next.transcriptGeneration).toBe(13);
     });
 
     it('durationMs update is gated by sequenceId (replay guard)', () => {
@@ -1146,11 +1221,13 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 29,
         messageId: original.message_id,
+        transcriptGeneration: 14,
         durationMs: 9999,
       });
 
       expect(next).toBe(atom); // applyIfNewer returned unchanged
       expect(next.messages[0]!.display_data).toBeNull();
+      expect(next.transcriptGeneration).toBe(atom.transcriptGeneration);
     });
   });
 

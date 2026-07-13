@@ -729,13 +729,13 @@ impl MessageStore for InMemoryStorage {
         &self,
         message_id: &str,
         display_data: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         let mut messages = self.messages.lock().unwrap();
         for msgs in messages.values_mut() {
             for msg in msgs.iter_mut() {
                 if msg.message_id == message_id {
                     msg.display_data = Some(display_data.clone());
-                    return Ok(());
+                    return Ok(1);
                 }
             }
         }
@@ -746,14 +746,14 @@ impl MessageStore for InMemoryStorage {
         &self,
         message_id: &str,
         content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         let mut messages = self.messages.lock().unwrap();
         for msgs in messages.values_mut() {
             for msg in msgs.iter_mut() {
                 if msg.message_id == message_id {
                     if let crate::db::MessageContent::Tool(ref mut tool) = msg.content {
                         tool.content = content.to_string();
-                        return Ok(());
+                        return Ok(1);
                     }
                     return Err(format!("Message {message_id} is not a tool message"));
                 }

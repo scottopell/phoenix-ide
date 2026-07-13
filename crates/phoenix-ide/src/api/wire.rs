@@ -268,6 +268,8 @@ pub enum SseWireEvent {
     MessageUpdated {
         sequence_id: i64,
         message_id: String,
+        /// Conversation transcript generation after this mutation committed.
+        transcript_generation: i64,
         #[ts(type = "unknown | null")]
         display_data: Option<Value>,
         #[ts(type = "unknown | null")]
@@ -463,12 +465,14 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 content,
                 duration_ms,
             } => SseWireEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 // `content` is `Option<MessageContent>` at the runtime layer
                 // and serializes to the same JSON shape as a Message's

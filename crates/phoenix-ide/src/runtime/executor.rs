@@ -4671,6 +4671,7 @@ where
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
             sequence_id: seq,
             message_id: assistant_message_id.clone(),
+            transcript_generation: 0,
             display_data: Some(display_for_broadcast),
             content: None,
             duration_ms: None,
@@ -5043,36 +5044,44 @@ where
             // Both writes must succeed before broadcasting. Otherwise the client
             // would see state the DB can't corroborate on reconnect (full resync
             // from DB would revert the UI to stale values).
-            if let Err(e) = self
+            let transcript_generation_after_content = match self
                 .storage
                 .update_tool_message_content(&message_id, &llm_content)
                 .await
             {
-                tracing::warn!(
-                    error = %e,
-                    message_id = %message_id,
-                    "Failed to update spawn_agents message content with sub-agent results"
-                );
-                return Ok(None);
-            }
+                Ok(generation) => generation,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        message_id = %message_id,
+                        "Failed to update spawn_agents message content with sub-agent results"
+                    );
+                    return Ok(None);
+                }
+            };
 
-            if let Err(e) = self
+            let transcript_generation = match self
                 .storage
                 .update_message_display_data(&message_id, &display_data)
                 .await
             {
-                tracing::warn!(
-                    error = %e,
-                    message_id = %message_id,
-                    "Failed to update spawn_agents message display_data"
-                );
-                return Ok(None);
-            }
+                Ok(generation) => generation,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        message_id = %message_id,
+                        "Failed to update spawn_agents message display_data"
+                    );
+                    return Ok(None);
+                }
+            };
 
+            debug_assert!(transcript_generation >= transcript_generation_after_content);
             let updated_content = crate::db::MessageContent::tool(&tool_id, &llm_content, false);
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
                 sequence_id: seq,
                 message_id: message_id.clone(),
+                transcript_generation,
                 display_data: Some(display_data.clone()),
                 content: Some(updated_content),
                 duration_ms: None,

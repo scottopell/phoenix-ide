@@ -96,7 +96,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         message_id: &str,
         display_data: &Value,
-    ) -> Result<(), String>;
+    ) -> Result<i64, String>;
 
     /// Update the `content` text inside a tool result message's JSON.
     /// Used to write sub-agent outcomes into the `spawn_agents` tool result before
@@ -105,7 +105,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         message_id: &str,
         content: &str,
-    ) -> Result<(), String>;
+    ) -> Result<i64, String>;
 
     /// Atomically persist a fork proposal together with the originating turn's
     /// tool round (REQ-PROJ-033): the assistant message, each synthetic
@@ -375,7 +375,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         message_id: &str,
         display_data: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         (**self)
             .update_message_display_data(message_id, display_data)
             .await
@@ -385,7 +385,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         message_id: &str,
         content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         (**self)
             .update_tool_message_content(message_id, content)
             .await
@@ -677,7 +677,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         message_id: &str,
         display_data: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         self.db
             .update_message_display_data(message_id, display_data)
             .await
@@ -688,7 +688,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         message_id: &str,
         content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         self.db
             .update_tool_message_content(message_id, content)
             .await

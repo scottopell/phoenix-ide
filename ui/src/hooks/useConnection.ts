@@ -365,6 +365,7 @@ export function useConnection({
               type: 'sse_message_updated',
               sequenceId: data.sequence_id,
               messageId: data.message_id,
+              transcriptGeneration: data.transcript_generation,
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),
               ...(data.duration_ms != null && { durationMs: data.duration_ms }),
