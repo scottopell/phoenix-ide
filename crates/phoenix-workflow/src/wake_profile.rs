@@ -232,7 +232,7 @@ pub enum WakeRegistrationEvent {
     Registered,
     CancelRequested,
     Continued,
-    RuntimeAccepted,
+    RuntimeAccepted { terminal: Box<WakeTerminalPayload> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,11 +357,19 @@ impl WorkflowProfile for WakeProfile {
             ReducerInboxPayload::Receipt(_) => {
                 matches!(
                     decision_event,
-                    WakeRegistrationEvent::Registered | WakeRegistrationEvent::RuntimeAccepted
+                    WakeRegistrationEvent::Registered
+                        | WakeRegistrationEvent::RuntimeAccepted { .. }
                 )
             }
             ReducerInboxPayload::Barrier(_) => *decision_event == WakeRegistrationEvent::Registered,
         }
+    }
+
+    fn owed_acceptance_matches_inbox(
+        event: &Self::OwedAcceptanceEvent,
+        inbox_payload: &ReducerInboxPayload<Self>,
+    ) -> bool {
+        matches!(inbox_payload, ReducerInboxPayload::Receipt(payload) if payload == event)
     }
 
     fn decision_handles_owed_acceptance(
@@ -369,7 +377,10 @@ impl WorkflowProfile for WakeProfile {
         decision_event: &Self::Event,
     ) -> bool {
         !matches!(event, WakeTerminalPayload::Cancelled { .. })
-            && *decision_event == WakeRegistrationEvent::RuntimeAccepted
+            && matches!(
+                decision_event,
+                WakeRegistrationEvent::RuntimeAccepted { terminal } if terminal.as_ref() == event
+            )
     }
 }
 
@@ -797,22 +808,34 @@ pub fn acceptance_owed_decl(
 }
 
 #[must_use]
-pub fn manual_choices() -> Vec<ManualChoice<WakeProfile>> {
+pub fn manual_choices(terminal: &WakeTerminalPayload) -> Vec<ManualChoice<WakeProfile>> {
     vec![
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
             payload: WakeManualPayload::Accept,
+            receipt_codec: terminal_codec(),
+            receipt: terminal.clone(),
+            receipt_event_codec: terminal_codec(),
+            receipt_event: terminal.clone(),
         },
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
             payload: WakeManualPayload::Defer,
+            receipt_codec: terminal_codec(),
+            receipt: terminal.clone(),
+            receipt_event_codec: terminal_codec(),
+            receipt_event: terminal.clone(),
         },
         ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: manual_codec(),
             payload: WakeManualPayload::Suppress,
+            receipt_codec: terminal_codec(),
+            receipt: terminal.clone(),
+            receipt_event_codec: terminal_codec(),
+            receipt_event: terminal.clone(),
         },
     ]
 }

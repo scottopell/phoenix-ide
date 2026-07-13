@@ -630,8 +630,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
         if !self.effect_ready_for_manual_resolution(&existing)
             || commit.transition_codec.family.is_empty()
-            || commit.receipt_codec.family.is_empty()
-            || commit.receipt_event_codec.family.is_empty()
+            || choice.receipt_codec.family.is_empty()
+            || choice.receipt_event_codec.family.is_empty()
             || validate_status_transition(self.status, commit.next_status).is_err()
         {
             return invalid_manual_resolution(Some(existing));
@@ -1162,6 +1162,15 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return Err(EngineError::InvalidInbox);
         }
         for owed in owed_acceptances {
+            let inbox = self
+                .reducer_inbox
+                .get(&owed.reducer_inbox_id)
+                .ok_or(EngineError::InvalidInbox)?;
+            if owed.event_codec != inbox.event_codec
+                || !P::owed_acceptance_matches_inbox(&owed.event, &inbox.payload)
+            {
+                return Err(EngineError::InvalidInbox);
+            }
             let id = OwedAcceptanceId(self.next_owed_acceptance_id);
             self.next_owed_acceptance_id += 1;
             self.owed_acceptances.insert(
@@ -1200,10 +1209,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             transition_codec,
             transition_event,
             next_status,
-            receipt_codec,
-            receipt,
-            receipt_event_codec,
-            receipt_event,
         } = commit;
         let transition = WorkflowTransition {
             transition_id: TransitionId(self.next_transition_id),
@@ -1231,8 +1236,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             ),
             attempt_id: None,
             origin: ReceiptOrigin::Manual,
-            receipt_codec,
-            receipt,
+            receipt_codec: choice.receipt_codec.clone(),
+            receipt: choice.receipt.clone(),
             generation: self.generation,
         };
         self.next_receipt_id += 1;
@@ -1242,9 +1247,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             effect_id: Some(existing.effect_id),
             barrier_id: None,
             kind: ReducerInboxKind::ReceiptAccepted,
-            event_codec: receipt_event_codec,
-            requires_runtime_acceptance: P::receipt_requires_runtime_acceptance(&receipt_event),
-            payload: ReducerInboxPayload::Receipt(receipt_event),
+            event_codec: choice.receipt_event_codec.clone(),
+            requires_runtime_acceptance: P::receipt_requires_runtime_acceptance(
+                &choice.receipt_event,
+            ),
+            payload: ReducerInboxPayload::Receipt(choice.receipt_event.clone()),
             delivery_status: DeliveryStatus::Pending,
             consumed_by: None,
         };
@@ -1435,9 +1442,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 owed_acceptance: None,
             });
         };
-        if existing != binding.owed
-            || !P::decision_handles_owed_acceptance(&existing.event, &decision.plan.event)
-        {
+        if !same_owed_acceptance_source(&existing, &binding.owed) {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::InvalidPlan,
                 transition: None,
@@ -1447,6 +1452,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if existing.disposition != OwedAcceptanceDisposition::Owed {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::Committed,
+                transition: None,
+                owed_acceptance: Some(existing),
+            });
+        }
+        if !P::decision_handles_owed_acceptance(&existing.event, &decision.plan.event) {
+            return Ok(RuntimeAcceptanceResult {
+                outcome: CommitOutcome::InvalidPlan,
                 transition: None,
                 owed_acceptance: Some(existing),
             });
@@ -1748,6 +1760,17 @@ fn version_conflict_manual_resolution<P: WorkflowProfile>(
     }
 }
 
+fn same_owed_acceptance_source<E: Eq>(
+    existing: &OwedAcceptanceRecord<E>,
+    supplied: &OwedAcceptanceRecord<E>,
+) -> bool {
+    existing.id == supplied.id
+        && existing.reducer_inbox_id == supplied.reducer_inbox_id
+        && existing.source_kind == supplied.source_kind
+        && existing.event_codec == supplied.event_codec
+        && existing.event == supplied.event
+}
+
 fn manual_choice_permitted<P: WorkflowProfile>(
     resolution: &ManualResolutionRecord<P>,
     choice: &ManualChoice<P>,
@@ -1802,6 +1825,10 @@ fn clone_manual_choice<P: WorkflowProfile>(choice: &ManualChoice<P>) -> ManualCh
         kind: choice.kind,
         codec: choice.codec.clone(),
         payload: choice.payload.clone(),
+        receipt_codec: choice.receipt_codec.clone(),
+        receipt: choice.receipt.clone(),
+        receipt_event_codec: choice.receipt_event_codec.clone(),
+        receipt_event: choice.receipt_event.clone(),
     }
 }
 

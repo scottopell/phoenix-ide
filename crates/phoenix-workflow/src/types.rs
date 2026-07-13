@@ -415,6 +415,13 @@ pub trait WorkflowProfile {
     where
         Self: Sized;
 
+    fn owed_acceptance_matches_inbox(
+        event: &Self::OwedAcceptanceEvent,
+        inbox_payload: &ReducerInboxPayload<Self>,
+    ) -> bool
+    where
+        Self: Sized;
+
     fn decision_handles_owed_acceptance(
         event: &Self::OwedAcceptanceEvent,
         decision_event: &Self::Event,
@@ -661,6 +668,10 @@ where
     pub kind: ManualChoiceKind,
     pub codec: CodecRef,
     pub payload: P::ManualPayload,
+    pub receipt_codec: CodecRef,
+    pub receipt: P::Receipt,
+    pub receipt_event_codec: CodecRef,
+    pub receipt_event: P::ReceiptReducerEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,10 +695,6 @@ pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_codec: CodecRef,
     pub transition_event: P::Event,
     pub next_status: WorkflowStatus,
-    pub receipt_codec: CodecRef,
-    pub receipt: P::Receipt,
-    pub receipt_event_codec: CodecRef,
-    pub receipt_event: P::ReceiptReducerEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -909,6 +916,10 @@ fn clone_manual_choice<P: WorkflowProfile>(choice: &ManualChoice<P>) -> ManualCh
         kind: choice.kind,
         codec: choice.codec.clone(),
         payload: choice.payload.clone(),
+        receipt_codec: choice.receipt_codec.clone(),
+        receipt: choice.receipt.clone(),
+        receipt_event_codec: choice.receipt_event_codec.clone(),
+        receipt_event: choice.receipt_event.clone(),
     }
 }
 
