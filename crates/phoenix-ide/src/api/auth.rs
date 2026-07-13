@@ -353,6 +353,7 @@ fn is_exempt_path(path: &str) -> bool {
         || path == "/service-worker.js"
         || path == "/phoenix.svg"
         || path == "/version"
+        || path == "/api/version"
     {
         return true;
     }
@@ -592,6 +593,7 @@ mod tests {
         assert!(is_exempt_path("/service-worker.js"));
         assert!(is_exempt_path("/phoenix.svg"));
         assert!(is_exempt_path("/version"));
+        assert!(is_exempt_path("/api/version"));
         assert!(is_exempt_path("/api/auth/status"));
         assert!(is_exempt_path("/api/auth/login"));
         assert!(is_exempt_path("/s/share-token"));

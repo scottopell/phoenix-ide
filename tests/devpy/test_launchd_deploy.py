@@ -70,6 +70,7 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         target_binary=str(root / "live-binary"), target_plist=str(root / "live.plist"),
         label="test.phoenix.server", helper_label="test.phoenix.deploy", uid=os.getuid(), health_url="http://127.0.0.1:1/api/version",
         health_insecure_tls=False, active_path=str(root / "active"), status_path=str(root / "status.json"),
+        previous_health_url="http://127.0.0.1:2/api/version", previous_health_insecure_tls=False,
         deployed_sha_path=str(root / "deployed.sha"), lock_path=str(root / "activate.lock"),
         created_at="2026-01-01T00:00:00+00:00", transition_timeout_secs=0.1, health_timeout_secs=0.1,
     )
@@ -145,7 +146,7 @@ class ActivationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
             identities = []
-            def verify(_manifest, identity):
+            def verify(_manifest, identity, **_kwargs):
                 identities.append(identity.git_sha)
                 if identity == manifest.expected:
                     raise helper.ActivationError("wrong version")
@@ -355,6 +356,34 @@ class PreparationTests(unittest.TestCase):
         embedded = "abc123"
         self.assertTrue(full_sha.startswith(embedded.removesuffix("-dirty")))
         self.assertNotEqual(full_sha, embedded)
+
+    def test_local_helper_is_materialized_from_selected_commit(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(self.dev.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"#!/usr/bin/python3\nprint('selected')\n", b"")
+            destination = Path(td) / "helper.py"
+            self.dev._materialize_helper("abc123", destination, "local_head")
+            self.assertIn(b"selected", destination.read_bytes())
+        self.assertEqual(["git", "show", "abc123:scripts/launchd_deploy_helper.py"], run.call_args.args[0])
+
+    def test_release_helper_is_fetched_from_selected_commit(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(self.dev.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"#!/usr/bin/python3\nprint('release')\n", b"")
+            destination = Path(td) / "helper.py"
+            self.dev._materialize_helper("abc123", destination, "published_release")
+            self.assertIn(b"release", destination.read_bytes())
+        self.assertIn("ref=abc123", run.call_args.args[0][2])
+
+    def test_rollback_uses_previous_endpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "wait_for_identity") as wait:
+                helper.restore(manifest, launchctl)
+            wait.assert_called_once_with(
+                manifest, manifest.previous,
+                health_url=manifest.previous_health_url,
+                health_insecure_tls=manifest.previous_health_insecure_tls,
+            )
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

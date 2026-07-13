@@ -58,6 +58,8 @@ class Manifest:
     uid: int
     health_url: str
     health_insecure_tls: bool
+    previous_health_url: Optional[str]
+    previous_health_insecure_tls: Optional[bool]
     active_path: str
     status_path: str
     deployed_sha_path: str
@@ -230,12 +232,20 @@ def fetch_identity(url: str, timeout: float = 2.0, insecure_tls: bool = False) -
         raise ActivationError("health response has no version identity") from exc
 
 
-def wait_for_identity(manifest: Manifest, expected: Identity) -> None:
+def wait_for_identity(
+    manifest: Manifest,
+    expected: Identity,
+    *,
+    health_url: Optional[str] = None,
+    health_insecure_tls: Optional[bool] = None,
+) -> None:
     deadline = time.monotonic() + manifest.health_timeout_secs
+    url = health_url or manifest.health_url
+    insecure_tls = manifest.health_insecure_tls if health_insecure_tls is None else health_insecure_tls
     last = "not responding"
     while time.monotonic() < deadline:
         try:
-            actual = fetch_identity(manifest.health_url, insecure_tls=manifest.health_insecure_tls)
+            actual = fetch_identity(url, insecure_tls=insecure_tls)
             last = f"version={actual.version} git_sha={actual.git_sha}"
             if actual == expected:
                 return
@@ -269,7 +279,14 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
     atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
     old_pid = launchctl.inspect()[1]
     launchctl.start(old_pid)
-    wait_for_identity(manifest, manifest.previous)
+    if manifest.previous_health_url is None or manifest.previous_health_insecure_tls is None:
+        raise ActivationError("previous endpoint is unavailable")
+    wait_for_identity(
+        manifest,
+        manifest.previous,
+        health_url=manifest.previous_health_url,
+        health_insecure_tls=manifest.previous_health_insecure_tls,
+    )
 
 
 def release_claim(manifest: Manifest) -> bool:

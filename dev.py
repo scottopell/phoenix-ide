@@ -7122,12 +7122,19 @@ def _binary_identity(binary: Path) -> dict[str, str]:
     return {"version": version, "git_sha": git_sha}
 
 
+def _launchd_health_probe(env: dict[str, str]) -> tuple[str, bool]:
+    return (
+        _prod_local_health_url(env).replace("/version", "/api/version"),
+        tls_enabled_from_env(env),
+    )
+
+
 def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
     import ssl
     import urllib.request
     try:
-        url = _prod_local_health_url(env).replace("/version", "/api/version")
-        context = ssl._create_unverified_context() if tls_enabled_from_env(env) else None
+        url, insecure_tls = _launchd_health_probe(env)
+        context = ssl._create_unverified_context() if insecure_tls else None
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
             value = json.load(response)
         return {"version": str(value["version"]), "git_sha": str(value["git_sha"])}
@@ -7274,6 +7281,24 @@ def _write_json_atomic(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
+def _materialize_helper(source_commit: str, destination: Path, source_kind: str) -> None:
+    if source_kind == "local_head":
+        result = subprocess.run(
+            ["git", "show", f"{source_commit}:scripts/launchd_deploy_helper.py"],
+            cwd=ROOT, capture_output=True,
+        )
+    else:
+        result = subprocess.run(
+            ["gh", "api", f"repos/scottopell/phoenix-ide/contents/scripts/launchd_deploy_helper.py?ref={source_commit}",
+             "-H", "Accept: application/vnd.github.raw+json"],
+            capture_output=True,
+        )
+    if result.returncode != 0 or not result.stdout:
+        raise SystemExit(f"selected source {source_commit} has no launchd deployment helper")
+    destination.write_bytes(result.stdout)
+    destination.chmod(0o700)
+
+
 def _helper_plist(label: str, helper: Path, manifest: Path, log_path: Path) -> bytes:
     return plistlib.dumps({
         "Label": label,
@@ -7382,6 +7407,7 @@ def launchd_prod_deploy(release: str | None = None):
             shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
             rollback_plist.chmod(0o600)
         previous_identity = _current_prod_identity(launchd_env)
+        previous_health_url, previous_health_insecure_tls = _launchd_health_probe(launchd_env)
         if target_binary.exists() and previous_identity is None:
             try:
                 previous_identity = _binary_identity(target_binary)
@@ -7391,8 +7417,7 @@ def launchd_prod_deploy(release: str | None = None):
                 ) from exc
 
         helper = staging / "activate.py"
-        shutil.copy2(ROOT / "scripts" / "launchd_deploy_helper.py", helper)
-        helper.chmod(0o700)
+        _materialize_helper(source_commit, helper, source_kind)
         helper_log = LAUNCHD_DEPLOY_DIR / "activation.log"
         helper_label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
         helper_plist = staging / "helper.plist"
@@ -7400,6 +7425,7 @@ def launchd_prod_deploy(release: str | None = None):
         helper_plist.chmod(0o600)
         subprocess.run(["plutil", "-lint", str(helper_plist)], check=True, capture_output=True)
 
+        health_url, health_insecure_tls = _launchd_health_probe(env_overrides)
         manifest = {
             "transaction_id": transaction_id,
             "source_kind": source_kind,
@@ -7421,8 +7447,10 @@ def launchd_prod_deploy(release: str | None = None):
             "label": LAUNCHD_LABEL,
             "helper_label": helper_label,
             "uid": os.getuid(),
-            "health_url": _prod_local_health_url(env_overrides).replace("/version", "/api/version"),
-            "health_insecure_tls": tls_enabled_from_env(env_overrides),
+            "health_url": health_url,
+            "health_insecure_tls": health_insecure_tls,
+            "previous_health_url": previous_health_url if previous_identity is not None else None,
+            "previous_health_insecure_tls": previous_health_insecure_tls if previous_identity is not None else None,
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH),
             "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH),

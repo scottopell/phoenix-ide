@@ -20,7 +20,7 @@ While an activation or unresolved transaction owns the host deployment claim, th
 
 ### REQ-LDD-004 — Immutable, secret-safe handoff
 
-The activation helper shall consume only stable host-resident files and a manifest containing source identity, expected runtime identity, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
+The activation helper shall be sourced from the selected immutable commit and consume only stable host-resident files and a manifest containing source identity, candidate and previous runtime identities and endpoints, artifact hashes, target paths, and rollback paths; the manifest and durable diagnostics shall not contain plist environment values.
 
 ### REQ-LDD-005 — Atomic artifact replacement
 
@@ -32,11 +32,11 @@ When changing the target job state, the system shall check launchctl exit status
 
 ### REQ-LDD-007 — Exact runtime verification
 
-A deployment shall succeed only when the target job is running with a new PID and `/api/version` reports both the expected package version and embedded git SHA.
+A deployment shall succeed only when the target job is running with a new PID and the credential-free `/api/version` endpoint reports both the expected package version and embedded git SHA.
 
 ### REQ-LDD-008 — Verified rollback
 
-If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the previous exact runtime identity, and durably distinguish successful rollback from rollback failure.
+If activation fails after disruption, the system shall atomically restore and bootstrap the previous binary and plist, verify the previous exact runtime identity at the previous service endpoint, and durably distinguish successful rollback from rollback failure.
 
 ### REQ-LDD-009 — Truthful durable result
 
