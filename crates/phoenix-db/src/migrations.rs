@@ -1601,11 +1601,13 @@ CREATE TABLE IF NOT EXISTS workflow_reducer_inbox (
     event_codec_family TEXT NOT NULL,
     event_codec_version INTEGER NOT NULL,
     event_payload TEXT NOT NULL,
+    requires_runtime_acceptance INTEGER NOT NULL DEFAULT 1,
     delivery_status TEXT NOT NULL,
     consumed_by_transition_id TEXT REFERENCES workflow_transitions(id) ON DELETE SET NULL,
+    CHECK (requires_runtime_acceptance IN (0, 1)),
     CHECK (delivery_status IN ('pending', 'consumed')),
     CHECK ((delivery_status = 'consumed') = (consumed_by_transition_id IS NOT NULL)),
-    CHECK ((receipt_id IS NOT NULL) <> (barrier_id IS NOT NULL))
+    CHECK (NOT (receipt_id IS NOT NULL AND barrier_id IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS workflow_inbox_consumer_dispositions (
@@ -1717,6 +1719,8 @@ CREATE TABLE IF NOT EXISTS workflow_shadow_divergences (
     severity TEXT NOT NULL,
     required_action TEXT NOT NULL,
     evidence_identity TEXT NOT NULL,
+    resolution_action TEXT,
+    resolved_by TEXT,
     resolved_at TEXT,
     expected_codec_family TEXT,
     expected_codec_version INTEGER,
@@ -1728,6 +1732,11 @@ CREATE TABLE IF NOT EXISTS workflow_shadow_divergences (
     CHECK (kind IN ('snapshot', 'transition', 'effect_plan', 'observation', 'receipt', 'reducer_event', 'capability', 'user_projection')),
     CHECK (severity IN ('blocking', 'actionable', 'informational')),
     CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only')),
+    CHECK (resolution_action IS NULL OR resolution_action IN ('rollback', 'reauthorize')),
+    CHECK (
+        (resolved_at IS NULL AND resolution_action IS NULL AND resolved_by IS NULL)
+        OR (resolved_at IS NOT NULL AND resolution_action IS NOT NULL AND resolved_by IS NOT NULL AND resolved_by <> '')
+    ),
     CHECK (shadow_workflow_id <> authoritative_workflow_id),
     CHECK ((expected_codec_family IS NULL) = (expected_codec_version IS NULL) AND (expected_codec_family IS NULL) = (expected_payload IS NULL)),
     CHECK ((actual_codec_family IS NULL) = (actual_codec_version IS NULL) AND (actual_codec_family IS NULL) = (actual_payload IS NULL))

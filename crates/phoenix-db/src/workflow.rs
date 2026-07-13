@@ -356,6 +356,21 @@ pub struct DurableReducerInboxRecord {
     pub workflow_id: String,
     pub receipt_id: String,
     pub event: DurablePayload,
+    pub requires_runtime_acceptance: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableDirectInboxEvent {
+    pub reducer_inbox_id: String,
+    pub workflow_id: String,
+    pub event: DurablePayload,
+    pub requires_runtime_acceptance: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableDivergenceResolutionAction {
+    Rollback,
+    Reauthorize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,8 +749,8 @@ impl WorkflowRepository {
         sqlx::query(
             "INSERT INTO workflow_reducer_inbox \
              (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
-              event_payload, delivery_status, consumed_by_transition_id) \
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'pending', NULL)",
+              event_payload, requires_runtime_acceptance, delivery_status, consumed_by_transition_id) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 1, 'pending', NULL)",
         )
         .bind(&request.reducer_inbox_id)
         .bind(&request.authority.workflow_id)
@@ -761,8 +776,64 @@ impl WorkflowRepository {
                 workflow_id: request.authority.workflow_id.clone(),
                 receipt_id: request.receipt_id.clone(),
                 event: request.reducer_event.clone(),
+                requires_runtime_acceptance: true,
             },
         })
+    }
+
+    /// Persist a reducer-only event that is not backed by a receipt or barrier.
+    ///
+    /// # Errors
+    /// Returns an error when the workflow does not exist or the insert violates durable constraints.
+    pub async fn persist_direct_inbox_event(
+        &self,
+        event: &DurableDirectInboxEvent,
+    ) -> WorkflowRepositoryResult<()> {
+        sqlx::query(
+            "INSERT INTO workflow_reducer_inbox \
+             (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
+              event_payload, requires_runtime_acceptance, delivery_status, consumed_by_transition_id) \
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, 'pending', NULL)",
+        )
+        .bind(&event.reducer_inbox_id)
+        .bind(&event.workflow_id)
+        .bind(&event.event.codec.family)
+        .bind(i64::from(event.event.codec.version))
+        .bind(&event.event.payload)
+        .bind(event.requires_runtime_acceptance)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve one shadow divergence with the operator's explicit cutover action.
+    ///
+    /// # Errors
+    /// Returns an error when the update query fails.
+    pub async fn resolve_shadow_divergence(
+        &self,
+        divergence_id: &str,
+        action: DurableDivergenceResolutionAction,
+        resolved_by: &str,
+        resolved_at: DateTime<Utc>,
+    ) -> WorkflowRepositoryResult<bool> {
+        if resolved_by.is_empty() {
+            return Err(WorkflowRepositoryError::InvalidPlan(
+                "shadow divergence resolver must not be empty",
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE workflow_shadow_divergences \
+             SET resolution_action = ?1, resolved_by = ?2, resolved_at = ?3 \
+             WHERE id = ?4 AND resolved_at IS NULL",
+        )
+        .bind(divergence_resolution_action_sql(action))
+        .bind(resolved_by)
+        .bind(resolved_at.to_rfc3339())
+        .bind(divergence_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// Persist a protocol selection plus its supported codecs and executors in one transaction.
@@ -2887,6 +2958,13 @@ fn parse_workflow_status_sql(status: &str) -> Option<WorkflowStatus> {
     }
 }
 
+fn divergence_resolution_action_sql(action: DurableDivergenceResolutionAction) -> &'static str {
+    match action {
+        DurableDivergenceResolutionAction::Rollback => "rollback",
+        DurableDivergenceResolutionAction::Reauthorize => "reauthorize",
+    }
+}
+
 fn workflow_execution_mode_sql(mode: WorkflowExecutionMode) -> &'static str {
     match mode {
         WorkflowExecutionMode::Authoritative => "authoritative",
@@ -4052,6 +4130,89 @@ mod tests {
         assert_eq!(rollback_inbox, 0);
         assert_eq!(rollback_effect.get::<String, _>("status"), "claimed");
         assert_eq!(rollback_claims, 1);
+    }
+
+    #[tokio::test]
+    async fn direct_inbox_and_shadow_resolution_persist_typed_authority() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        repo.persist_direct_inbox_event(&DurableDirectInboxEvent {
+            reducer_inbox_id: "cancel-inbox-1".to_owned(),
+            workflow_id: "wf-1".to_owned(),
+            event: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "wake-terminal".to_owned(),
+                    version: 1,
+                },
+                payload: "cancelled".to_owned(),
+            },
+            requires_runtime_acceptance: false,
+        })
+        .await
+        .unwrap();
+        let inbox = sqlx::query(
+            "SELECT receipt_id, barrier_id, requires_runtime_acceptance \
+             FROM workflow_reducer_inbox WHERE id = 'cancel-inbox-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(inbox.get::<Option<String>, _>("receipt_id"), None);
+        assert_eq!(inbox.get::<Option<String>, _>("barrier_id"), None);
+        assert_eq!(inbox.get::<i64, _>("requires_runtime_acceptance"), 0);
+
+        sqlx::query(
+            "INSERT INTO workflows \
+             (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, \
+              protocol_selection_id, version, generation, status, snapshot_codec_family, \
+              snapshot_codec_version, snapshot_payload, accepted_at) \
+             SELECT 'wf-shadow', profile_id, protocol_version, authority, 'shadow', 'wf-1', \
+                    protocol_selection_id, 0, 1, 'active', snapshot_codec_family, \
+                    snapshot_codec_version, snapshot_payload, accepted_at \
+             FROM workflows WHERE id = 'wf-1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_shadow_divergences \
+             (id, shadow_workflow_id, authoritative_workflow_id, kind, profile_detail_kind, severity, \
+              required_action, evidence_identity, recorded_at) \
+             VALUES ('div-1', 'wf-shadow', 'wf-1', 'snapshot', 'wake_snapshot', 'blocking', \
+                     'halt_acceptance', 'evidence-1', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        assert!(repo
+            .resolve_shadow_divergence(
+                "div-1",
+                DurableDivergenceResolutionAction::Rollback,
+                "operator-a",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(!repo
+            .resolve_shadow_divergence(
+                "div-1",
+                DurableDivergenceResolutionAction::Reauthorize,
+                "operator-b",
+                now,
+            )
+            .await
+            .unwrap());
+        let divergence = sqlx::query(
+            "SELECT resolution_action, resolved_by FROM workflow_shadow_divergences WHERE id = 'div-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(divergence.get::<String, _>("resolution_action"), "rollback");
+        assert_eq!(divergence.get::<String, _>("resolved_by"), "operator-a");
     }
 
     #[tokio::test]
