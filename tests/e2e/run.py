@@ -37,10 +37,10 @@ Adding a new scenario
    - Add a marker test in the `tests` module at the bottom
 
 3. Add a `scenario_xxx(base_url)` function below. Use the helpers
-   `_new_conv`, `_send_chat`, `_cancel`, `_get_conv`, `_drive`,
-   `_agent_text`, `_has_tool_use`, `_count_tool_use`, `_user_messages`,
-   `_user_message_images`. Raise `AssertionError` (with a useful
-   message) on failure.
+   `_new_conv`, `_cancel`, `_get_conv`, `_poll_to_idle_with_messages`,
+   `_send_chat_and_stream`, `_agent_text`, `_has_tool_use`,
+   `_count_tool_use`, `_user_messages`, `_user_message_images`. Raise
+   `AssertionError` (with a useful message) on failure.
 
 4. Register it in the `SCENARIOS` list near the bottom of this file.
    The list is ordered: faster scenarios first so the slowest get the
@@ -49,6 +49,7 @@ Adding a new scenario
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -63,12 +64,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
-from httpx_sse import connect_sse
+from httpx_sse import aconnect_sse
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target" / "debug" / "phoenix_ide"
 STARTUP_ATTEMPTS = 3
 STARTUP_TIMEOUT_SECONDS = 30.0
+SCENARIO_TIMEOUT_SECONDS = 45.0
 
 # 1x1 transparent PNG, base64-encoded.
 TINY_PNG_B64 = (
@@ -164,14 +166,31 @@ def _start_server_with_retries(env: dict[str, str], tmpdir: Path, start_attempt=
     raise AssertionError("bounded startup loop completed without a result")
 
 
-@contextmanager
-def _server():
-    tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
-    db_path = tmpdir / "phoenix.db"
-    env = os.environ.copy()
-    # Strip every channel that could register a non-mock provider so the
-    # registry contains exactly one model and behavior is reproducible.
-    for k in (
+def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if parent_env is None else parent_env)
+    isolated_home = tmpdir / "home"
+    isolated_config = tmpdir / "config"
+    isolated_codex = tmpdir / "codex"
+    for path in (isolated_home, isolated_config, isolated_codex):
+        path.mkdir(parents=True, exist_ok=True)
+
+    # The mock server must not discover personal providers, credentials, or MCP
+    # configuration. Keep PATH and other process essentials from the caller, but
+    # give every home/config lookup an empty per-run root.
+    env.update(
+        {
+            "HOME": str(isolated_home),
+            "USERPROFILE": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_config),
+            "CODEX_HOME": str(isolated_codex),
+            "PHOENIX_ENABLE_MOCK_MODEL": "1",
+            "DEFAULT_MODEL": "mock",
+            "PHOENIX_DB_PATH": str(tmpdir / "phoenix.db"),
+            "PHOENIX_BIND_ADDR": "127.0.0.1",
+            "RUST_LOG": env.get("E2E_RUST_LOG", "warn"),
+        }
+    )
+    for key in (
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "LLM_API_KEY_HELPER",
@@ -181,22 +200,14 @@ def _server():
         "PHOENIX_TLS_CERT_PATH",
         "PHOENIX_TLS_KEY_PATH",
     ):
-        env.pop(k, None)
-    env.update(
-        {
-            "PHOENIX_ENABLE_MOCK_MODEL": "1",
-            "DEFAULT_MODEL": "mock",
-            "PHOENIX_DB_PATH": str(db_path),
-            # Bind loopback: the harness talks to the server over 127.0.0.1, so a
-            # loopback bind is correct and satisfies the binary's fail-closed
-            # guard (no password, no insecure-bind override needed).
-            "PHOENIX_BIND_ADDR": "127.0.0.1",
-            # Quiet logs unless a test fails (we capture stderr and print on
-            # failure). RUST_LOG=warn drops the per-request access log too,
-            # which would otherwise spam the harness output.
-            "RUST_LOG": os.environ.get("E2E_RUST_LOG", "warn"),
-        },
-    )
+        env.pop(key, None)
+    return env
+
+
+@contextmanager
+def _server():
+    tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
+    env = _server_env(tmpdir)
 
     try:
         proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
@@ -244,15 +255,6 @@ def _new_conv_in(base_url: str, cwd: str, text: str, images: list[dict] | None =
     return _new_conv(base_url, text, images=images, cwd=cwd)
 
 
-def _send_chat(base_url: str, conv_id: str, text: str) -> None:
-    r = httpx.post(
-        f"{base_url}/api/conversations/{conv_id}/chat",
-        json={"text": text, "images": [], "message_id": str(uuid.uuid4())},
-        timeout=10.0,
-    )
-    r.raise_for_status()
-
-
 def _cancel(base_url: str, conv_id: str) -> dict:
     r = httpx.post(f"{base_url}/api/conversations/{conv_id}/cancel", timeout=10.0)
     r.raise_for_status()
@@ -271,76 +273,114 @@ def _state_str(state) -> str:
     return str(state)
 
 
-def _stream_to_terminal(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
-    """Drive the SSE stream until the conversation reaches a terminal state.
+def _init_has_completed_turn(data: dict) -> bool:
+    conversation = data.get("conversation") or {}
+    state = _state_str(conversation.get("state"))
+    if state == "error":
+        state_data = conversation.get("state_data") or {}
+        raise RuntimeError(f"conversation error: {state_data.get('message')}")
 
-    Returns nothing — callers should refetch via _get_conv for the authoritative
-    final message list. The stream is purely a synchronization barrier here
-    because message events fire incrementally during agent runs and would
-    double-count if naively accumulated.
+    if data.get("presentation_mode") not in ("idle", "done"):
+        return False
 
-    A watchdog thread closes the client at `timeout` seconds. iter_sse() does
-    not yield items for keepalive pings, so a per-event deadline check is not
-    sufficient — if termination signaling is broken (renamed event labels,
-    missing state_change), pings keep the read socket alive indefinitely.
-    Closing the client from a watchdog is the only timing-robust escape hatch.
-    """
-    import threading
-    url = f"{base_url}/api/conversations/{conv_id}/stream"
-    # Read timeout exceeds the server's 15s SSE keepalive so we don't fight
-    # pings during legitimate long-tool gaps; the watchdog is the actual
-    # deadline.
-    sse_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
-    client = httpx.Client(timeout=sse_timeout)
-    watchdog = threading.Timer(timeout, client.close)
-    watchdog.daemon = True
-    watchdog.start()
+    messages = data.get("messages") or []
+    latest_user_index = max(
+        (index for index, message in enumerate(messages) if message.get("message_type") == "user"),
+        default=-1,
+    )
+    return any(
+        message.get("message_type") == "agent"
+        for message in messages[latest_user_index + 1 :]
+    )
+
+
+def _terminal_event(event_type: str, raw_data: str) -> bool:
+    if event_type == "ping":
+        return False
+
     try:
-        with connect_sse(client, "GET", url) as src:
-            for event in src.iter_sse():
-                data = json.loads(event.data) if event.data else {}
-                if event.event == "state_change":
-                    display = data.get("display_state")
-                    state = _state_str(data.get("state"))
-                    if state == "error":
-                        sd = data.get("state_data") or {}
-                        raise RuntimeError(f"conversation error: {sd.get('message')}")
-                    if display == "terminal":
-                        return
-                elif event.event == "agent_done":
-                    return
-                elif event.event == "error":
-                    # Include raw event.data so an empty/malformed error
-                    # payload doesn't degrade to "sse error: None".
-                    msg = data.get("message") or event.data or "(no data)"
-                    raise RuntimeError(f"sse error: {msg}")
-    except Exception as e:
-        # Watchdog-triggered close manifests as a transport error or runtime
-        # error from the SSE library. Map to a clean TimeoutError if the
-        # deadline has actually elapsed, otherwise re-raise.
-        if not watchdog.is_alive():
-            raise TimeoutError(
-                f"SSE did not reach terminal in {timeout}s ({type(e).__name__})"
-            ) from e
-        raise
-    finally:
-        watchdog.cancel()
-        client.close()
+        data = json.loads(raw_data) if raw_data else {}
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"malformed JSON in SSE event {event_type!r}: {raw_data[:200]!r}"
+        ) from error
 
-
-def _poll_to_idle(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
-    """Poll GET until the conversation is idle. Same barrier role as SSE."""
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        data = _get_conv(base_url, conv_id)
-        state = _state_str(data["conversation"]["state"])
-        if state == "idle":
-            return
+    if event_type == "init":
+        return _init_has_completed_turn(data)
+    if event_type == "state_change":
+        presentation = data.get("presentation_mode")
+        state = _state_str(data.get("state"))
         if state == "error":
-            sd = data["conversation"].get("state_data") or {}
-            raise RuntimeError(f"conversation error: {sd.get('message')}")
-        time.sleep(0.1)
-    raise TimeoutError(f"poll timeout after {timeout}s")
+            state_data = data.get("state_data") or {}
+            raise RuntimeError(f"conversation error: {state_data.get('message')}")
+        return presentation in ("idle", "done")
+    if event_type == "agent_done":
+        return True
+    if event_type == "error":
+        message = data.get("message") or raw_data or "(no data)"
+        raise RuntimeError(f"sse error: {message}")
+    return False
+
+
+def _timeout_diagnostic(base_url: str, conv_id: str) -> str:
+    try:
+        response = httpx.get(
+            f"{base_url}/api/conversations/{conv_id}",
+            timeout=httpx.Timeout(3.0),
+        )
+        response.raise_for_status()
+        conversation = response.json()["conversation"]
+        state = _state_str(conversation.get("state"))
+        state_data = conversation.get("state_data")
+        return f"last state={state!r}, state_data={state_data!r}"
+    except Exception as error:
+        return f"final state unavailable ({type(error).__name__}: {error})"
+
+
+async def _send_chat_and_stream_async(
+    base_url: str,
+    conv_id: str,
+    text: str,
+    timeout: float,
+) -> None:
+    stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
+    chat_url = f"{base_url}/api/conversations/{conv_id}/chat"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            async with aconnect_sse(client, "GET", stream_url) as source:
+                events = source.aiter_sse()
+                init = await anext(events)
+                if init.event != "init":
+                    raise RuntimeError(f"expected initial SSE event, got {init.event!r}")
+                # Validate the snapshot, but only a post-chat event can complete
+                # the continuation barrier.
+                _terminal_event(init.event, init.data)
+
+                response = await client.post(
+                    chat_url,
+                    json={"text": text, "images": [], "message_id": str(uuid.uuid4())},
+                )
+                response.raise_for_status()
+                async for event in events:
+                    if _terminal_event(event.event, event.data):
+                        return
+            raise RuntimeError("SSE stream closed before the continuation completed")
+
+
+def _send_chat_and_stream(
+    base_url: str,
+    conv_id: str,
+    text: str,
+    timeout: float,
+) -> None:
+    try:
+        asyncio.run(_send_chat_and_stream_async(base_url, conv_id, text, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        diagnostic = _timeout_diagnostic(base_url, conv_id)
+        raise TimeoutError(
+            f"continuation SSE did not reach terminal in {timeout:g}s ({diagnostic})"
+        ) from error
 
 
 def _poll_to_idle_with_messages(
@@ -366,16 +406,6 @@ def _poll_to_idle_with_messages(
     raise TimeoutError(
         f"poll timeout waiting for idle transcript evidence: {label} (last state: {state})"
     )
-
-
-def _drive(base_url: str, conv_id: str, timeout: float = 30.0, use_polling: bool = False) -> dict:
-    """Wait for the conversation to settle, then return the authoritative
-    state via GET (not the in-flight stream snapshot)."""
-    if use_polling:
-        _poll_to_idle(base_url, conv_id, timeout)
-    else:
-        _stream_to_terminal(base_url, conv_id, timeout)
-    return _get_conv(base_url, conv_id)
 
 
 def _agent_text(messages: list[dict]) -> str:
@@ -441,14 +471,26 @@ def _user_message_images(message: dict) -> list[dict]:
 
 def scenario_text_streaming(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:plain_text]] hello")
-    final = _drive(base_url, conv["id"], timeout=15.0)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: "analyzed the situation" in _agent_text(messages),
+        "plain-text response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, f"unexpected assistant text: {text[:200]!r}"
 
 
 def scenario_multi_tool(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:multi_tool]] go")
-    final = _drive(base_url, conv["id"], timeout=30.0)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: _count_tool_use(messages, "bash") == 2,
+        "two bash tool uses",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
     n_bash = _count_tool_use(final["messages"], "bash")
     assert n_bash == 2, f"expected 2 bash tool uses, got {n_bash}"
     state = _state_str(final["conversation"]["state"])
@@ -457,7 +499,13 @@ def scenario_multi_tool(base_url: str) -> None:
 
 def scenario_think_tool(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:think]] explain")
-    final = _drive(base_url, conv["id"], timeout=15.0)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: _has_tool_use(messages, "think"),
+        "think tool use",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
     assert _has_tool_use(final["messages"], "think"), "expected a 'think' tool use in transcript"
     # Tool result must be a success — catches input-schema drift between the
     # mock's ToolUse payload and the real tool's expected fields.
@@ -472,9 +520,20 @@ def scenario_think_tool(base_url: str) -> None:
 
 def scenario_continuation(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:plain_text]] one")
-    _drive(base_url, conv["id"], timeout=15.0)
-    _send_chat(base_url, conv["id"], "[[scenario:markdown]] two")
-    final = _drive(base_url, conv["id"], timeout=15.0)
+    _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: "analyzed the situation" in _agent_text(messages),
+        "first-turn response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
+    _send_chat_and_stream(
+        base_url,
+        conv["id"],
+        "[[scenario:markdown]] two",
+        SCENARIO_TIMEOUT_SECONDS,
+    )
+    final = _get_conv(base_url, conv["id"])
     users = _user_messages(final["messages"])
     assert len(users) >= 2, f"expected at least 2 user messages, got {len(users)}"
     text = _agent_text(final["messages"])
@@ -515,7 +574,13 @@ def scenario_mid_stream_cancel(base_url: str) -> None:
 def scenario_image_roundtrip(base_url: str) -> None:
     image = {"media_type": "image/png", "data": TINY_PNG_B64}
     conv = _new_conv(base_url, "[[scenario:plain_text]] describe", images=[image])
-    final = _drive(base_url, conv["id"], timeout=15.0)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: "analyzed the situation" in _agent_text(messages),
+        "image-turn response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
     users = _user_messages(final["messages"])
     assert users, "no user message in transcript"
     images = _user_message_images(users[0])
@@ -535,18 +600,13 @@ def scenario_list_models(base_url: str) -> None:
 def scenario_read_file(base_url: str) -> None:
     # Mock scenario: see [[scenario:read_file]] in mock.rs — reads Cargo.toml
     # at the conversation's cwd (which is the project root here).
-    #
-    # Drives via polling (use_polling=True) rather than SSE so the
-    # _poll_to_idle barrier — GET state converging to "idle" — stays
-    # exercised. Every other scenario uses the SSE barrier; this is the one
-    # place the poll path runs end-to-end.
     conv = _new_conv(base_url, "[[scenario:read_file]] inspect")
     final = _poll_to_idle_with_messages(
         base_url,
         conv["id"],
         lambda messages: _has_tool_use(messages, "read_file"),
         "read_file tool use",
-        timeout=15.0,
+        timeout=SCENARIO_TIMEOUT_SECONDS,
     )
     assert _has_tool_use(final["messages"], "read_file"), "expected a 'read_file' tool use"
     tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
@@ -566,7 +626,13 @@ def scenario_patch(base_url: str) -> None:
     work_dir = tempfile.mkdtemp(prefix="phoenix-e2e-patch-")
     try:
         conv = _new_conv_in(base_url, work_dir, "[[scenario:patch]] write")
-        final = _drive(base_url, conv["id"], timeout=15.0)
+        final = _poll_to_idle_with_messages(
+            base_url,
+            conv["id"],
+            lambda messages: _has_tool_use(messages, "patch"),
+            "patch tool use",
+            timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
         assert _has_tool_use(final["messages"], "patch"), "expected a 'patch' tool use"
         tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
         assert tool_msgs, "expected at least one tool result message"
@@ -580,7 +646,6 @@ def scenario_patch(base_url: str) -> None:
         body = out_path.read_text()
         assert body == "hello from mock patch scenario\n", f"unexpected file body: {body!r}"
     finally:
-        import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -596,7 +661,13 @@ def scenario_perf_stream(base_url: str) -> None:
     # any particular N; the bug class is "more chunks than the short scenarios").
     n = 200
     conv = _new_conv(base_url, f"[[perf:{n}]] go")
-    final = _drive(base_url, conv["id"], timeout=30.0)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: len(_agent_text(messages).split()) == n,
+        f"{n}-word response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
     text = _agent_text(final["messages"])
     word_count = len(text.split())
     assert word_count == n, f"expected {n} words from perf stream, got {word_count}"
@@ -614,6 +685,95 @@ SCENARIOS = [
     ("image_roundtrip", scenario_image_roundtrip),
     ("perf_stream", scenario_perf_stream),
 ]
+
+
+class HarnessIsolationTests(unittest.TestCase):
+    def test_server_env_isolates_home_and_removes_real_providers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmpdir = Path(directory)
+            parent = {
+                "PATH": "/test/bin",
+                "HOME": "/real/home",
+                "USERPROFILE": "/real/profile",
+                "XDG_CONFIG_HOME": "/real/config",
+                "CODEX_HOME": "/real/codex",
+                "ANTHROPIC_API_KEY": "secret",
+                "OPENAI_API_KEY": "secret",
+                "LLM_API_KEY_HELPER": "secret-helper",
+                "E2E_RUST_LOG": "debug",
+            }
+            env = _server_env(tmpdir, parent)
+
+            self.assertEqual(env["PATH"], "/test/bin")
+            self.assertEqual(env["HOME"], str(tmpdir / "home"))
+            self.assertEqual(env["USERPROFILE"], str(tmpdir / "home"))
+            self.assertEqual(env["XDG_CONFIG_HOME"], str(tmpdir / "config"))
+            self.assertEqual(env["CODEX_HOME"], str(tmpdir / "codex"))
+            self.assertEqual(env["RUST_LOG"], "debug")
+            self.assertEqual(env["DEFAULT_MODEL"], "mock")
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertNotIn("LLM_API_KEY_HELPER", env)
+
+    def test_literal_ping_is_accepted_without_json_parsing(self):
+        self.assertFalse(_terminal_event("ping", "ping"))
+
+    def test_agent_done_completes_turn_barrier(self):
+        self.assertTrue(_terminal_event("agent_done", "{}"))
+
+    def test_error_event_is_actionable(self):
+        with self.assertRaisesRegex(RuntimeError, "sse error: broken stream"):
+            _terminal_event("error", json.dumps({"message": "broken stream"}))
+
+    def test_error_state_change_is_actionable(self):
+        data = json.dumps(
+            {
+                "presentation_mode": "error",
+                "state": {"type": "error"},
+                "state_data": {"message": "mock failed"},
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "conversation error: mock failed"):
+            _terminal_event("state_change", data)
+
+    def test_done_state_change_is_detected(self):
+        data = json.dumps({"presentation_mode": "done", "state": "terminal"})
+        self.assertTrue(_terminal_event("state_change", data))
+
+    def test_idle_state_change_completes_turn_barrier(self):
+        data = json.dumps({"presentation_mode": "idle", "state": "idle"})
+        self.assertTrue(_terminal_event("state_change", data))
+
+    def test_idle_init_with_agent_after_latest_user_is_terminal(self):
+        data = json.dumps(
+            {
+                "presentation_mode": "idle",
+                "conversation": {"state": "idle"},
+                "messages": [
+                    {"message_type": "user"},
+                    {"message_type": "agent"},
+                ],
+            }
+        )
+        self.assertTrue(_terminal_event("init", data))
+
+    def test_idle_init_with_unanswered_latest_user_is_not_terminal(self):
+        data = json.dumps(
+            {
+                "presentation_mode": "idle",
+                "conversation": {"state": "idle"},
+                "messages": [
+                    {"message_type": "user"},
+                    {"message_type": "agent"},
+                    {"message_type": "user"},
+                ],
+            }
+        )
+        self.assertFalse(_terminal_event("init", data))
+
+    def test_malformed_typed_event_has_actionable_error(self):
+        with self.assertRaisesRegex(ValueError, "malformed JSON.*state_change"):
+            _terminal_event("state_change", "not-json")
 
 
 class StartupRetryTests(unittest.TestCase):
@@ -660,7 +820,10 @@ class StartupRetryTests(unittest.TestCase):
 
 
 def _run_self_tests() -> int:
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(StartupRetryTests)
+    suite = unittest.TestSuite(
+        unittest.defaultTestLoader.loadTestsFromTestCase(case)
+        for case in (HarnessIsolationTests, StartupRetryTests)
+    )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
@@ -684,9 +847,24 @@ def main() -> int:
                 detail = f"{type(e).__name__}: {e}"
                 print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
                 failures.append((name, detail))
+                print("[e2e] stopping after first failure to preserve root-cause signal", flush=True)
+                break
         # Read log inside the context — the tempdir may be cleaned up after.
         if log_path.exists():
             log_text = log_path.read_text()
+
+    external_mcp_lines = [
+        line
+        for line in log_text.splitlines()
+        if "MCP stderr:" in line or "Connecting to remote server:" in line
+    ]
+    if external_mcp_lines:
+        print("\n[e2e] external MCP process output detected in hermetic server log:")
+        for line in external_mcp_lines[:5]:
+            print(f"  | {line}")
+        failures.append(
+            ("external-mcp-tripwire", f"{len(external_mcp_lines)} external MCP log line(s)")
+        )
 
     # Tripwire: surface sqlx slow-statement WARNs so cross-lane I/O
     # contention can't silently bloat write latency (task 13042). Filter
@@ -710,7 +888,10 @@ def main() -> int:
             print(f"  | {line}")
         print(f"\n✗ {len(failures)} e2e check(s) failed")
         return 1
-    print(f"\n✓ all {len(SCENARIOS)} e2e scenarios passed (no slow-statement WARNs)")
+    print(
+        f"\n✓ all {len(SCENARIOS)} e2e scenarios passed "
+        "(no external MCP or slow-statement WARNs)"
+    )
     return 0
 
 
