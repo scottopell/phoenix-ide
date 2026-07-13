@@ -380,25 +380,49 @@ async def _snapshot_has_agent_after_message(
     )
 
 
-async def _stream_first_turn_async(base_url: str, conv_id: str, timeout: float) -> None:
+async def _stream_first_turn_through_keepalive_async(
+    base_url: str,
+    conv_id: str,
+    timeout: float,
+) -> None:
     url = f"{base_url}/api/conversations/{conv_id}/stream"
     transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=transport_timeout) as client:
         async with asyncio.timeout(timeout):
             async with aconnect_sse(client, "GET", url) as source:
-                async for event in source.aiter_sse():
+                events = source.aiter_sse()
+                init = await anext(events)
+                if init.event != "init":
+                    raise RuntimeError(f"expected initial SSE event, got {init.event!r}")
+                _terminal_event(init.event, init.data)
+
+                keepalive_seen = False
+                async for event in events:
+                    if event.event == "ping":
+                        keepalive_seen = True
                     if _terminal_event(event.event, event.data):
+                        if not keepalive_seen:
+                            raise AssertionError(
+                                "first turn completed before a live SSE keepalive was observed"
+                            )
                         return
             raise RuntimeError("SSE stream closed before the first turn completed")
 
 
-def _stream_first_turn(base_url: str, conv_id: str, timeout: float) -> None:
+def _stream_first_turn_through_keepalive(
+    base_url: str,
+    conv_id: str,
+    timeout: float,
+) -> None:
     try:
-        asyncio.run(_stream_first_turn_async(base_url, conv_id, timeout))
+        asyncio.run(
+            _stream_first_turn_through_keepalive_async(base_url, conv_id, timeout)
+        )
     except (TimeoutError, httpx.TimeoutException) as error:
         diagnostic = _timeout_diagnostic(base_url, conv_id)
         raise TimeoutError(
-            f"first-turn SSE did not reach terminal in {timeout:g}s ({diagnostic})"
+            f"first-turn SSE did not reach terminal through a keepalive in "
+            f"{timeout:g}s ({diagnostic})"
         ) from error
 
 
@@ -538,8 +562,13 @@ def _user_message_images(message: dict) -> list[dict]:
 
 
 def scenario_text_streaming(base_url: str) -> None:
-    conv = _new_conv(base_url, "[[scenario:plain_text]] hello")
-    _stream_first_turn(base_url, conv["id"], SCENARIO_TIMEOUT_SECONDS)
+    conv = _new_conv(
+        base_url,
+        "[[scenario:plain_text]] [[stall:1,16000]] hello",
+    )
+    _stream_first_turn_through_keepalive(
+        base_url, conv["id"], SCENARIO_TIMEOUT_SECONDS
+    )
     final = _get_conv(base_url, conv["id"])
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, f"unexpected assistant text: {text[:200]!r}"
