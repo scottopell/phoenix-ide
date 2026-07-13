@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -1956,6 +1956,30 @@ export function ReadFileResultView({
   );
 }
 
+export function PatchResultView({
+  diff,
+  toolUseId,
+  activeHighlight = null,
+}: {
+  diff: string;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
+}) {
+  const projection = useMemo(
+    () => buildPatchOutputProjection(diff, toolUseId ? { toolUseId } : {}),
+    [diff, toolUseId],
+  );
+  const fragment = projection.fragments[0];
+  const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+  return (
+    <div className="tool-block-output-content" data-fragment-id={fragment.fragmentId}>
+      {highlight
+        ? renderHighlightedText(fragment.display.diff, highlight.start, highlight.end)
+        : fragment.display.diff}
+    </div>
+  );
+}
+
 export function SearchResultsView({
   rawText,
   onOpenFile,
@@ -2264,24 +2288,18 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     () => (name === 'read_file' ? buildReadFileOutputProjection(resultText, input as Record<string, unknown>, { toolUseId: toolId }) : null),
     [input, name, resultText, toolId],
   );
+  const patchProjection = useMemo(
+    () => (name === 'patch' ? buildPatchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
   const toolActiveHighlight = activeHighlight?.fragmentId
     && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
-      || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
+      || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)))
     ? activeHighlight
     : null;
 
-  useEffect(() => {
-    if (!revealRequest) return;
-    if (revealRequest.revealTarget.kind === 'tool-result-read-file') {
-      if (revealRequest.revealTarget.toolUseId !== toolId) return;
-      onRevealHandled?.(revealRequest);
-      return;
-    }
-    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search' && revealRequest.revealTarget.kind !== 'tool-result-search') return;
-    if (revealRequest.revealTarget.key !== toolRevealKey) return;
-    onRevealHandled?.(revealRequest);
-  }, [onRevealHandled, revealRequest, toolId, toolRevealKey]);
   
   // Check if this is an image result.
   // 1. Typed `images` channel (read_image — single source of truth, no
@@ -2330,6 +2348,27 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD || name === 'read_file' || isTrivialPatch
   );
   const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
+
+  useEffect(() => {
+    if (!revealRequest) return;
+    if (revealRequest.revealTarget.kind === 'tool-result-read-file') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-patch') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      if (!outputExpanded) {
+        setOutputExpanded(true);
+        return;
+      }
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search' && revealRequest.revealTarget.kind !== 'tool-result-search') return;
+    if (revealRequest.revealTarget.key !== toolRevealKey) return;
+    onRevealHandled?.(revealRequest);
+  }, [onRevealHandled, outputExpanded, revealRequest, toolId, toolRevealKey]);
 
   // For display, truncate very long outputs even when expanded
   const displayResult = useMemo(() => {
@@ -2454,6 +2493,12 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
                 <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>
               )}
             </>
+          ) : name === 'patch' && !isError && outputExpanded ? (
+            <PatchResultView
+              diff={toolActiveHighlight ? resultText : displayResult}
+              toolUseId={toolId}
+              activeHighlight={toolActiveHighlight}
+            />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

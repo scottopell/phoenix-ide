@@ -126,6 +126,25 @@ export interface ReadFileOutputProjection {
   fullText: string;
 }
 
+export interface PatchRevealTarget {
+  kind: 'tool-result-patch';
+  toolUseId: string;
+  fragmentId: string;
+}
+
+export interface PatchFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: { diff: string };
+  revealTarget: PatchRevealTarget;
+  kind: 'diff';
+}
+
+export interface PatchOutputProjection {
+  fragments: readonly [PatchFragment];
+  fullText: string;
+}
+
 export interface KeywordSearchRevealTarget {
   kind: 'tool-result-keyword-search';
   key: string;
@@ -140,7 +159,8 @@ export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
-  | ReadFileRevealTarget;
+  | ReadFileRevealTarget
+  | PatchRevealTarget;
 
 export interface ConversationTextFragment {
   fragmentId: string;
@@ -815,6 +835,25 @@ export function buildReadFileOutputProjection(
   return { fragments, fullText };
 }
 
+export function buildPatchOutputProjection(
+  diff: string,
+  options: { toolUseId?: string | null } = {},
+): PatchOutputProjection {
+  const fragmentId = 'patch-diff';
+  const fragment: PatchFragment = {
+    fragmentId,
+    semanticText: diff,
+    display: { diff },
+    revealTarget: {
+      kind: 'tool-result-patch',
+      toolUseId: options.toolUseId ?? '',
+      fragmentId,
+    },
+    kind: 'diff',
+  };
+  return { fragments: [fragment], fullText: diff };
+}
+
 export function buildSearchOutputProjection(
   text: string,
   options: { toolUseId?: string | null } = {},
@@ -1040,7 +1079,8 @@ function agentTurnSources(
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
       const detailsVisible = densityToolDetailsVisible(block.name, density);
       if (detailsVisible) out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-      const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
+      const toolResult = toolResultsByUseId.get(block.id ?? '');
+      const resultText = toolResultText(toolResult);
       if (block.name === 'keyword_search') {
         for (const fragment of buildKeywordSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
@@ -1053,6 +1093,12 @@ function agentTurnSources(
       } else if (block.name === 'read_file') {
         const readFileProjection = buildReadFileOutputProjection(resultText, block.input ?? {}, block.id ? { toolUseId: block.id } : {});
         for (const fragment of readFileProjection.fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+      } else if (block.name === 'patch') {
+        const displayDiff = (toolResult?.display_data as { diff?: unknown } | null | undefined)?.diff;
+        const patchDiff = typeof displayDiff === 'string' ? displayDiff : resultText;
+        for (const fragment of buildPatchOutputProjection(patchDiff, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
       } else if (detailsVisible) {

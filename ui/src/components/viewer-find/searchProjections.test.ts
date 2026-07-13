@@ -4,6 +4,7 @@ import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import {
   buildAgentTextFragments,
+  buildPatchOutputProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
@@ -200,6 +201,21 @@ describe('buildDiffSearchProjection', () => {
       startColumn: 0,
       endColumn: 4,
     });
+  });
+});
+
+describe('buildPatchOutputProjection', () => {
+  it('keeps semantic identity stable while carrying the current canonical diff as display text', () => {
+    const before = buildPatchOutputProjection('--- a/x\n+++ b/x\n-old\n+new', { toolUseId: 'patch-1' });
+    const after = buildPatchOutputProjection('--- a/x\n+++ b/x\n-context\n-old\n+new', { toolUseId: 'patch-1' });
+    expect(before.fragments[0].fragmentId).toBe('patch-diff');
+    expect(after.fragments[0].fragmentId).toBe(before.fragments[0].fragmentId);
+    expect(after.fragments[0].revealTarget).toEqual({
+      kind: 'tool-result-patch',
+      toolUseId: 'patch-1',
+      fragmentId: 'patch-diff',
+    });
+    expect(after.fullText).toContain('+new');
   });
 });
 

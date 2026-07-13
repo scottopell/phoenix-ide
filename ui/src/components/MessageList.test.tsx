@@ -3029,6 +3029,54 @@ describe('handleTotalListHeightChanged', () => {
 
 
 
+it('find navigation searches the canonical patch display diff and carries its typed reveal target', async () => {
+  const diff = '--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old value\n+canonical patch token';
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-patch',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-patch-1',
+        name: 'patch',
+        display: 'patch src/foo.ts',
+        input: { path: 'src/foo.ts', patches: [{ operation: 'replace', oldText: 'old value', newText: 'canonical patch token' }] },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-patch-1', result: 'Patch applied successfully' },
+      display_data: { diff },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-patch"
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'canonical patch token' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+  await waitFor(() => {
+    const call = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-patch');
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-patch');
+  expect(renderedAgent?.message.message_id).toBe('agent-patch');
+  expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-patch-1', fragmentId: 'patch-diff' });
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('patch-diff');
+  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+});
+
 it('find navigation carries read_file fragment reveal target for offscreen navigation', async () => {
   const messages: Message[] = [
     {

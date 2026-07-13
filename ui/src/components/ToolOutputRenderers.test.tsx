@@ -9,8 +9,9 @@ import {
   KeywordSearchView,
   __readFileResultTestables,
   ReadFileResultView,
+  PatchResultView,
 } from './MessageComponents';
-import { buildKeywordSearchOutputProjection, buildReadFileOutputProjection } from './viewer-find';
+import { buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection } from './viewer-find';
 import { buildSearchOutputProjection } from './viewer-find/searchProjections';
 
 describe('parseSearchOutput', () => {
@@ -242,6 +243,41 @@ describe('buildReadFileOutputProjection parity', () => {
       startLineNumber: 7,
       endLineNumber: 7,
     });
+  });
+});
+
+describe('buildPatchOutputProjection parity', () => {
+  const diff = '--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old alpha\n+new alpha';
+
+  it('builds one revealable fragment from the canonical display diff', () => {
+    expect(buildPatchOutputProjection(diff, { toolUseId: 'patch-1' })).toEqual({
+      fragments: [{
+        fragmentId: 'patch-diff',
+        semanticText: diff,
+        display: { diff },
+        revealTarget: {
+          kind: 'tool-result-patch',
+          toolUseId: 'patch-1',
+          fragmentId: 'patch-diff',
+        },
+        kind: 'diff',
+      }],
+      fullText: diff,
+    });
+  });
+
+  it('highlights the exact occurrence without changing diff layout or duplicating text', () => {
+    const start = diff.lastIndexOf('alpha');
+    const { container } = render(
+      <PatchResultView
+        diff={diff}
+        toolUseId="patch-1"
+        activeHighlight={{ fragmentId: 'patch-diff', start, end: start + 5 }}
+      />,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('alpha');
+    expect(container.querySelector('[data-fragment-id="patch-diff"]')?.textContent).toBe(diff);
+    expect(container.querySelectorAll('[data-fragment-id="patch-diff"]')).toHaveLength(1);
   });
 });
 
