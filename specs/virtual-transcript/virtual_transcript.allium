@@ -17,6 +17,7 @@ value CommandIdentity {
 
 entity TranscriptView {
     generation: Integer
+    layout_revision: Integer
     owner: ViewportOwner
     ordered_keys: List<String>
     measured_keys: Set<String>
@@ -38,6 +39,7 @@ entity PositionTransaction {
     anchor: PhysicalAnchor?
     target_key: String?
     geometry_satisfied: Boolean = false
+    geometry_revision: Integer?
     target_missing_evidence: Boolean = false
 }
 
@@ -54,12 +56,12 @@ surface VirtualTranscript {
         ViewReplaced(view, generation, ordered_keys)
         ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
         PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
-        CommandReplaced(view, token?, generation?, kind?)
+        CommandReplaced(view, token, generation, kind)
         UnitMeasured(view, unit_key, extent)
-        GeometryObserved(view, unit_key, viewport_start_offset)
-        TargetMissingObserved(view, unit_key)
+        GeometryObserved(view, generation, unit_key, viewport_start_offset)
+        TargetMissingObserved(view, generation, unit_key)
         CommandFinished(view, token, generation, result)
-        TransactionSuperseded(view, token)
+        TransactionSuperseded(view, token, generation)
 
     exposes:
         view.rendered_start
@@ -86,6 +88,7 @@ rule ViewReplacementSupersedesActiveTransactionBeforeDiscardingPhysicalState {
     ensures: view.terminal_identities.add(view.active_transaction.identity)
     ensures: view.owner = system
     ensures: view.generation = generation
+    ensures: view.layout_revision = view.layout_revision + 1
     ensures: view.ordered_keys = ordered_keys
     ensures: view.rendered_start = 0
     ensures: view.rendered_end = 0
@@ -100,6 +103,7 @@ rule ViewReplacementDiscardsPhysicalStateWithoutTransaction {
     requires: view.active_transaction = null
     ensures: view.owner = system
     ensures: view.generation = generation
+    ensures: view.layout_revision = view.layout_revision + 1
     ensures: view.ordered_keys = ordered_keys
     ensures: view.rendered_start = 0
     ensures: view.rendered_end = 0
@@ -127,19 +131,17 @@ rule PositionRequestOwnsOneTransaction {
         anchor: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset),
         target_key: unit_key,
         geometry_satisfied: false,
+        geometry_revision: null,
         target_missing_evidence: false
     )
 }
 
 rule CommandReplacementSupersedesPriorTransaction {
-    when: CommandReplaced(view, token?, generation?, kind?)
+    when: CommandReplaced(view, token, generation, kind)
     requires: view.active_transaction != null
-    requires: token? = null
-        or generation? = null
-        or kind? = null
-        or token? != view.active_transaction.identity.token
-        or generation? != view.active_transaction.identity.generation
-        or kind? != view.active_transaction.kind
+    requires: token != view.active_transaction.identity.token
+        or generation != view.active_transaction.identity.generation
+        or kind != view.active_transaction.kind
     requires: not view.terminal_identities.contains(view.active_transaction.identity)
     ensures: CommandFinished(
         view,
@@ -170,23 +172,28 @@ rule MeasurementUpdatesAuthoritativeLayout {
     requires: view.ordered_keys.contains(unit_key)
     requires: extent > 0
     ensures: view.measured_keys.contains(unit_key)
+    ensures: view.layout_revision = view.layout_revision + 1
+    ensures: view.active_transaction = view.active_transaction
 }
 
 rule AnchorGeometryAuthorizesAppliedResult {
-    when: GeometryObserved(view, unit_key, viewport_start_offset)
+    when: GeometryObserved(view, generation, unit_key, viewport_start_offset)
     requires: view.active_transaction != null
+    requires: generation = view.generation
     requires: view.active_transaction.target_key = unit_key
-    requires: view.active_transaction.identity.generation = view.generation
+    requires: view.active_transaction.identity.generation = generation
     requires: absolute(viewport_start_offset - view.active_transaction.anchor.viewport_start_offset)
         <= config.conformance_tolerance
     ensures: view.active_transaction.geometry_satisfied = true
+    ensures: view.active_transaction.geometry_revision = view.layout_revision
 }
 
 rule TargetMissingEvidenceAuthorizesTargetMissingResult {
-    when: TargetMissingObserved(view, unit_key)
+    when: TargetMissingObserved(view, generation, unit_key)
     requires: view.active_transaction != null
+    requires: generation = view.generation
     requires: view.active_transaction.target_key = unit_key
-    requires: view.active_transaction.identity.generation = view.generation
+    requires: view.active_transaction.identity.generation = generation
     ensures: view.active_transaction.target_missing_evidence = true
 }
 
@@ -197,6 +204,7 @@ rule MatchingAppliedFinishTerminatesOwnership {
     requires: generation = view.active_transaction.identity.generation
     requires: result = applied
     requires: view.active_transaction.geometry_satisfied = true
+    requires: view.active_transaction.geometry_revision = view.layout_revision
     requires: not view.terminal_identities.contains(view.active_transaction.identity)
     ensures: TerminalTransactionResult(
         view: view,
@@ -224,13 +232,14 @@ rule MatchingTargetMissingFinishTerminatesOwnership {
     ensures: view.active_transaction = null
 }
 
-rule AppliedFinishWithoutSatisfiedGeometryCannotTerminateOwnership {
+rule AppliedFinishWithoutCurrentGeometryCannotTerminateOwnership {
     when: CommandFinished(view, token, generation, result)
     requires: view.active_transaction != null
     requires: token = view.active_transaction.identity.token
     requires: generation = view.active_transaction.identity.generation
     requires: result = applied
     requires: view.active_transaction.geometry_satisfied = false
+        or view.active_transaction.geometry_revision != view.layout_revision
     ensures: view.active_transaction = view.active_transaction
 }
 
@@ -270,17 +279,28 @@ rule StaleCommandFinishCannotTerminateOwnership {
 }
 
 rule StaleGeometryCannotCompleteTransaction {
-    when: GeometryObserved(view, unit_key, _)
+    when: GeometryObserved(view, generation, unit_key, _)
     requires: view.active_transaction = null
+        or generation != view.generation
         or view.active_transaction.target_key != unit_key
-        or view.active_transaction.identity.generation != view.generation
+        or view.active_transaction.identity.generation != generation
+    ensures: view.active_transaction = view.active_transaction
+}
+
+rule StaleTargetMissingObservationCannotCompleteTransaction {
+    when: TargetMissingObserved(view, generation, unit_key)
+    requires: view.active_transaction = null
+        or generation != view.generation
+        or view.active_transaction.target_key != unit_key
+        or view.active_transaction.identity.generation != generation
     ensures: view.active_transaction = view.active_transaction
 }
 
 rule ExplicitSupersessionRequiresTerminalResult {
-    when: TransactionSuperseded(view, token)
+    when: TransactionSuperseded(view, token, generation)
     requires: view.active_transaction != null
     requires: view.active_transaction.identity.token = token
+    requires: view.active_transaction.identity.generation = generation
     requires: not view.terminal_identities.contains(view.active_transaction.identity)
     ensures: CommandFinished(
         view,

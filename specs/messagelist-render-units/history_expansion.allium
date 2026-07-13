@@ -129,7 +129,12 @@ rule ChangedDeepLinkRequiresCommandSupersession {
     requires: view.pending_command != null
     requires: view.pending_command.kind = jump_to_message
     requires: view.pending_command.message_id != target_message_id
-    ensures: view.pending_command = view.pending_command
+    ensures: PendingCommandSuperseded(
+        view,
+        view.pending_command.token,
+        view.pending_command.issued_view_generation
+    ).emitted()
+    ensures: view.pending_command = null
 }
 
 rule ChangedDeepLinkClearsStaleFailure {

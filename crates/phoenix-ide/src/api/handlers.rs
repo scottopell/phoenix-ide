@@ -8049,6 +8049,93 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn message_history_limit_zero_is_bad_request_for_latest_before_after_and_around() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-history-zero-limit",
+                "history-zero-limit",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                "zero-limit-msg-1",
+                "conv-history-zero-limit",
+                &crate::db::MessageContent::user("m1"),
+                None,
+                None,
+            )
+            .await
+            .expect("add message");
+
+        let latest_err = get_conversation_messages_latest(
+            State(state.clone()),
+            Path("conv-history-zero-limit".to_string()),
+            Query(LatestMessagesQuery { limit: Some(0) }),
+        )
+        .await
+        .expect_err("latest limit=0 should fail");
+        assert!(matches!(latest_err, AppError::BadRequest(_)));
+
+        let before_err = get_conversation_messages(
+            State(state.clone()),
+            Path("conv-history-zero-limit".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: Some(1),
+                after_message_sequence: None,
+                limit: Some(0),
+            }),
+        )
+        .await
+        .expect_err("before limit=0 should fail");
+        assert!(matches!(before_err, AppError::BadRequest(_)));
+
+        let after_err = get_conversation_messages(
+            State(state.clone()),
+            Path("conv-history-zero-limit".to_string()),
+            Query(MessageHistoryQuery {
+                before_message_sequence: None,
+                after_message_sequence: Some(1),
+                limit: Some(0),
+            }),
+        )
+        .await
+        .expect_err("after limit=0 should fail");
+        assert!(matches!(after_err, AppError::BadRequest(_)));
+
+        let around_before_err = get_conversation_messages_around(
+            State(state.clone()),
+            Path(("conv-history-zero-limit".to_string(), 1)),
+            Query(AroundMessagesQuery {
+                before: Some(0),
+                after: Some(1),
+            }),
+        )
+        .await
+        .expect_err("around before=0 should fail");
+        assert!(matches!(around_before_err, AppError::BadRequest(_)));
+
+        let around_after_err = get_conversation_messages_around(
+            State(state),
+            Path(("conv-history-zero-limit".to_string(), 1)),
+            Query(AroundMessagesQuery {
+                before: Some(1),
+                after: Some(0),
+            }),
+        )
+        .await
+        .expect_err("around after=0 should fail");
+        assert!(matches!(around_after_err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
     async fn latest_message_slice_retries_when_transcript_generation_changes_mid_read() {
         let state = make_test_state().await;
         state
