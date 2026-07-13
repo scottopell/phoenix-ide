@@ -12,9 +12,15 @@ import {
 import { useDensity } from '../hooks/useDensity';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildConversationSearchProjection,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
   type ConversationFragmentRevealTarget,
+  type ConversationSearchMatchTarget,
+  type FindSessionCommand,
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
@@ -331,6 +337,15 @@ function EmptyTranscriptState() {
   );
 }
 
+function stableConversationMatchId(match: {
+  sourceId: string;
+  start: number;
+  end: number;
+}): string {
+  return `${match.sourceId}:${match.start}:${match.end}`;
+}
+
+
 function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
   const buffer = useStreamingBuffer(slug);
   useEffect(() => onChange(buffer), [buffer, onChange]);
@@ -364,12 +379,7 @@ function MessageListImpl({
   const { activeScope } = useFocusScope();
   const { pushScope, popScope } = useFocusScopeCommands();
   const { density } = useDensity();
-  const [findOpen, setFindOpen] = useState(false);
-  const [findFocusVersion, setFindFocusVersion] = useState(0);
-  const [findQuery, setFindQuery] = useState('');
-  const [findActiveIndex, setFindActiveIndex] = useState(0);
   const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
-  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
@@ -429,6 +439,35 @@ function MessageListImpl({
     return null;
   }, [historicalUnits]);
 
+  const findSurfaceKey = useMemo(
+    () => createSurfaceKey(`conversation-transcript:${conversationId ?? 'empty'}`),
+    [conversationId],
+  );
+  const [findRevealVersion, setFindRevealVersion] = useState(0);
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<ConversationSearchMatchTarget, HTMLElement | null>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+          break;
+        case 'restore-focus':
+          requestAnimationFrame(() => command.focusOrigin?.focus());
+          break;
+        case 'reveal-match':
+          setFindRevealVersion((version) => version + 1);
+          break;
+        case 'clear-decorations':
+          scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+            .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+          break;
+      }
+    });
+  }, []);
+  const { state: findState, send: sendFind } = useFindSession<ConversationSearchMatchTarget, HTMLElement | null>({
+    onCommands: handleFindCommands,
+  });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
   const findProjection = useMemo(
     () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
@@ -441,30 +480,33 @@ function MessageListImpl({
       : { sources: [], matches: [] }),
     [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded],
   );
-  const findMatches = findProjection.matches;
-  const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
-  const activeFindMatch = findOpen && normalizedFindIndex >= 0 ? findMatches[normalizedFindIndex] ?? null : null;
+  const findSessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableConversationMatchId),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatch = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const activeFindMatchRef = useRef(activeFindMatch);
   activeFindMatchRef.current = activeFindMatch;
   const findSourcesRef = useRef(findProjection.sources);
   findSourcesRef.current = findProjection.sources;
   const activeFindMatchKey = activeFindMatch
-    ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
+    ? `${activeFindMatch.kind}:${activeFindMatch.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}:${findRevealVersion}`
     : null;
   const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
   const activeFindHighlight = useMemo(
-    () => activeFindMatch?.target.kind === 'unit-text' && activeFindMatch.target.fragmentId
+    () => activeFindMatch?.kind === 'unit-text' && activeFindMatch.fragmentId
       ? {
-          unitKey: activeFindMatch.target.unitKey,
-          fragmentId: activeFindMatch.target.fragmentId,
+          unitKey: activeFindMatch.unitKey,
+          fragmentId: activeFindMatch.fragmentId,
           start: activeFindMatch.start,
           end: activeFindMatch.end,
         }
       : null,
     [activeFindMatch],
   );
-  const activeFindRevealTarget = activeFindMatch?.target.kind === 'unit-text'
-    ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.target.sourceId)?.revealTarget ?? null
+  const activeFindRevealTarget = activeFindMatch?.kind === 'unit-text'
+    ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.sourceId)?.revealTarget ?? null
     : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
@@ -479,14 +521,13 @@ function MessageListImpl({
     setPendingRevealRequest((current) => (current?.nonce === request.nonce ? null : current));
   }, []);
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setFindOpen(true);
-    setFindFocusVersion((version) => version + 1);
-  }, []);
-  const closeFind = useCallback(() => {
-    setFindOpen(false);
-    requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
-  }, []);
+    const focusOrigin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sendFind({
+      type: 'open',
+      surface: { key: findSurfaceKey, query: '', matches: [], focusOrigin },
+    });
+  }, [findSurfaceKey, sendFind]);
+  const closeFind = useCallback(() => sendFind({ type: 'close' }), [sendFind]);
 
   useEffect(() => {
     if (!findOpen) return undefined;
@@ -517,26 +558,15 @@ function MessageListImpl({
   useEffect(() => {
     if (findConversationRef.current === conversationId) return;
     findConversationRef.current = conversationId;
-    if (findOpen) setFindOpen(false);
-    if (findQuery) setFindQuery('');
-    if (findActiveIndex !== 0) setFindActiveIndex(0);
-  }, [conversationId, findActiveIndex, findOpen, findQuery]);
-  const changeFindQuery = useCallback((query: string) => {
-    setFindQuery(query);
-    setFindActiveIndex(0);
-  }, []);
-  const nextFindMatch = useCallback(() => {
-    setFindActiveIndex(() => {
-      if (findMatches.length === 0) return 0;
-      return (normalizedFindIndex + 1) % findMatches.length;
-    });
-  }, [findMatches.length, normalizedFindIndex]);
-  const previousFindMatch = useCallback(() => {
-    setFindActiveIndex(() => {
-      if (findMatches.length === 0) return 0;
-      return (normalizedFindIndex - 1 + findMatches.length) % findMatches.length;
-    });
-  }, [findMatches.length, normalizedFindIndex]);
+    sendFind({ type: 'reset' });
+  }, [conversationId, sendFind]);
+  useEffect(() => {
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: findSessionMatches });
+  }, [findOpen, findQuery, findSessionMatches, sendFind]);
+  const changeFindQuery = useCallback((query: string) => sendFind({ type: 'set-query', query }), [sendFind]);
+  const nextFindMatch = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
+  const previousFindMatch = useCallback(() => sendFind({ type: 'previous' }), [sendFind]);
 
   // Chapters are derived here, not in a parent, so they share the exact
   // `historicalUnits` array the virtual transcript renders — a chapter's
@@ -1116,7 +1146,7 @@ function MessageListImpl({
     const match = activeFindMatchRef.current;
     if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
-    if (match.target.kind === 'header-text') {
+    if (match.kind === 'header-text') {
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
         const header = systemPromptRef.current;
         if (!header) return;
@@ -1126,7 +1156,7 @@ function MessageListImpl({
       }, delay));
       return () => timers.forEach(clearTimeout);
     }
-    const unitMatch = match.target;
+    const unitMatch = match;
     if (unitMatch.fragmentId) {
       const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
       const revealTarget: ConversationFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
@@ -1238,9 +1268,9 @@ function MessageListImpl({
           {slug && <OpenFindStreamingBuffer slug={slug} onChange={setFindStreamingBuffer} />}
           <FindBar
             query={findQuery}
-            activeIndex={normalizedFindIndex}
-            matchCount={findMatches.length}
-            focusVersion={findFocusVersion}
+            activeIndex={activeFindIndex}
+            matchCount={findSession?.matches.length ?? 0}
+            focusVersion={findSession?.focusVersion ?? 0}
             onQueryChange={changeFindQuery}
             onNext={nextFindMatch}
             onPrevious={previousFindMatch}

@@ -622,7 +622,7 @@ function addConversationHeaderSource(
 ): void {
   if (text.length === 0) return;
   out.push({
-    id: `${headerKey}:${out.length}`,
+    id: `conversation-header:${headerKey}`,
     kind: 'unit-text',
     unitKey: `${headerKey}-header`,
     unitKind: 'system',
@@ -632,7 +632,7 @@ function addConversationHeaderSource(
     target: {
       kind: 'header-text',
       headerKey,
-      sourceId: `${headerKey}:${out.length}`,
+      sourceId: `conversation-header:${headerKey}`,
       start: 0,
       end: 0,
     },
@@ -651,7 +651,7 @@ function addConversationSource(
 ): void {
   if (text.length === 0) return;
   out.push({
-    id: `${unitKey}:${role}:${out.length}`,
+    id: `${unitKey}:${role}`,
     kind: 'unit-text',
     unitKey,
     unitKind,
@@ -665,7 +665,7 @@ function addConversationSource(
       unitKey,
       unitKind,
       unitIndex,
-      sourceId: `${unitKey}:${role}:${out.length}`,
+      sourceId: `${unitKey}:${role}`,
       ...(fragmentId ? { fragmentId } : {}),
       start: 0,
       end: 0,
