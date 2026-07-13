@@ -79,11 +79,39 @@ export interface ConversationTextFragmentDisplay {
   summaryText: string;
 }
 
+export interface ConversationTextFragmentRevealTarget {
+  kind: 'agent-text' | 'tool-result-keyword-search';
+  key: string;
+}
+
 export interface ConversationTextFragment {
   fragmentId: string;
   semanticText: string;
   display: ConversationTextFragmentDisplay;
-  revealRequestKey: string;
+  revealTarget: ConversationTextFragmentRevealTarget;
+}
+
+export interface KeywordSearchFragmentDisplay {
+  title: string;
+  body?: string;
+}
+
+export interface KeywordSearchFragment {
+  fragmentId: string;
+  semanticText: string;
+  display: KeywordSearchFragmentDisplay;
+  revealTarget: ConversationTextFragmentRevealTarget;
+  kind: 'hit' | 'fallback' | 'empty';
+  path?: string;
+  explanation?: string;
+}
+
+export interface KeywordSearchOutputProjection {
+  hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }>;
+  rawFallback: boolean;
+  empty: boolean;
+  fallbackText: string | null;
+  fragments: KeywordSearchFragment[];
 }
 
 export interface ConversationHeaderSearchMatchTarget {
@@ -105,6 +133,7 @@ export interface ConversationSearchSource extends SearchableSource<ConversationS
   unitIndex: number;
   role: string;
   fragmentId?: string;
+  revealTarget?: ConversationTextFragmentRevealTarget;
 }
 
 export type ConversationSearchProjection = SearchableSourceProjection<
@@ -415,6 +444,7 @@ export function buildConversationSearchProjection(
             source.role,
             source.text,
             source.fragmentId,
+            source.revealTarget,
           );
         }
         break;
@@ -502,6 +532,7 @@ function addConversationSource(
   role: string,
   text: string,
   fragmentId?: string,
+  revealTarget?: ConversationTextFragmentRevealTarget,
 ): void {
   if (text.length === 0) return;
   out.push({
@@ -512,6 +543,7 @@ function addConversationSource(
     unitIndex,
     role,
     ...(fragmentId ? { fragmentId } : {}),
+    ...(revealTarget ? { revealTarget } : {}),
     text,
     target: {
       kind: 'unit-text',
@@ -598,6 +630,83 @@ function toolResultText(result: Message | undefined): string {
   return content?.content || content?.result || content?.error || '';
 }
 
+function keywordSearchToolResultKey(blockId: string): string {
+  return `keyword-search:${blockId}`;
+}
+
+export function buildKeywordSearchOutputProjection(
+  text: string,
+  options: { toolUseId?: string | null } = {},
+): KeywordSearchOutputProjection {
+  const trimmed = text.trim();
+  const revealTarget = {
+    kind: 'tool-result-keyword-search' as const,
+    key: keywordSearchToolResultKey(options.toolUseId ?? ''),
+  };
+  if (
+    trimmed === '' ||
+    trimmed === 'No matches found for the given search terms.' ||
+    trimmed.startsWith('No relevant files found')
+  ) {
+    const fragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-empty',
+      semanticText: 'No relevant files found.',
+      display: { title: 'No relevant files found.' },
+      revealTarget,
+      kind: 'empty',
+    };
+    return { hits: [], rawFallback: false, empty: true, fallbackText: null, fragments: [fragment] };
+  }
+
+  const lines = text.split('\n').filter((l) => l.trim());
+  const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
+  if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
+    const fragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback',
+      semanticText: text,
+      display: { title: 'Raw ripgrep results — LLM filter unavailable', body: text },
+      revealTarget,
+      kind: 'fallback',
+    };
+    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [fragment] };
+  }
+
+  const hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }> = [];
+  for (const line of lines) {
+    const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
+    if (m && m[1] !== undefined && m[2] !== undefined) {
+      const path = m[1].trim();
+      const explanation = m[2].trim();
+      const index = hits.length;
+      hits.push({
+        path,
+        explanation,
+        fragment: {
+          fragmentId: `keyword-search-hit-${index}`,
+          semanticText: `${path}: ${explanation}`,
+          display: { title: path, body: explanation },
+          revealTarget,
+          kind: 'hit',
+          path,
+          explanation,
+        },
+      });
+    }
+  }
+
+  if (hits.length === 0 || hits.length * 3 < lines.length) {
+    const fragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback',
+      semanticText: text,
+      display: { title: 'Raw ripgrep results — LLM filter unavailable', body: text },
+      revealTarget,
+      kind: 'fallback',
+    };
+    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [fragment] };
+  }
+  return { hits, rawFallback: false, empty: false, fallbackText: null, fragments: hits.map((hit) => hit.fragment) };
+}
+
 export function buildAgentTextFragments(
   blocks: readonly ContentBlock[],
   density: 'full' | 'compact',
@@ -612,7 +721,7 @@ export function buildAgentTextFragments(
     out.push({
       fragmentId,
       semanticText,
-      revealRequestKey: fragmentId,
+      revealTarget: { kind: 'agent-text', key: fragmentId },
       display: collapsed
         ? { mode: 'compact-collapsed', summaryText: firstLineSummary(semanticText) }
         : { mode: 'full', summaryText: semanticText },
@@ -626,13 +735,13 @@ function agentTurnSources(
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
-): Array<{ role: string; text: string; fragmentId?: string }> {
+): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationTextFragmentRevealTarget }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-  const out: Array<{ role: string; text: string; fragmentId?: string }> = [];
+  const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationTextFragmentRevealTarget }> = [];
   for (const fragment of buildAgentTextFragments(blocks, density, { forceExpandedText })) {
-    out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId });
+    out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
   }
   blocks.forEach((block, index) => {
     if (block.type === 'tool_use') {
@@ -640,7 +749,14 @@ function agentTurnSources(
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
       if (densityToolDetailsVisible(block.name, density)) {
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-        out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
+        const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
+        if (block.name === 'keyword_search') {
+          for (const fragment of buildKeywordSearchOutputProjection(resultText, { toolUseId: block.id }).fragments) {
+            out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+          }
+        } else {
+          out.push({ role: `tool-use-result-${index}`, text: resultText });
+        }
       }
     }
   });

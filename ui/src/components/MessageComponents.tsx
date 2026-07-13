@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, type ConversationTextFragment } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, type ConversationTextFragment, type ConversationTextFragmentRevealTarget, type KeywordSearchFragment } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -829,6 +829,7 @@ function CompactToolStripImpl({
 export interface AgentTextRevealRequest {
   unitKey: string;
   fragmentId: string;
+  revealTarget: ConversationTextFragmentRevealTarget;
   nonce: number;
 }
 
@@ -995,6 +996,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   const [expandedFragmentIds, setExpandedFragmentIds] = useState<Set<string>>(() => new Set());
   useEffect(() => {
     if (!revealRequest || revealRequest.unitKey !== unitKey) return;
+    if (revealRequest.revealTarget.kind !== 'agent-text') return;
     setExpandedFragmentIds((current) => {
       if (current.has(revealRequest.fragmentId)) return current;
       const next = new Set(current);
@@ -1165,16 +1167,20 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const showMissingResult =
                 result === undefined && !(isLatestAgentMessage && activeToolUseId !== undefined);
               return (
-                <ToolUseBlock
-                  key={block.id || i}
-                  block={block}
-                  result={result}
-                  onOpenFile={onOpenFile}
-                  workScopeKey={workScopeKey}
-                  knownResultIds={knownResultIds}
-                  toolStartedAtMs={toolStartedAtMs}
-                  showMissingResult={showMissingResult}
-                />
+                  <ToolUseBlock
+                    key={block.id || i}
+                    block={block}
+                    result={result}
+                    onOpenFile={onOpenFile}
+                    workScopeKey={workScopeKey}
+                    knownResultIds={knownResultIds}
+                    toolStartedAtMs={toolStartedAtMs}
+                    showMissingResult={showMissingResult}
+                    revealRequest={revealRequest}
+                    activeHighlight={activeHighlight}
+                    onRevealHandled={onRevealHandled}
+                  />
+
               );
             }
             return null;
@@ -1239,6 +1245,9 @@ interface ToolUseBlockProps {
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: AgentTextHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
    *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
@@ -2000,79 +2009,30 @@ export function SearchResultsView({
   );
 }
 
-// keyword_search returns LLM-filtered text shaped as `path: explanation` per line,
-// or — when the filter LLM is unavailable — raw ripgrep output (with line numbers
-// and context separators). Detect which and render accordingly.
-type KeywordHit = { path: string; explanation: string };
-
 // eslint-disable-next-line react-refresh/only-export-components
-export function parseKeywordSearchOutput(text: string): {
-  hits: KeywordHit[];
-  notes: string[];
-  rawFallback: boolean;
-  empty: boolean;
-} {
-  // Bracketed `[...]` lines are coverage/incompleteness notes (terms dropped to
-  // fit the budget, results truncated, broad terms skipped). Pull them out
-  // first so they neither pollute the hit parser (a note like `[note: ...]`
-  // otherwise matches the `path: explanation` shape) nor the empty/fallback
-  // heuristics — and so the renderer can surface them.
-  const notes: string[] = [];
-  const body: string[] = [];
-  for (const line of text.split('\n')) {
-    const t = line.trim();
-    if (!t) continue;
-    if (t.startsWith('[') && t.endsWith(']')) {
-      notes.push(t.slice(1, -1));
-    } else {
-      body.push(line);
-    }
-  }
+export function parseKeywordSearchOutput(text: string) {
+  return buildKeywordSearchOutputProjection(text);
+}
 
-  const trimmed = body.join('\n').trim();
-  if (
-    trimmed === '' ||
-    trimmed === 'No matches found for the given search terms.' ||
-    trimmed.startsWith('No relevant files found')
-  ) {
-    return { hits: [], notes, rawFallback: false, empty: true };
+function renderKeywordSearchFragmentText(fragment: KeywordSearchFragment, highlight: AgentTextHighlight | null): React.ReactNode {
+  if (!highlight) {
+    return fragment.display.body ?? fragment.display.title;
   }
-
-  const lines = body.filter((l) => l.trim());
-  // Raw ripgrep -C output has `path:NN:` or `path-NN-` per line plus `--` separators.
-  // If a meaningful fraction of lines look like that, treat as fallback.
-  const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
-  if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
-    return { hits: [], notes, rawFallback: true, empty: false };
-  }
-
-  const hits: KeywordHit[] = [];
-  for (const line of lines) {
-    // path is everything up to the first `: ` (with a trailing space), and must
-    // not itself contain a colon — the LLM-filter prompt's output uses absolute
-    // POSIX paths with `: ` as the separator before the explanation.
-    const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
-    if (m && m[1] !== undefined && m[2] !== undefined) {
-      hits.push({ path: m[1].trim(), explanation: m[2].trim() });
-    }
-  }
-
-  // If very few lines parsed cleanly, the output likely isn't the LLM-filtered
-  // shape — bail to plain rendering rather than show a tiny misleading list.
-  if (hits.length === 0 || hits.length * 3 < lines.length) {
-    return { hits: [], notes, rawFallback: true, empty: false };
-  }
-  return { hits, notes, rawFallback: false, empty: false };
+  return renderHighlightedText(fragment.semanticText, highlight.start, highlight.end);
 }
 
 export function KeywordSearchView({
   rawText,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
 }: {
   rawText: string;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
 }) {
-  const parsed = useMemo(() => parseKeywordSearchOutput(rawText), [rawText]);
+  const parsed = useMemo(() => buildKeywordSearchOutputProjection(rawText, { toolUseId }), [rawText, toolUseId]);
 
   // Coverage/incompleteness notes (terms dropped, results truncated, broad
   // terms skipped). Surfaced in every branch so the signal is never silently
@@ -2091,20 +2051,20 @@ export function KeywordSearchView({
   if (parsed.empty) {
     return (
       <div className="keyword-search-results">
-        <div className="search-results-empty">No relevant files found.</div>
-        {notesEl}
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>No relevant files found.</div>
       </div>
     );
   }
 
   if (parsed.rawFallback) {
+    const fragment = parsed.fragments[0] ?? null;
+    const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
     return (
       <div className="keyword-search-results keyword-search-raw">
-        <div className="keyword-search-fallback-note">
+        <div className="keyword-search-fallback-note" data-fragment-id={fragment?.fragmentId}>
           Raw ripgrep results — LLM filter unavailable
         </div>
-        {notesEl}
-        <pre className="keyword-search-raw-text">{rawText}</pre>
+        <pre className="keyword-search-raw-text">{highlight && fragment ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : rawText}</pre>
       </div>
     );
   }
@@ -2118,24 +2078,27 @@ export function KeywordSearchView({
       </div>
       {notesEl}
       <div className="keyword-search-list">
-        {parsed.hits.map((hit, i) => (
-          <div key={i} className="keyword-search-hit">
-            {onOpenFile ? (
-              <button
-                type="button"
-                className="keyword-search-filepath"
-                onClick={() => onOpenFile(hit.path, new Set(), 0)}
-              >
-                {hit.path}
-              </button>
-            ) : (
-              <span className="keyword-search-filepath keyword-search-filepath-static">
-                {hit.path}
-              </span>
-            )}
-            <div className="keyword-search-explanation">{hit.explanation}</div>
-          </div>
-        ))}
+        {parsed.hits.map((hit) => {
+          const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
+          return (
+            <div key={hit.fragment.fragmentId} className="keyword-search-hit" data-fragment-id={hit.fragment.fragmentId}>
+              {onOpenFile ? (
+                <button
+                  type="button"
+                  className="keyword-search-filepath"
+                  onClick={() => onOpenFile(hit.path, new Set(), 0)}
+                >
+                  {highlight ? renderKeywordSearchFragmentText(hit.fragment, highlight) : hit.path}
+                </button>
+              ) : (
+                <span className="keyword-search-filepath keyword-search-filepath-static">
+                  {highlight ? renderKeywordSearchFragmentText(hit.fragment, highlight) : hit.path}
+                </span>
+              )}
+              {!highlight && <div className="keyword-search-explanation">{hit.explanation}</div>}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -2143,7 +2106,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2207,6 +2170,21 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;
   const resultLength = resultText.length;
+  const keywordSearchProjection = useMemo(
+    () => (name === 'keyword_search' ? buildKeywordSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
+  const keywordSearchRevealKey = keywordSearchProjection?.fragments[0]?.revealTarget.key ?? null;
+  const keywordSearchActiveHighlight = activeHighlight && activeHighlight.fragmentId && revealRequest?.revealTarget.kind === 'tool-result-keyword-search'
+    ? activeHighlight
+    : activeHighlight;
+
+  useEffect(() => {
+    if (!revealRequest) return;
+    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search') return;
+    if (revealRequest.revealTarget.key !== keywordSearchRevealKey) return;
+    onRevealHandled?.(revealRequest);
+  }, [keywordSearchRevealKey, onRevealHandled, revealRequest]);
   
   // Check if this is an image result.
   // 1. Typed `images` channel (read_image — single source of truth, no
@@ -2364,14 +2342,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'search' && !isError ? (
             <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
           ) : name === 'keyword_search' && !isError ? (
-            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} />
-          ) : name === 'read_file' && !isError && readFileMetadata ? (
-            <ReadFileResultView
-              input={input as Record<string, unknown>}
-              rawText={resultText}
-              metadata={readFileMetadata}
-              onOpenFile={onOpenFile}
-            />
+            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={keywordSearchActiveHighlight} />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

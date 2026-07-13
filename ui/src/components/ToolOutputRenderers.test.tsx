@@ -9,6 +9,7 @@ import {
   KeywordSearchView,
   __readFileResultTestables,
 } from './MessageComponents';
+import { buildKeywordSearchOutputProjection } from './viewer-find';
 
 describe('parseSearchOutput', () => {
   it('parses path:lineno: content lines', () => {
@@ -59,6 +60,40 @@ describe('parseSearchOutput', () => {
   });
 });
 
+describe('buildKeywordSearchOutputProjection parity', () => {
+  it('matches parseKeywordSearchOutput for structured hits and stable reveal metadata', () => {
+    const text = [
+      '/abs/path/to/foo.rs: implements the foo state machine, primary hit',
+      '/abs/path/to/bar.rs: helper utilities referenced from foo',
+    ].join('\n');
+    const parsed = parseKeywordSearchOutput(text);
+    const built = buildKeywordSearchOutputProjection(text, { toolUseId: 'tool-1' });
+    expect(built.empty).toBe(parsed.empty);
+    expect(built.rawFallback).toBe(parsed.rawFallback);
+    expect(built.hits.map((hit) => ({ path: hit.path, explanation: hit.explanation }))).toEqual(
+      parsed.hits.map((hit) => ({ path: hit.path, explanation: hit.explanation }))
+    );
+    expect(built.fragments.map((fragment) => fragment.fragmentId)).toEqual(['keyword-search-hit-0', 'keyword-search-hit-1']);
+    expect(built.fragments.every((fragment) => fragment.revealTarget.kind === 'tool-result-keyword-search')).toBe(true);
+    expect(built.fragments.every((fragment) => fragment.revealTarget.key === 'keyword-search:tool-1')).toBe(true);
+  });
+
+  it('builds a searchable fallback fragment for raw output', () => {
+    const raw = [
+      'src/foo.rs:1:hit one',
+      'src/foo.rs-2-ctx',
+      '--',
+      'src/bar.rs:3:hit two',
+      'src/bar.rs-4-ctx',
+    ].join('\n');
+    const built = buildKeywordSearchOutputProjection(raw, { toolUseId: 'tool-2' });
+    expect(built.rawFallback).toBe(true);
+    expect(built.fragments).toHaveLength(1);
+    expect(built.fragments[0]?.semanticText).toBe(raw);
+    expect(built.fragments[0]?.fragmentId).toBe('keyword-search-fallback');
+  });
+});
+
 describe('parseKeywordSearchOutput', () => {
   it('parses path: explanation pairs (LLM-filtered shape)', () => {
     const text = [
@@ -69,10 +104,11 @@ describe('parseKeywordSearchOutput', () => {
     expect(parsed.empty).toBe(false);
     expect(parsed.rawFallback).toBe(false);
     expect(parsed.hits).toHaveLength(2);
-    expect(parsed.hits[0]).toEqual({
+    expect(parsed.hits[0]).toMatchObject({
       path: '/abs/path/to/foo.rs',
       explanation: 'implements the foo state machine, primary hit',
     });
+    expect(parsed.hits[0]?.fragment.fragmentId).toBe('keyword-search-hit-0');
   });
 
   it('recognizes "No relevant files found" as empty', () => {
@@ -212,6 +248,20 @@ describe('KeywordSearchView', () => {
     '/abs/path/to/foo.rs: implements the foo state machine',
     '/abs/path/to/bar.rs: helper utilities for foo',
   ].join('\n');
+
+  it('marks exact active fragment occurrence without duplicating explanation text', () => {
+    const { container } = render(
+      <KeywordSearchView
+        rawText={llm}
+        onOpenFile={undefined}
+        toolUseId="tool-1"
+        activeHighlight={{ fragmentId: 'keyword-search-hit-1', start: 0, end: 19 }}
+      />
+    );
+    const activeMark = container.querySelector('.viewer-find-inline-match--active');
+    expect(activeMark?.textContent).toBe('/abs/path/to/bar.rs');
+    expect(screen.queryByText('helper utilities for foo')).toBeNull();
+  });
 
   it('renders LLM-filtered hits with explanations', () => {
     const onOpenFile = vi.fn();

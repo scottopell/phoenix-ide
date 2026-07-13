@@ -14,6 +14,7 @@ import {
   FindBar,
   buildConversationSearchProjection,
   useViewerFindKeyboardShortcut,
+  type ConversationTextFragmentRevealTarget,
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
@@ -1122,7 +1123,14 @@ function MessageListImpl({
     }
     const unitMatch = match.target;
     if (unitMatch.fragmentId) {
-      setPendingRevealRequest({ unitKey: unitMatch.unitKey, fragmentId: unitMatch.fragmentId, nonce: Date.now() });
+      const source = findProjection.sources.find((candidate) => candidate.id === unitMatch.sourceId);
+      const revealTarget: ConversationTextFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
+      setPendingRevealRequest({
+        unitKey: unitMatch.unitKey,
+        fragmentId: unitMatch.fragmentId,
+        revealTarget,
+        nonce: Date.now(),
+      });
     }
     transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {

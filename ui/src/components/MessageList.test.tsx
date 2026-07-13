@@ -51,7 +51,7 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string }) => void) | undefined }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search'; key: string } } | null; activeHighlight?: { fragmentId: string; start: number; end: number } | null; onRevealHandled?: ((request: { nonce: number; fragmentId: string; unitKey: string; revealTarget: { kind: 'agent-text' | 'tool-result-keyword-search'; key: string } }) => void) | undefined }) => {
       agentRenderCounter.count++;
       agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
       if (revealRequest && onRevealHandled) onRevealHandled(revealRequest);
@@ -3015,6 +3015,49 @@ describe('handleTotalListHeightChanged', () => {
 
 
 
+
+it('find navigation carries keyword_search fragment reveal target for offscreen navigation', async () => {
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-keyword-search',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-keyword-1',
+        name: 'keyword_search',
+        display: 'keyword search alpha',
+        input: { query: 'alpha', search_terms: ['alpha'] },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-keyword-1', result: '/abs/path/to/bar.rs: helper utilities for alpha' },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-keyword-search"
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'helper utilities' } });
+
+  await waitFor(() => {
+    const call = agentMessageProps.at(-1);
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = agentMessageProps.at(-1);
+  expect(renderedAgent?.message.message_id).toBe('agent-keyword-search');
+  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+});
 
 it('find navigation requests reveal for compact hidden assistant second-line matches', async () => {
   const messages: Message[] = [
