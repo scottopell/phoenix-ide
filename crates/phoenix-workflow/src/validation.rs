@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::types::{
     BarrierId, BarrierMemberDecl, EffectDecl, EffectId, EffectRole, Generation, ReceiptFamily,
-    TransitionPlan, WorkflowProfile,
+    TransitionPlan, WorkflowProfile, WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,10 @@ pub enum PlanError {
         actual: Generation,
     },
     InvalidatesManualResolutionEffect(EffectId),
+    InvalidStatusTransition {
+        current: WorkflowStatus,
+        next: WorkflowStatus,
+    },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -69,9 +73,11 @@ pub fn declared_receipt_family<I>(effect: &EffectDecl<I>) -> ReceiptFamily {
 /// Returns [`PlanError`] when codecs are missing, references are dangling, barriers violate
 /// membership rules, or dependencies contain a cycle.
 pub fn validate_plan<P: WorkflowProfile>(
+    current_status: WorkflowStatus,
     plan: &TransitionPlan<P>,
     barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
 ) -> Result<(), PlanError> {
+    validate_status_transition(current_status, plan.next_status)?;
     validate_plan_codecs(plan)?;
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;
@@ -80,6 +86,36 @@ pub fn validate_plan<P: WorkflowProfile>(
     validate_barrier_members(plan, &members_by_barrier)?;
     validate_dependency_cycles(plan)?;
     Ok(())
+}
+
+fn validate_status_transition(
+    current_status: WorkflowStatus,
+    next_status: WorkflowStatus,
+) -> Result<(), PlanError> {
+    let valid = match current_status {
+        WorkflowStatus::Active => matches!(
+            next_status,
+            WorkflowStatus::Active | WorkflowStatus::Cancelling | WorkflowStatus::Cancelled
+        ),
+        WorkflowStatus::Cancelling => {
+            matches!(
+                next_status,
+                WorkflowStatus::Cancelling | WorkflowStatus::Cancelled
+            )
+        }
+        WorkflowStatus::Cancelled
+        | WorkflowStatus::DeletionPending
+        | WorkflowStatus::Completed
+        | WorkflowStatus::Failed => next_status == current_status,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(PlanError::InvalidStatusTransition {
+            current: current_status,
+            next: next_status,
+        })
+    }
 }
 
 fn validate_plan_codecs<P: WorkflowProfile>(plan: &TransitionPlan<P>) -> Result<(), PlanError> {
@@ -92,6 +128,18 @@ fn validate_plan_codecs<P: WorkflowProfile>(plan: &TransitionPlan<P>) -> Result<
     for effect in &plan.effects {
         if effect.codec.family.is_empty() {
             return Err(PlanError::MissingCodec("effect"));
+        }
+    }
+    for barrier in &plan.barriers {
+        if barrier.reducer_event_codec.family.is_empty() {
+            return Err(PlanError::MissingCodec("barrier"));
+        }
+    }
+    if let Some(owed_acceptances) = &plan.owed_acceptances {
+        for owed in owed_acceptances {
+            if owed.event_codec.family.is_empty() {
+                return Err(PlanError::MissingCodec("owed_acceptance"));
+            }
         }
     }
     Ok(())

@@ -11,14 +11,14 @@ use super::{
     deadline_matches_exactly, evidence_matches_resource, fence_accepts, forgotten_terminal_payload,
     inbox_contains_registration_barrier, lifecycle_fence, manual_choices, profile,
     project_runtime_availability, protocol, registration_decision, registration_fence,
-    registration_receipt, shadow_comparison, terminal_payload_from_evidence, transfer_continuation,
-    BashResourceIdentity, BashTerminalEvidence, BashTerminalStatus, FenceStatus,
-    ObserveHandleIntent, RuntimeAvailability, RuntimeAvailabilityProjection, TmuxResourceIdentity,
-    TmuxTerminalEvidence, TmuxTerminalStatus, WakeCancellationOutcome, WakeCancellationReason,
-    WakeForgottenReason, WakeManualPayload, WakeProfile, WakeRegistrationIntent,
-    WakeRegistrationReceipt, WakeResourceIdentity, WakeShadowComparisonKind, WakeTerminalEvidence,
-    WakeTerminalPayload, WorkScopeIdentity, WorkScopeKind, REGISTRATION_BARRIER_ID,
-    REGISTRATION_EFFECT_ID,
+    registration_receipt, shadow_comparison, terminal_codec, terminal_payload_from_evidence,
+    transfer_continuation, BashResourceIdentity, BashTerminalEvidence, BashTerminalStatus,
+    FenceStatus, ObserveHandleIntent, RuntimeAvailability, RuntimeAvailabilityProjection,
+    TmuxResourceIdentity, TmuxTerminalEvidence, TmuxTerminalStatus, WakeCancellationOutcome,
+    WakeCancellationReason, WakeForgottenReason, WakeManualPayload, WakeProfile,
+    WakeRegistrationIntent, WakeRegistrationReceipt, WakeResourceIdentity,
+    WakeShadowComparisonKind, WakeTerminalEvidence, WakeTerminalPayload, WorkScopeIdentity,
+    WorkScopeKind, REGISTRATION_BARRIER_ID, REGISTRATION_EFFECT_ID,
 };
 
 fn scope() -> WorkScopeIdentity {
@@ -297,9 +297,30 @@ fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload
         .cancel_with_compensation(&request, &BTreeMap::new())
         .expect("pure cancellation succeeds");
     assert_eq!(result.outcome, CommitOutcome::Committed);
+    assert_eq!(workflow.status, crate::WorkflowStatus::Cancelled);
+    assert!(workflow.snapshot.cancelled);
+    assert!(matches!(
+        workflow.snapshot.terminal,
+        Some(WakeTerminalPayload::Cancelled { .. })
+    ));
+    assert_eq!(result.reducer_events.len(), 1);
+    assert_eq!(workflow.reducer_inbox.len(), 1);
+    assert_eq!(result.reducer_events[0].event_codec, terminal_codec());
+    assert!(matches!(
+        result.reducer_events[0].payload,
+        crate::ReducerInboxPayload::Receipt(WakeTerminalPayload::Cancelled { .. })
+    ));
+    assert!(workflow.owed_acceptances.is_empty());
     assert_eq!(
         workflow.effects[&REGISTRATION_EFFECT_ID].status,
         EffectStatus::Invalidated
+    );
+    assert_eq!(
+        workflow.effects[&REGISTRATION_EFFECT_ID]
+            .declaration
+            .intent
+            .resource,
+        bash_identity("b-10")
     );
 }
 
@@ -343,7 +364,9 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
         Timestamp(5),
         Some(attempt.id),
         crate::ReceiptOrigin::Execution,
+        terminal_codec(),
         terminal.clone(),
+        terminal_codec(),
         terminal.clone(),
     );
     assert_eq!(workflow.snapshot.terminal, None);
@@ -518,7 +541,9 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
         Timestamp(5),
         Some(attempt.id),
         crate::ReceiptOrigin::Execution,
+        terminal_codec(),
         terminal.clone(),
+        terminal_codec(),
         terminal,
     );
     assert_eq!(accepted.outcome, AuthorityOutcome::Authorized);

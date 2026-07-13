@@ -5,9 +5,9 @@ use crate::{
     EffectAmbiguity, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole, EffectState,
     EffectStatus, Generation, ManualChoice, ManualChoiceKind, ObservationRecord,
     OwedAcceptanceDecl, ProfileRef, ProtocolSelection, ReceiptFamily, ReducerDecision,
-    ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, SemanticAuthority,
-    ShadowDivergenceKind, Timestamp, TransitionPlan, Version, WorkflowProfile, WorkflowState,
-    WorkflowStatus,
+    ReducerInboxDecl, ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload,
+    SemanticAuthority, ShadowDivergenceKind, Timestamp, TransitionPlan, Version, WorkflowProfile,
+    WorkflowState, WorkflowStatus,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -16,6 +16,8 @@ pub const SNAPSHOT_CODEC_FAMILY: &str = "wake.snapshot";
 pub const EVENT_CODEC_FAMILY: &str = "wake.event";
 pub const INTENT_CODEC_FAMILY: &str = "wake.intent";
 pub const MANUAL_CODEC_FAMILY: &str = "wake.manual";
+pub const BARRIER_CODEC_FAMILY: &str = "wake.barrier";
+pub const TERMINAL_CODEC_FAMILY: &str = "wake.terminal";
 pub const REGISTRATION_BARRIER_ID: BarrierId = BarrierId(1);
 pub const REGISTRATION_EFFECT_ID: EffectId = EffectId(1);
 pub const REGISTRATION_BARRIER_KIND: &str = "registration_observed";
@@ -392,6 +394,22 @@ pub fn manual_codec() -> CodecRef {
 }
 
 #[must_use]
+pub fn barrier_codec() -> CodecRef {
+    CodecRef {
+        family: BARRIER_CODEC_FAMILY,
+        version: PROTOCOL_VERSION,
+    }
+}
+
+#[must_use]
+pub fn terminal_codec() -> CodecRef {
+    CodecRef {
+        family: TERMINAL_CODEC_FAMILY,
+        version: PROTOCOL_VERSION,
+    }
+}
+
+#[must_use]
 pub fn barrier_events(receipt: WakeRegistrationReceipt) -> BTreeMap<BarrierId, WakeBarrierEvent> {
     BTreeMap::from([(
         REGISTRATION_BARRIER_ID,
@@ -454,6 +472,7 @@ pub fn registration_decision(
         ReducerDecision {
             expected_workflow_version,
             plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
                 snapshot: registration_snapshot(intent, fence_version),
                 snapshot_codec: snapshot_codec(),
                 event: WakeRegistrationEvent::Registered,
@@ -473,6 +492,7 @@ pub fn registration_decision(
                 dependencies: vec![],
                 barriers: vec![BarrierDecl {
                     barrier_id: REGISTRATION_BARRIER_ID,
+                    reducer_event_codec: barrier_codec(),
                 }],
                 barrier_members: vec![BarrierMemberDecl {
                     barrier_id: REGISTRATION_BARRIER_ID,
@@ -524,21 +544,30 @@ pub fn cancellation_request(
         .collect::<Vec<_>>();
     let mut next_snapshot = workflow.snapshot.clone();
     next_snapshot.cancelled = true;
-    next_snapshot.terminal = Some(cancelled_terminal_payload(
+    let cancelled_terminal = cancelled_terminal_payload(
         next_snapshot.contract_id,
         next_snapshot.resource,
         WakeCancellationReason::ExplicitCancel,
         resolved_at,
-    ));
+    );
+    next_snapshot.terminal = Some(cancelled_terminal.clone());
     WakeCancellationOutcome::Request(Box::new(CancellationRequest {
         expected_workflow_version: workflow.version,
-        next_snapshot,
+        next_snapshot: next_snapshot.clone(),
         next_snapshot_codec: snapshot_codec(),
         event: WakeRegistrationEvent::CancelRequested,
         event_codec: event_codec(),
         invalidations,
+        reducer_inbox_events: vec![ReducerInboxDecl {
+            effect_id: None,
+            barrier_id: None,
+            kind: ReducerInboxKind::ReceiptAccepted,
+            event_codec: terminal_codec(),
+            payload: ReducerInboxPayload::Receipt(cancelled_terminal),
+        }],
         compensation_plan: TransitionPlan {
-            snapshot: workflow.snapshot.clone(),
+            next_status: WorkflowStatus::Cancelled,
+            snapshot: next_snapshot.clone(),
             snapshot_codec: snapshot_codec(),
             event: WakeRegistrationEvent::CancelRequested,
             event_codec: event_codec(),
@@ -728,6 +757,7 @@ pub fn acceptance_owed_decl(
     Some(OwedAcceptanceDecl {
         reducer_inbox_id: inbox_id,
         source_kind: "wake_terminal_receipt",
+        event_codec: terminal_codec(),
         event: terminal.clone(),
     })
 }

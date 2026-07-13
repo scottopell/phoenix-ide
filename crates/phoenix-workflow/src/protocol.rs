@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::types::{
     DeliveryStatus, DivergenceSeverity, DrainCategoryEvidence, DrainProof, EffectRole,
     EffectStatus, ExternalAcceptanceBinding, ExternalAcceptanceKey, ExternalAcceptanceOutcome,
-    ExternalAcceptanceReceipt, ProtocolSelection, ResolutionStatus, WorkflowId, WorkflowProfile,
-    WorkflowState, WorkflowStatus,
+    ExternalAcceptanceReceipt, ProtocolSelection, ResolutionStatus, ShadowDivergenceResolution,
+    WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,11 +128,18 @@ pub fn drain_proof<P: WorkflowProfile>(workflow: &WorkflowState<P>) -> DrainProo
         "blocking_divergences",
         blocking_divergences_evidence(workflow),
     );
+    let complete = exact_drain_categories()
+        .into_iter()
+        .all(|category| categories.contains_key(category))
+        && categories.len() == exact_drain_categories().len();
     DrainProof {
         profile: workflow.binding.accepted_protocol().profile.clone(),
         protocol: workflow.binding.accepted_protocol().clone(),
         selector: workflow.binding.accepted_protocol().selector,
+        query_identity: "phoenix.workflow.drain",
+        query_version: 1,
         authority: workflow.semantic_authority,
+        complete,
         categories,
     }
 }
@@ -279,12 +286,24 @@ fn blocking_divergences_evidence<P: WorkflowProfile>(
         count: workflow
             .shadow_divergences
             .iter()
-            .filter(|divergence| divergence.severity == DivergenceSeverity::Blocking)
+            .filter(|divergence| {
+                divergence.severity == DivergenceSeverity::Blocking
+                    && matches!(
+                        divergence.resolution,
+                        ShadowDivergenceResolution::Unresolved
+                    )
+            })
             .count(),
         identities: workflow
             .shadow_divergences
             .iter()
-            .filter(|divergence| divergence.severity == DivergenceSeverity::Blocking)
+            .filter(|divergence| {
+                divergence.severity == DivergenceSeverity::Blocking
+                    && matches!(
+                        divergence.resolution,
+                        ShadowDivergenceResolution::Unresolved
+                    )
+            })
             .map(|divergence| divergence.evidence_identity.clone())
             .collect(),
     }
