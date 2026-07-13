@@ -1097,7 +1097,7 @@ impl Database {
                 work_scope_id, repo_owner, repo_name, pr_number, provenance,
                 latest_observed_repository_identity, latest_observed_branch_name,
                 inference_generation, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, 'pinned', ?5, ?6, 0, ?7)
+             ) VALUES (?1, ?2, ?3, ?4, 'pinned', ?5, ?6, 2, ?7)
              ON CONFLICT(work_scope_id) DO UPDATE SET
                 repo_owner = excluded.repo_owner,
                 repo_name = excluded.repo_name,

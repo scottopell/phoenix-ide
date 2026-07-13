@@ -48,6 +48,7 @@ vi.mock('../api', () => ({
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
+    getPrStatus: vi.fn(),
     createPrAutoFixContext: vi
       .fn()
       .mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
@@ -123,6 +124,12 @@ function primaryCount() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(api.getPrStatus).mockResolvedValue({
+    found: false,
+    refresh: { state: 'fresh', stale: false, last_attempted_at: '', last_refreshed_at: '' },
+    associated_prs: [],
+    work_change: cleanWorkChange(),
+  });
 });
 
 describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
@@ -507,7 +514,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(screen.getByText(/Uncommitted changes found/i)).toBeInTheDocument();
     expect(primaryCount()).toBe(1);
   });
-  it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', () => {
+  it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', async () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-1"
@@ -526,7 +533,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
 
     // Single click marks merged — no enable-then-cleanup state.
     fireEvent.click(clean);
-    expect(api.markMerged).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.markMerged).toHaveBeenCalledTimes(1));
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 });
@@ -551,7 +558,7 @@ describe('WorkControlBar — checking / loading', () => {
 });
 
 describe('WorkControlBar — terminal cleanup actions', () => {
-  it('Clean up is a single click that calls api.markMerged (no two-step)', () => {
+  it('Clean up is a single click that calls api.markMerged (no two-step)', async () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-1"
@@ -562,11 +569,11 @@ describe('WorkControlBar — terminal cleanup actions', () => {
       />,
     );
     fireEvent.click(screen.getByTestId('clean-up-button'));
-    expect(api.markMerged).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.markMerged).toHaveBeenCalledTimes(1));
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 
-  it('Abandon confirms then calls api.abandonTask', () => {
+  it('Abandon confirms then calls api.abandonTask', async () => {
     const confirmSpy = vi.fn().mockReturnValue(true);
     const prevConfirm = window.confirm;
     window.confirm = confirmSpy;
@@ -582,7 +589,7 @@ describe('WorkControlBar — terminal cleanup actions', () => {
       );
       fireEvent.click(screen.getByTestId('abandon-button'));
       expect(confirmSpy).toHaveBeenCalled();
-      expect(api.abandonTask).toHaveBeenCalledWith('conv-1');
+      await waitFor(() => expect(api.abandonTask).toHaveBeenCalledWith('conv-1'));
     } finally {
       window.confirm = prevConfirm;
     }

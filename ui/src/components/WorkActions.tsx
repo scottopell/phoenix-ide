@@ -183,6 +183,19 @@ export function WorkControlBar({
 
   if (!disposition.visible) return null;
 
+  const terminalActionStillSafe = async (): Promise<boolean> => {
+    const latest = await api.getPrStatus(conversationId);
+    const actionable = (latest.associated_prs ?? []).filter(
+      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+    );
+    if (actionable.length > 1 && !latest.active_pr) {
+      requestActivePrSelectorOpen();
+      setError('Select an active PR before cleaning up or abandoning this task.');
+      return false;
+    }
+    return true;
+  };
+
   const note = disposition.note;
   const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
   const addressFeedbackAriaLabel = canShowPrDiff
@@ -264,6 +277,7 @@ export function WorkControlBar({
                 setError(null);
                 setMarkingMerged(true);
                 try {
+                  if (!(await terminalActionStillSafe())) return;
                   await api.markMerged(conversationId);
                 } catch (err) {
                   setError(err instanceof Error ? err.message : 'Failed to mark as merged');
@@ -291,6 +305,7 @@ export function WorkControlBar({
                 setError(null);
                 setAbandoning(true);
                 try {
+                  if (!(await terminalActionStillSafe())) return;
                   await api.abandonTask(conversationId);
                 } catch (err) {
                   setError(err instanceof Error ? err.message : 'Failed to abandon task');

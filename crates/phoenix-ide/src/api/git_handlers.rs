@@ -76,12 +76,17 @@ fn github_repo_identifier_from_worktree(path: &FsPath) -> Option<String> {
     crate::runtime::pr_status_poll::github_repo_identifier(path)
 }
 
+fn github_repo_identity_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 fn active_pr_diff_repo_mismatch_reason(
     worktree_repo_identity: Option<&str>,
     selected_repo_identity: &str,
 ) -> Option<String> {
     match worktree_repo_identity {
-        Some(repo) if repo == selected_repo_identity => None,
+        Some(worktree_repo_identity)
+            if github_repo_identity_eq(worktree_repo_identity, selected_repo_identity) => None,
         Some(repo) => Some(format!(
             "PR-specific diff unavailable for selected repository {selected_repo_identity}; local worktree is attached to {repo}"
         )),

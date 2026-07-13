@@ -36,6 +36,7 @@ import { WorkControlBar } from '../components/WorkActions';
 import {
   useConversationEventCursorRef,
   useConversationView,
+  useWorkScope,
   useCreateConversationWithStore,
   readCreateIntent,
   clearCreateIntent,
@@ -202,6 +203,7 @@ function ConversationPageContent() {
   // read by <StreamingMessage>/<MessageList> via their own slice selectors;
   // the heartbeat clock by <ConnectedStateBar> via useLastSseEventAt.
   const [atom, dispatch] = useConversationView(slug!);
+  const workScopeInventory = useWorkScope(slug!);
 
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
@@ -220,6 +222,14 @@ function ConversationPageContent() {
     branchName: conversation?.branch_name,
     cachedPr: conversation?.cached_pr,
   });
+  const refreshPrStatus = prStatusHandle.refresh;
+
+  const lastWorkScopeRevision = useRef(workScopeInventory);
+  useEffect(() => {
+    if (lastWorkScopeRevision.current === workScopeInventory) return;
+    lastWorkScopeRevision.current = workScopeInventory;
+    if (confirmedLive) void refreshPrStatus();
+  }, [workScopeInventory, confirmedLive, refreshPrStatus]);
 
   useEffect(() => {
     setConversationReadiness({
