@@ -182,7 +182,7 @@ async function getConversationMetaForRoute(routeSegment: string) {
 }
 
 
-export function ConversationPage() {
+export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
   return (
     <ReviewNotesProvider scopeKey={slug}>
@@ -191,7 +191,7 @@ export function ConversationPage() {
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
       {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent />
+      <ConversationPageContent routePrefix={routePrefix} />
     </ReviewNotesProvider>
   );
 }
@@ -243,7 +243,7 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
-function ConversationPageContent() {
+function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -1865,7 +1865,7 @@ function ConversationPageContent() {
     && isWideDesktop
     && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen);
 
-  const terminalSplitPane = showTerminal ? (
+  const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
     <>
       <PaneDivider
         orientation="horizontal"
@@ -2094,7 +2094,7 @@ function ConversationPageContent() {
                     try {
                       const res = await api.continueConversation(conversation.id);
                       if (res.slug) {
-                        navigate(`/c/${res.slug}`);
+                        navigate(`${routePrefix}/${res.conversation_id}`);
                       }
                     } catch (err) {
                       showInfo(err instanceof Error ? err.message : 'Failed to open continuation');
@@ -2129,7 +2129,7 @@ function ConversationPageContent() {
                         }
                       }
                       if (res.slug) {
-                        navigate(`/c/${res.slug}`);
+                        navigate(`${routePrefix}/${res.conversation_id}`);
                       }
                     } catch (err) {
                       showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
@@ -2201,7 +2201,7 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          cwd={conversation.cwd}
+          cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -2245,7 +2245,7 @@ function ConversationPageContent() {
           <ConnectedInputArea
             ref={inputRef}
             slug={slug!}
-            cwd={conversation.cwd}
+            cwd={routePrefix === '/global' ? undefined : conversation.cwd}
             scopeKey={conversationId}
             convState={convStateForChildren}
             images={images}
@@ -2305,7 +2305,7 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          cwd={conversation.cwd}
+          cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}

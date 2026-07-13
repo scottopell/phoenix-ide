@@ -19,7 +19,11 @@ vi.mock('../api', async () => {
   };
 });
 
-vi.mock('./ConversationPage', () => ({ ConversationPage: () => <div>Shared conversation runtime</div> }));
+vi.mock('./ConversationPage', () => ({
+  ConversationPage: ({ routePrefix }: { routePrefix?: string }) => (
+    <div>Shared conversation runtime {routePrefix}</div>
+  ),
+}));
 
 function renderPage(initialEntry = '/global/conv-coordinator') {
   return render(
@@ -105,7 +109,7 @@ describe('CoordinatorPage', () => {
       expect(screen.getByRole('heading', { name: 'Coordinator' })).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Shared conversation runtime')).toBeInTheDocument();
+    expect(screen.getByText('Shared conversation runtime /global')).toBeInTheDocument();
     expect(screen.getByText('Fix coordinator page')).toBeInTheDocument();
     expect(screen.getByText('TASK 08700')).toBeInTheDocument();
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();

@@ -106,7 +106,7 @@ export function CoordinatorPage() {
       {slug && (
         <section className="coordinator-conversation" aria-label="Coordinator conversation">
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage />
+            <ConversationPage routePrefix="/global" />
           </Suspense>
         </section>
       )}

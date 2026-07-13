@@ -215,9 +215,26 @@ async fn build_open_work(service: &GlobalReadService) -> Result<GlobalOpenWorkRe
         .coordinator_conversation_id()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let coordinator_chain_ids = if let Some(coordinator_id) = coordinator_id.as_deref() {
+        let root_id = service
+            .db
+            .chain_root_of(coordinator_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .unwrap_or_else(|| coordinator_id.to_string());
+        service
+            .db
+            .chain_members_forward(&root_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .into_iter()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let conversations: Vec<_> = conversations
         .into_iter()
-        .filter(|conversation| Some(&conversation.id) != coordinator_id.as_ref())
+        .filter(|conversation| !coordinator_chain_ids.contains(&conversation.id))
         .collect();
     let projects = service
         .db

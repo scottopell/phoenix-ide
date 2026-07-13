@@ -808,10 +808,18 @@ async fn cached_pr_summaries_for_conversations(
 async fn get_coordinator(
     State(state): State<AppState>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let cwd = state.runtime_env.home().to_string_lossy().into_owned();
+    let llm_language = state
+        .db
+        .get_default_llm_language()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let conversation = state
         .db
-        .get_or_create_coordinator(&cwd, Some(state.llm_registry.default_model_id()))
+        .get_or_create_coordinator(
+            "",
+            Some(state.llm_registry.default_model_id()),
+            llm_language,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(ConversationResponse {
@@ -3392,14 +3400,26 @@ async fn send_chat(
 
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-            let expanded =
+            let expanded = if state
+                .db
+                .is_coordinator_conversation(&conversation.id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                crate::message_expander::ExpandedMessage {
+                    display_text: req.text.clone(),
+                    llm_text: req.text.clone(),
+                    skill_invocation: None,
+                }
+            } else {
                 crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
                         reference: e.reference(),
                     })
-                })?;
+                })?
+            };
             let images: Vec<ImageData> = req
                 .images
                 .into_iter()
@@ -3460,13 +3480,26 @@ async fn send_chat(
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-    let expanded = crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-        AppError::UnprocessableEntity(ExpansionErrorResponse {
-            error: e.to_string(),
-            error_type: e.error_type().to_string(),
-            reference: e.reference(),
-        })
-    })?;
+    let expanded = if state
+        .db
+        .is_coordinator_conversation(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        crate::message_expander::ExpandedMessage {
+            display_text: req.text.clone(),
+            llm_text: req.text.clone(),
+            skill_invocation: None,
+        }
+    } else {
+        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+            AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: e.to_string(),
+                error_type: e.error_type().to_string(),
+                reference: e.reference(),
+            })
+        })?
+    };
 
     // Convert images
     let images: Vec<ImageData> = req

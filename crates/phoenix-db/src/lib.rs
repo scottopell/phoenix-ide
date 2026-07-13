@@ -2404,6 +2404,7 @@ impl Database {
         &self,
         cwd: &str,
         model: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -2424,7 +2425,7 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
-                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, 'phoenix-native', 'explore')",
+                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore')",
             )
             .bind(&id)
             .bind(slug)
@@ -2432,6 +2433,7 @@ impl Database {
             .bind(idle)
             .bind(now)
             .bind(model)
+            .bind(llm_language.as_str())
             .execute(&mut *conn)
             .await?;
             sqlx::query("INSERT INTO coordinator (singleton, conversation_id) VALUES (1, ?1)")
@@ -4677,7 +4679,7 @@ impl Database {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
                 "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -4700,6 +4702,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
+            .bind(parent.user_initiated)
             .execute(&mut *tx)
             .await;
 
@@ -4769,7 +4772,7 @@ impl Database {
             title: Some(title_str),
             cwd: parent.cwd,
             parent_conversation_id: None,
-            user_initiated: true,
+            user_initiated: parent.user_initiated,
             state: ConvState::Idle,
             state_updated_at: now,
             created_at: now,
@@ -11004,15 +11007,27 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
 
         let first = db
-            .get_or_create_coordinator("/tmp/coordinator", Some("test-model"))
+            .get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::Caveman,
+            )
             .await
             .unwrap();
         let second = db
-            .get_or_create_coordinator("/tmp/ignored", Some("other-model"))
+            .get_or_create_coordinator(
+                "/tmp/ignored",
+                Some("other-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
             .await
             .unwrap();
 
         assert_eq!(first.id, second.id);
+        assert_eq!(
+            first.llm_language,
+            phoenix_core::llm_language::LlmLanguage::Caveman
+        );
         assert_eq!(
             db.coordinator_conversation_id().await.unwrap().as_deref(),
             Some(first.id.as_str())
@@ -11040,8 +11055,16 @@ mod tests {
             .unwrap();
 
         let (left, right) = tokio::join!(
-            db.get_or_create_coordinator("/tmp/coordinator", Some("test-model")),
-            db.get_or_create_coordinator("/tmp/coordinator", Some("test-model")),
+            db.get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default()
+            ),
+            db.get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default()
+            ),
         );
         let left = left.unwrap();
         let right = right.unwrap();
@@ -11152,7 +11175,11 @@ mod tests {
             .unwrap();
 
         let coordinator = db
-            .get_or_create_coordinator("/tmp", Some("test-model"))
+            .get_or_create_coordinator(
+                "/tmp",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
             .await
             .unwrap();
         db.update_conversation_state(&coordinator.id, &usage_limit_err(Some(reset)))
@@ -13229,7 +13256,11 @@ mod tests {
     async fn coordinator_relation_moves_to_continuation() {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
-            .get_or_create_coordinator("/tmp", Some("test-model"))
+            .get_or_create_coordinator(
+                "/tmp",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
             .await
             .unwrap();
         db.update_conversation_state(
@@ -13260,12 +13291,39 @@ mod tests {
             .is_coordinator_conversation(&continuation.id)
             .await
             .unwrap());
+        assert!(!continuation.user_initiated);
         assert!(!db
             .list_conversations()
             .await
             .unwrap()
             .iter()
             .any(|conversation| conversation.id == continuation.id));
+        db.update_conversation_state(
+            &continuation.id,
+            &ConvState::ContextExhausted {
+                summary: "second summary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let second = match db.continue_conversation(&continuation.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected second continuation, got {other:?}")
+            }
+        };
+        assert!(!second.user_initiated);
+        let listed_ids: Vec<_> = db
+            .list_conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|conversation| conversation.id)
+            .collect();
+        assert!(!listed_ids.contains(&coordinator.id));
+        assert!(!listed_ids.contains(&continuation.id));
+        assert!(!listed_ids.contains(&second.id));
     }
 
     // ------------------------------------------------------------------
