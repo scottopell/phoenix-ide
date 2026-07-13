@@ -1045,9 +1045,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
     const highlight = activeHighlight?.fragmentId === fragment.fragmentId
       ? activeHighlight
       : null;
-    const content = highlight
-      ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
-      : fragment.semanticText;
     if (!expanded) {
       return (
         <CollapsibleText
@@ -1062,10 +1059,15 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
         <div className="agent-text-block">
-          <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-            {typeof content === 'string' ? content : fragment.semanticText}
-          </ReactMarkdown>
-          {typeof content !== 'string' && <div className="viewer-find-inline-highlight" data-active-fragment-highlight>{content}</div>}
+          {highlight ? (
+            <div className="viewer-find-inline-highlight" data-active-fragment-highlight>
+              {renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)}
+            </div>
+          ) : (
+            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
+              {fragment.semanticText}
+            </ReactMarkdown>
+          )}
         </div>
       </div>
     );

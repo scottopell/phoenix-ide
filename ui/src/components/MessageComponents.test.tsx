@@ -3123,7 +3123,8 @@ describe('AgentMessage compact find reveal', () => {
     );
 
     await waitFor(() => expect(onRevealHandled).toHaveBeenCalled());
-    expect(screen.getByText(/hidden second line alpha/)).toBeInTheDocument();
+    expect(document.querySelector('[data-active-fragment-highlight]')?.textContent)
+      .toContain('hidden second line alpha target');
     const highlight = document.querySelector('.viewer-find-inline-match--active');
     expect(highlight).not.toBeNull();
     expect(highlight).toHaveTextContent('alpha target');
