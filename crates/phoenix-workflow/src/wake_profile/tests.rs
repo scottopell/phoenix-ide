@@ -700,6 +700,18 @@ fn runtime_acceptance_decision_names_the_exact_owed_terminal() {
             terminal: Box::new(other),
         }
     ));
+    assert!(WakeProfile::decision_handles_owed_acceptance_suppression(
+        &owed,
+        &super::WakeRegistrationEvent::RuntimeSuppressed {
+            terminal: Box::new(owed.clone()),
+        }
+    ));
+    assert!(!WakeProfile::decision_handles_owed_acceptance_suppression(
+        &owed,
+        &super::WakeRegistrationEvent::RuntimeAccepted {
+            terminal: Box::new(owed.clone()),
+        }
+    ));
 }
 
 #[test]

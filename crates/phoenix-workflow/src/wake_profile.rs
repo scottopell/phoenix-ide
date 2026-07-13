@@ -234,6 +234,7 @@ pub enum WakeRegistrationEvent {
     CancelRequested,
     Continued,
     RuntimeAccepted { terminal: Box<WakeTerminalPayload> },
+    RuntimeSuppressed { terminal: Box<WakeTerminalPayload> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +381,17 @@ impl WorkflowProfile for WakeProfile {
             && matches!(
                 decision_event,
                 WakeRegistrationEvent::RuntimeAccepted { terminal } if terminal.as_ref() == event
+            )
+    }
+
+    fn decision_handles_owed_acceptance_suppression(
+        event: &Self::OwedAcceptanceEvent,
+        decision_event: &Self::Event,
+    ) -> bool {
+        !matches!(event, WakeTerminalPayload::Cancelled { .. })
+            && matches!(
+                decision_event,
+                WakeRegistrationEvent::RuntimeSuppressed { terminal } if terminal.as_ref() == event
             )
     }
 }
