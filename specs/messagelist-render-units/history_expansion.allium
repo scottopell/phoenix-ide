@@ -83,9 +83,29 @@ surface ScrollCommandExecutor {
         command.issued_view_generation
 }
 
-rule ViewChangeInvalidatesOutstandingWork {
+rule ViewChangeSupersedesPendingCommandBeforeInvalidatingOutstandingWork {
     when: ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
     requires: view_generation > view.view_generation
+    requires: view.pending_command != null
+    ensures: PendingCommandSuperseded(
+        view,
+        view.pending_command.token,
+        view.pending_command.issued_view_generation
+    ).emitted()
+    ensures: view.conversation_id = conversation_id
+    ensures: view.view_generation = view_generation
+    ensures: view.transcript_generation = transcript_generation
+    ensures: has_earlier_history implies view.coverage = tail
+    ensures: not has_earlier_history implies view.coverage = complete
+    ensures: view.active_request = null
+    ensures: view.pending_command = null
+    ensures: view.failure = null
+}
+
+rule ViewChangeInvalidatesOutstandingWorkWithoutPendingCommand {
+    when: ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
+    requires: view_generation > view.view_generation
+    requires: view.pending_command = null
     ensures: view.conversation_id = conversation_id
     ensures: view.view_generation = view_generation
     ensures: view.transcript_generation = transcript_generation
