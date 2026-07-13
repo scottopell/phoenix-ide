@@ -266,6 +266,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fence_creation_shadow_reservation_updates",
         sql: MIGRATION_050,
     },
+    Migration {
+        version: 51,
+        name: "align_creation_shadow_divergence_actions",
+        sql: MIGRATION_051,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2145,8 +2150,9 @@ CREATE TABLE IF NOT EXISTS creation_shadow_divergences (
     evidence_identity TEXT NOT NULL,
     expected_value TEXT NOT NULL,
     actual_value TEXT NOT NULL,
-    severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('informational', 'warning', 'blocking')),
-    required_action TEXT NOT NULL DEFAULT 'reconcile_authoritative_projection',
+    severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('blocking', 'actionable', 'informational')),
+    required_action TEXT NOT NULL DEFAULT 'retain_authority_and_investigate'
+        CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only')),
     recorded_at TEXT NOT NULL,
     resolved_at TEXT,
     PRIMARY KEY (shadow_workflow_id, evidence_identity, recorded_at)
@@ -2264,6 +2270,42 @@ BEGIN
 END;
 ";
 
+const MIGRATION_051: &str = r"
+ALTER TABLE creation_shadow_divergences RENAME TO creation_shadow_divergences_legacy;
+
+CREATE TABLE creation_shadow_divergences (
+    shadow_workflow_id TEXT NOT NULL REFERENCES creation_shadow_bindings(shadow_workflow_id) ON DELETE CASCADE,
+    evidence_identity TEXT NOT NULL,
+    expected_value TEXT NOT NULL,
+    actual_value TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'blocking'
+        CHECK (severity IN ('blocking', 'actionable', 'informational')),
+    required_action TEXT NOT NULL DEFAULT 'retain_authority_and_investigate'
+        CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only')),
+    recorded_at TEXT NOT NULL,
+    resolved_at TEXT,
+    PRIMARY KEY (shadow_workflow_id, evidence_identity, recorded_at)
+);
+
+INSERT INTO creation_shadow_divergences
+    (shadow_workflow_id, evidence_identity, expected_value, actual_value,
+     severity, required_action, recorded_at, resolved_at)
+SELECT shadow_workflow_id, evidence_identity, expected_value, actual_value,
+       CASE severity WHEN 'warning' THEN 'actionable' ELSE severity END,
+       CASE required_action
+           WHEN 'reconcile_authoritative_projection' THEN 'retain_authority_and_investigate'
+           ELSE required_action
+       END,
+       recorded_at, resolved_at
+FROM creation_shadow_divergences_legacy;
+
+DROP TABLE creation_shadow_divergences_legacy;
+
+CREATE UNIQUE INDEX idx_creation_shadow_one_active_divergence
+    ON creation_shadow_divergences(shadow_workflow_id, evidence_identity)
+    WHERE resolved_at IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -2349,7 +2391,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             .await?;
     if !divergence_columns.is_empty() && !divergence_columns.iter().any(|name| name == "severity") {
         sqlx::query(
-            "ALTER TABLE creation_shadow_divergences ADD COLUMN severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('informational', 'warning', 'blocking'))",
+            "ALTER TABLE creation_shadow_divergences ADD COLUMN severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('blocking', 'actionable', 'informational'))",
         )
         .execute(pool)
         .await?;
@@ -2360,7 +2402,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             .any(|name| name == "required_action")
     {
         sqlx::query(
-            "ALTER TABLE creation_shadow_divergences ADD COLUMN required_action TEXT NOT NULL DEFAULT 'reconcile_authoritative_projection'",
+            "ALTER TABLE creation_shadow_divergences ADD COLUMN required_action TEXT NOT NULL DEFAULT 'retain_authority_and_investigate' CHECK (required_action IN ('halt_acceptance', 'retain_authority_and_investigate', 'record_only'))",
         )
         .execute(pool)
         .await?;

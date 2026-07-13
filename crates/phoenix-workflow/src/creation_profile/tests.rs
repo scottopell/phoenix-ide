@@ -563,7 +563,7 @@ fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_eviden
     pending.runtime_evidence = CreationRuntimeEvidence {
         runtime_bootstrapped: true,
         initial_llm_dispatched: true,
-        initial_turn_busy: false,
+        ready_capabilities: Some(super::capabilities([true, true, true, false, false, true])),
     };
     let complete = project_authoritative_creation(&pending);
     assert_eq!(complete.completion, CompletionPrediction::Complete);

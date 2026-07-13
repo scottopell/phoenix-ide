@@ -118,6 +118,18 @@ async fn reconcile_creation_cleanup(
             return Ok(());
         }
     }
+    if cleanup.status == "deletion_pending" {
+        if let Err(error) = manager
+            .mirror_creation_before_cleanup(&cleanup.job_id)
+            .await
+        {
+            tracing::warn!(
+                job_id = %cleanup.job_id,
+                error,
+                "creation shadow sync failed after resource cleanup; continuing"
+            );
+        }
+    }
     manager
         .db()
         .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())

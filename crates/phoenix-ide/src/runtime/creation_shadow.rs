@@ -279,7 +279,7 @@ fn oracle_from_committed(
         runtime_evidence: CreationRuntimeEvidence {
             runtime_bootstrapped,
             initial_llm_dispatched,
-            initial_turn_busy: active_runtime_evidence(conversation_state),
+            ready_capabilities: Some(capabilities_for_state(conversation_state)),
         },
     }
 }
@@ -293,10 +293,9 @@ fn uses_worktree(
     reservations: &[CreationResourceReservation],
     conv_mode: Option<&ConvMode>,
 ) -> bool {
-    matches!(requested_mode, Some("managed" | "branch"))
-        || (requested_mode == Some("auto")
-            && (!reservations.is_empty()
-                || conv_mode.is_some_and(|mode| mode.worktree_path().is_some())))
+    !reservations.is_empty()
+        || conv_mode.is_some_and(|mode| mode.worktree_path().is_some())
+        || matches!(requested_mode, Some("managed" | "branch"))
 }
 
 fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
@@ -369,41 +368,18 @@ fn observed_projection(
             creation_capabilities([false, false, false, false, false, false]),
         )
     } else {
-        match state {
-            ConvState::Provisioning { .. } => (
-                CreationProjectionStatus::Provisioning,
-                creation_capabilities([true, false, false, true, false, true]),
-            ),
-            ConvState::CreationFailed { .. } => (
-                CreationProjectionStatus::Failed,
-                creation_capabilities([true, false, false, false, true, true]),
-            ),
-            ConvState::CreationCancelled { .. } => (
-                CreationProjectionStatus::Cancelled,
-                creation_capabilities([true, false, false, false, true, true]),
-            ),
-            ConvState::LlmRequesting { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::ToolExecuting { .. }
-            | ConvState::AwaitingSubAgents { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingRecovery { .. } => (
-                CreationProjectionStatus::Ready,
-                creation_capabilities([true, true, true, true, false, false]),
-            ),
-            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => (
-                CreationProjectionStatus::Ready,
-                creation_capabilities([true, false, true, false, false, false]),
-            ),
-            _ => (
-                CreationProjectionStatus::Ready,
-                creation_capabilities([true, true, true, false, false, true]),
-            ),
-        }
+        let status = match state {
+            ConvState::Provisioning { .. } => CreationProjectionStatus::Provisioning,
+            ConvState::CreationFailed { .. } => CreationProjectionStatus::Failed,
+            ConvState::CreationCancelled { .. } => CreationProjectionStatus::Cancelled,
+            _ => CreationProjectionStatus::Ready,
+        };
+        (status, capabilities_for_state(state))
     };
-    if matches!(state, ConvState::Provisioning { .. }) || state.allows_user_cancel() {
-        capabilities.cancel = CapabilityAvailability::Allowed;
-    } else {
+    if matches!(
+        creation_status,
+        AuthoritativeCreationStatus::DeletionPending
+    ) {
         capabilities.cancel = CapabilityAvailability::Forbidden;
     }
     CreationShadowEvidence::UserProjection {
@@ -411,6 +387,36 @@ fn observed_projection(
         capabilities,
         hidden: archived,
     }
+}
+
+fn capabilities_for_state(state: &ConvState) -> CreationCapabilities {
+    let mut capabilities = match state {
+        ConvState::Provisioning { .. } => {
+            creation_capabilities([true, false, false, true, false, true])
+        }
+        ConvState::CreationFailed { .. } | ConvState::CreationCancelled { .. } => {
+            creation_capabilities([true, false, false, false, true, true])
+        }
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingRecovery { .. } => {
+            creation_capabilities([true, true, true, true, false, false])
+        }
+        ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
+            creation_capabilities([true, false, true, false, false, false])
+        }
+        _ => creation_capabilities([true, true, true, false, false, true]),
+    };
+    capabilities.cancel =
+        if matches!(state, ConvState::Provisioning { .. }) || state.allows_user_cancel() {
+            CapabilityAvailability::Allowed
+        } else {
+            CapabilityAvailability::Forbidden
+        };
+    capabilities
 }
 
 fn creation_capabilities(flags: [bool; 6]) -> CreationCapabilities {
@@ -539,6 +545,18 @@ mod tests {
     #[test]
     fn auto_without_committed_worktree_evidence_is_direct() {
         assert!(!uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
+    }
+
+    #[test]
+    fn redacted_intent_preserves_committed_worktree_evidence() {
+        let mode = ConvMode::Explore {
+            worktree_path: Some(
+                phoenix_core::domain::db_schema::NonEmptyString::new("/tmp/worktree".to_owned())
+                    .unwrap(),
+            ),
+            next_taskmd_id_hint: None,
+        };
+        assert!(uses_worktree(None, &[], Some(&mode)));
     }
 
     #[test]

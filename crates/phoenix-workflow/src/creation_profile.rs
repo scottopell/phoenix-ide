@@ -91,7 +91,7 @@ pub enum CleanupOwnership {
 pub struct CreationRuntimeEvidence {
     pub runtime_bootstrapped: bool,
     pub initial_llm_dispatched: bool,
-    pub initial_turn_busy: bool,
+    pub ready_capabilities: Option<CreationCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -861,11 +861,10 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         ),
         AuthoritativeCreationStatus::Ready => (
             CreationProjectionStatus::Ready,
-            if oracle.runtime_evidence.initial_turn_busy {
-                capabilities([true, true, true, true, false, false])
-            } else {
-                capabilities([true, true, true, false, false, true])
-            },
+            oracle
+                .runtime_evidence
+                .ready_capabilities
+                .unwrap_or_else(|| capabilities([true, true, true, false, false, true])),
             completion_for_ready(oracle),
             CompensationPrediction::None,
             false,
