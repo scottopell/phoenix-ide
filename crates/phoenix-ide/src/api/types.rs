@@ -2,7 +2,6 @@
 
 pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
@@ -295,83 +294,7 @@ pub struct DirectoryEntry {
 /// Refines a text file for icon and syntax-highlight selection. These are
 /// distinctions the viewer's openability dispatch collapses (all are openable
 /// text) but the renderer still needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum TextCategory {
-    Markdown,
-    Code,
-    Config,
-    Plain,
-    /// Extension unrecognized — treated as text; the read path confirms by
-    /// content-sniffing and downgrades to an error if the bytes are binary.
-    Unknown,
-}
-
-/// How the file viewer treats a path — the single authority on "can this be
-/// opened, and as what." [`ReadFileResponse`] dispatches on exactly this, and
-/// the listing/search endpoints carry it so every entry point (sidebar,
-/// quick-open, @-mention, linkified path) shares one verdict instead of
-/// re-deriving openability from extensions. The variant structure encodes
-/// openability directly: only [`FileViewerKind::Opaque`] is non-openable, so
-/// there is no separate boolean to drift out of sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum FileViewerKind {
-    /// Opens in the text/prose reader; `category` refines icon and highlighting.
-    Text { category: TextCategory },
-    /// Opens as an image preview.
-    Image,
-    /// Binary or otherwise unsupported — the viewer cannot open it. Also the
-    /// kind reported for directories (which are entered, not opened).
-    Opaque,
-}
-
-impl FileViewerKind {
-    /// Classify a path by extension — the single source of truth for "how does
-    /// the viewer treat this file." The directory listing carries this as an
-    /// affordance prediction; `/api/files/read` dispatches on the same verdict
-    /// and additionally content-sniffs [`TextCategory::Unknown`] files before
-    /// committing to text. Works equally on filesystem paths and on git-tree
-    /// path strings (extension-only, no I/O), so every callsite shares it.
-    pub fn for_path(path: &Path) -> Self {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase);
-
-        let text = |category| FileViewerKind::Text { category };
-
-        match ext.as_deref() {
-            Some("md" | "markdown") => text(TextCategory::Markdown),
-            Some(
-                "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "cpp" | "c" | "h"
-                | "hpp" | "css" | "html" | "htm" | "vue" | "svelte" | "php" | "rb" | "swift" | "kt"
-                | "scala" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "sql" | "graphql" | "proto",
-            ) => text(TextCategory::Code),
-            Some(
-                "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "conf" | "cfg" | "xml"
-                | "properties",
-            ) => text(TextCategory::Config),
-            Some("txt" | "log" | "csv" | "tsv" | "rtf") => text(TextCategory::Plain),
-            Some(
-                "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif",
-            ) => FileViewerKind::Image,
-            // Known-binary extensions: the viewer cannot open them.
-            Some(
-                "db" | "sqlite" | "sqlite3" | "bin" | "dat" | "exe" | "dll" | "so" | "dylib" | "o"
-                | "a" | "wasm" | "class" | "jar" | "war" | "pyc" | "pyo" | "pdf" | "doc" | "docx"
-                | "xls" | "xlsx" | "ppt" | "pptx" | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z"
-                | "rar" | "mp3" | "mp4" | "wav" | "avi" | "mkv" | "mov" | "webm" | "flac" | "ogg"
-                | "woff" | "woff2" | "ttf" | "otf",
-            ) => FileViewerKind::Opaque,
-            // Unknown extension: optimistically text; the read path confirms by
-            // content-sniffing before committing.
-            _ => text(TextCategory::Unknown),
-        }
-    }
-}
+pub use phoenix_core::file_viewer::{FileViewerKind, TextCategory};
 
 /// Enhanced file entry for file browser (REQ-PF-001 through REQ-PF-004)
 #[derive(Debug, Serialize)]

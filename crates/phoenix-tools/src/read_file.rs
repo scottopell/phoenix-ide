@@ -4,6 +4,7 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::file_viewer::FileViewerKind;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -164,7 +165,8 @@ impl Tool for ReadFileTool {
             .zip(std::fs::canonicalize(&ctx.working_dir).ok())
             .is_some_and(|(file, root)| file.starts_with(root))
             && std::fs::metadata(&resolved)
-                .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES);
+                .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
+            && !matches!(FileViewerKind::for_path(&resolved), FileViewerKind::Opaque);
 
         let display_data = serde_json::to_value(ReadFileDisplayData {
             r#type: "read_file",
@@ -298,6 +300,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_file_marks_opaque_file_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("database.sqlite"), "readable text\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "database.sqlite"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_file_marks_oversized_file_unavailable_to_viewer() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -314,7 +336,9 @@ mod tests {
             .await;
 
         assert_eq!(
-            result.display_data().and_then(|data| data.get("viewer_available")),
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
             Some(&json!(false))
         );
     }
@@ -337,7 +361,9 @@ mod tests {
             .await;
 
         assert_eq!(
-            result.display_data().and_then(|data| data.get("viewer_available")),
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
             Some(&json!(false))
         );
     }

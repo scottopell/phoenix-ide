@@ -6,6 +6,7 @@
 //! workspace. See `specs/` for the layering rationale.
 
 pub mod domain;
+pub mod file_viewer;
 pub mod git;
 pub mod llm_language;
 pub mod llm_service;

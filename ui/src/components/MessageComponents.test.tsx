@@ -1506,6 +1506,46 @@ describe('read_file structured result view', () => {
     expect(copyMock.mock.calls.at(-1)?.[0].length).toBeLessThanOrEqual(5_010);
   });
 
+  it('preserves literal ellipses and distinguishes an empty range from an empty file', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-empty-range', [
+            { type: 'tool_use', id: 'tool-read-empty-range', name: 'read_file', input: { path: 'short.txt', offset: 99, limit: 5 } },
+          ])}
+          toolResults={new Map([['tool-read-empty-range', toolMessage('tool-read-empty-range', '', 2, {
+            type: 'read_file', path: 'short.txt', requested_offset: 99, requested_limit: 5,
+            returned_start_line: null, returned_end_line: null, returned_line_count: 0,
+            total_line_count: 3, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('(empty file)')).not.toBeInTheDocument();
+    expect(screen.getByText(/No lines returned for the requested range/)).toBeInTheDocument();
+    expect(screen.getByText(/file contains 3 lines/)).toBeInTheDocument();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-ellipsis', [
+            { type: 'tool_use', id: 'tool-read-ellipsis', name: 'read_file', input: { path: 'ellipsis.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-ellipsis', toolMessage('tool-read-ellipsis', '     1\tliteral…\n     2\tstill visible', 2, {
+            type: 'read_file', path: 'ellipsis.txt', requested_offset: 1, requested_limit: 2000,
+            returned_start_line: 1, returned_end_line: 2, returned_line_count: 2,
+            total_line_count: 2, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('still visible')).toBeInTheDocument();
+    expect(screen.queryByText(/truncated for preview/)).not.toBeInTheDocument();
+  });
+
   it('hides the viewer action for absolute and traversal read paths', () => {
     const metadata = {
       type: 'read_file', requested_offset: 1, requested_limit: 1,

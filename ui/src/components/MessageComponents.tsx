@@ -1661,12 +1661,13 @@ function boundedReadFileLines(lines: ReadFileLine[]): { lines: ReadFileLine[]; t
   let remainingChars = READ_FILE_PREVIEW_MAX_CHARS;
   for (const line of lines.slice(0, READ_FILE_PREVIEW_MAX_LINES)) {
     if (remainingChars <= 0) break;
-    const content = line.content.length > remainingChars
+    const lineWasTruncated = line.content.length > remainingChars;
+    const content = lineWasTruncated
       ? `${line.content.slice(0, remainingChars)}…`
       : line.content;
     visible.push({ ...line, content });
     remainingChars -= Math.min(line.content.length, remainingChars);
-    if (content.endsWith('…')) break;
+    if (lineWasTruncated) break;
   }
   return {
     lines: visible,
@@ -1761,7 +1762,7 @@ function ReadFileResultView({
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
 
-  if (metadata.returned_line_count === 0) {
+  if (metadata.total_line_count === 0) {
     return (
       <div className="read-file-result read-file-result-fallback" data-read-file-state="empty">
         <div className="read-file-result-meta">
@@ -1769,6 +1770,18 @@ function ReadFileResultView({
           <span className="read-file-result-summary">No file content returned</span>
         </div>
         <div className="read-file-result-empty">(empty file)</div>
+      </div>
+    );
+  }
+
+  if (metadata.returned_line_count === 0) {
+    return (
+      <div className="read-file-result read-file-result-fallback" data-read-file-state="empty-range">
+        <div className="read-file-result-meta">
+          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-summary">No lines returned for the requested range</span>
+        </div>
+        <div className="read-file-result-empty">The file contains {metadata.total_line_count} lines.</div>
       </div>
     );
   }
