@@ -17,6 +17,7 @@ export function CoordinatorPage() {
   const [error, setError] = useState<string | null>(null);
   const [fleetError, setFleetError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(null);
   const [copiedReference, setCopiedReference] = useState<string | null>(null);
 
   const refreshOpenWork = useCallback(() => {
@@ -38,6 +39,7 @@ export function CoordinatorPage() {
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
+        setResolvedCoordinatorId(coordinator.conversation.id);
         if (slug !== coordinator.conversation.id) {
           navigate(`/global/${coordinator.conversation.id}`, { replace: true });
         }
@@ -123,7 +125,7 @@ export function CoordinatorPage() {
       </div>
       {loading ? <div className="coordinator-muted">Loading…</div> : null}
 
-      {slug && (
+      {slug === resolvedCoordinatorId && (
         <section className="coordinator-conversation" aria-label="Coordinator conversation">
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
             <ConversationPage routePrefix="/global" />
@@ -131,7 +133,8 @@ export function CoordinatorPage() {
         </section>
       )}
 
-      <section className="coordinator-open-work">
+      <div className="coordinator-fleet-pane">
+        <section className="coordinator-open-work">
         {fleetError && <div className="coordinator-error">Fleet unavailable: {fleetError}</div>}
         <div className="coordinator-section-title">
           <h2>Fleet</h2>
@@ -203,7 +206,8 @@ export function CoordinatorPage() {
             {openWorkLoadingMore ? 'Loading…' : 'Load more fleet items'}
           </button>
         )}
-      </section>
+        </section>
+      </div>
     </div>
   );
 }

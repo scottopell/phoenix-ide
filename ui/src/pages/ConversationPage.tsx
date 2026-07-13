@@ -193,11 +193,11 @@ export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | 
       return;
     }
     let cancelled = false;
-    api.getGlobalCoordinator()
-      .then(({ conversation }) => {
+    api.resolveCoordinatorRoute(slug)
+      .then(({ coordinator_id }) => {
         if (cancelled) return;
-        if (slug === conversation.id || slug === conversation.slug) {
-          navigate(`/global/${conversation.id}`, { replace: true });
+        if (coordinator_id) {
+          navigate(`/global/${coordinator_id}`, { replace: true });
         } else {
           setRouteChecked(true);
         }

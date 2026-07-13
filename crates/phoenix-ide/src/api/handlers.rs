@@ -58,7 +58,7 @@ use chrono::Datelike;
 use chrono::{Local, Timelike};
 use futures::future::BoxFuture;
 use rand::seq::IndexedRandom;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -117,6 +117,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),
+        )
+        .route(
+            "/api/global/coordinator/route/:conversation",
+            get(resolve_coordinator_route),
         )
         .route("/api/global/resolve", post(global_read::resolve_reference))
         .route(
@@ -821,6 +825,50 @@ async fn get_existing_coordinator(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(ConversationResponse {
         conversation: conversation_to_json(&state, &conversation, None),
+    }))
+}
+
+#[derive(Serialize)]
+struct CoordinatorRouteResponse {
+    coordinator_id: Option<String>,
+}
+
+async fn resolve_coordinator_route(
+    State(state): State<AppState>,
+    Path(conversation): Path<String>,
+) -> Result<Json<CoordinatorRouteResponse>, AppError> {
+    let Some(coordinator_id) = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    else {
+        return Ok(Json(CoordinatorRouteResponse {
+            coordinator_id: None,
+        }));
+    };
+    let root_id = state
+        .db
+        .chain_root_of(&coordinator_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .unwrap_or_else(|| coordinator_id.clone());
+    let members = state
+        .db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let matched = if members.iter().any(|id| id == &conversation) {
+        true
+    } else {
+        match state.db.get_conversation_by_slug(&conversation).await {
+            Ok(candidate) => members.iter().any(|id| id == &candidate.id),
+            Err(DbError::ConversationNotFound(_)) => false,
+            Err(error) => return Err(AppError::Internal(error.to_string())),
+        }
+    };
+    Ok(Json(CoordinatorRouteResponse {
+        coordinator_id: matched.then_some(coordinator_id),
     }))
 }
 

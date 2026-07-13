@@ -1261,6 +1261,14 @@ export const api = {
     return resp.json();
   },
 
+  async resolveCoordinatorRoute(conversation: string): Promise<{ coordinator_id: string | null }> {
+    const resp = await fetch(
+      `/api/global/coordinator/route/${encodeURIComponent(conversation)}`,
+    );
+    if (!resp.ok) throw new Error('Failed to resolve Coordinator route');
+    return resp.json();
+  },
+
   async getLlmLanguageSetting(): Promise<LlmLanguageSetting> {
     const resp = await fetch('/api/settings/llm-language');
     if (!resp.ok) throw new Error('Failed to load LLM language setting');

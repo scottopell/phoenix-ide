@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
-import type { Conversation, GlobalOpenWorkResponse } from '../api';
+import type { Conversation, GlobalCoordinatorResponse, GlobalOpenWorkResponse } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
@@ -109,7 +109,7 @@ describe('CoordinatorPage', () => {
       expect(screen.getByRole('heading', { name: 'Coordinator' })).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Shared conversation runtime /global')).toBeInTheDocument();
+    expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     expect(screen.getByText('Fix coordinator page')).toBeInTheDocument();
     expect(screen.getByText('TASK 08700')).toBeInTheDocument();
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
@@ -121,6 +121,18 @@ describe('CoordinatorPage', () => {
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
     expect(await screen.findByText('Fleet unavailable: projection unavailable')).toBeInTheDocument();
+  });
+
+  it('does not mount an ordinary conversation under the Coordinator shell', async () => {
+    let resolveCoordinator!: (value: GlobalCoordinatorResponse) => void;
+    apiMock.ensureGlobalCoordinator.mockReturnValueOnce(new Promise((resolve) => {
+      resolveCoordinator = resolve;
+    }));
+    renderPage('/global/ordinary-conversation');
+
+    expect(screen.queryByText('Shared conversation runtime /global')).not.toBeInTheDocument();
+    resolveCoordinator({ conversation: coordinatorConversation() });
+    expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
   });
 
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {
