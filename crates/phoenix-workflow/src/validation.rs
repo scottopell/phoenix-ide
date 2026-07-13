@@ -14,6 +14,13 @@ pub enum PlanError {
     DuplicateBarrierId(BarrierId),
     BarrierIdCollision(BarrierId),
     MissingCodec(&'static str),
+    MissingEffectFamily(EffectId),
+    MissingEffectKind(EffectId),
+    CompensationOutsideCancellation(EffectId),
+    NonCompensationInCancellation(EffectId),
+    EffectFamilyAmbiguityMismatch {
+        family: &'static str,
+    },
     UnknownEffectReference(EffectId),
     UnknownBarrierReference(BarrierId),
     UnknownInvalidationTarget(EffectId),
@@ -97,7 +104,6 @@ pub(crate) fn validate_status_transition(
             next_status,
             WorkflowStatus::Active
                 | WorkflowStatus::Cancelling
-                | WorkflowStatus::Cancelled
                 | WorkflowStatus::DeletionPending
                 | WorkflowStatus::Completed
                 | WorkflowStatus::Failed
@@ -105,13 +111,18 @@ pub(crate) fn validate_status_transition(
         WorkflowStatus::Cancelling => {
             matches!(
                 next_status,
-                WorkflowStatus::Cancelling | WorkflowStatus::Cancelled
+                WorkflowStatus::Cancelling
+                    | WorkflowStatus::Cancelled
+                    | WorkflowStatus::DeletionPending
             )
         }
-        WorkflowStatus::Cancelled
-        | WorkflowStatus::DeletionPending
-        | WorkflowStatus::Completed
-        | WorkflowStatus::Failed => next_status == current_status,
+        WorkflowStatus::DeletionPending => matches!(
+            next_status,
+            WorkflowStatus::DeletionPending | WorkflowStatus::Completed
+        ),
+        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed => {
+            next_status == current_status
+        }
     };
     if valid {
         Ok(())
@@ -131,6 +142,12 @@ fn validate_plan_codecs<P: WorkflowProfile>(plan: &TransitionPlan<P>) -> Result<
         return Err(PlanError::MissingCodec("event"));
     }
     for effect in &plan.effects {
+        if effect.family.is_empty() {
+            return Err(PlanError::MissingEffectFamily(effect.effect_id));
+        }
+        if effect.kind.is_empty() {
+            return Err(PlanError::MissingEffectKind(effect.effect_id));
+        }
         if effect.codec.family.is_empty() {
             return Err(PlanError::MissingCodec("effect"));
         }

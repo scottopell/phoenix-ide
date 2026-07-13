@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::types::{
     DeliveryStatus, DivergenceSeverity, DrainCategoryEvidence, DrainProof, EffectRole,
     EffectStatus, ExternalAcceptanceBinding, ExternalAcceptanceKey, ExternalAcceptanceOutcome,
-    ExternalAcceptanceReceipt, ProtocolSelection, ResolutionStatus, ShadowDivergenceResolution,
-    WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
+    ExternalAcceptanceReceipt, NonEmptyExternalKey, ProtocolSelection, ResolutionStatus,
+    ShadowDivergenceResolution, WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +34,16 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
         workflow_id: WorkflowId,
         handle: H,
     ) -> ExternalAcceptanceOutcome<H> {
+        let (Some(authority_scope), Some(idempotency_key)) = (
+            NonEmptyExternalKey::new(authority_scope),
+            NonEmptyExternalKey::new(idempotency_key),
+        ) else {
+            return ExternalAcceptanceOutcome::Unsupported;
+        };
         let key = ExternalAcceptanceKey {
             profile: selection.profile.clone(),
-            authority_scope: authority_scope.to_owned(),
-            idempotency_key: idempotency_key.to_owned(),
+            authority_scope,
+            idempotency_key: idempotency_key.clone(),
         };
         if let Some(binding) = self.bindings.get(&key) {
             return if binding.intent_fingerprint == intent_fingerprint {
@@ -50,7 +56,7 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
             return ExternalAcceptanceOutcome::Unsupported;
         }
         let receipt = ExternalAcceptanceReceipt {
-            idempotency_key: idempotency_key.to_owned(),
+            idempotency_key,
             workflow_id,
             handle,
         };
@@ -86,8 +92,42 @@ pub fn exact_drain_categories() -> [&'static str; 8] {
 }
 
 #[must_use]
-pub fn drain_proof<P: WorkflowProfile>(workflow: &WorkflowState<P>) -> DrainProof {
-    let mut categories = BTreeMap::new();
+pub fn drain_proof<'a, P, I>(protocol: &ProtocolSelection, workflows: I) -> DrainProof
+where
+    P: WorkflowProfile + 'a,
+    I: IntoIterator<Item = &'a WorkflowState<P>>,
+{
+    let mut categories = exact_drain_categories()
+        .into_iter()
+        .map(|category| {
+            (
+                category,
+                DrainCategoryEvidence {
+                    count: 0,
+                    identities: Vec::new(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for workflow in workflows
+        .into_iter()
+        .filter(|workflow| same_protocol(workflow.binding.accepted_protocol(), protocol))
+    {
+        aggregate_workflow_evidence(&mut categories, workflow);
+    }
+    build_drain_proof(protocol, categories)
+}
+
+fn same_protocol(left: &ProtocolSelection, right: &ProtocolSelection) -> bool {
+    left.profile == right.profile
+        && left.authority == right.authority
+        && left.selector == right.selector
+}
+
+fn aggregate_workflow_evidence<P: WorkflowProfile>(
+    categories: &mut BTreeMap<&'static str, DrainCategoryEvidence>,
+    workflow: &WorkflowState<P>,
+) {
     if workflow.binding.execution_mode() == crate::ExecutionMode::Shadow {
         for category in exact_drain_categories() {
             let evidence = if category == "blocking_divergences" {
@@ -98,55 +138,54 @@ pub fn drain_proof<P: WorkflowProfile>(workflow: &WorkflowState<P>) -> DrainProo
                     identities: Vec::new(),
                 }
             };
-            insert_drain_category(&mut categories, category, evidence);
+            insert_drain_category(categories, category, evidence);
         }
-        return build_drain_proof(workflow, categories);
+        return;
     }
     insert_drain_category(
-        &mut categories,
+        categories,
         "nonterminal_workflows",
         nonterminal_workflows_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "active_or_unexpired_claims",
         active_claims_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "eligible_or_retry_effects",
         eligible_or_retry_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "uncompensated_effects",
         uncompensated_effects_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "unresolved_manual_resolutions",
         unresolved_manual_resolutions_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "pending_reducer_inbox",
         pending_reducer_inbox_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "owed_runtime_acceptances",
         owed_runtime_acceptances_evidence(workflow),
     );
     insert_drain_category(
-        &mut categories,
+        categories,
         "blocking_divergences",
         blocking_divergences_evidence(workflow),
     );
-    build_drain_proof(workflow, categories)
 }
 
-fn build_drain_proof<P: WorkflowProfile>(
-    workflow: &WorkflowState<P>,
+fn build_drain_proof(
+    protocol: &ProtocolSelection,
     categories: BTreeMap<&'static str, DrainCategoryEvidence>,
 ) -> DrainProof {
     let complete = exact_drain_categories()
@@ -154,12 +193,12 @@ fn build_drain_proof<P: WorkflowProfile>(
         .all(|category| categories.contains_key(category))
         && categories.len() == exact_drain_categories().len();
     DrainProof {
-        profile: workflow.binding.accepted_protocol().profile.clone(),
-        protocol: workflow.binding.accepted_protocol().clone(),
-        selector: workflow.binding.accepted_protocol().selector,
+        profile: protocol.profile.clone(),
+        protocol: protocol.clone(),
+        selector: protocol.selector,
         query_identity: "phoenix.workflow.drain",
         query_version: 1,
-        authority: workflow.semantic_authority,
+        authority: Some(protocol.authority),
         complete,
         categories,
     }
@@ -170,7 +209,12 @@ fn insert_drain_category(
     key: &'static str,
     evidence: DrainCategoryEvidence,
 ) {
-    categories.insert(key, evidence);
+    let aggregate = categories.entry(key).or_insert(DrainCategoryEvidence {
+        count: 0,
+        identities: Vec::new(),
+    });
+    aggregate.count += evidence.count;
+    aggregate.identities.extend(evidence.identities);
 }
 
 fn nonterminal_workflows_evidence<P: WorkflowProfile>(
@@ -178,7 +222,10 @@ fn nonterminal_workflows_evidence<P: WorkflowProfile>(
 ) -> DrainCategoryEvidence {
     let terminal = matches!(
         workflow.status,
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+        WorkflowStatus::Cancelled
+            | WorkflowStatus::DeletionPending
+            | WorkflowStatus::Completed
+            | WorkflowStatus::Failed
     );
     DrainCategoryEvidence {
         count: usize::from(!terminal),
@@ -231,7 +278,10 @@ fn uncompensated_effects_evidence<P: WorkflowProfile>(
             .values()
             .filter(|effect| {
                 effect.declaration.role == EffectRole::Compensation
-                    && effect.status != EffectStatus::Receipted
+                    && !matches!(
+                        effect.status,
+                        EffectStatus::Receipted | EffectStatus::Invalidated
+                    )
             })
             .count(),
         identities: workflow
@@ -239,7 +289,10 @@ fn uncompensated_effects_evidence<P: WorkflowProfile>(
             .values()
             .filter(|effect| {
                 effect.declaration.role == EffectRole::Compensation
-                    && effect.status != EffectStatus::Receipted
+                    && !matches!(
+                        effect.status,
+                        EffectStatus::Receipted | EffectStatus::Invalidated
+                    )
             })
             .map(|effect| format!("effect:{}", effect.declaration.effect_id.0))
             .collect(),

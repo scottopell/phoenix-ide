@@ -341,6 +341,36 @@ impl WorkflowProfile for WakeProfile {
             )
         )
     }
+
+    fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool {
+        !matches!(event, WakeTerminalPayload::Cancelled { .. })
+    }
+
+    fn decision_handles_inbox(
+        event: &ReducerInboxPayload<Self>,
+        decision_event: &Self::Event,
+    ) -> bool {
+        match event {
+            ReducerInboxPayload::Receipt(WakeTerminalPayload::Cancelled { .. }) => {
+                *decision_event == WakeRegistrationEvent::CancelRequested
+            }
+            ReducerInboxPayload::Receipt(_) => {
+                matches!(
+                    decision_event,
+                    WakeRegistrationEvent::Registered | WakeRegistrationEvent::RuntimeAccepted
+                )
+            }
+            ReducerInboxPayload::Barrier(_) => *decision_event == WakeRegistrationEvent::Registered,
+        }
+    }
+
+    fn decision_handles_owed_acceptance(
+        event: &Self::OwedAcceptanceEvent,
+        decision_event: &Self::Event,
+    ) -> bool {
+        !matches!(event, WakeTerminalPayload::Cancelled { .. })
+            && *decision_event == WakeRegistrationEvent::RuntimeAccepted
+    }
 }
 
 #[must_use]
