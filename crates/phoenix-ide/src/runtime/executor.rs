@@ -5507,6 +5507,17 @@ where
                     self.context.conversation_id.clone(),
                     self.context.work_scope_worktree.as_deref(),
                 );
+                let old_durable_scope = super::wake::durable_scope_identity(&old_scope)
+                    .map_err(|error| error.to_string())?;
+                let new_durable_scope = super::wake::durable_scope_identity(&new_scope)
+                    .map_err(|error| error.to_string())?;
+                self.storage
+                    .rekey_pending_wake_scope(
+                        &self.context.conversation_id,
+                        &old_durable_scope,
+                        &new_durable_scope,
+                    )
+                    .await?;
 
                 // Migrate WorkScope-keyed resources opened before approval from
                 // the conversation scope to the worktree scope. Each rekey moves

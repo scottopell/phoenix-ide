@@ -137,7 +137,9 @@ pub struct TmuxWindowIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegisteredWindowState {
-    Live,
+    Live {
+        wait_targetable: bool,
+    },
     Terminal(TmuxTerminalInspection),
     Killed {
         occurred_at: chrono::DateTime<chrono::Utc>,
@@ -698,15 +700,26 @@ impl TmuxRegistry {
         self.inner.read().await.get(&key).cloned()
     }
 
-    pub async fn register_window(&self, identity: TmuxWindowIdentity) {
+    pub async fn register_window(&self, identity: TmuxWindowIdentity, wait_targetable: bool) {
         self.registered_windows
             .write()
             .await
-            .insert(identity, RegisteredWindowState::Live);
+            .insert(identity, RegisteredWindowState::Live { wait_targetable });
     }
 
     pub async fn has_registered_window(&self, identity: &TmuxWindowIdentity) -> bool {
         self.registered_windows.read().await.contains_key(identity)
+    }
+
+    pub async fn is_wait_targetable_window(&self, identity: &TmuxWindowIdentity) -> bool {
+        matches!(
+            self.registered_windows.read().await.get(identity),
+            Some(
+                RegisteredWindowState::Live {
+                    wait_targetable: true,
+                } | RegisteredWindowState::Terminal(_)
+            )
+        )
     }
 
     pub async fn preserve_terminal_before_kill(&self, identity: &TmuxWindowIdentity) {
@@ -746,7 +759,9 @@ impl TmuxRegistry {
 
     pub async fn clear_window_killed(&self, identity: &TmuxWindowIdentity) {
         if let Some(state) = self.registered_windows.write().await.get_mut(identity) {
-            *state = RegisteredWindowState::Live;
+            *state = RegisteredWindowState::Live {
+                wait_targetable: true,
+            };
         }
         let socket_path = match self.get_existing(&identity.work_scope).await {
             Some(entry) => entry.read().await.socket_path.clone(),
@@ -763,7 +778,7 @@ impl TmuxRegistry {
                     occurred_at: *occurred_at,
                 };
             }
-            Some(RegisteredWindowState::Live) | None => {}
+            Some(RegisteredWindowState::Live { .. }) | None => {}
         }
         if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
             return TmuxTerminalInspection::Unavailable;
@@ -775,7 +790,13 @@ impl TmuxRegistry {
         // read-only and never materializes a missing inventory entry.
         let socket_path = match self.get_existing(&identity.work_scope).await {
             Some(entry) => entry.read().await.socket_path.clone(),
-            None => self.derived_socket_path(&identity.work_scope),
+            None => match self
+                .socket_path_for_generation(&identity.server_generation)
+                .await
+            {
+                Some(path) => path,
+                None => self.derived_socket_path(&identity.work_scope),
+            },
         };
         match probe(&socket_path).await {
             Ok(ProbeResult::Live) => {}
@@ -798,6 +819,25 @@ impl TmuxRegistry {
         }
 
         inspect_tmux_window(&socket_path, &identity.window_id).await
+    }
+
+    async fn socket_path_for_generation(&self, generation: &str) -> Option<PathBuf> {
+        let mut entries = tokio::fs::read_dir(&self.socket_dir).await.ok()?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("sock") {
+                continue;
+            }
+            if matches!(probe(&path).await, Ok(ProbeResult::Live))
+                && tmux_global_env(&path, SERVER_GENERATION_VAR)
+                    .await
+                    .as_deref()
+                    == Some(generation)
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Deterministic socket path for a `WorkScope`, derived the same way
@@ -1507,7 +1547,7 @@ mod tests {
             server_generation: "generation-1".to_owned(),
             window_id: "@1".to_owned(),
         };
-        registry.register_window(identity.clone()).await;
+        registry.register_window(identity.clone(), true).await;
         assert!(registry.mark_window_killed(&identity).await);
         assert!(matches!(
             registry.inspect_window(&identity).await,
@@ -1529,6 +1569,20 @@ mod tests {
             registry.inspect_window(&wrong_window).await,
             TmuxTerminalInspection::Unavailable
         );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_windows_are_not_wait_targetable() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let identity = TmuxWindowIdentity {
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            server_generation: "generation-1".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        registry.register_window(identity.clone(), false).await;
+        assert!(registry.has_registered_window(&identity).await);
+        assert!(!registry.is_wait_targetable_window(&identity).await);
     }
 
     #[tokio::test]
@@ -1966,7 +2020,7 @@ mod tests {
             server_generation: "generation".to_owned(),
             window_id: "@1".to_owned(),
         };
-        reg.register_window(old_identity.clone()).await;
+        reg.register_window(old_identity.clone(), true).await;
 
         assert!(reg.rekey_scope(&old, &new).await);
         let new_identity = TmuxWindowIdentity {

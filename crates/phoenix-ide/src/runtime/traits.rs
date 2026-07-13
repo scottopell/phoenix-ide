@@ -172,6 +172,15 @@ pub trait StateStore: Send + Sync {
         cwd: &str,
     ) -> Result<(), String>;
 
+    async fn rekey_pending_wake_scope(
+        &self,
+        _conv_id: &str,
+        _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Read the conversation's clear watermark for stale tool-result clearing
     /// (specs/stale-tool-results). Returns 0 when nothing has been cleared yet.
     async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String>;
@@ -774,6 +783,20 @@ impl StateStore for DatabaseStorage {
             .update_conversation_cwd_recovery_only(conv_id, cwd)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn rekey_pending_wake_scope(
+        &self,
+        conv_id: &str,
+        old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+    ) -> Result<(), String> {
+        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .rekey_scope_for_conversation(conv_id, old_scope, new_scope)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {

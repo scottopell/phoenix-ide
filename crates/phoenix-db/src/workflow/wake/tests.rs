@@ -352,6 +352,37 @@ async fn fired_evidence_after_expiry_is_rejected_in_atomic_and_direct_receipt_pa
 }
 
 #[tokio::test]
+async fn pending_lookup_and_scope_rekey_follow_live_resource_ownership() {
+    let (pool, repo) = registered(bash()).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert!(adapter
+        .has_pending_for_conversation("conv-wake")
+        .await
+        .unwrap());
+    let worktree = WorkScopeIdentity {
+        kind: WorkScopeKind::Worktree,
+        stable_key: "/repo/worktree".to_owned(),
+    };
+    assert_eq!(
+        adapter
+            .rekey_scope_for_conversation("conv-wake", &scope(), &worktree)
+            .await
+            .unwrap(),
+        1
+    );
+    let row = sqlx::query(
+        "SELECT registration_scope_kind, registration_scope_stable_key, bash_work_scope_kind, bash_work_scope_stable_key FROM wake_workflow_bindings WHERE contract_id = 'wake-contract'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>(0), "worktree");
+    assert_eq!(row.get::<String, _>(1), "/repo/worktree");
+    assert_eq!(row.get::<String, _>(2), "worktree");
+    assert_eq!(row.get::<String, _>(3), "/repo/worktree");
+}
+
+#[tokio::test]
 async fn ensure_protocol_selection_reports_existing_accepting_selection_without_altering_it() {
     let pool = pool().await;
     let repo = WorkflowRepository::new(pool.clone());

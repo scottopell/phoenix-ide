@@ -176,6 +176,19 @@ pub struct QuestionMetadata {
     pub source: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitUntilInput {
+    pub target: WaitUntilTargetInput,
+    pub max_wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitUntilTargetInput {
+    Bash { handle_id: String },
+    TmuxWindow { window_id: String },
+}
+
 /// Strongly typed tool input enum
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
@@ -192,6 +205,7 @@ pub enum ToolInput {
     ApprovedCommissionReview(ApprovedCommissionReviewInput),
     ProposeTask(ProposeTaskInput),
     AskUserQuestion(AskUserQuestionInput),
+    WaitUntil(WaitUntilInput),
     /// The tool name did not match any registered tool. Carries the original
     /// name and payload so the executor can still dispatch by name (e.g. MCP
     /// tools registered at runtime that the state machine does not know about).
@@ -322,6 +336,7 @@ impl<'de> Deserialize<'de> for ToolInput {
             "ask_user_question" => {
                 parse_tool_input_or_malformed::<AskUserQuestionInput>("ask_user_question", payload)
             }
+            "wait_until" => parse_tool_input_or_malformed::<WaitUntilInput>("wait_until", payload),
             other => ToolInput::Unknown {
                 name: other.to_string(),
                 input: payload,
@@ -390,6 +405,11 @@ impl From<AskUserQuestionInput> for ToolInput {
         ToolInput::AskUserQuestion(input)
     }
 }
+impl From<WaitUntilInput> for ToolInput {
+    fn from(input: WaitUntilInput) -> Self {
+        ToolInput::WaitUntil(input)
+    }
+}
 
 impl ToolInput {
     /// Get the tool name
@@ -409,6 +429,7 @@ impl ToolInput {
             }
             ToolInput::ProposeTask(_) => "propose_task",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
+            ToolInput::WaitUntil(_) => "wait_until",
             ToolInput::Unknown { name, .. } | ToolInput::Malformed { name, .. } => name,
         }
     }
@@ -439,6 +460,7 @@ impl ToolInput {
             }
             ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::WaitUntil(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } | ToolInput::Malformed { input, .. } => input.clone(),
         }
     }
@@ -475,6 +497,7 @@ impl ToolInput {
             "approved_commission_review" => parse::<ApprovedCommissionReviewInput>(name, value),
             "propose_task" => parse::<ProposeTaskInput>(name, value),
             "ask_user_question" => parse::<AskUserQuestionInput>(name, value),
+            "wait_until" => parse::<WaitUntilInput>(name, value),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
                 input: value,

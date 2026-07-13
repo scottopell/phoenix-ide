@@ -15,7 +15,7 @@ use phoenix_workflow::{
     wake_profile::{
         self, BashTerminalStatus, ObserveHandleIntent, TmuxTerminalStatus, WakeCancellationReason,
         WakeForgottenReason, WakeRegistrationIntent, WakeResourceIdentity, WakeTerminalEvidence,
-        WakeTerminalPayload, WorkScopeKind,
+        WakeTerminalPayload, WorkScopeIdentity, WorkScopeKind,
     },
     BarrierStatus, EffectAmbiguity, EffectRole, EffectStatus, ReceiptFamily, SemanticAuthority,
     Timestamp, WorkflowStatus,
@@ -128,6 +128,51 @@ impl<'a> WakeWorkflowAdapter<'a> {
     #[must_use]
     pub const fn new(repository: &'a WorkflowRepository) -> Self {
         Self { repository }
+    }
+
+    pub async fn has_pending_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> WorkflowRepositoryResult<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM wake_workflow_bindings b \
+             JOIN workflows w ON w.id = b.workflow_id \
+             WHERE b.conversation_id = ?1 AND w.status NOT IN ('completed', 'cancelled'))",
+        )
+        .bind(conversation_id)
+        .fetch_one(self.repository.pool())
+        .await?;
+        Ok(exists != 0)
+    }
+
+    pub async fn rekey_scope_for_conversation(
+        &self,
+        conversation_id: &str,
+        old_scope: &WorkScopeIdentity,
+        new_scope: &WorkScopeIdentity,
+    ) -> WorkflowRepositoryResult<u64> {
+        let old_kind = scope_kind(old_scope.kind);
+        let old_key = &old_scope.stable_key;
+        let new_kind = scope_kind(new_scope.kind);
+        let new_key = &new_scope.stable_key;
+        let result = sqlx::query(
+            "UPDATE wake_workflow_bindings SET \
+             registration_scope_kind = ?1, registration_scope_stable_key = ?2, \
+             bash_work_scope_kind = CASE WHEN bash_work_scope_kind = ?3 AND bash_work_scope_stable_key = ?4 THEN ?1 ELSE bash_work_scope_kind END, \
+             bash_work_scope_stable_key = CASE WHEN bash_work_scope_kind = ?3 AND bash_work_scope_stable_key = ?4 THEN ?2 ELSE bash_work_scope_stable_key END, \
+             tmux_work_scope_kind = CASE WHEN tmux_work_scope_kind = ?3 AND tmux_work_scope_stable_key = ?4 THEN ?1 ELSE tmux_work_scope_kind END, \
+             tmux_work_scope_stable_key = CASE WHEN tmux_work_scope_kind = ?3 AND tmux_work_scope_stable_key = ?4 THEN ?2 ELSE tmux_work_scope_stable_key END \
+             WHERE conversation_id = ?5 \
+             AND registration_scope_kind = ?3 AND registration_scope_stable_key = ?4",
+        )
+        .bind(new_kind)
+        .bind(new_key)
+        .bind(old_kind)
+        .bind(old_key)
+        .bind(conversation_id)
+        .execute(self.repository.pool())
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Ensure the externally retryable wake protocol selection exists.

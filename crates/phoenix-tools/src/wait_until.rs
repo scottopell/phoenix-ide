@@ -258,7 +258,11 @@ async fn validate_target(
                 server_generation: server_generation.clone(),
                 window_id: window_id.clone(),
             };
-            if !ctx.tmux_registry().has_registered_window(&identity).await {
+            if !ctx
+                .tmux_registry()
+                .is_wait_targetable_window(&identity)
+                .await
+            {
                 return Err(error_output(
                     "wake_unauthorized_handle",
                     "tmux window is not a Phoenix-managed tmux_run resource in this work scope",

@@ -972,6 +972,25 @@ fn handle_core_tool_complete(
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
+        // A successful wait registration ends the tool round without another LLM turn.
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id
+            && matches!(current_tool.input, ToolInput::WaitUntil(_))
+            && remaining_tools.is_empty()
+            && pending_sub_agents.is_empty() =>
+        {
+            let mut all_results = completed_results.clone();
+            all_results.push(result);
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+                .expect("tool_use/tool_result count mismatch in wait-until transition");
+            Ok(CoreTransitionResult::new(CoreState::Idle)
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()))
+        }
+
         // ToolComplete (last tool, no sub-agents) -> LlmRequesting
         CoreEvent::ToolComplete {
             tool_use_id,
@@ -2192,6 +2211,7 @@ pub fn transition_parent(
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2441,6 +2461,7 @@ pub fn transition_parent(
                 | ToolInput::ProposeTask(_)
                 | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2604,6 +2625,7 @@ pub fn transition_parent(
                 | ToolInput::ProposeTask(_)
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -3221,6 +3243,7 @@ pub fn transition_sub_agent(
                     | ToolInput::CommissionReview(_)
                     | ToolInput::ApprovedCommissionReview(_)
                     | ToolInput::AskUserQuestion(_)
+                    | ToolInput::WaitUntil(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
                         unreachable!("is_terminal_tool returned true for non-terminal tool")
@@ -4389,6 +4412,54 @@ mod tests {
             result.new_state,
             ConvState::LlmRequesting { attempt: 1 }
         ));
+    }
+
+    #[test]
+    fn wait_until_completion_suspends_without_requesting_llm() {
+        use crate::state::{
+            AssistantMessage, ToolCall, ToolInput, WaitUntilInput, WaitUntilTargetInput,
+        };
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let assistant_message = AssistantMessage::new(
+            "assistant-wait".to_owned(),
+            vec![ContentBlock::tool_use(
+                "wait-1",
+                "wait_until",
+                serde_json::json!({"target":{"kind":"bash","handle_id":"b-1"},"max_wait_seconds":60}),
+            )],
+            None,
+            None,
+        );
+        let result = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "wait-1",
+                    ToolInput::WaitUntil(WaitUntilInput {
+                        target: WaitUntilTargetInput::Bash {
+                            handle_id: "b-1".to_owned(),
+                        },
+                        max_wait_seconds: 60,
+                    }),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message,
+            },
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "wait-1".to_owned(),
+                result: ToolResult::success("wait-1".to_owned(), "registered".to_owned()),
+            },
+        )
+        .expect("wait completion");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
     }
 
     #[test]
@@ -6697,6 +6768,7 @@ mod tests {
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ProposeTask(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. }) => {
                     panic!("expected approved commission review input, got {other:?}")

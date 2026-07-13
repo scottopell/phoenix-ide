@@ -66,7 +66,7 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             self.manager.kick_wake_worker();
             return Ok(receipt);
         }
-        let accepted_at = Utc::now();
+        let (accepted_at, registered_at) = normalized_registration_time()?;
         let expires_at = accepted_at
             + Duration::seconds(
                 i64::try_from(registration.max_wait_seconds)
@@ -96,7 +96,6 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             ),
         };
         let workflow_id = format!("wake-workflow-{stable}");
-        let registered_at = timestamp(accepted_at).map_err(WakeRegistrarError::Persistence)?;
         let expires_timestamp = timestamp(expires_at).map_err(WakeRegistrarError::Persistence)?;
         let expires_at = DateTime::<Utc>::from_timestamp(
             i64::try_from(expires_timestamp.0)
@@ -299,6 +298,16 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         })
 }
 
+fn normalized_registration_time() -> Result<(DateTime<Utc>, Timestamp), WakeRegistrarError> {
+    let registered_at = timestamp(Utc::now()).map_err(WakeRegistrarError::Persistence)?;
+    let seconds = i64::try_from(registered_at.0)
+        .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))?;
+    let accepted_at = DateTime::<Utc>::from_timestamp(seconds, 0).ok_or_else(|| {
+        WakeRegistrarError::Persistence("wake registration is out of range".to_owned())
+    })?;
+    Ok((accepted_at, registered_at))
+}
+
 fn scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, WakeRegistrarError> {
     match scope {
         WorkScope::Conversation(id) => Ok(WorkScopeIdentity {
@@ -313,6 +322,12 @@ fn scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, WakeRegistrarE
             "global resources cannot be registered for conversation wake".to_owned(),
         )),
     }
+}
+
+pub(crate) fn durable_scope_identity(
+    scope: &WorkScope,
+) -> Result<WorkScopeIdentity, WakeRegistrarError> {
+    scope_identity(scope)
 }
 
 pub(crate) async fn run(manager: Arc<RuntimeManager>, mut kick: watch::Receiver<u64>) {
@@ -439,6 +454,7 @@ async fn process_claim(
         .await
         .map_err(|error| error.to_string())?;
     let decision = inspect_binding(manager, &binding, now).await?;
+    let now = Utc::now();
     match decision {
         InspectionDecision::Terminal { evidence, terminal } => {
             let stem = format!(

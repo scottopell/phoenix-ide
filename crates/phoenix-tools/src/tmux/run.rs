@@ -190,7 +190,9 @@ impl Tool for TmuxRunTool {
             server_generation: server_generation.clone(),
             window_id: target.window_id.clone(),
         };
-        ctx.tmux_registry().register_window(identity.clone()).await;
+        ctx.tmux_registry()
+            .register_window(identity.clone(), parsed.keep_open_on_exit)
+            .await;
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
