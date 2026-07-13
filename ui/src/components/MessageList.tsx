@@ -463,6 +463,9 @@ function MessageListImpl({
       : null,
     [activeFindMatch],
   );
+  const activeFindRevealTarget = activeFindMatch?.target.kind === 'unit-text'
+    ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.target.sourceId)?.revealTarget ?? null
+    : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;
@@ -1206,13 +1209,20 @@ function MessageListImpl({
           unit.kind === 'agent_turn' && unit.key === latestAgentKey,
           pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
-            ? { fragmentId: activeFindHighlight.fragmentId, start: activeFindHighlight.start, end: activeFindHighlight.end }
+            ? (
+                activeFindRevealTarget?.kind === 'agent-text'
+                || activeFindRevealTarget?.kind === 'tool-result-search'
+                || activeFindRevealTarget?.kind === 'tool-result-keyword-search'
+                || activeFindRevealTarget?.kind === 'tool-result-read-file'
+              )
+              ? { fragmentId: activeFindHighlight.fragmentId, start: activeFindHighlight.start, end: activeFindHighlight.end }
+              : null
             : null,
           handleRevealHandled,
         )}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, handleRevealHandled, pulseMountedRow],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(
