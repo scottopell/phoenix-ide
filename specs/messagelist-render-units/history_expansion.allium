@@ -61,7 +61,7 @@ surface HistoryExpansionController {
         view.failure
 
     provides:
-        ViewChanged(view, conversation_id, view_generation, transcript_generation)
+        ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
         ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
         LoadedTargetRequested(view, command_token, target_message_id)
@@ -84,11 +84,13 @@ surface ScrollCommandExecutor {
 }
 
 rule ViewChangeInvalidatesOutstandingWork {
-    when: ViewChanged(view, conversation_id, view_generation, transcript_generation)
+    when: ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
     requires: view_generation > view.view_generation
     ensures: view.conversation_id = conversation_id
     ensures: view.view_generation = view_generation
     ensures: view.transcript_generation = transcript_generation
+    ensures: has_earlier_history implies view.coverage = tail
+    ensures: not has_earlier_history implies view.coverage = complete
     ensures: view.active_request = null
     ensures: view.pending_command = null
     ensures: view.failure = null
@@ -128,7 +130,7 @@ rule ChangedDeepLinkPreservesManualRequest {
 rule LoadedTargetCreatesNavigationCommandWithoutExpandingCoverage {
     when: LoadedTargetRequested(view, command_token, target_message_id)
     requires: view.pending_command = null
-    requires: view.failure = null
+    requires: view.failure = null or view.failure.kind = request_failed
     ensures: view.pending_command = ScrollCommand(
         view: view,
         token: command_token,
@@ -139,6 +141,14 @@ rule LoadedTargetCreatesNavigationCommandWithoutExpandingCoverage {
         issued_view_generation: view.view_generation
     )
     ensures: view.coverage = view.coverage
+}
+
+rule LoadedTargetRequestClearsPriorRequestFailure {
+    when: LoadedTargetRequested(view, _, _)
+    requires: view.pending_command = null
+    requires: view.failure != null
+    requires: view.failure.kind = request_failed
+    ensures: view.failure = null
 }
 
 rule ManualExpansionStartsOneRequest {

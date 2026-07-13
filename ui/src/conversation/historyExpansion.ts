@@ -116,7 +116,7 @@ export function reduceHistoryExpansion(
     }
 
     case 'loaded_target_requested':
-      if (state.pendingCommand || state.failure) return state;
+      if (state.pendingCommand || (state.failure && state.failure.kind !== 'request_failed')) return state;
       return {
         ...state,
         pendingCommand: {

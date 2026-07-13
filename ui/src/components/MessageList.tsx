@@ -888,18 +888,17 @@ function MessageListImpl({
   };
 
   useEffect(() => {
+    cancelHistoryCommandRef.current();
     pendingHistoryAckRef.current = null;
     handledHistoryCommandRef.current = null;
     acknowledgedHistoryCommandRef.current = null;
-    activeHistoryCommandRef.current = null;
     lastVisibleRangeRef.current = null;
     releaseContinuityRestoreSuppression();
   }, [conversationId, releaseContinuityRestoreSuppression]);
 
   useEffect(() => () => {
-    activeHistoryCommandRef.current = null;
-    releaseContinuityRestoreSuppression();
-  }, [releaseContinuityRestoreSuppression]);
+    cancelHistoryCommandRef.current();
+  }, []);
   useEffect(() => {
     const incomingOwnerOrNull = historyScrollCommand ? ownerForHistoryCommand(historyScrollCommand) : null;
     const activeOwner = activeHistoryCommandRef.current;

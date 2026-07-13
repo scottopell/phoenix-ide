@@ -1214,6 +1214,61 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
   });
 
+  it('supersedes the active owner exactly once when the conversation is replaced', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (conversationId: string) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId={conversationId}
+        historyScrollCommand={command}
+        currentHistoryView={view}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList('conv-history'));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    rerender(renderList('conv-history-replacement'));
+    rerender(renderList('conv-history-replacement'));
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
+  it('supersedes the active owner exactly once on unmount', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
+    const onHistoryScrollCommandHandled = vi.fn();
+
+    const { unmount } = render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        currentHistoryView={view}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    ));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    unmount();
+    unmount();
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
   it('supersedes a pending jump exactly once when a newer jump replaces it', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
@@ -1354,7 +1409,12 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     rerender(renderList('conv-history-b', 2));
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(
+      1,
+      'superseded',
+      { conversationId: 'conv-history-a', generation: 1, transcriptGeneration: 1 },
+    );
   });
 
   it('does not let a stale history range callback acknowledge a new conversation with overlapping indices', () => {
@@ -1415,7 +1475,12 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
     unmount();
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(
+      1,
+      'superseded',
+      { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 },
+    );
   });
 });
 

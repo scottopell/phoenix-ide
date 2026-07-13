@@ -53,9 +53,26 @@ surface VirtualTranscript {
         view.active_transaction
 }
 
-rule ViewReplacementDiscardsPhysicalState {
+rule ViewReplacementSupersedesActiveTransactionBeforeDiscardingPhysicalState {
     when: ViewReplaced(view, generation, ordered_keys)
     requires: generation > view.generation
+    requires: view.active_transaction != null
+    ensures: CommandFinished(
+        view,
+        view.active_transaction.token,
+        view.active_transaction.generation,
+        superseded
+    ).emitted()
+    ensures: view.generation = generation
+    ensures: view.ordered_keys = ordered_keys
+    ensures: view.measured_keys = {}
+    ensures: view.active_transaction = null
+}
+
+rule ViewReplacementDiscardsPhysicalStateWithoutTransaction {
+    when: ViewReplaced(view, generation, ordered_keys)
+    requires: generation > view.generation
+    requires: view.active_transaction = null
     ensures: view.generation = generation
     ensures: view.ordered_keys = ordered_keys
     ensures: view.measured_keys = {}
@@ -150,13 +167,6 @@ rule ExplicitSupersessionRequiresTerminalResult {
     requires: view.active_transaction != null
     requires: view.active_transaction.token = token
     ensures: view.active_transaction = view.active_transaction
-}
-
-invariant ActiveTransactionHasOneTerminalResult {
-    -- A matching CommandFinished event is the only terminal transition that
-    -- clears active_transaction, so each owner receives at most one terminal
-    -- result.
-    true
 }
 
 invariant OrderedKeysAreUnique {

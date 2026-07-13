@@ -186,6 +186,27 @@ describe('history expansion reducer', () => {
     expect(next.pendingCommand?.kind).toBe('jump_to_message');
   });
 
+  it('creates a navigation command for a loaded target despite an unrelated request failure', () => {
+    const currentView = view('a', 1);
+    const state = {
+      ...initialHistoryExpansionState(currentView, true),
+      failure: {
+        kind: 'request_failed' as const,
+        message: 'offline',
+        intent: { kind: 'deep_link' as const, targetMessageId: 'missing' },
+        transcriptGeneration: currentView.transcriptGeneration,
+      },
+    };
+    const next = reduceHistoryExpansion(state, {
+      type: 'loaded_target_requested',
+      targetMessageId: 'loaded',
+      commandToken: 7,
+    });
+
+    expect(next.pendingCommand).toMatchObject({ kind: 'jump_to_message', targetMessageId: 'loaded' });
+    expect(next.failure).toBeNull();
+  });
+
   it('clears a missing-target failure when the deep-link target changes', () => {
     const currentView = view('a', 1);
     const state = {
