@@ -19,6 +19,13 @@ export interface VirtualTranscriptRange {
   endIndex: number;
 }
 
+export interface VirtualTranscriptPhysicalSnapshot {
+  range: VirtualTranscriptRange | null;
+  layoutRevision: number;
+}
+
+export type VirtualTranscriptRangeChange = VirtualTranscriptPhysicalSnapshot;
+
 export interface VirtualTranscriptAnchor {
   index: number;
   key: string;
@@ -30,7 +37,9 @@ export interface VirtualTranscriptHandle {
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
   measureOffsetForIndex(index: number): number | null;
+  measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
+  physicalSnapshot(): VirtualTranscriptPhysicalSnapshot;
 }
 
 export interface VirtualTranscriptProps<T> {
@@ -44,7 +53,7 @@ export interface VirtualTranscriptProps<T> {
   estimatedExtent: number | ((item: T, index: number) => number);
   className?: string;
   scrollerRef?: (element: HTMLDivElement | null) => void;
-  onRangeChange?: (range: VirtualTranscriptRange | null) => void;
+  onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
   onTotalExtentChange?: (totalExtent: number) => void;
   onPinnedChange?: (pinned: boolean) => void;
 }
@@ -85,6 +94,20 @@ function clampNonNegative(value: number): number {
 
 function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange | null {
   return range ? { startIndex: range.startIndex, endIndex: range.endIndex } : null;
+}
+
+function physicalSnapshot<T>(store: PhysicalStore<T>): VirtualTranscriptPhysicalSnapshot {
+  return {
+    range: normalizeRange(store.range),
+    layoutRevision: store.revision,
+  };
+}
+
+function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number): number | null {
+  store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
+  const offset = itemPhysicalOffset(store, index);
+  if (offset === undefined) return null;
+  return offset - store.viewportTop;
 }
 
 function resolveKeys<T>(
@@ -450,8 +473,8 @@ function VirtualTranscriptInner<T>(
   }, []);
 
   useLayoutEffect(() => {
-    onRangeChange?.(normalizeRange(store.range));
-  }, [onRangeChange, store.range, store.revision]);
+    onRangeChange?.(physicalSnapshot(store));
+  }, [onRangeChange, store, store.range, store.revision]);
 
   useLayoutEffect(() => {
     onTotalExtentChange?.(totalPhysicalExtent(store));
@@ -498,13 +521,19 @@ function VirtualTranscriptInner<T>(
     measureOffsetForIndex(index) {
       const current = storeRef.current;
       if (!current) return null;
-      current.viewportTop = current.scroller?.scrollTop ?? current.viewportTop;
-      const offset = itemPhysicalOffset(current, index);
-      if (offset === undefined) return null;
-      return offset - current.viewportTop;
+      return measureOffsetForIndexInStore(current, index);
+    },
+    measureOffsetForIndexAtSnapshot(index, snapshot) {
+      const current = storeRef.current;
+      if (!current || current.revision !== snapshot.layoutRevision) return null;
+      return measureOffsetForIndexInStore(current, index);
     },
     layoutRevision() {
       return storeRef.current?.revision ?? 0;
+    },
+    physicalSnapshot() {
+      const current = storeRef.current;
+      return current ? physicalSnapshot(current) : { range: null, layoutRevision: 0 };
     },
   }), [publish]);
 

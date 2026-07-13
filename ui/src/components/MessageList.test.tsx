@@ -1,10 +1,10 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
-import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
+import { createRef, forwardRef, StrictMode, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
-import type { VirtualTranscriptRange } from './VirtualTranscript';
+import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
@@ -98,10 +98,13 @@ const virtualTranscriptMock = {
   scrollToTail: vi.fn(),
   captureVisibleAnchor: vi.fn(),
   measureOffsetForIndex: vi.fn(),
+  measureOffsetForIndexAtSnapshot: vi.fn(),
   layoutRevision: vi.fn(),
+  physicalSnapshot: vi.fn(),
   totalExtentChanged: null as ((height: number) => void) | null,
   pinnedChanged: null as ((pinned: boolean) => void) | null,
-  rangeChanged: null as ((range: VirtualTranscriptRange | null) => void) | null,
+  rangeChanged: null as ((snapshot: VirtualTranscriptRangeChange) => void) | null,
+  currentSnapshot: { range: null, layoutRevision: 1 } as VirtualTranscriptPhysicalSnapshot,
   renderedIndices: null as Set<number> | null,
 };
 
@@ -110,7 +113,10 @@ beforeEach(() => {
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
+  virtualTranscriptMock.measureOffsetForIndexAtSnapshot = vi.fn((index: number) => virtualTranscriptMock.measureOffsetForIndex(index));
   virtualTranscriptMock.layoutRevision = vi.fn(() => 1);
+  virtualTranscriptMock.currentSnapshot = { range: null, layoutRevision: 1 };
+  virtualTranscriptMock.physicalSnapshot = vi.fn(() => virtualTranscriptMock.currentSnapshot);
   virtualTranscriptMock.totalExtentChanged = null;
   virtualTranscriptMock.pinnedChanged = null;
   virtualTranscriptMock.rangeChanged = null;
@@ -140,10 +146,10 @@ vi.mock('./VirtualTranscript', async () => {
       scrollerRef?: (ref: HTMLDivElement | null) => void;
       onTotalExtentChange?: (height: number) => void;
       onPinnedChange?: (pinned: boolean) => void;
-      onRangeChange?: (range: VirtualTranscriptRange | null) => void;
+      onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; measureOffsetForIndex: (index: number) => number | null; layoutRevision: () => number }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: () => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -152,14 +158,19 @@ vi.mock('./VirtualTranscript', async () => {
         virtualTranscriptMock.pinnedChanged = onPinnedChange;
       }
       if (onRangeChange) {
-        virtualTranscriptMock.rangeChanged = onRangeChange;
+        virtualTranscriptMock.rangeChanged = (snapshot) => {
+          virtualTranscriptMock.currentSnapshot = snapshot;
+          onRangeChange(snapshot);
+        };
       }
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
         measureOffsetForIndex: virtualTranscriptMock.measureOffsetForIndex,
+        measureOffsetForIndexAtSnapshot: virtualTranscriptMock.measureOffsetForIndexAtSnapshot,
         layoutRevision: virtualTranscriptMock.layoutRevision,
+        physicalSnapshot: virtualTranscriptMock.physicalSnapshot,
       }), []);
       useLayoutEffect(() => {
         scrollerRef?.(containerRef.current);
@@ -913,20 +924,23 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start', -24);
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 0, endIndex: 0 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-30);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 1 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 0, endIndex: 1 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-22.5);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
 
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(3);
-    expect(virtualTranscriptMock.measureOffsetForIndex).toHaveBeenCalledWith(1);
+    expect(virtualTranscriptMock.measureOffsetForIndexAtSnapshot).toHaveBeenCalledWith(
+      1,
+      { range: { startIndex: 1, endIndex: 2 }, layoutRevision: 1 },
+    );
 
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
@@ -949,7 +963,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     );
 
     const { rerender } = render(renderList());
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 0, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
 
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
@@ -961,7 +975,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
 
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 0, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
   });
 
@@ -994,11 +1008,64 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
 
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 0, endIndex: 0 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 0, endIndex: 0 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
 
     fireEvent.scroll(scroller);
     expect(onVisibleRangeChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('supersedes active restore when a suppressed scroll diverges from the desired offset', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        />,
+      ),
+    );
+
+    virtualTranscriptMock.physicalSnapshot.mockReturnValue({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: 7 });
+    virtualTranscriptMock.measureOffsetForIndexAtSnapshot.mockReturnValue(-30);
+
+    fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
+  });
+
+  it('does not supersede active restore when a suppressed scroll remains within desired offset tolerance', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        />,
+      ),
+    );
+
+    virtualTranscriptMock.physicalSnapshot.mockReturnValue({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: 7 });
+    virtualTranscriptMock.measureOffsetForIndexAtSnapshot.mockReturnValue(-22.5);
+
+    fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
+
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
   });
 
   it('range acknowledgement releases suppression for subsequent continuity handling', () => {
@@ -1026,7 +1093,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
 
     fireEvent.scroll(scroller);
@@ -1052,7 +1119,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     );
 
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-21.5);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
   });
 
@@ -1086,7 +1153,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 2, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 2, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(2, 'applied', { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 });
@@ -1118,7 +1185,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
   });
 
-  it('supersedes the active owner exactly once on unmount', () => {
+  it('does not supersede the active owner on React effect cleanup', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
     const onHistoryScrollCommandHandled = vi.fn();
@@ -1140,8 +1207,34 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     unmount();
     unmount();
 
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+  });
+
+  it('does not let StrictMode setup-cleanup-setup terminally supersede a mounted command', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
+    const onHistoryScrollCommandHandled = vi.fn();
+
+    render(withConvContext(
+      <StrictMode>
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          transcriptPositioning={transcriptPositioningForCommand(command)}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        />
+      </StrictMode>,
+    ));
+
+    virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-24);
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 1 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
+
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'applied', view);
   });
 
   it('supersedes a pending jump exactly once when a newer jump replaces it', () => {
@@ -1277,11 +1370,11 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 
     const { rerender } = render(renderList('conv-history-a', 1));
     virtualTranscriptMock.measureOffsetForIndex.mockReturnValue(-21.5);
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
 
     rerender(renderList('conv-history-b', 2));
-    act(() => virtualTranscriptMock.rangeChanged?.({ startIndex: 1, endIndex: 2 }));
+    act(() => virtualTranscriptMock.rangeChanged?.({ range: { startIndex: 1, endIndex: 2 }, layoutRevision: virtualTranscriptMock.layoutRevision() }));
 
     expect(onHistoryScrollCommandHandled).not.toHaveBeenCalledWith(
       1,
@@ -1290,7 +1383,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     );
   });
 
-  it('clears suppressed continuity on unmount', () => {
+  it('keeps suppressed continuity local to the unmounted lifecycle', () => {
     const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
     const onHistoryScrollCommandHandled = vi.fn();
     const onVisibleRangeChange = vi.fn();
@@ -1315,12 +1408,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onVisibleRangeChange).not.toHaveBeenCalled();
 
     unmount();
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
-    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(
-      1,
-      'superseded',
-      { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 },
-    );
+    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
   });
 });
 

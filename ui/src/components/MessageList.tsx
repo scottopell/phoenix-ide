@@ -19,7 +19,9 @@ import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
   VirtualTranscript,
   type VirtualTranscriptHandle,
+  type VirtualTranscriptPhysicalSnapshot,
   type VirtualTranscriptRange,
+  type VirtualTranscriptRangeChange,
 } from './VirtualTranscript';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -77,6 +79,12 @@ const ChevronDown = () => (
     <polyline points="6 9 12 15 18 9" />
   </svg>
 );
+
+const RESTORE_OFFSET_TOLERANCE_PX = 2;
+
+function historyViewKey(view: HistoryView): string {
+  return `${view.conversationId}:${view.generation}:${view.transcriptGeneration}`;
+}
 
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -503,6 +511,10 @@ function MessageListImpl({
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
   const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
+  const lastPhysicalSnapshotRef = useRef<VirtualTranscriptPhysicalSnapshot | null>(null);
+  const transcriptPositioningViewKeyRef = useRef(historyViewKey(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  ));
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -639,7 +651,20 @@ function MessageListImpl({
         if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
       };
       const onScroll = () => {
-        if (continuityRestoreInFlightRef.current) return;
+        if (continuityRestoreInFlightRef.current) {
+          const active = transcriptPositioningStateRef.current.active;
+          const phase = transcriptPositioningStateRef.current.phase;
+          if (active?.command.kind === 'restore_after_prefix_expansion' && phase?.kind === 'awaiting_physical') {
+            const snapshot = transcriptRef.current?.physicalSnapshot() ?? null;
+            const actualOffset = snapshot
+              ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(phase.targetIndex, snapshot) ?? null
+              : null;
+            if (actualOffset !== null && Math.abs(actualOffset - active.command.viewportStartOffset) > RESTORE_OFFSET_TOLERANCE_PX) {
+              dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+            }
+          }
+          return;
+        }
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
@@ -699,6 +724,7 @@ function MessageListImpl({
     prevPendingLengthRef.current = pendingMessages.length;
 
     if (conversationChanged) {
+      lastPhysicalSnapshotRef.current = null;
       dispatchScrollEvent({ type: 'conversationChanged', conversationId });
       return;
     }
@@ -839,8 +865,6 @@ function MessageListImpl({
     [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
   );
 
-  const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
-
   const applyTranscriptPositioningEffects = useCallback((effects: TranscriptPositioningEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
@@ -872,21 +896,24 @@ function MessageListImpl({
             continuityRestoreInFlightRef.current = true;
             transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
           }
-          const layoutRevision = transcriptRef.current?.layoutRevision() ?? 0;
+          const physicalSnapshot = transcriptRef.current?.physicalSnapshot()
+            ?? lastPhysicalSnapshotRef.current
+            ?? { range: null, layoutRevision: 0 };
+          lastPhysicalSnapshotRef.current = physicalSnapshot;
           dispatchTranscriptPositioningRef.current({
             type: 'position_issued',
             commandKey: effect.commandKey,
             targetIndex: effect.targetIndex,
-            layoutRevision,
+            layoutRevision: physicalSnapshot.layoutRevision,
           });
           dispatchTranscriptPositioningRef.current({
             type: 'physical_observed',
             commandKey: effect.commandKey,
-            range: lastVisibleRangeRef.current,
+            range: physicalSnapshot.range,
             actualOffset: command.kind === 'restore_after_prefix_expansion'
-              ? transcriptRef.current?.measureOffsetForIndex(effect.targetIndex) ?? null
+              ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(effect.targetIndex, physicalSnapshot) ?? null
               : null,
-            layoutRevision,
+            layoutRevision: physicalSnapshot.layoutRevision,
           });
           break;
         }
@@ -908,12 +935,14 @@ function MessageListImpl({
   dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
 
   useEffect(() => {
+    const nextView = transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view;
+    const nextViewKey = historyViewKey(nextView);
+    if (transcriptPositioningViewKeyRef.current !== nextViewKey) {
+      lastPhysicalSnapshotRef.current = null;
+      transcriptPositioningViewKeyRef.current = nextViewKey;
+    }
     dispatchTranscriptPositioning({ type: 'input_changed', input: transcriptPositioning });
   }, [dispatchTranscriptPositioning, transcriptPositioning]);
-
-  useEffect(() => () => {
-    dispatchTranscriptPositioningRef.current({ type: 'executor_detached' });
-  }, []);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -951,10 +980,11 @@ function MessageListImpl({
       .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
   }, [activeScope, findOpen, findScopeId]);
 
-  const handleRangeChanged = useCallback((range: VirtualTranscriptRange | null) => {
+  const handleRangeChanged = useCallback((snapshot: VirtualTranscriptRangeChange) => {
+    const range = snapshot.range;
+    lastPhysicalSnapshotRef.current = snapshot;
     if (!range) return;
     firstVisibleUnitIndexRef.current = range.startIndex;
-    lastVisibleRangeRef.current = range;
     const active = transcriptPositioningStateRef.current.active;
     const phase = transcriptPositioningStateRef.current.phase;
     if (active && phase?.kind === 'awaiting_physical') {
@@ -963,9 +993,9 @@ function MessageListImpl({
         commandKey: active.key,
         range,
         actualOffset: active.command.kind === 'restore_after_prefix_expansion'
-          ? transcriptRef.current?.measureOffsetForIndex(phase.targetIndex) ?? null
+          ? transcriptRef.current?.measureOffsetForIndexAtSnapshot(phase.targetIndex, snapshot) ?? null
           : null,
-        layoutRevision: transcriptRef.current?.layoutRevision() ?? 0,
+        layoutRevision: snapshot.layoutRevision,
       });
     }
     onVisibleRangeChange?.(range);

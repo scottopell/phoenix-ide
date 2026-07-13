@@ -1,7 +1,7 @@
 import { type ReactElement } from 'react';
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptRange } from './VirtualTranscript';
+import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
 interface TestItem {
   id: string;
@@ -116,7 +116,7 @@ beforeEach(() => {
 
 describe('VirtualTranscript', () => {
   it('renders a bounded contiguous range with top and bottom spacers', () => {
-    const ranges: Array<VirtualTranscriptRange | null> = [];
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
 
     render(
       <VirtualTranscript
@@ -126,14 +126,15 @@ describe('VirtualTranscript', () => {
         overscan={20}
         initialTail={false}
         renderItem={renderRow}
-        onRangeChange={(range) => ranges.push(range)}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
       />,
     );
 
     const indexes = rowIndexes();
     expect(indexes).toEqual([0, 1, 2, 3, 4, 5]);
     expect(indexes.length).toBeLessThan(100);
-    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 5 });
+    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 5 });
+    expect(ranges.at(-1)?.layoutRevision).toBeGreaterThan(0);
 
     const scroller = document.querySelector('.virtual-transcript');
     expect(scroller).toBeInstanceOf(HTMLElement);
@@ -231,7 +232,7 @@ describe('VirtualTranscript', () => {
   });
 
   it('updates viewport geometry through ResizeObserver before publishing range', () => {
-    const ranges: Array<VirtualTranscriptRange | null> = [];
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
 
     render(
       <VirtualTranscript
@@ -241,18 +242,18 @@ describe('VirtualTranscript', () => {
         overscan={0}
         initialTail={false}
         renderItem={renderRow}
-        onRangeChange={(range) => ranges.push(range)}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
       />,
     );
 
-    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 4 });
+    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 4 });
 
     const scroller = document.querySelector('.virtual-transcript')!;
     act(() => {
       resizeObservers.at(-1)?.triggerEntries([[scroller, 60]]);
     });
 
-    expect(ranges.at(-1)).toEqual({ startIndex: 0, endIndex: 2 });
+    expect(ranges.at(-1)?.range).toEqual({ startIndex: 0, endIndex: 2 });
     expect(rowIndexes()).toEqual([0, 1, 2]);
   });
 
@@ -336,6 +337,11 @@ describe('VirtualTranscript', () => {
     act(() => ref.current?.scrollToIndex(0, 'start'));
     expect(scrollTopOf(scroller)).toBe(30);
     expect(ref.current?.measureOffsetForIndex(0)).toBe(0);
+
+    const snapshot = ref.current?.physicalSnapshot();
+    expect(snapshot?.range).toEqual({ startIndex: 0, endIndex: 9 });
+    expect(ref.current?.measureOffsetForIndexAtSnapshot(0, snapshot!)).toBe(0);
+    expect(ref.current?.measureOffsetForIndexAtSnapshot(0, { ...snapshot!, layoutRevision: snapshot!.layoutRevision - 1 })).toBeNull();
 
     const header = document.querySelector<HTMLElement>('[data-virtual-header]')!;
     act(() => resizeObservers[0]!.triggerEntries([[header, 60]]));
