@@ -867,11 +867,16 @@ impl WorkflowRepository {
             return Ok(TransitionCommitOutcome::VersionConflict);
         };
 
-        if let Err(WorkflowRepositoryError::InvalidPlan(_)) =
-            validate_transition_plan(&mut tx, commit, &workflow).await
-        {
-            tx.rollback().await?;
-            return Ok(TransitionCommitOutcome::InvalidPlan);
+        match validate_transition_plan(&mut tx, commit, &workflow).await {
+            Ok(()) => {}
+            Err(WorkflowRepositoryError::InvalidPlan(_)) => {
+                tx.rollback().await?;
+                return Ok(TransitionCommitOutcome::InvalidPlan);
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
         }
 
         let updated = sqlx::query(
@@ -1051,6 +1056,11 @@ impl WorkflowRepository {
         }
 
         for invalidation in &commit.invalidations {
+            sqlx::query("DELETE FROM workflow_claims WHERE effect_id = ?1 AND workflow_id = ?2")
+                .bind(&invalidation.effect_id)
+                .bind(&commit.workflow_id)
+                .execute(&mut *tx)
+                .await?;
             let updated = sqlx::query(
                 "UPDATE workflow_effects SET status = ?1 \
                  WHERE id = ?2 AND workflow_id = ?3 AND declared_workflow_version = ?4 \
@@ -1095,6 +1105,9 @@ impl WorkflowRepository {
         &self,
         request: &DurableClaimRequest,
     ) -> WorkflowRepositoryResult<ClaimEffectResult> {
+        if request.lease_until <= request.now {
+            return Ok(ClaimEffectResult::Ineligible);
+        }
         let mut tx = self.pool.begin().await?;
 
         let insert_claim = sqlx::query(
@@ -1108,10 +1121,15 @@ impl WorkflowRepository {
                AND w.authority = 'engine_protocol' \
                AND w.execution_mode = 'authoritative' \
                AND w.status = 'active' \
-               AND e.status = 'eligible' \
+               AND e.status IN ('eligible', 'blocked') \
                AND e.pending_reconciliation = 0 \
                AND e.generation = w.generation \
-               AND c.effect_id IS NULL",
+               AND c.effect_id IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM workflow_effect_dependencies d \
+                   JOIN workflow_effects prerequisite ON prerequisite.id = d.dependency_effect_id \
+                   WHERE d.effect_id = e.id AND prerequisite.status <> 'receipted' \
+               )",
         )
         .bind(&request.claim_token)
         .bind(&request.worker_id)
@@ -1147,7 +1165,7 @@ impl WorkflowRepository {
             "UPDATE workflow_effects \
              SET status = 'claimed' \
              WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
-               AND generation = ?4 AND status = 'eligible'",
+               AND generation = ?4 AND status IN ('eligible', 'blocked')",
         )
         .bind(&authority.effect_id)
         .bind(&authority.workflow_id)
@@ -1487,7 +1505,12 @@ impl WorkflowRepository {
                AND w.execution_mode = 'authoritative' \
                AND w.status = 'active' \
                AND w.generation = e.generation \
-               AND (e.status = 'eligible' \
+               AND ((e.status IN ('eligible', 'blocked') \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM workflow_effect_dependencies d \
+                         JOIN workflow_effects prerequisite ON prerequisite.id = d.dependency_effect_id \
+                         WHERE d.effect_id = e.id AND prerequisite.status <> 'receipted' \
+                     )) \
                     OR (e.status = 'retry_wait' AND e.next_eligible_at IS NOT NULL AND e.next_eligible_at <= ?1) \
                     OR (e.status = 'claimed' AND c.effect_id IS NOT NULL AND c.lease_until <= ?1)) \
              ORDER BY e.workflow_id, e.id",
@@ -1510,7 +1533,7 @@ impl WorkflowRepository {
                 .try_into()
                 .expect("generation fits u64");
             match status.as_str() {
-                "eligible" => due.push(DueEffect::Eligible {
+                "eligible" | "blocked" => due.push(DueEffect::Eligible {
                     workflow_id,
                     effect_id,
                     declared_workflow_version,
@@ -2235,6 +2258,12 @@ async fn record_observation_in_transaction(
     tx: &mut SqliteConnection,
     observation: &DurableObservationRecord,
 ) -> WorkflowRepositoryResult<bool> {
+    validate_workflow_codecs(
+        tx,
+        &observation.authority.workflow_id,
+        [&observation.payload.codec],
+    )
+    .await?;
     let effect_live = update_effect_status_if_live_claim(
         tx,
         &observation.authority,
@@ -2406,6 +2435,53 @@ async fn accept_new_receipt_in_transaction(
     fail_if_configured(tx, failpoint, WorkflowFailpoint::AfterReceiptInsert).await?;
     if let Some(projection) = &request.wake_terminal_projection {
         insert_wake_terminal_projection(tx, request, projection).await?;
+        let current_snapshot: Option<String> = sqlx::query_scalar(
+            "SELECT w.snapshot_payload FROM workflows w \
+             JOIN wake_workflow_bindings b ON b.workflow_id = w.id \
+             WHERE w.id = ?1 AND w.status = 'active'",
+        )
+        .bind(&request.authority.workflow_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(current_snapshot) = current_snapshot {
+            let mut snapshot: serde_json::Value =
+                serde_json::from_str(&current_snapshot).map_err(|error| {
+                    WorkflowRepositoryError::CorruptState(format!(
+                        "wake snapshot is invalid JSON while accepting terminal receipt: {error}"
+                    ))
+                })?;
+            let object = snapshot.as_object_mut().ok_or_else(|| {
+                WorkflowRepositoryError::CorruptState(
+                    "wake snapshot is not an object while accepting terminal receipt".to_owned(),
+                )
+            })?;
+            let terminal: serde_json::Value = serde_json::from_str(&request.reducer_event.payload)
+                .map_err(|error| {
+                    WorkflowRepositoryError::CorruptState(format!(
+                        "wake terminal event is invalid JSON: {error}"
+                    ))
+                })?;
+            object.insert("terminal".to_owned(), terminal);
+            object.insert(
+                "runtime_availability".to_owned(),
+                serde_json::Value::String("terminal".to_owned()),
+            );
+            let workflow_updated = sqlx::query(
+                "UPDATE workflows SET status = 'completed', snapshot_payload = ?1 \
+             WHERE id = ?2 AND status = 'active' AND generation = ?3",
+            )
+            .bind(snapshot.to_string())
+            .bind(&request.authority.workflow_id)
+            .bind(to_i64(
+                request.authority.generation,
+                WorkflowRepositoryError::GenerationOutOfRange,
+            )?)
+            .execute(&mut *tx)
+            .await?;
+            if workflow_updated.rows_affected() != 1 {
+                return Ok(AcceptReceiptResult::StaleAuthority);
+            }
+        }
     }
 
     let claim_deleted = sqlx::query(
@@ -2472,6 +2548,62 @@ async fn accept_new_receipt_in_transaction(
         .bind(sequence)
         .bind(request.now.to_rfc3339())
         .bind(&request.authority.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        let conversation_id: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM wake_workflow_bindings WHERE workflow_id = ?1",
+        )
+        .bind(&request.authority.workflow_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_obligation: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM wake_runtime_obligations \
+             WHERE conversation_id = ?1 AND status = 'owed' ORDER BY created_at LIMIT 1",
+        )
+        .bind(&conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let obligation_id = if let Some(id) = existing_obligation {
+            sqlx::query(
+                "UPDATE wake_runtime_obligations SET snapshot_upper_bound = MAX(snapshot_upper_bound, ?1) \
+                 WHERE id = ?2 AND status = 'owed'",
+            )
+            .bind(sequence)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            id
+        } else {
+            let id = format!(
+                "wake-obligation:{}:{sequence}",
+                request.authority.workflow_id
+            );
+            sqlx::query(
+                "INSERT INTO wake_runtime_obligations \
+                 (id, conversation_id, snapshot_upper_bound, status, created_at, resolved_at, terminal_reason) \
+                 VALUES (?1, ?2, ?3, 'owed', ?4, NULL, NULL)",
+            )
+            .bind(&id)
+            .bind(&conversation_id)
+            .bind(sequence)
+            .bind(request.now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            id
+        };
+        let ordinal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_runtime_obligation_items WHERE obligation_id = ?1",
+        )
+        .bind(&obligation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO wake_runtime_obligation_items (obligation_id, ordinal, inbox_item_id) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(&obligation_id)
+        .bind(ordinal)
+        .bind(&request.reducer_inbox_id)
         .execute(&mut *tx)
         .await?;
         let stored_contract: String =

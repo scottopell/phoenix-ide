@@ -493,7 +493,13 @@ impl<'a> WakeWorkflowAdapter<'a> {
         request: &WakeTerminalReceiptRequest,
     ) -> WorkflowRepositoryResult<AcceptReceiptResult> {
         let binding_resource = self.load_resource(&request.authority.workflow_id).await?;
-        if request.terminal.resource() != &binding_resource {
+        if request.terminal.resource() != &binding_resource
+            || matches!(
+                &request.terminal,
+                WakeTerminalPayload::Fired { evidence, .. }
+                    if evidence.identity() != binding_resource
+            )
+        {
             return Ok(AcceptReceiptResult::StaleAuthority);
         }
         self.repository
@@ -616,21 +622,55 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .execute(&mut *tx)
         .await?;
         if invalidated.rows_affected() != 1 {
-            let already_terminal: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM workflow_effects \
-                 WHERE id = ?1 AND workflow_id = ?2 AND generation = ?3 \
-                   AND status IN ('receipted', 'invalidated'))",
-            )
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM workflow_claims WHERE effect_id = ?1 AND workflow_id = ?2")
             .bind(&request.observe_effect_id)
             .bind(&request.workflow_id)
-            .bind(i64::try_from(request.expected_generation).map_err(|_| {
-                WorkflowRepositoryError::GenerationOutOfRange(request.expected_generation)
-            })?)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            tx.rollback().await?;
-            return Ok(!already_terminal);
-        }
+        sqlx::query(
+            "UPDATE workflow_barriers SET status = 'invalidated', satisfied_at = NULL \
+             WHERE workflow_id = ?1 AND status = 'waiting'",
+        )
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_manual_resolutions SET status = 'cancelled' \
+             WHERE workflow_id = ?1 AND status = 'required'",
+        )
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_owed_acceptance \
+             SET status = 'suppressed', resolving_transition_id = ?1, suppression_reason = 'cancelled' \
+             WHERE workflow_id = ?2 AND status = 'owed'",
+        )
+        .bind(&request.transition_id)
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_reducer_inbox \
+             SET delivery_status = 'suppressed', consumed_by_transition_id = NULL \
+             WHERE workflow_id = ?1 AND delivery_status = 'pending'",
+        )
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_runtime_obligations \
+             SET status = 'suppressed', resolved_at = ?1, terminal_reason = 'lifecycle_terminal' \
+             WHERE conversation_id = (SELECT conversation_id FROM wake_workflow_bindings WHERE workflow_id = ?2) \
+               AND status = 'owed'",
+        )
+        .bind(request.committed_at.to_rfc3339())
+        .bind(&request.workflow_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO workflow_transitions \
              (id, workflow_id, from_version, to_version, generation, event_codec_family, \
@@ -949,7 +989,7 @@ async fn validate_registration_invariant(
          WHERE id = ?1 AND selection_id = ?2 AND profile_id = ?3 AND protocol_version = ?4 \
            AND authority = 'engine_protocol' AND authority_scope = ?5 AND idempotency_key = ?6 \
            AND intent_fingerprint = ?7 AND workflow_id = ?8 AND receipt_codec_family = ?9 \
-           AND receipt_codec_version = ?10 AND receipt_payload = ?11 AND accepted_at = ?12)",
+           AND receipt_codec_version = ?10 AND receipt_payload = ?11)",
     )
     .bind(&request.binding_id)
     .bind(SELECTION_ID)
@@ -962,7 +1002,6 @@ async fn validate_registration_invariant(
     .bind(&receipt.codec.family)
     .bind(i64::from(receipt.codec.version))
     .bind(&receipt.payload)
-    .bind(request.accepted_at.to_rfc3339())
     .fetch_one(repository.pool())
     .await?;
     if !acceptance_valid {

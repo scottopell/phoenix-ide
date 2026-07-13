@@ -106,16 +106,33 @@ where
     // for discovering newly due work, avoiding a self-sustaining database loop.
     for item in due {
         let item_now = now();
-        if matches!(item, DueEffect::RetryWait { .. }) {
-            adapter
+        let claimable = if let DueEffect::RetryWait {
+            workflow_id,
+            effect_id,
+            declared_workflow_version,
+            generation,
+            ..
+        } = &item
+        {
+            if !adapter
                 .promote_exact_deadline(&item, item_now)
                 .await
-                .map_err(|error| error.to_string())?;
-            continue;
-        }
+                .map_err(|error| error.to_string())?
+            {
+                continue;
+            }
+            DueEffect::Eligible {
+                workflow_id: workflow_id.clone(),
+                effect_id: effect_id.clone(),
+                declared_workflow_version: *declared_workflow_version,
+                generation: *generation,
+            }
+        } else {
+            item
+        };
         let Some(claim) = adapter
             .claim(
-                &item,
+                &claimable,
                 uuid::Uuid::new_v4().to_string(),
                 worker_id.to_owned(),
                 item_now,

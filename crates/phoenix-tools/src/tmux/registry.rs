@@ -72,6 +72,7 @@ pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
 const COMPANION_ENV_VERSION: &str = "1";
 const COMPANION_VERSION_VAR: &str = "PHOENIX_COMPANION_VERSION";
 const SERVER_GENERATION_VAR: &str = "PHOENIX_TMUX_SERVER_GENERATION";
+const KILLED_WINDOW_ENV_PREFIX: &str = "PHOENIX_TMUX_KILLED_";
 const TERMINAL_CAPTURE_START: &str = "-2000";
 
 /// Errors surfaced by the tmux registry. The tmux tool translates these
@@ -693,14 +694,33 @@ impl TmuxRegistry {
     }
 
     pub async fn mark_window_killed(&self, identity: &TmuxWindowIdentity) -> bool {
+        let occurred_at = chrono::Utc::now();
         let mut windows = self.registered_windows.write().await;
         let Some(state) = windows.get_mut(identity) else {
             return false;
         };
-        *state = RegisteredWindowState::Killed {
-            occurred_at: chrono::Utc::now(),
+        *state = RegisteredWindowState::Killed { occurred_at };
+        drop(windows);
+
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
         };
+        if !persist_killed_window(&socket_path, identity, occurred_at).await {
+            tracing::warn!(window_id = %identity.window_id, "tmux: failed to persist killed-window tombstone");
+        }
         true
+    }
+
+    pub async fn clear_window_killed(&self, identity: &TmuxWindowIdentity) {
+        if let Some(state) = self.registered_windows.write().await.get_mut(identity) {
+            *state = RegisteredWindowState::Live;
+        }
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
+        };
+        clear_killed_window(&socket_path, identity).await;
     }
 
     pub async fn inspect_window(&self, identity: &TmuxWindowIdentity) -> TmuxTerminalInspection {
@@ -736,6 +756,10 @@ impl TmuxRegistry {
 
         if observed_generation != identity.server_generation {
             return TmuxTerminalInspection::Missing;
+        }
+
+        if let Some(occurred_at) = load_killed_window(&socket_path, identity).await {
+            return TmuxTerminalInspection::WindowKilled { occurred_at };
         }
 
         inspect_tmux_window(&socket_path, &identity.window_id).await
@@ -1121,6 +1145,79 @@ async fn verify_server_generation(socket_path: &Path, expected: &str) -> Result<
     })
 }
 
+fn killed_window_env_name(window_id: &str) -> String {
+    use std::fmt::Write as _;
+
+    window_id
+        .as_bytes()
+        .iter()
+        .fold(KILLED_WINDOW_ENV_PREFIX.to_owned(), |mut encoded, byte| {
+            write!(encoded, "{byte:02X}").expect("writing to String cannot fail");
+            encoded
+        })
+}
+
+async fn persist_killed_window(
+    socket_path: &Path,
+    identity: &TmuxWindowIdentity,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let value = format!(
+        "{}|{}",
+        identity.server_generation,
+        occurred_at.to_rfc3339()
+    );
+    let sock = socket_path.to_string_lossy().into_owned();
+    tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "set-environment",
+            "-g",
+            &killed_window_env_name(&identity.window_id),
+            &value,
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+async fn clear_killed_window(socket_path: &Path, identity: &TmuxWindowIdentity) {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let _ = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "set-environment",
+            "-gu",
+            &killed_window_env_name(&identity.window_id),
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+async fn load_killed_window(
+    socket_path: &Path,
+    identity: &TmuxWindowIdentity,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = tmux_global_env(socket_path, &killed_window_env_name(&identity.window_id)).await?;
+    let (generation, occurred_at) = value.split_once('|')?;
+    if generation != identity.server_generation {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(occurred_at)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
 async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTerminalInspection {
     let sock = socket_path.to_string_lossy().into_owned();
     let output = tokio::process::Command::new("tmux")
@@ -1356,6 +1453,12 @@ fn default_socket_dir() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn killed_window_environment_key_is_exact_and_tmux_safe() {
+        assert_eq!(killed_window_env_name("@12"), "PHOENIX_TMUX_KILLED_403132");
+        assert_ne!(killed_window_env_name("@12"), killed_window_env_name("@21"));
+    }
 
     #[tokio::test]
     async fn killed_window_tombstone_is_exact_and_survives_for_worker_inspection() {

@@ -339,6 +339,20 @@ async fn registration_replay_accepts_progressed_effect_state() {
 }
 
 #[tokio::test]
+async fn registration_replay_uses_stable_intent_not_fresh_acceptance_time() {
+    let (_pool, repo) = registered(bash()).await;
+    let mut retry = registration(bash());
+    retry.accepted_at = Utc.timestamp_opt(9_999, 0).single().unwrap();
+    assert!(matches!(
+        WakeWorkflowAdapter::new(&repo)
+            .register(&retry)
+            .await
+            .unwrap(),
+        WakeRegistrationResult::Replay { .. }
+    ));
+}
+
+#[tokio::test]
 async fn registration_replay_rejects_an_incomplete_invariant_without_repair() {
     let (pool, repo) = registered(bash()).await;
     sqlx::query("DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'")
@@ -504,6 +518,29 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
     assert_eq!(wake_inbox.get::<String, _>("conversation_id"), "conv-wake");
     assert_eq!(wake_inbox.get::<i64, _>("sequence"), 1);
     assert_eq!(wake_inbox.get::<Option<String>, _>("consumed_at"), None);
+
+    let workflow: (String, String) =
+        sqlx::query_as("SELECT status, snapshot_payload FROM workflows WHERE id = 'wake-workflow'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(workflow.0, "completed");
+    let snapshot: Value = serde_json::from_str(&workflow.1).unwrap();
+    assert_eq!(snapshot["runtime_availability"], "terminal");
+    assert_eq!(snapshot["terminal"]["type"], "fired");
+    let obligation: (String, i64) =
+        sqlx::query_as("SELECT status, snapshot_upper_bound FROM wake_runtime_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(obligation, ("owed".to_owned(), 1));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wake_runtime_obligation_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -683,6 +720,49 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
         .await
         .unwrap();
     assert_eq!(owed, 0);
+}
+
+#[tokio::test]
+async fn cancellation_revokes_live_claim_and_rejects_wrong_effect_id() {
+    let (pool, repo) = registered(bash()).await;
+    let _claim = claimed(&repo).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    let mut request = WakeCancellationRequest {
+        workflow_id: "wake-workflow".to_owned(),
+        observe_effect_id: "wrong-effect".to_owned(),
+        reducer_inbox_id: "cancel-inbox".to_owned(),
+        transition_id: "cancel-transition".to_owned(),
+        expected_version: 1,
+        expected_generation: 0,
+        contract_id: "wake-contract",
+        resource: bash(),
+        resolved_at: Timestamp(1_015),
+        committed_at: Utc.timestamp_opt(1_015, 0).single().unwrap(),
+    };
+    assert!(!adapter.cancel(&request).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM workflows WHERE id = 'wake-workflow'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "active"
+    );
+    request.observe_effect_id = "wake-observe:wake-workflow".to_owned();
+    assert!(adapter.cancel(&request).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM workflow_barriers")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "invalidated"
+    );
 }
 
 #[tokio::test]
