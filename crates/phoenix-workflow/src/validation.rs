@@ -85,6 +85,13 @@ pub fn validate_plan<P: WorkflowProfile>(
     barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
 ) -> Result<(), PlanError> {
     validate_status_transition(current_status, plan.next_status)?;
+    validate_plan_body(plan, barrier_events)
+}
+
+pub(crate) fn validate_plan_body<P: WorkflowProfile>(
+    plan: &TransitionPlan<P>,
+    barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
+) -> Result<(), PlanError> {
     validate_plan_codecs(plan)?;
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;

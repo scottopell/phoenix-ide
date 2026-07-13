@@ -427,6 +427,11 @@ pub trait WorkflowProfile {
         event: &Self::OwedAcceptanceEvent,
         decision_event: &Self::Event,
     ) -> bool;
+
+    fn decision_handles_owed_acceptance_suppression(
+        event: &Self::OwedAcceptanceEvent,
+        decision_event: &Self::Event,
+    ) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,6 +710,18 @@ pub struct CancellationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualEffectOutcome<P: WorkflowProfile> {
+    Receipt {
+        receipt: Box<ReceiptRecord<P::Receipt>>,
+        reducer_event: Box<ReducerInboxEvent<P>>,
+    },
+    Retry,
+    Compensate,
+    Failed,
+    Suppressed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualResolutionOutcome<P: WorkflowProfile>
 where
     P::Observation: Clone + Eq,
@@ -714,8 +731,7 @@ where
 {
     pub outcome: CommitOutcome,
     pub resolution: Option<ManualResolutionRecord<P>>,
-    pub receipt: Option<ReceiptRecord<P::Receipt>>,
-    pub reducer_event: Option<ReducerInboxEvent<P>>,
+    pub effect_outcome: Option<ManualEffectOutcome<P>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
