@@ -1,13 +1,15 @@
 -- allium: 3
--- Platform-neutral physical transcript positioning
+-- Pure transcript-positioning reducer and VirtualTranscript physical authority
 
-use "../messagelist-render-units/scroll_policy.allium" as scroll
-
-enum CommandKind { restore_after_prefix_expansion jump_to_message }
-enum PhaseKind { resolving_target awaiting_physical }
 config {
-    conformance_tolerance: Decimal = 2.0
+    restore_offset_tolerance_px: Decimal = 2.0
 }
+
+enum CommandKind { restore_after_prefix_expansion | jump_to_message }
+enum InputKind { idle | positioning }
+enum PhaseKind { resolving_target | awaiting_physical }
+enum FinishResult { applied | target_missing | superseded }
+enum EffectKind { resolve_target | position | finish }
 
 value HistoryViewIdentity {
     conversation_id: String
@@ -15,443 +17,648 @@ value HistoryViewIdentity {
     transcript_generation: Integer
 }
 
-value CommandIdentity {
-    key: String
-    token: String
-    request_token: String
-    view: HistoryViewIdentity
+-- The key is derived from every identity-bearing command field: kind, token,
+-- request token, all three view fields, and the command's target message id.
+value ScrollCommand {
     kind: CommandKind
-    message_id: String
+    token: Integer
+    request_token: Integer
+    view: HistoryViewIdentity
+    target_message_id: String
+    viewport_start_offset: Decimal? when kind = restore_after_prefix_expansion
 }
 
-entity TranscriptView {
+-- Closed projection of TranscriptPositioningInput. Idle carries only a view;
+-- positioning carries only a command.
+entity PositioningInput {
+    kind: InputKind
+    view: HistoryViewIdentity when kind = idle
+    command: ScrollCommand when kind = positioning
+}
+
+value ActiveCommand {
+    command: ScrollCommand
+    command_key: String
+}
+
+value PositioningPhase {
+    kind: PhaseKind
+    target_index: Integer? when kind = awaiting_physical
+    -- Null is the specification projection of POSITIVE_INFINITY: no physical
+    -- write has reported the authoritative layout revision yet.
+    issued_layout_revision: Integer? when kind = awaiting_physical
+}
+
+entity TranscriptPositioningState {
     current_view: HistoryViewIdentity?
+    active: ActiveCommand?
+    phase: PositioningPhase?
+    -- Keys are terminal only within current_view. A view change replaces this
+    -- set after any old active command has emitted its terminal effect.
+    terminal_command_keys: Set<String>
+    effects: PositioningEffect with owner = this
+}
+
+-- Effects are an ordered reducer output. ordinal zero is executed first.
+entity PositioningEffect {
+    owner: TranscriptPositioningState
+    ordinal: Integer
+    kind: EffectKind
+    command: ScrollCommand
+    command_key: String
+    target_message_id: String? when kind = resolve_target
+    target_index: Integer? when kind = position
+    align: String? when kind = position
+    viewport_start_offset: Decimal? when kind = position
+    result: FinishResult? when kind = finish
+}
+
+-- VirtualTranscript owns physical layout. The positioning reducer neither
+-- measures rows nor mutates this state; its executor reads this authority to
+-- issue position_issued and physical_observed reducer events.
+entity PhysicalTranscript {
     ordered_keys: List<String>
     measured_keys: Set<String>
     rendered_start: Integer
     rendered_end: Integer
+    visible_range_present: Boolean
     layout_revision: Integer
-    active_command: ActiveCommand?
-    phase: PositioningPhase?
-    terminal_command_keys: Set<String>
-}
-
-entity ActiveCommand {
-    identity: CommandIdentity
-    viewport_start_offset: Decimal?
-}
-
-entity PositioningPhase {
-    kind: PhaseKind
-    target_index: Integer?
-    issued_layout_revision: Integer?
-}
-
-entity FixtureCorpus {
-    schema_path: String
-    scenarios_path: String
-    schema_version: String
-    scenario_ids: Set<String>
 }
 
 surface TranscriptPositioningReducer {
-    facing view: TranscriptView
+    facing state: TranscriptPositioningState
 
     provides:
-        InputIdle(view, history_view)
-        InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
-        TargetResolved(view, command_key, target_index)
-        TargetMissing(view, command_key)
-        PositionIssued(view, command_key, target_index, layout_revision)
-        PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
-        UserInterrupted(view)
-        ExecutorDetached(view)
-        UnitMeasured(view, unit_key, extent)
-
-    emits:
-        ResolveTarget(command_key, message_id)
-        Position(command_key, target_index, align, viewport_start_offset)
-        Finish(command_key, result)
+        InputChanged(state, input, command_key)
+        TargetResolved(state, command_key, target_index)
+        TargetMissing(state, command_key)
+        PositionIssued(state, command_key, target_index, layout_revision)
+        PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+        UserInterrupted(state)
+        ExecutorDetached(state)
 
     exposes:
-        view.current_view
-        view.active_command
-        view.phase
-        view.terminal_command_keys
+        state.current_view
+        state.active
+        state.phase
+        state.terminal_command_keys
 }
 
-surface VirtualTranscriptFixtures {
-    facing corpus: FixtureCorpus
-
-    provides:
-        CorpusLoaded(corpus)
+surface TranscriptPositioningEffectExecutor {
+    facing effect: PositioningEffect
 
     exposes:
-        corpus.schema_path
-        corpus.scenarios_path
-        corpus.schema_version
-        corpus.scenario_ids
+        effect.ordinal
+        effect.kind
+        effect.command_key
+        effect.align
+        effect.result
 }
 
-rule IdleInputCreatesClosedIdleStateForView {
-    when: InputIdle(view, history_view)
-    requires: view.active_command = null
-    ensures: view.current_view = history_view
-    ensures: view.active_command = null
-    ensures: view.phase = null
+surface VirtualTranscriptPhysicalAuthority {
+    facing physical: PhysicalTranscript
+
+    exposes:
+        physical.ordered_keys
+        physical.measured_keys
+        physical.rendered_start
+        physical.rendered_end
+        physical.visible_range_present
+        physical.layout_revision
 }
 
-rule PositioningInputStartsOneResolvingCommand {
-    when: InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
-    requires: view.active_command = null
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: view.current_view = history_view
-    ensures: view.active_command = ActiveCommand(
-        identity: CommandIdentity(
-            key: command_key,
-            token: token,
-            request_token: request_token,
-            view: history_view,
-            kind: kind,
-            message_id: message_id
-        ),
-        viewport_start_offset: viewport_start_offset
-    )
-    ensures: view.phase = PositioningPhase(
+rule IdleInputLeavesReducerIdle {
+    when: InputChanged(state, input, _)
+    requires: input.kind = idle
+    requires: state.active = null
+    requires: state.current_view = null or state.current_view = input.view
+    ensures: state.current_view = input.view
+    ensures: state.active = null
+    ensures: state.phase = null
+    ensures: not PositioningEffect.created(owner: state)
+}
+
+rule NewPositioningInputStartsResolution {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active = null
+    requires: state.current_view = null or state.current_view = input.command.view
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: state.current_view = input.command.view
+    ensures: state.active = ActiveCommand(command: input.command, command_key: command_key)
+    ensures: state.phase = PositioningPhase(
         kind: resolving_target,
         target_index: null,
         issued_layout_revision: null
     )
-    ensures: ResolveTarget(command_key, message_id).emitted()
-}
-
-rule IdenticalPositioningInputIsIdempotent {
-    when: InputPositioning(view, command_key, _, _, history_view, _, _, _)
-    requires: view.active_command != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.active_command.identity.view = history_view
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
-}
-
-rule ReplacementInputSupersedesPriorCommandBeforeResolvingNewCommand {
-    when: InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
-    requires: view.active_command != null
-    requires: view.active_command.identity.key != command_key
-        or view.active_command.identity.view != history_view
-    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: Finish(view.active_command.identity.key, superseded).emitted()
-    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
-    ensures: view.current_view = history_view
-    ensures: view.active_command = ActiveCommand(
-        identity: CommandIdentity(
-            key: command_key,
-            token: token,
-            request_token: request_token,
-            view: history_view,
-            kind: kind,
-            message_id: message_id
-        ),
-        viewport_start_offset: viewport_start_offset
-    )
-    ensures: view.phase = PositioningPhase(
-        kind: resolving_target,
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: resolve_target,
+        command: input.command,
+        command_key: command_key,
+        target_message_id: input.command.target_message_id,
         target_index: null,
-        issued_layout_revision: null
+        align: null,
+        viewport_start_offset: null,
+        result: null
     )
-    ensures: ResolveTarget(command_key, message_id).emitted()
 }
 
-rule IdleInputSupersedesActiveCommandWithoutResolvingNewCommand {
-    when: InputIdle(view, history_view)
-    requires: view.active_command != null
-    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
-    ensures: Finish(view.active_command.identity.key, superseded).emitted()
-    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
-    ensures: view.current_view = history_view
-    ensures: view.active_command = null
-    ensures: view.phase = null
+rule IdenticalActiveInputIsIdempotent {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.active.command.view = input.command.view
+    ensures: state.active = state.active
+    ensures: state.phase = state.phase
+    ensures: state.terminal_command_keys = state.terminal_command_keys
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-rule ViewChangeResetsTerminalIdentityScope {
-    when: InputIdle(view, history_view)
-        or InputPositioning(view, _, _, _, history_view, _, _, _)
-    requires: view.current_view != null
-    requires: view.current_view != history_view
-    ensures: view.terminal_command_keys = {}
+rule SameViewReplacementFinishesThenResolves {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active != null
+    requires: state.active.command.view = input.command.view
+    requires: state.active.command_key != command_key
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 1,
+        kind: resolve_target,
+        command: input.command,
+        command_key: command_key,
+        target_message_id: input.command.target_message_id,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: null
+    )
+    ensures: state.terminal_command_keys.contains(state.active.command_key)
+    ensures: state.current_view = input.command.view
+    ensures: state.active = ActiveCommand(command: input.command, command_key: command_key)
+    ensures: state.phase.kind = resolving_target
 }
 
-rule TerminalInputCannotReactivateCommandWithinSameView {
-    when: InputPositioning(view, command_key, _, _, history_view, _, _, _)
-    requires: view.active_command = null
-    requires: view.current_view = history_view
-    requires: view.terminal_command_keys.contains(command_key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
+rule IdleInputFinishesActiveBeforeBecomingIdle {
+    when: InputChanged(state, input, _)
+    requires: input.kind = idle
+    requires: state.active != null
+    requires: state.current_view = null or state.current_view = input.view
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: state.current_view = input.view
+    ensures: state.terminal_command_keys.contains(state.active.command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
-rule TargetResolutionEvidenceIssuesPosition {
-    when: TargetResolved(view, command_key, target_index)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = resolving_target
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: view.phase = PositioningPhase(
+rule IdleViewChangeWithoutActiveCommandResetsTerminalScope {
+    when: InputChanged(state, input, _)
+    requires: input.kind = idle
+    requires: state.active = null
+    requires: state.current_view != null
+    requires: state.current_view != input.view
+    ensures: state.current_view = input.view
+    ensures: state.terminal_command_keys = {}
+    ensures: state.active = null
+    ensures: state.phase = null
+    ensures: not PositioningEffect.created(owner: state)
+}
+
+rule IdleViewChangeFinishesBeforeResettingTerminalScope {
+    when: InputChanged(state, input, _)
+    requires: input.kind = idle
+    requires: state.active != null
+    requires: state.current_view != null
+    requires: state.current_view != input.view
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: state.current_view = input.view
+    ensures: state.terminal_command_keys = {}
+    ensures: state.active = null
+    ensures: state.phase = null
+}
+
+rule PositioningViewChangeWithoutActiveCommandResolvesAfterReset {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active = null
+    requires: state.current_view != null
+    requires: state.current_view != input.command.view
+    ensures: state.current_view = input.command.view
+    ensures: state.terminal_command_keys = {}
+    ensures: state.active = ActiveCommand(command: input.command, command_key: command_key)
+    ensures: state.phase.kind = resolving_target
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: resolve_target,
+        command: input.command,
+        command_key: command_key,
+        target_message_id: input.command.target_message_id,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: null
+    )
+}
+
+rule PositioningViewChangeFinishesThenResetsThenResolves {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active != null
+    requires: state.current_view != null
+    requires: state.current_view != input.command.view
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 1,
+        kind: resolve_target,
+        command: input.command,
+        command_key: command_key,
+        target_message_id: input.command.target_message_id,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: null
+    )
+    ensures: state.current_view = input.command.view
+    ensures: state.terminal_command_keys = {}
+    ensures: state.active = ActiveCommand(command: input.command, command_key: command_key)
+    ensures: state.phase.kind = resolving_target
+}
+
+rule TerminalInputCannotReactivateWithinView {
+    when: InputChanged(state, input, command_key)
+    requires: input.kind = positioning
+    requires: state.active = null
+    requires: state.current_view = input.command.view
+    requires: state.terminal_command_keys.contains(command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
+    ensures: not PositioningEffect.created(owner: state)
+}
+
+rule TargetResolvedRequestsPhysicalPosition {
+    when: TargetResolved(state, command_key, target_index)
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.phase.kind = resolving_target
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: state.phase = PositioningPhase(
         kind: awaiting_physical,
         target_index: target_index,
         issued_layout_revision: null
     )
-    ensures: Position(command_key, target_index, "start", view.active_command.viewport_start_offset).emitted()
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: position,
+        command: state.active.command,
+        command_key: command_key,
+        target_message_id: null,
+        target_index: target_index,
+        align: "start",
+        viewport_start_offset: state.active.command.viewport_start_offset,
+        result: null
+    )
 }
 
-rule TargetMissingEvidenceFinishesCommand {
-    when: TargetMissing(view, command_key)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = resolving_target
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: Finish(command_key, target_missing).emitted()
-    ensures: view.terminal_command_keys.add(command_key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
+rule TargetMissingFinishesCurrentResolution {
+    when: TargetMissing(state, command_key)
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.phase.kind = resolving_target
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: target_missing
+    )
+    ensures: state.terminal_command_keys.contains(command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
-rule PositionIssuedRecordsAuthoritativeLayoutRevision {
-    when: PositionIssued(view, command_key, target_index, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.target_index = target_index
-    requires: view.phase.issued_layout_revision = null
-        or layout_revision >= view.phase.issued_layout_revision
-    ensures: view.phase.issued_layout_revision = layout_revision
+rule PositionIssuedRecordsAuthoritativeRevision {
+    when: PositionIssued(state, command_key, target_index, layout_revision)
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.phase.kind = awaiting_physical
+    requires: state.phase.target_index = target_index
+    requires: state.phase.issued_layout_revision = null
+        or layout_revision >= state.phase.issued_layout_revision
+    ensures: state.phase.issued_layout_revision = layout_revision
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-rule OlderPositionIssuedCannotMoveIssuedRevisionBackward {
-    when: PositionIssued(view, command_key, target_index, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.target_index = target_index
-    requires: view.phase.issued_layout_revision != null
-    requires: layout_revision < view.phase.issued_layout_revision
-    ensures: view.phase = view.phase
+rule JumpCompletesWhenIssuedTargetIsVisible {
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, _, layout_revision)
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.active.command.kind = jump_to_message
+    requires: state.phase.kind = awaiting_physical
+    requires: state.phase.issued_layout_revision != null
+    requires: layout_revision >= state.phase.issued_layout_revision
+    requires: range_present = true
+    requires: range_start <= state.phase.target_index
+    requires: state.phase.target_index <= range_end
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: applied
+    )
+    ensures: state.terminal_command_keys.contains(command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
-rule PhysicalObservationAppliesJumpWhenIssuedTargetIsVisible {
-    when: PhysicalObserved(view, command_key, visible_range, _, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.active_command.identity.kind = jump_to_message
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.issued_layout_revision != null
-    requires: layout_revision >= view.phase.issued_layout_revision
-    requires: visible_range != null
-    requires: visible_range.start_index <= view.phase.target_index
-    requires: visible_range.end_index >= view.phase.target_index
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: Finish(command_key, applied).emitted()
-    ensures: view.terminal_command_keys.add(command_key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
-}
-
-rule PhysicalObservationAppliesRestoreWhenIssuedTargetOffsetMatches {
-    when: PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.active_command.identity.kind = restore_after_prefix_expansion
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.issued_layout_revision != null
-    requires: layout_revision >= view.phase.issued_layout_revision
-    requires: visible_range != null
-    requires: visible_range.start_index <= view.phase.target_index
-    requires: visible_range.end_index >= view.phase.target_index
+rule RestoreCompletesWhenIssuedVisibleOffsetConforms {
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+    requires: state.active != null
+    requires: state.active.command_key = command_key
+    requires: state.active.command.kind = restore_after_prefix_expansion
+    requires: state.phase.kind = awaiting_physical
+    requires: state.phase.issued_layout_revision != null
+    requires: layout_revision >= state.phase.issued_layout_revision
+    requires: range_present = true
+    requires: range_start <= state.phase.target_index
+    requires: state.phase.target_index <= range_end
     requires: actual_offset != null
-    requires: absolute(actual_offset - view.active_command.viewport_start_offset) <= config.conformance_tolerance
-    requires: not view.terminal_command_keys.contains(command_key)
-    ensures: Finish(command_key, applied).emitted()
-    ensures: view.terminal_command_keys.add(command_key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
-}
-
-rule PhysicalObservationBeforeIssuedRevisionCannotFinish {
-    when: PhysicalObserved(view, command_key, _, _, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.issued_layout_revision = null
-        or layout_revision < view.phase.issued_layout_revision
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
-}
-
-rule PhysicalObservationWithoutVisibleTargetCannotFinish {
-    when: PhysicalObserved(view, command_key, visible_range, _, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.issued_layout_revision != null
-    requires: layout_revision >= view.phase.issued_layout_revision
-    requires: visible_range = null
-        or visible_range.start_index > view.phase.target_index
-        or visible_range.end_index < view.phase.target_index
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
-}
-
-rule PhysicalRestoreObservationWithoutMatchingOffsetCannotFinish {
-    when: PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
-    requires: view.active_command != null
-    requires: view.phase != null
-    requires: view.active_command.identity.key = command_key
-    requires: view.active_command.identity.kind = restore_after_prefix_expansion
-    requires: view.phase.kind = awaiting_physical
-    requires: view.phase.issued_layout_revision != null
-    requires: layout_revision >= view.phase.issued_layout_revision
-    requires: visible_range != null
-    requires: visible_range.start_index <= view.phase.target_index
-    requires: visible_range.end_index >= view.phase.target_index
-    requires: actual_offset = null
-        or absolute(actual_offset - view.active_command.viewport_start_offset) > config.conformance_tolerance
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
+    requires: absolute(actual_offset - state.active.command.viewport_start_offset) <= config.restore_offset_tolerance_px
+    requires: not state.terminal_command_keys.contains(command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: applied
+    )
+    ensures: state.terminal_command_keys.contains(command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
 rule UserInterruptionSupersedesActiveCommand {
-    when: UserInterrupted(view)
-    requires: view.active_command != null
-    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
-    ensures: Finish(view.active_command.identity.key, superseded).emitted()
-    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
+    when: UserInterrupted(state)
+    requires: state.active != null
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: state.terminal_command_keys.contains(state.active.command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
 rule ExecutorDetachSupersedesActiveCommand {
-    when: ExecutorDetached(view)
-    requires: view.active_command != null
-    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
-    ensures: Finish(view.active_command.identity.key, superseded).emitted()
-    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
-    ensures: view.active_command = null
-    ensures: view.phase = null
+    when: ExecutorDetached(state)
+    requires: state.active != null
+    requires: not state.terminal_command_keys.contains(state.active.command_key)
+    ensures: PositioningEffect.created(
+        owner: state,
+        ordinal: 0,
+        kind: finish,
+        command: state.active.command,
+        command_key: state.active.command_key,
+        target_message_id: null,
+        target_index: null,
+        align: null,
+        viewport_start_offset: null,
+        result: superseded
+    )
+    ensures: state.terminal_command_keys.contains(state.active.command_key)
+    ensures: state.active = null
+    ensures: state.phase = null
 }
 
-rule StaleTargetResolutionEventsHaveNoEffect {
-    when: TargetResolved(view, command_key, _)
-        or TargetMissing(view, command_key)
-    requires: view.active_command = null
-        or view.active_command.identity.key != command_key
-        or view.phase = null
-        or view.phase.kind != resolving_target
-        or view.terminal_command_keys.contains(command_key)
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
+rule StaleTargetEventIsNoOp {
+    when: TargetResolved(state, command_key, _)
+        or TargetMissing(state, command_key)
+    requires: state.active = null
+        or state.active.command_key != command_key
+        or state.phase = null
+        or state.phase.kind != resolving_target
+        or state.terminal_command_keys.contains(command_key)
+    ensures: state.active = state.active
+    ensures: state.phase = state.phase
+    ensures: state.terminal_command_keys = state.terminal_command_keys
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-rule StalePhysicalEventsHaveNoEffect {
-    when: PositionIssued(view, command_key, _, _)
-        or PhysicalObserved(view, command_key, _, _, _)
-    requires: view.active_command = null
-        or view.active_command.identity.key != command_key
-        or view.phase = null
-        or view.phase.kind != awaiting_physical
-        or view.terminal_command_keys.contains(command_key)
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
+rule StalePositionIssuedIsNoOp {
+    when: PositionIssued(state, command_key, target_index, layout_revision)
+    requires: state.active = null
+        or state.active.command_key != command_key
+        or state.phase = null
+        or state.phase.kind != awaiting_physical
+        or state.phase.target_index != target_index
+        or state.phase.issued_layout_revision != null and layout_revision < state.phase.issued_layout_revision
+    ensures: state.active = state.active
+    ensures: state.phase = state.phase
+    ensures: state.terminal_command_keys = state.terminal_command_keys
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-rule MeasurementUpdatesAuthoritativeLayoutOnly {
-    when: UnitMeasured(view, unit_key, extent)
-    requires: view.ordered_keys.contains(unit_key)
-    requires: extent > 0
-    ensures: view.measured_keys.contains(unit_key)
-    ensures: view.layout_revision = view.layout_revision + 1
-    ensures: view.active_command = view.active_command
-    ensures: view.phase = view.phase
+rule NonConformingPhysicalObservationIsNoOp {
+    when: PhysicalObserved(state, command_key, range_present, range_start, range_end, actual_offset, layout_revision)
+    requires: state.active = null
+        or state.active.command_key != command_key
+        or state.phase = null
+        or state.phase.kind != awaiting_physical
+        or state.phase.issued_layout_revision = null
+        or layout_revision < state.phase.issued_layout_revision
+        or range_present = false
+        or range_start > state.phase.target_index
+        or range_end < state.phase.target_index
+        or state.active.command.kind = restore_after_prefix_expansion and actual_offset = null
+        or state.active.command.kind = restore_after_prefix_expansion and absolute(actual_offset - state.active.command.viewport_start_offset) > config.restore_offset_tolerance_px
+    ensures: state.active = state.active
+    ensures: state.phase = state.phase
+    ensures: state.terminal_command_keys = state.terminal_command_keys
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-rule FixtureCorpusLoadedFromRootVersionedJson {
-    when: CorpusLoaded(corpus)
-    ensures: corpus.schema_path = "fixtures/virtual-transcript/v1/schema.json"
-    ensures: corpus.scenarios_path = "fixtures/virtual-transcript/v1/scenarios.json"
-    ensures: corpus.schema_version = "virtual-transcript.scenarios.v1"
-    ensures: corpus.scenario_ids = {
-        "prefix-insertion-within-tall-unit",
-        "resize-above-anchor",
-        "alias-navigation",
-        "orphan-target",
-        "streaming-growth-reading",
-        "streaming-growth-following",
-        "supersession"
-    }
+rule TerminalWithoutActiveCommandIsNoOp {
+    when: UserInterrupted(state) or ExecutorDetached(state)
+    requires: state.active = null or state.terminal_command_keys.contains(state.active.command_key)
+    ensures: state.active = state.active
+    ensures: state.phase = state.phase
+    ensures: state.terminal_command_keys = state.terminal_command_keys
+    ensures: not PositioningEffect.created(owner: state)
 }
 
-invariant OrderedKeysAreUnique {
-    view.ordered_keys.to_set().count() = view.ordered_keys.count()
+invariant InputIsClosedIdleOrPositioning {
+    for input in PositioningInput:
+        input.kind = idle or input.kind = positioning
 }
 
-invariant RenderedWindowStartsWithinSequence {
-    view.ordered_keys.count() = 0 or view.rendered_start < view.ordered_keys.count()
+invariant OrderedPhysicalKeysAreUnique {
+    for physical in PhysicalTranscript:
+        physical.ordered_keys.to_set().count() = physical.ordered_keys.count()
 }
 
-invariant RenderedWindowEndsWithinSequence {
-    view.ordered_keys.count() = 0 or view.rendered_end < view.ordered_keys.count()
+invariant MeasuredKeysBelongToPhysicalSequence {
+    for physical in PhysicalTranscript:
+        physical.measured_keys.subset_of(physical.ordered_keys.to_set())
 }
 
-invariant RenderedWindowIsContiguous {
-    view.rendered_start <= view.rendered_end
+invariant RenderedWindowIsAContiguousBoundedSlice {
+    for physical in PhysicalTranscript:
+        physical.visible_range_present implies
+            physical.rendered_start >= 0
+            and physical.rendered_start <= physical.rendered_end
+            and physical.rendered_end < physical.ordered_keys.count()
 }
 
-invariant AtMostOneActiveCommandPerTranscriptView {
-    view.active_command = null or view.phase != null
+invariant ReducerHasAtMostOneActiveCommand {
+    for state in TranscriptPositioningState:
+        state.active = null or state.phase != null
 }
 
 invariant ActiveCommandBelongsToCurrentView {
-    view.active_command != null implies view.active_command.identity.view = view.current_view
+    for state in TranscriptPositioningState:
+        state.active != null implies state.active.command.view = state.current_view
 }
 
-invariant TerminalIdentitySetIsScopedToCurrentView {
-    view.current_view = null implies view.terminal_command_keys = {}
+invariant IdleStateHasNoPhase {
+    for state in TranscriptPositioningState:
+        state.active = null implies state.phase = null
 }
 
-invariant FinishedCommandsHaveNoActivePhysicalAuthority {
-    view.active_command = null implies view.phase = null
+invariant ResolvingPhaseHasNoIssuedRevision {
+    for state in TranscriptPositioningState:
+        state.phase != null and state.phase.kind = resolving_target implies
+            state.phase.target_index = null and state.phase.issued_layout_revision = null
+}
+
+invariant ActiveCommandIsNotTerminal {
+    for state in TranscriptPositioningState:
+        state.active != null implies not state.terminal_command_keys.contains(state.active.command_key)
+}
+
+invariant EffectOrdinalsAreUniquePerReduction {
+    for state in TranscriptPositioningState:
+        state.effects.ordinal.to_set().count() = state.effects.ordinal.count()
+}
+
+invariant AtMostOneTerminalEffectPerReduction {
+    for state in TranscriptPositioningState:
+        (state.effects where kind = finish).count() <= 1
+}
+
+invariant FinishMarksItsCommandTerminalWithinTheResultingViewScope {
+    for effect in PositioningEffect:
+        effect.kind = finish and effect.command.view = effect.owner.current_view implies
+            effect.owner.terminal_command_keys.contains(effect.command_key)
+}
+
+invariant EffectsAreReducerOrdered {
+    for effect in PositioningEffect:
+        effect.ordinal >= 0
 }
 
 contract TranscriptPositioningSafety {
-    validate: (view: TranscriptView) -> Boolean
+    validate: (state: TranscriptPositioningState, physical: PhysicalTranscript) -> Boolean
 
-    @invariant PureReducerEventsProduceEffectsOnly
-        -- Input, target-resolution, issued-position, physical-observation,
-        -- interruption, and detach events mutate only reducer state and emit
-        -- resolve_target, position, or finish effects; physical DOM/native writes
-        -- are performed by the effect executor.
+    @invariant PureReducerHasNoPhysicalWriteAuthority
+        -- The reducer consumes only input_changed, target_resolved,
+        -- target_missing, position_issued, physical_observed,
+        -- user_interrupted, and executor_detached. It returns ordered
+        -- resolve_target, position, and finish effects; only the executor may
+        -- call VirtualTranscript's physical methods.
 
-    @invariant FinishIsExactOncePerCommandKeyWithinView
-        -- A command key enters terminal_command_keys when and only when a finish
-        -- effect is emitted for that key, so duplicate or stale events cannot
-        -- produce a second terminal result.
+    @invariant SupersessionPrecedesReplacementWork
+        -- A replacement, null/idle input, or view change emits finish for the
+        -- old active command before any resolve_target for a replacement. A
+        -- view change then resets terminal identity scope to the new view.
 
-    @invariant PositionSuccessRequiresIssuedRevisionAndPhysicalEvidence
-        -- Applied completion requires a matching active command, an issued
-        -- layout revision, a physical observation at or after that revision, and
-        -- visible target evidence; restore commands additionally require offset
-        -- conformance within config.conformance_tolerance.
+    @invariant AppliedRequiresCurrentPhysicalEvidence
+        -- Jump completion requires the issued target index to be visible at
+        -- or after the issued layout revision. Restore completion additionally
+        -- requires measured offset agreement within restore_offset_tolerance_px.
 
-    @invariant SupersessionCausesAreReducerInputs
-        -- Replacement, null idle input, view identity change, user interruption,
-        -- and executor detach all terminate the active command as superseded
-        -- before stale work can write position or finish successfully.
+    @invariant PhysicalLayoutRemainsAuthoritative
+        -- Stable ordered keys, key-scoped measurements, a contiguous rendered
+        -- window, and monotonic layout revision belong to VirtualTranscript;
+        -- reducer state does not duplicate or update them.
 }
