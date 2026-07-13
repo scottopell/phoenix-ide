@@ -728,7 +728,9 @@ describe('inline tool timers', () => {
     );
 
     expect(screen.getByText('read_file')).toBeInTheDocument();
-    expect(screen.getByText(/# README/)).toBeInTheDocument();
+    const completedRead = document.querySelector('[data-tool-id="tool-read"]');
+    expect(completedRead).toHaveTextContent('# README');
+    expect(completedRead).toHaveTextContent('Done');
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
 
@@ -909,7 +911,7 @@ describe('inline tool timers', () => {
 
     expect(screen.getByText('The sandbox remaps ~, so I will inspect the worktree.')).toBeInTheDocument();
     expect(screen.getByText('I found the v2 repo files and will inspect SPEARS.md.')).toBeInTheDocument();
-    expect(screen.getByText(/# spEARS/)).toBeInTheDocument();
+    expect(document.querySelector('[data-tool-id="tool-read-root"]')).toHaveTextContent('# spEARS');
     expect(screen.getByText(/SPEARS\.md:1–240/)).toBeInTheDocument();
     expect(document.querySelectorAll('.tool-block')).toHaveLength(4);
     expect(document.querySelectorAll('.tool-block-status.success')).toHaveLength(4);
@@ -958,7 +960,7 @@ describe('inline tool timers', () => {
 
     expect(document.querySelector('[data-tool-id="tool-ok"] .tool-block-status.success')).not.toBeNull();
     expect(document.querySelector('[data-tool-id="tool-fail"] .tool-block-status.error')).not.toBeNull();
-    expect(screen.getByText('done')).toBeInTheDocument();
+    expect(document.querySelector('[data-tool-id="tool-ok"]')).toHaveTextContent('done');
     expect(screen.getByText('boom')).toBeInTheDocument();
   });
 });

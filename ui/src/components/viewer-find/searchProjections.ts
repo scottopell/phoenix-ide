@@ -779,9 +779,12 @@ function buildReadFileProjectionFragments(
   }
 
   const duplicateLineCounts = new Map<string, number>();
-  for (const rawLine of text.split('\n')) {
-    const renderedLine = parseReadFileRenderedLine(rawLine);
-    if (!renderedLine) continue;
+  const startLine = typeof input['offset'] === 'number' ? input['offset'] : 1;
+  for (const [lineIndex, rawLine] of text.split('\n').entries()) {
+    const renderedLine = parseReadFileRenderedLine(rawLine) ?? {
+      lineNumber: startLine + lineIndex,
+      content: rawLine,
+    };
     const duplicateIndex = duplicateLineCounts.get(renderedLine.content) ?? 0;
     duplicateLineCounts.set(renderedLine.content, duplicateIndex + 1);
     const fragmentId = `read-file-line:${encodeURIComponent(renderedLine.content)}:${duplicateIndex}`;

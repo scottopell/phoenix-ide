@@ -1893,27 +1893,9 @@ export function ReadFileResultView({
   );
   const pathFragment = parsed.fragments.find((fragment) => fragment.kind === 'path') ?? null;
   const lineFragments = parsed.fragments.filter((fragment) => fragment.kind === 'line');
-  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
 
   return (
     <div className="read-file-results">
-      {pathFragment && (
-        onOpenFile ? (
-          <button
-            type="button"
-            className="search-results-filepath"
-            data-fragment-id={pathFragment.fragmentId}
-            onClick={() => onOpenFile(pathFragment.display.path, new Set(), 0)}
-            title="Open file"
-          >
-            {pathHighlight ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end) : pathFragment.semanticText}
-          </button>
-        ) : (
-          <div className="search-results-filepath search-results-filepath-static" data-fragment-id={pathFragment.fragmentId}>
-            {pathHighlight ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end) : pathFragment.semanticText}
-          </div>
-        )
-      )}
       <div className="search-results-hits">
         {lineFragments.map((fragment) => {
           const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
