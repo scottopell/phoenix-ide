@@ -1132,34 +1132,13 @@ describe('history scroll acknowledgement + continuity suppression', () => {
       ),
     );
 
-    virtualTranscriptMock.physicalSnapshot.mockReturnValue({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: 7 });
-    virtualTranscriptMock.measureOffsetForIndexAtSnapshot.mockReturnValue(-22.5);
-
-    fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
-
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
-  });
-
-  it('does not supersede active restore when a suppressed scroll remains within desired offset tolerance', () => {
-    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
-    const onHistoryScrollCommandHandled = vi.fn();
-    const { container } = render(
-      withConvContext(
-        <MessageList
-          messages={messages}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-history"
-          transcriptPositioning={transcriptPositioningForCommand(makeRestoreAfterPrefixExpansionCommand())}
-          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
-        />,
-      ),
-    );
-
-    virtualTranscriptMock.physicalSnapshot.mockReturnValue({ renderedRange: { startIndex: 1, endIndex: 2 }, visibleRange: { startIndex: 0, endIndex: 0 }, viewportTop: 0, layoutRevision: 7 });
-    virtualTranscriptMock.measureOffsetForIndexAtSnapshot.mockReturnValue(-22.5);
+    virtualTranscriptMock.physicalSnapshot.mockImplementation((targetIndex?: number) => ({
+      renderedRange: { startIndex: 1, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 0 },
+      viewportTop: 0,
+      layoutRevision: 7,
+      ...(targetIndex === undefined ? {} : { targetIndex, targetOffset: -22.5 }),
+    }));
 
     fireEvent.scroll(container.querySelector<HTMLElement>('#messages')!);
 
