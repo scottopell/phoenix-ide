@@ -6604,14 +6604,29 @@ impl Database {
     ) -> DbResult<()> {
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let result = sqlx::query("UPDATE messages SET display_data = ?1 WHERE message_id = ?2")
-            .bind(&display_str)
-            .bind(message_id)
-            .execute(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE messages
+             SET display_data = ?1
+             WHERE message_id = ?2",
+        )
+        .bind(&display_str)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(DbError::MessageNotFound(message_id.to_string()));
         }
+        sqlx::query(
+            "UPDATE conversations
+             SET transcript_generation = transcript_generation + 1
+             WHERE id = (SELECT conversation_id FROM messages WHERE message_id = ?1)",
+        )
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6627,16 +6642,29 @@ impl Database {
         message_id: &str,
         new_content: &str,
     ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE messages SET content = json_set(content, '$.content', ?1) WHERE message_id = ?2",
+            "UPDATE messages
+             SET content = json_set(content, '$.content', ?1)
+             WHERE message_id = ?2",
         )
         .bind(new_content)
         .bind(message_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(DbError::MessageNotFound(message_id.to_string()));
         }
+        sqlx::query(
+            "UPDATE conversations
+             SET transcript_generation = transcript_generation + 1
+             WHERE id = (SELECT conversation_id FROM messages WHERE message_id = ?1)",
+        )
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         // Re-index the mutated message so the retrieval index reflects the new
         // content (specs/conversation-retrieval/ REQ-RET-003).
         let updated: Option<Message> = sqlx::query(
@@ -11071,6 +11099,110 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    #[tokio::test]
+    async fn transcript_generation_does_not_change_on_append() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-append", "slug-append", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let before = db.get_conversation("conv-append").await.unwrap();
+        db.add_message(
+            "append-1",
+            "conv-append",
+            &MessageContent::user("hello"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let after = db.get_conversation("conv-append").await.unwrap();
+
+        assert_eq!(before.transcript_generation, 1);
+        assert_eq!(after.transcript_generation, before.transcript_generation);
+    }
+
+    #[tokio::test]
+    async fn update_message_display_data_increments_transcript_generation_once() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-display", "slug-display", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "display-1",
+            "conv-display",
+            &MessageContent::tool("tool-1", "result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = db.get_conversation("conv-display").await.unwrap();
+        db.update_message_display_data("display-1", &serde_json::json!({ "hidden": true }))
+            .await
+            .unwrap();
+        let after = db.get_conversation("conv-display").await.unwrap();
+
+        assert_eq!(
+            after.transcript_generation,
+            before.transcript_generation + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn update_tool_message_content_increments_transcript_generation_once() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-tool", "slug-tool", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "tool-1",
+            "conv-tool",
+            &MessageContent::tool("tool-use-1", "alpha", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = db.get_conversation("conv-tool").await.unwrap();
+        db.update_tool_message_content("tool-1", "omega")
+            .await
+            .unwrap();
+        let after = db.get_conversation("conv-tool").await.unwrap();
+
+        assert_eq!(
+            after.transcript_generation,
+            before.transcript_generation + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_message_edit_leaves_transcript_generation_unchanged() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-miss", "slug-miss", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let before = db.get_conversation("conv-miss").await.unwrap();
+        let err = db
+            .update_message_display_data("missing", &serde_json::json!({ "hidden": true }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::MessageNotFound(id) if id == "missing"));
+        let mid = db.get_conversation("conv-miss").await.unwrap();
+        assert_eq!(mid.transcript_generation, before.transcript_generation);
+
+        let err = db
+            .update_tool_message_content("missing", "omega")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::MessageNotFound(id) if id == "missing"));
+        let after = db.get_conversation("conv-miss").await.unwrap();
+        assert_eq!(after.transcript_generation, before.transcript_generation);
     }
 
     #[tokio::test]
