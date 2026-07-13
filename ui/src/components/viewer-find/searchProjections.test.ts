@@ -507,6 +507,60 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('preserves rendered block order across interleaved text and tools', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'interleaved',
+      isFirstInTurn: true,
+      agent: agentMsg('interleaved', [
+        { type: 'text', text: 'first shared token' },
+        { type: 'tool_use', id: 'middle-tool', name: 'bash', display: 'middle shared token', input: { cmd: 'echo shared' } },
+        { type: 'text', text: 'last shared token' },
+      ]),
+      toolResultsByUseId: new Map([[
+        'middle-tool',
+        toolMsg('middle-result', 'middle-tool', { content: JSON.stringify({ status: 'exited', stdout: 'tool shared token', exit_code: 0 }) }),
+      ]]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'shared token', { density: 'full' });
+    const matchingSources = projection.matches.map((match) =>
+      projection.sources.find((source) => source.id === match.target.sourceId)?.role);
+    expect(matchingSources).toEqual([
+      'agent-text-0',
+      'tool-use-display-1',
+      'tool-use-result-1:terminal-result:bash',
+      'agent-text-2',
+    ]);
+  });
+
+  it('uses browser-profile reveal family for every structured profile error', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'metrics-error',
+      isFirstInTurn: true,
+      agent: agentMsg('metrics-error', [
+        { type: 'tool_use', id: 'profile-metrics', name: 'browser_profile', input: { action: 'metrics' } },
+      ]),
+      toolResultsByUseId: new Map([[
+        'profile-metrics',
+        {
+          ...toolMsg('metrics-result', 'profile-metrics', { error: 'metrics unavailable', is_error: true }),
+          display_data: { error: 'metrics unavailable' },
+        },
+      ]]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'metrics unavailable', { density: 'compact' });
+    const source = projection.sources.find((candidate) => candidate.id === projection.matches[0]?.target.sourceId);
+    expect(source?.fragmentId).toBe('terminal-result:browser-profile');
+    expect(source?.revealTarget).toMatchObject({
+      kind: 'tool-result-terminal',
+      family: 'browser-profile',
+      toolUseId: 'profile-metrics',
+    });
+  });
+
   it('does not synthesize result fragments before a tool result exists', () => {
     const units: RenderUnit[] = [{
       kind: 'agent_turn',

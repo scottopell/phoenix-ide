@@ -1314,10 +1314,18 @@ function agentTurnSources(
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> = [];
-  for (const fragment of buildAgentTextFragments(blocks, density, { forceExpandedText })) {
-    out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
-  }
+  const textFragments = new Map(
+    buildAgentTextFragments(blocks, density, { forceExpandedText })
+      .map((fragment) => [fragment.fragmentId, fragment] as const),
+  );
   blocks.forEach((block, index) => {
+    if (block.type === 'text') {
+      const fragment = textFragments.get(`agent-text-${index}`);
+      if (fragment) {
+        out.push({ role: fragment.fragmentId, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+      }
+      return;
+    }
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
@@ -1335,7 +1343,7 @@ function agentTurnSources(
       if (isError) {
         const errorFamily: TerminalToolResultFamily = block.name === 'bash' || block.name === 'tmux'
           ? block.name
-          : structuredProfile && profileAction === 'run_scenario'
+          : structuredProfile
             ? 'browser-profile'
             : 'opaque';
         for (const fragment of buildTerminalToolResultProjection(errorFamily, resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
