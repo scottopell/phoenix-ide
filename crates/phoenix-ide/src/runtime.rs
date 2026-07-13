@@ -1434,6 +1434,7 @@ impl RuntimeManager {
                 };
                 match event {
                     BridgeEvent::Bash(event) if event.phase.schedules_reconciliation() => {
+                        manager.broadcast_work_scope_update(&event.work_scope).await;
                         let generation = manager
                             .db()
                             .active_work_scope_pr_selection(&event.work_scope)

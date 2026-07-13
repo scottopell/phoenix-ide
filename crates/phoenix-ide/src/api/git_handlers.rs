@@ -217,6 +217,71 @@ fn response_identity_matches_association(
         })
 }
 
+fn refreshed_pr_association(
+    response: &PrStatusResponse,
+    observations: &[crate::db::WorkScopePrObservation],
+    associations: &[crate::db::WorkScopePrAssociation],
+) -> Option<crate::db::WorkScopePrAssociation> {
+    observations
+        .iter()
+        .find(|observation| response.number == Some(observation.pr_number))
+        .and_then(|observation| {
+            associations.iter().find(|association| {
+                association
+                    .repo_owner
+                    .eq_ignore_ascii_case(&observation.repo_owner)
+                    && association
+                        .repo_name
+                        .eq_ignore_ascii_case(&observation.repo_name)
+                    && association.pr_number == observation.pr_number
+            })
+        })
+        .cloned()
+}
+
+fn association_for_artifact_baseline<'a>(
+    associations: &'a [crate::db::WorkScopePrAssociation],
+    baseline: &crate::db::WorkScopePrFeedbackBaselineInput,
+) -> Result<&'a crate::db::WorkScopePrAssociation, AppError> {
+    let legacy_identity = baseline.repo_owner.is_empty() && baseline.repo_name.is_empty();
+    if baseline.repo_owner.is_empty() != baseline.repo_name.is_empty() {
+        return Err(AppError::BadRequest(
+            "PR context artifact has an incomplete repository identity".to_string(),
+        ));
+    }
+
+    let matches = associations
+        .iter()
+        .filter(|association| {
+            association.pr_number == baseline.pr_number
+                && (legacy_identity
+                    || (association
+                        .repo_owner
+                        .eq_ignore_ascii_case(&baseline.repo_owner)
+                        && association
+                            .repo_name
+                            .eq_ignore_ascii_case(&baseline.repo_name)))
+        })
+        .collect::<Vec<_>>();
+
+    if legacy_identity {
+        return match matches.as_slice() {
+            [association] => Ok(*association),
+            [] => Err(AppError::BadRequest(
+                "PR context artifact no longer matches an associated PR".to_string(),
+            )),
+            _ => Err(AppError::BadRequest(
+                "Legacy PR context artifact is ambiguous across associated repositories"
+                    .to_string(),
+            )),
+        };
+    }
+
+    matches.into_iter().next().ok_or_else(|| {
+        AppError::BadRequest("PR context artifact no longer matches an associated PR".to_string())
+    })
+}
+
 async fn active_selection_target_for_scope(
     db: &crate::db::Database,
     work_scope: &crate::work_scope::WorkScope,
@@ -998,6 +1063,14 @@ pub(crate) async fn get_conversation_pr_status(
                 })
                 .await
                 .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+                if !retargeted_refresh.observations.is_empty() {
+                    db.upsert_work_scope_pr_observations(
+                        &work_scope,
+                        &retargeted_refresh.observations,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
                 attach_pr_feedback_freshness(
                     retargeted_refresh.response,
                     &db,
@@ -1214,15 +1287,25 @@ pub(crate) async fn create_pr_auto_fix_context(
                     .await
                     .map_err(|e| AppError::Internal(e.to_string()))?;
             }
-            db.primary_work_scope_pr_association(&work_scope)
+            let associations = db
+                .list_work_scope_pr_associations(&work_scope)
                 .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "PR-specific action unavailable until a PR is associated with this work"
-                            .to_string(),
-                    )
-                })?
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let discovered =
+                refreshed_pr_association(&refresh.response, &refresh.observations, &associations);
+            match discovered {
+                Some(pr) => pr,
+                None => db
+                    .primary_work_scope_pr_association(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "PR-specific action unavailable until a PR is associated with this work"
+                                .to_string(),
+                        )
+                    })?,
+            }
         };
 
     let target_repo_owner = active_pr.repo_owner.clone();
@@ -1359,32 +1442,12 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         &pr_auto_fix_artifact_path(&conv, artifact_path)?,
     )
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    let active = db
-        .active_work_scope_pr_selection(&work_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .and_then(|state| state.selection)
-        .ok_or_else(|| {
-            AppError::BadRequest("PR context artifact requires an active PR selection".to_string())
-        })?;
-    if active.pr.pr_number != artifact.baseline().pr_number {
-        return Err(AppError::BadRequest(
-            "PR context artifact no longer matches the active PR".to_string(),
-        ));
-    }
-    let association = db
+    let artifact_baseline = artifact.baseline();
+    let associations = db
         .list_work_scope_pr_associations(&work_scope)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .find(|association| {
-            association.repo_owner == active.pr.repo_owner
-                && association.repo_name == active.pr.repo_name
-                && association.pr_number == active.pr.pr_number
-        })
-        .ok_or_else(|| {
-            AppError::BadRequest("Active PR is no longer associated with this work".to_string())
-        })?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let association = association_for_artifact_baseline(&associations, &artifact_baseline)?;
     let baseline =
         artifact.baseline_for_repository(&association.repo_owner, &association.repo_name);
     db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
@@ -1675,6 +1738,115 @@ mod tests {
         let fetched = Some(PrFeedbackStatus::Open);
 
         assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::Open));
+    }
+
+    fn association(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrAssociation {
+        crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            title: format!("PR {number}"),
+            url: format!("https://example.test/{owner}/{repo}/{number}"),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: format!("feature/{number}"),
+            github_updated_at: None,
+            feedback_status: PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn observation(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrObservation {
+        crate::db::WorkScopePrObservation {
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            title: format!("PR {number}"),
+            url: format!("https://example.test/{owner}/{repo}/{number}"),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: format!("feature/{number}"),
+            github_updated_at: None,
+        }
+    }
+
+    fn baseline(
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> crate::db::WorkScopePrFeedbackBaselineInput {
+        crate::db::WorkScopePrFeedbackBaselineInput {
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            captured_at: "2024-01-01T00:00:00Z".to_string(),
+            github_updated_at: None,
+            feedback_identities: Vec::new(),
+            feedback_fingerprints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refreshed_pr_precedes_older_ranked_primary_association() {
+        let mut response = PrStatusResponse::not_found();
+        response.number = Some(22);
+        let associations = vec![
+            association("acme", "old", 11),
+            association("Acme", "New", 22),
+        ];
+        let observations = vec![observation("acme", "new", 22)];
+
+        let selected = refreshed_pr_association(&response, &observations, &associations).unwrap();
+
+        assert_eq!(
+            (selected.repo_name.as_str(), selected.pr_number),
+            ("New", 22)
+        );
+    }
+
+    #[test]
+    fn complete_artifact_identity_selects_exact_repository_case_insensitively() {
+        let associations = vec![
+            association("other", "repo", 7),
+            association("Acme", "App", 7),
+        ];
+
+        let selected =
+            association_for_artifact_baseline(&associations, &baseline("acme", "app", 7)).unwrap();
+
+        assert_eq!(
+            (selected.repo_owner.as_str(), selected.repo_name.as_str()),
+            ("Acme", "App")
+        );
+    }
+
+    #[test]
+    fn legacy_artifact_identity_selects_unique_number_without_active_selection() {
+        let associations = vec![association("acme", "app", 7), association("acme", "app", 8)];
+
+        let selected =
+            association_for_artifact_baseline(&associations, &baseline("", "", 7)).unwrap();
+
+        assert_eq!(selected.pr_number, 7);
+    }
+
+    #[test]
+    fn legacy_artifact_identity_rejects_same_number_across_repositories() {
+        let associations = vec![
+            association("acme", "app", 7),
+            association("other", "repo", 7),
+        ];
+
+        let error =
+            association_for_artifact_baseline(&associations, &baseline("", "", 7)).unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("ambiguous")));
     }
 
     fn conversation_with_mode(
