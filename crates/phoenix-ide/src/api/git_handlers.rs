@@ -1290,7 +1290,34 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         &pr_auto_fix_artifact_path(&conv, artifact_path)?,
     )
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    let baseline = artifact.baseline();
+    let active = db
+        .active_work_scope_pr_selection(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .and_then(|state| state.selection)
+        .ok_or_else(|| {
+            AppError::BadRequest("PR context artifact requires an active PR selection".to_string())
+        })?;
+    if active.pr.pr_number != artifact.baseline().pr_number {
+        return Err(AppError::BadRequest(
+            "PR context artifact no longer matches the active PR".to_string(),
+        ));
+    }
+    let association = db
+        .list_work_scope_pr_associations(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find(|association| {
+            association.repo_owner == active.pr.repo_owner
+                && association.repo_name == active.pr.repo_name
+                && association.pr_number == active.pr.pr_number
+        })
+        .ok_or_else(|| {
+            AppError::BadRequest("Active PR is no longer associated with this work".to_string())
+        })?;
+    let baseline =
+        artifact.baseline_for_repository(&association.repo_owner, &association.repo_name);
     db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

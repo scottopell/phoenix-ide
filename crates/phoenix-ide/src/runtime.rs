@@ -1494,19 +1494,6 @@ impl RuntimeManager {
         };
         let worktree = std::path::PathBuf::from(worktree_path);
         let observed = phoenix_core::git::observe_local_git_head(&worktree);
-        let latest_observed_branch = match &observed {
-            phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
-                repository_identity,
-                branch_name,
-                ..
-            } => Some(
-                phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
-                    repository_identity: repository_identity.clone(),
-                    branch_name: branch_name.clone(),
-                },
-            ),
-            _ => None,
-        };
 
         if let Some(upsert) =
             Self::qualify_observed_branch_for_conversation(&conv, &worktree, &observed)
@@ -1521,6 +1508,18 @@ impl RuntimeManager {
         let worktree_repo_identity = worktree_repo_root.as_deref().and_then(|root| {
             crate::runtime::pr_status_poll::github_repo_identifier(std::path::Path::new(root))
         });
+        let latest_observed_branch = match &observed {
+            phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+                branch_name,
+                ..
+            } => worktree_repo_identity.clone().map(|repository_identity| {
+                phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                    repository_identity,
+                    branch_name: branch_name.clone(),
+                }
+            }),
+            _ => None,
+        };
         let mut candidates = std::collections::BTreeMap::new();
         for branch in self
             .db()

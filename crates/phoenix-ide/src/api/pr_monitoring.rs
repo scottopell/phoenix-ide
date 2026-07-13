@@ -1533,6 +1533,18 @@ impl PrAutoFixContextArtifact {
                 .collect(),
         }
     }
+    pub(crate) fn baseline_for_repository(
+        &self,
+        repo_owner: &str,
+        repo_name: &str,
+    ) -> WorkScopePrFeedbackBaselineInput {
+        let mut baseline = self.baseline();
+        if baseline.repo_owner.is_empty() && baseline.repo_name.is_empty() {
+            baseline.repo_owner = repo_owner.to_string();
+            baseline.repo_name = repo_name.to_string();
+        }
+        baseline
+    }
 }
 
 pub(crate) fn read_pr_auto_fix_context_artifact(
