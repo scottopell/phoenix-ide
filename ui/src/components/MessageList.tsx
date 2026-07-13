@@ -301,6 +301,36 @@ function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (
   return null;
 }
 
+type ActiveHistoryCommand = {
+  token: number;
+  view: HistoryScrollCommand['view'];
+  kind: HistoryScrollCommand['kind'];
+};
+
+function ownerForHistoryCommand(command: HistoryScrollCommand): ActiveHistoryCommand {
+  return { token: command.token, view: command.view, kind: command.kind };
+}
+
+function sameHistoryCommandKind(left: HistoryScrollCommand['kind'] | null, right: HistoryScrollCommand['kind'] | null): boolean {
+  return left !== null && right !== null && left === right;
+}
+
+function sameHistoryViewIdentity(left: HistoryScrollCommand['view'] | null, right: HistoryScrollCommand['view'] | null): boolean {
+  return left !== null
+    && right !== null
+    && left.conversationId === right.conversationId
+    && left.generation === right.generation
+    && left.transcriptGeneration === right.transcriptGeneration;
+}
+
+function sameHistoryCommandOwner(left: ActiveHistoryCommand | null, right: ActiveHistoryCommand | null): boolean {
+  return left !== null
+    && right !== null
+    && left.token === right.token
+    && sameHistoryCommandKind(left.kind, right.kind)
+    && sameHistoryViewIdentity(left.view, right.view);
+}
+
 function MessageListImpl({
   messages,
   pendingMessages,
@@ -833,85 +863,71 @@ function MessageListImpl({
     [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
   );
 
-  const handledHistoryCommandRef = useRef<{ token: number; view: HistoryScrollCommand['view'] } | null>(null);
-  const acknowledgedHistoryCommandRef = useRef<{ token: number; view: HistoryScrollCommand['view'] } | null>(null);
-  const pendingHistoryAckRef = useRef<{ token: number; view: HistoryScrollCommand['view']; targetIndex: number; viewportStartOffset: number | null } | null>(null);
-  const continuityRestoreTokenRef = useRef<number | null>(null);
-  const continuityRestoreViewRef = useRef<HistoryScrollCommand['view'] | null>(null);
+  const handledHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
+  const acknowledgedHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
+  const activeHistoryCommandRef = useRef<ActiveHistoryCommand | null>(null);
+  const pendingHistoryAckRef = useRef<{ owner: ActiveHistoryCommand; targetIndex: number; viewportStartOffset: number | null } | null>(null);
   const lastVisibleRangeRef = useRef<VirtualTranscriptRange | null>(null);
-
-  const sameHistoryView = useCallback((left: HistoryScrollCommand['view'] | null, right: HistoryScrollCommand['view'] | null) => (
-    left !== null
-    && right !== null
-    && left.conversationId === right.conversationId
-    && left.generation === right.generation
-    && left.transcriptGeneration === right.transcriptGeneration
-  ), []);
 
   const releaseContinuityRestoreSuppression = useCallback(() => {
     continuityRestoreInFlightRef.current = false;
-    continuityRestoreTokenRef.current = null;
-    continuityRestoreViewRef.current = null;
   }, []);
 
-  const finishHistoryCommand = useCallback((token: number, view: HistoryScrollCommand['view'], result: 'applied' | 'target_missing' | 'superseded') => {
-    const acknowledged = acknowledgedHistoryCommandRef.current;
-    if (acknowledged?.token === token && sameHistoryView(acknowledged.view, view)) return;
-    acknowledgedHistoryCommandRef.current = { token, view };
-    if (pendingHistoryAckRef.current?.token === token && sameHistoryView(pendingHistoryAckRef.current.view, view)) pendingHistoryAckRef.current = null;
-    if (continuityRestoreTokenRef.current === token && sameHistoryView(continuityRestoreViewRef.current, view)) releaseContinuityRestoreSuppression();
-    onHistoryScrollCommandHandled?.(token, result, view);
-  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression, sameHistoryView]);
+  const finishHistoryCommand = useCallback((owner: ActiveHistoryCommand, result: 'applied' | 'target_missing' | 'superseded') => {
+    if (sameHistoryCommandOwner(acknowledgedHistoryCommandRef.current, owner)) return;
+    acknowledgedHistoryCommandRef.current = owner;
+    if (sameHistoryCommandOwner(pendingHistoryAckRef.current?.owner ?? null, owner)) pendingHistoryAckRef.current = null;
+    if (sameHistoryCommandOwner(activeHistoryCommandRef.current, owner)) activeHistoryCommandRef.current = null;
+    if (owner.kind === 'restore_after_prefix_expansion') releaseContinuityRestoreSuppression();
+    onHistoryScrollCommandHandled?.(owner.token, result, owner.view);
+  }, [onHistoryScrollCommandHandled, releaseContinuityRestoreSuppression]);
 
   cancelHistoryCommandRef.current = () => {
-    const token = continuityRestoreTokenRef.current;
-    const view = continuityRestoreViewRef.current;
-    if (token !== null && view !== null) finishHistoryCommand(token, view, 'superseded');
+    const owner = activeHistoryCommandRef.current;
+    if (owner) finishHistoryCommand(owner, 'superseded');
   };
 
   useEffect(() => {
     pendingHistoryAckRef.current = null;
     handledHistoryCommandRef.current = null;
     acknowledgedHistoryCommandRef.current = null;
+    activeHistoryCommandRef.current = null;
     lastVisibleRangeRef.current = null;
     releaseContinuityRestoreSuppression();
   }, [conversationId, releaseContinuityRestoreSuppression]);
 
   useEffect(() => () => {
+    activeHistoryCommandRef.current = null;
     releaseContinuityRestoreSuppression();
   }, [releaseContinuityRestoreSuppression]);
   useEffect(() => {
-    const activeToken = continuityRestoreTokenRef.current;
-    const activeView = continuityRestoreViewRef.current;
-    if (!historyScrollCommand) {
-      if (activeToken !== null && activeView !== null) finishHistoryCommand(activeToken, activeView, 'superseded');
-      return;
+    const incomingOwnerOrNull = historyScrollCommand ? ownerForHistoryCommand(historyScrollCommand) : null;
+    const activeOwner = activeHistoryCommandRef.current;
+    if (!sameHistoryCommandOwner(activeOwner, incomingOwnerOrNull) && activeOwner) {
+      finishHistoryCommand(activeOwner, 'superseded');
     }
-    if (activeToken !== null
-      && activeView !== null
-      && (activeToken !== historyScrollCommand.token || !sameHistoryView(activeView, historyScrollCommand.view))) {
-      finishHistoryCommand(activeToken, activeView, 'superseded');
-    }
-    if (!sameHistoryView(historyScrollCommand.view, currentHistoryView ?? null)) {
-      finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'superseded');
+    if (!historyScrollCommand) return;
+    const incomingOwner = ownerForHistoryCommand(historyScrollCommand);
+    if (!sameHistoryViewIdentity(historyScrollCommand.view, currentHistoryView ?? null)) {
+      finishHistoryCommand(incomingOwner, 'superseded');
       return;
     }
     const handled = handledHistoryCommandRef.current;
-    if (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view)) return;
+    if (sameHistoryCommandOwner(handled, incomingOwner)) return;
     pendingHistoryAckRef.current = null;
-    handledHistoryCommandRef.current = { token: historyScrollCommand.token, view: historyScrollCommand.view };
+    activeHistoryCommandRef.current = incomingOwner;
+    handledHistoryCommandRef.current = incomingOwner;
     acknowledgedHistoryCommandRef.current = null;
     const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
       ? historyScrollCommand.messageId
       : historyScrollCommand.targetMessageId;
     const index = findUnitIndexByMessageId(messageId);
     if (index < 0) {
-      finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'target_missing');
+      finishHistoryCommand(incomingOwner, 'target_missing');
       return;
     }
     pendingHistoryAckRef.current = {
-      token: historyScrollCommand.token,
-      view: historyScrollCommand.view,
+      owner: incomingOwner,
       targetIndex: index,
       viewportStartOffset: historyScrollCommand.kind === 'restore_after_prefix_expansion'
         ? historyScrollCommand.viewportStartOffset
@@ -921,8 +937,6 @@ function MessageListImpl({
       scrollToUnitIndex(index);
     } else {
       continuityRestoreInFlightRef.current = true;
-      continuityRestoreTokenRef.current = historyScrollCommand.token;
-      continuityRestoreViewRef.current = historyScrollCommand.view;
       transcriptRef.current?.scrollToIndex(index, 'start', historyScrollCommand.viewportStartOffset);
     }
     const lastVisibleRange = lastVisibleRangeRef.current;
@@ -932,10 +946,10 @@ function MessageListImpl({
         : null;
       if (historyScrollCommand.kind === 'jump_to_message'
         || (actualOffset !== null && Math.abs(actualOffset - historyScrollCommand.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX)) {
-        finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'applied');
+        finishHistoryCommand(incomingOwner, 'applied');
       }
     }
-  }, [currentHistoryView, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, sameHistoryView, scrollToUnitIndex]);
+  }, [currentHistoryView, findUnitIndexByMessageId, finishHistoryCommand, historyScrollCommand, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -984,11 +998,11 @@ function MessageListImpl({
       && pendingAck.targetIndex <= range.endIndex
     ) {
       if (pendingAck.viewportStartOffset === null) {
-        finishHistoryCommand(pendingAck.token, pendingAck.view, 'applied');
+        finishHistoryCommand(pendingAck.owner, 'applied');
       } else {
         const actualOffset = transcriptRef.current?.measureOffsetForIndex(pendingAck.targetIndex) ?? null;
         if (actualOffset !== null && Math.abs(actualOffset - pendingAck.viewportStartOffset) <= HISTORY_CONTINUITY_OFFSET_TOLERANCE_PX) {
-          finishHistoryCommand(pendingAck.token, pendingAck.view, 'applied');
+          finishHistoryCommand(pendingAck.owner, 'applied');
         }
       }
     }

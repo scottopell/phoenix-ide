@@ -209,6 +209,17 @@ function makeRestoreAfterPrefixExpansionCommand(overrides: Partial<Extract<Histo
   };
 }
 
+function makeJumpToMessageCommand(overrides: Partial<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }>> = {}): Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> {
+  return {
+    kind: 'jump_to_message',
+    token: 1,
+    requestToken: 11,
+    view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 },
+    targetMessageId: 'msg-2',
+    ...overrides,
+  };
+}
+
 describe('latest assistant expansion in compact mode', () => {
   it('shows the latest finalized assistant text fully in compact mode', () => {
     const messages: Message[] = [
@@ -1199,6 +1210,119 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
 
     rerender(renderList(null));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
+  it('supersedes a pending jump exactly once when a newer jump replaces it', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const renderList = (command: HistoryScrollCommand) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        currentHistoryView={view}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledWith(1, 'start');
+
+    rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(2, 'start');
+
+    rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view })));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it('supersedes a pending jump before rejecting a stale replacement command', () => {
+    const messages = [makeMessage(1, 'user'), makeMessage(2, 'user'), makeMessage(3, 'user')];
+    const onHistoryScrollCommandHandled = vi.fn();
+    const currentView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const staleView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
+    const renderList = (command: HistoryScrollCommand) => withConvContext(
+      <MessageList
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        currentHistoryView={currentView}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view: currentView })));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    rerender(renderList(makeJumpToMessageCommand({ token: 2, targetMessageId: 'msg-3', view: staleView })));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
+    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(1, 1, 'superseded', currentView);
+    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(2, 2, 'superseded', staleView);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
+  it('supersedes a pending jump exactly once when its command disappears', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const command = makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view });
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (historyScrollCommand: HistoryScrollCommand | null) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={historyScrollCommand}
+        currentHistoryView={view}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(command));
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    rerender(renderList(null));
+    rerender(renderList(null));
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
+  it('supersedes a pending jump exactly once on user interaction', () => {
+    const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const onHistoryScrollCommandHandled = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          historyScrollCommand={makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view })}
+          currentHistoryView={view}
+          onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    fireEvent.wheel(scroller, { deltaY: 10 });
+    fireEvent.pointerDown(scroller);
+
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
   });

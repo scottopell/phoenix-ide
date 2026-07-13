@@ -69,6 +69,7 @@ surface HistoryExpansionController {
         HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
         HistoryLoadFailed(view, request_token, view_generation, transcript_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
+        PendingCommandSuperseded(view, command_token, view_generation)
         StreamingTailAdvanced(view)
 }
 
@@ -101,12 +102,12 @@ rule ChangedDeepLinkInvalidatesItsStaleRequest {
     ensures: view.active_request = null
 }
 
-rule ChangedDeepLinkInvalidatesItsStaleCommand {
+rule ChangedDeepLinkRequiresCommandSupersession {
     when: DeepLinkTargetChanged(view, target_message_id)
     requires: view.pending_command != null
     requires: view.pending_command.kind = jump_to_message
     requires: view.pending_command.message_id != target_message_id
-    ensures: view.pending_command = null
+    ensures: view.pending_command = view.pending_command
 }
 
 rule ChangedDeepLinkClearsStaleFailure {
@@ -144,6 +145,7 @@ rule ManualExpansionStartsOneRequest {
     when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.pending_command = null
     requires: view.failure = null
     requires: restore_basis in { reader_anchor, following_tail }
     requires: restore_basis = following_tail
@@ -164,6 +166,7 @@ rule ManualExpansionRetryClearsAndReplacesFailure {
     when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.pending_command = null
     requires: view.failure != null
     requires: view.failure.kind = request_failed
     requires: restore_basis in { reader_anchor, following_tail }
@@ -185,6 +188,7 @@ rule DeepLinkStartsOneCoverageRequest {
     when: DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.pending_command = null
     requires: view.failure = null
     ensures: view.active_request = HistoryRequest(
         view: view,
@@ -202,6 +206,7 @@ rule DeepLinkRetryClearsAndReplacesFailure {
     when: DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
+    requires: view.pending_command = null
     requires: view.failure != null
     requires: view.failure.kind = request_failed
     ensures: view.active_request = HistoryRequest(
@@ -231,6 +236,7 @@ rule StaleHistorySuccessCannotMutateView {
 rule ManualReaderExpansionCreatesContinuityCommand {
     when: HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, _)
     requires: view.active_request != null
+    requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: command_token != ""
     requires: view_generation = view.view_generation
@@ -253,6 +259,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
 rule ManualFollowingExpansionCreatesNoPositionCommand {
     when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
     requires: view.active_request != null
+    requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
@@ -266,6 +273,7 @@ rule ManualFollowingExpansionCreatesNoPositionCommand {
 rule DeepLinkExpansionCreatesNavigationCommand {
     when: HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
     requires: view.active_request != null
+    requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: command_token != ""
     requires: view_generation = view.view_generation
@@ -288,6 +296,7 @@ rule DeepLinkExpansionCreatesNavigationCommand {
 rule MissingDeepLinkTargetTerminatesAttempt {
     when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, target_present)
     requires: view.active_request != null
+    requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
@@ -319,6 +328,7 @@ rule StaleHistoryFailureCannotMutateView {
 rule MatchingFailureLeavesTailUsable {
     when: HistoryLoadFailed(view, request_token, view_generation, transcript_generation, message)
     requires: view.active_request != null
+    requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
@@ -333,11 +343,28 @@ rule MatchingFailureLeavesTailUsable {
     ensures: view.active_request = null
 }
 
-rule MatchingAcknowledgementConsumesCommand {
-    when: ScrollCommandAcknowledged(view, command_token, view_generation, _)
+rule MatchingSupersessionConsumesCommand {
+    when: PendingCommandSuperseded(view, command_token, view_generation)
     requires: view.pending_command != null
     requires: command_token = view.pending_command.token
     requires: view_generation = view.view_generation
+    ensures: view.pending_command = null
+}
+
+rule StaleSupersessionCannotConsumeCommand {
+    when: PendingCommandSuperseded(view, command_token, view_generation)
+    requires: view.pending_command = null
+        or command_token != view.pending_command.token
+        or view_generation != view.view_generation
+    ensures: view.pending_command = view.pending_command
+}
+
+rule MatchingAcknowledgementConsumesCommand {
+    when: ScrollCommandAcknowledged(view, command_token, view_generation, result)
+    requires: view.pending_command != null
+    requires: command_token = view.pending_command.token
+    requires: view_generation = view.view_generation
+    requires: result in { applied, target_missing, superseded }
     ensures: view.pending_command = null
 }
 

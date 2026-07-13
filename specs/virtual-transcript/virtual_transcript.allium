@@ -5,6 +5,7 @@ use "../messagelist-render-units/scroll_policy.allium" as scroll
 
 enum ViewportOwner { system reader }
 enum TransactionKind { preserve_anchor navigate follow_tail initial_tail }
+enum TransactionResult { applied target_missing superseded }
 config {
     conformance_tolerance: Decimal = 2.0
 }
@@ -40,8 +41,10 @@ surface VirtualTranscript {
         ViewReplaced(view, generation, ordered_keys)
         ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
         PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
+        CommandReplaced(view, token?, generation?, kind?)
         UnitMeasured(view, unit_key, extent)
         GeometryObserved(view, unit_key, viewport_start_offset)
+        CommandFinished(view, token, generation, result)
         TransactionSuperseded(view, token)
 
     exposes:
@@ -80,19 +83,25 @@ rule PositionRequestOwnsOneTransaction {
     )
 }
 
-rule NewPositionRequestSupersedesPriorTransaction {
-    when: PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
+rule CommandReplacementSupersedesPriorTransaction {
+    when: CommandReplaced(view, token?, generation?, kind?)
+    requires: view.active_transaction != null
+    requires: token? = null
+        or generation? = null
+        or kind? = null
+        or token? != view.active_transaction.token
+        or generation? != view.active_transaction.generation
+        or kind? != view.active_transaction.kind
+    ensures: view.active_transaction = null
+}
+
+rule NewPositionRequestRequiresPriorReplacement {
+    when: PositionRequested(view, token, generation, kind, _, _)
     requires: view.active_transaction != null
     requires: token != view.active_transaction.token
-    requires: generation = view.generation
-    ensures: view.active_transaction = PositionTransaction(
-        view: view,
-        token: token,
-        generation: generation,
-        kind: kind,
-        anchor: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset),
-        target_key: unit_key
-    )
+        or generation != view.active_transaction.generation
+        or kind != view.active_transaction.kind
+    ensures: view.active_transaction = view.active_transaction
 }
 
 rule MeasurementUpdatesAuthoritativeLayout {
@@ -102,13 +111,30 @@ rule MeasurementUpdatesAuthoritativeLayout {
     ensures: view.measured_keys.contains(unit_key)
 }
 
-rule AnchorGeometryCompletesTransaction {
+rule AnchorGeometryAuthorizesAppliedResult {
     when: GeometryObserved(view, unit_key, viewport_start_offset)
     requires: view.active_transaction != null
     requires: view.active_transaction.target_key = unit_key
     requires: absolute(viewport_start_offset - view.active_transaction.anchor.viewport_start_offset)
         <= config.conformance_tolerance
+    ensures: view.active_transaction = view.active_transaction
+}
+
+rule MatchingCommandFinishTerminatesOwnership {
+    when: CommandFinished(view, token, generation, result)
+    requires: view.active_transaction != null
+    requires: token = view.active_transaction.token
+    requires: generation = view.active_transaction.generation
+    requires: result in { applied, target_missing, superseded }
     ensures: view.active_transaction = null
+}
+
+rule StaleCommandFinishCannotTerminateOwnership {
+    when: CommandFinished(view, token, generation, _)
+    requires: view.active_transaction = null
+        or token != view.active_transaction.token
+        or generation != view.active_transaction.generation
+    ensures: view.active_transaction = view.active_transaction
 }
 
 rule StaleGeometryCannotCompleteTransaction {
@@ -119,11 +145,18 @@ rule StaleGeometryCannotCompleteTransaction {
     ensures: view.active_transaction = view.active_transaction
 }
 
-rule ExplicitSupersessionTerminatesOwnership {
+rule ExplicitSupersessionRequiresTerminalResult {
     when: TransactionSuperseded(view, token)
     requires: view.active_transaction != null
     requires: view.active_transaction.token = token
-    ensures: view.active_transaction = null
+    ensures: view.active_transaction = view.active_transaction
+}
+
+invariant ActiveTransactionHasOneTerminalResult {
+    -- A matching CommandFinished event is the only terminal transition that
+    -- clears active_transaction, so each owner receives at most one terminal
+    -- result.
+    true
 }
 
 invariant OrderedKeysAreUnique {
