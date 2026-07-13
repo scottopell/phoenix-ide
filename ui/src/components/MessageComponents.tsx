@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, type ConversationTextFragment, type ConversationTextFragmentRevealTarget, type KeywordSearchFragment } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, type ConversationTextFragment, type ConversationTextFragmentRevealTarget } from './viewer-find/searchProjections';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -2014,11 +2014,15 @@ export function parseKeywordSearchOutput(text: string) {
   return buildKeywordSearchOutputProjection(text);
 }
 
-function renderKeywordSearchFragmentText(fragment: KeywordSearchFragment, highlight: AgentTextHighlight | null): React.ReactNode {
-  if (!highlight) {
-    return fragment.display.body ?? fragment.display.title;
-  }
-  return renderHighlightedText(fragment.semanticText, highlight.start, highlight.end);
+function keywordFieldHighlight(
+  highlight: AgentTextHighlight | null,
+  fieldStart: number,
+  fieldText: string,
+): React.ReactNode {
+  if (!highlight) return fieldText;
+  const start = Math.max(0, highlight.start - fieldStart);
+  const end = Math.min(fieldText.length, highlight.end - fieldStart);
+  return end > start ? renderHighlightedText(fieldText, start, end) : fieldText;
 }
 
 export function KeywordSearchView({
@@ -2032,7 +2036,10 @@ export function KeywordSearchView({
   toolUseId?: string | undefined;
   activeHighlight?: AgentTextHighlight | null;
 }) {
-  const parsed = useMemo(() => buildKeywordSearchOutputProjection(rawText, { toolUseId }), [rawText, toolUseId]);
+  const parsed = useMemo(
+    () => buildKeywordSearchOutputProjection(rawText, toolUseId ? { toolUseId } : {}),
+    [rawText, toolUseId],
+  );
 
   // Coverage/incompleteness notes (terms dropped, results truncated, broad
   // terms skipped). Surfaced in every branch so the signal is never silently
@@ -2088,14 +2095,16 @@ export function KeywordSearchView({
                   className="keyword-search-filepath"
                   onClick={() => onOpenFile(hit.path, new Set(), 0)}
                 >
-                  {highlight ? renderKeywordSearchFragmentText(hit.fragment, highlight) : hit.path}
+                  {keywordFieldHighlight(highlight, 0, hit.path)}
                 </button>
               ) : (
                 <span className="keyword-search-filepath keyword-search-filepath-static">
-                  {highlight ? renderKeywordSearchFragmentText(hit.fragment, highlight) : hit.path}
+                  {keywordFieldHighlight(highlight, 0, hit.path)}
                 </span>
               )}
-              {!highlight && <div className="keyword-search-explanation">{hit.explanation}</div>}
+              <div className="keyword-search-explanation">
+                {keywordFieldHighlight(highlight, hit.path.length + 2, hit.explanation)}
+              </div>
             </div>
           );
         })}
@@ -2175,9 +2184,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     [name, resultText, toolId],
   );
   const keywordSearchRevealKey = keywordSearchProjection?.fragments[0]?.revealTarget.key ?? null;
-  const keywordSearchActiveHighlight = activeHighlight && activeHighlight.fragmentId && revealRequest?.revealTarget.kind === 'tool-result-keyword-search'
+  const keywordSearchActiveHighlight = activeHighlight?.fragmentId
+    && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
     ? activeHighlight
-    : activeHighlight;
+    : null;
 
   useEffect(() => {
     if (!revealRequest) return;

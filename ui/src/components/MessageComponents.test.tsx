@@ -3115,7 +3115,12 @@ describe('AgentMessage compact find reveal', () => {
           message={message}
           toolResults={toolResults}
           unitKey="unit-find"
-          revealRequest={{ unitKey: 'unit-find', fragmentId: 'agent-text-0', nonce: 1 }}
+          revealRequest={{
+            unitKey: 'unit-find',
+            fragmentId: 'agent-text-0',
+            revealTarget: { kind: 'agent-text', key: 'agent-text:unit-find:agent-text-0' },
+            nonce: 1,
+          }}
           activeHighlight={{ fragmentId: 'agent-text-0', start: 30, end: 42 }}
           onRevealHandled={onRevealHandled}
         />

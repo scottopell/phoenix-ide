@@ -253,6 +253,26 @@ describe('buildConversationSearchProjection', () => {
     expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
   });
 
+  it('searches complete keyword-search hits in compact display mode', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'keyword-compact',
+      isFirstInTurn: true,
+      agent: agentMsg('keyword-compact', [
+        { type: 'tool_use', id: 'keyword-1', name: 'keyword_search', display: 'search docs', input: { query: 'needle' } },
+      ]),
+      toolResultsByUseId: new Map([
+        ['keyword-1', toolMsg('keyword-result', 'keyword-1', { result: 'src/hidden.ts: compact hidden needle explanation' })],
+      ]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'hidden needle', { density: 'compact' });
+    expect(projection.matches).toHaveLength(1);
+    const target = projection.matches[0]?.target;
+    expect(target?.kind).toBe('unit-text');
+    expect(target?.kind === 'unit-text' ? target.fragmentId : undefined).toContain('keyword-search-hit:');
+  });
+
   it('indexes full-density non-think tool details while compact still excludes them', () => {
     const units: RenderUnit[] = [
       {

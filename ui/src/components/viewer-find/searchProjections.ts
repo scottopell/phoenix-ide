@@ -672,18 +672,21 @@ export function buildKeywordSearchOutputProjection(
   }
 
   const hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }> = [];
+  const duplicateCounts = new Map<string, number>();
   for (const line of lines) {
     const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
     if (m && m[1] !== undefined && m[2] !== undefined) {
       const path = m[1].trim();
       const explanation = m[2].trim();
-      const index = hits.length;
+      const semanticText = `${path}: ${explanation}`;
+      const duplicateIndex = duplicateCounts.get(semanticText) ?? 0;
+      duplicateCounts.set(semanticText, duplicateIndex + 1);
       hits.push({
         path,
         explanation,
         fragment: {
-          fragmentId: `keyword-search-hit-${index}`,
-          semanticText: `${path}: ${explanation}`,
+          fragmentId: `keyword-search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
+          semanticText,
           display: { title: path, body: explanation },
           revealTarget,
           kind: 'hit',
@@ -747,16 +750,15 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
-      if (densityToolDetailsVisible(block.name, density)) {
-        out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-        const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
-        if (block.name === 'keyword_search') {
-          for (const fragment of buildKeywordSearchOutputProjection(resultText, { toolUseId: block.id }).fragments) {
-            out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
-          }
-        } else {
-          out.push({ role: `tool-use-result-${index}`, text: resultText });
+      const detailsVisible = densityToolDetailsVisible(block.name, density);
+      if (detailsVisible) out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
+      const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
+      if (block.name === 'keyword_search') {
+        for (const fragment of buildKeywordSearchOutputProjection(resultText, block.id ? { toolUseId: block.id } : {}).fragments) {
+          out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
+      } else if (detailsVisible) {
+        out.push({ role: `tool-use-result-${index}`, text: resultText });
       }
     }
   });
