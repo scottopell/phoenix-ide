@@ -11,7 +11,7 @@ use super::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CompensationPrediction, CompletionPrediction, CreationFailure,
     CreationKind, CreationProjectionStatus, EffectPrediction, WorktreeReconciliationClassification,
-    COMMIT_METADATA, COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS,
+    BOOTSTRAP_RUNTIME, COMMIT_METADATA, COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS,
     DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS,
     FINISH_CANCELLATION_OR_DELETION, MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION,
     REMOVE_OWNED_WORKTREE, RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
@@ -32,8 +32,9 @@ fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
         },
         status: AuthoritativeCreationStatus::Accepted,
         stage: AuthoritativeCreationStage::ValidateIntent,
-        attempt: 0,
+        attempt: 2,
         generation: 3,
+        revision: 7,
     }
 }
 
@@ -73,6 +74,7 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
             FINALIZE_ATTACHMENTS,
             EXPAND_INITIAL_MESSAGE,
             COMMIT_METADATA,
+            BOOTSTRAP_RUNTIME,
             DISPATCH_INITIAL_LLM_REQUEST,
         ])
     );
@@ -89,8 +91,9 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
         (EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS),
         (COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         (COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        (DISPATCH_INITIAL_LLM_REQUEST, COMMIT_METADATA),
-        (DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE),
+        (BOOTSTRAP_RUNTIME, COMMIT_METADATA),
+        (BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+        (DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
     ] {
         assert!(dependencies.contains(&edge), "missing dependency {edge:?}");
     }
@@ -99,7 +102,11 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
         adapter.plan.barriers[0].barrier_id,
         super::COMPLETION_BARRIER_ID
     );
-    assert_eq!(adapter.plan.barrier_members.len(), 7);
+    assert_eq!(adapter.plan.barrier_members.len(), 8);
+    assert_eq!(
+        adapter.projection.readiness_effects,
+        vec![BOOTSTRAP_RUNTIME, DISPATCH_INITIAL_LLM_REQUEST]
+    );
 }
 
 #[test]
@@ -128,11 +135,16 @@ fn seeded_empty_has_distinct_required_dag_without_expansion_or_dispatch() {
     );
     assert!(!ids.contains(&EXPAND_INITIAL_MESSAGE));
     assert!(!ids.contains(&DISPATCH_INITIAL_LLM_REQUEST));
+    assert!(!ids.contains(&BOOTSTRAP_RUNTIME));
     assert_eq!(adapter.plan.barrier_members.len(), 5);
     assert!(adapter
         .projection
         .effect_predictions
         .contains(&(EXPAND_INITIAL_MESSAGE, EffectPrediction::Omitted)));
+    assert!(adapter
+        .projection
+        .effect_predictions
+        .contains(&(BOOTSTRAP_RUNTIME, EffectPrediction::Omitted)));
     assert!(adapter
         .projection
         .effect_predictions

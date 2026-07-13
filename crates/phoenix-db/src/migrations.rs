@@ -251,6 +251,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_creation_shadow_tables",
         sql: MIGRATION_047,
     },
+    Migration {
+        version: 48,
+        name: "fence_and_archive_creation_shadow_projections",
+        sql: MIGRATION_048,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2158,6 +2163,66 @@ BEGIN
 END;
 ";
 
+const MIGRATION_048: &str = r"
+ALTER TABLE conversation_creation_jobs
+    ADD COLUMN shadow_projection_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (shadow_projection_revision >= 0);
+
+ALTER TABLE creation_shadow_projections
+    ADD COLUMN oracle_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (oracle_revision >= 0);
+
+CREATE TRIGGER creation_job_shadow_revision_after_update
+AFTER UPDATE OF status, stage, attempt, generation, intent_json, error
+ON conversation_creation_jobs
+FOR EACH ROW
+WHEN NEW.shadow_projection_revision = OLD.shadow_projection_revision
+BEGIN
+    UPDATE conversation_creation_jobs
+    SET shadow_projection_revision = OLD.shadow_projection_revision + 1
+    WHERE id = OLD.id;
+END;
+
+CREATE TABLE creation_shadow_effect_intents (
+    effect_id TEXT PRIMARY KEY REFERENCES workflow_effects(id) ON DELETE CASCADE,
+    intent_kind TEXT NOT NULL,
+    conversation_id TEXT,
+    repository_path TEXT,
+    worktree_path TEXT,
+    branch_name TEXT,
+    message_id TEXT,
+    attachment_count INTEGER,
+    CHECK (intent_kind IN (
+        'resolve_repository', 'reserve_worktree', 'materialize_or_reconcile_worktree',
+        'finalize_attachments', 'expand_initial_message', 'commit_metadata',
+        'bootstrap_runtime', 'dispatch_initial_llm_request', 'revoke_runtime',
+        'remove_owned_worktree', 'release_reservation', 'delete_staged_attachments',
+        'finish_cancellation_or_deletion'
+    )),
+    CHECK (attachment_count IS NULL OR attachment_count >= 0)
+);
+
+CREATE TABLE creation_shadow_archives (
+    creation_job_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    oracle_revision INTEGER NOT NULL,
+    terminal_status TEXT NOT NULL,
+    terminal_stage TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    projection_status TEXT,
+    completion TEXT,
+    compensation TEXT,
+    projected_at TEXT,
+    archived_at TEXT NOT NULL,
+    CHECK (oracle_revision >= 0 AND attempt >= 0 AND generation >= 0),
+    CHECK (terminal_status IN ('cancelled', 'deletion_pending', 'ready', 'failed')),
+    CHECK (projection_status IS NULL OR projection_status IN ('provisioning', 'failed', 'cancelled', 'deletion_pending', 'ready')),
+    CHECK (completion IS NULL OR completion IN ('pending', 'complete', 'failed', 'cancelled', 'deletion_pending')),
+    CHECK (compensation IS NULL OR compensation IN ('none', 'required_for_cancellation', 'required_for_deletion'))
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -2357,7 +2422,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(tables, 5);
+        assert_eq!(tables, 7);
     }
 
     /// A pre-stamped *highest* version must not suppress lower, un-stamped

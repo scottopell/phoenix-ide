@@ -2923,7 +2923,7 @@ impl Database {
     ) -> DbResult<ConversationCreationJob> {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
-                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    shadow_projection_revision, claim_worker_id, claim_token, lease_until, next_attempt_at,
                     intent_json, error, accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE id = ?1",
@@ -2946,7 +2946,7 @@ impl Database {
     ) -> DbResult<Option<ConversationCreationJob>> {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
-                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    shadow_projection_revision, claim_worker_id, claim_token, lease_until, next_attempt_at,
                     intent_json, error, accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE conversation_id = ?1",
@@ -2969,7 +2969,7 @@ impl Database {
     ) -> DbResult<Option<ConversationCreationJob>> {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
-                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    shadow_projection_revision, claim_worker_id, claim_token, lease_until, next_attempt_at,
                     intent_json, error, accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE message_id = ?1",
@@ -3562,6 +3562,46 @@ impl Database {
                 ));
             }
         } else if cleanup.status == "deletion_pending" {
+            let archived = sqlx::query(
+                "INSERT INTO creation_shadow_archives
+                 (creation_job_id, conversation_id, oracle_revision, terminal_status, terminal_stage,
+                  attempt, generation, projection_status, completion, compensation, projected_at, archived_at)
+                 SELECT j.id, j.conversation_id, j.shadow_projection_revision, j.status, j.stage,
+                        j.attempt, j.generation, p.projection_status, p.completion, p.compensation,
+                        p.projected_at, ?1
+                 FROM conversation_creation_jobs j
+                 LEFT JOIN creation_shadow_bindings b ON b.creation_job_id = j.id
+                 LEFT JOIN creation_shadow_projections p ON p.shadow_workflow_id = b.shadow_workflow_id
+                 WHERE j.id = ?2 AND j.conversation_id = ?3
+                   AND j.status = 'deletion_pending' AND j.generation = ?4
+                   AND j.cleanup_worker_id = ?5 AND j.cleanup_token = ?6
+                   AND j.cleanup_lease_until > ?1
+                 ON CONFLICT(creation_job_id) DO UPDATE SET
+                     oracle_revision = excluded.oracle_revision,
+                     terminal_status = excluded.terminal_status,
+                     terminal_stage = excluded.terminal_stage,
+                     attempt = excluded.attempt,
+                     generation = excluded.generation,
+                     projection_status = excluded.projection_status,
+                     completion = excluded.completion,
+                     compensation = excluded.compensation,
+                     projected_at = excluded.projected_at,
+                     archived_at = excluded.archived_at",
+            )
+            .bind(&now_str)
+            .bind(&cleanup.job_id)
+            .bind(&cleanup.conversation_id)
+            .bind(generation)
+            .bind(&cleanup.worker_id)
+            .bind(&cleanup.token)
+            .execute(&mut *tx)
+            .await?;
+            if archived.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(
+                    "creation cleanup diagnostic archive failed".to_string(),
+                ));
+            }
             let deleted = sqlx::query(
                 "DELETE FROM conversations
                  WHERE id = ?1 AND EXISTS (
@@ -3661,6 +3701,15 @@ impl Database {
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET shadow_projection_revision = shadow_projection_revision + 1
+             WHERE id = ?1 AND generation = ?2",
+        )
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(CreationCasOutcome::Applied)
     }
@@ -3677,6 +3726,7 @@ impl Database {
         resource_identity: &str,
         now: DateTime<Utc>,
     ) -> DbResult<CreationCasOutcome> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversation_creation_resource_reservations
              SET status = 'present', updated_at = ?1
@@ -3694,13 +3744,23 @@ impl Database {
         .bind(resource_identity)
         .bind(&claim.worker_id.0)
         .bind(&claim.token.0)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(if result.rows_affected() == 1 {
-            CreationCasOutcome::Applied
-        } else {
-            CreationCasOutcome::ClaimLost
-        })
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET shadow_projection_revision = shadow_projection_revision + 1
+             WHERE id = ?1 AND generation = ?2",
+        )
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
     }
 
     /// Load durable resource reservations for one creation job.
@@ -7468,6 +7528,10 @@ fn parse_conversation_creation_job_row(
             generation,
         },
         intent,
+        shadow_projection_revision: u64::try_from(
+            row.try_get::<i64, _>("shadow_projection_revision")?,
+        )
+        .map_err(|_| sqlx::Error::Decode("invalid shadow projection revision".into()))?,
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
         updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
         accepted_at: row
@@ -8660,6 +8724,23 @@ mod tests {
             .await
             .unwrap();
         assert!(db.get_conversation("conv-cancel").await.is_err());
+        let archive = sqlx::query(
+            "SELECT conversation_id, terminal_status, terminal_stage, attempt, generation FROM creation_shadow_archives WHERE creation_job_id = 'job-cancel'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(archive.get::<String, _>("conversation_id"), "conv-cancel");
+        assert_eq!(
+            archive.get::<String, _>("terminal_status"),
+            "deletion_pending"
+        );
+        assert_eq!(
+            archive.get::<String, _>("terminal_stage"),
+            "validate_intent"
+        );
+        assert_eq!(archive.get::<i64, _>("attempt"), 1);
+        assert_eq!(archive.get::<i64, _>("generation"), 3);
     }
 
     #[tokio::test]

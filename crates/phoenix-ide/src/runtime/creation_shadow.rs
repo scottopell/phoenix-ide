@@ -22,8 +22,14 @@ use phoenix_workflow::creation_profile::{
 
 const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
 
+#[derive(Default)]
+struct JobSyncGate {
+    lock: tokio::sync::Mutex<()>,
+    users: std::sync::atomic::AtomicUsize,
+}
+
 type JobSyncGates = std::sync::Arc<
-    tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<JobSyncGate>>>,
 >;
 
 #[derive(Clone)]
@@ -70,21 +76,27 @@ impl CreationShadowCoordinator {
         }
         let gate = {
             let mut gates = self.job_gates.lock().await;
-            gates
+            let gate = gates
                 .entry(job_id.to_owned())
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+                .or_insert_with(|| std::sync::Arc::new(JobSyncGate::default()))
+                .clone();
+            gate.users
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            gate
         };
-        // Each task reads committed state only after entering its job gate, so a delayed task
-        // cannot project an earlier stage over a newer projection. Unrelated jobs remain parallel.
-        let guard = gate.lock().await;
+        let guard = gate.lock.lock().await;
         let result = self.sync_committed_job_while_gated(job_id).await;
         drop(guard);
         let mut gates = self.job_gates.lock().await;
-        if gates.get(job_id).is_some_and(|registered| {
-            std::sync::Arc::ptr_eq(registered, &gate)
-                && std::sync::Arc::strong_count(registered) == 2
-        }) {
+        let remaining = gate
+            .users
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            - 1;
+        if remaining == 0
+            && gates
+                .get(job_id)
+                .is_some_and(|registered| std::sync::Arc::ptr_eq(registered, &gate))
+        {
             gates.remove(job_id);
         }
         result
@@ -128,7 +140,8 @@ impl CreationShadowCoordinator {
             &reservations,
             Some(conv_mode),
         );
-        let observed = observed_projection(&conversation.state);
+        let observed =
+            observed_projection(&conversation.state, conversation.archived, &oracle.status);
         let persistence = CreationShadowPersistence::Enabled(CreationShadowConfig {
             shadow_workflow_id: format!("creation-shadow:{}", oracle.intent.job_id),
             authoritative_anchor_workflow_id: format!(
@@ -202,6 +215,7 @@ fn oracle_from_committed(
         stage: map_stage(job.protocol.stage),
         attempt: job.protocol.attempt,
         generation: job.protocol.generation,
+        revision: job.shadow_projection_revision,
     }
 }
 
@@ -246,24 +260,52 @@ fn map_stage(stage: CreationStage) -> AuthoritativeCreationStage {
     }
 }
 
-fn observed_projection(state: &ConvState) -> CreationShadowEvidence {
-    let (status, capabilities) = match state {
-        ConvState::Provisioning { .. } => (
-            CreationProjectionStatus::Provisioning,
-            creation_capabilities([true, false, false, true, false, true]),
-        ),
-        ConvState::CreationFailed { .. } => (
-            CreationProjectionStatus::Failed,
-            creation_capabilities([true, false, false, false, true, true]),
-        ),
-        ConvState::CreationCancelled { .. } => (
-            CreationProjectionStatus::Cancelled,
-            creation_capabilities([true, false, false, false, true, true]),
-        ),
-        _ => (
-            CreationProjectionStatus::Ready,
-            creation_capabilities([true, true, true, false, false, true]),
-        ),
+fn observed_projection(
+    state: &ConvState,
+    archived: bool,
+    creation_status: &AuthoritativeCreationStatus,
+) -> CreationShadowEvidence {
+    let (status, capabilities) = if archived
+        || matches!(
+            creation_status,
+            AuthoritativeCreationStatus::DeletionPending
+        ) {
+        (
+            CreationProjectionStatus::DeletionPending,
+            creation_capabilities([false, false, false, false, false, false]),
+        )
+    } else {
+        match state {
+            ConvState::Provisioning { .. } => (
+                CreationProjectionStatus::Provisioning,
+                creation_capabilities([true, false, false, true, false, true]),
+            ),
+            ConvState::CreationFailed { .. } => (
+                CreationProjectionStatus::Failed,
+                creation_capabilities([true, false, false, false, true, true]),
+            ),
+            ConvState::CreationCancelled { .. } => (
+                CreationProjectionStatus::Cancelled,
+                creation_capabilities([true, false, false, false, true, true]),
+            ),
+            ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingRecovery { .. } => (
+                CreationProjectionStatus::Ready,
+                creation_capabilities([true, true, true, true, false, false]),
+            ),
+            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => (
+                CreationProjectionStatus::Ready,
+                creation_capabilities([true, false, true, false, false, false]),
+            ),
+            _ => (
+                CreationProjectionStatus::Ready,
+                creation_capabilities([true, true, true, false, false, true]),
+            ),
+        }
     };
     CreationShadowEvidence::UserProjection {
         status,
@@ -314,19 +356,52 @@ mod tests {
     #[test]
     fn observed_projection_comes_from_visible_conversation_state() {
         assert_eq!(
-            observed_projection(&ConvState::CreationCancelled {
-                job_id: "job".to_owned()
-            }),
+            observed_projection(
+                &ConvState::CreationCancelled {
+                    job_id: "job".to_owned()
+                },
+                false,
+                &AuthoritativeCreationStatus::Cancelled,
+            ),
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Cancelled,
                 capabilities: creation_capabilities([true, false, false, false, true, true]),
             }
         );
         assert_eq!(
-            observed_projection(&ConvState::Idle),
+            observed_projection(&ConvState::Idle, false, &AuthoritativeCreationStatus::Ready),
             CreationShadowEvidence::UserProjection {
                 status: CreationProjectionStatus::Ready,
                 capabilities: creation_capabilities([true, true, true, false, false, true]),
+            }
+        );
+        assert_eq!(
+            observed_projection(
+                &ConvState::LlmRequesting { attempt: 1 },
+                false,
+                &AuthoritativeCreationStatus::Ready
+            ),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::Ready,
+                capabilities: creation_capabilities([true, true, true, true, false, false]),
+            }
+        );
+        assert_eq!(
+            observed_projection(&ConvState::Idle, true, &AuthoritativeCreationStatus::Ready),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::DeletionPending,
+                capabilities: creation_capabilities([false, false, false, false, false, false]),
+            }
+        );
+        assert_eq!(
+            observed_projection(
+                &ConvState::Idle,
+                false,
+                &AuthoritativeCreationStatus::DeletionPending
+            ),
+            CreationShadowEvidence::UserProjection {
+                status: CreationProjectionStatus::DeletionPending,
+                capabilities: creation_capabilities([false, false, false, false, false, false]),
             }
         );
     }
@@ -377,6 +452,19 @@ mod tests {
             .sync_committed_job("job-shadow-runtime")
             .await
             .unwrap();
+        assert!(coordinator.job_gates.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_gate_and_last_waiter_removes_it() {
+        let db = database().await;
+        insert_job(&db).await;
+        let coordinator = CreationShadowCoordinator::with_enabled(db, true);
+        let first = coordinator.sync_committed_job("job-shadow-runtime");
+        let second = coordinator.sync_committed_job("job-shadow-runtime");
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
         assert!(coordinator.job_gates.lock().await.is_empty());
     }
 

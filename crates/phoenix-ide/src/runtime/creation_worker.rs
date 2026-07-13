@@ -123,7 +123,9 @@ async fn reconcile_creation_cleanup(
         .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
-    manager.mirror_creation_after_commit(cleanup.job_id.clone());
+    if cleanup.status != "deletion_pending" {
+        manager.mirror_creation_after_commit(cleanup.job_id.clone());
+    }
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use phoenix_workflow::{
     creation_profile::{
         self, AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
         CapabilityAvailability, CompensationPrediction, CompletionPrediction, CreationCapabilities,
-        CreationProjectionStatus, EffectPrediction,
+        CreationEffectIntent, CreationProjectionStatus, EffectPrediction,
     },
     SemanticAuthority,
 };
@@ -99,6 +99,10 @@ impl<'a> CreationShadowAdapter<'a> {
 
         let mut tx = self.repository.pool().begin().await?;
         verify_authoritative_job(&mut tx, oracle).await?;
+        if projection_is_newer(&mut tx, config, oracle.revision).await? {
+            tx.rollback().await?;
+            return Ok(CreationShadowPersistOutcome::Updated);
+        }
         let existed: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM creation_shadow_bindings WHERE shadow_workflow_id = ?1)",
         )
@@ -183,7 +187,7 @@ async fn verify_authoritative_job(
     oracle: &AuthoritativeCreationOracle,
 ) -> WorkflowRepositoryResult<()> {
     let row = sqlx::query(
-        "SELECT conversation_id, generation, attempt, status, stage FROM conversation_creation_jobs WHERE id = ?1",
+        "SELECT conversation_id, generation, attempt, status, stage, shadow_projection_revision FROM conversation_creation_jobs WHERE id = ?1",
     )
     .bind(&oracle.intent.job_id)
     .fetch_optional(&mut **tx)
@@ -198,12 +202,28 @@ async fn verify_authoritative_job(
         || row.get::<i64, _>("attempt") != i64::from(oracle.attempt)
         || row.get::<String, _>("status") != authoritative_status_sql(&oracle.status)
         || row.get::<String, _>("stage") != authoritative_stage_sql(oracle.stage)
+        || row.get::<i64, _>("shadow_projection_revision") != to_i64(oracle.revision)?
     {
         return Err(WorkflowRepositoryError::CorruptState(
             "creation oracle does not match committed authoritative job".to_owned(),
         ));
     }
     Ok(())
+}
+
+async fn projection_is_newer(
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &CreationShadowConfig,
+    oracle_revision: u64,
+) -> WorkflowRepositoryResult<bool> {
+    let oracle_revision = to_i64(oracle_revision)?;
+    let persisted: Option<i64> = sqlx::query_scalar(
+        "SELECT oracle_revision FROM creation_shadow_projections WHERE shadow_workflow_id = ?1",
+    )
+    .bind(&config.shadow_workflow_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(persisted.is_some_and(|revision| revision > oracle_revision))
 }
 
 async fn upsert_anchor(
@@ -283,6 +303,7 @@ async fn upsert_shadow_workflow(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn replace_graph(
     tx: &mut Transaction<'_, Sqlite>,
     config: &CreationShadowConfig,
@@ -290,6 +311,26 @@ async fn replace_graph(
     domain: &creation_profile::CreationShadowAdapter,
     now: DateTime<Utc>,
 ) -> WorkflowRepositoryResult<()> {
+    sqlx::query(
+        "DELETE FROM workflow_barrier_members WHERE barrier_id IN (SELECT id FROM workflow_barriers WHERE workflow_id = ?1)",
+    )
+    .bind(&config.shadow_workflow_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM workflow_effect_dependencies WHERE effect_id IN (SELECT id FROM workflow_effects WHERE workflow_id = ?1) OR dependency_effect_id IN (SELECT id FROM workflow_effects WHERE workflow_id = ?1)",
+    )
+    .bind(&config.shadow_workflow_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM workflow_barriers WHERE workflow_id = ?1")
+        .bind(&config.shadow_workflow_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM workflow_effects WHERE workflow_id = ?1")
+        .bind(&config.shadow_workflow_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM workflow_transitions WHERE workflow_id = ?1")
         .bind(&config.shadow_workflow_id)
         .execute(&mut **tx)
@@ -326,6 +367,7 @@ async fn replace_graph(
         .bind(effect.destructive_resource)
         .execute(&mut **tx)
         .await?;
+        insert_typed_effect_intent(tx, config, effect.effect_id.0, &effect.intent).await?;
     }
     for dependency in &domain.plan.dependencies {
         sqlx::query(
@@ -370,6 +412,188 @@ async fn replace_graph(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+async fn insert_typed_effect_intent(
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &CreationShadowConfig,
+    effect_number: u64,
+    intent: &CreationEffectIntent,
+) -> WorkflowRepositoryResult<()> {
+    let (
+        kind,
+        conversation_id,
+        repository_path,
+        worktree_path,
+        branch_name,
+        message_id,
+        attachment_count,
+    ) = match intent {
+        CreationEffectIntent::ResolveRepository { repository_path } => (
+            "resolve_repository",
+            None,
+            Some(repository_path.as_str()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::ReserveWorktree {
+            repository_path,
+            worktree_path,
+            branch_name,
+        } => (
+            "reserve_worktree",
+            None,
+            Some(repository_path.as_str()),
+            Some(worktree_path.as_str()),
+            Some(branch_name.as_str()),
+            None,
+            None,
+        ),
+        CreationEffectIntent::MaterializeOrReconcileWorktree {
+            repository_path,
+            worktree_path,
+            branch_name,
+        } => (
+            "materialize_or_reconcile_worktree",
+            None,
+            Some(repository_path.as_str()),
+            Some(worktree_path.as_str()),
+            Some(branch_name.as_str()),
+            None,
+            None,
+        ),
+        CreationEffectIntent::FinalizeAttachments {
+            conversation_id,
+            attachment_ids,
+        } => (
+            "finalize_attachments",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
+            Some(attachment_ids.len()),
+        ),
+        CreationEffectIntent::ExpandInitialMessage {
+            conversation_id,
+            message_id,
+            ..
+        } => (
+            "expand_initial_message",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            Some(message_id.as_str()),
+            None,
+        ),
+        CreationEffectIntent::CommitMetadata {
+            conversation_id,
+            worktree_path,
+        } => (
+            "commit_metadata",
+            Some(conversation_id.as_str()),
+            None,
+            Some(worktree_path.as_str()),
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::BootstrapRuntime { conversation_id } => (
+            "bootstrap_runtime",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::DispatchInitialLlmRequest {
+            conversation_id,
+            message_id,
+        } => (
+            "dispatch_initial_llm_request",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            Some(message_id.as_str()),
+            None,
+        ),
+        CreationEffectIntent::RevokeRuntime { conversation_id } => (
+            "revoke_runtime",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::RemoveOwnedWorktree {
+            repository_path,
+            worktree_path,
+        } => (
+            "remove_owned_worktree",
+            None,
+            Some(repository_path.as_str()),
+            Some(worktree_path.as_str()),
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::ReleaseReservation {
+            conversation_id,
+            worktree_path,
+        } => (
+            "release_reservation",
+            Some(conversation_id.as_str()),
+            None,
+            Some(worktree_path.as_str()),
+            None,
+            None,
+            None,
+        ),
+        CreationEffectIntent::DeleteStagedAttachments {
+            conversation_id,
+            attachment_ids,
+        } => (
+            "delete_staged_attachments",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
+            Some(attachment_ids.len()),
+        ),
+        CreationEffectIntent::FinishCancellationOrDeletion { conversation_id } => (
+            "finish_cancellation_or_deletion",
+            Some(conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+    sqlx::query(
+        "INSERT INTO creation_shadow_effect_intents
+         (effect_id, intent_kind, conversation_id, repository_path, worktree_path, branch_name, message_id, attachment_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(effect_db_id(config, effect_number))
+    .bind(kind)
+    .bind(conversation_id)
+    .bind(repository_path)
+    .bind(worktree_path)
+    .bind(branch_name)
+    .bind(message_id)
+    .bind(attachment_count.map(i64::try_from).transpose().map_err(|_| WorkflowRepositoryError::InvalidPlan("too many attachments"))?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn upsert_projection(
     tx: &mut Transaction<'_, Sqlite>,
     config: &CreationShadowConfig,
@@ -379,17 +603,17 @@ async fn upsert_projection(
 ) -> WorkflowRepositoryResult<()> {
     let p = &domain.projection;
     sqlx::query(
-        "INSERT INTO creation_shadow_projections (shadow_workflow_id, oracle_generation, oracle_attempt, \
+        "INSERT INTO creation_shadow_projections (shadow_workflow_id, oracle_generation, oracle_attempt, oracle_revision, \
          projection_status, completion, compensation, hidden, can_read, can_write, can_runtime, can_cancel, \
-         can_start_over, can_delete, projected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         can_start_over, can_delete, projected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(shadow_workflow_id) DO UPDATE SET oracle_generation=excluded.oracle_generation, \
-         oracle_attempt=excluded.oracle_attempt, projection_status=excluded.projection_status, completion=excluded.completion, \
+         oracle_attempt=excluded.oracle_attempt, oracle_revision=excluded.oracle_revision, projection_status=excluded.projection_status, completion=excluded.completion, \
          compensation=excluded.compensation, hidden=excluded.hidden, can_read=excluded.can_read, can_write=excluded.can_write, \
          can_runtime=excluded.can_runtime, can_cancel=excluded.can_cancel, can_start_over=excluded.can_start_over, \
          can_delete=excluded.can_delete, projected_at=excluded.projected_at",
     )
     .bind(&config.shadow_workflow_id).bind(to_i64(oracle.generation)?).bind(i64::from(oracle.attempt))
-    .bind(projection_status_sql(p.status)).bind(completion_sql(p.completion)).bind(compensation_sql(p.compensation))
+    .bind(to_i64(oracle.revision)?).bind(projection_status_sql(p.status)).bind(completion_sql(p.completion)).bind(compensation_sql(p.compensation))
     .bind(p.hidden).bind(allowed(p.capabilities.read)).bind(allowed(p.capabilities.write))
     .bind(allowed(p.capabilities.runtime)).bind(allowed(p.capabilities.cancel))
     .bind(allowed(p.capabilities.start_over)).bind(allowed(p.capabilities.delete)).bind(now.to_rfc3339())

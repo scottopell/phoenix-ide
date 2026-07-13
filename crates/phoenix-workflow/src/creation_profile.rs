@@ -17,6 +17,7 @@ pub const FINALIZE_ATTACHMENTS: EffectId = EffectId(4);
 pub const EXPAND_INITIAL_MESSAGE: EffectId = EffectId(5);
 pub const COMMIT_METADATA: EffectId = EffectId(6);
 pub const DISPATCH_INITIAL_LLM_REQUEST: EffectId = EffectId(7);
+pub const BOOTSTRAP_RUNTIME: EffectId = EffectId(8);
 
 pub const REVOKE_RUNTIME: EffectId = EffectId(101);
 pub const REMOVE_OWNED_WORKTREE: EffectId = EffectId(102);
@@ -86,6 +87,8 @@ pub struct AuthoritativeCreationOracle {
     pub stage: AuthoritativeCreationStage,
     pub attempt: u32,
     pub generation: u64,
+    /// Committed source revision for monotonic diagnostic projection writes.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -126,6 +129,9 @@ pub enum CreationEffectIntent {
     CommitMetadata {
         conversation_id: String,
         worktree_path: String,
+    },
+    BootstrapRuntime {
+        conversation_id: String,
     },
     DispatchInitialLlmRequest {
         conversation_id: String,
@@ -186,6 +192,9 @@ pub enum CreationReceipt {
         message_id: String,
     },
     MetadataCommitted {
+        conversation_id: String,
+    },
+    RuntimeBootstrapped {
         conversation_id: String,
     },
     InitialLlmRequestDispatched {
@@ -490,6 +499,16 @@ pub fn creation_plan(
             None,
         ));
         effects.push(effect(
+            BOOTSTRAP_RUNTIME,
+            "bootstrap_runtime",
+            CreationEffectIntent::BootstrapRuntime {
+                conversation_id: oracle.intent.conversation_id.clone(),
+            },
+            oracle.generation,
+            EffectAmbiguity::ObservableReconciliation,
+            None,
+        ));
+        effects.push(effect(
             DISPATCH_INITIAL_LLM_REQUEST,
             "dispatch_initial_llm_request",
             CreationEffectIntent::DispatchInitialLlmRequest {
@@ -523,8 +542,9 @@ pub fn creation_plan(
     if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
         dependencies.extend([
             dependency(EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS),
-            dependency(DISPATCH_INITIAL_LLM_REQUEST, COMMIT_METADATA),
-            dependency(DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE),
+            dependency(BOOTSTRAP_RUNTIME, COMMIT_METADATA),
+            dependency(BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+            dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
         ]);
     }
     let barrier_members = effects
@@ -780,7 +800,7 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
         ),
     };
     let readiness_effects = match &oracle.intent.kind {
-        CreationKind::InitialTurn { .. } => vec![DISPATCH_INITIAL_LLM_REQUEST],
+        CreationKind::InitialTurn { .. } => vec![BOOTSTRAP_RUNTIME, DISPATCH_INITIAL_LLM_REQUEST],
         CreationKind::SeededEmpty => vec![COMMIT_METADATA],
     };
     CreationProjection {
@@ -842,12 +862,17 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
                 AuthoritativeCreationStage::ExpandInitialMessage,
             ),
             (
+                BOOTSTRAP_RUNTIME,
+                AuthoritativeCreationStage::BootstrapInitialTurn,
+            ),
+            (
                 DISPATCH_INITIAL_LLM_REQUEST,
                 AuthoritativeCreationStage::BootstrapInitialTurn,
             ),
         ]),
         CreationKind::SeededEmpty => effects.extend([
             (EXPAND_INITIAL_MESSAGE, AuthoritativeCreationStage::Finalize),
+            (BOOTSTRAP_RUNTIME, AuthoritativeCreationStage::Finalize),
             (
                 DISPATCH_INITIAL_LLM_REQUEST,
                 AuthoritativeCreationStage::Finalize,
@@ -858,8 +883,10 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
         .into_iter()
         .map(|(id, stage)| {
             let prediction = if matches!(oracle.intent.kind, CreationKind::SeededEmpty)
-                && matches!(id, EXPAND_INITIAL_MESSAGE | DISPATCH_INITIAL_LLM_REQUEST)
-            {
+                && matches!(
+                    id,
+                    EXPAND_INITIAL_MESSAGE | BOOTSTRAP_RUNTIME | DISPATCH_INITIAL_LLM_REQUEST
+                ) {
                 EffectPrediction::Omitted
             } else if oracle.stage > stage
                 || matches!(oracle.status, AuthoritativeCreationStatus::Ready)

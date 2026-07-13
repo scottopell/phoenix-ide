@@ -60,6 +60,7 @@ fn oracle() -> AuthoritativeCreationOracle {
         stage: AuthoritativeCreationStage::ValidateIntent,
         attempt: 0,
         generation: 0,
+        revision: 0,
     }
 }
 
@@ -148,11 +149,11 @@ async fn persists_real_bounded_shadow_graph_without_authority_or_semantic_byte_d
     assert_eq!(selection.get::<i64, _>("external_acceptance_enabled"), 0);
     assert_eq!(row_count(&pool, "workflow_claims").await, 0);
     assert_eq!(row_count(&pool, "workflow_attempts").await, 0);
-    assert_eq!(row_count(&pool, "workflow_effects").await, 7);
+    assert_eq!(row_count(&pool, "workflow_effects").await, 8);
     assert_eq!(row_count(&pool, "workflow_transitions").await, 1);
     assert_eq!(
         row_count(&pool, "creation_shadow_effect_predictions").await,
-        7
+        8
     );
     let executable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = 'creation-shadow' AND status <> 'blocked'")
         .fetch_one(&pool).await.unwrap();
@@ -313,6 +314,14 @@ async fn cleanup_status_persists_compensation_graph() {
     .unwrap();
     let mut cleanup = oracle();
     cleanup.status = AuthoritativeCreationStatus::Cancelling;
+    cleanup.revision = sqlx::query_scalar::<_, i64>(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_into()
+    .unwrap();
     let repo = WorkflowRepository::new(pool.clone());
     CreationShadowAdapter::new(&repo, &config())
         .persist_after_authoritative_commit(
@@ -330,6 +339,134 @@ async fn cleanup_status_persists_compensation_graph() {
     .await
     .unwrap();
     assert_eq!(compensation, 5);
+}
+
+#[tokio::test]
+async fn replacement_removes_old_forward_graph_before_compensation_graph() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let persistence = config();
+    let adapter = CreationShadowAdapter::new(&repo, &persistence);
+    adapter
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_350, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = 'job-shadow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT shadow_projection_revision FROM conversation_creation_jobs WHERE id = 'job-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut cleanup = oracle();
+    cleanup.status = AuthoritativeCreationStatus::Cancelling;
+    cleanup.revision = u64::try_from(revision).unwrap();
+    adapter
+        .persist_after_authoritative_commit(
+            &cleanup,
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Cancelled),
+            Utc.timestamp_opt(2_351, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role FROM workflow_effects WHERE workflow_id = 'creation-shadow' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roles.len(), 5);
+    assert!(roles.iter().all(|role| role == "compensation"));
+    let dependencies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_effect_dependencies d JOIN workflow_effects e ON e.id = d.effect_id WHERE e.workflow_id = 'creation-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(dependencies, 5);
+}
+
+#[tokio::test]
+async fn older_persisted_revision_cannot_regress_same_attempt_projection() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let persistence = config();
+    let adapter = CreationShadowAdapter::new(&repo, &persistence);
+    adapter
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_400, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE creation_shadow_projections SET oracle_revision = 10, projection_status = 'ready' WHERE shadow_workflow_id = 'creation-shadow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    adapter
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_401, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+    let status: String = sqlx::query_scalar(
+        "SELECT projection_status FROM creation_shadow_projections WHERE shadow_workflow_id = 'creation-shadow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "ready");
+}
+
+#[tokio::test]
+async fn effect_intent_diagnostics_are_typed_and_omit_semantic_payload_bytes() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    CreationShadowAdapter::new(&repo, &config())
+        .persist_after_authoritative_commit(
+            &oracle(),
+            CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
+            Utc.timestamp_opt(2_500, 0).single().unwrap(),
+        )
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT intent_kind, message_id, attachment_count FROM creation_shadow_effect_intents ORDER BY intent_kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 8);
+    assert!(rows
+        .iter()
+        .any(|(kind, _, count)| kind == "finalize_attachments" && *count == Some(1)));
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT intent_payload FROM workflow_effects WHERE workflow_id = 'creation-shadow'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(payloads.iter().all(|payload| payload == "{}"));
+    assert!(payloads
+        .iter()
+        .all(|payload| !payload.contains("do the thing")));
 }
 
 #[tokio::test]
