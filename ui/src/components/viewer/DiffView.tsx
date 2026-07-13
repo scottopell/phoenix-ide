@@ -16,10 +16,14 @@ import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext'
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildDiffSearchProjection,
-  useViewerFind,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
   type DiffSearchMatchTarget,
+  type FindSessionCommand,
 } from '../viewer-find';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
@@ -54,6 +58,9 @@ export interface DiffViewProps {
 
 type DiffStyle = 'unified' | 'split';
 const DIFF_STYLE_KEY = 'phoenix-diff-style';
+const DIFF_FIND_SURFACE_KEY = createSurfaceKey('diff-viewer');
+
+type DiffFindFocusOrigin = HTMLElement | { readonly token: 'diff-find-button' };
 
 function initialDiffStyle(): DiffStyle {
   const stored = localStorage.getItem(DIFF_STYLE_KEY);
@@ -83,46 +90,87 @@ export function DiffView({
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
-  const find = useViewerFind({ text: '' });
-  const resetFind = find.reset;
+  const restoreFocus = useCallback((focusOrigin: DiffFindFocusOrigin) => {
+    if (focusOrigin instanceof HTMLElement) {
+      queueMicrotask(() => focusOrigin.focus());
+      return;
+    }
+    queueMicrotask(() => findButtonRef.current?.focus());
+  }, []);
+
+  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
+    if (target.kind === 'commit-log-line') {
+      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    codeViewRef.current?.scrollToFindTarget(target);
+  }, []);
+
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<DiffSearchMatchTarget, DiffFindFocusOrigin>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+          break;
+        case 'restore-focus':
+          restoreFocus(command.focusOrigin);
+          break;
+        case 'reveal-match':
+          navigateFindTarget(command.target);
+          break;
+        case 'clear-decorations':
+          break;
+      }
+    });
+  }, [navigateFindTarget, restoreFocus]);
+  const find = useFindSession<DiffSearchMatchTarget, DiffFindFocusOrigin>({ onCommands: handleFindCommands });
 
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    find.open();
+    const focusOrigin = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : { token: 'diff-find-button' as const };
+    findPreviousFocusRef.current = focusOrigin instanceof HTMLElement ? focusOrigin : null;
+    find.send({
+      type: 'open',
+      surface: {
+        key: DIFF_FIND_SURFACE_KEY,
+        query: '',
+        matches: [],
+        focusOrigin,
+      },
+    });
   }, [find]);
 
   const closeFind = useCallback(() => {
-    find.close();
-    const restoreTarget = findPreviousFocusRef.current;
-    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
+    find.send({ type: 'close' });
   }, [find]);
 
   useEffect(() => {
     if (open) return;
-    resetFind();
+    find.send({ type: 'reset' });
     findPreviousFocusRef.current = null;
-  }, [open, resetFind]);
+  }, [open, find]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
     onOpen: openFind,
     dialogOpen: !open || notes.annotating !== null,
   });
+  const findSession = find.state.status === 'open' ? find.state : null;
   const findProjection = useMemo(
-    () => (find.isOpen && find.query.length > 0
-      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog)
+    () => (findSession && findSession.query.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, findSession.query, commitLog)
       : { sources: [], matches: [] }),
-    [commitLog, committedDiff, find.isOpen, uncommittedDiff, find.query],
+    [commitLog, committedDiff, findSession, uncommittedDiff],
   );
-  const activeFindIndex = findProjection.matches.length === 0
-    ? -1
-    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
-  const activeFindMatchTarget = find.isOpen && activeFindIndex >= 0
-    ? findProjection.matches[activeFindIndex]?.target ?? null
-    : null;
+  const sessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, (match) => stableDiffMatchId(match.target)),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatchTarget = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
-    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
-    [find.isOpen, findProjection.matches],
+    () => (findSession ? findSession.matches.map((match) => match.target) : []),
+    [findSession],
   );
 
   const toggleDiffStyle = useCallback(() => {
@@ -141,54 +189,40 @@ export function DiffView({
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-      const codeView = codeViewRef.current;
-      if (codeView) codeView.scrollToNote(note);
+      codeViewRef.current?.scrollToNote(note);
       highlight(note.id);
       closePanel();
     },
     [highlight, closePanel],
   );
 
-  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
-    if (target.kind === 'commit-log-line') {
-      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  useEffect(() => {
+    if (!findSession) return;
+    if (findSession.query.length === 0) {
+      find.send({ type: 'replace-results', matches: [] });
       return;
     }
-    const codeView = codeViewRef.current;
-    if (codeView) codeView.scrollToFindTarget(target);
-  }, []);
+    find.send({ type: 'replace-results', matches: sessionMatches });
+  }, [find, findSession, sessionMatches]);
 
   const handleFindQueryChange = useCallback((query: string) => {
-    find.setQuery(query);
-  }, [find]);
-
-  useEffect(() => {
-    if (!find.isOpen || find.query.length === 0) return;
-    const target = findProjection.matches[0]?.target;
-    if (target) navigateFindTarget(target);
-  }, [find.isOpen, find.query, findProjection.matches, navigateFindTarget]);
+    const projection = query.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog)
+      : { matches: [] as const };
+    find.send({
+      type: 'set-query-and-results',
+      query,
+      matches: projectionMatchesToSessionMatches(projection.matches, (match) => stableDiffMatchId(match.target)),
+    });
+  }, [commitLog, committedDiff, find, uncommittedDiff]);
 
   const handleFindNext = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? 0
-        : (activeFindIndex + 1) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) navigateFindTarget(target);
-  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+    find.send({ type: 'next' });
+  }, [find]);
 
   const handleFindPrevious = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? Math.max(findProjection.matches.length - 1, 0)
-        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) navigateFindTarget(target);
-  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+    find.send({ type: 'previous' });
+  }, [find]);
 
   if (!open) return null;
 
@@ -196,7 +230,7 @@ export function DiffView({
 
   return (
     <ViewerShell
-      closeOnEscape={!find.isOpen}
+      closeOnEscape={findSession === null}
       onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel={label ?? 'Worktree diff'}
@@ -227,12 +261,12 @@ export function DiffView({
           </button>
         </>
       }
-      banner={find.isOpen ? (
+      banner={findSession ? (
         <FindBar
-          query={find.query}
+          query={findSession.query}
           activeIndex={activeFindIndex}
-          matchCount={findProjection.matches.length}
-          focusVersion={find.focusVersion}
+          matchCount={findSession.matches.length}
+          focusVersion={findSession.focusVersion}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
@@ -283,7 +317,7 @@ export function DiffView({
                 commitLog={commitLog}
                 matches={findProjection.matches}
                 activeMatchIndex={activeFindIndex}
-                findOpen={find.isOpen}
+                findOpen={findSession !== null}
               />
             )}
             <DiffSummaryBar
@@ -312,6 +346,17 @@ export function DiffView({
       </div>
     </ViewerShell>
   );
+}
+
+function stableDiffMatchId(target: DiffSearchMatchTarget): string {
+  return [
+    target.kind,
+    target.itemId,
+    target.side ?? '',
+    target.lineNumber ?? '',
+    target.startColumn,
+    target.endColumn,
+  ].join(':');
 }
 
 function CommitLogSection({

@@ -152,6 +152,67 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
+  it('preserves the exact active diff match when insertions appear before it without scrolling', async () => {
+    const base = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+    const insertedBefore = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,3 @@',
+      '+alpha zero',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={base}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+
+    const scrollCountBefore = codeViewMockState.scrollToCalls.length;
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={insertedBefore}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('3 of 3')).toBeInTheDocument());
+    expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore);
+  });
+
   it('keeps diff find inert until open with a non-empty query', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
