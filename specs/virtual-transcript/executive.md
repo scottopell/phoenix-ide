@@ -6,10 +6,12 @@ Virtual Transcript is the platform-neutral contract and Phoenix-owned web implem
 
 ## Implementation surfaces
 
-- `ui/src/components/VirtualTranscript.tsx` — web physical layout authority.
+- `ui/src/components/VirtualTranscript.tsx` — web physical layout authority and effect executor for viewport writes/observations.
 - `ui/src/conversation/virtualTranscriptLayout.ts` — pure measured layout model and visible-window calculations.
-- `ui/src/fixtures/virtualTranscript/` — cross-platform semantic fixture corpus and web conformance renderer.
-- `specs/virtual-transcript/virtual_transcript.allium` — positioning and measurement lifecycle.
+- `ui/src/conversation/transcriptPositioning.ts` — pure reducer for closed `idle(view)`/`positioning(command)` input, target-resolution evidence, issued-position revisions, physical observations, supersession, and exact-once finish effects.
+- `fixtures/virtual-transcript/v1/schema.json` and `fixtures/virtual-transcript/v1/scenarios.json` — root portable JSON schema and conformance corpus.
+- `ui/src/fixtures/virtualTranscript/scenarios.ts` — TypeScript validated adapter for the root corpus.
+- `specs/virtual-transcript/virtual_transcript.allium` — reducer-aligned positioning and measurement lifecycle.
 - `specs/messagelist-render-units/` — render-unit construction and conversation scroll ownership policy.
 
 ## Verification matrix
@@ -18,7 +20,7 @@ Virtual Transcript is the platform-neutral contract and Phoenix-owned web implem
 |---|---|
 | REQ-VT-001–004 | Pure layout-model tests and VirtualTranscript component tests |
 | REQ-VT-005 | Tall-row prefix continuity browser scenario with ≤2 CSS px drift |
-| REQ-VT-006–007 | Navigation, missing-target, acknowledgement, and supersession tests |
+| REQ-VT-006–007 | `transcriptPositioning` reducer tests for target resolution, missing-target evidence, position-issued revision gating, physical observation, replacement/null/view/interruption/detach supersession, terminal identity scoping, and exact-once finish |
 | REQ-VT-008–010 | MessageList scroll-policy tests and dynamic measurement browser scenarios |
-| REQ-VT-011 | Typed shared fixture schema and corpus tests |
+| REQ-VT-011 | Root JSON Schema/corpus validation and TypeScript adapter tests |
 | REQ-VT-012 | Playwright Chromium, WebKit, and Firefox conformance runs |

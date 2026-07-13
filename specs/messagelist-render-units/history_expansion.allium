@@ -4,16 +4,17 @@
 -- Scope: coverage acquisition, asynchronous ownership, and the one-shot
 -- positioning obligation caused by expanding a loaded tail into complete
 -- history. Scroll physics and reader/follow ownership remain governed by
--- scroll_policy.allium.
+-- scroll_policy.allium; physical positioning command execution is handed to
+-- virtual_transcript.allium.
 
 use "./scroll_policy.allium" as scroll
+use "../virtual-transcript/virtual_transcript.allium" as vt
 
 enum Coverage { tail complete }
 enum RequestIntent { manual_expand deep_link }
 enum RestoreBasis { reader_anchor following_tail target_message }
-enum CommandKind { restore_after_prefix jump_to_message }
+enum CommandKind { restore_after_prefix_expansion jump_to_message }
 enum FailureKind { request_failed target_not_found anchor_not_found }
-enum CommandResult { applied target_missing superseded }
 
 entity HistoryView {
     conversation_id: String
@@ -81,6 +82,20 @@ surface ScrollCommandExecutor {
         command.kind
         command.message_id
         command.issued_view_generation
+}
+
+surface TranscriptPositioningBoundary {
+    facing view: HistoryView
+
+    provides:
+        CommandInputProjected(view, transcript_view, command_key, history_view)
+        TranscriptPositioningFinished(view, command_token, view_generation, result)
+
+    emits:
+        vt.InputIdle(transcript_view, history_view)
+        vt.InputPositioning(transcript_view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
+        ScrollCommandAcknowledged(view, command_token, view_generation, result)
+        PendingCommandSuperseded(view, command_token, view_generation)
 }
 
 rule ViewChangeSupersedesPendingCommandBeforeInvalidatingOutstandingWork {
@@ -283,7 +298,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
         view: view,
         token: command_token,
         request_token: request_token,
-        kind: restore_after_prefix,
+        kind: restore_after_prefix_expansion,
         message_id: view.active_request.message_id,
         viewport_start_offset: view.active_request.viewport_start_offset,
         issued_view_generation: view_generation
@@ -378,6 +393,36 @@ rule MatchingFailureLeavesTailUsable {
     ensures: view.active_request = null
 }
 
+rule PendingCommandHandsOffToTranscriptPositioningInput {
+    when: CommandInputProjected(view, transcript_view, command_key, history_view)
+    requires: view.pending_command != null
+    ensures: vt.InputPositioning(
+        transcript_view,
+        command_key,
+        view.pending_command.token,
+        view.pending_command.request_token,
+        history_view,
+        view.pending_command.kind,
+        view.pending_command.message_id,
+        view.pending_command.viewport_start_offset
+    ).emitted()
+    ensures: view.pending_command = view.pending_command
+}
+
+rule AbsenceOfPendingCommandHandsOffIdleTranscriptPositioningInput {
+    when: CommandInputProjected(view, transcript_view, _, history_view)
+    requires: view.pending_command = null
+    ensures: vt.InputIdle(transcript_view, history_view).emitted()
+}
+
+rule TranscriptPositioningFinishAcknowledgesPendingCommand {
+    when: TranscriptPositioningFinished(view, command_token, view_generation, result)
+    requires: view.pending_command != null
+    requires: command_token = view.pending_command.token
+    requires: view_generation = view.view_generation
+    ensures: ScrollCommandAcknowledged(view, command_token, view_generation, result).emitted()
+}
+
 rule MatchingSupersessionConsumesCommand {
     when: PendingCommandSuperseded(view, command_token, view_generation)
     requires: view.pending_command != null
@@ -430,7 +475,7 @@ contract HistoryExpansionSafety {
     validate: (view: HistoryView) -> Boolean
 
     @invariant ContinuityRestorationDoesNotAcquireNavigationOwnership
-        -- A restore_after_prefix command positions the canonical historical
+        -- A restore_after_prefix_expansion command positions the canonical historical
         -- message so unitTop - viewportTop equals the captured
         -- viewport_start_offset, preserves the scroll policy's existing reader
         -- or following ownership, and never highlights a message.

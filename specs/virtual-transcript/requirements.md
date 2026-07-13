@@ -45,6 +45,10 @@ WHEN earlier units are inserted before that anchor
 THE SYSTEM SHALL preserve the same unit key at the same viewport-start offset within the platform's conformance tolerance
 AND SHALL acknowledge restoration only after the measured geometric postcondition holds.
 
+WHEN the platform issues the physical position write for a command
+THE SYSTEM SHALL record the layout revision of that write
+AND SHALL accept physical success only from observations at or after the issued layout revision.
+
 The anchor shall be a physically visible unit, not an overscanned range boundary.
 
 ## REQ-VT-006: Semantic Navigation
@@ -56,19 +60,23 @@ AND SHALL acknowledge the command only after the target is physically present at
 WHEN no render unit owns the identifier
 THE SYSTEM SHALL report the target as missing.
 
-## REQ-VT-007: Position Command Ownership
+Target resolution and missing-target detection are evidence supplied to the positioning reducer. The reducer shall not infer target presence from time, retries, or physical layout alone.
 
-THE SYSTEM SHALL allow at most one active programmatic positioning transaction for a transcript view
-AND every transaction SHALL be bound to a command token and view generation.
+## REQ-VT-007: Pure Position Command Ownership
 
-WHEN a newer command or view generation supersedes an active transaction
-THE SYSTEM SHALL prevent the stale transaction from writing viewport position or acknowledging success.
+THE SYSTEM SHALL model transcript positioning as a pure reducer over a closed input: either `idle(view)` or `positioning(command)`.
 
-WHEN the command corresponding to an active transaction is removed without replacement
-THE SYSTEM SHALL terminate that transaction exactly once as superseded
-AND SHALL prevent it from performing further viewport writes or producing another terminal result.
+THE SYSTEM SHALL allow at most one active programmatic positioning command for a transcript view
+AND every command SHALL be bound to a command key derived from command kind, command token, request token, conversation identity, view generation, transcript generation, and target message identity.
 
-Each command shall produce at most one terminal result: applied, target missing, or superseded.
+WHEN input changes to a replacement command, null idle input, a different view identity, user interruption, or executor detach
+THE SYSTEM SHALL supersede the active command before stale target resolution, viewport writes, or physical observations can acknowledge success.
+
+THE SYSTEM SHALL scope terminal command identities to the current view identity.
+WHEN the view identity changes
+THE SYSTEM SHALL reset the terminal identity set for that view.
+
+Each command shall finish exactly once within a view as applied, target missing, or superseded.
 
 ## REQ-VT-008: Durable Tail Following
 
@@ -99,9 +107,9 @@ A streaming-to-finalized transition that retains the same render-unit key shall 
 
 ## REQ-VT-011: Cross-Platform Conformance Fixtures
 
-THE SYSTEM SHALL maintain a platform-neutral fixture corpus describing ordered units, stable keys, navigation aliases, initial viewport state, operations, and geometric expectations.
+THE SYSTEM SHALL maintain a platform-neutral fixture corpus at `fixtures/virtual-transcript/v1/` with a JSON Schema (`schema.json`) and scenario corpus (`scenarios.json`) describing ordered units, stable keys, navigation aliases, initial viewport state, operations, and geometric expectations.
 
-Web and native clients SHALL be able to consume the same semantic scenarios without sharing physical implementation code.
+Web and native clients SHALL be able to consume the same semantic scenarios without sharing physical implementation code. The TypeScript web adapter SHALL validate the root corpus before exposing scenarios to fixtures or tests.
 
 Conformance SHALL include prefix insertion within a tall unit, dynamic resize above an anchor, semantic navigation through an alias, missing orphan targets, streaming growth while reading, streaming growth while following, and command supersession.
 

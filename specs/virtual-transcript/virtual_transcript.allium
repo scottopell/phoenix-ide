@@ -3,318 +3,399 @@
 
 use "../messagelist-render-units/scroll_policy.allium" as scroll
 
-enum ViewportOwner { system reader }
-enum TransactionKind { preserve_anchor navigate follow_tail initial_tail }
-enum TransactionResult { applied target_missing superseded }
+enum CommandKind { restore_after_prefix_expansion jump_to_message }
+enum PhaseKind { resolving_target awaiting_physical }
 config {
     conformance_tolerance: Decimal = 2.0
 }
 
-value CommandIdentity {
-    token: String
+value HistoryViewIdentity {
+    conversation_id: String
     generation: Integer
+    transcript_generation: Integer
+}
+
+value CommandIdentity {
+    key: String
+    token: String
+    request_token: String
+    view: HistoryViewIdentity
+    kind: CommandKind
+    message_id: String
 }
 
 entity TranscriptView {
-    generation: Integer
-    layout_revision: Integer
-    owner: ViewportOwner
+    current_view: HistoryViewIdentity?
     ordered_keys: List<String>
     measured_keys: Set<String>
     rendered_start: Integer
     rendered_end: Integer
-    active_transaction: PositionTransaction?
-    terminal_identities: Set<CommandIdentity>
+    layout_revision: Integer
+    active_command: ActiveCommand?
+    phase: PositioningPhase?
+    terminal_command_keys: Set<String>
 }
 
-entity PhysicalAnchor {
-    unit_key: String
-    viewport_start_offset: Decimal
-}
-
-entity PositionTransaction {
-    view: TranscriptView
+entity ActiveCommand {
     identity: CommandIdentity
-    kind: TransactionKind
-    anchor: PhysicalAnchor?
-    target_key: String?
-    geometry_satisfied: Boolean = false
-    geometry_revision: Integer?
-    target_missing_evidence: Boolean = false
+    viewport_start_offset: Decimal?
 }
 
-entity TerminalTransactionResult {
-    view: TranscriptView
-    identity: CommandIdentity
-    result: TransactionResult
+entity PositioningPhase {
+    kind: PhaseKind
+    target_index: Integer?
+    issued_layout_revision: Integer?
 }
 
-surface VirtualTranscript {
+entity FixtureCorpus {
+    schema_path: String
+    scenarios_path: String
+    schema_version: String
+    scenario_ids: Set<String>
+}
+
+surface TranscriptPositioningReducer {
     facing view: TranscriptView
 
     provides:
-        ViewReplaced(view, generation, ordered_keys)
-        ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
-        PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
-        CommandReplaced(view, token, generation, kind)
+        InputIdle(view, history_view)
+        InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
+        TargetResolved(view, command_key, target_index)
+        TargetMissing(view, command_key)
+        PositionIssued(view, command_key, target_index, layout_revision)
+        PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
+        UserInterrupted(view)
+        ExecutorDetached(view)
         UnitMeasured(view, unit_key, extent)
-        GeometryObserved(view, generation, unit_key, viewport_start_offset)
-        TargetMissingObserved(view, generation, unit_key)
-        CommandFinished(view, token, generation, result)
-        TransactionSuperseded(view, token, generation)
+
+    emits:
+        ResolveTarget(command_key, message_id)
+        Position(command_key, target_index, align, viewport_start_offset)
+        Finish(command_key, result)
 
     exposes:
-        view.rendered_start
-        view.rendered_end
-        view.active_transaction
+        view.current_view
+        view.active_command
+        view.phase
+        view.terminal_command_keys
 }
 
-rule ViewReplacementSupersedesActiveTransactionBeforeDiscardingPhysicalState {
-    when: ViewReplaced(view, generation, ordered_keys)
-    requires: generation > view.generation
-    requires: view.active_transaction != null
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: CommandFinished(
-        view,
-        view.active_transaction.identity.token,
-        view.active_transaction.identity.generation,
-        superseded
-    ).emitted()
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: superseded
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.owner = system
-    ensures: view.generation = generation
-    ensures: view.layout_revision = view.layout_revision + 1
-    ensures: view.ordered_keys = ordered_keys
-    ensures: view.rendered_start = 0
-    ensures: view.rendered_end = 0
-    ensures: view.measured_keys = {}
-    ensures: view.active_transaction = null
-    ensures: view.terminal_identities = {}
+surface VirtualTranscriptFixtures {
+    facing corpus: FixtureCorpus
+
+    provides:
+        CorpusLoaded(corpus)
+
+    exposes:
+        corpus.schema_path
+        corpus.scenarios_path
+        corpus.schema_version
+        corpus.scenario_ids
 }
 
-rule ViewReplacementDiscardsPhysicalStateWithoutTransaction {
-    when: ViewReplaced(view, generation, ordered_keys)
-    requires: generation > view.generation
-    requires: view.active_transaction = null
-    ensures: view.owner = system
-    ensures: view.generation = generation
-    ensures: view.layout_revision = view.layout_revision + 1
-    ensures: view.ordered_keys = ordered_keys
-    ensures: view.rendered_start = 0
-    ensures: view.rendered_end = 0
-    ensures: view.measured_keys = {}
-    ensures: view.active_transaction = null
-    ensures: view.terminal_identities = {}
+rule IdleInputCreatesClosedIdleStateForView {
+    when: InputIdle(view, history_view)
+    requires: view.active_command = null
+    ensures: view.current_view = history_view
+    ensures: view.active_command = null
+    ensures: view.phase = null
 }
 
-rule ReaderCaptureIncludesIdentityAndGeometry {
-    when: ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
-    requires: view.owner = reader
-    requires: view.ordered_keys.contains(unit_key)
-    ensures: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset).created()
-}
-
-rule PositionRequestOwnsOneTransaction {
-    when: PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
-    requires: generation = view.generation
-    requires: view.active_transaction = null
-    requires: not view.terminal_identities.contains(CommandIdentity(token: token, generation: generation))
-    ensures: view.active_transaction = PositionTransaction(
-        view: view,
-        identity: CommandIdentity(token: token, generation: generation),
-        kind: kind,
-        anchor: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset),
-        target_key: unit_key,
-        geometry_satisfied: false,
-        geometry_revision: null,
-        target_missing_evidence: false
+rule PositioningInputStartsOneResolvingCommand {
+    when: InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
+    requires: view.active_command = null
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: view.current_view = history_view
+    ensures: view.active_command = ActiveCommand(
+        identity: CommandIdentity(
+            key: command_key,
+            token: token,
+            request_token: request_token,
+            view: history_view,
+            kind: kind,
+            message_id: message_id
+        ),
+        viewport_start_offset: viewport_start_offset
     )
+    ensures: view.phase = PositioningPhase(
+        kind: resolving_target,
+        target_index: null,
+        issued_layout_revision: null
+    )
+    ensures: ResolveTarget(command_key, message_id).emitted()
 }
 
-rule CommandReplacementSupersedesPriorTransaction {
-    when: CommandReplaced(view, token, generation, kind)
-    requires: view.active_transaction != null
-    requires: token != view.active_transaction.identity.token
-        or generation != view.active_transaction.identity.generation
-        or kind != view.active_transaction.kind
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: CommandFinished(
-        view,
-        view.active_transaction.identity.token,
-        view.active_transaction.identity.generation,
-        superseded
-    ).emitted()
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: superseded
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.active_transaction = null
+rule IdenticalPositioningInputIsIdempotent {
+    when: InputPositioning(view, command_key, _, _, history_view, _, _, _)
+    requires: view.active_command != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.active_command.identity.view = history_view
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
 }
 
-rule NewPositionRequestRequiresPriorReplacement {
-    when: PositionRequested(view, token, generation, kind, _, _)
-    requires: view.active_transaction != null
-    requires: token != view.active_transaction.identity.token
-        or generation != view.active_transaction.identity.generation
-        or kind != view.active_transaction.kind
-    ensures: view.active_transaction = view.active_transaction
+rule ReplacementInputSupersedesPriorCommandBeforeResolvingNewCommand {
+    when: InputPositioning(view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
+    requires: view.active_command != null
+    requires: view.active_command.identity.key != command_key
+        or view.active_command.identity.view != history_view
+    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: Finish(view.active_command.identity.key, superseded).emitted()
+    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
+    ensures: view.current_view = history_view
+    ensures: view.active_command = ActiveCommand(
+        identity: CommandIdentity(
+            key: command_key,
+            token: token,
+            request_token: request_token,
+            view: history_view,
+            kind: kind,
+            message_id: message_id
+        ),
+        viewport_start_offset: viewport_start_offset
+    )
+    ensures: view.phase = PositioningPhase(
+        kind: resolving_target,
+        target_index: null,
+        issued_layout_revision: null
+    )
+    ensures: ResolveTarget(command_key, message_id).emitted()
 }
 
-rule MeasurementUpdatesAuthoritativeLayout {
+rule IdleInputSupersedesActiveCommandWithoutResolvingNewCommand {
+    when: InputIdle(view, history_view)
+    requires: view.active_command != null
+    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
+    ensures: Finish(view.active_command.identity.key, superseded).emitted()
+    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
+    ensures: view.current_view = history_view
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule ViewChangeResetsTerminalIdentityScope {
+    when: InputIdle(view, history_view)
+        or InputPositioning(view, _, _, _, history_view, _, _, _)
+    requires: view.current_view != null
+    requires: view.current_view != history_view
+    ensures: view.terminal_command_keys = {}
+}
+
+rule TerminalInputCannotReactivateCommandWithinSameView {
+    when: InputPositioning(view, command_key, _, _, history_view, _, _, _)
+    requires: view.active_command = null
+    requires: view.current_view = history_view
+    requires: view.terminal_command_keys.contains(command_key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule TargetResolutionEvidenceIssuesPosition {
+    when: TargetResolved(view, command_key, target_index)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = resolving_target
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: view.phase = PositioningPhase(
+        kind: awaiting_physical,
+        target_index: target_index,
+        issued_layout_revision: null
+    )
+    ensures: Position(command_key, target_index, "start", view.active_command.viewport_start_offset).emitted()
+}
+
+rule TargetMissingEvidenceFinishesCommand {
+    when: TargetMissing(view, command_key)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = resolving_target
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: Finish(command_key, target_missing).emitted()
+    ensures: view.terminal_command_keys.add(command_key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule PositionIssuedRecordsAuthoritativeLayoutRevision {
+    when: PositionIssued(view, command_key, target_index, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.target_index = target_index
+    requires: view.phase.issued_layout_revision = null
+        or layout_revision >= view.phase.issued_layout_revision
+    ensures: view.phase.issued_layout_revision = layout_revision
+}
+
+rule OlderPositionIssuedCannotMoveIssuedRevisionBackward {
+    when: PositionIssued(view, command_key, target_index, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.target_index = target_index
+    requires: view.phase.issued_layout_revision != null
+    requires: layout_revision < view.phase.issued_layout_revision
+    ensures: view.phase = view.phase
+}
+
+rule PhysicalObservationAppliesJumpWhenIssuedTargetIsVisible {
+    when: PhysicalObserved(view, command_key, visible_range, _, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.active_command.identity.kind = jump_to_message
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.issued_layout_revision != null
+    requires: layout_revision >= view.phase.issued_layout_revision
+    requires: visible_range != null
+    requires: visible_range.start_index <= view.phase.target_index
+    requires: visible_range.end_index >= view.phase.target_index
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: Finish(command_key, applied).emitted()
+    ensures: view.terminal_command_keys.add(command_key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule PhysicalObservationAppliesRestoreWhenIssuedTargetOffsetMatches {
+    when: PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.active_command.identity.kind = restore_after_prefix_expansion
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.issued_layout_revision != null
+    requires: layout_revision >= view.phase.issued_layout_revision
+    requires: visible_range != null
+    requires: visible_range.start_index <= view.phase.target_index
+    requires: visible_range.end_index >= view.phase.target_index
+    requires: actual_offset != null
+    requires: absolute(actual_offset - view.active_command.viewport_start_offset) <= config.conformance_tolerance
+    requires: not view.terminal_command_keys.contains(command_key)
+    ensures: Finish(command_key, applied).emitted()
+    ensures: view.terminal_command_keys.add(command_key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule PhysicalObservationBeforeIssuedRevisionCannotFinish {
+    when: PhysicalObserved(view, command_key, _, _, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.issued_layout_revision = null
+        or layout_revision < view.phase.issued_layout_revision
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
+}
+
+rule PhysicalObservationWithoutVisibleTargetCannotFinish {
+    when: PhysicalObserved(view, command_key, visible_range, _, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.issued_layout_revision != null
+    requires: layout_revision >= view.phase.issued_layout_revision
+    requires: visible_range = null
+        or visible_range.start_index > view.phase.target_index
+        or visible_range.end_index < view.phase.target_index
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
+}
+
+rule PhysicalRestoreObservationWithoutMatchingOffsetCannotFinish {
+    when: PhysicalObserved(view, command_key, visible_range, actual_offset, layout_revision)
+    requires: view.active_command != null
+    requires: view.phase != null
+    requires: view.active_command.identity.key = command_key
+    requires: view.active_command.identity.kind = restore_after_prefix_expansion
+    requires: view.phase.kind = awaiting_physical
+    requires: view.phase.issued_layout_revision != null
+    requires: layout_revision >= view.phase.issued_layout_revision
+    requires: visible_range != null
+    requires: visible_range.start_index <= view.phase.target_index
+    requires: visible_range.end_index >= view.phase.target_index
+    requires: actual_offset = null
+        or absolute(actual_offset - view.active_command.viewport_start_offset) > config.conformance_tolerance
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
+}
+
+rule UserInterruptionSupersedesActiveCommand {
+    when: UserInterrupted(view)
+    requires: view.active_command != null
+    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
+    ensures: Finish(view.active_command.identity.key, superseded).emitted()
+    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule ExecutorDetachSupersedesActiveCommand {
+    when: ExecutorDetached(view)
+    requires: view.active_command != null
+    requires: not view.terminal_command_keys.contains(view.active_command.identity.key)
+    ensures: Finish(view.active_command.identity.key, superseded).emitted()
+    ensures: view.terminal_command_keys.add(view.active_command.identity.key)
+    ensures: view.active_command = null
+    ensures: view.phase = null
+}
+
+rule StaleTargetResolutionEventsHaveNoEffect {
+    when: TargetResolved(view, command_key, _)
+        or TargetMissing(view, command_key)
+    requires: view.active_command = null
+        or view.active_command.identity.key != command_key
+        or view.phase = null
+        or view.phase.kind != resolving_target
+        or view.terminal_command_keys.contains(command_key)
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
+}
+
+rule StalePhysicalEventsHaveNoEffect {
+    when: PositionIssued(view, command_key, _, _)
+        or PhysicalObserved(view, command_key, _, _, _)
+    requires: view.active_command = null
+        or view.active_command.identity.key != command_key
+        or view.phase = null
+        or view.phase.kind != awaiting_physical
+        or view.terminal_command_keys.contains(command_key)
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
+}
+
+rule MeasurementUpdatesAuthoritativeLayoutOnly {
     when: UnitMeasured(view, unit_key, extent)
     requires: view.ordered_keys.contains(unit_key)
     requires: extent > 0
     ensures: view.measured_keys.contains(unit_key)
     ensures: view.layout_revision = view.layout_revision + 1
-    ensures: view.active_transaction = view.active_transaction
+    ensures: view.active_command = view.active_command
+    ensures: view.phase = view.phase
 }
 
-rule AnchorGeometryAuthorizesAppliedResult {
-    when: GeometryObserved(view, generation, unit_key, viewport_start_offset)
-    requires: view.active_transaction != null
-    requires: generation = view.generation
-    requires: view.active_transaction.target_key = unit_key
-    requires: view.active_transaction.identity.generation = generation
-    requires: absolute(viewport_start_offset - view.active_transaction.anchor.viewport_start_offset)
-        <= config.conformance_tolerance
-    ensures: view.active_transaction.geometry_satisfied = true
-    ensures: view.active_transaction.geometry_revision = view.layout_revision
-}
-
-rule TargetMissingEvidenceAuthorizesTargetMissingResult {
-    when: TargetMissingObserved(view, generation, unit_key)
-    requires: view.active_transaction != null
-    requires: generation = view.generation
-    requires: view.active_transaction.target_key = unit_key
-    requires: view.active_transaction.identity.generation = generation
-    ensures: view.active_transaction.target_missing_evidence = true
-}
-
-rule MatchingAppliedFinishTerminatesOwnership {
-    when: CommandFinished(view, token, generation, result)
-    requires: view.active_transaction != null
-    requires: token = view.active_transaction.identity.token
-    requires: generation = view.active_transaction.identity.generation
-    requires: result = applied
-    requires: view.active_transaction.geometry_satisfied = true
-    requires: view.active_transaction.geometry_revision = view.layout_revision
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: applied
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.active_transaction = null
-}
-
-rule MatchingTargetMissingFinishTerminatesOwnership {
-    when: CommandFinished(view, token, generation, result)
-    requires: view.active_transaction != null
-    requires: token = view.active_transaction.identity.token
-    requires: generation = view.active_transaction.identity.generation
-    requires: result = target_missing
-    requires: view.active_transaction.target_missing_evidence = true
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: target_missing
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.active_transaction = null
-}
-
-rule AppliedFinishWithoutCurrentGeometryCannotTerminateOwnership {
-    when: CommandFinished(view, token, generation, result)
-    requires: view.active_transaction != null
-    requires: token = view.active_transaction.identity.token
-    requires: generation = view.active_transaction.identity.generation
-    requires: result = applied
-    requires: view.active_transaction.geometry_satisfied = false
-        or view.active_transaction.geometry_revision != view.layout_revision
-    ensures: view.active_transaction = view.active_transaction
-}
-
-rule TargetMissingFinishWithoutEvidenceCannotTerminateOwnership {
-    when: CommandFinished(view, token, generation, result)
-    requires: view.active_transaction != null
-    requires: token = view.active_transaction.identity.token
-    requires: generation = view.active_transaction.identity.generation
-    requires: result = target_missing
-    requires: view.active_transaction.target_missing_evidence = false
-    ensures: view.active_transaction = view.active_transaction
-}
-
-rule MatchingSupersededFinishTerminatesOwnership {
-    when: CommandFinished(view, token, generation, result)
-    requires: view.active_transaction != null
-    requires: token = view.active_transaction.identity.token
-    requires: generation = view.active_transaction.identity.generation
-    requires: result = superseded
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: superseded
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.active_transaction = null
-}
-
-rule StaleCommandFinishCannotTerminateOwnership {
-    when: CommandFinished(view, token, generation, _)
-    requires: view.active_transaction = null
-        or token != view.active_transaction.identity.token
-        or generation != view.active_transaction.identity.generation
-        or view.terminal_identities.contains(CommandIdentity(token: token, generation: generation))
-    ensures: view.active_transaction = view.active_transaction
-}
-
-rule StaleGeometryCannotCompleteTransaction {
-    when: GeometryObserved(view, generation, unit_key, _)
-    requires: view.active_transaction = null
-        or generation != view.generation
-        or view.active_transaction.target_key != unit_key
-        or view.active_transaction.identity.generation != generation
-    ensures: view.active_transaction = view.active_transaction
-}
-
-rule StaleTargetMissingObservationCannotCompleteTransaction {
-    when: TargetMissingObserved(view, generation, unit_key)
-    requires: view.active_transaction = null
-        or generation != view.generation
-        or view.active_transaction.target_key != unit_key
-        or view.active_transaction.identity.generation != generation
-    ensures: view.active_transaction = view.active_transaction
-}
-
-rule ExplicitSupersessionRequiresTerminalResult {
-    when: TransactionSuperseded(view, token, generation)
-    requires: view.active_transaction != null
-    requires: view.active_transaction.identity.token = token
-    requires: view.active_transaction.identity.generation = generation
-    requires: not view.terminal_identities.contains(view.active_transaction.identity)
-    ensures: CommandFinished(
-        view,
-        view.active_transaction.identity.token,
-        view.active_transaction.identity.generation,
-        superseded
-    ).emitted()
-    ensures: TerminalTransactionResult(
-        view: view,
-        identity: view.active_transaction.identity,
-        result: superseded
-    ).created()
-    ensures: view.terminal_identities.add(view.active_transaction.identity)
-    ensures: view.active_transaction = null
+rule FixtureCorpusLoadedFromRootVersionedJson {
+    when: CorpusLoaded(corpus)
+    ensures: corpus.schema_path = "fixtures/virtual-transcript/v1/schema.json"
+    ensures: corpus.scenarios_path = "fixtures/virtual-transcript/v1/scenarios.json"
+    ensures: corpus.schema_version = "virtual-transcript.scenarios.v1"
+    ensures: corpus.scenario_ids = {
+        "prefix-insertion-within-tall-unit",
+        "resize-above-anchor",
+        "alias-navigation",
+        "orphan-target",
+        "streaming-growth-reading",
+        "streaming-growth-following",
+        "supersession"
+    }
 }
 
 invariant OrderedKeysAreUnique {
@@ -333,6 +414,44 @@ invariant RenderedWindowIsContiguous {
     view.rendered_start <= view.rendered_end
 }
 
-invariant ActiveTransactionBelongsToCurrentView {
-    view.active_transaction != null implies view.active_transaction.identity.generation = view.generation
+invariant AtMostOneActiveCommandPerTranscriptView {
+    view.active_command = null or view.phase != null
+}
+
+invariant ActiveCommandBelongsToCurrentView {
+    view.active_command != null implies view.active_command.identity.view = view.current_view
+}
+
+invariant TerminalIdentitySetIsScopedToCurrentView {
+    view.current_view = null implies view.terminal_command_keys = {}
+}
+
+invariant FinishedCommandsHaveNoActivePhysicalAuthority {
+    view.active_command = null implies view.phase = null
+}
+
+contract TranscriptPositioningSafety {
+    validate: (view: TranscriptView) -> Boolean
+
+    @invariant PureReducerEventsProduceEffectsOnly
+        -- Input, target-resolution, issued-position, physical-observation,
+        -- interruption, and detach events mutate only reducer state and emit
+        -- resolve_target, position, or finish effects; physical DOM/native writes
+        -- are performed by the effect executor.
+
+    @invariant FinishIsExactOncePerCommandKeyWithinView
+        -- A command key enters terminal_command_keys when and only when a finish
+        -- effect is emitted for that key, so duplicate or stale events cannot
+        -- produce a second terminal result.
+
+    @invariant PositionSuccessRequiresIssuedRevisionAndPhysicalEvidence
+        -- Applied completion requires a matching active command, an issued
+        -- layout revision, a physical observation at or after that revision, and
+        -- visible target evidence; restore commands additionally require offset
+        -- conformance within config.conformance_tolerance.
+
+    @invariant SupersessionCausesAreReducerInputs
+        -- Replacement, null idle input, view identity change, user interruption,
+        -- and executor detach all terminate the active command as superseded
+        -- before stale work can write position or finish successfully.
 }
