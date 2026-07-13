@@ -173,9 +173,9 @@ fresh server."#
                 return error_envelope("tmux_server_unavailable", &e.to_string());
             }
         };
-        let socket_path = {
+        let (socket_path, server_generation) = {
             let server = server_arc.read().await;
-            server.socket_path.clone()
+            (server.socket_path.clone(), server.server_generation.clone())
         };
         let config_path = ctx.tmux_registry().config_path();
 
@@ -188,6 +188,11 @@ fresh server."#
         // `-f` only loads when tmux must spawn a fresh server. For a
         // running server the flag is benign; we include it so any
         // auto-spawn path uses the Phoenix config.
+        let killed_identity = killed_registered_window_identity(
+            &parsed.args,
+            &ctx.work_scope,
+            server_generation.as_deref(),
+        );
         let mut full_args: Vec<String> = vec![
             "-f".into(),
             config_path.to_string_lossy().into(),
@@ -215,8 +220,27 @@ fresh server."#
             }
         };
 
-        run_with_timeout(child, wait_seconds, started, ctx).await
+        run_with_timeout(child, wait_seconds, started, ctx, killed_identity).await
     }
+}
+
+fn killed_registered_window_identity(
+    args: &[String],
+    work_scope: &phoenix_core::work_scope::WorkScope,
+    server_generation: Option<&str>,
+) -> Option<TmuxWindowIdentity> {
+    if args.first().map(String::as_str) != Some("kill-window") {
+        return None;
+    }
+    let target = args
+        .windows(2)
+        .find(|pair| pair[0] == "-t")
+        .map(|pair| pair[1].clone())?;
+    Some(TmuxWindowIdentity {
+        work_scope: work_scope.clone(),
+        server_generation: server_generation?.to_owned(),
+        window_id: target,
+    })
 }
 
 enum RunOutcome {
@@ -245,6 +269,7 @@ async fn run_with_timeout(
     wait_seconds: u64,
     started: Instant,
     ctx: ToolContext,
+    killed_identity: Option<TmuxWindowIdentity>,
 ) -> ToolOutput {
     let cancel = ctx.cancel.clone();
     let timeout = tokio::time::sleep(Duration::from_secs(wait_seconds));
@@ -303,6 +328,11 @@ async fn run_with_timeout(
             let stdout = collect_drain(stdout_task).await;
             let stderr = collect_drain(stderr_task).await;
             let (so, se, truncated) = truncate_pair(&stdout, &stderr);
+            if status.success() {
+                if let Some(identity) = killed_identity.as_ref() {
+                    ctx.tmux_registry().mark_window_killed(identity).await;
+                }
+            }
             structured_response(
                 "ok",
                 status.code(),

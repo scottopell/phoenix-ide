@@ -190,7 +190,7 @@ impl Tool for TmuxRunTool {
             server_generation: server_generation.clone(),
             window_id: target.window_id.clone(),
         };
-        ctx.tmux_registry().register_window(identity).await;
+        ctx.tmux_registry().register_window(identity.clone()).await;
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
@@ -207,6 +207,7 @@ impl Tool for TmuxRunTool {
                     &text,
                     timeout,
                     !parsed.keep_open_on_exit,
+                    &identity,
                 )
                 .await
             }
@@ -413,6 +414,7 @@ async fn wait_for_text_response(
     text: &str,
     timeout: Duration,
     close_after_completion: bool,
+    identity: &TmuxWindowIdentity,
 ) -> ToolOutput {
     let deadline = Instant::now() + timeout;
     loop {
@@ -447,8 +449,13 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion && observation.exit_code.is_some() {
-                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            if close_after_completion
+                && observation.exit_code.is_some()
+                && kill_window(config_path, socket_path, &target.window_id)
+                    .await
+                    .is_ok()
+            {
+                ctx.tmux_registry().mark_window_killed(identity).await;
             }
             return response;
         }

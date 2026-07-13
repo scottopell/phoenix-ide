@@ -291,6 +291,19 @@ fn classify_tmux(
     now: DateTime<Utc>,
 ) -> Result<InspectionDecision, String> {
     match inspection {
+        TmuxTerminalInspection::WindowKilled { occurred_at }
+            if occurred_at <= binding.expires_at =>
+        {
+            let evidence = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                identity: identity.clone(),
+                status: TmuxTerminalStatus::WindowKilled,
+                occurred_at: timestamp(occurred_at)?,
+                exit_code: None,
+                duration_ms: None,
+                final_tail: Vec::new(),
+            });
+            fired(binding, evidence, now)
+        }
         TmuxTerminalInspection::Terminal {
             exit_code,
             occurred_at: Some(occurred_at),
@@ -308,7 +321,9 @@ fn classify_tmux(
             fired(binding, evidence, now)
         }
         TmuxTerminalInspection::Missing if now >= binding.expires_at => forgotten(binding, now),
-        TmuxTerminalInspection::Live | TmuxTerminalInspection::Terminal { .. }
+        TmuxTerminalInspection::Live
+        | TmuxTerminalInspection::WindowKilled { .. }
+        | TmuxTerminalInspection::Terminal { .. }
             if now >= binding.expires_at =>
         {
             expired(binding, now)
@@ -317,6 +332,7 @@ fn classify_tmux(
         // evidence that may outrank the exact deadline.
         TmuxTerminalInspection::Missing
         | TmuxTerminalInspection::Live
+        | TmuxTerminalInspection::WindowKilled { .. }
         | TmuxTerminalInspection::Terminal { .. } => retry(binding, now),
     }
 }
@@ -569,6 +585,36 @@ mod tests {
             .unwrap(),
             InspectionDecision::Terminal { .. }
         ));
+    }
+
+    #[test]
+    fn registered_window_kill_becomes_typed_terminal_evidence() {
+        let identity = TmuxResourceIdentity {
+            work_scope: scope(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let binding = binding(WakeResourceIdentity::TmuxWindow(identity.clone()));
+        let decision = classify_tmux(
+            &binding,
+            &identity,
+            TmuxTerminalInspection::WindowKilled {
+                occurred_at: at(99),
+            },
+            at(101),
+        )
+        .unwrap();
+        let InspectionDecision::Terminal {
+            evidence: WakeTerminalEvidence::TmuxWindow(evidence),
+            ..
+        } = decision
+        else {
+            panic!("expected typed tmux terminal evidence");
+        };
+        assert_eq!(evidence.status, TmuxTerminalStatus::WindowKilled);
+        assert_eq!(evidence.identity, identity);
+        assert_eq!(evidence.occurred_at, Timestamp(99));
+        assert_eq!(evidence.exit_code, None);
     }
 
     #[test]

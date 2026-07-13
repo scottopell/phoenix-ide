@@ -573,6 +573,7 @@ impl WorkflowRepository {
             return Ok(result);
         }
         let mut tx = self.pool.begin().await?;
+        validate_receipt_codecs(&mut tx, request).await?;
         let result = accept_receipt_in_transaction(&mut tx, request, failpoint).await?;
         if matches!(result, AcceptReceiptResult::Accepted { .. }) {
             tx.commit().await?;
@@ -623,6 +624,7 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Ok(compare_existing_receipt(existing, request));
         }
+        validate_receipt_codecs(&mut tx, request).await?;
         if !record_observation_in_transaction(&mut tx, observation).await? {
             tx.rollback().await?;
             return Ok(AcceptReceiptResult::StaleAuthority);
@@ -644,6 +646,8 @@ impl WorkflowRepository {
         &self,
         event: &DurableDirectInboxEvent,
     ) -> WorkflowRepositoryResult<()> {
+        let mut tx = self.pool.begin().await?;
+        validate_workflow_codecs(&mut tx, &event.workflow_id, [&event.event.codec]).await?;
         sqlx::query(
             "INSERT INTO workflow_reducer_inbox \
              (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
@@ -656,8 +660,9 @@ impl WorkflowRepository {
         .bind(i64::from(event.event.codec.version))
         .bind(&event.event.payload)
         .bind(event.requires_runtime_acceptance)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1706,7 +1711,7 @@ impl WorkflowRepository {
 
         let updated_effect = sqlx::query(
             "UPDATE workflow_effects \
-             SET status = 'claimed' \
+             SET status = 'claimed', pending_reconciliation = 1 \
              WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
                AND generation = ?4 AND status = 'claimed'",
         )
@@ -1723,29 +1728,6 @@ impl WorkflowRepository {
         .execute(&mut *tx)
         .await?;
         if updated_effect.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(TakeOverExpiredClaimResult::Ineligible);
-        }
-
-        let flagged = sqlx::query(
-            "UPDATE workflow_effects \
-             SET pending_reconciliation = 1 \
-             WHERE id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
-               AND generation = ?4 AND status = 'claimed' AND pending_reconciliation = 0",
-        )
-        .bind(&authority.effect_id)
-        .bind(&authority.workflow_id)
-        .bind(to_i64(
-            authority.declared_workflow_version,
-            WorkflowRepositoryError::VersionOutOfRange,
-        )?)
-        .bind(to_i64(
-            authority.generation,
-            WorkflowRepositoryError::GenerationOutOfRange,
-        )?)
-        .execute(&mut *tx)
-        .await?;
-        if flagged.rows_affected() != 1 {
             tx.rollback().await?;
             return Ok(TakeOverExpiredClaimResult::Ineligible);
         }
@@ -2193,6 +2175,41 @@ async fn load_claim_authority(
     }))
 }
 
+async fn validate_receipt_codecs(
+    tx: &mut SqliteConnection,
+    request: &DurableAcceptReceiptRequest,
+) -> WorkflowRepositoryResult<()> {
+    validate_workflow_codecs(
+        tx,
+        &request.authority.workflow_id,
+        [&request.receipt.codec, &request.reducer_event.codec],
+    )
+    .await
+}
+
+async fn validate_workflow_codecs<'a>(
+    tx: &mut SqliteConnection,
+    workflow_id: &str,
+    codecs: impl IntoIterator<Item = &'a DurableCodecRef>,
+) -> WorkflowRepositoryResult<()> {
+    let selection_id: Option<String> =
+        sqlx::query_scalar("SELECT protocol_selection_id FROM workflows WHERE id = ?1")
+            .bind(workflow_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(selection_id) = selection_id else {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "codec validation requires an existing workflow",
+        ));
+    };
+    if !selection_supports_codec_and_executor(tx, &selection_id, codecs, None).await? {
+        return Err(WorkflowRepositoryError::InvalidPlan(
+            "payload codec unsupported by workflow selection",
+        ));
+    }
+    Ok(())
+}
+
 async fn preflight_receipt_acceptance<'e, E>(
     executor: E,
     request: &DurableAcceptReceiptRequest,
@@ -2432,6 +2449,8 @@ async fn accept_new_receipt_in_transaction(
     .execute(&mut *tx)
     .await?;
 
+    satisfy_newly_ready_barriers(tx, &request.authority.workflow_id, request.now).await?;
+
     if let Some(projection) = &request.wake_terminal_projection {
         let sequence: i64 = sqlx::query_scalar(
             "INSERT INTO wake_inbox_sequences (conversation_id, last_sequence) \
@@ -2484,6 +2503,61 @@ async fn accept_new_receipt_in_transaction(
             requires_runtime_acceptance: true,
         },
     })
+}
+
+async fn satisfy_newly_ready_barriers(
+    tx: &mut SqliteConnection,
+    workflow_id: &str,
+    satisfied_at: DateTime<Utc>,
+) -> WorkflowRepositoryResult<()> {
+    let ready = sqlx::query(
+        "SELECT b.id, b.event_codec_family, b.event_codec_version, b.event_payload \
+         FROM workflow_barriers b \
+         WHERE b.workflow_id = ?1 AND b.status = 'waiting' \
+           AND NOT EXISTS (\
+             SELECT 1 FROM workflow_barrier_members bm \
+             JOIN workflow_effects e ON e.id = bm.effect_id \
+             JOIN workflows w ON w.id = e.workflow_id \
+             WHERE bm.barrier_id = b.id \
+               AND (e.status <> 'receipted' OR e.generation <> w.generation \
+                    OR (bm.receipt_family = 'compensation_effect' AND e.role <> 'compensation') \
+                    OR (bm.receipt_family = 'current_generation_effect' AND e.role = 'compensation'))\
+           )",
+    )
+    .bind(workflow_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for barrier in ready {
+        let barrier_id: String = barrier.get("id");
+        let updated = sqlx::query(
+            "UPDATE workflow_barriers SET status = 'satisfied', satisfied_at = ?1 \
+             WHERE id = ?2 AND workflow_id = ?3 AND status = 'waiting'",
+        )
+        .bind(satisfied_at.to_rfc3339())
+        .bind(&barrier_id)
+        .bind(workflow_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO workflow_reducer_inbox \
+             (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
+              event_payload, requires_runtime_acceptance, delivery_status, consumed_by_transition_id) \
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, 'pending', NULL)",
+        )
+        .bind(format!("barrier:{barrier_id}:satisfied"))
+        .bind(workflow_id)
+        .bind(&barrier_id)
+        .bind(barrier.get::<String, _>("event_codec_family"))
+        .bind(barrier.get::<i64, _>("event_codec_version"))
+        .bind(barrier.get::<String, _>("event_payload"))
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn load_receipt_for_effect<'e, E>(
@@ -4400,6 +4474,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_expired_takeover_replaces_reconciliation_authority_and_keeps_attempt_audit() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(10)))
+            .await
+            .unwrap();
+        let first = match claim {
+            ClaimEffectResult::Claimed { authority, .. } => authority,
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claim, got {other:?}")
+            }
+        };
+        let second = match repo
+            .take_over_expired_claim(&DurableClaimTakeover {
+                authority: first,
+                replacement_claim_token: "claim-2".to_owned(),
+                replacement_worker_id: "worker-2".to_owned(),
+                now: now + chrono::Duration::seconds(10),
+                lease_until: now + chrono::Duration::seconds(20),
+            })
+            .await
+            .unwrap()
+        {
+            TakeOverExpiredClaimResult::Claimed { authority, .. } => authority,
+            other @ (TakeOverExpiredClaimResult::Ineligible
+            | TakeOverExpiredClaimResult::StaleAuthority) => {
+                panic!("expected first takeover, got {other:?}")
+            }
+        };
+        assert!(matches!(
+            repo.take_over_expired_claim(&DurableClaimTakeover {
+                authority: second,
+                replacement_claim_token: "claim-3".to_owned(),
+                replacement_worker_id: "worker-3".to_owned(),
+                now: now + chrono::Duration::seconds(20),
+                lease_until: now + chrono::Duration::seconds(30),
+            })
+            .await
+            .unwrap(),
+            TakeOverExpiredClaimResult::Claimed { .. }
+        ));
+        let attempts: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT ordinal, status FROM workflow_attempts WHERE effect_id = 'eff-1' ORDER BY ordinal",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0].1, "authority_lost");
+        assert_eq!(attempts[1].1, "authority_lost");
+        assert_eq!(attempts[2].1, "begun");
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claim_count, 1);
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn accept_receipt_handles_duplicate_conflict_and_failpoint_rollback() {
         let pool = test_pool().await;
@@ -4531,6 +4668,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_rejects_undeclared_receipt_and_reducer_codecs_without_mutation() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claim, got {other:?}")
+            }
+        };
+
+        for mutate in [0, 1] {
+            let mut request = receipt_request(
+                &authority,
+                Some(&attempt.attempt_id),
+                now + chrono::Duration::seconds(1),
+            );
+            if mutate == 0 {
+                request.receipt.codec.family = "undeclared-receipt".to_owned();
+            } else {
+                request.reducer_event.codec.family = "undeclared-reducer".to_owned();
+            }
+            assert!(matches!(
+                repo.accept_receipt(&request).await,
+                Err(WorkflowRepositoryError::InvalidPlan(_))
+            ));
+        }
+
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM workflow_receipts), \
+                    (SELECT COUNT(*) FROM workflow_reducer_inbox)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn accepting_last_barrier_receipt_satisfies_and_emits_declared_event_once() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        register_and_accept(&repo).await;
+        assert_eq!(
+            repo.persist_transition_plan(&transition_commit())
+                .await
+                .unwrap(),
+            TransitionCommitOutcome::Committed
+        );
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claim, got {other:?}")
+            }
+        };
+        let request = receipt_request(
+            &authority,
+            Some(&attempt.attempt_id),
+            now + chrono::Duration::seconds(1),
+        );
+        assert!(matches!(
+            repo.accept_receipt(&request).await.unwrap(),
+            AcceptReceiptResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            repo.accept_receipt(&request).await.unwrap(),
+            AcceptReceiptResult::AlreadyReceipted { .. }
+        ));
+
+        let barrier =
+            sqlx::query("SELECT status, satisfied_at FROM workflow_barriers WHERE id = 'bar-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(barrier.get::<String, _>("status"), "satisfied");
+        assert!(barrier.get::<Option<String>, _>("satisfied_at").is_some());
+        let inbox = sqlx::query(
+            "SELECT COUNT(*) AS n, MIN(event_codec_family) AS family, \
+                    MIN(event_codec_version) AS version, MIN(event_payload) AS payload \
+             FROM workflow_reducer_inbox WHERE barrier_id = 'bar-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(inbox.get::<i64, _>("n"), 1);
+        assert_eq!(inbox.get::<String, _>("family"), "barrier-event");
+        assert_eq!(inbox.get::<i64, _>("version"), 1);
+        assert_eq!(inbox.get::<String, _>("payload"), "barrier-payload");
+    }
+
+    #[tokio::test]
     async fn direct_inbox_and_shadow_resolution_persist_typed_authority() {
         let pool = test_pool().await;
         let repo = WorkflowRepository::new(pool.clone());
@@ -4541,7 +4779,7 @@ mod tests {
             workflow_id: "wf-1".to_owned(),
             event: DurablePayload {
                 codec: DurableCodecRef {
-                    family: "wake-terminal".to_owned(),
+                    family: "event".to_owned(),
                     version: 1,
                 },
                 payload: "cancelled".to_owned(),

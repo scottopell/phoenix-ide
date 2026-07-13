@@ -29,7 +29,7 @@
 //! serialises concurrent `ensure_live` calls on the same `WorkScope`;
 //! the second caller observes `Live` after the first one finishes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -135,8 +135,19 @@ pub struct TmuxWindowIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredWindowState {
+    Live,
+    Killed {
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxTerminalInspection {
     Live,
+    WindowKilled {
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    },
     Terminal {
         exit_code: i32,
         occurred_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -240,7 +251,7 @@ pub struct TmuxRegistry {
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
-    registered_windows: RwLock<HashSet<TmuxWindowIdentity>>,
+    registered_windows: RwLock<HashMap<TmuxWindowIdentity, RegisteredWindowState>>,
     socket_dir: PathBuf,
     binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
@@ -275,7 +286,7 @@ impl TmuxRegistry {
         let binary_available = which::which("tmux").is_ok();
         Self {
             inner: RwLock::new(HashMap::new()),
-            registered_windows: RwLock::new(HashSet::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -325,7 +336,7 @@ impl TmuxRegistry {
     pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            registered_windows: RwLock::new(HashSet::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -346,7 +357,7 @@ impl TmuxRegistry {
     ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            registered_windows: RwLock::new(HashSet::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -671,14 +682,35 @@ impl TmuxRegistry {
     }
 
     pub async fn register_window(&self, identity: TmuxWindowIdentity) {
-        self.registered_windows.write().await.insert(identity);
+        self.registered_windows
+            .write()
+            .await
+            .insert(identity, RegisteredWindowState::Live);
     }
 
     pub async fn has_registered_window(&self, identity: &TmuxWindowIdentity) -> bool {
-        self.registered_windows.read().await.contains(identity)
+        self.registered_windows.read().await.contains_key(identity)
+    }
+
+    pub async fn mark_window_killed(&self, identity: &TmuxWindowIdentity) -> bool {
+        let mut windows = self.registered_windows.write().await;
+        let Some(state) = windows.get_mut(identity) else {
+            return false;
+        };
+        *state = RegisteredWindowState::Killed {
+            occurred_at: chrono::Utc::now(),
+        };
+        true
     }
 
     pub async fn inspect_window(&self, identity: &TmuxWindowIdentity) -> TmuxTerminalInspection {
+        if let Some(RegisteredWindowState::Killed { occurred_at }) =
+            self.registered_windows.read().await.get(identity)
+        {
+            return TmuxTerminalInspection::WindowKilled {
+                occurred_at: *occurred_at,
+            };
+        }
         if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
             return TmuxTerminalInspection::Missing;
         }
@@ -1324,6 +1356,39 @@ fn default_socket_dir() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn killed_window_tombstone_is_exact_and_survives_for_worker_inspection() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let identity = TmuxWindowIdentity {
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            server_generation: "generation-1".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        registry.register_window(identity.clone()).await;
+        assert!(registry.mark_window_killed(&identity).await);
+        assert!(matches!(
+            registry.inspect_window(&identity).await,
+            TmuxTerminalInspection::WindowKilled { .. }
+        ));
+        let wrong_generation = TmuxWindowIdentity {
+            server_generation: "generation-2".to_owned(),
+            ..identity.clone()
+        };
+        let wrong_window = TmuxWindowIdentity {
+            window_id: "@2".to_owned(),
+            ..identity
+        };
+        assert_eq!(
+            registry.inspect_window(&wrong_generation).await,
+            TmuxTerminalInspection::Missing
+        );
+        assert_eq!(
+            registry.inspect_window(&wrong_window).await,
+            TmuxTerminalInspection::Missing
+        );
+    }
 
     #[test]
     fn terminal_markers_parse_subsecond_precision_and_exact_duration() {
