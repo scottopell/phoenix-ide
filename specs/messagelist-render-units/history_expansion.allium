@@ -224,6 +224,8 @@ rule StaleHistorySuccessCannotMutateView {
         or transcript_generation != view.transcript_generation
     ensures: view.coverage = view.coverage
     ensures: view.pending_command = view.pending_command
+    ensures: view.active_request = view.active_request
+    ensures: view.failure = view.failure
 }
 
 rule ManualReaderExpansionCreatesContinuityCommand {

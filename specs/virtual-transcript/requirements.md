@@ -64,6 +64,10 @@ AND every transaction SHALL be bound to a command token and view generation.
 WHEN a newer command or view generation supersedes an active transaction
 THE SYSTEM SHALL prevent the stale transaction from writing viewport position or acknowledging success.
 
+WHEN the command corresponding to an active transaction is removed without replacement
+THE SYSTEM SHALL terminate that transaction exactly once as superseded
+AND SHALL prevent it from performing further viewport writes or producing another terminal result.
+
 Each command shall produce at most one terminal result: applied, target missing, or superseded.
 
 ## REQ-VT-008: Durable Tail Following

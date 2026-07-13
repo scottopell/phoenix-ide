@@ -887,19 +887,17 @@ function MessageListImpl({
       if (activeToken !== null && activeView !== null) finishHistoryCommand(activeToken, activeView, 'superseded');
       return;
     }
+    if (activeToken !== null
+      && activeView !== null
+      && (activeToken !== historyScrollCommand.token || !sameHistoryView(activeView, historyScrollCommand.view))) {
+      finishHistoryCommand(activeToken, activeView, 'superseded');
+    }
     if (!sameHistoryView(historyScrollCommand.view, currentHistoryView ?? null)) {
       finishHistoryCommand(historyScrollCommand.token, historyScrollCommand.view, 'superseded');
       return;
     }
     const handled = handledHistoryCommandRef.current;
     if (handled?.token === historyScrollCommand.token && sameHistoryView(handled.view, historyScrollCommand.view)) return;
-    const activeContinuityToken = continuityRestoreTokenRef.current;
-    const activeContinuityView = continuityRestoreViewRef.current;
-    if (activeContinuityToken !== null
-      && activeContinuityView !== null
-      && (activeContinuityToken !== historyScrollCommand.token || !sameHistoryView(activeContinuityView, historyScrollCommand.view))) {
-      finishHistoryCommand(activeContinuityToken, activeContinuityView, 'superseded');
-    }
     pendingHistoryAckRef.current = null;
     handledHistoryCommandRef.current = { token: historyScrollCommand.token, view: historyScrollCommand.view };
     acknowledgedHistoryCommandRef.current = null;

@@ -1123,6 +1123,34 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', oldView);
   });
 
+  it('supersedes the active owner before rejecting a mismatched replacement command', () => {
+    const currentView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
+    const staleView = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 2 };
+    const first = makeRestoreAfterPrefixExpansionCommand({ token: 1, view: currentView });
+    const replacement = makeRestoreAfterPrefixExpansionCommand({ token: 2, view: staleView });
+    const onHistoryScrollCommandHandled = vi.fn();
+    const renderList = (command: HistoryScrollCommand) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-history"
+        historyScrollCommand={command}
+        currentHistoryView={currentView}
+        onHistoryScrollCommandHandled={onHistoryScrollCommandHandled}
+      />,
+    );
+
+    const { rerender } = render(renderList(first));
+    rerender(renderList(replacement));
+
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(2);
+    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(1, 1, 'superseded', currentView);
+    expect(onHistoryScrollCommandHandled).toHaveBeenNthCalledWith(2, 2, 'superseded', staleView);
+  });
+
   it('supersedes an active restore when current view ownership disappears', () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
