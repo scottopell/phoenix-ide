@@ -1160,6 +1160,7 @@ async fn attach_pr_feedback_freshness(
     Ok(response)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_pr_auto_fix_context(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1171,7 +1172,7 @@ pub(crate) async fn create_pr_auto_fix_context(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (_branch_name, worktree_path, work_scope) = match &conv.conv_mode {
+    let (branch_name, worktree_path, work_scope) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
@@ -1197,13 +1198,32 @@ pub(crate) async fn create_pr_auto_fix_context(
     };
 
     let db = state.runtime.db().clone();
-    let active_pr = active_selection_target_for_scope(&db, &work_scope)
-        .await?
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "PR-specific action unavailable until an active PR is selected".to_string(),
-            )
-        })?;
+    let active_pr =
+        if let Some(active_pr) = active_selection_target_for_scope(&db, &work_scope).await? {
+            active_pr
+        } else {
+            let worktree = PathBuf::from(&worktree_path);
+            let refresh = tokio::task::spawn_blocking({
+                let branch_name = branch_name.clone();
+                move || crate::api::pr_monitoring::get_pr_status_for_branch(&worktree, &branch_name)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+            if !refresh.observations.is_empty() {
+                db.upsert_work_scope_pr_observations(&work_scope, &refresh.observations)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            db.primary_work_scope_pr_association(&work_scope)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "PR-specific action unavailable until a PR is associated with this work"
+                            .to_string(),
+                    )
+                })?
+        };
 
     let target_repo_owner = active_pr.repo_owner.clone();
     let target_repo_name = active_pr.repo_name.clone();
