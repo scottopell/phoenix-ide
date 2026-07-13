@@ -53,7 +53,7 @@ function RouterHarness({
   allowWhenNoActiveScope?: boolean;
   dialogOpen?: boolean;
 }) {
-  if (scopeId) useRegisterFocusScope(scopeId);
+  useRegisterFocusScope(scopeId ?? null);
   useKeyboardRouterShortcut({
     id,
     layer,
