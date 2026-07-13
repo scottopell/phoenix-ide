@@ -3598,7 +3598,9 @@ impl Database {
                         p.projected_at, ?1
                  FROM conversation_creation_jobs j
                  LEFT JOIN creation_shadow_bindings b ON b.creation_job_id = j.id
-                 LEFT JOIN creation_shadow_projections p ON p.shadow_workflow_id = b.shadow_workflow_id
+                 LEFT JOIN creation_shadow_projections p
+                   ON p.shadow_workflow_id = b.shadow_workflow_id
+                  AND p.oracle_revision = j.shadow_projection_revision
                  WHERE j.id = ?2 AND j.conversation_id = ?3
                    AND j.status = 'deletion_pending' AND j.generation = ?4
                    AND j.cleanup_worker_id = ?5 AND j.cleanup_token = ?6
@@ -8820,7 +8822,9 @@ mod tests {
             .unwrap();
         assert!(db.get_conversation("conv-cancel").await.is_err());
         let archive = sqlx::query(
-            "SELECT conversation_id, terminal_status, terminal_stage, attempt, generation FROM creation_shadow_archives WHERE creation_job_id = 'job-cancel'",
+            "SELECT conversation_id, terminal_status, terminal_stage, attempt, generation,
+                    projection_status, completion, compensation, projected_at
+             FROM creation_shadow_archives WHERE creation_job_id = 'job-cancel'",
         )
         .fetch_one(db.pool())
         .await
@@ -8836,6 +8840,10 @@ mod tests {
         );
         assert_eq!(archive.get::<i64, _>("attempt"), 1);
         assert_eq!(archive.get::<i64, _>("generation"), 3);
+        assert_eq!(archive.get::<Option<String>, _>("projection_status"), None);
+        assert_eq!(archive.get::<Option<String>, _>("completion"), None);
+        assert_eq!(archive.get::<Option<String>, _>("compensation"), None);
+        assert_eq!(archive.get::<Option<String>, _>("projected_at"), None);
     }
 
     #[tokio::test]

@@ -286,6 +286,10 @@ fn declared_effect_policies_and_prebootstrap_readiness_match_profile() {
         Some(&EffectAmbiguity::ExternalIdempotency)
     );
     assert_eq!(
+        policies.get(&COMMIT_METADATA),
+        Some(&EffectAmbiguity::ExternalIdempotency)
+    );
+    assert_eq!(
         policies.get(&BOOTSTRAP_RUNTIME),
         Some(&EffectAmbiguity::ExternalIdempotency)
     );

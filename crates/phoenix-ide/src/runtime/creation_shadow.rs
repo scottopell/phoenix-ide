@@ -247,8 +247,9 @@ fn oracle_from_committed(
         },
         CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
     };
-    let initial_llm_dispatched = active_runtime_evidence(conversation_state);
+    let initial_llm_dispatched = initial_llm_dispatched(&job.protocol.status, conversation_state);
     let runtime_bootstrapped = runtime_bootstrapped(&job.protocol.status, conversation_state);
+    let uses_worktree = uses_worktree(job.intent.mode.as_deref(), reservations, conv_mode);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
             job_id: job.id.clone(),
@@ -256,10 +257,7 @@ fn oracle_from_committed(
             idempotency_key: job.id,
             repository_path,
             worktree_path,
-            uses_worktree: matches!(
-                job.intent.mode.as_deref(),
-                Some("managed" | "auto" | "branch")
-            ),
+            uses_worktree,
             branch_name,
             initial_text: job.intent.text,
             attachment_ids,
@@ -284,6 +282,21 @@ fn oracle_from_committed(
             initial_turn_busy: active_runtime_evidence(conversation_state),
         },
     }
+}
+
+fn initial_llm_dispatched(status: &CreationStatus, state: &ConvState) -> bool {
+    matches!(status, CreationStatus::Ready) || active_runtime_evidence(state)
+}
+
+fn uses_worktree(
+    requested_mode: Option<&str>,
+    reservations: &[CreationResourceReservation],
+    conv_mode: Option<&ConvMode>,
+) -> bool {
+    matches!(requested_mode, Some("managed" | "branch"))
+        || (requested_mode == Some("auto")
+            && (!reservations.is_empty()
+                || conv_mode.is_some_and(|mode| mode.worktree_path().is_some())))
 }
 
 fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
@@ -513,6 +526,19 @@ mod tests {
                 hidden: false,
             }
         );
+    }
+
+    #[test]
+    fn settled_ready_turn_preserves_dispatch_evidence() {
+        assert!(initial_llm_dispatched(
+            &CreationStatus::Ready,
+            &ConvState::Idle
+        ));
+    }
+
+    #[test]
+    fn auto_without_committed_worktree_evidence_is_direct() {
+        assert!(!uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
     }
 
     #[test]

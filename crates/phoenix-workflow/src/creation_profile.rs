@@ -555,7 +555,7 @@ pub fn creation_plan(
             worktree_path: oracle.intent.worktree_path.clone(),
         },
         oracle.generation,
-        EffectAmbiguity::ObservableReconciliation,
+        EffectAmbiguity::ExternalIdempotency,
         None,
     ));
     if let Some(message_id) = initial_turn {
