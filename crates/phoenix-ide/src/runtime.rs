@@ -2086,6 +2086,10 @@ impl RuntimeManager {
         self.creation_shadow.schedule(job_id.into());
     }
 
+    pub(crate) async fn mirror_creation_before_cleanup(&self, job_id: &str) -> Result<(), String> {
+        self.creation_shadow.sync(job_id).await
+    }
+
     pub async fn start_wake_worker(self: &Arc<Self>) {
         let rx = self.wake_kick_rx.write().await.take();
         let Some(rx) = rx else {

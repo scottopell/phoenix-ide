@@ -70,6 +70,10 @@ impl CreationShadowCoordinator {
         });
     }
 
+    pub(crate) async fn sync(&self, job_id: &str) -> Result<(), String> {
+        self.sync_committed_job(job_id).await
+    }
+
     async fn sync_committed_job(&self, job_id: &str) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
