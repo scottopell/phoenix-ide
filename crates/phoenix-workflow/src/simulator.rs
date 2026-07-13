@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    AttemptId, BarrierId, CancellationRequest, ClaimAuthority, EffectId, LeaseExpiry,
+    AttemptId, BarrierId, CancellationRequest, ClaimAuthority, CodecRef, EffectId, LeaseExpiry,
     ReducerDecision, Timestamp, WorkflowProfile, WorkflowState,
 };
 
@@ -27,6 +27,7 @@ pub enum SimOp<P: WorkflowProfile> {
     Observe {
         authority: ClaimAuthority,
         attempt_id: AttemptId,
+        observation_codec: CodecRef,
         observation: P::Observation,
     },
     Retry {
@@ -89,11 +90,16 @@ impl<P: WorkflowProfile> Simulator<P> {
             SimOp::Observe {
                 authority,
                 attempt_id,
+                observation_codec,
                 observation,
             } => {
-                let _ =
-                    self.workflow
-                        .record_observation(&authority, self.now, attempt_id, observation);
+                let _ = self.workflow.record_observation(
+                    &authority,
+                    self.now,
+                    attempt_id,
+                    observation_codec,
+                    observation,
+                );
             }
             SimOp::Retry {
                 authority,

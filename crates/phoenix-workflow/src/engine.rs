@@ -1,22 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::validation::validate_status_transition;
 use crate::{
     declared_receipt_family, validate_plan, AtomicInboxConsumeResult, AttemptId, AttemptRecord,
     AttemptStatus, AuthoritativeWorkflow, AuthorityOutcome, BarrierEvaluation, BarrierId,
     BarrierState, BarrierStatus, CancellationRequest, ClaimAuthority, ClaimOutcome, ClaimResult,
-    CodecRef, CommitOutcome, CommitResult, DeliveryStatus, DivergenceAction, DivergenceSeverity,
-    EffectDecl, EffectId, EffectInvalidationDecl, EffectState, EffectStatus, EngineError,
-    ExecutionMode, Generation, LeaseExpiry, ManualChoice, ManualResolutionCommit,
-    ManualResolutionId, ManualResolutionOutcome, ManualResolutionRecord, ObservationId,
-    ObservationRecord, OwedAcceptanceDisposition, OwedAcceptanceId, OwedAcceptanceRecord,
-    PlanError, ProfileRef, ProtocolSelection, ReceiptAcceptance, ReceiptFamily, ReceiptId,
-    ReceiptOrigin, ReceiptRecord, ReconciliationDecision, ReconciliationOutcome, ReducerDecision,
-    ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, ResolutionStatus,
-    ResourceLockGrant, RuntimeAcceptanceResult, SemanticAuthority, ShadowComparisonEvidence,
-    ShadowDivergenceId, ShadowDivergenceKind, ShadowDivergenceRecord, ShadowDivergenceResolution,
-    ShadowWorkflow, StaleObservationRecord, SuppressionReason, Timestamp, TransitionId,
-    TransitionPlan, Version, WorkflowBinding, WorkflowId, WorkflowProfile, WorkflowState,
-    WorkflowStatus, WorkflowTransition,
+    CodecRef, CommitOutcome, CommitResult, DeliveryStatus, DivergenceAction,
+    DivergenceResolutionAction, DivergenceSeverity, EffectDecl, EffectId, EffectInvalidationDecl,
+    EffectState, EffectStatus, EngineError, ExecutionMode, Generation, LeaseExpiry, ManualChoice,
+    ManualResolutionCommit, ManualResolutionId, ManualResolutionOutcome, ManualResolutionRecord,
+    ObservationId, ObservationRecord, OwedAcceptanceDisposition, OwedAcceptanceId,
+    OwedAcceptanceRecord, PlanError, ProfileRef, ProtocolSelection, ReceiptAcceptance,
+    ReceiptFamily, ReceiptId, ReceiptOrigin, ReceiptRecord, ReconciliationDecision,
+    ReconciliationOutcome, ReducerDecision, ReducerInboxEvent, ReducerInboxId, ReducerInboxKind,
+    ReducerInboxPayload, ResolutionStatus, ResourceLockGrant, RuntimeAcceptanceResult,
+    SemanticAuthority, ShadowComparisonEvidence, ShadowDivergenceId, ShadowDivergenceKind,
+    ShadowDivergenceRecord, ShadowDivergenceResolution, ShadowWorkflow, StaleObservationRecord,
+    SuppressionReason, Timestamp, TransitionId, TransitionPlan, Version, WorkflowBinding,
+    WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus, WorkflowTransition,
 };
 
 impl<P: WorkflowProfile> WorkflowState<P> {
@@ -237,13 +238,23 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         new_lease_until: LeaseExpiry,
     ) -> AuthorityOutcome {
-        if !new_lease_until.is_live_at(now) || new_lease_until <= authority.lease_until {
+        if !new_lease_until.is_live_at(now) {
             return AuthorityOutcome::StaleAuthority;
         }
         match self.effect_authorized_mut(authority, now) {
             Some(effect) => {
-                if let Some(claim) = &mut effect.claim {
-                    claim.lease_until = new_lease_until;
+                let Some(claim) = &mut effect.claim else {
+                    return AuthorityOutcome::StaleAuthority;
+                };
+                if new_lease_until <= claim.lease_until {
+                    return AuthorityOutcome::StaleAuthority;
+                }
+                claim.lease_until = new_lease_until;
+                if let Some(lock) = &mut effect.destructive_lock {
+                    lock.lease_until = new_lease_until;
+                }
+                if let Some(lock) = &mut claim.resource_lock {
+                    lock.lease_until = new_lease_until;
                 }
                 AuthorityOutcome::Authorized
             }
@@ -324,10 +335,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         authority: &ClaimAuthority,
         now: Timestamp,
         attempt_id: AttemptId,
+        observation_codec: CodecRef,
         observation: P::Observation,
     ) -> AuthorityOutcome {
+        if observation_codec.family.is_empty() {
+            return AuthorityOutcome::StaleAuthority;
+        }
         let observation_id = ObservationId(self.next_observation_id);
-        self.next_observation_id += 1;
         if let Some(effect) = self.effect_authorized_mut(authority, now) {
             if !effect
                 .attempts
@@ -340,6 +354,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 id: observation_id,
                 authority: authority.clone(),
                 attempt_id,
+                observation_codec,
                 observation,
                 authoritative: true,
             });
@@ -350,20 +365,23 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             {
                 attempt.status = AttemptStatus::ObservationRecorded;
             }
+            self.next_observation_id += 1;
             return AuthorityOutcome::Authorized;
         }
         if let Some(effect) = self.effects.get_mut(&authority.effect_id) {
+            self.next_observation_id += 1;
             effect.stale_observations.push(StaleObservationRecord {
                 id: observation_id,
                 authority: authority.clone(),
                 attempt_id,
+                observation_codec,
                 observation,
             });
         }
         AuthorityOutcome::StaleAuthority
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     /// Accepts a receipt produced under live claimed-worker authority.
     ///
     /// Manual-origin receipts are structurally reserved for [`Self::resolve_manual`]
@@ -379,6 +397,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         receipt_event_codec: CodecRef,
         receipt_event: P::ReceiptReducerEvent,
     ) -> ReceiptAcceptance<P> {
+        if receipt_codec.family.is_empty() || receipt_event_codec.family.is_empty() {
+            return ReceiptAcceptance {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                receipt_inbox_ids: Vec::new(),
+                reducer_events: Vec::new(),
+            };
+        }
         let receipt_id = ReceiptId(self.next_receipt_id);
         self.next_receipt_id += 1;
         let generation = self.generation;
@@ -460,6 +486,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             barrier_id: None,
             kind: ReducerInboxKind::ReceiptAccepted,
             event_codec: receipt_event_codec,
+            requires_runtime_acceptance: true,
             payload: ReducerInboxPayload::Receipt(receipt_event),
             delivery_status: DeliveryStatus::Pending,
             consumed_by: None,
@@ -518,7 +545,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         permitted_choices: Vec<ManualChoice<P>>,
     ) -> ReconciliationOutcome<P> {
-        if self.ensure_executable().is_err() {
+        if self.ensure_executable().is_err() || permitted_choices.is_empty() {
             return stale_reconciliation_outcome();
         }
         let resolution_id = ManualResolutionId(self.next_manual_resolution_id);
@@ -583,7 +610,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if !manual_choice_permitted(&existing, choice) {
             return invalid_manual_resolution(Some(existing));
         }
-        if !self.effect_ready_for_manual_resolution(&existing) {
+        if !self.effect_ready_for_manual_resolution(&existing)
+            || commit.transition_codec.family.is_empty()
+            || commit.receipt_codec.family.is_empty()
+            || commit.receipt_event_codec.family.is_empty()
+            || validate_status_transition(self.status, commit.next_status).is_err()
+        {
             return invalid_manual_resolution(Some(existing));
         }
 
@@ -770,6 +802,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                     barrier_id: Some(barrier_id),
                     kind: ReducerInboxKind::BarrierSatisfied,
                     event_codec: reducer_event_codec,
+                    requires_runtime_acceptance: false,
                     payload: ReducerInboxPayload::Barrier(reducer_event_payload),
                     delivery_status: DeliveryStatus::Pending,
                     consumed_by: None,
@@ -808,6 +841,17 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             });
         }
         self.validate_plan_against_state(&request.compensation_plan, barrier_events)?;
+        if request.next_snapshot_codec.family.is_empty()
+            || request.event_codec.family.is_empty()
+            || request
+                .reducer_inbox_events
+                .iter()
+                .any(|event| event.event_codec.family.is_empty())
+        {
+            return Err(EngineError::InvalidPlan(PlanError::MissingCodec(
+                "cancellation",
+            )));
+        }
 
         let mut replacement = self.clone();
         replacement.enter_cancellation(request);
@@ -881,6 +925,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn resolve_shadow_divergence(
         &mut self,
         divergence_id: ShadowDivergenceId,
+        action: DivergenceResolutionAction,
         resolved_by: &'static str,
     ) -> bool {
         let Some(divergence) = self
@@ -897,7 +942,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return false;
         }
         divergence.resolution = ShadowDivergenceResolution::Resolved {
-            action: divergence.action,
+            action,
             resolved_by,
         };
         true
@@ -1061,17 +1106,27 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
             return Ok(());
         }
+        let runtime_acceptance_inbox_ids = consumed_inbox_ids
+            .iter()
+            .copied()
+            .filter(|inbox_id| {
+                self.reducer_inbox
+                    .get(inbox_id)
+                    .is_some_and(|event| event.requires_runtime_acceptance)
+            })
+            .collect::<Vec<_>>();
         let Some(owed_acceptances) = &plan.owed_acceptances else {
-            if consumed_inbox_ids.is_empty() {
+            if runtime_acceptance_inbox_ids.is_empty() {
                 return Ok(());
             }
             return Err(EngineError::InvalidInbox);
         };
-        if owed_acceptances.len() != consumed_inbox_ids.len() {
+        if owed_acceptances.len() != runtime_acceptance_inbox_ids.len() {
             return Err(EngineError::InvalidInbox);
         }
-        let consumed: BTreeSet<ReducerInboxId> = consumed_inbox_ids.iter().copied().collect();
-        if consumed.len() != consumed_inbox_ids.len() {
+        let consumed: BTreeSet<ReducerInboxId> =
+            runtime_acceptance_inbox_ids.iter().copied().collect();
+        if consumed.len() != runtime_acceptance_inbox_ids.len() {
             return Err(EngineError::InvalidInbox);
         }
         let declared: BTreeSet<ReducerInboxId> = owed_acceptances
@@ -1163,6 +1218,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             barrier_id: None,
             kind: ReducerInboxKind::ReceiptAccepted,
             event_codec: receipt_event_codec,
+            requires_runtime_acceptance: true,
             payload: ReducerInboxPayload::Receipt(receipt_event),
             delivery_status: DeliveryStatus::Pending,
             consumed_by: None,
@@ -1218,7 +1274,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         ReducerDecision {
             expected_workflow_version: self.version,
             plan: TransitionPlan {
-                next_status: request.compensation_plan.next_status,
+                next_status: match request.compensation_plan.next_status {
+                    WorkflowStatus::Active => WorkflowStatus::Cancelling,
+                    status @ (WorkflowStatus::Cancelling
+                    | WorkflowStatus::Cancelled
+                    | WorkflowStatus::DeletionPending
+                    | WorkflowStatus::Completed
+                    | WorkflowStatus::Failed) => status,
+                },
                 snapshot: self.snapshot.clone(),
                 snapshot_codec: self.snapshot_codec.clone(),
                 event: request.event.clone(),
@@ -1250,6 +1313,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 barrier_id: declaration.barrier_id,
                 kind: declaration.kind,
                 event_codec: declaration.event_codec.clone(),
+                requires_runtime_acceptance: declaration.requires_runtime_acceptance,
                 payload: match &declaration.payload {
                     ReducerInboxPayload::Receipt(payload) => {
                         ReducerInboxPayload::Receipt(payload.clone())
@@ -1456,6 +1520,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             && claim.effect_id == authority.effect_id
             && claim.claim_token == authority.claim_token
             && claim.worker_id == authority.worker_id
+            && claim.resource_lock == authority.resource_lock
+            && effect.destructive_lock == authority.resource_lock
             && authority.generation == self.generation
             && claim.lease_until.is_live_at(now)
         {
@@ -1589,6 +1655,7 @@ fn clone_reducer_inbox_event<P: WorkflowProfile>(
         barrier_id: event.barrier_id,
         kind: event.kind,
         event_codec: event.event_codec.clone(),
+        requires_runtime_acceptance: event.requires_runtime_acceptance,
         payload: match &event.payload {
             ReducerInboxPayload::Receipt(payload) => ReducerInboxPayload::Receipt(payload.clone()),
             ReducerInboxPayload::Barrier(payload) => ReducerInboxPayload::Barrier(payload.clone()),
