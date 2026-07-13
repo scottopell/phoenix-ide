@@ -13,14 +13,19 @@ THE SYSTEM SHALL search the repository using ripgrep with provided terms
 AND filter results for relevance using an LLM
 AND return ranked list of relevant files with explanations
 
-WHEN search terms yield too many results (>64KB per term)
-THE SYSTEM SHALL skip overly broad terms
+WHEN a search term matches more than a breadth threshold of locations
+THE SYSTEM SHALL skip that term
 AND continue with remaining terms
+AND determine breadth without buffering the term's full contextual output
 
-WHEN all terms yield too many results
+WHEN all terms exceed the breadth threshold
 THE SYSTEM SHALL return error indicating terms are too broad
 
-**Rationale:** LLMs navigating unfamiliar codebases need conceptual search. Raw ripgrep output is often too noisy; LLM filtering provides relevant results.
+WHEN combined contextual output exceeds a fixed size ceiling
+THE SYSTEM SHALL stop the scan at the ceiling
+AND signal that results were truncated
+
+**Rationale:** LLMs navigating unfamiliar codebases need conceptual search. Raw ripgrep output is often too noisy; LLM filtering provides relevant results. Breadth and output cost must be bounded independently of the size of the search tree, so an intentionally broad working directory stays searchable rather than stalling — measuring a term's breadth by first producing its full output would pay the exact cost the skip is meant to avoid.
 
 ---
 
@@ -30,12 +35,15 @@ WHEN keyword search executes
 THE SYSTEM SHALL search from git repository root if in a git repo
 AND fall back to conversation working directory otherwise
 
+WHEN the resolved search root is the filesystem root
+THE SYSTEM SHALL refuse the search
+
 WHEN searching
 THE SYSTEM SHALL use case-insensitive matching
 AND include 10 lines of context around matches
 AND include filenames and line numbers
 
-**Rationale:** Repository root provides complete codebase coverage. Context helps the filtering LLM understand relevance.
+**Rationale:** Repository root provides complete codebase coverage. Context helps the filtering LLM understand relevance. A working directory spanning many repositories is a supported, intentional scope and is not refused for breadth alone; the filesystem root is refused because it would scan every mounted volume, and bounded cost is enforced by the breadth threshold and output ceiling (REQ-KWS-001) rather than by narrowing the user's chosen scope.
 
 ---
 

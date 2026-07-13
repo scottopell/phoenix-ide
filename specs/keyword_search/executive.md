@@ -2,11 +2,11 @@
 
 ## Requirements Summary
 
-Keyword search enables conceptual code search when agents lack precise information. It uses a two-stage approach: ripgrep searches for provided terms, then an LLM filters results for relevance. Search runs from git repository root (or working directory fallback) with case-insensitive matching and 10 lines of context. Overly broad terms (>64KB results) are automatically skipped. The filtering LLM is selected from fast, cheap models to keep latency and cost acceptable.
+Keyword search enables conceptual code search when agents lack precise information. It uses a two-stage approach: ripgrep searches for provided terms, then an LLM filters results for relevance. Search runs from git repository root (or working directory fallback) with case-insensitive matching and 10 lines of context. The search scope is respected even when it is a large, intentionally broad tree (e.g. a multi-repo working directory); breadth is made affordable rather than refused. Overly broad terms are dropped by a cheap early-exit match-count probe, and combined output is bounded by an always-on cap. The filtering LLM is selected from fast, cheap models to keep latency and cost acceptable.
 
 ## Technical Summary
 
-Tool accepts query string and ordered search terms array. Ripgrep runs with `-C 10 -i --line-number --with-filename -e <term>` for each term. Terms yielding >64KB are skipped; combined results are trimmed by removing lowest-priority terms until <128KB. Results plus query are sent to filtering LLM with system prompt requesting ranked relevant files. LLM selection prefers Fireworks Qwen, GPT-5 mini, then Claude Sonnet.
+Tool accepts query string and ordered search terms array. Scope resolution walks up from the working directory to the enclosing git root, falling back to the working directory; the filesystem root is refused as a floor. Each term is first probed with `rg --count`: its match total is accumulated as `rg` streams, and the child is killed the instant the total crosses `BROAD_TERM_MATCH_LIMIT`, so rejecting a broad term costs O(limit) regardless of tree size. Usable terms are then scanned once with `rg -C 10 -i --line-number --with-filename -e <term>`, streaming stdout into a buffer killed at `MAX_COMBINED_RESULTS` (128KB) — the always-on ceiling that fires even inside a legitimate single repo — with a truncation marker appended when it trips. Every `rg` child is raced against the cancellation token and killed+reaped on cancel (REQ-BED-005). Results plus query are sent to the filtering LLM with a system prompt requesting ranked relevant files. LLM selection prefers `claude-haiku-4-5`, then `claude-sonnet-5`, then `claude-sonnet-4-6`, falling back to any available model.
 
 ## Status Summary
 
