@@ -5,10 +5,10 @@ Virtual Transcript defines the platform-neutral behavioral contract for renderin
 ## REQ-VT-001: One Physical Layout Authority
 
 WHEN a transcript view is mounted
-THE SYSTEM SHALL have exactly one component responsible for the ordered layout model, measured unit extents, rendered window, spacers, and programmatic viewport writes
+THE SYSTEM SHALL have exactly one typed physical executor responsible for the ordered layout model, measured unit extents, rendered window, spacers, target resolution against rendered units, and programmatic viewport writes
 AND no other component shall maintain a competing height model or independently compensate the viewport.
 
-The layout model is ephemeral to the mounted conversation. It is not persisted across visits.
+In the Phoenix web implementation, `MessageList` owns this typed physical execution surface through its `VirtualTranscript` integration. The layout model is ephemeral to the mounted conversation. It is not persisted across visits.
 
 ## REQ-VT-002: Stable Semantic Units
 
@@ -66,6 +66,8 @@ Target resolution and missing-target detection are evidence supplied to the posi
 
 THE SYSTEM SHALL model transcript positioning as a pure reducer over a closed input: either `idle(view)` or `positioning(command)`.
 
+The pure positioning controller SHALL own the programmatic command lifecycle, derive terminal results from target-resolution evidence and physical observations, and emit ordered effects for target resolution, physical positioning, and exact-once finish.
+
 THE SYSTEM SHALL allow at most one active programmatic positioning command for a transcript view
 AND every command SHALL be bound to a command key derived from command kind, command token, request token, conversation identity, view generation, transcript generation, and target message identity.
 
@@ -109,7 +111,7 @@ A streaming-to-finalized transition that retains the same render-unit key shall 
 
 THE SYSTEM SHALL maintain a platform-neutral fixture corpus at `fixtures/virtual-transcript/v1/` with a JSON Schema (`schema.json`) and scenario corpus (`scenarios.json`) describing ordered units, stable keys, navigation aliases, initial viewport state, operations, and geometric expectations.
 
-Web and native clients SHALL be able to consume the same semantic scenarios without sharing physical implementation code. The TypeScript web adapter SHALL validate the root corpus before exposing scenarios to fixtures or tests.
+The root `fixtures/virtual-transcript/v1/` schema and corpus SHALL be the shared contract across Phoenix web and iOS clients. Web and native clients SHALL be able to consume the same semantic scenarios without sharing physical implementation code. The TypeScript web adapter SHALL validate the root corpus before exposing scenarios to fixtures or tests.
 
 Conformance SHALL include prefix insertion within a tall unit, dynamic resize above an anchor, semantic navigation through an alias, missing orphan targets, streaming growth while reading, streaming growth while following, and command supersession.
 

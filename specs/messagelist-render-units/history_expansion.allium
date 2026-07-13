@@ -4,7 +4,9 @@
 -- Scope: coverage acquisition, asynchronous ownership, and the one-shot
 -- positioning obligation caused by expanding a loaded tail into complete
 -- history. Scroll physics and reader/follow ownership remain governed by
--- scroll_policy.allium; physical positioning command execution is handed to
+-- scroll_policy.allium. This spec owns the semantic handoff into the closed
+-- transcript-positioning input (`idle(view)` or `positioning(command)`);
+-- physical positioning command execution remains governed by
 -- virtual_transcript.allium.
 
 use "./scroll_policy.allium" as scroll
@@ -96,6 +98,20 @@ surface TranscriptPositioningBoundary {
         vt.InputPositioning(transcript_view, command_key, token, request_token, history_view, kind, message_id, viewport_start_offset)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
         PendingCommandSuperseded(view, command_token, view_generation)
+}
+
+contract HistoryExpansionToPositioningBoundary {
+    validate: (view: HistoryView) -> Boolean
+
+    @invariant BoundaryProjectsClosedTranscriptInput
+        -- For each HistoryView, the boundary emits exactly one semantic transcript
+        -- positioning input: vt.InputIdle(view) when pending_command is absent, or
+        -- vt.InputPositioning(command) when pending_command is present.
+
+    @invariant BoundaryDoesNotOwnPhysicalCommandLifecycle
+        -- After projection, target resolution, viewport writes, issued-layout
+        -- revision tracking, and physical success observation belong to
+        -- virtual_transcript.allium.
 }
 
 rule ViewChangeSupersedesPendingCommandBeforeInvalidatingOutstandingWork {
@@ -448,6 +464,36 @@ rule MatchingAcknowledgementConsumesCommand {
     ensures: view.pending_command = null
 }
 
+rule PendingCommandProjectsToTranscriptPositioningInput {
+    when: CommandInputProjected(view, transcript_view, command_key, history_view)
+    requires: view.pending_command != null
+    requires: history_view = view
+    requires: transcript_view.conversation_id = view.conversation_id
+    requires: transcript_view.generation = view.view_generation
+    requires: transcript_view.transcript_generation = view.transcript_generation
+    requires: command_key = view.pending_command.token
+    ensures: vt.InputPositioning(
+        transcript_view,
+        command_key,
+        view.pending_command.token,
+        view.pending_command.request_token,
+        history_view,
+        view.pending_command.kind,
+        view.pending_command.message_id,
+        view.pending_command.viewport_start_offset
+    ).emitted()
+}
+
+rule NoPendingCommandProjectsIdleTranscriptInput {
+    when: CommandInputProjected(view, transcript_view, _, history_view)
+    requires: view.pending_command = null
+    requires: history_view = view
+    requires: transcript_view.conversation_id = view.conversation_id
+    requires: transcript_view.generation = view.view_generation
+    requires: transcript_view.transcript_generation = view.transcript_generation
+    ensures: vt.InputIdle(transcript_view, history_view).emitted()
+}
+
 rule StaleAcknowledgementCannotConsumeCommand {
     when: ScrollCommandAcknowledged(view, command_token, view_generation, _)
     requires: view.pending_command = null
@@ -485,8 +531,8 @@ contract HistoryExpansionSafety {
         -- positioning to the existing scroll policy.
 
     @invariant ScrollCommandsExecuteAtMostOncePerToken
-        -- Each command token authorizes at most one physical positioning
-        -- operation and one terminal acknowledgement.
+        -- Each command token authorizes at most one semantic handoff into
+        -- transcript positioning and one terminal acknowledgement.
 
     @invariant DeepLinkCoverageExpansionHasOneAutomaticAttempt
         -- A deep-link target causes at most one automatic history request for a
