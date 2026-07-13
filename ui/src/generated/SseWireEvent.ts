@@ -68,17 +68,17 @@ pending_truncated: boolean, } | { "type": "message", sequence_id: number,
  * validated against `MessageSchema` and transformed to the UI's
  * `Message` type at the valibot boundary.
  */
-message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, 
-/**
- * Conversation transcript generation after this mutation committed.
- */
-transcript_generation: number, display_data: unknown | null, content: unknown | null, 
+message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, 
 /**
  * Tool-execution duration in milliseconds. Present only when the
  * `MessageUpdated` event is emitted for a tool-result message;
  * absent (`undefined` on the TS side) for all other update paths.
  */
-duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, 
+duration_ms?: number, 
+/**
+ * Conversation transcript generation after a persisted mutation commits.
+ */
+transcript_generation: number | null, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, 
 /**
  * Server clock at which the conversation entered this state — the
  * same `Conversation.state_updated_at: DateTime<Utc>` value the

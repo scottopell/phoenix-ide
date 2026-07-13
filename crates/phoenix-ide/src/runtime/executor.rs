@@ -4671,7 +4671,7 @@ where
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
             sequence_id: seq,
             message_id: assistant_message_id.clone(),
-            transcript_generation: 0,
+            transcript_generation: None,
             display_data: Some(display_for_broadcast),
             content: None,
             duration_ms: None,
@@ -5081,7 +5081,7 @@ where
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
                 sequence_id: seq,
                 message_id: message_id.clone(),
-                transcript_generation,
+                transcript_generation: Some(transcript_generation),
                 display_data: Some(display_data.clone()),
                 content: Some(updated_content),
                 duration_ms: None,

@@ -215,7 +215,7 @@ export type SSEAction =
       type: 'sse_message_updated';
       sequenceId: number;
       messageId: string;
-      transcriptGeneration: number;
+      transcriptGeneration?: number;
       displayData?: Record<string, unknown>;
       content?: Message['content'];
       /** Typed tool-execution duration; present only for tool-result updates. */
@@ -596,7 +596,10 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
       if (idx < 0) {
         const next = storePendingMessagePatch(atom, action.messageId, patch);
-        return { ...next, transcriptGeneration: action.transcriptGeneration };
+        return {
+          ...next,
+          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+        };
       }
       const existingPending = atom.pendingMessagePatches[action.messageId] ?? {
         lastAppliedPatchEventSeq: 0,
@@ -613,7 +616,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       if (!applied.applied) {
         return {
           ...atom,
-          transcriptGeneration: action.transcriptGeneration,
+          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
           pendingMessagePatches: nextPendingMessagePatches,
         };
       }
@@ -621,7 +624,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       newMessages[idx] = applied.message;
       return {
         ...atom,
-        transcriptGeneration: action.transcriptGeneration,
+        transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
         messages: newMessages,
         pendingMessagePatches: nextPendingMessagePatches,
       };

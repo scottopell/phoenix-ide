@@ -63,6 +63,7 @@ export type ConversationPageView = Pick<
   | 'firstByteRequestId'
   | 'turnRetryContext'
   | 'transcriptGeneration'
+  | 'transcriptCoverage'
 >;
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
@@ -78,6 +79,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'firstByteRequestId',
   'turnRetryContext',
   'transcriptGeneration',
+  'transcriptCoverage',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -125,6 +127,7 @@ export function useConversationView(
       firstByteRequestId: a.firstByteRequestId,
       turnRetryContext: a.turnRetryContext,
       transcriptGeneration: a.transcriptGeneration,
+      transcriptCoverage: a.transcriptCoverage,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;

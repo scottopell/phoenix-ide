@@ -268,8 +268,6 @@ pub enum SseWireEvent {
     MessageUpdated {
         sequence_id: i64,
         message_id: String,
-        /// Conversation transcript generation after this mutation committed.
-        transcript_generation: i64,
         #[ts(type = "unknown | null")]
         display_data: Option<Value>,
         #[ts(type = "unknown | null")]
@@ -280,6 +278,8 @@ pub enum SseWireEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         duration_ms: Option<u64>,
+        /// Conversation transcript generation after a persisted mutation commits.
+        transcript_generation: Option<i64>,
     },
     /// Conversation phase transition. `state` is opaque here — the UI has
     /// its own tagged-union validator (`parseConversationState`). States that

@@ -992,8 +992,8 @@ pub enum SseEvent {
     MessageUpdated {
         sequence_id: i64,
         message_id: String,
-        /// Conversation transcript generation after this mutation committed.
-        transcript_generation: i64,
+        /// Conversation transcript generation after a persisted mutation commits.
+        transcript_generation: Option<i64>,
         display_data: Option<serde_json::Value>,
         content: Option<crate::db::MessageContent>,
         /// Typed tool-execution duration in milliseconds, emitted alongside

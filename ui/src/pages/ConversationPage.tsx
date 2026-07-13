@@ -576,9 +576,9 @@ function ConversationPageContent() {
         generation: historyGenerationRef.current,
         transcriptGeneration: atom.transcriptGeneration,
       },
-      hasEarlierHistory: historyCoverageRef.current === 'tail',
+      hasEarlierHistory: atom.transcriptCoverage === 'tail',
     });
-  }, [conversationId, atom.transcriptGeneration]);
+  }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const eventCursorRef = useConversationEventCursorRef(slug!);
 
@@ -642,6 +642,7 @@ function ConversationPageContent() {
                 phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
                 contextWindow: { used: 0 },
                 transcriptGeneration: cached.transcript_generation ?? 1,
+                transcriptCoverage: 'tail',
                 eventCursorFloor: eventCursorRef.current,
               });
             }
@@ -652,8 +653,14 @@ function ConversationPageContent() {
         if (navigator.onLine && !cancelled) {
           const cachedConversationId = cached?.id ?? null;
           const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
+          const metadata = await getConversationMetaForRoute(slug);
+          if (cancelled) return;
+          const metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
+          const cachedTranscriptGeneration = cached?.transcript_generation ?? null;
+          const cacheGenerationMatchesMetadata = cachedTranscriptGeneration !== null
+            && cachedTranscriptGeneration === metadataTranscriptGeneration;
 
-          if (hasCachedMessages && cachedConversationId) {
+          if (hasCachedMessages && cachedConversationId && cacheGenerationMatchesMetadata) {
             try {
               const snapshotStartedAtEventSeq = eventCursorRef.current;
               const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
@@ -720,8 +727,6 @@ function ConversationPageContent() {
                   lastHydratedAt: new Date().toISOString(),
                 });
 
-                const metadata = await getConversationMetaForRoute(slug);
-                if (cancelled) return;
                 const authoritativeConversation = metadata.conversation;
                 if (authoritativeConversation.id !== cachedConversationId) {
                   throw new Error('Cached conversation no longer owns the requested slug');
@@ -733,9 +738,6 @@ function ConversationPageContent() {
                   atomRef.current.conversationId === null
                   || atomRef.current.conversationId === authoritativeConversation.id
                 ) {
-                  const cachedStartsAtTranscriptBeginning = mergedMessages.some(
-                    (message) => message.sequence_id === 1,
-                  );
                   dispatchHistoryExpansion({
                     type: 'view_changed',
                     view: {
@@ -743,7 +745,7 @@ function ConversationPageContent() {
                       generation: historyGenerationRef.current,
                       transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
                     },
-                    hasEarlierHistory: latestWindow.has_older_messages && !cachedStartsAtTranscriptBeginning,
+                    hasEarlierHistory: latestWindow.has_older_messages,
                   });
                   dispatch({
                     type: 'merge_conversation_data',
@@ -755,6 +757,7 @@ function ConversationPageContent() {
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
                     transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                    transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
                     eventCursorFloor: snapshotStartedAtEventSeq,
                     snapshotStartedAtEventSeq,
                   });
@@ -770,14 +773,12 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const metadata = await getConversationMetaForRoute(slug);
-            if (cancelled) return;
             let latestWindow;
             try {
               latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
             } catch (error) {
               if (!(error instanceof MessageSliceAlignmentError)) throw error;
-              const full = await getConversationForRoute(slug);
+              const full = await api.getConversation(metadata.conversation.id);
               latestWindow = {
                 messages: full.messages,
                 has_older_messages: false,
@@ -785,7 +786,6 @@ function ConversationPageContent() {
                 transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
               };
             }
-            const metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? latestWindow.transcript_generation;
             if (metadataTranscriptGeneration !== latestWindow.transcript_generation) {
               throw new Error('Conversation transcript changed while loading');
             }
@@ -817,6 +817,7 @@ function ConversationPageContent() {
                   used: result.context_window_size || 0,
                 },
                 transcriptGeneration: metadataTranscriptGeneration,
+                transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
                 eventCursorFloor: snapshotStartedAtEventSeq,
                 snapshotStartedAtEventSeq,
               });
@@ -827,7 +828,7 @@ function ConversationPageContent() {
                 conversationId: result.conversation.id,
                 latestMessageSequenceId: latestMessageSequenceId(result.messages),
                 latestEventSequenceId: null,
-                transcriptGeneration: null,
+                transcriptGeneration: metadataTranscriptGeneration,
                 lastHydratedAt: new Date().toISOString(),
               });
             }
@@ -902,6 +903,7 @@ function ConversationPageContent() {
             : { type: 'idle' },
         contextWindow: { used: result.context_window_size || 0 },
         transcriptGeneration: responseTranscriptGeneration,
+        transcriptCoverage: 'complete',
         eventCursorFloor: historyMergeEventCursorFloor(request),
         snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
       });

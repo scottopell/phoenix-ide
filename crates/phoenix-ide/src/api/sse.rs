@@ -600,7 +600,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 7,
             message_id: "msg-abc".to_string(),
-            transcript_generation: 3,
+            transcript_generation: Some(3),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,
@@ -614,7 +614,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 9,
             message_id: "msg-def".to_string(),
-            transcript_generation: 4,
+            transcript_generation: Some(4),
             display_data: None,
             content: Some(MessageContent::Agent(vec![ContentBlock::Text {
                 text: "updated".to_string(),
@@ -629,7 +629,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 11,
             message_id: "msg-xyz".to_string(),
-            transcript_generation: 5,
+            transcript_generation: Some(5),
             display_data: None,
             content: None,
             duration_ms: None,
@@ -643,7 +643,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 12,
             message_id: "msg-tool-result".to_string(),
-            transcript_generation: 6,
+            transcript_generation: Some(6),
             display_data: None,
             content: None,
             duration_ms: Some(1234),
@@ -1049,7 +1049,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 42,
             message_id: "msg-abc".to_string(),
-            transcript_generation: 9,
+            transcript_generation: Some(9),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,

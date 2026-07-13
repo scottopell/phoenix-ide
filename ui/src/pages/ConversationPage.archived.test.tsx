@@ -135,6 +135,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     created_at: '2024-01-01T00:00:00Z',
     updated_at: '2024-01-01T00:00:01Z',
     message_count: 1,
+    transcript_generation: 1,
     state: { type: 'idle' },
     archived: false,
     browser_session_active: false,
@@ -203,6 +204,13 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     context_window_size: 0,
   });
 
+  vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+    conversation,
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
+
   render(
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
@@ -223,6 +231,7 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
 afterEach(() => {
   viewportFlags.isDesktop = true;
   viewportFlags.isWideDesktop = true;
+  vi.clearAllMocks();
   vi.restoreAllMocks();
 });
 
@@ -351,7 +360,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
-  it('preserves complete coverage when the cache already starts at the transcript beginning', async () => {
+  it('keeps cached history conservatively tail-covered when the server reports earlier messages', async () => {
     const cachedConversation = makeConversation();
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
     vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage, catchUpMessage]);
@@ -380,11 +389,11 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     await waitFor(() => expect(api.getConversationMessagesLatest).toHaveBeenCalled());
-    expect(screen.queryByRole('button', { name: 'Load older messages' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load older messages' })).toBeInTheDocument();
   });
 
   it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
-    const cachedConversation = makeConversation();
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
     const message3 = { ...catchUpMessage, message_id: 'm3', sequence_id: 3, content: [{ type: 'text', text: 'middle message' }] } as Message;
     const message4 = { ...catchUpMessage, message_id: 'm4', sequence_id: 4, content: [{ type: 'text', text: 'new tail message' }] } as Message;
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
@@ -582,7 +591,7 @@ describe('ConversationPage archived read-only rendering', () => {
     vi.mocked(api.getConversationMessagesLatest).mockRejectedValue(
       new MessageSliceAlignmentError('Aligned message slice exceeds the server response ceiling of 100 messages'),
     );
-    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+    vi.mocked(api.getConversation).mockResolvedValue({
       conversation: archivedConversation,
       messages: [historyMessage, fallbackMessage],
       agent_working: false,
@@ -608,7 +617,8 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByTestId('history-message-count')).toHaveTextContent('2');
     expect(screen.getByTestId('history-has-older')).toHaveTextContent('no');
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-    await waitFor(() => expect(api.getConversationBySlug).toHaveBeenCalledWith(slug));
+    await waitFor(() => expect(api.getConversation).toHaveBeenCalledWith(archivedConversation.id));
+    expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
   it('does not fall back to a full fetch for unrelated latest-window cold-load failures', async () => {
@@ -741,8 +751,36 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByText('keep this history visible')).toBeInTheDocument();
   });
 
+  it('cold alignment fallback fetches full conversation by metadata id without re-resolving slug', async () => {
+    const uuidRoute = '11111111-2222-4333-8444-555555555555';
+    const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-fallback', transcript_generation: 7 });
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([]);
+    vi.mocked(api.getConversationMeta).mockResolvedValue({
+      conversation: uuidConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockRejectedValue(new MessageSliceAlignmentError('misaligned'));
+    vi.mocked(api.getConversation).mockResolvedValue({
+      conversation: uuidConversation,
+      messages: [historyMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(uuidConversation, uuidRoute);
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    await waitFor(() => expect(api.getConversation).toHaveBeenCalledWith(uuidRoute));
+    expect(api.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+  });
+
   it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
-    const cachedConversation = makeConversation();
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
     vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
     vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);

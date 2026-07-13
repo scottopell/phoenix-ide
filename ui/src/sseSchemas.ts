@@ -207,7 +207,7 @@ export const SseMessageDataSchema = v.looseObject({
 export const SseMessageUpdatedDataSchema = v.looseObject({
   sequence_id: v.number(),
   message_id: v.string(),
-  transcript_generation: v.number(),
+  transcript_generation: v.nullable(v.number()),
   display_data: v.nullable(v.unknown()),
   content: v.nullable(v.unknown()),
   duration_ms: v.exactOptional(v.number()),

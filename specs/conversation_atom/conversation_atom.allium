@@ -99,6 +99,8 @@ entity ConversationAtom {
     conversationId: String?
     phase: Phase
     messages: List<Message>
+    transcriptGeneration: Integer?
+    transcriptCoverage: String
     lastSequenceId: Integer
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
@@ -403,7 +405,7 @@ rule SseMessageReplayDropped {
 -- reconnect race could reorder — tolerating the no-op is safer than
 -- erroring).
 rule SseMessageUpdatedApplied {
-    when: SseMessageUpdatedDispatched(atom, messageId, seq)
+    when: SseMessageUpdatedDispatched(atom, messageId, seq, transcriptGeneration)
 
     requires: seq > atom.lastSequenceId
     requires: message_in_list(atom.messages, messageId)
@@ -411,16 +413,20 @@ rule SseMessageUpdatedApplied {
     ensures: atom.messages = replace_message(atom.messages, messageId)
     ensures: atom.lastSequenceId = seq
     ensures: atom.streamingBuffer = atom.streamingBuffer
+    ensures: transcriptGeneration != null implies atom.transcriptGeneration = transcriptGeneration
+    ensures: transcriptGeneration = null implies atom.transcriptGeneration = atom.transcriptGeneration
 }
 
 rule SseMessageUpdatedUnknownTarget {
-    when: SseMessageUpdatedDispatched(atom, messageId, seq)
+    when: SseMessageUpdatedDispatched(atom, messageId, seq, transcriptGeneration)
 
     requires: seq > atom.lastSequenceId
     requires: not message_in_list(atom.messages, messageId)
 
     ensures: atom.messages = atom.messages
     ensures: atom.lastSequenceId = seq
+    ensures: transcriptGeneration != null implies atom.transcriptGeneration = transcriptGeneration
+    ensures: transcriptGeneration = null implies atom.transcriptGeneration = atom.transcriptGeneration
 }
 
 -- `state_change` — phase transition from the server.

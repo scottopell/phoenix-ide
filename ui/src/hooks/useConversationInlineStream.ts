@@ -194,7 +194,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             type: 'sse_message_updated',
             sequenceId: data.sequence_id,
             messageId: data.message_id,
-            transcriptGeneration: data.transcript_generation,
+            ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
             ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
             ...(data.content != null && { content: data.content as Message['content'] }),
             ...(data.duration_ms != null && { durationMs: data.duration_ms }),
