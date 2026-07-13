@@ -503,6 +503,7 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
             &authority,
             Timestamp(5),
             attempt.id,
+            terminal_codec(),
             WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
                 identity: TmuxResourceIdentity {
                     work_scope: scope(),
@@ -592,7 +593,13 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         final_tail: vec!["hung"],
     });
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(6), attempt.id, evidence),
+        workflow.record_observation(
+            &authority,
+            Timestamp(6),
+            attempt.id,
+            terminal_codec(),
+            evidence
+        ),
         AuthorityOutcome::Authorized
     );
     let effect = &workflow.effects[&REGISTRATION_EFFECT_ID];

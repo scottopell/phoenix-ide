@@ -563,6 +563,7 @@ pub fn cancellation_request(
             barrier_id: None,
             kind: ReducerInboxKind::ReceiptAccepted,
             event_codec: terminal_codec(),
+            requires_runtime_acceptance: false,
             payload: ReducerInboxPayload::Receipt(cancelled_terminal),
         }],
         compensation_plan: TransitionPlan {
