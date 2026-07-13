@@ -14,7 +14,10 @@ pub mod probe;
 pub mod registry;
 pub mod run;
 
-pub use registry::{TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxServer};
+pub use registry::{
+    TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxServer,
+    TmuxTerminalInspection, TmuxWindowIdentity,
+};
 pub use run::TmuxRunTool;
 
 // `cascade_tmux_on_delete`, `socket_path_for`, `CascadeReport`, and

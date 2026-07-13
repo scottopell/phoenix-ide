@@ -29,11 +29,11 @@
 //! serialises concurrent `ensure_live` calls on the same `WorkScope`;
 //! the second caller observes `Live` after the first one finishes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::WorkScope;
@@ -71,6 +71,8 @@ pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
 /// left untouched.
 const COMPANION_ENV_VERSION: &str = "1";
 const COMPANION_VERSION_VAR: &str = "PHOENIX_COMPANION_VERSION";
+const SERVER_GENERATION_VAR: &str = "PHOENIX_TMUX_SERVER_GENERATION";
+const TERMINAL_CAPTURE_START: &str = "-2000";
 
 /// Errors surfaced by the tmux registry. The tmux tool translates these
 /// into the stable error envelope on the agent's response.
@@ -125,6 +127,23 @@ pub enum ServerStatus {
 /// invariant). For `WorkScope::Worktree(path)` the path is keyed to the
 /// worktree; for `WorkScope::Conversation(id)` it falls back to the
 /// conversation id (task 03001 / REQ-TMUX-WS-001).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TmuxWindowIdentity {
+    pub work_scope: WorkScope,
+    pub server_generation: String,
+    pub window_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxTerminalInspection {
+    Live,
+    Terminal {
+        exit_code: i32,
+        final_tail: Vec<String>,
+    },
+    Missing,
+}
+
 #[derive(Debug)]
 pub struct TmuxServer {
     /// The scope this server belongs to. Diagnostic field — the
@@ -137,6 +156,7 @@ pub struct TmuxServer {
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
     pub status: ServerStatus,
+    pub server_generation: Option<String>,
 }
 
 impl TmuxServer {
@@ -145,6 +165,7 @@ impl TmuxServer {
             work_scope,
             socket_path,
             status: ServerStatus::NotProbed,
+            server_generation: None,
         }
     }
 }
@@ -217,6 +238,7 @@ pub struct TmuxRegistry {
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
+    registered_windows: RwLock<HashSet<TmuxWindowIdentity>>,
     socket_dir: PathBuf,
     binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
@@ -251,6 +273,7 @@ impl TmuxRegistry {
         let binary_available = which::which("tmux").is_ok();
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashSet::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -300,6 +323,7 @@ impl TmuxRegistry {
     pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashSet::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -320,6 +344,7 @@ impl TmuxRegistry {
     ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashSet::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -483,11 +508,21 @@ impl TmuxRegistry {
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
+                let generation = ensure_server_generation(&server.socket_path).await;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = new_server_generation();
+                spawn_session_with_generation(
+                    &server.socket_path,
+                    &self.config_path(),
+                    cwd,
+                    &generation,
+                )
+                .await?;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -499,7 +534,15 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = new_server_generation();
+                spawn_session_with_generation(
+                    &server.socket_path,
+                    &self.config_path(),
+                    cwd,
+                    &generation,
+                )
+                .await?;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
         }
@@ -621,6 +664,38 @@ impl TmuxRegistry {
     pub async fn get_existing(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<TmuxServer>>> {
         let key = work_scope.stable_key();
         self.inner.read().await.get(&key).cloned()
+    }
+
+    pub async fn register_window(&self, identity: TmuxWindowIdentity) {
+        self.registered_windows.write().await.insert(identity);
+    }
+
+    pub async fn has_registered_window(&self, identity: &TmuxWindowIdentity) -> bool {
+        self.registered_windows.read().await.contains(identity)
+    }
+
+    pub async fn inspect_window(&self, identity: &TmuxWindowIdentity) -> TmuxTerminalInspection {
+        if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
+            return TmuxTerminalInspection::Missing;
+        }
+
+        let socket_path = self.derived_socket_path(&identity.work_scope);
+        match probe(&socket_path).await {
+            Ok(ProbeResult::Live) => {}
+            Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket) | Err(_) => {
+                return TmuxTerminalInspection::Missing;
+            }
+        }
+        let Some(observed_generation) = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await
+        else {
+            return TmuxTerminalInspection::Missing;
+        };
+
+        if observed_generation != identity.server_generation {
+            return TmuxTerminalInspection::Missing;
+        }
+
+        inspect_tmux_window(&socket_path, &identity.window_id).await
     }
 
     /// Deterministic socket path for a `WorkScope`, derived the same way
@@ -812,13 +887,14 @@ pub async fn cascade_tmux_on_delete(
 /// the Phoenix process environment, which would leak server secrets (LLM API
 /// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
 /// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+fn set_tmux_server_env(cmd: &mut tokio::process::Command, generation: &str) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     cmd.env_clear();
     cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
+    cmd.env(SERVER_GENERATION_VAR, generation);
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -942,6 +1018,81 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
     .await;
 }
 
+fn new_server_generation() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("srv-{nanos}-{}", uuid::Uuid::new_v4())
+}
+
+async fn ensure_server_generation(socket_path: &Path) -> String {
+    if let Some(generation) = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await {
+        return generation;
+    }
+    let generation = new_server_generation();
+    run_tmux_quiet(
+        socket_path,
+        &[
+            "set-environment",
+            "-g",
+            SERVER_GENERATION_VAR,
+            generation.as_str(),
+        ],
+    )
+    .await;
+    generation
+}
+
+async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTerminalInspection {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "capture-pane",
+            "-p",
+            "-t",
+            window_id,
+            "-S",
+            TERMINAL_CAPTURE_START,
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return TmuxTerminalInspection::Missing;
+    };
+    if !output.status.success() {
+        return TmuxTerminalInspection::Missing;
+    }
+    let captured = String::from_utf8_lossy(&output.stdout);
+    if let Some(exit_code) = parse_exit_marker(&captured) {
+        return TmuxTerminalInspection::Terminal {
+            exit_code,
+            final_tail: captured
+                .lines()
+                .rev()
+                .take(20)
+                .map(str::to_string)
+                .collect(),
+        };
+    }
+    TmuxTerminalInspection::Live
+}
+
+fn parse_exit_marker(output: &str) -> Option<i32> {
+    const PREFIX: &str = "[phoenix] process exited with code ";
+    output.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(PREFIX)
+            .and_then(|code| code.parse::<i32>().ok())
+    })
+}
+
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` with `cwd` as the pane's start directory
 /// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
@@ -963,6 +1114,16 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
+    let generation = new_server_generation();
+    spawn_session_with_generation(socket_path, config_path, cwd, &generation).await
+}
+
+async fn spawn_session_with_generation(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    generation: &str,
+) -> Result<(), TmuxError> {
     let mut cmd = tokio::process::Command::new("tmux");
     cmd.args([
         "-f",
@@ -981,7 +1142,7 @@ pub async fn spawn_session(
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd);
+    set_tmux_server_env(&mut cmd, generation);
     let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

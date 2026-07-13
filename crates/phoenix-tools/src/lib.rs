@@ -48,7 +48,7 @@ pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
 pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
-    TmuxTool,
+    TmuxTerminalInspection, TmuxTool, TmuxWindowIdentity,
 };
 
 use async_trait::async_trait;

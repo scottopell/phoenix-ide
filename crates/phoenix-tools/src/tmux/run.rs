@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
+use super::registry::TmuxWindowIdentity;
 use super::TmuxError;
 use crate::{Tool, ToolContext, ToolOutput};
 
@@ -163,10 +164,11 @@ impl Tool for TmuxRunTool {
         };
 
         let cwd = effective_file_root(&ctx);
-        let (config_path, socket_path) = match resolve_tmux_paths(&ctx, &cwd).await {
-            Ok(paths) => paths,
-            Err(out) => return out,
-        };
+        let (config_path, socket_path, server_generation) =
+            match resolve_tmux_paths(&ctx, &cwd).await {
+                Ok(paths) => paths,
+                Err(out) => return out,
+            };
         let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
         let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
         let target = match start_tmux_window(
@@ -182,6 +184,13 @@ impl Tool for TmuxRunTool {
             Ok(name) => name,
             Err(out) => return out,
         };
+
+        let identity = TmuxWindowIdentity {
+            work_scope: ctx.work_scope.clone(),
+            server_generation: server_generation.clone(),
+            window_id: target.window_id.clone(),
+        };
+        ctx.tmux_registry().register_window(identity).await;
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
@@ -253,7 +262,7 @@ fn effective_file_root(ctx: &ToolContext) -> PathBuf {
 async fn resolve_tmux_paths(
     ctx: &ToolContext,
     cwd: &Path,
-) -> Result<(PathBuf, PathBuf), ToolOutput> {
+) -> Result<(PathBuf, PathBuf, String), ToolOutput> {
     let server_arc = match ctx.tmux_registry().ensure_live(&ctx.work_scope, cwd).await {
         Ok(arc) => arc,
         Err(TmuxError::BinaryUnavailable) => {
@@ -264,11 +273,26 @@ async fn resolve_tmux_paths(
         }
         Err(e) => return Err(error_envelope("tmux_server_unavailable", &e.to_string())),
     };
-    let socket_path = {
+    let (socket_path, server_generation) = {
         let server = server_arc.read().await;
-        server.socket_path.clone()
+        (
+            server.socket_path.clone(),
+            match server.server_generation.clone() {
+                Some(generation) => generation,
+                None => {
+                    return Err(error_envelope(
+                        "tmux_server_unavailable",
+                        "live tmux server has no durable generation",
+                    ));
+                }
+            },
+        )
     };
-    Ok((ctx.tmux_registry().config_path(), socket_path))
+    Ok((
+        ctx.tmux_registry().config_path(),
+        socket_path,
+        server_generation,
+    ))
 }
 
 async fn start_tmux_window(
@@ -627,7 +651,9 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::registry::socket_path_for_worktree;
+    use crate::tmux::registry::{
+        socket_path_for_worktree, TmuxTerminalInspection, TmuxWindowIdentity,
+    };
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -768,7 +794,7 @@ mod tests {
         let ctx = ctx(
             "tmux-run-quick-failure",
             cwd_tmp.path().canonicalize().unwrap(),
-            registry,
+            registry.clone(),
             None,
         );
 
@@ -801,6 +827,31 @@ mod tests {
             "pane output: {pane}"
         );
         assert_eq!(v["captured_output"]["truncated"], false);
+
+        let scope =
+            phoenix_core::work_scope::WorkScope::Conversation("tmux-run-quick-failure".to_string());
+        let server_generation = registry
+            .get_existing(&scope)
+            .await
+            .expect("server registered")
+            .read()
+            .await
+            .server_generation
+            .clone()
+            .expect("generation installed");
+        let identity = TmuxWindowIdentity {
+            work_scope: scope,
+            server_generation,
+            window_id: v["window_id"].as_str().unwrap().to_string(),
+        };
+        assert!(
+            registry.has_registered_window(&identity).await,
+            "tmux_run must register the exact window identity"
+        );
+        assert!(matches!(
+            registry.inspect_window(&identity).await,
+            TmuxTerminalInspection::Terminal { exit_code: 7, .. }
+        ));
 
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
@@ -1029,6 +1080,84 @@ mod tests {
         .unwrap();
         assert_eq!(String::from_utf8_lossy(&display.stdout).trim(), "main");
         kill_socket(&socket_path).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_inspection_rejects_stale_generation_and_recovers_after_restart() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-restart-inspect",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry.clone(),
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo restart-inspect; exit 3",
+                    "name": "tmux-run-restart-inspect",
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": EXIT_MARKER_PREFIX,
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        let scope = phoenix_core::work_scope::WorkScope::Conversation(
+            "tmux-run-restart-inspect".to_string(),
+        );
+        let generation = registry
+            .get_existing(&scope)
+            .await
+            .expect("server")
+            .read()
+            .await
+            .server_generation
+            .clone()
+            .expect("generation");
+        let identity = TmuxWindowIdentity {
+            work_scope: scope.clone(),
+            server_generation: generation.clone(),
+            window_id: v["window_id"].as_str().unwrap().to_string(),
+        };
+        let stale = TmuxWindowIdentity {
+            server_generation: "stale-generation".to_string(),
+            ..identity.clone()
+        };
+        assert_eq!(
+            registry.inspect_window(&stale).await,
+            TmuxTerminalInspection::Missing
+        );
+
+        let restarted = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        assert!(
+            restarted.get_existing(&scope).await.is_none(),
+            "new registry simulates Phoenix restart"
+        );
+        assert!(matches!(
+            restarted.inspect_window(&identity).await,
+            TmuxTerminalInspection::Terminal { exit_code: 3, .. }
+        ));
+        assert!(
+            restarted.get_existing(&scope).await.is_none(),
+            "read-only inspection must not materialize registry inventory"
+        );
+
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-restart-inspect.sock")).await;
     }
 
     #[tokio::test]
