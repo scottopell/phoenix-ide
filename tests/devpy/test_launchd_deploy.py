@@ -71,7 +71,9 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         label="test.phoenix.server", helper_label="test.phoenix.deploy", uid=os.getuid(), health_url="http://127.0.0.1:1/api/version",
         health_insecure_tls=False, active_path=str(root / "active"), status_path=str(root / "status.json"),
         previous_health_url="http://127.0.0.1:2/api/version", previous_health_insecure_tls=False,
+        previous_health_json=True,
         deployed_sha_path=str(root / "deployed.sha"), lock_path=str(root / "activate.lock"),
+        claim_lock_path=str(root / "claim.lock"),
         created_at="2026-01-01T00:00:00+00:00", transition_timeout_secs=0.1, health_timeout_secs=0.1,
     )
 
@@ -316,7 +318,8 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td)), \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"), \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"):
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"):
             self.dev._claim_launchd_deploy("first")
             self.assertFalse(self.dev._release_launchd_deploy_claim("second"))
             self.assertEqual("first", self.dev._deploy_claim_owner())
@@ -383,7 +386,44 @@ class PreparationTests(unittest.TestCase):
                 manifest, manifest.previous,
                 health_url=manifest.previous_health_url,
                 health_insecure_tls=manifest.previous_health_insecure_tls,
+                health_json=manifest.previous_health_json,
             )
+
+    def test_rollback_plist_is_parsed_before_disruption(self):
+        FakeLaunchctl.events = []
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.rollback_plist).write_text("not a plist")
+            Path(manifest.target_binary).write_bytes(b"installed")
+            manifest = helper.dataclasses.replace(
+                manifest, rollback_plist_sha256=helper.sha256(Path(manifest.rollback_plist))
+            )
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl):
+                with self.assertRaises(Exception):
+                    helper.activate(manifest)
+            self.assertEqual([], FakeLaunchctl.events)
+
+    def test_legacy_identity_uses_public_version_and_deployed_sha(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return b"0.9.0"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "PROD_SHA_PATH", Path(td) / "deployed.sha"), \
+             mock.patch("urllib.request.urlopen", return_value=Response()):
+            self.dev.PROD_SHA_PATH.write_text("abc123\n")
+            identity, url, insecure = self.dev._legacy_prod_identity({"PHOENIX_PORT": "9123"})
+        self.assertEqual({"version": "0.9.0", "git_sha": "abc123"}, identity)
+        self.assertEqual("http://localhost:9123/version", url)
+        self.assertFalse(insecure)
+
+    def test_legacy_rollback_verification_uses_plain_version_body(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = helper.dataclasses.replace(make_manifest(Path(td)), previous_health_json=False)
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "fetch_identity", return_value=manifest.previous) as fetch:
+                helper.restore(manifest, launchctl)
+            self.assertEqual(manifest.previous.git_sha, fetch.call_args.kwargs["expected_git_sha"])
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

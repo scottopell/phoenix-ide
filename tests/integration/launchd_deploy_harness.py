@@ -147,7 +147,9 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
         "label": target_label, "helper_label": helper_label, "uid": os.getuid(), "health_url": url,
         "health_insecure_tls": False, "active_path": str(active), "status_path": str(status),
         "previous_health_url": url, "previous_health_insecure_tls": False,
+        "previous_health_json": True,
         "deployed_sha_path": str(root / f"deployed-{suffix}.sha"), "lock_path": str(root / f"lock-{suffix}"),
+        "claim_lock_path": str(root / f"claim-lock-{suffix}"),
         "created_at": "2026-01-01T00:00:00+00:00", "transition_timeout_secs": 10,
         "health_timeout_secs": 2 if not healthy_candidate else 10,
     }

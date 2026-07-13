@@ -60,10 +60,12 @@ class Manifest:
     health_insecure_tls: bool
     previous_health_url: Optional[str]
     previous_health_insecure_tls: Optional[bool]
+    previous_health_json: Optional[bool]
     active_path: str
     status_path: str
     deployed_sha_path: str
     lock_path: str
+    claim_lock_path: str
     created_at: str
     transition_timeout_secs: float = 30.0
     health_timeout_secs: float = 30.0
@@ -222,9 +224,16 @@ class Launchctl:
         return pid
 
 
-def fetch_identity(url: str, timeout: float = 2.0, insecure_tls: bool = False) -> Identity:
+def fetch_identity(
+    url: str,
+    timeout: float = 2.0,
+    insecure_tls: bool = False,
+    expected_git_sha: Optional[str] = None,
+) -> Identity:
     context = ssl._create_unverified_context() if insecure_tls else None
     with urllib.request.urlopen(url, timeout=timeout, context=context) as response:
+        if expected_git_sha is not None:
+            return Identity(version=response.read().decode().strip(), git_sha=expected_git_sha)
         body = json.load(response)
     try:
         return Identity(version=str(body["version"]), git_sha=str(body["git_sha"]))
@@ -238,6 +247,7 @@ def wait_for_identity(
     *,
     health_url: Optional[str] = None,
     health_insecure_tls: Optional[bool] = None,
+    health_json: bool = True,
 ) -> None:
     deadline = time.monotonic() + manifest.health_timeout_secs
     url = health_url or manifest.health_url
@@ -245,7 +255,11 @@ def wait_for_identity(
     last = "not responding"
     while time.monotonic() < deadline:
         try:
-            actual = fetch_identity(url, insecure_tls=insecure_tls)
+            actual = fetch_identity(
+                url,
+                insecure_tls=insecure_tls,
+                expected_git_sha=None if health_json else expected.git_sha,
+            )
             last = f"version={actual.version} git_sha={actual.git_sha}"
             if actual == expected:
                 return
@@ -279,25 +293,34 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
     atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
     old_pid = launchctl.inspect()[1]
     launchctl.start(old_pid)
-    if manifest.previous_health_url is None or manifest.previous_health_insecure_tls is None:
+    if (
+        manifest.previous_health_url is None
+        or manifest.previous_health_insecure_tls is None
+        or manifest.previous_health_json is None
+    ):
         raise ActivationError("previous endpoint is unavailable")
     wait_for_identity(
         manifest,
         manifest.previous,
         health_url=manifest.previous_health_url,
         health_insecure_tls=manifest.previous_health_insecure_tls,
+        health_json=manifest.previous_health_json,
     )
 
 
 def release_claim(manifest: Manifest) -> bool:
     claim = Path(manifest.active_path)
-    try:
-        if claim.read_text().strip() != manifest.transaction_id:
+    claim_lock = Path(manifest.claim_lock_path)
+    claim_lock.parent.mkdir(parents=True, exist_ok=True)
+    with claim_lock.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if claim.read_text().strip() != manifest.transaction_id:
+                return False
+            claim.unlink()
+            return True
+        except FileNotFoundError:
             return False
-        claim.unlink()
-        return True
-    except FileNotFoundError:
-        return False
 
 
 def request_helper_bootout(uid: int, helper_label: str) -> None:
@@ -321,9 +344,18 @@ def activate(manifest: Manifest) -> str:
             candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
             with candidate_plist.open("rb") as stream:
                 plistlib.load(stream)
-            if Path(manifest.target_binary).exists():
+            if manifest.previous is not None:
                 verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
-                verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
+                rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
+                with rollback_plist.open("rb") as stream:
+                    plistlib.load(stream)
+            elif any((
+                manifest.rollback_binary,
+                manifest.rollback_binary_sha256,
+                manifest.rollback_plist,
+                manifest.rollback_plist_sha256,
+            )):
+                raise ActivationError("first-install rollback inputs are inconsistent")
         except Exception as exc:
             write_status(manifest, "precondition_failed", failure=str(exc))
             raise

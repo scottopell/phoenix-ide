@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import contextlib
 import dataclasses
 import datetime
 import fcntl
@@ -196,6 +197,7 @@ PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 LAUNCHD_DEPLOY_DIR = Path.home() / ".phoenix-ide" / "deploy"
 LAUNCHD_DEPLOY_STATUS_PATH = LAUNCHD_DEPLOY_DIR / "status.json"
 LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
+LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
@@ -7129,6 +7131,25 @@ def _launchd_health_probe(env: dict[str, str]) -> tuple[str, bool]:
     )
 
 
+def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, bool] | None:
+    import ssl
+    import urllib.request
+
+    source_sha = PROD_SHA_PATH.read_text().strip() if PROD_SHA_PATH.exists() else ""
+    if not source_sha:
+        return None
+    url = _prod_local_health_url(env)
+    context = ssl._create_unverified_context() if tls_enabled_from_env(env) else None
+    try:
+        with urllib.request.urlopen(url, timeout=2, context=context) as response:
+            version = response.read().decode().strip()
+        if not version:
+            return None
+        return {"version": version, "git_sha": source_sha}, url, tls_enabled_from_env(env)
+    except Exception:
+        return None
+
+
 def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
     import ssl
     import urllib.request
@@ -7225,6 +7246,16 @@ _DEPLOY_TERMINAL_STATES = {
 }
 
 
+@contextlib.contextmanager
+def _launchd_claim_lock():
+    import fcntl
+
+    LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with LAUNCHD_DEPLOY_CLAIM_LOCK_PATH.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def _deploy_claim_owner() -> str | None:
     try:
         return LAUNCHD_DEPLOY_ACTIVE_PATH.read_text().strip() or None
@@ -7232,7 +7263,7 @@ def _deploy_claim_owner() -> str | None:
         return None
 
 
-def _release_launchd_deploy_claim(transaction_id: str) -> bool:
+def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
     if _deploy_claim_owner() != transaction_id:
         return False
     try:
@@ -7242,32 +7273,34 @@ def _release_launchd_deploy_claim(transaction_id: str) -> bool:
         return False
 
 
+def _release_launchd_deploy_claim(transaction_id: str) -> bool:
+    with _launchd_claim_lock():
+        return _release_launchd_deploy_claim_unlocked(transaction_id)
+
+
 def _claim_launchd_deploy(transaction_id: str) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
-    for _attempt in range(2):
+    with _launchd_claim_lock():
         owner = _deploy_claim_owner()
         if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
             try:
                 status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
                 if status.get("transaction_id") == owner and status.get("state") in _DEPLOY_TERMINAL_STATES:
-                    _release_launchd_deploy_claim(owner)
+                    _release_launchd_deploy_claim_unlocked(owner)
+                    owner = None
             except (OSError, json.JSONDecodeError):
                 pass
-        try:
-            fd = os.open(LAUNCHD_DEPLOY_ACTIVE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(transaction_id + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            return
-        except FileExistsError:
-            continue
-    owner = _deploy_claim_owner() or "unknown"
-    raise SystemExit(
-        f"another launchd deployment ({owner}) is active or needs recovery. "
-        "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
-    )
+        if owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
+            raise SystemExit(
+                f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
+                "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
+            )
+        fd = os.open(LAUNCHD_DEPLOY_ACTIVE_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(transaction_id + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
 
 def _write_json_atomic(path: Path, value: dict) -> None:
@@ -7408,13 +7441,20 @@ def launchd_prod_deploy(release: str | None = None):
             rollback_plist.chmod(0o600)
         previous_identity = _current_prod_identity(launchd_env)
         previous_health_url, previous_health_insecure_tls = _launchd_health_probe(launchd_env)
+        previous_health_json = previous_identity is not None
         if target_binary.exists() and previous_identity is None:
-            try:
-                previous_identity = _binary_identity(target_binary)
-            except (OSError, subprocess.SubprocessError, SystemExit) as exc:
-                raise SystemExit(
-                    "installed production identity is unavailable; refusing an unverifiable rollback"
-                ) from exc
+            legacy = _legacy_prod_identity(launchd_env)
+            if legacy is not None:
+                previous_identity, previous_health_url, previous_health_insecure_tls = legacy
+                previous_health_json = False
+            else:
+                try:
+                    previous_identity = _binary_identity(target_binary)
+                    previous_health_json = True
+                except (OSError, subprocess.SubprocessError, SystemExit) as exc:
+                    raise SystemExit(
+                        "installed production identity is unavailable; refusing an unverifiable rollback"
+                    ) from exc
 
         helper = staging / "activate.py"
         _materialize_helper(source_commit, helper, source_kind)
@@ -7451,10 +7491,12 @@ def launchd_prod_deploy(release: str | None = None):
             "health_insecure_tls": health_insecure_tls,
             "previous_health_url": previous_health_url if previous_identity is not None else None,
             "previous_health_insecure_tls": previous_health_insecure_tls if previous_identity is not None else None,
+            "previous_health_json": previous_health_json if previous_identity is not None else None,
             "active_path": str(LAUNCHD_DEPLOY_ACTIVE_PATH),
             "status_path": str(LAUNCHD_DEPLOY_STATUS_PATH),
             "deployed_sha_path": str(PROD_SHA_PATH),
             "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
+            "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
