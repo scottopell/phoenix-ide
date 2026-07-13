@@ -535,7 +535,7 @@ pub fn creation_plan(
                 text: oracle.intent.initial_text.clone(),
             },
             oracle.generation,
-            EffectAmbiguity::SafeRepeatability,
+            EffectAmbiguity::ExternalIdempotency,
             None,
         ));
         effects.push(effect(
@@ -545,7 +545,7 @@ pub fn creation_plan(
                 conversation_id: oracle.intent.conversation_id.clone(),
             },
             oracle.generation,
-            EffectAmbiguity::ObservableReconciliation,
+            EffectAmbiguity::ExternalIdempotency,
             None,
         ));
         effects.push(effect(
@@ -564,7 +564,7 @@ pub fn creation_plan(
     let mut dependencies = vec![
         dependency(RESERVE_WORKTREE, RESOLVE_REPOSITORY),
         dependency(MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
-        dependency(FINALIZE_ATTACHMENTS, MATERIALIZE_OR_RECONCILE_WORKTREE),
+        dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
         dependency(COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
     ];
@@ -612,7 +612,7 @@ fn base_effects(intent: &CreationIntent, generation: u64) -> Vec<EffectDecl<Crea
                 repository_path: intent.repository_path.clone(),
             },
             generation,
-            EffectAmbiguity::SafeRepeatability,
+            EffectAmbiguity::ObservableReconciliation,
             None,
         ),
         effect(
@@ -765,9 +765,9 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
         dependencies: vec![
             dependency(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME),
             dependency(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS),
-            dependency(RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE),
-            dependency(FINISH_CANCELLATION_OR_DELETION, RELEASE_RESERVATION),
+            dependency(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE),
             dependency(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS),
+            dependency(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION),
         ],
         barriers: vec![BarrierDecl {
             barrier_id: COMPENSATION_BARRIER_ID,
@@ -986,8 +986,10 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
             } else if id == BOOTSTRAP_RUNTIME {
                 if oracle.runtime_evidence.runtime_bootstrapped {
                     EffectPrediction::Completed
-                } else {
+                } else if oracle.stage >= AuthoritativeCreationStage::BootstrapInitialTurn {
                     EffectPrediction::Eligible
+                } else {
+                    EffectPrediction::Blocked
                 }
             } else if id == DISPATCH_INITIAL_LLM_REQUEST {
                 if oracle.runtime_evidence.initial_llm_dispatched {

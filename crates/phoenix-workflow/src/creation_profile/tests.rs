@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use crate::{
-    EffectRole, EngineError, ExecutionMode, SemanticAuthority, WorkflowBinding, WorkflowId,
+    EffectAmbiguity, EffectRole, EngineError, ExecutionMode, SemanticAuthority, WorkflowBinding,
+    WorkflowId,
 };
 
 use super::{
@@ -90,7 +91,7 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
     for edge in [
         (RESERVE_WORKTREE, RESOLVE_REPOSITORY),
         (MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
-        (FINALIZE_ATTACHMENTS, MATERIALIZE_OR_RECONCILE_WORKTREE),
+        (FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
         (COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         (COMMIT_METADATA, FINALIZE_ATTACHMENTS),
         (EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
@@ -198,9 +199,9 @@ fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
         .collect::<BTreeSet<_>>();
     assert!(dependencies.contains(&(DELETE_STAGED_ATTACHMENTS, REVOKE_RUNTIME)));
     assert!(dependencies.contains(&(REMOVE_OWNED_WORKTREE, DELETE_STAGED_ATTACHMENTS)));
-    assert!(dependencies.contains(&(RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE)));
-    assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, RELEASE_RESERVATION)));
+    assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, REMOVE_OWNED_WORKTREE)));
     assert!(dependencies.contains(&(FINISH_CANCELLATION_OR_DELETION, DELETE_STAGED_ATTACHMENTS)));
+    assert!(dependencies.contains(&(RELEASE_RESERVATION, FINISH_CANCELLATION_OR_DELETION)));
     assert_eq!(plan.barriers[0].barrier_id, COMPENSATION_BARRIER_ID);
     assert_eq!(plan.barrier_members.len(), 5);
 
@@ -244,6 +245,37 @@ fn compensation_projection_predicts_every_selected_effect() {
         predictions.get(&FINISH_CANCELLATION_OR_DELETION),
         Some(&EffectPrediction::Blocked)
     );
+}
+
+#[test]
+fn declared_effect_policies_and_prebootstrap_readiness_match_profile() {
+    let oracle = oracle(CreationKind::InitialTurn {
+        message_id: "msg-policy".to_owned(),
+    });
+    let adapter = adapt_authoritative_creation(WorkflowId(14), WorkflowId(81), &oracle)
+        .expect("initial-turn adapter");
+    let policies = adapter
+        .plan
+        .effects
+        .iter()
+        .map(|effect| (effect.effect_id, effect.ambiguity))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        policies.get(&RESOLVE_REPOSITORY),
+        Some(&EffectAmbiguity::ObservableReconciliation)
+    );
+    assert_eq!(
+        policies.get(&EXPAND_INITIAL_MESSAGE),
+        Some(&EffectAmbiguity::ExternalIdempotency)
+    );
+    assert_eq!(
+        policies.get(&BOOTSTRAP_RUNTIME),
+        Some(&EffectAmbiguity::ExternalIdempotency)
+    );
+    assert!(adapter
+        .projection
+        .effect_predictions
+        .contains(&(BOOTSTRAP_RUNTIME, EffectPrediction::Blocked)));
 }
 
 #[test]
