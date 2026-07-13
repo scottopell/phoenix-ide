@@ -46,6 +46,7 @@ vi.mock('../cache', () => ({
     getMessages: vi.fn(() => Promise.resolve([])),
     getMaxMessageSequenceId: vi.fn(() => Promise.resolve(null)),
     getAllConversations: vi.fn(() => Promise.resolve([])),
+    getReplicaMeta: vi.fn(() => Promise.resolve(null)),
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
     putMessages: vi.fn(() => Promise.resolve()),
@@ -364,6 +365,13 @@ describe('ConversationPage archived read-only rendering', () => {
     const cachedConversation = makeConversation();
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
     vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage, catchUpMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 2,
+      latestEventSequenceId: null,
+      transcriptGeneration: 1,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
     vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
       messages: [],
       tombstones: [],
@@ -392,12 +400,219 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByRole('button', { name: 'Load older messages' })).toBeInTheDocument();
   });
 
+  it('refreshes stale cached rows with authoritative latest when replica meta generation is missing or stale', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
+    const staleCachedTail = {
+      ...catchUpMessage,
+      content: [{ type: 'text', text: 'stale cached tail' }],
+    } as Message;
+    const authoritativeTail = {
+      ...catchUpMessage,
+      content: [{ type: 'text', text: 'authoritative tail' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage, staleCachedTail]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 2,
+      latestEventSequenceId: null,
+      transcriptGeneration: null,
+      lastHydratedAt: '2024-01-01T00:00:03Z',
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [authoritativeTail],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('authoritative tail')).toBeInTheDocument();
+    expect(screen.queryByText('stale cached tail')).not.toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).not.toHaveBeenCalled();
+    expect(api.getConversationMessagesLatest).toHaveBeenCalledWith(conversationId, 50);
+    expect(cacheDB.putMessages).toHaveBeenLastCalledWith([authoritativeTail]);
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId,
+          latestMessageSequenceId: 2,
+          transcriptGeneration: 7,
+        }),
+      );
+    });
+  });
+
+  it('keeps the warm incremental path when cached replica meta generation matches metadata', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesAfter)
+      .mockResolvedValueOnce({
+        messages: [catchUpMessage],
+        tombstones: [],
+        transcript_generation: 7,
+        server_message_tail: 2,
+        has_older_messages: false,
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        tombstones: [],
+        transcript_generation: 7,
+        server_message_tail: 2,
+        has_older_messages: false,
+      });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+      has_older_messages: false,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(api.getConversationMessagesLatest).toHaveBeenCalledWith(conversationId, 50);
+  });
+
+  it('retries cold latest-window load after metadata refresh when the transcript generation advances once', async () => {
+    const firstMetadata = makeConversation({ transcript_generation: 7 });
+    const refreshedMetadata = makeConversation({ transcript_generation: 8, updated_at: '2024-01-01T00:00:09Z' });
+    const authoritativeTail = {
+      ...catchUpMessage,
+      content: [{ type: 'text', text: 'refreshed latest tail' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug)
+      .mockResolvedValueOnce({
+        conversation: firstMetadata,
+        agent_working: false,
+        presentation_mode: 'idle',
+        context_window_size: 0,
+      })
+      .mockResolvedValueOnce({
+        conversation: refreshedMetadata,
+        agent_working: false,
+        presentation_mode: 'idle',
+        context_window_size: 0,
+      });
+    vi.mocked(api.getConversationMessagesLatest)
+      .mockResolvedValueOnce({
+        messages: [authoritativeTail],
+        tombstones: [],
+        transcript_generation: 8,
+        server_message_tail: 2,
+        has_older_messages: true,
+      })
+      .mockResolvedValueOnce({
+        messages: [authoritativeTail],
+        tombstones: [],
+        transcript_generation: 8,
+        server_message_tail: 2,
+        has_older_messages: true,
+      });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('refreshed latest tail')).toBeInTheDocument();
+    expect(screen.queryByText('Conversation transcript kept changing while loading')).not.toBeInTheDocument();
+    expect(api.getConversationMetaBySlug).toHaveBeenCalledTimes(3);
+    expect(api.getConversationMessagesLatest).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a changing-transcript error after three consecutive cold-load mismatches', async () => {
+    const metadata7 = makeConversation({ transcript_generation: 7 });
+    const metadata8 = makeConversation({ transcript_generation: 8, updated_at: '2024-01-01T00:00:08Z' });
+    const metadata9 = makeConversation({ transcript_generation: 9, updated_at: '2024-01-01T00:00:09Z' });
+    const latestTail = { ...catchUpMessage } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
+    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
+    vi.mocked(api.getConversationMetaBySlug)
+      .mockResolvedValueOnce({ conversation: metadata7, agent_working: false, presentation_mode: 'idle', context_window_size: 0 })
+      .mockResolvedValueOnce({ conversation: metadata8, agent_working: false, presentation_mode: 'idle', context_window_size: 0 })
+      .mockResolvedValueOnce({ conversation: metadata9, agent_working: false, presentation_mode: 'idle', context_window_size: 0 });
+    vi.mocked(api.getConversationMessagesLatest)
+      .mockResolvedValueOnce({ messages: [latestTail], tombstones: [], transcript_generation: 8, server_message_tail: 2, has_older_messages: true })
+      .mockResolvedValueOnce({ messages: [latestTail], tombstones: [], transcript_generation: 9, server_message_tail: 2, has_older_messages: true })
+      .mockResolvedValueOnce({ messages: [latestTail], tombstones: [], transcript_generation: 10, server_message_tail: 2, has_older_messages: true });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('Conversation transcript kept changing while loading')).toBeInTheDocument();
+    expect(api.getConversationMetaBySlug).toHaveBeenCalledTimes(3);
+    expect(api.getConversationMessagesLatest).toHaveBeenCalledTimes(3);
+  });
+
   it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
+    vi.mocked(api.getConversationMetaBySlug).mockReset();
+    vi.mocked(api.getConversationMessagesAfter).mockReset();
+    vi.mocked(api.getConversationMessagesLatest).mockReset();
+    vi.mocked(cacheDB.getConversationBySlug).mockReset();
+    vi.mocked(cacheDB.getMessages).mockReset();
+    vi.mocked(cacheDB.getReplicaMeta).mockReset();
     const cachedConversation = makeConversation({ transcript_generation: 7 });
     const message3 = { ...catchUpMessage, message_id: 'm3', sequence_id: 3, content: [{ type: 'text', text: 'middle message' }] } as Message;
     const message4 = { ...catchUpMessage, message_id: 'm4', sequence_id: 4, content: [{ type: 'text', text: 'new tail message' }] } as Message;
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
     vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
     vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
     vi.mocked(api.getConversationMessagesAfter).mockImplementation(async (_id, afterSequence) => (
       afterSequence < 2
@@ -523,54 +738,6 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
-  it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {
-    const mismatchConversation = makeConversation({ transcript_generation: 2 });
-    const staleLatestWindowMessage = {
-      ...catchUpMessage,
-      message_id: 'm-stale-latest-window',
-      sequence_id: 2,
-      content: [{ type: 'text', text: 'stale latest-window message' }],
-    } as Message;
-
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
-    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
-    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
-      conversation: mismatchConversation,
-      agent_working: false,
-      presentation_mode: 'idle',
-      context_window_size: 0,
-    });
-    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
-      messages: [staleLatestWindowMessage],
-      tombstones: [],
-      transcript_generation: 1,
-      server_message_tail: 2,
-      has_older_messages: true,
-    });
-
-    vi.mocked(cacheDB.putReplicaMeta).mockClear();
-    vi.mocked(cacheDB.putMessages).mockClear();
-
-    render(
-      <ConversationContext.Provider value={new ConversationStore()}>
-        <DraftContext.Provider value={new DraftStore()}>
-          <ConversationReadinessProvider>
-            <MemoryRouter initialEntries={[`/c/${slug}`]}>
-              <Routes>
-                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
-              </Routes>
-            </MemoryRouter>
-          </ConversationReadinessProvider>
-        </DraftContext.Provider>
-      </ConversationContext.Provider>,
-    );
-
-    expect(await screen.findByText('Conversation transcript changed while loading')).toBeInTheDocument();
-    expect(screen.queryByText('stale latest-window message')).not.toBeInTheDocument();
-    expect(cacheDB.putMessages).not.toHaveBeenCalledWith([staleLatestWindowMessage]);
-    expect(cacheDB.putReplicaMeta).not.toHaveBeenCalled();
-  });
-
   it('falls back to a full archived conversation fetch when cold latest-window load hits MessageSliceAlignmentError', async () => {
     const archivedConversation = makeConversation({ archived: true, transcript_generation: 3 });
     const fallbackMessage = {
@@ -651,54 +818,6 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('database offline')).toBeInTheDocument();
     expect(api.getConversationBySlug).not.toHaveBeenCalled();
-  });
-
-  it('rejects metadata/latest-window generation mismatches instead of merging stale latest-window messages', async () => {
-    const mismatchConversation = makeConversation({ transcript_generation: 2 });
-    const staleLatestWindowMessage = {
-      ...catchUpMessage,
-      message_id: 'm-stale-latest-window',
-      sequence_id: 2,
-      content: [{ type: 'text', text: 'stale latest-window message' }],
-    } as Message;
-
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(null);
-    vi.mocked(cacheDB.getConversation).mockResolvedValue(null);
-    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
-      conversation: mismatchConversation,
-      agent_working: false,
-      presentation_mode: 'idle',
-      context_window_size: 0,
-    });
-    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
-      messages: [staleLatestWindowMessage],
-      tombstones: [],
-      transcript_generation: 1,
-      server_message_tail: 2,
-      has_older_messages: true,
-    });
-
-    vi.mocked(cacheDB.putReplicaMeta).mockClear();
-    vi.mocked(cacheDB.putMessages).mockClear();
-
-    render(
-      <ConversationContext.Provider value={new ConversationStore()}>
-        <DraftContext.Provider value={new DraftStore()}>
-          <ConversationReadinessProvider>
-            <MemoryRouter initialEntries={[`/c/${slug}`]}>
-              <Routes>
-                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
-              </Routes>
-            </MemoryRouter>
-          </ConversationReadinessProvider>
-        </DraftContext.Provider>
-      </ConversationContext.Provider>,
-    );
-
-    expect(await screen.findByText('Conversation transcript changed while loading')).toBeInTheDocument();
-    expect(screen.queryByText('stale latest-window message')).not.toBeInTheDocument();
-    expect(cacheDB.putMessages).not.toHaveBeenCalledWith([staleLatestWindowMessage]);
-    expect(cacheDB.putReplicaMeta).not.toHaveBeenCalled();
   });
 
   it('rejects full-history responses when a slug resolves to a different conversation', async () => {
@@ -783,6 +902,13 @@ describe('ConversationPage archived read-only rendering', () => {
     const cachedConversation = makeConversation({ transcript_generation: 7 });
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
     vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
     vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
     vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
       messages: [catchUpMessage],

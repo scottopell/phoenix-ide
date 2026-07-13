@@ -466,6 +466,8 @@ function ConversationPageContent() {
   // them and the contract "these are per-slug state" is colocated.
   const seedHydratedRef = useRef<string | null>(null);
   const cachedMsgCountRef = useRef(0);
+  const cachedRowsGenerationRef = useRef<number | null>(null);
+  const cacheWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
   if (lastSlug !== slug) {
     setLastSlug(slug);
@@ -484,6 +486,8 @@ function ConversationPageContent() {
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
     cachedMsgCountRef.current = 0;
+    cachedRowsGenerationRef.current = null;
+    cacheWriteQueueRef.current = Promise.resolve();
   }
   // Terminal split-pane height — collapses to a 32px header strip.
   // Default collapsed: most conversations don't use the terminal, and an
@@ -653,12 +657,15 @@ function ConversationPageContent() {
         if (navigator.onLine && !cancelled) {
           const cachedConversationId = cached?.id ?? null;
           const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
-          const metadata = await getConversationMetaForRoute(slug);
+          const cachedReplicaMeta = cachedConversationId
+            ? await cacheDB.getReplicaMeta(cachedConversationId)
+            : null;
+          let metadata = await getConversationMetaForRoute(slug);
           if (cancelled) return;
-          const metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
-          const cachedTranscriptGeneration = cached?.transcript_generation ?? null;
-          const cacheGenerationMatchesMetadata = cachedTranscriptGeneration !== null
-            && cachedTranscriptGeneration === metadataTranscriptGeneration;
+          let metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
+          const cachedRowsTranscriptGeneration = cachedReplicaMeta?.transcriptGeneration ?? null;
+          const cacheGenerationMatchesMetadata = cachedRowsTranscriptGeneration !== null
+            && cachedRowsTranscriptGeneration === metadataTranscriptGeneration;
 
           if (hasCachedMessages && cachedConversationId && cacheGenerationMatchesMetadata) {
             try {
@@ -668,7 +675,7 @@ function ConversationPageContent() {
                 let contiguousTranscriptTail = mergedTranscriptTail;
                 let mergedMessages = cachedMessages;
                 let latestServerTail: number | null = null;
-                let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
+                let latestTranscriptGeneration = cachedRowsTranscriptGeneration;
 
                 while (!cancelled) {
                   const catchUp = await api.getConversationMessagesAfter(cachedConversationId, contiguousTranscriptTail, 200);
@@ -774,21 +781,25 @@ function ConversationPageContent() {
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
             let latestWindow;
-            try {
-              latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
-            } catch (error) {
-              if (!(error instanceof MessageSliceAlignmentError)) throw error;
-              const full = await api.getConversation(metadata.conversation.id);
-              latestWindow = {
-                messages: full.messages,
-                has_older_messages: false,
-                server_message_tail: latestMessageSequenceId(full.messages),
-                transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
-              };
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+              } catch (error) {
+                if (!(error instanceof MessageSliceAlignmentError)) throw error;
+                const full = await api.getConversation(metadata.conversation.id);
+                latestWindow = {
+                  messages: full.messages,
+                  has_older_messages: false,
+                  server_message_tail: latestMessageSequenceId(full.messages),
+                  transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
+                };
+              }
+              if (metadataTranscriptGeneration === latestWindow.transcript_generation) break;
+              if (attempt === 2) throw new Error('Conversation transcript kept changing while loading');
+              metadata = await getConversationMetaForRoute(slug);
+              metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
             }
-            if (metadataTranscriptGeneration !== latestWindow.transcript_generation) {
-              throw new Error('Conversation transcript changed while loading');
-            }
+            if (!latestWindow) throw new Error('Failed to load conversation messages');
             const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
               dispatchHistoryExpansion({
@@ -1113,17 +1124,31 @@ function ConversationPageContent() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [terminalPane]);
 
-  // Cache new messages as they arrive via SSE.
-  // (`cachedMsgCountRef` is declared with the per-slug reset block above so
-  //  it resets to 0 on slug change.)
   useEffect(() => {
-    const msgs = atom.messages;
-    if (msgs.length > cachedMsgCountRef.current) {
-      const newMsgs = msgs.slice(cachedMsgCountRef.current);
-      cachedMsgCountRef.current = msgs.length;
-      void cacheDB.putMessages(newMsgs);
-    }
-  }, [atom.messages]);
+    if (!atom.conversationId || atom.transcriptGeneration === null) return;
+    const generationChanged = cachedRowsGenerationRef.current !== atom.transcriptGeneration;
+    const rowsToWrite = generationChanged
+      ? atom.messages
+      : atom.messages.slice(cachedMsgCountRef.current);
+    cachedMsgCountRef.current = atom.messages.length;
+    cachedRowsGenerationRef.current = atom.transcriptGeneration;
+    if (rowsToWrite.length === 0) return;
+    const conversationId = atom.conversationId;
+    const transcriptGeneration = atom.transcriptGeneration;
+    const latestSequenceId = latestMessageSequenceId(atom.messages);
+    cacheWriteQueueRef.current = cacheWriteQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await cacheDB.putMessages(rowsToWrite);
+        await cacheDB.putReplicaMeta({
+          conversationId,
+          latestMessageSequenceId: latestSequenceId,
+          latestEventSequenceId: null,
+          transcriptGeneration,
+          lastHydratedAt: new Date().toISOString(),
+        });
+      });
+  }, [atom.conversationId, atom.messages, atom.transcriptGeneration]);
 
   // Cache conversation metadata when it changes
   useEffect(() => {

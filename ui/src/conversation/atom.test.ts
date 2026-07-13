@@ -1229,6 +1229,29 @@ describe('conversationReducer', () => {
       expect(next.messages[0]!.display_data).toBeNull();
       expect(next.transcriptGeneration).toBe(atom.transcriptGeneration);
     });
+
+    it('preserves existing display-data markers for ephemeral updates without transcript generation', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        display_data: { marker: 'keep' } as Record<string, unknown>,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastAppliedEventSeq: 30,
+        transcriptGeneration: 14,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 31,
+        messageId: original.message_id,
+        displayData: { marker: 'keep', ephemeral: true },
+      });
+
+      expect(next.messages[0]!.display_data).toEqual({ marker: 'keep', ephemeral: true });
+      expect(next.transcriptGeneration).toBe(14);
+    });
   });
 
   describe('sse_state_change', () => {
