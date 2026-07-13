@@ -273,7 +273,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
   });
 
-  it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
+  it('lets a focused large HTML file still toggle from line-aware source to sandboxed preview', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({
       ...textCommon,
@@ -282,14 +282,13 @@ describe('MetaViewer payload routing', () => {
       content: largeHtml,
       renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
+      focusRange: { startLine: 100, endLine: 110 },
     });
 
-    // Source view falls back to plain text for the large file...
-    expect(screen.getByTestId('viewer-large-text-fallback')).toBeInTheDocument();
-    // ...but switching to Preview must reach the iframe, not stay stranded on <pre>.
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(container.querySelector('iframe')).not.toBeNull();
-    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
+    expect(container.querySelector('.phoenix-file-codeview')).toBeNull();
   });
 
   it('routes an image payload to the image body', () => {

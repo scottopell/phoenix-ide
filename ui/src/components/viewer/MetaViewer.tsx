@@ -45,18 +45,20 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
 
+  const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
+  const [imageTakeover, setImageTakeover] = useState(false);
+
   // Pierre-backed payloads own their virtualized scroller and line identity — the
   // lineRef/contentRef machinery below (scroll restore, jump-to-line, select-all,
   // copy) is bypassed for them and handled by PhoenixFileCodeView via its typed
   // handle instead.
+  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const largeRangeFocus = focusRange !== undefined
     && textLike
-    && payload.renderMode === 'plainLargeText';
+    && payload.renderMode === 'plainLargeText'
+    && !htmlPreview;
   const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || largeRangeFocus;
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
-
-  const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
-  const [imageTakeover, setImageTakeover] = useState(false);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
@@ -235,7 +237,6 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // The plain-text fallback never applies to HTML preview: preview renders an
   // iframe (no per-line DOM cost), so a large HTML file must still reach it
   // rather than being stranded on the raw <pre>.
-  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
   const findEligible = (textLike && !htmlPreview) || largeFallback;
