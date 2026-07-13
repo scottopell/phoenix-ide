@@ -62,16 +62,4 @@ export {
   type SearchableSourceProjection,
 } from './searchProjections';
 export { useFindSession, type UseFindSessionOptions } from './useFindSession';
-export {
-  useViewerFind,
-  type UseViewerFindOptions,
-  type UseViewerFindReturn,
-  type ViewerFindNavigateContext,
-} from './useViewerFind';
 export { useViewerFindKeyboardShortcut } from './useViewerFindKeyboardShortcut';
-export {
-  initialViewerFindState,
-  viewerFindReducer,
-  type ViewerFindAction,
-  type ViewerFindState,
-} from './viewerFindReducer';

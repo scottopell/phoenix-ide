@@ -23,9 +23,14 @@ import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildBlockSearchProjection,
-  useViewerFind,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
+  type BlockSearchMatchTarget,
+  type FindSessionCommand,
 } from './viewer-find';
 import {
   X,
@@ -273,7 +278,6 @@ export function TaskApprovalReader({
     : null;
 
   const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
-  const find = useViewerFind({ text: '', resetKey: plan });
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
@@ -283,7 +287,6 @@ export function TaskApprovalReader({
     if (element) blockRefs.current.set(blockId, element);
     else blockRefs.current.delete(blockId);
   }, []);
-  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   // Focus note input when dialog opens
   useEffect(() => {
@@ -349,16 +352,48 @@ export function TaskApprovalReader({
     setShowNotesPanel(false);
   }, []);
 
+  const revealFindTarget = useCallback((target: BlockSearchMatchTarget) => {
+    queueMicrotask(() => {
+      blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
+    });
+  }, []);
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<BlockSearchMatchTarget, HTMLElement | null>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+        case 'clear-decorations':
+          break;
+        case 'restore-focus':
+          queueMicrotask(() => (command.focusOrigin ?? findButtonRef.current)?.focus());
+          break;
+        case 'reveal-match':
+          revealFindTarget(command.target);
+          break;
+      }
+    });
+  }, [revealFindTarget]);
+  const { state: findState, send: sendFind } = useFindSession<BlockSearchMatchTarget, HTMLElement | null>({
+    onCommands: handleFindCommands,
+  });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
+  const findSurfaceKey = useMemo(() => createSurfaceKey(`task-approval:${plan}`), [plan]);
+  const findProjection = useMemo(
+    () => (findOpen ? buildBlockSearchProjection(findablePlanBlocks, findQuery) : { sources: [], matches: [] }),
+    [findOpen, findablePlanBlocks, findQuery],
+  );
+  const findSessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, (match) => `${match.sourceId}:${match.start}:${match.end}`),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    find.open();
-  }, [find]);
-
-  const closeFind = useCallback(() => {
-    find.close();
-    const restoreTarget = findPreviousFocusRef.current;
-    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
-  }, [find]);
+    const focusOrigin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sendFind({ type: 'open', surface: { key: findSurfaceKey, query: '', matches: [], focusOrigin } });
+  }, [findSurfaceKey, sendFind]);
+  const closeFind = useCallback(() => sendFind({ type: 'close' }), [sendFind]);
 
   // Block Escape from closing — note/dialog/discard/find each get precedence, but
   // the approval reader itself still cannot be dismissed by Escape.
@@ -375,7 +410,7 @@ export function TaskApprovalReader({
           setDiscardConfirmOpen(false);
           return;
         }
-        if (find.isOpen) {
+        if (findOpen) {
           closeFind();
           return;
         }
@@ -388,47 +423,24 @@ export function TaskApprovalReader({
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, closeFind, discardConfirmOpen, find.isOpen, handleAddNote]);
+  }, [annotatingLine, closeFind, discardConfirmOpen, findOpen, handleAddNote]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'task-approval',
     onOpen: openFind,
     dialogOpen: annotatingLine !== null || discardConfirmOpen,
   });
-  const findProjection = useMemo(
-    () => (find.isOpen ? buildBlockSearchProjection(findablePlanBlocks, find.query) : { sources: [], matches: [] }),
-    [find.isOpen, findablePlanBlocks, find.query]
-  );
-  const activeFindIndex = findProjection.matches.length === 0
-    ? -1
-    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  useEffect(() => {
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: findSessionMatches });
+  }, [findOpen, findQuery, findSessionMatches, sendFind]);
+  useEffect(() => {
+    sendFind({ type: 'reset' });
+  }, [findSurfaceKey, sendFind]);
 
-  const handleFindQueryChange = useCallback((query: string) => {
-    find.setQuery(query);
-    const target = buildBlockSearchProjection(findablePlanBlocks, query).matches[0]?.target;
-    if (!target) return;
-    queueMicrotask(() => {
-      blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    });
-  }, [find, findablePlanBlocks]);
-
-  const handleFindNext = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? 0
-        : (activeFindIndex + 1) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
-
-  const handleFindPrevious = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? Math.max(findProjection.matches.length - 1, 0)
-        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
+  const handleFindQueryChange = useCallback((query: string) => sendFind({ type: 'set-query', query }), [sendFind]);
+  const handleFindNext = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
+  const handleFindPrevious = useCallback(() => sendFind({ type: 'previous' }), [sendFind]);
 
   // Format and send notes (REQ-PF-009 format)
   const handleSendFeedback = useCallback(() => {
@@ -456,14 +468,6 @@ export function TaskApprovalReader({
     },
     [onApprove]
   );
-
-  useEffect(() => {
-    if (!find.isOpen || activeFindIndex < 0) return;
-    const target = findProjection.matches[activeFindIndex]?.target;
-    if (!target) return;
-    blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
-  }, [activeFindIndex, find.isOpen, findProjection.matches]);
 
   const confirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
@@ -678,12 +682,12 @@ export function TaskApprovalReader({
         </div>
       </div>
 
-      {find.isOpen && (
+      {findOpen && (
         <FindBar
-          query={find.query}
+          query={findQuery}
           activeIndex={activeFindIndex}
-          matchCount={findProjection.matches.length}
-          focusVersion={find.focusVersion}
+          matchCount={findSession?.matches.length ?? 0}
+          focusVersion={findSession?.focusVersion ?? 0}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
