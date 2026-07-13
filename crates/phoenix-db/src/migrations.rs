@@ -1459,7 +1459,7 @@ CREATE TABLE IF NOT EXISTS workflow_barriers (
     FOREIGN KEY (declaring_transition_id, workflow_id, declaring_workflow_version)
         REFERENCES workflow_transitions(id, workflow_id, to_version)
         ON DELETE CASCADE,
-    CHECK (status IN ('waiting', 'satisfied')),
+    CHECK (status IN ('waiting', 'satisfied', 'invalidated')),
     CHECK ((status = 'satisfied') = (satisfied_at IS NOT NULL))
 );
 
@@ -1605,7 +1605,7 @@ CREATE TABLE IF NOT EXISTS workflow_reducer_inbox (
     delivery_status TEXT NOT NULL,
     consumed_by_transition_id TEXT REFERENCES workflow_transitions(id) ON DELETE SET NULL,
     CHECK (requires_runtime_acceptance IN (0, 1)),
-    CHECK (delivery_status IN ('pending', 'consumed')),
+    CHECK (delivery_status IN ('pending', 'consumed', 'suppressed')),
     CHECK ((delivery_status = 'consumed') = (consumed_by_transition_id IS NOT NULL)),
     CHECK (NOT (receipt_id IS NOT NULL AND barrier_id IS NOT NULL))
 );
@@ -1651,9 +1651,9 @@ CREATE TABLE IF NOT EXISTS workflow_manual_resolutions (
     accepted_choice_id TEXT,
     resolved_by TEXT,
     UNIQUE (id, workflow_id),
-    CHECK (status IN ('required', 'resolved')),
+    CHECK (status IN ('required', 'resolved', 'cancelled')),
     CHECK (
-        (status = 'required' AND accepted_choice_id IS NULL AND resolved_by IS NULL)
+        (status IN ('required', 'cancelled') AND accepted_choice_id IS NULL AND resolved_by IS NULL)
         OR (status = 'resolved' AND accepted_choice_id IS NOT NULL AND resolved_by IS NOT NULL AND resolved_by <> '')
     )
 );
@@ -1914,7 +1914,7 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
                     AND tmux_status IS NOT NULL
                     AND tmux_occurred_at IS NOT NULL
                     AND tmux_server_generation IS NOT NULL
-                    AND tmux_duration_ms IS NOT NULL
+                    AND (tmux_status = 'window_killed' OR tmux_duration_ms IS NOT NULL)
                     AND bash_status IS NULL
                     AND bash_occurred_at IS NULL
                     AND bash_exit_code IS NULL

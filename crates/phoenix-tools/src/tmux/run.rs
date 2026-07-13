@@ -449,13 +449,15 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion
-                && observation.exit_code.is_some()
-                && kill_window(config_path, socket_path, &target.window_id)
+            if close_after_completion && observation.exit_code.is_some() {
+                let marked = ctx.tmux_registry().mark_window_killed(identity).await;
+                if kill_window(config_path, socket_path, &target.window_id)
                     .await
-                    .is_ok()
-            {
-                ctx.tmux_registry().mark_window_killed(identity).await;
+                    .is_err()
+                    && marked
+                {
+                    ctx.tmux_registry().clear_window_killed(identity).await;
+                }
             }
             return response;
         }
