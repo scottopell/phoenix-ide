@@ -570,8 +570,8 @@ pub fn creation_plan(
     ];
     if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
         dependencies.extend([
-            dependency(EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
-            dependency(BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+            dependency(COMMIT_METADATA, EXPAND_INITIAL_MESSAGE),
+            dependency(BOOTSTRAP_RUNTIME, COMMIT_METADATA),
             dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
         ]);
     }

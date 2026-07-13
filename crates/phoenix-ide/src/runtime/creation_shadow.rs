@@ -149,8 +149,6 @@ impl CreationShadowCoordinator {
             preserved_evidence.as_ref(),
             &conversation.state,
         );
-        let observed =
-            observed_projection(&conversation.state, conversation.archived, &oracle.status);
         let persistence = CreationShadowPersistence::Enabled(CreationShadowConfig {
             shadow_workflow_id: format!("creation-shadow:{}", oracle.intent.job_id),
             authoritative_anchor_workflow_id: format!(
@@ -163,11 +161,11 @@ impl CreationShadowCoordinator {
             .get_conversation(&oracle.intent.conversation_id)
             .await
             .map_err(|error| error.to_string())?;
-        if current_conversation.state != conversation.state
-            || current_conversation.archived != conversation.archived
-        {
-            return Ok(());
-        }
+        let observed = observed_projection(
+            &current_conversation.state,
+            current_conversation.archived,
+            &oracle.status,
+        );
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,

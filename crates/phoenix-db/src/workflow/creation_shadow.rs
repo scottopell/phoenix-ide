@@ -171,7 +171,8 @@ impl<'a> CreationShadowAdapter<'a> {
                 "creation shadow selection has incompatible capabilities".to_owned(),
             ));
         }
-        self.repository
+        match self
+            .repository
             .register_protocol_selection(&DurableProtocolSelectionRegistration {
                 selection_id: SELECTION_ID.to_owned(),
                 profile_id: creation_profile::PROFILE_ID.to_owned(),
@@ -201,6 +202,15 @@ impl<'a> CreationShadowAdapter<'a> {
                 executor_kinds: vec![],
             })
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(WorkflowRepositoryError::Sqlx(sqlx::Error::Database(error)))
+                if error.is_unique_violation() =>
+            {
+                Box::pin(self.ensure_protocol_selection(now)).await
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

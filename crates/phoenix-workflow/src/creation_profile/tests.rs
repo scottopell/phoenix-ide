@@ -94,8 +94,8 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
         (FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
         (COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         (COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        (EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
-        (BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+        (COMMIT_METADATA, EXPAND_INITIAL_MESSAGE),
+        (BOOTSTRAP_RUNTIME, COMMIT_METADATA),
         (DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
     ] {
         assert!(dependencies.contains(&edge), "missing dependency {edge:?}");
