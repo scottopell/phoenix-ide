@@ -140,7 +140,7 @@ function layoutFor(units: readonly VirtualTranscriptUnit[]) {
 
 function findUnit(snapshot: VirtualTranscriptSnapshot, messageId: string) {
   return snapshot.units.find(
-    (unit) => unit.canonicalMessageId === messageId || unit.aliasMessageIds?.includes(messageId),
+    (unit) => unit.canonicalMessageId === messageId || unit.aliasMessageIds.includes(messageId),
   );
 }
 
@@ -376,6 +376,33 @@ describe('virtual transcript scenario valibot numeric constraints', () => {
     ((corpus['metadata'] as Record<string, unknown>))['scenarioCount'] = 7.25;
     ((((aliasScenario['after'] as Record<string, unknown>)['visibleRange'] as Record<string, unknown>)))['endIndex'] = 2.5;
     ((((aliasScenario['after'] as Record<string, unknown>)['viewport'] as Record<string, unknown>)))['extent'] = 0;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).toThrow();
+  });
+
+  it('rejects fractional transcriptGeneration where JSON Schema requires a nonnegative integer', () => {
+    const corpus = clone(readFixtureJson('scenarios.json')) as Record<string, unknown>;
+    const scenarios = corpus['scenarios'] as Array<Record<string, unknown>>;
+    const firstScenario = scenarios[0]!;
+    (firstScenario['before'] as Record<string, unknown>)['transcriptGeneration'] = 1.5;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).toThrow();
+  });
+
+  it('accepts negative alias targetOffset because the schema allows signed numbers', () => {
+    const corpus = clone(readFixtureJson('scenarios.json')) as Record<string, unknown>;
+    const scenarios = corpus['scenarios'] as Array<Record<string, unknown>>;
+    const aliasScenario = scenarios.find((scenario) => scenario['id'] === 'alias-navigation')!;
+    ((aliasScenario['expectation'] as Record<string, unknown>))['targetOffset'] = -12.5;
+
+    expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).not.toThrow();
+  });
+
+  it('requires aliasMessageIds on every unit to match the JSON schema corpus contract', () => {
+    const corpus = clone(readFixtureJson('scenarios.json')) as Record<string, unknown>;
+    const scenarios = corpus['scenarios'] as Array<Record<string, unknown>>;
+    const firstScenario = scenarios[0]!;
+    delete ((firstScenario['before'] as Record<string, unknown>)['units'] as Array<Record<string, unknown>>)[0]!['aliasMessageIds'];
 
     expect(() => parseVirtualTranscriptScenarioCorpus(corpus)).toThrow();
   });

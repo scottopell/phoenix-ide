@@ -987,17 +987,18 @@ function MessageListImpl({
     const active = transcriptPositioningStateRef.current.active;
     const phase = transcriptPositioningStateRef.current.phase;
     if (active && phase?.kind === 'awaiting_physical') {
+      const physicalSnapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? snapshot;
       dispatchTranscriptPositioningRef.current({
         type: 'physical_observed',
         commandKey: active.key,
-        range: visibleRange,
+        range: physicalSnapshot.visibleRange,
         actualOffset: active.command.kind === 'restore_after_prefix_expansion'
-          ? (snapshot.targetIndex === phase.targetIndex ? snapshot.targetOffset ?? null : null)
+          ? physicalSnapshot.targetOffset ?? null
           : null,
-        layoutRevision: snapshot.layoutRevision,
+        layoutRevision: physicalSnapshot.layoutRevision,
       });
     }
-    if (renderedRange) onVisibleRangeChange?.(renderedRange);
+    if (visibleRange) onVisibleRangeChange?.(visibleRange);
   }, [onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {

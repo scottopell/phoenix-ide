@@ -26,7 +26,7 @@ export interface VirtualTranscriptUnit {
   key: string;
   role: VirtualTranscriptUnitRole;
   canonicalMessageId: string;
-  aliasMessageIds?: readonly string[];
+  aliasMessageIds: readonly string[];
   estimatedExtent: number;
   measuredExtent?: number;
   text: string;

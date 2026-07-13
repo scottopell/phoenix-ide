@@ -32,6 +32,7 @@ const StringArraySchema = v.array(v.string());
 const NonNegativeNumberSchema = v.pipe(v.number(), v.minValue(0));
 const PositiveNumberSchema = v.pipe(v.number(), v.minValue(0), v.notValue(0));
 const NonNegativeIntegerSchema = v.pipe(v.number(), v.integer(), v.minValue(0));
+const SignedNumberSchema = v.number();
 
 const UnitSchema = v.strictObject({
   key: v.string(),
@@ -60,7 +61,7 @@ const VisibleRangeSchema = v.strictObject({
 
 const SnapshotSchema = v.strictObject({
   revision: v.string(),
-  transcriptGeneration: NonNegativeNumberSchema,
+  transcriptGeneration: NonNegativeIntegerSchema,
   units: v.array(UnitSchema),
   viewport: ViewportSchema,
   readingAnchor: v.optional(ReadingAnchorSchema),
@@ -97,7 +98,7 @@ const ExpectationSchema = v.variant('kind', [
     requestedMessageId: v.string(),
     resolvedMessageKey: v.string(),
     targetIndex: NonNegativeIntegerSchema,
-    targetOffset: NonNegativeNumberSchema,
+    targetOffset: SignedNumberSchema,
   }),
   v.strictObject({
     kind: v.literal('report_orphan_target'),
