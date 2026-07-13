@@ -4,7 +4,7 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
-use phoenix_core::file_viewer::FileViewerKind;
+use phoenix_core::file_viewer::has_opaque_extension;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -166,7 +166,7 @@ impl Tool for ReadFileTool {
             .is_some_and(|(file, root)| file.starts_with(root))
             && std::fs::metadata(&resolved)
                 .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
-            && !matches!(FileViewerKind::for_path(&resolved), FileViewerKind::Opaque);
+            && !has_opaque_extension(&resolved);
 
         let display_data = serde_json::to_value(ReadFileDisplayData {
             r#type: "read_file",
