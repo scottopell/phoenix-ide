@@ -29,26 +29,26 @@ pub enum WorkScopeKind {
     Worktree,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkScopeIdentity {
     pub kind: WorkScopeKind,
-    pub stable_key: &'static str,
+    pub stable_key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BashResourceIdentity {
     pub work_scope: WorkScopeIdentity,
-    pub handle_id: &'static str,
+    pub handle_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TmuxResourceIdentity {
     pub work_scope: WorkScopeIdentity,
-    pub server_generation: &'static str,
-    pub window_id: &'static str,
+    pub server_generation: String,
+    pub window_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WakeResourceIdentity {
     Bash(BashResourceIdentity),
     TmuxWindow(TmuxResourceIdentity),
@@ -56,38 +56,38 @@ pub enum WakeResourceIdentity {
 
 impl WakeResourceIdentity {
     #[must_use]
-    pub const fn work_scope(self) -> WorkScopeIdentity {
+    pub const fn work_scope(&self) -> &WorkScopeIdentity {
         match self {
-            Self::Bash(identity) => identity.work_scope,
-            Self::TmuxWindow(identity) => identity.work_scope,
+            Self::Bash(identity) => &identity.work_scope,
+            Self::TmuxWindow(identity) => &identity.work_scope,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeRegistrationIntent {
-    pub contract_id: &'static str,
-    pub conversation_id: &'static str,
+    pub contract_id: String,
+    pub conversation_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
-    pub registering_tool_use_id: &'static str,
+    pub registering_tool_use_id: String,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObserveHandleIntent {
-    pub contract_id: &'static str,
+    pub contract_id: String,
     pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeRegistrationReceipt {
-    pub contract_id: &'static str,
+    pub contract_id: String,
     pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
-    pub registering_tool_use_id: &'static str,
+    pub registering_tool_use_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +111,8 @@ pub struct BashTerminalEvidence {
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     pub signal_number: Option<i32>,
-    pub kill_signal_sent: Option<&'static str>,
-    pub final_tail: Vec<&'static str>,
+    pub kill_signal_sent: Option<String>,
+    pub final_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +122,7 @@ pub struct TmuxTerminalEvidence {
     pub occurred_at: Timestamp,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
-    pub final_tail: Vec<&'static str>,
+    pub final_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,10 +141,12 @@ impl WakeTerminalEvidence {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> WakeResourceIdentity {
+    pub fn identity(&self) -> WakeResourceIdentity {
         match self {
-            Self::Bash(evidence) => WakeResourceIdentity::Bash(evidence.identity),
-            Self::TmuxWindow(evidence) => WakeResourceIdentity::TmuxWindow(evidence.identity),
+            Self::Bash(evidence) => WakeResourceIdentity::Bash(evidence.identity.clone()),
+            Self::TmuxWindow(evidence) => {
+                WakeResourceIdentity::TmuxWindow(evidence.identity.clone())
+            }
         }
     }
 }
@@ -163,24 +165,24 @@ pub enum WakeForgottenReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeTerminalPayload {
     Fired {
-        contract_id: &'static str,
+        contract_id: String,
         resource: WakeResourceIdentity,
         evidence: WakeTerminalEvidence,
         resolved_at: Timestamp,
     },
     Expired {
-        contract_id: &'static str,
+        contract_id: String,
         resource: WakeResourceIdentity,
         resolved_at: Timestamp,
     },
     Cancelled {
-        contract_id: &'static str,
+        contract_id: String,
         resource: WakeResourceIdentity,
         reason: WakeCancellationReason,
         resolved_at: Timestamp,
     },
     Forgotten {
-        contract_id: &'static str,
+        contract_id: String,
         resource: WakeResourceIdentity,
         reason: WakeForgottenReason,
         resolved_at: Timestamp,
@@ -189,7 +191,7 @@ pub enum WakeTerminalPayload {
 
 impl WakeTerminalPayload {
     #[must_use]
-    pub const fn contract_id(&self) -> &'static str {
+    pub fn contract_id(&self) -> &str {
         match self {
             Self::Fired { contract_id, .. }
             | Self::Expired { contract_id, .. }
@@ -199,23 +201,23 @@ impl WakeTerminalPayload {
     }
 
     #[must_use]
-    pub const fn resource(&self) -> WakeResourceIdentity {
+    pub const fn resource(&self) -> &WakeResourceIdentity {
         match self {
             Self::Fired { resource, .. }
             | Self::Expired { resource, .. }
             | Self::Cancelled { resource, .. }
-            | Self::Forgotten { resource, .. } => *resource,
+            | Self::Forgotten { resource, .. } => resource,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeRegistrationSnapshot {
-    pub contract_id: &'static str,
-    pub conversation_id: &'static str,
+    pub contract_id: String,
+    pub conversation_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
-    pub registering_tool_use_id: &'static str,
+    pub registering_tool_use_id: String,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
     pub registration_fence_version: Version,
@@ -254,7 +256,7 @@ pub enum RuntimeAvailabilityProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeContinuationTransfer {
-    pub pending_contract: &'static str,
+    pub pending_contract: String,
     pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
     pub inbox_ids: Vec<ReducerInboxId>,
@@ -428,11 +430,11 @@ pub fn registration_snapshot(
     fence_version: Version,
 ) -> WakeRegistrationSnapshot {
     WakeRegistrationSnapshot {
-        contract_id: intent.contract_id,
-        conversation_id: intent.conversation_id,
-        registration_scope: intent.registration_scope,
-        resource: intent.resource,
-        registering_tool_use_id: intent.registering_tool_use_id,
+        contract_id: intent.contract_id.clone(),
+        conversation_id: intent.conversation_id.clone(),
+        registration_scope: intent.registration_scope.clone(),
+        resource: intent.resource.clone(),
+        registering_tool_use_id: intent.registering_tool_use_id.clone(),
         registered_at: intent.registered_at,
         expires_at: intent.expires_at,
         registration_fence_version: fence_version,
@@ -446,10 +448,10 @@ pub fn registration_snapshot(
 #[must_use]
 pub fn registration_receipt(intent: &WakeRegistrationIntent) -> WakeRegistrationReceipt {
     WakeRegistrationReceipt {
-        contract_id: intent.contract_id,
-        resource: intent.resource,
+        contract_id: intent.contract_id.clone(),
+        resource: intent.resource.clone(),
         expires_at: intent.expires_at,
-        registering_tool_use_id: intent.registering_tool_use_id,
+        registering_tool_use_id: intent.registering_tool_use_id.clone(),
     }
 }
 
@@ -464,8 +466,8 @@ pub fn registration_decision(
 ) {
     let receipt = registration_receipt(intent);
     let observe_intent = ObserveHandleIntent {
-        contract_id: intent.contract_id,
-        resource: intent.resource,
+        contract_id: intent.contract_id.clone(),
+        resource: intent.resource.clone(),
         expires_at: intent.expires_at,
     };
     (
@@ -510,7 +512,7 @@ pub fn registration_decision(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeCancellationOutcome {
     Request(Box<CancellationRequest<WakeProfile>>),
-    AlreadyTerminal(WakeTerminalPayload),
+    AlreadyTerminal(Box<WakeTerminalPayload>),
 }
 
 #[must_use]
@@ -527,7 +529,7 @@ pub fn cancellation_request(
         })
         .and_then(|effect| effect.receipt.as_ref())
     {
-        return WakeCancellationOutcome::AlreadyTerminal(receipt.receipt.clone());
+        return WakeCancellationOutcome::AlreadyTerminal(Box::new(receipt.receipt.clone()));
     }
     let invalidations = workflow
         .effects
@@ -545,8 +547,8 @@ pub fn cancellation_request(
     let mut next_snapshot = workflow.snapshot.clone();
     next_snapshot.cancelled = true;
     let cancelled_terminal = cancelled_terminal_payload(
-        next_snapshot.contract_id,
-        next_snapshot.resource,
+        next_snapshot.contract_id.clone(),
+        next_snapshot.resource.clone(),
         WakeCancellationReason::ExplicitCancel,
         resolved_at,
     );
@@ -583,14 +585,14 @@ pub fn cancellation_request(
 }
 
 #[must_use]
-pub const fn cancelled_terminal_payload(
-    contract_id: &'static str,
+pub fn cancelled_terminal_payload(
+    contract_id: impl Into<String>,
     resource: WakeResourceIdentity,
     reason: WakeCancellationReason,
     resolved_at: Timestamp,
 ) -> WakeTerminalPayload {
     WakeTerminalPayload::Cancelled {
-        contract_id,
+        contract_id: contract_id.into(),
         resource,
         reason,
         resolved_at,
@@ -610,7 +612,7 @@ pub const fn project_runtime_availability(
 
 #[must_use]
 pub fn terminal_payload_from_evidence(
-    contract_id: &'static str,
+    contract_id: impl Into<String>,
     resource: WakeResourceIdentity,
     evidence: WakeTerminalEvidence,
     expires_at: Timestamp,
@@ -619,6 +621,7 @@ pub fn terminal_payload_from_evidence(
         return None;
     }
     let occurred_at = evidence.occurred_at();
+    let contract_id = contract_id.into();
     if occurred_at <= expires_at {
         Some(WakeTerminalPayload::Fired {
             contract_id,
@@ -636,14 +639,14 @@ pub fn terminal_payload_from_evidence(
 }
 
 #[must_use]
-pub const fn forgotten_terminal_payload(
-    contract_id: &'static str,
+pub fn forgotten_terminal_payload(
+    contract_id: impl Into<String>,
     resource: WakeResourceIdentity,
     reason: WakeForgottenReason,
     resolved_at: Timestamp,
 ) -> WakeTerminalPayload {
     WakeTerminalPayload::Forgotten {
-        contract_id,
+        contract_id: contract_id.into(),
         resource,
         reason,
         resolved_at,
@@ -653,9 +656,9 @@ pub const fn forgotten_terminal_payload(
 #[must_use]
 pub fn evidence_matches_resource(
     evidence: &WakeTerminalEvidence,
-    resource: WakeResourceIdentity,
+    resource: &WakeResourceIdentity,
 ) -> bool {
-    evidence.identity() == resource
+    evidence.identity() == *resource
 }
 
 #[must_use]
@@ -683,8 +686,8 @@ pub fn continuation_from_snapshot(
     successor_workflow_id: u64,
 ) -> WakeContinuationTransfer {
     WakeContinuationTransfer {
-        pending_contract: snapshot.contract_id,
-        resource: snapshot.resource,
+        pending_contract: snapshot.contract_id.clone(),
+        resource: snapshot.resource.clone(),
         expires_at: snapshot.expires_at,
         inbox_ids,
         owed_ids,
