@@ -722,6 +722,23 @@ impl TmuxRegistry {
         )
     }
 
+    pub async fn registered_window_identities(
+        &self,
+        work_scope: &WorkScope,
+        server_generation: &str,
+    ) -> Vec<TmuxWindowIdentity> {
+        self.registered_windows
+            .read()
+            .await
+            .keys()
+            .filter(|identity| {
+                identity.work_scope == *work_scope
+                    && identity.server_generation == server_generation
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn preserve_terminal_before_kill(&self, identity: &TmuxWindowIdentity) {
         let socket_path = match self.get_existing(&identity.work_scope).await {
             Some(entry) => entry.read().await.socket_path.clone(),

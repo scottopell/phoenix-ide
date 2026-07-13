@@ -181,8 +181,12 @@ pub trait StateStore: Send + Sync {
         Ok(())
     }
 
-    async fn accept_owed_wakes(&self, _conv_id: &str, _inbox_ids: &[String]) -> Result<(), String> {
-        Ok(())
+    async fn accept_owed_wakes(
+        &self,
+        _conv_id: &str,
+        _inbox_ids: &[String],
+    ) -> Result<bool, String> {
+        Ok(true)
     }
 
     /// Read the conversation's clear watermark for stale tool-result clearing
@@ -803,12 +807,12 @@ impl StateStore for DatabaseStorage {
             .map_err(|error| error.to_string())
     }
 
-    async fn accept_owed_wakes(&self, conv_id: &str, inbox_ids: &[String]) -> Result<(), String> {
+    async fn accept_owed_wakes(&self, conv_id: &str, inbox_ids: &[String]) -> Result<bool, String> {
         let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
             .accept_owed_items(conv_id, inbox_ids, chrono::Utc::now())
             .await
-            .map(|_| ())
+            .map(|accepted| accepted > 0)
             .map_err(|error| error.to_string())
     }
 

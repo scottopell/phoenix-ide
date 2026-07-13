@@ -160,10 +160,14 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         }
     }
 
-    async fn cancel_registration(&self, conversation_id: &str) -> Result<(), WakeRegistrarError> {
+    async fn cancel_registration(
+        &self,
+        conversation_id: &str,
+        contract_id: &str,
+    ) -> Result<(), WakeRegistrarError> {
         let repository = WorkflowRepository::new(self.manager.db().pool().clone());
         WakeWorkflowAdapter::new(&repository)
-            .cancel_pending_for_conversation(conversation_id, Utc::now())
+            .cancel_pending_contract(conversation_id, contract_id, Utc::now())
             .await
             .map(|_| ())
             .map_err(|error| WakeRegistrarError::Persistence(error.to_string()))

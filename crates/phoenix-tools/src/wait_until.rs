@@ -76,7 +76,11 @@ pub trait WakeRegistrar: Send + Sync {
         registration: WakeRegistration,
     ) -> Result<WakeRegistrationReceipt, WakeRegistrarError>;
 
-    async fn cancel_registration(&self, conversation_id: &str) -> Result<(), WakeRegistrarError>;
+    async fn cancel_registration(
+        &self,
+        conversation_id: &str,
+        contract_id: &str,
+    ) -> Result<(), WakeRegistrarError>;
 }
 
 pub struct DisabledWakeRegistrar;
@@ -90,7 +94,11 @@ impl WakeRegistrar for DisabledWakeRegistrar {
         Err(WakeRegistrarError::Unavailable)
     }
 
-    async fn cancel_registration(&self, _conversation_id: &str) -> Result<(), WakeRegistrarError> {
+    async fn cancel_registration(
+        &self,
+        _conversation_id: &str,
+        _contract_id: &str,
+    ) -> Result<(), WakeRegistrarError> {
         Err(WakeRegistrarError::Unavailable)
     }
 }
@@ -204,7 +212,7 @@ impl Tool for WaitUntilTool {
         if ctx.cancel.is_cancelled() {
             if let Err(error) = ctx
                 .wake_registrar()
-                .cancel_registration(&ctx.conversation_id)
+                .cancel_registration(&ctx.conversation_id, &receipt.contract_id)
                 .await
             {
                 return error_output(registration_error_id(&error), &error.to_string());
@@ -362,6 +370,7 @@ mod tests {
         async fn cancel_registration(
             &self,
             _conversation_id: &str,
+            _contract_id: &str,
         ) -> Result<(), WakeRegistrarError> {
             Ok(())
         }
