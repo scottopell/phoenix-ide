@@ -1937,6 +1937,9 @@ async fn create_conversation_with_id(
                     .get_conversation(&existing_job.conversation_id)
                     .await
                     .map_err(|e| AppError::Internal(e.to_string()))?;
+                state
+                    .runtime
+                    .mirror_creation_after_commit(existing_job.id.clone());
                 let mut conversation_json =
                     conversation_to_json(&state, &existing_conversation, None);
                 inject_creation_job_state_fields(
@@ -1973,6 +1976,11 @@ async fn create_conversation_with_id(
                 .and_then(|job| job.message_id.as_deref())
                 == Some(req.message_id.as_str());
             if is_same_create {
+                if let Some(existing_job) = existing_job.as_ref() {
+                    state
+                        .runtime
+                        .mirror_creation_after_commit(existing_job.id.clone());
+                }
                 let mut conversation_json =
                     conversation_to_json(&state, &existing_conversation, None);
                 inject_creation_job_state_fields(
@@ -1998,6 +2006,8 @@ async fn create_conversation_with_id(
     };
 
     state.runtime.kick_creation_worker();
+
+    state.runtime.mirror_creation_after_commit(job_id);
 
     let mut conversation_json = conversation_to_json(&state, &conversation, None);
     inject_creation_job_state_fields(&state, &conversation, &mut conversation_json).await;
@@ -3669,13 +3679,15 @@ async fn cancel_conversation(
         .await
         .unwrap_or_else(|| conversation.state.clone());
 
-    if matches!(conversation.state, ConvState::Provisioning { .. }) {
+    if let ConvState::Provisioning { job_id, .. } = &conversation.state {
+        let job_id = job_id.clone();
         state
             .runtime
             .db()
             .cancel_conversation_creation(&id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        state.runtime.mirror_creation_after_commit(job_id);
         let cancelled = state
             .runtime
             .db()
@@ -4438,18 +4450,18 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if matches!(
-        conv.state,
-        ConvState::Provisioning { .. }
-            | ConvState::CreationCancelled { .. }
-            | ConvState::CreationFailed { .. }
-    ) {
+    if let ConvState::Provisioning { job_id, .. }
+    | ConvState::CreationCancelled { job_id }
+    | ConvState::CreationFailed { job_id, .. } = &conv.state
+    {
+        let job_id = job_id.clone();
         state
             .runtime
             .db()
             .request_conversation_creation_deletion(id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        state.runtime.mirror_creation_after_commit(job_id);
         state
             .runtime
             .evict_runtime(id, crate::runtime::EvictionReason::CreationProvisioned)

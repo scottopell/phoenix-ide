@@ -582,11 +582,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct DatabaseStorage {
     db: Database,
+    creation_shadow: crate::runtime::creation_shadow::CreationShadowCoordinator,
 }
 
 impl DatabaseStorage {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        let creation_shadow =
+            crate::runtime::creation_shadow::CreationShadowCoordinator::from_env(db.clone());
+        Self {
+            db,
+            creation_shadow,
+        }
     }
 
     #[allow(dead_code)] // Useful for tests
@@ -684,10 +690,15 @@ impl MessageStore for DatabaseStorage {
         job_id: &str,
         claim: &phoenix_core::domain::creation_protocol::CreationClaim,
     ) -> Result<crate::db::CreationCasOutcome, String> {
-        self.db
+        let outcome = self
+            .db
             .complete_conversation_creation_job(job_id, claim, chrono::Utc::now())
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
+            self.creation_shadow.schedule(job_id.to_string());
+        }
+        Ok(outcome)
     }
 
     async fn update_message_display_data(

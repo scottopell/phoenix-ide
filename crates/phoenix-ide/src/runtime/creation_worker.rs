@@ -123,6 +123,7 @@ async fn reconcile_creation_cleanup(
         .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
+    manager.mirror_creation_after_commit(cleanup.job_id.clone());
     Ok(())
 }
 
@@ -203,6 +204,9 @@ async fn process_job(
             if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation completion rejected after claim loss");
             }
+            if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
+                manager.mirror_creation_after_commit(job.id.clone());
+            }
             return Ok(());
         }
         if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
@@ -240,6 +244,9 @@ async fn process_job(
                 if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
                     tracing::warn!(job_id = %job.id, attempt = job.protocol.attempt, retry_at = %(now + delay), error = %message, "conversation creation retry scheduled");
                 }
+                if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
+                    manager.mirror_creation_after_commit(job.id.clone());
+                }
                 return Ok(());
             }
             let failed = ConvState::CreationFailed {
@@ -262,6 +269,7 @@ async fn process_job(
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation failure rejected after claim loss");
                 return Ok(());
             }
+            manager.mirror_creation_after_commit(job.id.clone());
             let broadcast_tx = manager.conversation_broadcaster(&conv_id).await;
             let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                 sequence_id: seq,
@@ -685,6 +693,7 @@ async fn provision_conversation(
             ));
         }
         job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
+        manager.mirror_creation_after_commit(job.id.clone());
     }
     let persisted_conversation = manager
         .db()
@@ -743,6 +752,7 @@ async fn provision_conversation(
                 ErrorKind::Cancelled,
             ));
         }
+        manager.mirror_creation_after_commit(job.id.clone());
         if let Some(broadcast_tx) = {
             let runtimes = manager.runtimes.read().await;
             runtimes
@@ -908,6 +918,7 @@ async fn checkpoint_creation_stage(
             ));
         }
         job.protocol.stage = next;
+        manager.mirror_creation_after_commit(job.id.clone());
     }
     Ok(())
 }
@@ -937,6 +948,7 @@ async fn reserve_worktree(
             ErrorKind::Cancelled,
         ));
     }
+    manager.mirror_creation_after_commit(job.id.clone());
     Ok(())
 }
 
@@ -962,6 +974,7 @@ async fn mark_worktree_present(
             ErrorKind::Cancelled,
         ));
     }
+    manager.mirror_creation_after_commit(job.id.clone());
     Ok(())
 }
 

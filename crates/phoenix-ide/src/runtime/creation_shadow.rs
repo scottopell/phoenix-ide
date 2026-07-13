@@ -1,0 +1,320 @@
+//! Best-effort production bridge from committed creation jobs to shadow diagnostics.
+
+use crate::db::{
+    ConvMode, ConversationCreationJob, CreationResourceReservation, Database, FileAttachment,
+};
+use phoenix_core::domain::creation_protocol::{
+    CreationKind as CoreCreationKind, CreationStage, CreationStatus,
+};
+use phoenix_db::workflow::{
+    creation_shadow::{
+        CreationShadowAdapter, CreationShadowConfig, CreationShadowEvidence,
+        CreationShadowPersistence,
+    },
+    WorkflowRepository,
+};
+use phoenix_workflow::creation_profile::{
+    AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
+    CreationFailure, CreationIntent, CreationKind, CreationProjectionStatus,
+};
+
+const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
+
+type JobSyncGates = std::sync::Arc<
+    tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+>;
+
+#[derive(Clone)]
+pub(crate) struct CreationShadowCoordinator {
+    db: Database,
+    enabled: bool,
+    job_gates: JobSyncGates,
+}
+
+impl CreationShadowCoordinator {
+    pub(crate) fn from_env(db: Database) -> Self {
+        Self {
+            db,
+            enabled: std::env::var(ENABLE_ENV).ok().as_deref() == Some("1"),
+            job_gates: std::sync::Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_enabled(db: Database, enabled: bool) -> Self {
+        Self {
+            db,
+            enabled,
+            job_gates: std::sync::Arc::default(),
+        }
+    }
+
+    /// Returns before any shadow read or write. The spawned task owns all diagnostic work.
+    pub(crate) fn schedule(&self, job_id: String) {
+        if !self.enabled {
+            return;
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = coordinator.sync_committed_job(&job_id).await {
+                tracing::warn!(job_id, error = %error, "creation shadow sync failed; authoritative state is unchanged");
+            }
+        });
+    }
+
+    async fn sync_committed_job(&self, job_id: &str) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let gate = {
+            let mut gates = self.job_gates.lock().await;
+            gates
+                .entry(job_id.to_owned())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        // Each task reads committed state only after entering its job gate, so a delayed task
+        // cannot project an earlier stage over a newer projection. Unrelated jobs remain parallel.
+        let _guard = gate.lock().await;
+        let job = self
+            .db
+            .get_conversation_creation_job(job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let files = self
+            .db
+            .get_conversation_creation_job_files(job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Image bytes stay in their authoritative normalized table. Only stable ordinals enter the
+        // in-memory oracle, and the persistence adapter writes no semantic payload bytes.
+        let image_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_job_images WHERE job_id = ?1",
+        )
+        .bind(job_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?;
+        let reservations = self
+            .db
+            .get_creation_resource_reservations(job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let conv_mode = self
+            .db
+            .get_conversation(&job.conversation_id)
+            .await
+            .ok()
+            .map(|conversation| conversation.conv_mode);
+        let oracle = oracle_from_committed(
+            job,
+            &files,
+            usize::try_from(image_count).map_err(|_| "negative image count".to_string())?,
+            &reservations,
+            conv_mode.as_ref(),
+        );
+        let observed =
+            CreationShadowEvidence::ProjectionStatus(observed_projection(&oracle.status));
+        let persistence = CreationShadowPersistence::Enabled(CreationShadowConfig {
+            shadow_workflow_id: format!("creation-shadow:{}", oracle.intent.job_id),
+            authoritative_anchor_workflow_id: format!(
+                "creation-authoritative:{}",
+                oracle.intent.job_id
+            ),
+        });
+        CreationShadowAdapter::new(
+            &WorkflowRepository::new(self.db.pool().clone()),
+            &persistence,
+        )
+        .persist_after_authoritative_commit(&oracle, observed, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?;
+        tracing::debug!(job_id, "creation shadow synchronized");
+        Ok(())
+    }
+}
+
+fn oracle_from_committed(
+    job: ConversationCreationJob,
+    files: &[FileAttachment],
+    image_count: usize,
+    reservations: &[CreationResourceReservation],
+    conv_mode: Option<&ConvMode>,
+) -> AuthoritativeCreationOracle {
+    let attachment_ids = (0..files.len())
+        .map(|ordinal| format!("file:{ordinal}"))
+        .chain((0..image_count).map(|ordinal| format!("image:{ordinal}")))
+        .collect();
+    let reservation = reservations
+        .iter()
+        .find(|reservation| reservation.status != "released")
+        .or_else(|| reservations.first());
+    let repository_path = reservation.map_or_else(
+        || job.intent.cwd.clone(),
+        |reservation| reservation.repository_identity.clone(),
+    );
+    let worktree_path = reservation
+        .map(|reservation| reservation.resource_identity.clone())
+        .or_else(|| {
+            conv_mode
+                .and_then(ConvMode::worktree_path)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| job.intent.cwd.clone());
+    let branch_name = conv_mode
+        .and_then(ConvMode::branch_name)
+        .map(str::to_owned)
+        .or_else(|| job.intent.base_branch.clone())
+        .unwrap_or_default();
+    let kind = match &job.protocol.kind {
+        CoreCreationKind::InitialTurn { message_id } => CreationKind::InitialTurn {
+            message_id: message_id.clone(),
+        },
+        CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
+    };
+    AuthoritativeCreationOracle {
+        intent: CreationIntent {
+            job_id: job.id.clone(),
+            conversation_id: job.conversation_id,
+            idempotency_key: job.id,
+            repository_path,
+            worktree_path,
+            branch_name,
+            initial_text: job.intent.text,
+            attachment_ids,
+            kind,
+        },
+        status: map_status(job.protocol.status),
+        stage: map_stage(job.protocol.stage),
+        attempt: job.protocol.attempt,
+        generation: job.protocol.generation,
+    }
+}
+
+fn map_status(status: CreationStatus) -> AuthoritativeCreationStatus {
+    match status {
+        CreationStatus::Accepted => AuthoritativeCreationStatus::Accepted,
+        CreationStatus::Claimed(claim) => AuthoritativeCreationStatus::Claimed {
+            worker_id: claim.worker_id.0,
+        },
+        CreationStatus::RetryScheduled {
+            next_attempt_at,
+            last_error,
+        } => AuthoritativeCreationStatus::RetryScheduled {
+            next_attempt_at,
+            error: CreationFailure {
+                kind: last_error.kind,
+                message: last_error.message,
+            },
+        },
+        CreationStatus::Cancelling => AuthoritativeCreationStatus::Cancelling,
+        CreationStatus::Cancelled => AuthoritativeCreationStatus::Cancelled,
+        CreationStatus::DeletionPending => AuthoritativeCreationStatus::DeletionPending,
+        CreationStatus::Ready => AuthoritativeCreationStatus::Ready,
+        CreationStatus::Failed(error) => AuthoritativeCreationStatus::Failed(CreationFailure {
+            kind: error.kind,
+            message: error.message,
+        }),
+    }
+}
+
+fn map_stage(stage: CreationStage) -> AuthoritativeCreationStage {
+    match stage {
+        CreationStage::ValidateIntent => AuthoritativeCreationStage::ValidateIntent,
+        CreationStage::ResolveRepository => AuthoritativeCreationStage::ResolveRepository,
+        CreationStage::ReserveResources => AuthoritativeCreationStage::ReserveResources,
+        CreationStage::MaterializeWorktree => AuthoritativeCreationStage::MaterializeWorktree,
+        CreationStage::FinalizeAttachments => AuthoritativeCreationStage::FinalizeAttachments,
+        CreationStage::ExpandInitialMessage => AuthoritativeCreationStage::ExpandInitialMessage,
+        CreationStage::CommitMetadata => AuthoritativeCreationStage::CommitMetadata,
+        CreationStage::BootstrapInitialTurn => AuthoritativeCreationStage::BootstrapInitialTurn,
+        CreationStage::Finalize => AuthoritativeCreationStage::Finalize,
+    }
+}
+
+fn observed_projection(status: &AuthoritativeCreationStatus) -> CreationProjectionStatus {
+    match status {
+        AuthoritativeCreationStatus::Ready => CreationProjectionStatus::Ready,
+        AuthoritativeCreationStatus::Failed(_) => CreationProjectionStatus::Failed,
+        AuthoritativeCreationStatus::Cancelled => CreationProjectionStatus::Cancelled,
+        AuthoritativeCreationStatus::DeletionPending => CreationProjectionStatus::DeletionPending,
+        AuthoritativeCreationStatus::Accepted
+        | AuthoritativeCreationStatus::Claimed { .. }
+        | AuthoritativeCreationStatus::RetryScheduled { .. }
+        | AuthoritativeCreationStatus::Cancelling => CreationProjectionStatus::Provisioning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn database() -> Database {
+        Database::open_in_memory().await.unwrap()
+    }
+
+    async fn insert_job(db: &Database) {
+        sqlx::query("INSERT INTO conversations (id, slug, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, cm_kind) VALUES ('conv-shadow-runtime', 'shadow-runtime', '/tmp', 1, '{\"type\":\"provisioning\",\"job_id\":\"job-shadow-runtime\"}', '2025-01-01', '2025-01-01', '2025-01-01', 0, 'direct')")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO conversation_creation_jobs (id, conversation_id, message_id, status, stage, attempt, generation, intent_json, accepted_at, created_at, updated_at) VALUES ('job-shadow-runtime', 'conv-shadow-runtime', NULL, 'accepted', 'validate_intent', 0, 0, '{\"cwd\":\"/tmp\",\"text\":\"secret semantic bytes\"}', '2025-01-01', '2025-01-01', '2025-01-01')")
+            .execute(db.pool()).await.unwrap();
+    }
+
+    async fn binding_count(db: &Database) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM creation_shadow_bindings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disabled_writes_nothing() {
+        let db = database().await;
+        insert_job(&db).await;
+        CreationShadowCoordinator::with_enabled(db.clone(), false)
+            .sync_committed_job("job-shadow-runtime")
+            .await
+            .unwrap();
+        assert_eq!(binding_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn enabled_eventually_writes_bounded_non_executable_projection() {
+        let db = database().await;
+        insert_job(&db).await;
+        let coordinator = CreationShadowCoordinator::with_enabled(db.clone(), true);
+        coordinator.schedule("job-shadow-runtime".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while binding_count(&db).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        coordinator
+            .sync_committed_job("job-shadow-runtime")
+            .await
+            .unwrap();
+        assert_eq!(binding_count(&db).await, 1);
+        let executable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_effects WHERE status <> 'blocked' AND workflow_id = 'creation-shadow:job-shadow-runtime'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(executable, 0);
+        let transitions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = 'creation-shadow:job-shadow-runtime'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduling_broken_shadow_database_is_non_blocking_and_non_propagating() {
+        let db = database().await;
+        insert_job(&db).await;
+        sqlx::query("DROP TABLE creation_shadow_bindings")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let coordinator = CreationShadowCoordinator::with_enabled(db, true);
+        let start = std::time::Instant::now();
+        coordinator.schedule("job-shadow-runtime".to_string());
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+}
