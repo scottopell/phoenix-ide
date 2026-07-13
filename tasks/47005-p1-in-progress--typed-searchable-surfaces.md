@@ -231,6 +231,25 @@ Each migration must remain shippable and remove its superseded representation in
 - Existing viewer note, navigation, scroll-restoration, tail-follow, streaming-isolation, and annotation behavior remains covered.
 - Task 47004 consumes this foundation rather than reproducing the current file/message divergence in a new wrapper.
 
+## Implementation progress
+
+The foundation and first surface migrations are established:
+
+- A pure typed find-session state machine owns structural closed/open state, stable `MatchId`, reconciliation, focus origin, wraparound navigation, and explicit reveal/focus/decoration commands.
+- A React adapter delivers command batches exactly once and does not re-reveal surviving active matches during projection updates.
+- Search projection matches carry semantic source identity separately from mutable navigation coordinates.
+- Diff and file viewers use typed sessions and preserve active semantic identity when line insertions move reveal targets.
+- Keyboard shortcuts route through one provider-owned layered router rather than competing global listeners.
+- Assistant transcript text uses shared typed semantic/display fragments: compact-hidden content remains searchable, navigation expands it, and the renderer highlights the exact active occurrence.
+
+Remaining migration order:
+
+1. Define a typed capability matrix for heterogeneous tool renderers, then migrate tool semantic/display fragments incrementally by renderer family rather than as one raw-input/result adapter.
+2. Migrate sub-agent cards with renderer-owned disclosure and exact reveal targets.
+3. Parse task/file Markdown into semantic display blocks shared by rendering, matching, and reveal.
+4. Migrate the transcript itself from numeric local state to the typed session and remove legacy row-level highlight paths.
+5. Migrate task approval, remove `useViewerFind`/`viewerFindReducer`, and complete the source-aware document-viewer integration with task 47004.
+
 ## Relationship to other tasks
 
 - **Task 47004** — source-aware side-panel document viewer consolidation should depend on or be sequenced after this foundation. Its unified document viewer consumes typed display projections and the shared find session; it must not copy current file/message find composition.
