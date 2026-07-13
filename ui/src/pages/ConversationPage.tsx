@@ -185,11 +185,13 @@ async function getConversationMetaForRoute(routeSegment: string) {
 export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
-  const [routeChecked, setRouteChecked] = useState(routePrefix === '/global');
+  const [checkedRouteSlug, setCheckedRouteSlug] = useState<string | null>(
+    routePrefix === '/global' ? (slug ?? null) : null,
+  );
 
   useEffect(() => {
     if (routePrefix === '/global' || !slug) {
-      setRouteChecked(true);
+      setCheckedRouteSlug(slug ?? null);
       return;
     }
     let cancelled = false;
@@ -199,16 +201,16 @@ export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | 
         if (coordinator_id) {
           navigate(`/global/${coordinator_id}`, { replace: true });
         } else {
-          setRouteChecked(true);
+          setCheckedRouteSlug(slug ?? null);
         }
       })
       .catch(() => {
-        if (!cancelled) setRouteChecked(true);
+        if (!cancelled) setCheckedRouteSlug(slug ?? null);
       });
     return () => { cancelled = true; };
   }, [navigate, routePrefix, slug]);
 
-  if (!routeChecked) return null;
+  if (checkedRouteSlug !== slug) return null;
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,

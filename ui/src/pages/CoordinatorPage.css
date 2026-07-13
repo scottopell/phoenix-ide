@@ -18,7 +18,7 @@
   color: var(--text-primary);
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 16px;
   overflow: hidden;
 }
@@ -45,13 +45,20 @@
   overflow: auto;
 }
 
-.coordinator-conversation #app {
-  height: 100%;
-  min-height: 0;
+.coordinator-conversation {
+  grid-column: 1;
+  grid-row: 3;
 }
 
 .coordinator-fleet-pane {
+  grid-column: 2;
+  grid-row: 3;
   padding-right: 4px;
+}
+
+.coordinator-conversation #app {
+  height: 100%;
+  min-height: 0;
 }
 
 .coordinator-header h1,
@@ -80,6 +87,11 @@
 .coordinator-error {
   margin: 16px 0;
   color: var(--accent-red);
+}
+
+.coordinator-page > .coordinator-error,
+.coordinator-page > .coordinator-muted {
+  grid-row: 2;
 }
 
 .coordinator-open-work {

@@ -1050,9 +1050,17 @@ async fn load_conversation_by_slug_or_id(
     service: &GlobalReadService,
     slug_or_id: &str,
 ) -> Result<Conversation, AppError> {
+    let uuid_shaped = uuid::Uuid::parse_str(slug_or_id).is_ok();
+    if uuid_shaped {
+        match service.db.get_conversation(slug_or_id).await {
+            Ok(conv) => return Ok(conv),
+            Err(DbError::ConversationNotFound(_)) => {}
+            Err(e) => return Err(map_db_not_found(e)),
+        }
+    }
     match service.db.get_conversation_by_slug(slug_or_id).await {
         Ok(conv) => Ok(conv),
-        Err(DbError::ConversationNotFound(_)) => service
+        Err(DbError::ConversationNotFound(_)) if !uuid_shaped => service
             .db
             .get_conversation(slug_or_id)
             .await
