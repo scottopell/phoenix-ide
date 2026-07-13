@@ -1337,6 +1337,56 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
 }
 
 #[test]
+fn reducer_only_inbox_ids_cannot_be_consumed_twice() {
+    let mut workflow = workflow();
+    let inbox_id = ReducerInboxId(90);
+    workflow.reducer_inbox.insert(
+        inbox_id,
+        ReducerInboxEvent {
+            id: inbox_id,
+            effect_id: None,
+            barrier_id: None,
+            kind: ReducerInboxKind::BarrierSatisfied,
+            event_codec: codec("barrier"),
+            requires_runtime_acceptance: false,
+            payload: ReducerInboxPayload::Barrier("barrier-event"),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        },
+    );
+    let event = workflow.reducer_inbox[&inbox_id].clone();
+    let result = workflow.consume_reducer_inbox_atomically(
+        &InboxDecisionBinding {
+            inbox: vec![event.clone(), event],
+            decision: ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "consumed",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+        },
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(result, Err(EngineError::InvalidInbox));
+    assert_eq!(workflow.version, Version(0));
+    assert_eq!(
+        workflow.reducer_inbox[&inbox_id].delivery_status,
+        DeliveryStatus::Pending
+    );
+}
+
+#[test]
 fn commit_rejects_effect_and_barrier_id_collisions() {
     let mut workflow = workflow();
     workflow
@@ -1467,6 +1517,64 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
     );
     assert_eq!(consume, Err(EngineError::InvalidInbox));
     assert_eq!(workflow.version, Version(1));
+}
+
+#[test]
+fn runtime_required_inbox_is_rejected_when_protocol_runtime_acceptance_is_disabled() {
+    let mut selection = protocol();
+    selection.runtime_acceptance_enabled = false;
+    let mut workflow = WorkflowState::<TestProfile>::new_authoritative(
+        WorkflowId(21),
+        &profile(),
+        &selection,
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("accepting protocol");
+    let inbox_id = ReducerInboxId(1);
+    workflow.reducer_inbox.insert(
+        inbox_id,
+        ReducerInboxEvent {
+            id: inbox_id,
+            effect_id: None,
+            barrier_id: None,
+            kind: ReducerInboxKind::ReceiptAccepted,
+            event_codec: codec("receipt-event"),
+            requires_runtime_acceptance: true,
+            payload: ReducerInboxPayload::Receipt("receipt-event"),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        },
+    );
+    let result = workflow.consume_reducer_inbox_atomically(
+        &InboxDecisionBinding {
+            inbox: vec![workflow.reducer_inbox[&inbox_id].clone()],
+            decision: ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "consumed",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+        },
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(result, Err(EngineError::InvalidInbox));
+    assert_eq!(workflow.version, Version(0));
+    assert_eq!(
+        workflow.reducer_inbox[&inbox_id].delivery_status,
+        DeliveryStatus::Pending
+    );
 }
 
 #[test]
@@ -3204,6 +3312,107 @@ fn review_regressions_preserve_renewed_authority_and_ambiguity_family_contract()
 }
 
 #[test]
+fn renewed_claim_rejects_the_pre_renewal_authority_for_non_destructive_effects() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("plan");
+    let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
+    let original_authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    let renewed_authority = workflow
+        .renew_claim(&original_authority, Timestamp(1), LeaseExpiry(20))
+        .authority
+        .expect("renewed authority");
+
+    assert_eq!(
+        workflow.record_observation(
+            &original_authority,
+            Timestamp(2),
+            attempt.id,
+            codec("observation"),
+            "stale bearer",
+        ),
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        workflow.record_observation(
+            &renewed_authority,
+            Timestamp(2),
+            attempt.id,
+            codec("observation"),
+            "renewed bearer",
+        ),
+        AuthorityOutcome::Authorized
+    );
+}
+
+#[test]
+fn post_terminal_receipt_is_durably_suppressed_instead_of_pending() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("plan");
+    let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Completed,
+                    snapshot: "completed",
+                    snapshot_codec: codec("snapshot"),
+                    event: "complete",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("complete workflow");
+    let accepted = workflow.accept_receipt(
+        &claim.authority.expect("authority"),
+        Timestamp(1),
+        Some(claim.attempt.expect("attempt").id),
+        ReceiptOrigin::Execution,
+        codec("receipt"),
+        "done",
+        codec("receipt-event"),
+        "receipt-event",
+    );
+    let inbox_id = accepted.receipt_inbox_ids[0];
+
+    assert_eq!(accepted.outcome, AuthorityOutcome::Authorized);
+    assert_eq!(
+        workflow.reducer_inbox[&inbox_id].delivery_status,
+        DeliveryStatus::Suppressed {
+            reason: SuppressionReason::LifecycleTerminal,
+        }
+    );
+    assert_eq!(
+        drain_proof(&protocol(), [&workflow]).categories["pending_reducer_inbox"].count,
+        0
+    );
+}
+
+#[test]
 fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
     let mut workflow = workflow();
     let mut first = plan();
@@ -3277,6 +3486,14 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
         },
     );
     assert_eq!(resolved.outcome, CommitOutcome::Committed);
+    assert_eq!(
+        resolved
+            .receipt
+            .expect("manual receipt")
+            .authority
+            .declared_workflow_version,
+        Version(1)
+    );
 }
 
 #[test]
@@ -3561,6 +3778,47 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
         "reducer-only",
     );
     assert!(!workflow.reducer_inbox[&accepted.receipt_inbox_ids[0]].requires_runtime_acceptance);
+}
+
+#[test]
+fn manual_resolution_requirement_rejects_any_empty_choice_codec() {
+    for missing_codec in ["choice", "receipt", "receipt-event"] {
+        let mut workflow = workflow();
+        workflow
+            .commit_transition(
+                &ReducerDecision {
+                    expected_workflow_version: Version(0),
+                    plan: plan(),
+                },
+                &barrier_events(),
+            )
+            .expect("plan");
+        let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
+        let mut choice = ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
+        };
+        match missing_codec {
+            "choice" => choice.codec.family = "",
+            "receipt" => choice.receipt_codec.family = "",
+            "receipt-event" => choice.receipt_event_codec.family = "",
+            _ => unreachable!(),
+        }
+        let before = workflow.clone();
+        let outcome = workflow.require_manual_resolution(
+            &claim.authority.expect("authority"),
+            Timestamp(1),
+            vec![choice],
+        );
+
+        assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
+        assert_eq!(workflow, before);
+    }
 }
 
 #[test]

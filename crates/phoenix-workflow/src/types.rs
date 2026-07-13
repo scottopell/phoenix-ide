@@ -183,6 +183,7 @@ pub enum ReducerInboxKind {
 pub enum DeliveryStatus {
     Pending,
     Consumed,
+    Suppressed { reason: SuppressionReason },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
