@@ -765,7 +765,7 @@
         },
         "followTail": true,
         "visibleRange": {
-          "startIndex": 1,
+          "startIndex": 2,
           "endIndex": 3
         }
       },
@@ -834,7 +834,7 @@
         },
         "followTail": true,
         "visibleRange": {
-          "startIndex": 3,
+          "startIndex": 4,
           "endIndex": 5
         }
       },
@@ -905,7 +905,7 @@
         },
         "followTail": false,
         "visibleRange": {
-          "startIndex": 0,
+          "startIndex": 1,
           "endIndex": 2
         },
         "readingAnchor": {
@@ -960,7 +960,7 @@
         },
         "followTail": false,
         "visibleRange": {
-          "startIndex": 1,
+          "startIndex": 2,
           "endIndex": 3
         },
         "readingAnchor": {

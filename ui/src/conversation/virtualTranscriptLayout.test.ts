@@ -73,7 +73,7 @@ describe('buildTranscriptLayout', () => {
     expect(result.totalExtent).toBe(0);
   });
 
-  it('looks up indexes by offset across boundaries and outside the range', () => {
+  it('looks up indexes by half-open offset boundaries and outside the range', () => {
     const result = layout(
       new Map([
         ['a', 5],
@@ -86,11 +86,12 @@ describe('buildTranscriptLayout', () => {
     expect(result.indexAtOffset(-100)).toBe(0);
     expect(result.indexAtOffset(0)).toBe(0);
     expect(result.indexAtOffset(4.999)).toBe(0);
-    expect(result.indexAtOffset(5)).toBe(0);
+    expect(result.indexAtOffset(5)).toBe(1);
     expect(result.indexAtOffset(5.001)).toBe(1);
     expect(result.indexAtOffset(19.999)).toBe(1);
-    expect(result.indexAtOffset(20)).toBe(1);
+    expect(result.indexAtOffset(20)).toBe(2);
     expect(result.indexAtOffset(20.001)).toBe(2);
+    expect(result.indexAtOffset(40)).toBe(3);
     expect(result.indexAtOffset(1000)).toBe(3);
   });
 
@@ -111,6 +112,41 @@ describe('buildTranscriptLayout', () => {
         overscanExtent: 10,
       }),
     ).toEqual({ startIndex: 1, endIndex: 2 });
+  });
+
+  it('includes only rows with positive-area half-open viewport intersection', () => {
+    const result = layout(
+      new Map([
+        ['a', 10],
+        ['b', 20],
+        ['c', 30],
+        ['d', 40],
+      ]),
+    );
+
+    expect(
+      result.rangeForViewport({
+        viewportOffset: 10,
+        viewportExtent: 20,
+        overscanExtent: 0,
+      }),
+    ).toEqual({ startIndex: 1, endIndex: 1 });
+
+    expect(
+      result.rangeForViewport({
+        viewportOffset: 30,
+        viewportExtent: 30,
+        overscanExtent: 0,
+      }),
+    ).toEqual({ startIndex: 2, endIndex: 2 });
+
+    expect(
+      result.rangeForViewport({
+        viewportOffset: 60,
+        viewportExtent: 0,
+        overscanExtent: 0,
+      }),
+    ).toBeNull();
   });
 
   it('expands overscan to surrounding items and clamps at transcript edges', () => {

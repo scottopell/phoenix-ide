@@ -140,8 +140,18 @@ export function parseVirtualTranscriptScenarioCorpus(raw: unknown): VirtualTrans
   const ids = parsed.scenarios.map((scenario) => scenario.id);
   const expectedIds = [...EXPECTED_SCENARIO_IDS];
 
+  const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
+  const missingIds = expectedIds.filter((id) => !ids.includes(id));
+  const unexpectedIds = ids.filter((id) => !(expectedIds as readonly string[]).includes(id));
+
+  if (duplicateIds.length > 0 || missingIds.length > 0 || unexpectedIds.length > 0) {
+    throw new Error(
+      `Virtual Transcript fixture IDs invalid: missing [${missingIds.join(', ')}], duplicates [${duplicateIds.join(', ')}], unexpected [${unexpectedIds.join(', ')}]`,
+    );
+  }
+
   if (ids.length !== expectedIds.length || ids.some((id, index) => id !== expectedIds[index])) {
-    throw new Error(`Virtual Transcript fixture IDs changed: expected ${expectedIds.join(', ')}, got ${ids.join(', ')}`);
+    throw new Error(`Virtual Transcript fixture IDs changed order: expected ${expectedIds.join(', ')}, got ${ids.join(', ')}`);
   }
 
   if (parsed.metadata.scenarioCount !== parsed.scenarios.length) {

@@ -2956,7 +2956,8 @@ fn db_message_selection_for_stream(
 
     match (query.init_mode, query.after_message_floor) {
         (Some(StreamInitMode::MessagesAfterFloor), Some(after_floor))
-            if query.transcript_generation == Some(transcript_generation) =>
+            if query.transcript_generation == Some(transcript_generation)
+                && after_floor <= last_sequence_id =>
         {
             StreamDbMessageSelection::AfterFloor(after_floor)
         }
@@ -8585,6 +8586,89 @@ pub(crate) mod hard_delete_cascade_tests {
         );
     }
 
+    #[tokio::test]
+    async fn above_tail_after_floor_stream_selection_reads_full_transcript() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "stream-floor-above-tail",
+                "floor-above-tail",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        for idx in 1..=3 {
+            state
+                .db
+                .add_message(
+                    &format!("stream-floor-above-tail-msg-{idx}"),
+                    "stream-floor-above-tail",
+                    &crate::db::MessageContent::user(format!("m{idx}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add message");
+        }
+        let query = StreamConversationQuery {
+            after_event_sequence: None,
+            after_sequence: None,
+            init_mode: Some(StreamInitMode::MessagesAfterFloor),
+            after_message_floor: Some(99),
+            transcript_generation: Some(1),
+        };
+
+        let stable = stable_transcript_read(
+            state.runtime.db(),
+            "stream-floor-above-tail",
+            |db, id, attempt| {
+                let query = query.clone();
+                Box::pin(async move {
+                    let last_sequence_id = db.get_last_sequence_id(id).await.unwrap_or(0);
+                    let mut selection = db_message_selection_for_stream(
+                        false,
+                        &query,
+                        last_sequence_id,
+                        db.get_conversation(id)
+                            .await
+                            .map_err(|e| AppError::NotFound(e.to_string()))?
+                            .transcript_generation,
+                    );
+                    if attempt > 1 {
+                        selection = StreamDbMessageSelection::Full;
+                    }
+                    let messages = match selection {
+                        StreamDbMessageSelection::None => Vec::new(),
+                        StreamDbMessageSelection::Full => db
+                            .get_messages(id)
+                            .await
+                            .map_err(|e| AppError::Internal(e.to_string()))?,
+                        StreamDbMessageSelection::AfterFloor(after_floor) => db
+                            .get_messages_after(id, after_floor)
+                            .await
+                            .map_err(|e| AppError::Internal(e.to_string()))?,
+                    };
+                    Ok((last_sequence_id, selection, messages))
+                })
+            },
+        )
+        .await
+        .expect("stable stream read");
+
+        let (last_sequence_id, selection, messages) = stable.value;
+        assert_eq!(stable.attempts, 1);
+        assert_eq!(last_sequence_id, 3);
+        assert_eq!(selection, StreamDbMessageSelection::Full);
+        assert_eq!(
+            messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
     #[test]
     fn demand_driven_stream_modes_select_db_messages_by_rest_floor() {
         assert_eq!(
@@ -8611,6 +8695,21 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(50),
                     transcript_generation: Some(2),
+                },
+                75,
+                3,
+            ),
+            StreamDbMessageSelection::Full
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                false,
+                &StreamConversationQuery {
+                    after_event_sequence: None,
+                    after_sequence: None,
+                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
+                    after_message_floor: Some(76),
+                    transcript_generation: Some(3),
                 },
                 75,
                 3,

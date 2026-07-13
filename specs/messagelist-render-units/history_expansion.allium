@@ -409,28 +409,6 @@ rule MatchingFailureLeavesTailUsable {
     ensures: view.active_request = null
 }
 
-rule PendingCommandHandsOffToTranscriptPositioningInput {
-    when: CommandInputProjected(view, transcript_view, command_key, history_view)
-    requires: view.pending_command != null
-    ensures: vt.InputPositioning(
-        transcript_view,
-        command_key,
-        view.pending_command.token,
-        view.pending_command.request_token,
-        history_view,
-        view.pending_command.kind,
-        view.pending_command.message_id,
-        view.pending_command.viewport_start_offset
-    ).emitted()
-    ensures: view.pending_command = view.pending_command
-}
-
-rule AbsenceOfPendingCommandHandsOffIdleTranscriptPositioningInput {
-    when: CommandInputProjected(view, transcript_view, _, history_view)
-    requires: view.pending_command = null
-    ensures: vt.InputIdle(transcript_view, history_view).emitted()
-}
-
 rule TranscriptPositioningFinishAcknowledgesPendingCommand {
     when: TranscriptPositioningFinished(view, command_token, view_generation, result)
     requires: view.pending_command != null
@@ -492,6 +470,27 @@ rule NoPendingCommandProjectsIdleTranscriptInput {
     requires: transcript_view.generation = view.view_generation
     requires: transcript_view.transcript_generation = view.transcript_generation
     ensures: vt.InputIdle(transcript_view, history_view).emitted()
+}
+
+rule StaleOrMismatchedPendingCommandProjectionIsNoOp {
+    when: CommandInputProjected(view, transcript_view, command_key, history_view)
+    requires: view.pending_command != null
+    requires: history_view != view
+        or transcript_view.conversation_id != view.conversation_id
+        or transcript_view.generation != view.view_generation
+        or transcript_view.transcript_generation != view.transcript_generation
+        or command_key != view.pending_command.token
+    ensures: view.pending_command = view.pending_command
+}
+
+rule StaleOrMismatchedIdleProjectionIsNoOp {
+    when: CommandInputProjected(view, transcript_view, _, history_view)
+    requires: view.pending_command = null
+    requires: history_view != view
+        or transcript_view.conversation_id != view.conversation_id
+        or transcript_view.generation != view.view_generation
+        or transcript_view.transcript_generation != view.transcript_generation
+    ensures: view.pending_command = view.pending_command
 }
 
 rule StaleAcknowledgementCannotConsumeCommand {

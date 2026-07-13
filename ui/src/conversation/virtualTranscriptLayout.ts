@@ -55,7 +55,23 @@ function resolveEstimatedExtent(
   );
 }
 
-function lowerBound(prefixEnds: readonly number[], target: number): number {
+function firstEndAfter(prefixEnds: readonly number[], target: number): number {
+  let low = 0;
+  let high = prefixEnds.length - 1;
+
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (prefixEnds[mid]! > target) {
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  return low;
+}
+
+function firstEndAtOrAfter(prefixEnds: readonly number[], target: number): number {
   let low = 0;
   let high = prefixEnds.length - 1;
 
@@ -144,7 +160,7 @@ export function buildTranscriptLayout(
       if (items.length === 0) return 0;
       if (rawOffset <= 0) return 0;
       if (rawOffset >= totalExtent) return items.length - 1;
-      return lowerBound(prefixEnds, rawOffset);
+      return firstEndAfter(prefixEnds, rawOffset);
     },
     rangeForViewport({ viewportOffset, viewportExtent, overscanExtent }) {
       if (items.length === 0) return null;
@@ -157,8 +173,10 @@ export function buildTranscriptLayout(
         visibleEnd + Math.max(0, overscanExtent),
       );
 
+      if (startOffset >= endOffset) return null;
+
       const startIndex = this.indexAtOffset(startOffset);
-      const endIndex = this.indexAtOffset(Math.max(0, endOffset - Number.EPSILON));
+      const endIndex = firstEndAtOrAfter(prefixEnds, endOffset);
 
       return { startIndex, endIndex };
     },

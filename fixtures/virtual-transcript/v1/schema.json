@@ -12,7 +12,16 @@
       "type": "array",
       "minItems": 7,
       "maxItems": 7,
-      "items": { "$ref": "#/$defs/scenario" }
+      "items": { "$ref": "#/$defs/scenario" },
+      "allOf": [
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "prefix-insertion-within-tall-unit" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "resize-above-anchor" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "alias-navigation" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "orphan-target" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "streaming-growth-reading" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "streaming-growth-following" } } }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "type": "object", "required": ["id"], "properties": { "id": { "const": "supersession" } } }, "minContains": 1, "maxContains": 1 }
+      ]
     }
   },
   "$defs": {
@@ -86,6 +95,7 @@
       }
     },
     "visibleRange": {
+      "description": "Inclusive start/end indexes of rows whose half-open layout interval [rowStart, rowEnd) has positive-area intersection with the half-open viewport interval [offset, offset + extent). This visible range excludes overscan-only/rendered rows.",
       "type": "object",
       "additionalProperties": false,
       "required": ["startIndex", "endIndex"],

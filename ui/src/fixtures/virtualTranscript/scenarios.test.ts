@@ -36,6 +36,10 @@ interface JsonSchema {
   properties?: Record<string, JsonSchema>;
   items?: JsonSchema;
   oneOf?: JsonSchema[];
+  allOf?: JsonSchema[];
+  contains?: JsonSchema;
+  minContains?: number;
+  maxContains?: number;
   minimum?: number;
   exclusiveMinimum?: number;
   minItems?: number;
@@ -74,12 +78,22 @@ function validateJsonSchema(value: unknown, rootSchema: JsonSchema, schema: Json
     if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) return [`${path}: expected > ${schema.exclusiveMinimum}`];
   }
 
+  if (schema.allOf) {
+    const errors = schema.allOf.flatMap((option) => validateJsonSchema(value, rootSchema, option, path));
+    if (errors.length > 0) return errors;
+  }
+
   if (Array.isArray(value)) {
     const errors: string[] = [];
     if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${path}: expected at least ${schema.minItems} items`);
     if (schema.maxItems !== undefined && value.length > schema.maxItems) errors.push(`${path}: expected at most ${schema.maxItems} items`);
     if (schema.items) {
       value.forEach((item, index) => errors.push(...validateJsonSchema(item, rootSchema, schema.items!, `${path}[${index}]`)));
+    }
+    if (schema.contains) {
+      const matches = value.filter((item, index) => validateJsonSchema(item, rootSchema, schema.contains!, `${path}[${index}]`).length === 0).length;
+      if (schema.minContains !== undefined && matches < schema.minContains) errors.push(`${path}: expected at least ${schema.minContains} contains matches`);
+      if (schema.maxContains !== undefined && matches > schema.maxContains) errors.push(`${path}: expected at most ${schema.maxContains} contains matches`);
     }
     return errors;
   }
@@ -247,7 +261,14 @@ describe('virtual transcript fixture scenarios', () => {
 
     const scenarios = [...(corpus['scenarios'] as Record<string, unknown>[])];
     scenarios[0] = { ...scenarios[0], id: 'unexpected-id' };
-    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios })).toThrow();
+    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios })).toThrow(/unexpected-id/);
+
+    const duplicateScenarios = [...(corpus['scenarios'] as Record<string, unknown>[])];
+    duplicateScenarios[1] = { ...duplicateScenarios[1], id: duplicateScenarios[0]?.id };
+    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios: duplicateScenarios })).toThrow(/duplicates/);
+
+    const reorderedScenarios = [...(corpus['scenarios'] as Record<string, unknown>[])].reverse();
+    expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios: reorderedScenarios })).toThrow(/changed order/);
   });
 
   it('covers the intended conformance corpus with stable ids and lookups', () => {
