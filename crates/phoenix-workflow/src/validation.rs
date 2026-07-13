@@ -88,14 +88,19 @@ pub fn validate_plan<P: WorkflowProfile>(
     Ok(())
 }
 
-fn validate_status_transition(
+pub(crate) fn validate_status_transition(
     current_status: WorkflowStatus,
     next_status: WorkflowStatus,
 ) -> Result<(), PlanError> {
     let valid = match current_status {
         WorkflowStatus::Active => matches!(
             next_status,
-            WorkflowStatus::Active | WorkflowStatus::Cancelling | WorkflowStatus::Cancelled
+            WorkflowStatus::Active
+                | WorkflowStatus::Cancelling
+                | WorkflowStatus::Cancelled
+                | WorkflowStatus::DeletionPending
+                | WorkflowStatus::Completed
+                | WorkflowStatus::Failed
         ),
         WorkflowStatus::Cancelling => {
             matches!(

@@ -236,6 +236,12 @@ pub enum DivergenceAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivergenceResolutionAction {
+    Rollback,
+    Reauthorize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowDivergenceKind {
     Snapshot,
     Transition,
@@ -466,6 +472,7 @@ pub struct ReducerInboxDecl<P: WorkflowProfile> {
     pub barrier_id: Option<BarrierId>,
     pub kind: ReducerInboxKind,
     pub event_codec: CodecRef,
+    pub requires_runtime_acceptance: bool,
     pub payload: ReducerInboxPayload<P>,
 }
 
@@ -503,6 +510,7 @@ pub struct ObservationRecord<O> {
     pub id: ObservationId,
     pub authority: ClaimAuthority,
     pub attempt_id: AttemptId,
+    pub observation_codec: CodecRef,
     pub observation: O,
     pub authoritative: bool,
 }
@@ -512,6 +520,7 @@ pub struct StaleObservationRecord<O> {
     pub id: ObservationId,
     pub authority: ClaimAuthority,
     pub attempt_id: AttemptId,
+    pub observation_codec: CodecRef,
     pub observation: O,
 }
 
@@ -533,6 +542,7 @@ pub struct ReducerInboxEvent<P: WorkflowProfile> {
     pub barrier_id: Option<BarrierId>,
     pub kind: ReducerInboxKind,
     pub event_codec: CodecRef,
+    pub requires_runtime_acceptance: bool,
     pub payload: ReducerInboxPayload<P>,
     pub delivery_status: DeliveryStatus,
     pub consumed_by: Option<TransitionId>,
@@ -717,7 +727,7 @@ pub struct ShadowDivergenceRecord {
 pub enum ShadowDivergenceResolution {
     Unresolved,
     Resolved {
-        action: DivergenceAction,
+        action: DivergenceResolutionAction,
         resolved_by: &'static str,
     },
 }
@@ -832,6 +842,7 @@ fn clone_reducer_inbox_event<P: WorkflowProfile>(
         barrier_id: event.barrier_id,
         kind: event.kind,
         event_codec: event.event_codec.clone(),
+        requires_runtime_acceptance: event.requires_runtime_acceptance,
         payload: match &event.payload {
             ReducerInboxPayload::Receipt(payload) => ReducerInboxPayload::Receipt(payload.clone()),
             ReducerInboxPayload::Barrier(payload) => ReducerInboxPayload::Barrier(payload.clone()),

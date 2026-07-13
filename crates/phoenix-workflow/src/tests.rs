@@ -384,11 +384,23 @@ fn observations_and_receipts_require_matching_attempt() {
     let authority = claim.authority.expect("authority issued");
     let attempt = claim.attempt.expect("attempt created");
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(1), AttemptId(999), "saw"),
+        workflow.record_observation(
+            &authority,
+            Timestamp(1),
+            AttemptId(999),
+            codec("observation"),
+            "saw"
+        ),
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(1), attempt.id, "saw"),
+        workflow.record_observation(
+            &authority,
+            Timestamp(1),
+            attempt.id,
+            codec("observation"),
+            "saw"
+        ),
         AuthorityOutcome::Authorized
     );
     let accepted = workflow.accept_receipt(
@@ -456,7 +468,13 @@ fn stale_observations_are_retained_diagnostically() {
     let authority = claim.authority.expect("authority issued");
     let attempt = claim.attempt.expect("attempt created");
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(2), attempt.id, "late"),
+        workflow.record_observation(
+            &authority,
+            Timestamp(2),
+            attempt.id,
+            codec("observation"),
+            "late"
+        ),
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(workflow.effects[&EffectId(1)].stale_observations.len(), 1);
@@ -1915,12 +1933,20 @@ fn shadow_divergence_is_recorded_without_authority() {
         1
     );
     let divergence_id = workflow.shadow_divergences[0].id;
-    assert!(workflow.resolve_shadow_divergence(divergence_id, "operator-a"));
-    assert!(!workflow.resolve_shadow_divergence(divergence_id, "operator-b"));
+    assert!(workflow.resolve_shadow_divergence(
+        divergence_id,
+        DivergenceResolutionAction::Rollback,
+        "operator-a",
+    ));
+    assert!(!workflow.resolve_shadow_divergence(
+        divergence_id,
+        DivergenceResolutionAction::Reauthorize,
+        "operator-b",
+    ));
     assert!(matches!(
         workflow.shadow_divergences[0].resolution,
         ShadowDivergenceResolution::Resolved {
-            action: DivergenceAction::HaltAcceptance,
+            action: DivergenceResolutionAction::Rollback,
             resolved_by: "operator-a"
         }
     ));
@@ -2085,6 +2111,617 @@ fn simulator_restart_preserves_durable_claim_and_recovers_worker_runtime() {
             .outcome,
         ClaimOutcome::Claimed
     );
+}
+
+#[test]
+fn active_allows_completed_failed_and_deletion_pending_but_terminals_do_not_reopen() {
+    let workflow = workflow();
+    for next_status in [
+        WorkflowStatus::Completed,
+        WorkflowStatus::Failed,
+        WorkflowStatus::DeletionPending,
+    ] {
+        let mut candidate = workflow.clone();
+        let committed = candidate
+            .commit_transition(
+                &ReducerDecision {
+                    expected_workflow_version: Version(0),
+                    plan: TransitionPlan {
+                        next_status,
+                        snapshot: "terminal",
+                        snapshot_codec: codec("snapshot"),
+                        event: "terminalize",
+                        event_codec: codec("event"),
+                        effects: vec![],
+                        dependencies: vec![],
+                        barriers: vec![],
+                        barrier_members: vec![],
+                        invalidations: vec![],
+                        owed_acceptances: None,
+                    },
+                },
+                &BTreeMap::new(),
+            )
+            .expect("terminal transition succeeds from active");
+        assert_eq!(committed.outcome, CommitOutcome::Committed);
+        assert_eq!(candidate.status, next_status);
+        let reopen = candidate.commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "reopen",
+                    snapshot_codec: codec("snapshot"),
+                    event: "reopen",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            reopen,
+            Err(EngineError::InvalidPlan(
+                PlanError::InvalidStatusTransition {
+                    current: next_status,
+                    next: WorkflowStatus::Active,
+                }
+            ))
+        );
+    }
+}
+
+#[test]
+fn cancellation_active_compensation_cannot_reopen_and_stays_cancelling() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let result = workflow
+        .cancel_with_compensation(
+            &CancellationRequest {
+                expected_workflow_version: Version(1),
+                next_snapshot: "cancelling",
+                next_snapshot_codec: codec("snapshot"),
+                event: "cancel",
+                event_codec: codec("cancel-event"),
+                invalidations: vec![],
+                reducer_inbox_events: vec![],
+                compensation_plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "should-not-reopen",
+                    snapshot_codec: codec("snapshot"),
+                    event: "compensate",
+                    event_codec: codec("compensate-event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("cancellation succeeds");
+    assert_eq!(result.outcome, CommitOutcome::Committed);
+    assert_eq!(workflow.status, WorkflowStatus::Cancelling);
+    assert_eq!(workflow.snapshot, "cancelling");
+    assert_eq!(
+        workflow
+            .transition_log
+            .last()
+            .expect("cancel transition")
+            .event,
+        "cancel"
+    );
+}
+
+#[test]
+fn reducer_only_inbox_consumes_without_owed_but_receipt_requires_exact_runtime_acceptance() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let reducer_only = ReducerInboxId(7000);
+    workflow.reducer_inbox.insert(
+        reducer_only,
+        ReducerInboxEvent {
+            id: reducer_only,
+            effect_id: None,
+            barrier_id: Some(BarrierId(77)),
+            kind: ReducerInboxKind::BarrierSatisfied,
+            event_codec: codec("barrier"),
+            requires_runtime_acceptance: false,
+            payload: ReducerInboxPayload::Barrier("barrier-only"),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        },
+    );
+    let consumed = workflow
+        .consume_reducer_inbox_atomically(
+            &[reducer_only],
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    next_status: WorkflowStatus::Active,
+                    snapshot: "reducer-only-consumed",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume-reducer-only",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: None,
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("reducer-only inbox can commit without owed acceptance");
+    assert_eq!(consumed.outcome, CommitOutcome::Committed);
+    assert!(workflow.owed_acceptances.is_empty());
+
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    let accepted = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        codec("receipt"),
+        "done",
+        codec("receipt-event"),
+        "receipt-event",
+    );
+    let receipt_inbox_id = accepted.receipt_inbox_ids[0];
+    let rejected = workflow.consume_reducer_inbox_atomically(
+        &[receipt_inbox_id],
+        &ReducerDecision {
+            expected_workflow_version: Version(2),
+            plan: TransitionPlan {
+                next_status: WorkflowStatus::Active,
+                snapshot: "missing-owed",
+                snapshot_codec: codec("snapshot"),
+                event: "consume-receipt",
+                event_codec: codec("event"),
+                effects: vec![],
+                dependencies: vec![],
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: None,
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(rejected, Err(EngineError::InvalidInbox));
+}
+
+#[test]
+fn shadow_drain_excludes_all_authority_categories_except_unresolved_blocking_divergence() {
+    let profile = profile();
+    let mut workflow = WorkflowState::<TestProfile>::new_shadow(
+        WorkflowId(9),
+        WorkflowId(1),
+        &profile,
+        &protocol(),
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("shadow workflow");
+    workflow.record_shadow_divergence(
+        ShadowDivergenceKind::Receipt,
+        "receipt-divergence".to_string(),
+        ShadowComparisonEvidence {
+            profile_detail_kind: "receipt".to_string(),
+            expected_codec: Some(codec("expected")),
+            expected_payload: Some("a".to_string()),
+            actual_codec: Some(codec("actual")),
+            actual_payload: Some("b".to_string()),
+        },
+    );
+    let proof = drain_proof(&workflow);
+    for category in exact_drain_categories() {
+        if category == "blocking_divergences" {
+            assert_eq!(proof.categories[category].count, 1);
+        } else {
+            assert_eq!(
+                proof.categories[category].count, 0,
+                "category {category} should be excluded for shadow drain"
+            );
+        }
+    }
+}
+
+#[test]
+fn monotonic_renewal_uses_stored_lease_and_updates_destructive_lock() {
+    let mut workflow = workflow();
+    let mut destructive_plan = plan();
+    destructive_plan.effects[0].destructive_resource = Some("resource-a");
+    destructive_plan.effects[1].effect_id = EffectId(3);
+    destructive_plan.effects[1].destructive_resource = Some("resource-b");
+    destructive_plan.dependencies[0] = DependencyDecl {
+        effect_id: EffectId(3),
+        depends_on_effect_id: EffectId(1),
+    };
+    destructive_plan.barrier_members[1].effect_id = EffectId(3);
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: destructive_plan,
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    assert_eq!(
+        workflow.renew_claim(&authority, Timestamp(1), LeaseExpiry(10)),
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        workflow.renew_claim(&authority, Timestamp(1), LeaseExpiry(9)),
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        workflow.renew_claim(&authority, Timestamp(1), LeaseExpiry(20)),
+        AuthorityOutcome::Authorized
+    );
+    let effect = &workflow.effects[&EffectId(1)];
+    assert_eq!(
+        effect.claim.as_ref().expect("claim").lease_until,
+        LeaseExpiry(20)
+    );
+    assert_eq!(
+        effect.destructive_lock.as_ref().expect("lock").lease_until,
+        LeaseExpiry(20)
+    );
+}
+
+#[test]
+fn observation_codec_persists_and_empty_family_is_rejected() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    assert_eq!(
+        workflow.record_observation(
+            &authority,
+            Timestamp(1),
+            attempt.id,
+            codec("observation"),
+            "observed"
+        ),
+        AuthorityOutcome::Authorized
+    );
+    assert_eq!(
+        workflow.effects[&EffectId(1)].observations[0].observation_codec,
+        codec("observation")
+    );
+    let before = workflow.clone();
+    assert_eq!(
+        workflow.record_observation(
+            &authority,
+            Timestamp(1),
+            attempt.id,
+            CodecRef {
+                family: "",
+                version: 1
+            },
+            "ignored"
+        ),
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(workflow, before);
+}
+
+#[test]
+fn empty_manual_choices_are_rejected() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let before = workflow.clone();
+    let outcome = workflow.require_manual_resolution(&authority, Timestamp(1), vec![]);
+    assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
+    assert_eq!(workflow, before);
+}
+
+#[test]
+fn empty_cancellation_codecs_are_rejected_atomically() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let before = workflow.clone();
+    let result = workflow.cancel_with_compensation(
+        &CancellationRequest {
+            expected_workflow_version: Version(1),
+            next_snapshot: "cancelled",
+            next_snapshot_codec: CodecRef {
+                family: "",
+                version: 1,
+            },
+            event: "cancel",
+            event_codec: codec("cancel-event"),
+            invalidations: vec![],
+            reducer_inbox_events: vec![],
+            compensation_plan: TransitionPlan {
+                next_status: WorkflowStatus::Cancelling,
+                snapshot: "cancelled",
+                snapshot_codec: codec("snapshot"),
+                event: "cancel",
+                event_codec: codec("event"),
+                effects: vec![],
+                dependencies: vec![],
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: None,
+            },
+        },
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        result,
+        Err(EngineError::InvalidPlan(PlanError::MissingCodec(
+            "cancellation"
+        )))
+    );
+    assert_eq!(workflow, before);
+}
+
+#[test]
+fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let resolution = workflow
+        .require_manual_resolution(
+            &authority,
+            Timestamp(1),
+            vec![ManualChoice {
+                kind: ManualChoiceKind::Adopt,
+                codec: codec("manual"),
+                payload: "adopt",
+            }],
+        )
+        .manual_resolution
+        .expect("resolution");
+    let before = workflow.clone();
+    let empty_codec = workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        "operator-a",
+        &ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+        },
+        ManualResolutionCommit {
+            transition_codec: CodecRef {
+                family: "",
+                version: 1,
+            },
+            transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
+        },
+    );
+    assert_eq!(empty_codec.outcome, CommitOutcome::InvalidPlan);
+    assert_eq!(workflow, before);
+    workflow.status = WorkflowStatus::Cancelling;
+    let before_cancelling = workflow.clone();
+    let invalid_status = workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        "operator-a",
+        &ManualChoice {
+            kind: ManualChoiceKind::Adopt,
+            codec: codec("manual"),
+            payload: "adopt",
+        },
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-transition",
+            next_status: WorkflowStatus::Active,
+            receipt_codec: codec("receipt"),
+            receipt: "receipt",
+            receipt_event_codec: codec("receipt-event"),
+            receipt_event: "manual-receipt-event",
+        },
+    );
+    assert_eq!(invalid_status.outcome, CommitOutcome::InvalidPlan);
+    assert_eq!(workflow, before_cancelling);
+}
+
+#[test]
+fn empty_receipt_codecs_are_rejected() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    let before = workflow.clone();
+    let accepted = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        CodecRef {
+            family: "",
+            version: 1,
+        },
+        "done",
+        codec("receipt-event"),
+        "receipt-event",
+    );
+    assert_eq!(accepted.outcome, AuthorityOutcome::StaleAuthority);
+    assert_eq!(workflow, before);
+}
+
+#[test]
+fn explicit_reauthorize_divergence_action_is_persisted() {
+    let profile = profile();
+    let mut workflow = WorkflowState::<TestProfile>::new_shadow(
+        WorkflowId(11),
+        WorkflowId(1),
+        &profile,
+        &protocol(),
+        codec("snapshot"),
+        "initial",
+    )
+    .expect("shadow workflow");
+    workflow.record_shadow_divergence(
+        ShadowDivergenceKind::Capability,
+        "cap-1".to_string(),
+        ShadowComparisonEvidence {
+            profile_detail_kind: "capability".to_string(),
+            expected_codec: None,
+            expected_payload: Some("expected".to_string()),
+            actual_codec: None,
+            actual_payload: Some("actual".to_string()),
+        },
+    );
+    let divergence_id = workflow.shadow_divergences[0].id;
+    assert!(workflow.resolve_shadow_divergence(
+        divergence_id,
+        DivergenceResolutionAction::Reauthorize,
+        "operator-z",
+    ));
+    assert!(matches!(
+        workflow.shadow_divergences[0].resolution,
+        ShadowDivergenceResolution::Resolved {
+            action: DivergenceResolutionAction::Reauthorize,
+            resolved_by: "operator-z"
+        }
+    ));
+}
+
+#[test]
+fn forged_or_missing_destructive_resource_lock_is_rejected() {
+    let mut workflow = workflow();
+    let mut destructive_plan = plan();
+    destructive_plan.effects[0].destructive_resource = Some("resource-a");
+    destructive_plan.effects[1].effect_id = EffectId(3);
+    destructive_plan.effects[1].destructive_resource = Some("resource-b");
+    destructive_plan.dependencies[0] = DependencyDecl {
+        effect_id: EffectId(3),
+        depends_on_effect_id: EffectId(1),
+    };
+    destructive_plan.barrier_members[1].effect_id = EffectId(3);
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: destructive_plan,
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+
+    let mut forged = authority.clone();
+    forged.resource_lock = None;
+    assert_eq!(
+        workflow.record_observation(
+            &forged,
+            Timestamp(1),
+            attempt.id,
+            codec("observation"),
+            "forged"
+        ),
+        AuthorityOutcome::StaleAuthority
+    );
+
+    let mut forged_lock = authority.clone();
+    if let Some(lock) = &mut forged_lock.resource_lock {
+        lock.claim_token += 1;
+    }
+    assert_eq!(
+        workflow
+            .accept_receipt(
+                &forged_lock,
+                Timestamp(1),
+                Some(attempt.id),
+                ReceiptOrigin::Execution,
+                codec("receipt"),
+                "done",
+                codec("receipt-event"),
+                "receipt-event",
+            )
+            .outcome,
+        AuthorityOutcome::StaleAuthority
+    );
+
+    assert!(workflow.effects[&EffectId(1)].receipt.is_none());
+    assert_eq!(workflow.effects[&EffectId(1)].status, EffectStatus::Claimed);
 }
 
 proptest! {

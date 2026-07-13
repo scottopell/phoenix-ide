@@ -88,6 +88,20 @@ pub fn exact_drain_categories() -> [&'static str; 8] {
 #[must_use]
 pub fn drain_proof<P: WorkflowProfile>(workflow: &WorkflowState<P>) -> DrainProof {
     let mut categories = BTreeMap::new();
+    if workflow.binding.execution_mode() == crate::ExecutionMode::Shadow {
+        for category in exact_drain_categories() {
+            let evidence = if category == "blocking_divergences" {
+                blocking_divergences_evidence(workflow)
+            } else {
+                DrainCategoryEvidence {
+                    count: 0,
+                    identities: Vec::new(),
+                }
+            };
+            insert_drain_category(&mut categories, category, evidence);
+        }
+        return build_drain_proof(workflow, categories);
+    }
     insert_drain_category(
         &mut categories,
         "nonterminal_workflows",
@@ -128,6 +142,13 @@ pub fn drain_proof<P: WorkflowProfile>(workflow: &WorkflowState<P>) -> DrainProo
         "blocking_divergences",
         blocking_divergences_evidence(workflow),
     );
+    build_drain_proof(workflow, categories)
+}
+
+fn build_drain_proof<P: WorkflowProfile>(
+    workflow: &WorkflowState<P>,
+    categories: BTreeMap<&'static str, DrainCategoryEvidence>,
+) -> DrainProof {
     let complete = exact_drain_categories()
         .into_iter()
         .all(|category| categories.contains_key(category))
