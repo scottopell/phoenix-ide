@@ -103,9 +103,13 @@ function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange |
 }
 
 function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
+  const viewportStart = Math.max(store.viewportTop, store.headerExtent);
+  const viewportEnd = Math.min(store.viewportTop + store.viewportExtent, totalPhysicalExtent(store));
+  const clippedExtent = viewportEnd - viewportStart;
+  if (clippedExtent <= 0) return null;
   return store.layout.rangeForViewport({
-    viewportOffset: rowViewportOffset(store),
-    viewportExtent: store.viewportExtent,
+    viewportOffset: viewportStart - store.headerExtent,
+    viewportExtent: clippedExtent,
     overscanExtent: 0,
   });
 }

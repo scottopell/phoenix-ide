@@ -17,16 +17,6 @@ const EXPECTED_SCENARIO_IDS = [
   'supersession',
 ] as const satisfies readonly VirtualTranscriptScenarioId[];
 
-const EXPECTED_EXPECTATION_KIND_BY_SCENARIO_ID = {
-  'prefix-insertion-within-tall-unit': 'restore_anchor_after_prefix_insertion',
-  'resize-above-anchor': 'preserve_anchor_across_resize',
-  'alias-navigation': 'resolve_alias_navigation',
-  'orphan-target': 'report_orphan_target',
-  'streaming-growth-reading': 'stream_append_without_reposition',
-  'streaming-growth-following': 'stream_append_and_follow_tail',
-  'supersession': 'supersede_restore_command',
-} as const satisfies Record<VirtualTranscriptScenarioId, VirtualTranscriptScenario['expectation']['kind']>;
-
 const UnitRoleSchema = v.picklist(['user', 'agent', 'tool', 'system']);
 const StringArraySchema = v.array(v.string());
 const NonNegativeNumberSchema = v.pipe(v.number(), v.minValue(0));
@@ -74,69 +64,121 @@ const AliasLookupSchema = v.strictObject({
   resolvedMessageKey: v.nullable(v.string()),
 });
 
-const ExpectationSchema = v.variant('kind', [
+const ScenarioSchema = v.variant('id', [
   v.strictObject({
-    kind: v.literal('restore_anchor_after_prefix_insertion'),
-    anchorMessageId: v.string(),
-    anchorKey: v.string(),
-    previousAnchorOffset: v.number(),
-    nextAnchorOffset: v.number(),
-    insertedKeys: StringArraySchema,
-    preservedViewportDelta: v.number(),
+    id: v.literal('prefix-insertion-within-tall-unit'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('restore_anchor_after_prefix_insertion'),
+      anchorMessageId: v.string(),
+      anchorKey: v.string(),
+      previousAnchorOffset: v.number(),
+      nextAnchorOffset: v.number(),
+      insertedKeys: StringArraySchema,
+      preservedViewportDelta: v.number(),
+    }),
   }),
   v.strictObject({
-    kind: v.literal('preserve_anchor_across_resize'),
-    anchorMessageId: v.string(),
-    anchorKey: v.string(),
-    previousAnchorOffset: v.number(),
-    nextAnchorOffset: v.number(),
-    resizedKeys: StringArraySchema,
-    preservedViewportDelta: v.number(),
+    id: v.literal('resize-above-anchor'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('preserve_anchor_across_resize'),
+      anchorMessageId: v.string(),
+      anchorKey: v.string(),
+      previousAnchorOffset: v.number(),
+      nextAnchorOffset: v.number(),
+      resizedKeys: StringArraySchema,
+      preservedViewportDelta: v.number(),
+    }),
   }),
   v.strictObject({
-    kind: v.literal('resolve_alias_navigation'),
-    requestedMessageId: v.string(),
-    resolvedMessageKey: v.string(),
-    targetIndex: NonNegativeIntegerSchema,
-    targetOffset: SignedNumberSchema,
+    id: v.literal('alias-navigation'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('resolve_alias_navigation'),
+      requestedMessageId: v.string(),
+      resolvedMessageKey: v.string(),
+      targetIndex: NonNegativeIntegerSchema,
+      targetOffset: SignedNumberSchema,
+    }),
   }),
   v.strictObject({
-    kind: v.literal('report_orphan_target'),
-    requestedMessageId: v.string(),
-    reason: v.literal('target_missing'),
+    id: v.literal('orphan-target'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('report_orphan_target'),
+      requestedMessageId: v.string(),
+      reason: v.literal('target_missing'),
+    }),
   }),
   v.strictObject({
-    kind: v.literal('stream_append_without_reposition'),
-    appendedKeys: StringArraySchema,
-    preservedViewportOffset: v.number(),
+    id: v.literal('streaming-growth-reading'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('stream_append_without_reposition'),
+      appendedKeys: StringArraySchema,
+      preservedViewportOffset: v.number(),
+    }),
   }),
   v.strictObject({
-    kind: v.literal('stream_append_and_follow_tail'),
-    appendedKeys: StringArraySchema,
-    previousViewportOffset: v.number(),
-    nextViewportOffset: v.number(),
-    nextViewportEnd: v.number(),
-    totalExtent: v.number(),
+    id: v.literal('streaming-growth-following'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('stream_append_and_follow_tail'),
+      appendedKeys: StringArraySchema,
+      previousViewportOffset: v.number(),
+      nextViewportOffset: v.number(),
+      nextViewportEnd: v.number(),
+      totalExtent: v.number(),
+    }),
   }),
   v.strictObject({
-    kind: v.literal('supersede_restore_command'),
-    supersededMessageId: v.string(),
-    winningMessageId: v.string(),
-    winningMessageKey: v.string(),
-    targetIndex: NonNegativeIntegerSchema,
+    id: v.literal('supersession'),
+    title: v.string(),
+    story: v.string(),
+    tags: StringArraySchema,
+    before: SnapshotSchema,
+    after: SnapshotSchema,
+    aliasLookups: v.optional(v.array(AliasLookupSchema)),
+    expectation: v.strictObject({
+      kind: v.literal('supersede_restore_command'),
+      supersededMessageId: v.string(),
+      winningMessageId: v.string(),
+      winningMessageKey: v.string(),
+      targetIndex: NonNegativeIntegerSchema,
+    }),
   }),
 ]);
-
-const ScenarioSchema = v.strictObject({
-  id: v.picklist(EXPECTED_SCENARIO_IDS),
-  title: v.string(),
-  story: v.string(),
-  tags: StringArraySchema,
-  before: SnapshotSchema,
-  after: SnapshotSchema,
-  aliasLookups: v.optional(v.array(AliasLookupSchema)),
-  expectation: ExpectationSchema,
-});
 
 const ScenarioCorpusSchema = v.strictObject({
   schemaVersion: v.literal(EXPECTED_SCHEMA_VERSION),
@@ -144,7 +186,7 @@ const ScenarioCorpusSchema = v.strictObject({
     name: v.string(),
     version: v.literal(1),
     unit: v.literal('css_px'),
-    scenarioCount: NonNegativeIntegerSchema,
+    scenarioCount: v.literal(7),
   }),
   scenarios: v.array(ScenarioSchema),
 });
@@ -164,23 +206,10 @@ export function parseVirtualTranscriptScenarioCorpus(raw: unknown): VirtualTrans
     );
   }
 
-  if (ids.length !== expectedIds.length || ids.some((id, index) => id !== expectedIds[index])) {
-    throw new Error(`Virtual Transcript fixture IDs changed order: expected ${expectedIds.join(', ')}, got ${ids.join(', ')}`);
-  }
-
   if (parsed.metadata.scenarioCount !== parsed.scenarios.length) {
     throw new Error(
       `Virtual Transcript fixture metadata scenarioCount ${parsed.metadata.scenarioCount} does not match ${parsed.scenarios.length} scenarios`,
     );
-  }
-
-  for (const scenario of parsed.scenarios) {
-    const expectedKind = EXPECTED_EXPECTATION_KIND_BY_SCENARIO_ID[scenario.id];
-    if (scenario.expectation.kind !== expectedKind) {
-      throw new Error(
-        `Virtual Transcript fixture scenario ${scenario.id} requires expectation kind ${expectedKind}, got ${scenario.expectation.kind}`,
-      );
-    }
   }
 
   return parsed;

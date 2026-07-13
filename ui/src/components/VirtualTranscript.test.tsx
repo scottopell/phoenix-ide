@@ -352,6 +352,60 @@ describe('VirtualTranscript', () => {
     expect(ref.current?.measureOffsetForIndex(0)).toBe(0);
   });
 
+  it('reports no visible range while the physical viewport is wholly inside the header', () => {
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    const ref = { current: null as VirtualTranscriptHandle | null };
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(5, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        header={<div data-testid="header" data-height={150}>Header</div>}
+        renderItem={renderRow}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
+      />,
+    );
+
+    expect(ranges.at(-1)?.visibleRange).toBeNull();
+    expect(ranges.at(-1)?.renderedRange).toEqual({ startIndex: 0, endIndex: 4 });
+    expect(ref.current?.physicalSnapshot().visibleRange).toBeNull();
+  });
+
+  it('clips visible range to the row region when the viewport partially overlaps the header', () => {
+    const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(5, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        header={<div data-testid="header" data-height={30}>Header</div>}
+        renderItem={renderRow}
+        onRangeChange={(snapshot) => ranges.push(snapshot)}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    act(() => {
+      scroller!.scrollTop = 10;
+      ref.current?.scrollToIndex(0, 'start', 20);
+    });
+
+    const snapshot = ref.current?.physicalSnapshot();
+    expect(snapshot?.viewportTop).toBe(10);
+    expect(snapshot?.visibleRange).toEqual({ startIndex: 0, endIndex: 3 });
+    expect(ranges.at(-1)?.visibleRange).toEqual({ startIndex: 0, endIndex: 3 });
+  });
+
   it('renders header with the empty state and observes async header resize', () => {
     const totals: number[] = [];
 

@@ -1,6 +1,6 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
-import { createRef, forwardRef, StrictMode, useImperativeHandle, useLayoutEffect, useRef } from 'react';
+import { createRef, forwardRef, StrictMode, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
@@ -236,6 +236,12 @@ function transcriptPositioningForCommand(command?: HistoryScrollCommand | null):
     ? { kind: 'positioning', command }
     : { kind: 'idle', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } };
 }
+
+const flushMicrotasks = async () => {
+  await act(async () => {
+    await Promise.resolve();
+  });
+};
 
 function makeJumpToMessageCommand(overrides: Partial<Extract<HistoryScrollCommand, { kind: 'jump_to_message' }>> = {}): Extract<HistoryScrollCommand, { kind: 'jump_to_message' }> {
   return {
@@ -1345,7 +1351,7 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
   });
 
-  it('does not supersede the active owner on React effect cleanup', () => {
+  it('supersedes a genuinely unmounted active owner exactly once', async () => {
     const view = { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 };
     const command = makeRestoreAfterPrefixExpansionCommand({ token: 1, view });
     const onHistoryScrollCommandHandled = vi.fn();
@@ -1365,9 +1371,42 @@ describe('history scroll acknowledgement + continuity suppression', () => {
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
 
     unmount();
-    unmount();
+    await flushMicrotasks();
 
-    expect(onHistoryScrollCommandHandled).not.toHaveBeenCalled();
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledTimes(1);
+    expect(onHistoryScrollCommandHandled).toHaveBeenCalledWith(1, 'superseded', view);
+  });
+
+  it('reconciles transcript positioning in layout before sibling passive effects observe it', async () => {
+    const phases: string[] = [];
+    const command = makeJumpToMessageCommand({ token: 1, targetMessageId: 'msg-2', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } });
+
+    function PassiveProbe() {
+      useEffect(() => {
+        phases.push(`passive:${virtualTranscriptMock.scrollToIndex.mock.calls.length}`);
+      }, []);
+      return null;
+    }
+
+    render(withConvContext(
+      <>
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          transcriptPositioning={transcriptPositioningForCommand(command)}
+        />
+        <PassiveProbe />
+      </>,
+    ));
+
+    await flushMicrotasks();
+
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalledTimes(1);
+    expect(phases).toEqual(['passive:1']);
   });
 
   it('does not let StrictMode setup-cleanup-setup terminally supersede a mounted command', () => {

@@ -11,7 +11,7 @@ export interface VirtualTranscriptCorpusMetadata {
   name: string;
   version: 1;
   unit: 'css_px';
-  scenarioCount: number;
+  scenarioCount: 7;
 }
 
 export interface VirtualTranscriptScenarioCorpus {
@@ -114,13 +114,41 @@ export type VirtualTranscriptExpectation =
       targetIndex: number;
     };
 
-export interface VirtualTranscriptScenario {
-  id: VirtualTranscriptScenarioId;
+interface VirtualTranscriptScenarioBase {
   title: string;
   story: string;
   tags: readonly string[];
   before: VirtualTranscriptSnapshot;
   after: VirtualTranscriptSnapshot;
   aliasLookups?: readonly VirtualTranscriptAliasLookup[];
-  expectation: VirtualTranscriptExpectation;
 }
+
+export type VirtualTranscriptScenario =
+  | (VirtualTranscriptScenarioBase & {
+      id: 'prefix-insertion-within-tall-unit';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'restore_anchor_after_prefix_insertion' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'resize-above-anchor';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'preserve_anchor_across_resize' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'alias-navigation';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'resolve_alias_navigation' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'orphan-target';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'report_orphan_target' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'streaming-growth-reading';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'stream_append_without_reposition' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'streaming-growth-following';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'stream_append_and_follow_tail' }>;
+    })
+  | (VirtualTranscriptScenarioBase & {
+      id: 'supersession';
+      expectation: Extract<VirtualTranscriptExpectation, { kind: 'supersede_restore_command' }>;
+    });

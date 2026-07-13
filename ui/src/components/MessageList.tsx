@@ -86,6 +86,16 @@ function historyViewKey(view: HistoryView): string {
   return `${view.conversationId}:${view.generation}:${view.transcriptGeneration}`;
 }
 
+function scheduleDeferred(callback: () => void): () => void {
+  let cancelled = false;
+  queueMicrotask(() => {
+    if (!cancelled) callback();
+  });
+  return () => {
+    cancelled = true;
+  };
+}
+
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -515,6 +525,8 @@ function MessageListImpl({
   const transcriptPositioningViewKeyRef = useRef(historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
+  const executorAttachEpochRef = useRef(0);
+  const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -932,7 +944,22 @@ function MessageListImpl({
   }, [applyTranscriptPositioningEffects]);
   dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const attachEpoch = executorAttachEpochRef.current + 1;
+    executorAttachEpochRef.current = attachEpoch;
+    cancelPendingExecutorDetachRef.current?.();
+    cancelPendingExecutorDetachRef.current = null;
+    return () => {
+      const cancel = scheduleDeferred(() => {
+        if (executorAttachEpochRef.current !== attachEpoch) return;
+        cancelPendingExecutorDetachRef.current = null;
+        dispatchTranscriptPositioningRef.current({ type: 'executor_detached' });
+      });
+      cancelPendingExecutorDetachRef.current = cancel;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
     const nextView = transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view;
     const nextViewKey = historyViewKey(nextView);
     if (transcriptPositioningViewKeyRef.current !== nextViewKey) {
