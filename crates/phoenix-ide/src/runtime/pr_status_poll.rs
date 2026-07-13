@@ -27,7 +27,7 @@ struct PollTarget {
 }
 
 pub(crate) fn github_repo_identifier(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = phoenix_core::git::command()
         .args(["remote", "get-url", "origin"])
         .current_dir(path)
         .output()
