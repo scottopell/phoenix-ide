@@ -221,14 +221,12 @@ fn oracle_from_committed(
         .map(str::to_owned)
         .or_else(|| {
             job.intent.mode.as_deref().and_then(|mode| {
-                (matches!(mode, "managed" | "auto") && job.intent.checkout_ref.is_none()).then(
-                    || {
-                        format!(
-                            "task-pending-{}",
-                            job.conversation_id.chars().take(8).collect::<String>()
-                        )
-                    },
-                )
+                matches!(mode, "managed" | "auto").then(|| {
+                    format!(
+                        "task-pending-{}",
+                        job.conversation_id.chars().take(8).collect::<String>()
+                    )
+                })
             })
         })
         .or_else(|| job.intent.base_branch.clone())
@@ -240,6 +238,7 @@ fn oracle_from_committed(
         CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
     };
     let initial_llm_dispatched = matches!(job.protocol.status, CreationStatus::Ready);
+    let runtime_bootstrapped = runtime_bootstrapped(&job.protocol.status, conversation_state);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
             job_id: job.id.clone(),
@@ -247,6 +246,7 @@ fn oracle_from_committed(
             idempotency_key: job.id,
             repository_path,
             worktree_path,
+            uses_worktree: job.intent.mode.as_deref() != Some("direct"),
             branch_name,
             initial_text: job.intent.text,
             attachment_ids,
@@ -266,7 +266,7 @@ fn oracle_from_committed(
             CleanupOwnership::None
         },
         runtime_evidence: CreationRuntimeEvidence {
-            runtime_bootstrapped: runtime_bootstrapped(job.protocol.stage, conversation_state),
+            runtime_bootstrapped,
             initial_llm_dispatched,
             initial_turn_busy: matches!(
                 conversation_state,
@@ -283,18 +283,19 @@ fn oracle_from_committed(
     }
 }
 
-fn runtime_bootstrapped(_checkpoint: CreationStage, state: &ConvState) -> bool {
-    matches!(
-        state,
-        ConvState::LlmRequesting { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::ToolExecuting { .. }
-            | ConvState::AwaitingSubAgents { .. }
-            | ConvState::AwaitingContinuation { .. }
-            | ConvState::AwaitingRecovery { .. }
-            | ConvState::CancellingTool { .. }
-            | ConvState::CancellingSubAgents { .. }
-    )
+fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
+    matches!(status, CreationStatus::Ready)
+        || matches!(
+            state,
+            ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::CancellingSubAgents { .. }
+        )
 }
 
 fn map_status(status: CreationStatus) -> AuthoritativeCreationStatus {
@@ -384,7 +385,7 @@ fn observed_projection(
             ),
         }
     };
-    if state.allows_user_cancel() {
+    if matches!(state, ConvState::Provisioning { .. }) || state.allows_user_cancel() {
         capabilities.cancel = CapabilityAvailability::Allowed;
     } else {
         capabilities.cancel = CapabilityAvailability::Forbidden;
@@ -514,7 +515,10 @@ mod tests {
     #[test]
     fn terminal_pre_bootstrap_shells_do_not_count_as_runtime_bootstrapped() {
         assert!(!runtime_bootstrapped(
-            CreationStage::ValidateIntent,
+            &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
+                kind: "failed".to_owned(),
+                message: "failed".to_owned(),
+            }),
             &ConvState::CreationFailed {
                 job_id: "job".to_owned(),
                 error: "failed".to_owned(),
@@ -522,17 +526,29 @@ mod tests {
             },
         ));
         assert!(!runtime_bootstrapped(
-            CreationStage::ResolveRepository,
+            &CreationStatus::Cancelled,
             &ConvState::CreationCancelled {
                 job_id: "job".to_owned(),
             },
         ));
         assert!(runtime_bootstrapped(
-            CreationStage::BootstrapInitialTurn,
+            &CreationStatus::Claimed(phoenix_core::domain::creation_protocol::CreationClaim {
+                worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                    "worker".to_owned(),
+                ),
+                generation: 1,
+                token: phoenix_core::domain::creation_protocol::CreationClaimToken(
+                    "token".to_owned(),
+                ),
+                lease_until: 2,
+            }),
             &ConvState::LlmRequesting { attempt: 1 },
         ));
         assert!(!runtime_bootstrapped(
-            CreationStage::Finalize,
+            &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
+                kind: "failed".to_owned(),
+                message: "failed".to_owned(),
+            }),
             &ConvState::CreationFailed {
                 job_id: "job".to_owned(),
                 error: "late failure".to_owned(),

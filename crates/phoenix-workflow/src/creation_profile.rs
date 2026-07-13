@@ -38,6 +38,7 @@ pub struct CreationIntent {
     pub idempotency_key: String,
     pub repository_path: String,
     pub worktree_path: String,
+    pub uses_worktree: bool,
     pub branch_name: String,
     pub initial_text: String,
     pub attachment_ids: Vec<String>,
@@ -505,6 +506,31 @@ fn uses_compensation_plan(oracle: &AuthoritativeCreationOracle) -> bool {
     )
 }
 
+fn creation_dependencies(oracle: &AuthoritativeCreationOracle) -> Vec<DependencyDecl> {
+    let mut dependencies = if oracle.intent.uses_worktree {
+        vec![
+            dependency(RESERVE_WORKTREE, RESOLVE_REPOSITORY),
+            dependency(MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
+            dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
+            dependency(COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
+            dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
+        ]
+    } else {
+        vec![
+            dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
+            dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
+        ]
+    };
+    if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
+        dependencies.extend([
+            dependency(EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
+            dependency(BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
+            dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
+        ]);
+    }
+    dependencies
+}
+
 #[must_use]
 pub fn creation_plan(
     oracle: &AuthoritativeCreationOracle,
@@ -515,6 +541,14 @@ pub fn creation_plan(
         CreationKind::SeededEmpty => None,
     };
     let mut effects = base_effects(&oracle.intent, oracle.generation);
+    if !oracle.intent.uses_worktree {
+        effects.retain(|effect| {
+            !matches!(
+                effect.effect_id,
+                RESERVE_WORKTREE | MATERIALIZE_OR_RECONCILE_WORKTREE
+            )
+        });
+    }
     effects.push(effect(
         COMMIT_METADATA,
         "commit_metadata",
@@ -562,20 +596,7 @@ pub fn creation_plan(
         ));
     }
 
-    let mut dependencies = vec![
-        dependency(RESERVE_WORKTREE, RESOLVE_REPOSITORY),
-        dependency(MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
-        dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
-        dependency(COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
-        dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-    ];
-    if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
-        dependencies.extend([
-            dependency(COMMIT_METADATA, EXPAND_INITIAL_MESSAGE),
-            dependency(BOOTSTRAP_RUNTIME, COMMIT_METADATA),
-            dependency(DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
-        ]);
-    }
+    let dependencies = creation_dependencies(oracle);
     let barrier_members = effects
         .iter()
         .map(|effect| BarrierMemberDecl {

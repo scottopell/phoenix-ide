@@ -50,6 +50,7 @@ fn oracle() -> AuthoritativeCreationOracle {
             idempotency_key: "key".to_owned(),
             repository_path: "/repo".to_owned(),
             worktree_path: "/repo/wt".to_owned(),
+            uses_worktree: true,
             branch_name: "shadow".to_owned(),
             initial_text: "authoritative semantic bytes must not be copied".to_owned(),
             attachment_ids: vec!["attachment-secret".to_owned()],

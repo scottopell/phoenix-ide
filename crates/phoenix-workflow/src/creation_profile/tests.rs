@@ -27,6 +27,7 @@ fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
             idempotency_key: "request-1".into(),
             repository_path: "/repo".into(),
             worktree_path: "/repo-worktree".into(),
+            uses_worktree: true,
             branch_name: "task-1".into(),
             initial_text: "do the thing".into(),
             attachment_ids: vec!["attachment-1".into()],
@@ -94,8 +95,8 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
         (FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
         (COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
         (COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        (COMMIT_METADATA, EXPAND_INITIAL_MESSAGE),
-        (BOOTSTRAP_RUNTIME, COMMIT_METADATA),
+        (EXPAND_INITIAL_MESSAGE, COMMIT_METADATA),
+        (BOOTSTRAP_RUNTIME, EXPAND_INITIAL_MESSAGE),
         (DISPATCH_INITIAL_LLM_REQUEST, BOOTSTRAP_RUNTIME),
     ] {
         assert!(dependencies.contains(&edge), "missing dependency {edge:?}");
@@ -115,6 +116,21 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
             .map(|member| member.effect_id)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn direct_creation_omits_worktree_effects() {
+    let mut oracle = oracle(CreationKind::SeededEmpty);
+    oracle.intent.uses_worktree = false;
+    let adapted = adapt_authoritative_creation(WorkflowId(31), WorkflowId(101), &oracle).unwrap();
+    let plan = adapted.plan;
+    let ids = plan
+        .effects
+        .iter()
+        .map(|effect| effect.effect_id)
+        .collect::<BTreeSet<_>>();
+    assert!(!ids.contains(&RESERVE_WORKTREE));
+    assert!(!ids.contains(&MATERIALIZE_OR_RECONCILE_WORKTREE));
 }
 
 #[test]
