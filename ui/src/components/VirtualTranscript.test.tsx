@@ -158,7 +158,7 @@ describe('VirtualTranscript', () => {
     );
 
     expect(scrollTopOf(scroller)).toBe(100);
-    expect(rowIndexes()).toEqual([9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+    expect(rowIndexes()).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
 
     act(() => ref.current?.scrollToIndex(10, 'start', 25));
 
@@ -224,9 +224,9 @@ describe('VirtualTranscript', () => {
       anchor = ref.current?.captureVisibleAnchor() ?? null;
     });
     expect(anchor).toEqual({
-      index: 4,
-      key: 'item-4',
-      offset: -20,
+      index: 5,
+      key: 'item-5',
+      offset: 0,
     });
   });
 

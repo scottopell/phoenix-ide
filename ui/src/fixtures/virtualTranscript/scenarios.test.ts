@@ -264,7 +264,7 @@ describe('virtual transcript fixture scenarios', () => {
     expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios })).toThrow(/unexpected-id/);
 
     const duplicateScenarios = [...(corpus['scenarios'] as Record<string, unknown>[])];
-    duplicateScenarios[1] = { ...duplicateScenarios[1], id: duplicateScenarios[0]?.id };
+    duplicateScenarios[1] = { ...duplicateScenarios[1], id: duplicateScenarios[0]?.['id'] };
     expect(() => parseVirtualTranscriptScenarioCorpus({ ...corpus, scenarios: duplicateScenarios })).toThrow(/duplicates/);
 
     const reorderedScenarios = [...(corpus['scenarios'] as Record<string, unknown>[])].reverse();
