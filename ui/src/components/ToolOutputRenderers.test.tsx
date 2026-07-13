@@ -303,6 +303,22 @@ describe('ReadFileResultView', () => {
     expect(screen.getByText('second alpha line')).toBeInTheDocument();
   });
 
+  it('renders and marks the path when it is the active read_file occurrence', () => {
+    const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
+    const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path')!;
+    const { container } = render(
+      <ReadFileResultView
+        rawText={readText}
+        input={{ path: 'src/foo.ts', offset: 7, limit: 2 }}
+        onOpenFile={undefined}
+        toolUseId="read-1"
+        showPath
+        activeHighlight={{ fragmentId: pathFragment.fragmentId, start: 0, end: 'src/foo.ts'.length }}
+      />,
+    );
+    expect(container.querySelector('[data-fragment-id="read-file-path"] .viewer-find-inline-match--active')?.textContent).toBe('src/foo.ts');
+  });
+
   it('highlights the exact active occurrence without duplicating content', () => {
     const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
     const targetFragment = projection.fragments.find((fragment) => fragment.kind === 'line'
@@ -385,6 +401,24 @@ describe('SearchResultsView', () => {
     const activeMark = container.querySelector('.viewer-find-inline-match--active');
     expect(activeMark?.textContent).toBe('println!');
     expect(screen.getAllByText(/println!/)).toHaveLength(1);
+  });
+
+  it('marks a path-only active occurrence in the grouped path field', () => {
+    const projection = buildSearchOutputProjection(text, { toolUseId: 'search-1' });
+    const targetFragment = projection.hits[0]!.fragment;
+    const { container } = render(
+      <SearchResultsView
+        rawText={text}
+        onOpenFile={undefined}
+        toolUseId="search-1"
+        activeHighlight={{
+          fragmentId: targetFragment.fragmentId,
+          start: 0,
+          end: 'src/foo.rs'.length,
+        }}
+      />,
+    );
+    expect(container.querySelector('.search-results-filepath .viewer-find-inline-match--active')?.textContent).toBe('src/foo.rs');
   });
 });
 

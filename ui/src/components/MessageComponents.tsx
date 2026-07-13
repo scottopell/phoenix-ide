@@ -918,6 +918,14 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   // a turn of pure prose / think asides has nothing to collapse.
   const collapseTools = compact && !toolsExpanded && toolStripItems.length > 0;
 
+  useEffect(() => {
+    if (!compact || toolsExpanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
+    pendingScrollToolIdRef.current = 'toolUseId' in revealRequest.revealTarget
+      ? revealRequest.revealTarget.toolUseId
+      : null;
+    setToolsExpanded(true);
+  }, [compact, revealRequest, toolsExpanded]);
+
   const filePathCopyContext = useMemo(
     () => (filePathRootDir ? { rootDir: filePathRootDir } : undefined),
     [filePathRootDir],
@@ -1894,6 +1902,7 @@ export function ReadFileResultView({
     [rawText, input, toolUseId],
   );
   const pathFragment = parsed.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
   const lineFragments = parsed.fragments.filter((fragment) => fragment.kind === 'line');
 
   return (
@@ -1907,14 +1916,18 @@ export function ReadFileResultView({
             onClick={() => onOpenFile(pathFragment.display.path, new Set(), 0)}
             title="Open file"
           >
-            {pathFragment.semanticText}
+            {pathHighlight
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : pathFragment.semanticText}
           </button>
         ) : (
           <div
             className="search-results-filepath search-results-filepath-static"
             data-fragment-id={pathFragment.fragmentId}
           >
-            {pathFragment.semanticText}
+            {pathHighlight
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : pathFragment.semanticText}
           </div>
         )
       )}
@@ -1996,6 +2009,15 @@ export function PatchResultView({
   );
 }
 
+function renderSearchResultPath(
+  path: string,
+  hits: readonly { fragment: { fragmentId: string } }[],
+  activeHighlight: AgentTextHighlight | null,
+): React.ReactNode {
+  if (!activeHighlight || !hits.some((hit) => hit.fragment.fragmentId === activeHighlight.fragmentId)) return path;
+  return keywordFieldHighlight(activeHighlight, 0, path);
+}
+
 export function SearchResultsView({
   rawText,
   onOpenFile,
@@ -2049,14 +2071,14 @@ export function SearchResultsView({
                 }
                 title="Open file"
               >
-                {group.path}
+                {renderSearchResultPath(group.path, group.hits, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
               </button>
             ) : (
               <span className="search-results-filepath search-results-filepath-static">
-                {group.path}
+                {renderSearchResultPath(group.path, group.hits, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
@@ -2537,7 +2559,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
                 onOpenFile={onOpenFile}
                 toolUseId={toolId}
                 activeHighlight={toolActiveHighlight}
-                showPath={false}
+                showPath={toolActiveHighlight?.fragmentId === 'read-file-path'}
               />
               {!toolActiveHighlight && resultText.length > 5000 && (
                 <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>

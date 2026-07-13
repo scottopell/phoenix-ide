@@ -482,24 +482,32 @@ export function TaskApprovalReader({
   // Render plan as markdown with annotatable blocks.
   const renderPlanMarkdown = useMemo(() => {
     const rawLines = plan.split('\n');
-    const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+    const matchesByBlockId = new Map<string, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
-      const lineMatches = matchesByLine.get(match.target.lineNumber) ?? [];
-      lineMatches.push({
+      const blockMatches = matchesByBlockId.get(match.target.blockId) ?? [];
+      blockMatches.push({
         start: match.target.startOffset,
         end: match.target.endOffset,
         occurrenceIndex,
       });
-      matchesByLine.set(match.target.lineNumber, lineMatches);
+      matchesByBlockId.set(match.target.blockId, blockMatches);
     });
 
-    const claimDisplayBlock = (lineNumber: number, kind?: string): string => {
-      const candidates = markdownDisplayBlocks.filter((block) => block.lineNumber === lineNumber);
-      const match = kind ? candidates.find((block) => block.kind === kind) : candidates[0];
+    const claimDisplayBlock = (lineNumber: number, startOffset?: number, kind?: string): string => {
+      const compatible = kind
+        ? markdownDisplayBlocks.filter((block) => block.kind === kind)
+        : markdownDisplayBlocks;
+      const containing = startOffset === undefined
+        ? []
+        : compatible
+            .filter((block) => block.sourceRange.start <= startOffset && startOffset < block.sourceRange.end)
+            .sort((left, right) =>
+              (left.sourceRange.end - left.sourceRange.start) - (right.sourceRange.end - right.sourceRange.start));
+      const match = containing[0] ?? compatible.find((block) => block.lineNumber === lineNumber);
       return match?.id ?? `markdown:line:${lineNumber}`;
     };
 
-    const annotatable = (Tag: React.ElementType) =>
+    const annotatable = (Tag: React.ElementType, kind?: string) =>
       ({
         children,
         node,
@@ -508,8 +516,8 @@ export function TaskApprovalReader({
         children?: React.ReactNode;
         node?: {
           position?: {
-            start?: { line?: number };
-            end?: { line?: number };
+            start?: { line?: number; offset?: number };
+            end?: { line?: number; offset?: number };
           };
         };
         [key: string]: unknown;
@@ -522,11 +530,11 @@ export function TaskApprovalReader({
           .join(' ')
           .slice(0, 200);
         const lineText = rawLines[ln - 1] ?? '';
-        const blockId = claimDisplayBlock(ln);
+        const blockId = claimDisplayBlock(ln, node?.position?.start?.offset, kind);
         const displayBlock = markdownDisplayBlocks.find((block) => block.id === blockId);
         const blockText = displayBlock?.searchableText ?? lineText;
-        const lineMatches = matchesByLine.get(ln) ?? [];
-        const shouldDecorateChildren = lineMatches.length > 0;
+        const blockMatches = matchesByBlockId.get(blockId) ?? [];
+        const shouldDecorateChildren = blockMatches.length > 0;
         return (
           <AnnotatableBlock
             as={Tag}
@@ -547,7 +555,7 @@ export function TaskApprovalReader({
             {...props}
           >
             {shouldDecorateChildren
-              ? renderFindFragments(blockText, lineMatches, activeFindIndex)
+              ? renderFindFragments(blockText, blockMatches, activeFindIndex)
               : children}
           </AnnotatableBlock>
         );
@@ -559,12 +567,12 @@ export function TaskApprovalReader({
         remarkPlugins={[remarkGfm]}
         components={
           {
-            p: annotatable('p'),
-            h1: annotatable('h1'),
-            h2: annotatable('h2'),
-            h3: annotatable('h3'),
-            td: annotatable('td'),
-            th: annotatable('th'),
+            p: annotatable('p', 'paragraph'),
+            h1: annotatable('h1', 'heading'),
+            h2: annotatable('h2', 'heading'),
+            h3: annotatable('h3', 'heading'),
+            td: annotatable('td', 'tableCell'),
+            th: annotatable('th', 'tableCell'),
             li: annotatable('li'),
             blockquote: annotatable('blockquote'),
             code: ({
@@ -579,7 +587,7 @@ export function TaskApprovalReader({
               children?: React.ReactNode;
               node?: {
                 position?: {
-                  start?: { line?: number };
+                  start?: { line?: number; offset?: number };
                 };
               };
               [key: string]: unknown;
@@ -588,7 +596,8 @@ export function TaskApprovalReader({
               const language = match?.[1]?.toLowerCase();
               const codeText = String(children).replace(/\n$/, '');
               const lineNumber = node?.position?.start?.line ?? 0;
-              const codeBlockId = claimDisplayBlock(lineNumber, 'code');
+              const codeBlockId = claimDisplayBlock(lineNumber, node?.position?.start?.offset, 'code');
+              const codeMatches = matchesByBlockId.get(codeBlockId) ?? [];
               if (!inline && language === 'mermaid') {
                 return (
                   <div ref={(element) => registerBlockRef(codeBlockId, element)}>
@@ -598,14 +607,20 @@ export function TaskApprovalReader({
               }
               return !inline && match ? (
                 <div ref={(element) => registerBlockRef(codeBlockId, element)}>
-                  <SyntaxHighlighter
-                    style={oneDark}
-                    language={match[1]}
-                    PreTag="div"
-                    {...props}
-                  >
-                    {codeText}
-                  </SyntaxHighlighter>
+                  {codeMatches.length > 0 ? (
+                    <pre className={`language-${match[1]}`}>
+                      <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
+                    </pre>
+                  ) : (
+                    <SyntaxHighlighter
+                      style={oneDark}
+                      language={match[1]}
+                      PreTag="div"
+                      {...props}
+                    >
+                      {codeText}
+                    </SyntaxHighlighter>
+                  )}
                 </div>
               ) : (
                 <code className={className} {...props}>

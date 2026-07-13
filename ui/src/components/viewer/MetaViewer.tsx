@@ -591,13 +591,14 @@ function stableFileMatchId(
   sources: readonly FileSearchProjection['sources'][number][],
 ): (match: SearchableSourceMatch<FileSearchMatchTarget>) => string {
   const sourceIndex = new Map<string, number>(sources.map((source, index) => [source.id, index]));
+  const duplicateOccurrences = new Map<string, number>();
   return (match) => {
     const index = sourceIndex.get(match.sourceId) ?? -1;
     const previous = index > 0 ? sources[index - 1]?.text ?? '' : '';
     const next = index >= 0 && index + 1 < sources.length ? sources[index + 1]?.text ?? '' : '';
     const leftContext = match.sourceText.slice(Math.max(0, match.start - 32), match.start);
     const rightContext = match.sourceText.slice(match.end, Math.min(match.sourceText.length, match.end + 32));
-    return [
+    const semanticSignature = [
       match.sourceText,
       `${match.start}:${match.end}`,
       previous,
@@ -605,5 +606,8 @@ function stableFileMatchId(
       rightContext,
       next,
     ].join('\u0001');
+    const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
+    duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
+    return `${semanticSignature}\u0001${duplicateOccurrence}`;
   };
 }

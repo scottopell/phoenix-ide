@@ -312,6 +312,28 @@ describe('TaskApprovalReader shared find integration', () => {
     }
   });
 
+  it('marks the exact active occurrence inside fenced code', async () => {
+    renderTaskApprovalReader('```ts\nconst fencedToken = true;\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'fencedToken' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.textContent).toBe('fencedToken'));
+  });
+
+  it('keeps same-line table-cell matches attached to their own display block', async () => {
+    renderTaskApprovalReader('| first | secondToken |\n| --- | --- |\n| alpha | beta |');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'secondToken' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    await waitFor(() => {
+      const activeMark = document.querySelector('.viewer-find-match--active');
+      expect(activeMark?.textContent).toBe('secondToken');
+      expect(activeMark?.closest('th')?.textContent).toBe('secondToken');
+    });
+  });
+
   it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {
     renderTaskApprovalReader('# Plan\n\nfoo  bar');
 

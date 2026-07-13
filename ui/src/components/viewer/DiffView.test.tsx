@@ -213,6 +213,25 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore);
   });
 
+  it('keeps repeated identical diff matches distinct', async () => {
+    const repeated = [
+      'diff --git a/foo.txt b/foo.txt',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+same',
+      '+same',
+    ].join('\n');
+    renderDiff(repeated, '');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'same' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+  });
+
   it('keeps diff find inert until open with a non-empty query', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 

@@ -582,7 +582,23 @@ describe('MetaViewer payload routing', () => {
     expect(codeViewMockState.scrollToCalls).toHaveLength(scrollCount);
   });
 
+  it('keeps repeated identical file matches distinct', async () => {
+    render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'same\nsame\nsame' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'same' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 3')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 3')).toBeInTheDocument();
+  });
+
   it('falls back to line reveal for HTML source matches without explicit marks', async () => {
+
     renderViewer({
       ...textCommon,
       kind: 'html',

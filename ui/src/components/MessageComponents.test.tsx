@@ -2166,6 +2166,44 @@ describe('compact tool summaries', () => {
     expect(container.querySelectorAll('.tool-block')).toHaveLength(3);
     expect(screen.getByText('ui/src/components/MessageComponents.tsx:711-750')).toBeInTheDocument();
   });
+
+  it('expands compact tool details when find reveals a hidden result', async () => {
+    mockDensity = 'compact';
+    const message = agentMessage('agent-compact-find', [
+      { type: 'tool_use', id: 'tool-read', name: 'read_file', input: { path: 'src/hidden.ts', offset: 1, limit: 1 } },
+    ]);
+    const results = new Map<string, Message>([
+      ['tool-read', toolMessage('tool-read', '     1\thidden token')],
+    ]);
+    const revealRequest = {
+      nonce: 1,
+      unitKey: 'unit-1',
+      fragmentId: 'read-file-line:hidden%20token:0',
+      revealTarget: {
+        kind: 'tool-result-read-file' as const,
+        toolUseId: 'tool-read',
+        fragmentId: 'read-file-line:hidden%20token:0',
+        lineNumber: 1,
+        path: 'src/hidden.ts',
+      },
+    };
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={results}
+          onOpenFile={undefined}
+          unitKey="unit-1"
+          revealRequest={revealRequest}
+          activeHighlight={{ fragmentId: revealRequest.fragmentId, start: 2, end: 8 }}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelectorAll('.tool-block')).toHaveLength(1));
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('hidden');
+  });
 });
 
 describe('bash tool inspector affordance', () => {

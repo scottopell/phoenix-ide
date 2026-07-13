@@ -167,7 +167,7 @@ export function DiffView({
     [commitLog, committedDiff, findQuery, uncommittedDiff],
   );
   const sessionMatches = useMemo(
-    () => projectionMatchesToSessionMatches(findProjection.matches, stableDiffMatchId),
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableDiffMatchIds()),
     [findProjection.matches],
   );
   const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
@@ -341,15 +341,21 @@ export function DiffView({
   );
 }
 
-function stableDiffMatchId(match: {
+function stableDiffMatchIds(): (match: {
   sourceId: string;
   sourceText: string;
   start: number;
   end: number;
   target: DiffSearchMatchTarget;
-}): string {
-  const target = match.target;
-  return `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.sourceText}:${match.start}:${match.end}`;
+}) => string {
+  const duplicateOccurrences = new Map<string, number>();
+  return (match) => {
+    const target = match.target;
+    const semanticSignature = `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.sourceText}:${match.start}:${match.end}`;
+    const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
+    duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
+    return `${semanticSignature}:${duplicateOccurrence}`;
+  };
 }
 
 function CommitLogSection({

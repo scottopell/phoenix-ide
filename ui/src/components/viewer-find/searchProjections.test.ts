@@ -213,7 +213,6 @@ describe('typed semantic display projections', () => {
     expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([
       'Plan',
       'Use alpha and diagram text.',
-      'diagram text',
       'const beta = 1;',
     ]));
     expect(blocks.some((block) => block.searchableText.includes('**'))).toBe(false);

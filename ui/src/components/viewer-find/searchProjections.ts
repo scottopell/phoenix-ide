@@ -322,11 +322,9 @@ export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownD
   const blocks: MarkdownDisplayBlock[] = [];
   const visit = (node: MarkdownNode, path: readonly number[]) => {
     if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {
-      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code', 'image'].includes(node.type);
+      const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code'].includes(node.type);
       if (isDisplayBlock) {
-        const searchableText = node.type === 'image'
-          ? node.alt ?? ''
-          : mdastToString(node as Parameters<typeof mdastToString>[0]);
+        const searchableText = mdastToString(node as Parameters<typeof mdastToString>[0]);
         if (searchableText) {
           blocks.push({
             id: `markdown:${path.join('.')}:${node.position.start.offset}-${node.position.end.offset}`,
