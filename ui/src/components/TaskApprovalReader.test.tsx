@@ -41,6 +41,16 @@ describe('TaskApprovalReader markdown rendering', () => {
     expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
   });
+
+  it('shows exact source highlighting for active mermaid matches', async () => {
+    const { container } = renderTaskApprovalReader('```mermaid\nflowchart TD\nA[UniqueNode] --> B\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'UniqueNode' } });
+
+    await waitFor(() => expect(container.querySelector('.viewer-find-match--active')?.textContent).toBe('UniqueNode'));
+    expect(container.querySelector('.language-mermaid')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeInTheDocument();
+  });
 });
 
 describe('TaskApprovalReader feedback action emphasis', () => {

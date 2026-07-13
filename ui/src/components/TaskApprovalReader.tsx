@@ -610,7 +610,13 @@ export function TaskApprovalReader({
               if (isBlockCode && language === 'mermaid') {
                 return (
                   <div ref={(element) => registerBlockRef(codeBlockId, element)}>
-                    <MermaidDiagram code={String(children)} />
+                    {codeMatches.length > 0 ? (
+                      <pre className="language-mermaid">
+                        <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
+                      </pre>
+                    ) : (
+                      <MermaidDiagram code={String(children)} />
+                    )}
                   </div>
                 );
               }
