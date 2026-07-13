@@ -1880,12 +1880,14 @@ export function ReadFileResultView({
   onOpenFile,
   toolUseId,
   activeHighlight = null,
+  showPath = true,
 }: {
   rawText: string;
   input: Record<string, unknown>;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   toolUseId?: string | undefined;
   activeHighlight?: AgentTextHighlight | null;
+  showPath?: boolean;
 }) {
   const parsed = useMemo(
     () => buildReadFileOutputProjection(rawText, input, toolUseId ? { toolUseId } : {}),
@@ -1896,6 +1898,26 @@ export function ReadFileResultView({
 
   return (
     <div className="read-file-results">
+      {showPath && pathFragment && (
+        onOpenFile ? (
+          <button
+            type="button"
+            className="search-results-filepath"
+            data-fragment-id={pathFragment.fragmentId}
+            onClick={() => onOpenFile(pathFragment.display.path, new Set(), 0)}
+            title="Open file"
+          >
+            {pathFragment.semanticText}
+          </button>
+        ) : (
+          <div
+            className="search-results-filepath search-results-filepath-static"
+            data-fragment-id={pathFragment.fragmentId}
+          >
+            {pathFragment.semanticText}
+          </div>
+        )
+      )}
       <div className="search-results-hits">
         {lineFragments.map((fragment) => {
           const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
@@ -2160,7 +2182,7 @@ export const ToolUseBlock = memo(ToolUseBlockImpl);
 
 function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
-  const input = block.input || {};
+  const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
 
   // Format the input display based on tool type
@@ -2426,6 +2448,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
                 onOpenFile={onOpenFile}
                 toolUseId={toolId}
                 activeHighlight={toolActiveHighlight}
+                showPath={false}
               />
               {!toolActiveHighlight && resultText.length > 5000 && (
                 <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>
