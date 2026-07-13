@@ -170,6 +170,20 @@ impl CreationShadowCoordinator {
     }
 }
 
+fn active_runtime_evidence(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::CancellingSubAgents { .. }
+    )
+}
+
 fn oracle_from_committed(
     job: ConversationCreationJob,
     files: &[FileAttachment],
@@ -229,7 +243,7 @@ fn oracle_from_committed(
         },
         CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
     };
-    let initial_llm_dispatched = matches!(job.protocol.status, CreationStatus::Ready);
+    let initial_llm_dispatched = active_runtime_evidence(conversation_state);
     let runtime_bootstrapped = runtime_bootstrapped(&job.protocol.status, conversation_state);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
@@ -238,7 +252,10 @@ fn oracle_from_committed(
             idempotency_key: job.id,
             repository_path,
             worktree_path,
-            uses_worktree: !matches!(conv_mode, Some(ConvMode::Direct)),
+            uses_worktree: matches!(
+                job.intent.mode.as_deref(),
+                Some("managed" | "auto" | "branch")
+            ),
             branch_name,
             initial_text: job.intent.text,
             attachment_ids,
@@ -260,17 +277,7 @@ fn oracle_from_committed(
         runtime_evidence: CreationRuntimeEvidence {
             runtime_bootstrapped,
             initial_llm_dispatched,
-            initial_turn_busy: matches!(
-                conversation_state,
-                ConvState::LlmRequesting { .. }
-                    | ConvState::SeededLlmRequesting { .. }
-                    | ConvState::ToolExecuting { .. }
-                    | ConvState::AwaitingSubAgents { .. }
-                    | ConvState::AwaitingContinuation { .. }
-                    | ConvState::AwaitingRecovery { .. }
-                    | ConvState::CancellingTool { .. }
-                    | ConvState::CancellingSubAgents { .. }
-            ),
+            initial_turn_busy: active_runtime_evidence(conversation_state),
         },
     }
 }

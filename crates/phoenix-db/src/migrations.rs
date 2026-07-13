@@ -2145,6 +2145,8 @@ CREATE TABLE IF NOT EXISTS creation_shadow_divergences (
     evidence_identity TEXT NOT NULL,
     expected_value TEXT NOT NULL,
     actual_value TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('informational', 'warning', 'blocking')),
+    required_action TEXT NOT NULL DEFAULT 'reconcile_authoritative_projection',
     recorded_at TEXT NOT NULL,
     resolved_at TEXT,
     PRIMARY KEY (shadow_workflow_id, evidence_identity, recorded_at)
@@ -2336,6 +2338,29 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     {
         sqlx::query(
             "ALTER TABLE creation_shadow_projections ADD COLUMN oracle_revision INTEGER NOT NULL DEFAULT 0 CHECK (oracle_revision >= 0)",
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    let divergence_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('creation_shadow_divergences')")
+            .fetch_all(pool)
+            .await?;
+    if !divergence_columns.is_empty() && !divergence_columns.iter().any(|name| name == "severity") {
+        sqlx::query(
+            "ALTER TABLE creation_shadow_divergences ADD COLUMN severity TEXT NOT NULL DEFAULT 'blocking' CHECK (severity IN ('informational', 'warning', 'blocking'))",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if !divergence_columns.is_empty()
+        && !divergence_columns
+            .iter()
+            .any(|name| name == "required_action")
+    {
+        sqlx::query(
+            "ALTER TABLE creation_shadow_divergences ADD COLUMN required_action TEXT NOT NULL DEFAULT 'reconcile_authoritative_projection'",
         )
         .execute(pool)
         .await?;

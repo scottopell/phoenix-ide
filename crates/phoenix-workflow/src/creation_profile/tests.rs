@@ -465,7 +465,6 @@ fn cleanup_states_adapt_to_compensation_graphs() {
     let statuses = [
         AuthoritativeCreationStatus::Cancelling,
         AuthoritativeCreationStatus::DeletionPending,
-        AuthoritativeCreationStatus::Cancelled,
     ];
     for status in statuses {
         let mut oracle = oracle(CreationKind::SeededEmpty);
@@ -481,6 +480,19 @@ fn cleanup_states_adapt_to_compensation_graphs() {
             .all(|effect| effect.role == crate::EffectRole::Compensation));
         assert_eq!(adapted.plan.dependencies.len(), 5);
     }
+}
+
+#[test]
+fn completed_cancellation_has_no_compensation_effects() {
+    let mut cancelled = oracle(CreationKind::SeededEmpty);
+    cancelled.status = AuthoritativeCreationStatus::Cancelled;
+    cancelled.cleanup_ownership = CleanupOwnership::OwnedResources;
+    let adapted = adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &cancelled).unwrap();
+    assert!(adapted
+        .plan
+        .effects
+        .iter()
+        .all(|effect| effect.role != crate::EffectRole::Compensation));
 }
 
 #[test]

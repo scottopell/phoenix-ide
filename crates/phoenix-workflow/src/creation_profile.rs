@@ -494,9 +494,7 @@ pub fn adapt_authoritative_creation(
 fn uses_compensation_plan(oracle: &AuthoritativeCreationOracle) -> bool {
     matches!(
         oracle.status,
-        AuthoritativeCreationStatus::Cancelling
-            | AuthoritativeCreationStatus::DeletionPending
-            | AuthoritativeCreationStatus::Cancelled
+        AuthoritativeCreationStatus::Cancelling | AuthoritativeCreationStatus::DeletionPending
     ) || matches!(
         (&oracle.status, oracle.cleanup_ownership),
         (
