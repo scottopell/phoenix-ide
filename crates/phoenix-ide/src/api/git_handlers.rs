@@ -116,6 +116,19 @@ fn capture_active_pr_diff_for_repo_identity(
     {
         return Err(AppError::BadRequest(reason));
     }
+    let checked_out_branch = run_git(
+        worktree_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .map(|branch| branch.trim().to_string());
+    if checked_out_branch.as_deref() != Some(active_pr.head.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "PR-specific diff unavailable until selected head {} is checked out; current branch is {}",
+            active_pr.head,
+            checked_out_branch.as_deref().unwrap_or("detached or unborn")
+        )));
+    }
     Ok(capture_branch_diff(
         worktree_path,
         &active_pr.base,
@@ -2122,6 +2135,41 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_pr_diff_rejects_selected_head_that_is_not_checked_out() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/other"]).unwrap();
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "acme".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 77,
+            title: "selected".to_string(),
+            url: "https://example.test/acme/repo/77".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "feature/selected".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let err = capture_active_pr_diff_for_repo_identity(
+            repo.path(),
+            Some("acme/repo"),
+            &selected,
+            256 * 1024,
+        )
+        .err()
+        .expect("mismatched head should be rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(message) if message.contains("selected head feature/selected") && message.contains("feature/other"))
+        );
     }
 
     #[test]

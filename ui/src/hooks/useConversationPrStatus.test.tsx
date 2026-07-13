@@ -118,7 +118,7 @@ describe('useConversationPrStatus', () => {
     expect(screen.getByTestId('pr-number')).toHaveTextContent('7');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 7');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
-    expect(screen.getByTestId('associated-count')).toHaveTextContent('1');
+    expect(screen.getByTestId('associated-count')).toHaveTextContent('0');
     expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
     expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
     await waitFor(() => {
@@ -288,7 +288,7 @@ describe('useConversationPrStatus', () => {
     expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
-    expect(screen.getByTestId('associated-count')).toHaveTextContent('1');
+    expect(screen.getByTestId('associated-count')).toHaveTextContent('0');
     expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
     expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
   });

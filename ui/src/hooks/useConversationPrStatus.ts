@@ -103,25 +103,6 @@ function selectionFromPrStatus(prStatus: PrStatusResponse): AssociatedPrStatusEn
   return null;
 }
 
-function selectionForCachedPr(cachedPr: CachedPrSummary | null | undefined): AssociatedPrStatusEnvelope | null {
-  if (!cachedPr) return null;
-  return {
-    associated_prs: [{
-      repo_owner: '',
-      repo_name: '',
-      pr_number: cachedPr.number,
-      title: cachedPr.title,
-      url: cachedPr.url,
-      state: cachedPr.display_state.toUpperCase(),
-      draft: cachedPr.display_state === 'draft',
-      display_state: cachedPr.display_state,
-      base: cachedPr.base,
-      head: cachedPr.head,
-      feedback_status: cachedPr.feedback_status ?? 'open',
-    }],
-  };
-}
-
 function activePrSummaryFromSelection(selection: AssociatedPrStatusEnvelope | null): AssociatedPrSummaryResponse | null {
   if (!selection) return null;
   return selection.associated_prs.find((pr) => samePrIdentity(selection.active_pr, pr)) ?? null;
@@ -178,10 +159,7 @@ export function useConversationPrStatus({
     () => (scopeKey && cachedPr ? cachedPrToStatus(cachedPr) : null),
     [cachedPr, scopeKey],
   );
-  const cachedSelection = useMemo(
-    () => (scopeKey ? selectionForCachedPr(cachedPr) : null),
-    [cachedPr, scopeKey],
-  );
+  const cachedSelection: AssociatedPrStatusEnvelope | null = null;
   const cachedSeedRef = useRef<PrStatusResponse | null>(null);
   cachedSeedRef.current = cachedSeed;
   const [internalState, setInternalState] = useState<InternalConversationPrStatusState>(() => (
