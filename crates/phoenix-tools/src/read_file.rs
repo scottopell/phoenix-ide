@@ -5,14 +5,27 @@
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use phoenix_core::file_viewer::has_opaque_extension;
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_LIMIT: usize = 2000;
 const FILE_VIEWER_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn is_within_viewer_roots(file: &Path, working_dir: &Path) -> bool {
+    let Ok(file) = std::fs::canonicalize(file) else {
+        return false;
+    };
+    let runtime_env = PhoenixRuntimeEnvironment::detect();
+    runtime_env
+        .file_viewer_roots(working_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| file.starts_with(root))
+}
 
 /// Read a file's contents with line numbers.
 pub struct ReadFileTool;
@@ -160,10 +173,7 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
-        let viewer_available = std::fs::canonicalize(&resolved)
-            .ok()
-            .zip(std::fs::canonicalize(&ctx.working_dir).ok())
-            .is_some_and(|(file, root)| file.starts_with(root))
+        let viewer_available = is_within_viewer_roots(&resolved, &ctx.working_dir)
             && std::fs::metadata(&resolved)
                 .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
             && !has_opaque_extension(&resolved);

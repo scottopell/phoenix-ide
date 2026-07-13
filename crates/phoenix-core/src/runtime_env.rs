@@ -195,6 +195,23 @@ impl PhoenixRuntimeEnvironment {
         self.phoenix_home().join(BUILTIN_SKILLS_SUBDIR)
     }
 
+    /// Global skill roots the browser file viewer may read outside a conversation.
+    #[must_use]
+    pub fn skill_viewer_roots(&self) -> [PathBuf; 3] {
+        [
+            self.home().join(".claude").join("skills"),
+            self.home().join(".agents").join("skills"),
+            self.builtin_skills_dir(),
+        ]
+    }
+
+    /// Filesystem roots the browser file viewer may read from for a conversation.
+    #[must_use]
+    pub fn file_viewer_roots(&self, conversation_root: &Path) -> [PathBuf; 4] {
+        let [claude, agents, builtin] = self.skill_viewer_roots();
+        [conversation_root.to_path_buf(), claude, agents, builtin]
+    }
+
     /// `data_dir/tmux-sockets` — directory holding per-conversation tmux
     /// server sockets.
     #[must_use]

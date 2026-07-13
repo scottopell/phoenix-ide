@@ -5086,12 +5086,7 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
-    let home = state.runtime_env.home();
-    for skill_root in [
-        home.join(".claude").join("skills"),
-        home.join(".agents").join("skills"),
-        state.runtime_env.builtin_skills_dir(),
-    ] {
+    for skill_root in state.runtime_env.skill_viewer_roots() {
         if let Ok(dir) = fs::canonicalize(skill_root) {
             roots.push(dir);
         }
