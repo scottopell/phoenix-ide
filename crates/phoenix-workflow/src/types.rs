@@ -329,7 +329,7 @@ impl From<&ProtocolSelection> for ProtocolSelectionIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalAcceptanceKey {
-    pub selection: ProtocolSelectionIdentity,
+    pub profile: ProfileRef,
     pub authority_scope: NonEmptyExternalKey,
     pub idempotency_key: NonEmptyExternalKey,
 }
@@ -343,6 +343,7 @@ pub struct ExternalAcceptanceReceipt<H> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAcceptanceBinding<H> {
+    pub accepted_protocol: ProtocolSelectionIdentity,
     pub intent_fingerprint: String,
     pub receipt: ExternalAcceptanceReceipt<H>,
 }

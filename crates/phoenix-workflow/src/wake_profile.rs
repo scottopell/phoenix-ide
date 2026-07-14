@@ -158,8 +158,10 @@ pub enum WakeCancellationReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeForgottenReason {
-    HandleMissing,
-    RuntimeUnrecoverableAfterRestart,
+    PhoenixRestart,
+    CascadeDestroyedHandle,
+    SubagentHandleMissing,
+    TmuxHandleMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

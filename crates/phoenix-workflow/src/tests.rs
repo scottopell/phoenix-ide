@@ -228,8 +228,11 @@ fn external_acceptance_replays_same_receipt_and_rejects_conflicting_intent() {
         WorkflowId(99),
         "conversation-99",
     );
-    assert_eq!(replay, ExternalAcceptanceOutcome::Replay(first_receipt));
-    for distinct_selection in [
+    assert_eq!(
+        replay,
+        ExternalAcceptanceOutcome::Replay(first_receipt.clone())
+    );
+    for replacement_selection in [
         ProtocolSelection {
             selector: "selector-v2",
             ..selection.clone()
@@ -238,26 +241,37 @@ fn external_acceptance_replays_same_receipt_and_rejects_conflicting_intent() {
             authority: SemanticAuthority::LegacyProtocol,
             ..selection.clone()
         },
-        ProtocolSelection {
-            profile: ProfileRef {
-                profile_id: "test",
-                protocol_version: 2,
-            },
-            ..selection.clone()
-        },
     ] {
-        assert!(matches!(
+        assert_eq!(
             registry.accept(
-                &distinct_selection,
+                &replacement_selection,
                 "account:a",
                 "client-key",
                 "intent:v1",
                 WorkflowId(99),
                 "conversation-99",
             ),
-            ExternalAcceptanceOutcome::New(_)
-        ));
+            ExternalAcceptanceOutcome::Replay(first_receipt.clone())
+        );
     }
+    let distinct_profile = ProtocolSelection {
+        profile: ProfileRef {
+            profile_id: "test",
+            protocol_version: 2,
+        },
+        ..selection.clone()
+    };
+    assert!(matches!(
+        registry.accept(
+            &distinct_profile,
+            "account:a",
+            "client-key",
+            "intent:v1",
+            WorkflowId(99),
+            "conversation-99",
+        ),
+        ExternalAcceptanceOutcome::New(_)
+    ));
     assert_eq!(
         registry.accept(
             &selection,
