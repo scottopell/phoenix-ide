@@ -54,6 +54,10 @@
   border-left: 3px solid var(--accent-red);
 }
 
+.commission-review-result.skipped {
+  border-left: 3px solid var(--accent-blue);
+}
+
 .commission-review-summary-header {
   display: flex;
   justify-content: space-between;
@@ -117,6 +121,11 @@
 .commission-review-outcome-pill.rejected {
   background: color-mix(in srgb, var(--accent-red) 15%, var(--bg-primary));
   color: var(--accent-red);
+}
+
+.commission-review-outcome-pill.skipped {
+  background: color-mix(in srgb, var(--accent-blue) 14%, var(--bg-primary));
+  color: var(--accent-blue);
 }
 
 .commission-review-metrics {

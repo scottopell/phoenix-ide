@@ -16,28 +16,56 @@ export type CommissionReviewFinding = {
   suggestedFix?: string | undefined;
 };
 
-export type CommissionReviewDisplayData = {
+export type CommissionReviewStageStatus = {
+  targetCollection?: string | undefined;
+  diffCollection?: string | undefined;
+  llmReview?: string | undefined;
+  jsonParse?: string | undefined;
+  findingExtraction?: string | undefined;
+};
+
+export type CommissionReviewResolvedSummary = {
+  target: { kind?: string | undefined; repoRoot: string; base: string; head: string; dirty?: boolean | undefined };
+  filesChanged: number;
+  filesReviewed: number;
+  insertions: number;
+  deletions: number;
+  elapsedMs: number;
+  reviewerSummary?: string | undefined;
+};
+
+export type CommissionReviewResolvedDisplayData = {
   kind: 'commission_review';
-  status: 'success' | 'partial' | 'failed' | 'skipped' | 'rejected';
+  status: 'success' | 'partial' | 'failed' | 'skipped';
   reviewStatus: string;
   findingsStatus: string;
   findingsTrust: string;
   retryRecommendation: string;
+  stageStatus: CommissionReviewStageStatus;
   findingSummary: { total: number; critical: number; high: number; medium: number; low: number };
   warningsSummary: string[];
-  summary: {
-    target: { kind?: string | undefined; repoRoot: string; base: string; head: string; dirty?: boolean | undefined };
-    filesChanged: number;
-    filesReviewed: number;
-    insertions: number;
-    deletions: number;
-    elapsedMs: number;
-    reviewerSummary?: string | undefined;
-  };
+  summary: CommissionReviewResolvedSummary;
   unreviewed: Array<{ file: string; reason?: string | undefined }>;
   findings: CommissionReviewFinding[];
   warnings: Array<{ kind?: string | undefined; message: string; file?: string | undefined }>;
 };
+
+export type CommissionReviewRejectedDisplayData = {
+  kind: 'commission_review';
+  status: 'rejected';
+  reviewStatus: 'rejected';
+  findingsStatus: 'unavailable';
+  findingsTrust: 'low';
+  retryRecommendation: 'do_not_retry';
+  stageStatus: CommissionReviewStageStatus;
+  warningsSummary: string[];
+  reviewerSummary?: string | undefined;
+  unreviewed: Array<{ file: string; reason?: string | undefined }>;
+  findings: CommissionReviewFinding[];
+  warnings: Array<{ kind?: string | undefined; message: string; file?: string | undefined }>;
+};
+
+export type CommissionReviewDisplayData = CommissionReviewResolvedDisplayData | CommissionReviewRejectedDisplayData;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -45,6 +73,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim() : undefined;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -82,21 +114,118 @@ export function parseCommissionReviewInput(input: Record<string, unknown>): Comm
   return { brief, focus: asString(input['focus']) };
 }
 
+function parseStageStatus(value: unknown): CommissionReviewStageStatus {
+  const record = asRecord(value);
+  if (!record) return {};
+  return {
+    targetCollection: asString(record['target_collection']),
+    diffCollection: asString(record['diff_collection']),
+    llmReview: asString(record['llm_review']),
+    jsonParse: asString(record['json_parse']),
+    findingExtraction: asString(record['finding_extraction']),
+  };
+}
+
+function parseFindings(value: unknown): CommissionReviewFinding[] {
+  const findings: CommissionReviewFinding[] = [];
+  if (!Array.isArray(value)) return findings;
+  for (const entry of value) {
+    const item = asRecord(entry);
+    if (!item) continue;
+    const severity = asString(item['severity']);
+    const file = asString(item['file']);
+    const title = asString(item['title']);
+    const rationale = asOptionalString(item['rationale']);
+    if (!severity || !file || !title || rationale === undefined) continue;
+    if (!['critical', 'high', 'medium', 'low'].includes(severity)) continue;
+    findings.push({
+      severity: severity as CommissionReviewFindingSeverity,
+      confidence: asString(item['confidence']),
+      file,
+      line: asNumber(item['line']),
+      symbol: asString(item['symbol']),
+      title,
+      rationale,
+      suggestedFix: asString(item['suggested_fix']),
+    });
+  }
+  return findings;
+}
+
+function parseUnreviewed(value: unknown): CommissionReviewDisplayData['unreviewed'] {
+  const unreviewed: CommissionReviewDisplayData['unreviewed'] = [];
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const item = asRecord(entry);
+      const file = asString(item?.['file']);
+      if (file) unreviewed.push({ file, reason: asString(item?.['reason']) });
+    }
+  }
+  return unreviewed;
+}
+
+function parseWarnings(value: unknown): CommissionReviewDisplayData['warnings'] {
+  const warnings: CommissionReviewDisplayData['warnings'] = [];
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const item = asRecord(entry);
+      const message = asString(item?.['message']);
+      if (message) warnings.push({ kind: asString(item?.['kind']), message, file: asString(item?.['file']) });
+    }
+  }
+  return warnings;
+}
+
 export function parseCommissionReviewDisplayData(value: unknown): CommissionReviewDisplayData | null {
   const record = asRecord(value);
   if (!record || record['kind'] !== 'commission_review') return null;
+
+  const status = asString(record['status']);
+  const validStatuses: CommissionReviewDisplayData['status'][] = ['success', 'partial', 'failed', 'skipped', 'rejected'];
+  if (!status || !validStatuses.includes(status as CommissionReviewDisplayData['status'])) return null;
+
+  const common = {
+    kind: 'commission_review' as const,
+    stageStatus: parseStageStatus(record['stage_status']),
+    warningsSummary: asStringArray(record['warnings_summary']),
+    unreviewed: parseUnreviewed(record['unreviewed']),
+    findings: parseFindings(record['findings']),
+    warnings: parseWarnings(record['warnings']),
+  };
+
+  if (status === 'rejected') {
+    const summary = asRecord(record['summary']);
+    return {
+      ...common,
+      status,
+      reviewStatus: 'rejected',
+      findingsStatus: 'unavailable',
+      findingsTrust: 'low',
+      retryRecommendation: 'do_not_retry',
+      reviewerSummary: asString(summary?.['reviewer_summary']),
+    };
+  }
+
+  const reviewStatus = asString(record['review_status']);
+  const findingsStatus = asString(record['findings_status']);
+  const findingsTrust = asString(record['findings_trust']);
+  const retryRecommendation = asString(record['retry_recommendation']);
+  if (!reviewStatus || !findingsStatus || !findingsTrust || !retryRecommendation) return null;
+
+  const resolvedCommon = {
+    ...common,
+    status,
+    reviewStatus,
+    findingsStatus,
+    findingsTrust,
+    retryRecommendation,
+  };
 
   const summary = asRecord(record['summary']);
   const target = asRecord(summary?.['target']);
   const findingSummary = asRecord(record['finding_summary']);
   if (!summary || !target || !findingSummary) return null;
 
-  const status = asString(record['status']);
-  const validStatuses: CommissionReviewDisplayData['status'][] = ['success', 'partial', 'failed', 'skipped', 'rejected'];
-  const reviewStatus = asString(record['review_status']);
-  const findingsStatus = asString(record['findings_status']);
-  const findingsTrust = asString(record['findings_trust']);
-  const retryRecommendation = asString(record['retry_recommendation']);
   const repoRoot = asString(target['repo_root']);
   const base = asString(target['base']);
   const head = asString(target['head']);
@@ -111,60 +240,13 @@ export function parseCommissionReviewDisplayData(value: unknown): CommissionRevi
   const medium = asNumber(findingSummary['medium']);
   const low = asNumber(findingSummary['low']);
 
-  if (!status || !validStatuses.includes(status as CommissionReviewDisplayData['status']) || !reviewStatus || !findingsStatus || !findingsTrust || !retryRecommendation || !repoRoot || !base || !head) return null;
+  if (!repoRoot || !base || !head) return null;
   if ([filesChanged, filesReviewed, insertions, deletions, elapsedMs, total, critical, high, medium, low].some((v) => v === undefined)) return null;
 
-  const findings: CommissionReviewFinding[] = [];
-  if (Array.isArray(record['findings'])) {
-    for (const entry of record['findings']) {
-      const item = asRecord(entry);
-      if (!item) continue;
-      const severity = asString(item['severity']);
-      const file = asString(item['file']);
-      const title = asString(item['title']);
-      const rationale = asString(item['rationale']);
-      if (!severity || !file || !title || !rationale) continue;
-      if (!['critical', 'high', 'medium', 'low'].includes(severity)) continue;
-      findings.push({
-        severity: severity as CommissionReviewFindingSeverity,
-        confidence: asString(item['confidence']),
-        file,
-        line: asNumber(item['line']),
-        symbol: asString(item['symbol']),
-        title,
-        rationale,
-        suggestedFix: asString(item['suggested_fix']),
-      });
-    }
-  }
-
-  const unreviewed: CommissionReviewDisplayData['unreviewed'] = [];
-  if (Array.isArray(record['unreviewed'])) {
-    for (const entry of record['unreviewed']) {
-      const item = asRecord(entry);
-      const file = asString(item?.['file']);
-      if (file) unreviewed.push({ file, reason: asString(item?.['reason']) });
-    }
-  }
-
-  const warnings: CommissionReviewDisplayData['warnings'] = [];
-  if (Array.isArray(record['warnings'])) {
-    for (const entry of record['warnings']) {
-      const item = asRecord(entry);
-      const message = asString(item?.['message']);
-      if (message) warnings.push({ kind: asString(item?.['kind']), message, file: asString(item?.['file']) });
-    }
-  }
-
   return {
-    kind: 'commission_review',
-    status: status as CommissionReviewDisplayData['status'],
-    reviewStatus,
-    findingsStatus,
-    findingsTrust,
-    retryRecommendation,
+    ...resolvedCommon,
+    status: status as CommissionReviewResolvedDisplayData['status'],
     findingSummary: { total: total!, critical: critical!, high: high!, medium: medium!, low: low! },
-    warningsSummary: asStringArray(record['warnings_summary']),
     summary: {
       target: { kind: asString(target['kind']), repoRoot, base, head, dirty: target['dirty'] === true },
       filesChanged: filesChanged!,
@@ -174,9 +256,6 @@ export function parseCommissionReviewDisplayData(value: unknown): CommissionRevi
       elapsedMs: elapsedMs!,
       reviewerSummary: asString(summary['reviewer_summary']),
     },
-    unreviewed,
-    findings,
-    warnings,
   };
 }
 
@@ -186,7 +265,7 @@ export function commissionReviewOutcomeLabel(data: CommissionReviewDisplayData):
     case 'partial': return 'Partial';
     case 'failed': return 'Failed';
     case 'rejected': return 'Rejected';
-    case 'skipped': return 'Clean';
+    case 'skipped': return 'Skipped';
   }
 }
 
@@ -196,6 +275,6 @@ export function commissionReviewOutcomeClass(data: CommissionReviewDisplayData):
     case 'partial': return 'partial';
     case 'failed': return 'failed';
     case 'rejected': return 'rejected';
-    case 'skipped': return 'clean';
+    case 'skipped': return 'skipped';
   }
 }

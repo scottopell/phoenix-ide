@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { CommissionReviewFixture } from './renderFixture';
 import { getCommissionReviewScenario } from './scenarios';
@@ -21,5 +21,17 @@ describe('CommissionReviewFixture', () => {
     expect(container.querySelector('[data-commission-review-fixture-ready="inline-partial-light"]')).not.toBeNull();
     expect(container.textContent).toContain('Commission review');
     expect(container.textContent).toContain('Warnings');
+  });
+
+  it('renders full viewer stage details for commission review fixtures', () => {
+    const scenario = getCommissionReviewScenario('viewer-partial-light');
+    render(<CommissionReviewFixture scenario={scenario} />);
+
+    expect(screen.getByText('target collection')).toBeInTheDocument();
+    expect(screen.getByText('diff collection')).toBeInTheDocument();
+    expect(screen.getByText('llm review')).toBeInTheDocument();
+    expect(screen.getByText('json parse')).toBeInTheDocument();
+    expect(screen.getByText('finding extraction')).toBeInTheDocument();
+    expect(screen.getByText('No rationale provided by the reviewer.')).toBeInTheDocument();
   });
 });

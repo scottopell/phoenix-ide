@@ -103,6 +103,13 @@ function commissionReviewDisplayData(overrides: Record<string, unknown> = {}): R
     findings_status: 'complete',
     findings_trust: 'complete',
     retry_recommendation: 'do_not_retry',
+    stage_status: {
+      target_collection: 'ok',
+      diff_collection: 'ok',
+      llm_review: 'ok',
+      json_parse: 'ok',
+      finding_extraction: 'ok',
+    },
     finding_summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0 },
     warnings_summary: [],
     summary: {
@@ -406,7 +413,7 @@ describe('commission review tool rendering', () => {
     expect(screen.queryByText('Finding 5')).not.toBeInTheDocument();
   });
 
-  it('falls back to generic output when display_data is malformed and renders failed/rejected states when valid', () => {
+  it('falls back to generic output when display_data is malformed and renders failed/rejected/skipped states when valid', () => {
     const malformed = toolMessage('tool-commission-review-malformed', '{"status":"failed"}');
     malformed.display_data = { kind: 'commission_review', status: 'failed' };
 
@@ -417,6 +424,13 @@ describe('commission review tool rendering', () => {
       findings_status: 'unavailable',
       findings_trust: 'low',
       retry_recommendation: 'retry',
+      stage_status: {
+        target_collection: 'ok',
+        diff_collection: 'ok',
+        llm_review: 'timeout',
+        json_parse: 'skipped',
+        finding_extraction: 'skipped',
+      },
       warnings_summary: ['review request timed out before findings were produced'],
       summary: {
         target: {
@@ -436,12 +450,40 @@ describe('commission review tool rendering', () => {
     });
 
     const rejected = toolMessage('tool-commission-review-rejected', JSON.stringify({ ok: true }));
-    rejected.display_data = commissionReviewDisplayData({
+    rejected.display_data = {
+      kind: 'commission_review',
       status: 'rejected',
       review_status: 'rejected',
       findings_status: 'unavailable',
       findings_trust: 'low',
       retry_recommendation: 'do_not_retry',
+      stage_status: {
+        target_collection: 'skipped',
+        diff_collection: 'skipped',
+        llm_review: 'skipped',
+        json_parse: 'skipped',
+        finding_extraction: 'skipped',
+      },
+      warnings_summary: [],
+      unreviewed: [],
+      findings: [],
+      warnings: [],
+    };
+
+    const skipped = toolMessage('tool-commission-review-skipped', JSON.stringify({ ok: true }));
+    skipped.display_data = commissionReviewDisplayData({
+      status: 'skipped',
+      review_status: 'skipped_due_to_empty_diff',
+      findings_status: 'unavailable',
+      findings_trust: 'unavailable',
+      retry_recommendation: 'do_not_retry',
+      stage_status: {
+        target_collection: 'ok',
+        diff_collection: 'skipped',
+        llm_review: 'skipped',
+        json_parse: 'skipped',
+        finding_extraction: 'skipped',
+      },
       summary: {
         target: {
           kind: 'committed_branch_diff',
@@ -450,12 +492,12 @@ describe('commission review tool rendering', () => {
           head: 'feature/branch',
           dirty: false,
         },
-        files_changed: 1,
-        files_reviewed: 1,
-        insertions: 1,
+        files_changed: 0,
+        files_reviewed: 0,
+        insertions: 0,
         deletions: 0,
-        elapsed_ms: 1,
-        reviewer_summary: 'The review request was rejected before spending tokens.',
+        elapsed_ms: 25,
+        reviewer_summary: 'No changed files were available to review.',
       },
     });
 
@@ -492,6 +534,16 @@ describe('commission review tool rendering', () => {
             toolResults={new Map([['tool-commission-review-rejected', rejected]])}
             onOpenFile={undefined}
           />
+          <AgentMessage
+            message={agentMessage('agent-commission-review-skipped', [{
+              type: 'tool_use',
+              id: 'tool-commission-review-skipped',
+              name: 'commission_review',
+              input: { brief: 'Skipped payload' },
+            }], 7)}
+            toolResults={new Map([['tool-commission-review-skipped', skipped]])}
+            onOpenFile={undefined}
+          />
         </>
       </MemoryRouter>,
     );
@@ -501,6 +553,45 @@ describe('commission review tool rendering', () => {
     expect(screen.getByText('retry')).toBeInTheDocument();
     expect(screen.getByText('No actionable findings were produced.')).toBeInTheDocument();
     expect(screen.getByText('Rejected')).toBeInTheDocument();
+    expect(screen.getByText('Review was rejected before findings were produced.')).toBeInTheDocument();
+    expect(screen.getByText('Skipped')).toBeInTheDocument();
+  });
+
+  it('renders empty-rationale findings fallback', () => {
+    const result = toolMessage('tool-commission-review-details', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData({
+      status: 'partial',
+      review_status: 'completed_with_warnings',
+      findings_status: 'partial',
+      findings_trust: 'partial',
+      retry_recommendation: 'review_findings_first',
+      stage_status: {
+        target_collection: 'ok',
+        diff_collection: 'partial',
+        llm_review: 'timeout',
+        json_parse: 'ok',
+        finding_extraction: 'partial',
+      },
+      findings: [{ severity: 'high', file: 'src/race.ts', title: 'Race', rationale: '   ' }],
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-commission-review-details', [{
+            type: 'tool_use',
+            id: 'tool-commission-review-details',
+            name: 'commission_review',
+            input: { brief: 'Detailed payload' },
+          }])}
+          toolResults={new Map([['tool-commission-review-details', result]])}
+          onOpenFile={undefined}
+          onOpenCommissionReview={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('No rationale provided by the reviewer.')).toBeInTheDocument();
   });
 });
 

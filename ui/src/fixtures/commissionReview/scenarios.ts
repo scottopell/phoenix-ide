@@ -39,6 +39,13 @@ function commissionReviewDisplayData(overrides: Record<string, unknown> = {}): R
     findings_status: 'complete',
     findings_trust: 'complete',
     retry_recommendation: 'do_not_retry',
+    stage_status: {
+      target_collection: 'ok',
+      diff_collection: 'ok',
+      llm_review: 'ok',
+      json_parse: 'ok',
+      finding_extraction: 'ok',
+    },
     finding_summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0 },
     warnings_summary: [],
     summary: {
@@ -180,7 +187,7 @@ function inlineFixture(kind: CommissionReviewScenarioKind): CommissionReviewFixt
         line: index + 10,
         symbol: `fn${index}`,
         title: `Finding ${index}`,
-        rationale: `Rationale ${index}`,
+        rationale: index === 0 ? '   ' : `Rationale ${index}`,
         suggested_fix: `Fix ${index}`,
       })),
     });
@@ -216,27 +223,25 @@ function inlineFixture(kind: CommissionReviewScenarioKind): CommissionReviewFixt
   }
 
   const result = toolMessage(toolUseId, JSON.stringify({ ok: true }));
-  result.display_data = commissionReviewDisplayData({
+  result.display_data = {
+    kind: 'commission_review',
     status: 'rejected',
     review_status: 'rejected',
     findings_status: 'unavailable',
     findings_trust: 'low',
-    summary: {
-      target: {
-        kind: 'committed_branch_diff',
-        repo_root: '/Users/example/src/phoenix-ide/.phoenix/worktrees/task-19004-style-commission-review-ui',
-        base: 'origin/main',
-        head: 'task-19004-style-commission-review-ui',
-        dirty: false,
-      },
-      files_changed: 7,
-      files_reviewed: 7,
-      insertions: 188,
-      deletions: 42,
-      elapsed_ms: 1,
-      reviewer_summary: 'The review request was rejected before spending tokens.',
+    retry_recommendation: 'do_not_retry',
+    stage_status: {
+      target_collection: 'skipped',
+      diff_collection: 'skipped',
+      llm_review: 'skipped',
+      json_parse: 'skipped',
+      finding_extraction: 'skipped',
     },
-  });
+    warnings_summary: [],
+    unreviewed: [],
+    findings: [],
+    warnings: [],
+  };
   return { message, toolResults: new Map([[toolUseId, result]]) };
 }
 

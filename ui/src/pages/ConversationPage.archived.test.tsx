@@ -12,6 +12,7 @@ import { ConversationReadinessProvider } from '../contexts/ConversationReadiness
 import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
+const navStackProps = vi.hoisted(() => ({ onOpenCommissionReview: undefined as ((sequenceId: number) => void) | undefined }));
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -77,6 +78,7 @@ vi.mock('../components/ConversationNavStack', () => ({
     loadingOlderMessages,
     transcriptPositioning,
     olderHistoryError,
+    onOpenCommissionReview,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -91,34 +93,38 @@ vi.mock('../components/ConversationNavStack', () => ({
       view?: { conversationId: string; generation: number; transcriptGeneration: number };
     };
     olderHistoryError?: string | null;
-  }) => (
-    <div>
-      <div data-testid="message-history">
-        {messages.map((message) => {
-          const content = message.content as { text?: string } | { type?: string; text?: string }[];
-          const rendered = Array.isArray(content)
-            ? content.find((block) => block.type === 'text')?.text
-            : content?.text;
-          return <div key={message.message_id}>{rendered}</div>;
-        })}
+    onOpenCommissionReview?: (sequenceId: number) => void;
+  }) => {
+    navStackProps.onOpenCommissionReview = onOpenCommissionReview;
+    return (
+      <div>
+        <div data-testid="message-history">
+          {messages.map((message) => {
+            const content = message.content as { text?: string } | { type?: string; text?: string }[];
+            const rendered = Array.isArray(content)
+              ? content.find((block) => block.type === 'text')?.text
+              : content?.text;
+            return <div key={message.message_id}>{rendered}</div>;
+          })}
+        </div>
+        <div data-testid="history-message-count">{messages.length}</div>
+        <div data-testid="history-has-older">{hasOlderMessages ? 'yes' : 'no'}</div>
+        {hasOlderMessages && onLoadOlderMessages && (
+          <button type="button" onClick={() => onLoadOlderMessages()}>
+            Load older messages
+          </button>
+        )}
+        <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
+        <div data-testid="history-scroll-command">
+          {transcriptPositioning?.kind === 'positioning'
+            ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
+            : 'none'}
+        </div>
+        <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
+        {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
       </div>
-      <div data-testid="history-message-count">{messages.length}</div>
-      <div data-testid="history-has-older">{hasOlderMessages ? 'yes' : 'no'}</div>
-      {hasOlderMessages && onLoadOlderMessages && (
-        <button type="button" onClick={() => onLoadOlderMessages()}>
-          Load older messages
-        </button>
-      )}
-      <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
-      <div data-testid="history-scroll-command">
-        {transcriptPositioning?.kind === 'positioning'
-          ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
-          : 'none'}
-      </div>
-      <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
-      {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
-    </div>
-  ),
+    );
+  },
 }));
 
 vi.mock('../components/TerminalPanel', () => ({
@@ -286,6 +292,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
   });
 
+<<<<<<< HEAD
   it('cold-loads a UUID route via id metadata and id full-history paths', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-archived', archived: true });
@@ -314,6 +321,13 @@ describe('ConversationPage archived read-only rendering', () => {
       expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
     });
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+  });
+
+  it('only exposes commission review sidepanel actions on wide desktop', async () => {
+    viewportFlags.isWideDesktop = false;
+    renderPage(makeConversation());
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(navStackProps.onOpenCommissionReview).toBeUndefined();
   });
 
   it('uses authoritative metadata when the cached slug owner changed', async () => {

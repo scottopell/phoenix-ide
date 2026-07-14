@@ -373,7 +373,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const handleCloseMessageViewer = viewerSlot.close;
   const handleOpenBrowserView = viewerSlot.openBrowser;
   const handleOpenMessageViewer = viewerSlot.openMessage;
-  const handleOpenCommissionReview = viewerSlot.openCommissionReview;
   // ConversationPage was previously snapshotting `isDesktop` at mount and
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
@@ -383,6 +382,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
   const isWideDesktop = useIsWideDesktop();
+  const handleOpenCommissionReview = useCallback((requestSequenceId: number) => {
+    if (!isWideDesktop) return;
+    viewerSlot.openCommissionReview(requestSequenceId);
+  }, [isWideDesktop, viewerSlot]);
   const VIEWER_PANE_MIN = 360;
   const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({
@@ -1984,7 +1987,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         onRetry={handleRetry}
         onCancelSteering={isArchived ? undefined : handleCancelSteering}
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
-        onOpenCommissionReview={isArchived ? undefined : handleOpenCommissionReview}
+        onOpenCommissionReview={isArchived || !isWideDesktop ? undefined : handleOpenCommissionReview}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         enableMessageSidepanel={canOpenMessageSidepanel}

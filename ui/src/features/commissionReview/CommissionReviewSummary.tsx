@@ -53,14 +53,26 @@ export function CommissionReviewSummaryCard({
     .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
     .slice(0, mode === 'inline' ? COMMISSION_REVIEW_FINDINGS_PREVIEW_LIMIT : data.findings.length);
   const remainingFindings = Math.max(0, data.findings.length - findingsPreview.length);
-  const severityBadges = ([
-    ['critical', data.findingSummary.critical],
-    ['high', data.findingSummary.high],
-    ['medium', data.findingSummary.medium],
-    ['low', data.findingSummary.low],
-  ] satisfies Array<[CommissionReviewFinding['severity'], number]>).filter((entry) => entry[1] > 0);
-  const coverageLabel = `${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed`;
+  const severityBadges = ('findingSummary' in data
+    ? ([
+        ['critical', data.findingSummary.critical],
+        ['high', data.findingSummary.high],
+        ['medium', data.findingSummary.medium],
+        ['low', data.findingSummary.low],
+      ] satisfies Array<[CommissionReviewFinding['severity'], number]>)
+    : []).filter((entry) => entry[1] > 0);
+  const coverageLabel = 'summary' in data ? `${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed` : null;
   const showFullDetails = mode === 'full';
+  const stageDetails = [
+    ['target collection', data.stageStatus.targetCollection],
+    ['diff collection', data.stageStatus.diffCollection],
+    ['llm review', data.stageStatus.llmReview],
+    ['json parse', data.stageStatus.jsonParse],
+    ['finding extraction', data.stageStatus.findingExtraction],
+  ] as const;
+  const findingRationaleFallback = (finding: CommissionReviewFinding) => {
+    return finding.rationale.length > 0 ? finding.rationale : 'No rationale provided by the reviewer.';
+  };
   const canOpenFullReview = !showFullDetails && requestSequenceId !== undefined && onOpenFullReview !== undefined;
 
   return (
@@ -87,20 +99,28 @@ export function CommissionReviewSummaryCard({
         </div>
       </div>
 
-      <div className="commission-review-metrics" role="list" aria-label="Commission review metrics">
-        <div className="commission-review-metric" role="listitem"><span>elapsed</span><strong>{formatDuration(data.summary.elapsedMs)}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>coverage</span><strong>{coverageLabel}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>changes</span><strong>+{data.summary.insertions} / -{data.summary.deletions}</strong></div>
-        <div className="commission-review-metric" role="listitem"><span>findings</span><strong>{data.findingSummary.total}</strong></div>
-      </div>
+      {data.status === 'rejected' && data.reviewerSummary && (
+        <p className="commission-review-reviewer-summary">{data.reviewerSummary}</p>
+      )}
 
-      <div className="commission-review-target">
-        <div className="commission-review-target-branch">{data.summary.target.base} → {data.summary.target.head}</div>
-        <div className="commission-review-target-repo">{data.summary.target.repoRoot}</div>
-      </div>
+      {'summary' in data && 'findingSummary' in data && (
+        <>
+          <div className="commission-review-metrics" role="list" aria-label="Commission review metrics">
+            <div className="commission-review-metric" role="listitem"><span>elapsed</span><strong>{formatDuration(data.summary.elapsedMs)}</strong></div>
+            <div className="commission-review-metric" role="listitem"><span>coverage</span><strong>{coverageLabel}</strong></div>
+            <div className="commission-review-metric" role="listitem"><span>changes</span><strong>+{data.summary.insertions} / -{data.summary.deletions}</strong></div>
+            <div className="commission-review-metric" role="listitem"><span>findings</span><strong>{data.findingSummary.total}</strong></div>
+          </div>
 
-      {data.summary.reviewerSummary && (
-        <p className="commission-review-reviewer-summary">{data.summary.reviewerSummary}</p>
+          <div className="commission-review-target">
+            <div className="commission-review-target-branch">{data.summary.target.base} → {data.summary.target.head}</div>
+            <div className="commission-review-target-repo">{data.summary.target.repoRoot}</div>
+          </div>
+
+          {data.summary.reviewerSummary && (
+            <p className="commission-review-reviewer-summary">{data.summary.reviewerSummary}</p>
+          )}
+        </>
       )}
 
       {severityBadges.length > 0 && (
@@ -146,9 +166,17 @@ export function CommissionReviewSummaryCard({
           <div><span>status</span><strong>{formatCommissionReviewLabel(data.status)}</strong></div>
           <div><span>review</span><strong>{formatCommissionReviewLabel(data.reviewStatus)}</strong></div>
           <div><span>findings</span><strong>{formatCommissionReviewLabel(data.findingsStatus)}</strong></div>
+          <div><span>trust</span><strong>{formatCommissionReviewLabel(data.findingsTrust)}</strong></div>
           <div><span>retry</span><strong>{formatCommissionReviewLabel(data.retryRecommendation)}</strong></div>
-          <div><span>target kind</span><strong>{data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}</strong></div>
-          <div><span>dirty</span><strong>{data.summary.target.dirty ? 'yes' : 'no'}</strong></div>
+          {stageDetails.map(([label, value]) => (
+            <div key={label}><span>{label}</span><strong>{value ? formatCommissionReviewLabel(value) : 'not reported'}</strong></div>
+          ))}
+          {'summary' in data && (
+            <>
+              <div><span>target kind</span><strong>{data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}</strong></div>
+              <div><span>dirty</span><strong>{data.summary.target.dirty ? 'yes' : 'no'}</strong></div>
+            </>
+          )}
         </div>
       )}
 
@@ -183,7 +211,7 @@ export function CommissionReviewSummaryCard({
                   {finding.line !== undefined ? `:${finding.line}` : ''}
                   {finding.symbol ? ` · ${finding.symbol}` : ''}
                 </div>
-                <p>{finding.rationale}</p>
+                <p>{findingRationaleFallback(finding)}</p>
                 {finding.suggestedFix && <p className="commission-review-suggested-fix">Fix: {finding.suggestedFix}</p>}
               </li>
             ))}
@@ -192,7 +220,7 @@ export function CommissionReviewSummaryCard({
         </div>
       ) : (
         <div className="commission-review-empty-findings">
-          {data.status === 'failed' ? 'No actionable findings were produced.' : 'No findings reported.'}
+          {data.status === 'failed' ? 'No actionable findings were produced.' : data.status === 'rejected' ? 'Review was rejected before findings were produced.' : 'No findings reported.'}
         </div>
       )}
     </section>
