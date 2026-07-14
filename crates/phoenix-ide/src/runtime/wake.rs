@@ -678,7 +678,9 @@ async fn inspect_binding(
                         now,
                     )
                 }
-                BashTerminalInspection::Unknown => forgotten(binding, now),
+                BashTerminalInspection::Unknown => {
+                    forgotten(binding, WakeForgottenReason::CascadeDestroyedHandle, now)
+                }
                 BashTerminalInspection::Live
                 | BashTerminalInspection::KillPendingKernel { .. }
                 | BashTerminalInspection::Terminal { .. }
@@ -741,8 +743,12 @@ fn classify_tmux(
             });
             fired(binding, evidence, now)
         }
-        TmuxTerminalInspection::Unavailable if now >= binding.expires_at => forgotten(binding, now),
-        TmuxTerminalInspection::Missing => forgotten(binding, now),
+        TmuxTerminalInspection::Unavailable if now >= binding.expires_at => {
+            forgotten(binding, WakeForgottenReason::PhoenixRestart, now)
+        }
+        TmuxTerminalInspection::Missing => {
+            forgotten(binding, WakeForgottenReason::TmuxHandleMissing, now)
+        }
         TmuxTerminalInspection::Live
         | TmuxTerminalInspection::WindowKilled { .. }
         | TmuxTerminalInspection::Terminal { .. }
@@ -785,12 +791,16 @@ fn expired(binding: &WakeBinding, now: DateTime<Utc>) -> Result<InspectionDecisi
     ))
 }
 
-fn forgotten(binding: &WakeBinding, now: DateTime<Utc>) -> Result<InspectionDecision, String> {
+fn forgotten(
+    binding: &WakeBinding,
+    reason: WakeForgottenReason,
+    now: DateTime<Utc>,
+) -> Result<InspectionDecision, String> {
     Ok(InspectionDecision::DeadlineTerminal(
         WakeTerminalPayload::Forgotten {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
-            reason: WakeForgottenReason::HandleMissing,
+            reason,
             resolved_at: timestamp(now)?,
         },
     ))
@@ -1067,7 +1077,7 @@ mod tests {
         assert!(matches!(
             inspect_binding(&manager, &binding, at(50)).await.unwrap(),
             InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten {
-                reason: WakeForgottenReason::HandleMissing,
+                reason: WakeForgottenReason::CascadeDestroyedHandle,
                 resolved_at: Timestamp(50),
                 ..
             })
@@ -1086,7 +1096,7 @@ mod tests {
         assert!(matches!(
             classify_tmux(&binding, &identity, TmuxTerminalInspection::Missing, at(50)).unwrap(),
             InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten {
-                reason: WakeForgottenReason::HandleMissing,
+                reason: WakeForgottenReason::TmuxHandleMissing,
                 resolved_at: Timestamp(50),
                 ..
             })

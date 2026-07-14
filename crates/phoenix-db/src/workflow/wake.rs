@@ -1255,7 +1255,7 @@ async fn lookup_wake_registration(
     let row = sqlx::query(
         "SELECT intent_fingerprint, workflow_id, receipt_codec_family, receipt_codec_version, receipt_payload \
          FROM external_acceptance_bindings WHERE profile_id = ?1 AND protocol_version = ?2 \
-           AND authority = 'engine_protocol' AND authority_scope = ?3 AND idempotency_key = ?4",
+           AND authority_scope = ?3 AND idempotency_key = ?4",
     )
     .bind(wake_profile::PROFILE_ID)
     .bind(i64::from(wake_profile::PROTOCOL_VERSION))
@@ -1791,19 +1791,20 @@ fn terminal_projection(
             projection.cancellation_reason = Some("explicit_cancel".to_owned());
         }
         WakeTerminalPayload::Forgotten { reason, .. } => {
-            projection.forgotten_reason = Some(
-                match reason {
-                    WakeForgottenReason::HandleMissing => "handle_missing",
-                    WakeForgottenReason::RuntimeUnrecoverableAfterRestart => {
-                        "runtime_unrecoverable_after_restart"
-                    }
-                }
-                .to_owned(),
-            );
+            projection.forgotten_reason = Some(forgotten_reason(*reason).to_owned());
         }
         WakeTerminalPayload::Expired { .. } => {}
     }
     Ok(projection)
+}
+
+const fn forgotten_reason(reason: WakeForgottenReason) -> &'static str {
+    match reason {
+        WakeForgottenReason::PhoenixRestart => "phoenix_restart",
+        WakeForgottenReason::CascadeDestroyedHandle => "cascade_destroyed_handle",
+        WakeForgottenReason::SubagentHandleMissing => "subagent_handle_missing",
+        WakeForgottenReason::TmuxHandleMissing => "tmux_handle_missing",
+    }
 }
 
 fn terminal_json(terminal: &WakeTerminalPayload) -> Value {
@@ -1837,7 +1838,7 @@ fn terminal_json(terminal: &WakeTerminalPayload) -> Value {
             reason,
             resolved_at,
         } => {
-            json!({"type":"forgotten","contract_id":contract_id,"resource":resource_json(resource),"reason":match reason { WakeForgottenReason::HandleMissing => "handle_missing", WakeForgottenReason::RuntimeUnrecoverableAfterRestart => "runtime_unrecoverable_after_restart" },"resolved_at":resolved_at.0})
+            json!({"type":"forgotten","contract_id":contract_id,"resource":resource_json(resource),"reason":forgotten_reason(*reason),"resolved_at":resolved_at.0})
         }
     }
 }

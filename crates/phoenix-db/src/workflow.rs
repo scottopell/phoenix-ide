@@ -3318,11 +3318,10 @@ where
     let existing = sqlx::query(
         "SELECT intent_fingerprint, workflow_id, receipt_codec_family, receipt_codec_version, receipt_payload \
          FROM external_acceptance_bindings WHERE profile_id = ?1 AND protocol_version = ?2 \
-         AND authority = ?3 AND authority_scope = ?4 AND idempotency_key = ?5",
+         AND authority_scope = ?3 AND idempotency_key = ?4",
     )
     .bind(&acceptance.profile_id)
     .bind(i64::from(acceptance.protocol_version))
-    .bind(authority_sql(acceptance.authority.authority))
     .bind(&acceptance.authority.scope)
     .bind(&acceptance.idempotency_key)
     .fetch_optional(executor)

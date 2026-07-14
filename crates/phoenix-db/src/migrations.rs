@@ -1361,7 +1361,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_external_acceptance_idempotency
     ON external_acceptance_bindings(
         profile_id,
         protocol_version,
-        authority,
         authority_scope,
         idempotency_key
     );
