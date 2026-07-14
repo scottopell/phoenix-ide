@@ -523,44 +523,29 @@ rule UserCancelsContract {
         tool_use_id:    Contract{id: contract_id}.registering_tool_use_id,
         payload:        payload
     )
-    ensures: ConversationNextLlmTurnTriggered(
-        Contract{id: contract_id}.conversation
-    )
     ensures: SseEmitted(WakeContractCancelled, contract_id)
 }
 
--- REQ-WAKE-004: lifecycle cascade (archive, hard-delete, abandon,
--- mark-merged) cancels every pending contract on the conversation
--- BEFORE the resource cleanup cascade runs. Because is_busy() now
--- consults the contract table, archive/hard-delete will refuse with
--- 409 if any contract is pending - this rule only runs after the
--- user has explicitly cancelled contracts (or chosen the
--- cancel-and-archive composite action).
-rule LifecycleCascadeCancelsContracts {
+-- REQ-WAKE-004: lifecycle admission for archive, hard-delete, abandon,
+-- and mark-merged must not auto-cancel pending contracts. The request is
+-- either rejected while any contract is pending, or serialized only after a
+-- wake-aware admission step has closed registration and proven no pending
+-- contract remains.
+rule LifecycleAdmissionRejectsPendingContracts {
     when: ConversationLifecycleCascadeBegun(conversation)
 
     requires: exists Contract{conversation: conversation, status: pending}
 
-    ensures: AllContractsOnConversationCancelled(
-        conversation,
-        cancelled,
-        before: ResourceCleanupCascadeBegun(conversation)
-    )
+    ensures: LifecycleTransitionRejected(conversation, reason: wake_contract_pending)
+    ensures: not ResourceCleanupCascadeBegun(conversation)
 
     @guidance
-        -- Lifecycle-driven cancellation runs BEFORE the resource
-        -- cleanup cascade (bash/tmux/browser/projects). Rationale:
-        -- the cascade may destroy the handle the contract was
-        -- waiting on; if the cancel fires after, the contract's
-        -- last-evaluator-run will see a destroyed handle and
-        -- incorrectly fire forgotten instead of cancelled.
-        --
-        -- Order: cancel contracts -> run resource cascade -> delete
-        -- conv row (for hard-delete only).
-        --
-        -- For hard-delete: no synthetic tool result delivery (the
-        -- conv is being deleted). For archive/abandon/mark-merged:
-        -- deliver if conv is still queryable.
+        -- Earlier wording auto-cancelled wake contracts during lifecycle
+        -- teardown. That let archive/delete race the wake's own terminal
+        -- observation and rewrote an outstanding wait into cancelled as a side
+        -- effect of lifecycle admission. The durable wake semantics now reject
+        -- (or a higher-level composite action serializes explicitly) instead of
+        -- silently cancelling pending waits.
 }
 
 -- REQ-WAKE-012: a continuation that inherits the WorkScope transfers

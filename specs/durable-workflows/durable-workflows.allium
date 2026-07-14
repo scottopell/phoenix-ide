@@ -847,6 +847,7 @@ rule RenewLiveClaim {
 rule RejectStaleClaimRenewal {
     when: ClaimRenewalRequested(worker, effect, authority, new_lease_until)
     requires: not live_matching_authority(effect, authority)
+        or authority.worker_id != worker
     ensures: ClaimRenewalOutcome(stale_authority)
 }
 
@@ -964,6 +965,7 @@ rule RejectUnavailableOrClosedTerminalReceipt {
 rule ScheduleRetryDurably {
     when: ReconciliationDecisionReported(worker, effect, authority, retry_infrastructure)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: ambiguity_recovery_allowed(effect, retry_infrastructure)
     ensures: effect.status = retry_wait
     ensures: effect.next_eligible_at = retry_deadline_for(effect, retry_infrastructure)
@@ -973,6 +975,7 @@ rule ScheduleRetryDurably {
 rule RequireManualResolution {
     when: ReconciliationDecisionReported(worker, effect, authority, request_manual_resolution)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     ensures: effect.status = ambiguity_wait
     ensures: ManualResolution.created(
         id: next_manual_resolution_id(), workflow: effect.workflow,
@@ -1176,10 +1179,24 @@ rule ReducerAcceptsInboxEvent {
     requires: decision.expected_workflow_version = inbox.workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
     requires: committed_transition_for_decision(inbox.workflow, decision) = null
+    requires: reducer_plan_commit_outcome_for(inbox.workflow, decision) = committed
     ensures: ReducerPlanCommitRequested(reducer, inbox.workflow, decision)
     ensures: committed_transition_for_decision(inbox.workflow, decision) != null
     ensures: inbox.delivery_status = consumed
     ensures: inbox.consumed_by = committed_transition_for_decision(inbox.workflow, decision)
+}
+
+rule ReducerRejectedPlanLeavesInboxPending {
+    when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
+    requires: inbox.workflow.authority = engine_protocol and inbox.workflow.execution_mode = authoritative
+    requires: inbox.delivery_status = pending
+    requires: reducer_inbox_belongs_to_current_generation(inbox)
+    requires: decision.expected_workflow_version = inbox.workflow.version
+    requires: reducer_decision_is_product_authoritative(decision)
+    requires: committed_transition_for_decision(inbox.workflow, decision) = null
+    requires: reducer_plan_commit_outcome_for(inbox.workflow, decision) in {unsupported_codec, invalid_plan}
+    ensures: inbox.delivery_status = pending
+    ensures: inbox.consumed_by = null
 }
 
 rule RuntimeAcceptsOwedAcceptance {

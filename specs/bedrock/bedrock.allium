@@ -1300,10 +1300,13 @@ rule UserHardDeletesConversationRule {
         -- have happened." A property test that runs the handler and
         -- checks the post-state suffices.
         --
-        -- Archive / abandon / mark-merged share this cascade (REQ-BED-032
-        -- now covers all four terminal transitions). UI-only state
-        -- changes (close-tab, blur) do NOT trigger this rule — tmux
-        -- servers and browser sessions deliberately survive them
+        -- Archive / abandon / mark-merged share this cascade only AFTER
+        -- wake-plane destructive-lifecycle admission either rejects for
+        -- pending wakes or serializes behind a closed registration fence.
+        -- Bedrock does not auto-cancel pending wakes as part of terminal
+        -- lifecycle admission; wake-profile owns that choice structurally.
+        -- UI-only state changes (close-tab, blur) do NOT trigger this rule
+        -- — tmux servers and browser sessions deliberately survive them
         -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/
         -- REQ-BROWSER-WS-003).
 }

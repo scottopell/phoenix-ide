@@ -665,13 +665,22 @@ rule ReadinessBarrierPublishesReady {
     ensures: ConversationCreationReady(binding.conversation_id)
 }
 
-rule ReadinessIgnoresLateTerminalGeneration {
+rule ReadinessIgnoresLateOrTerminalGeneration {
     when: CreationReadinessBarrierSatisfied(reducer, binding)
     requires: binding.readiness_barrier.status = satisfied
     requires: binding.workflow.generation != binding.readiness_barrier.declaring_transition.generation
-        or binding.outcome != provisioning
+        or binding.outcome in {cancelled, deletion_pending, deleted, failed, manual_resolution}
     ensures: not ConversationCreationReady(binding.conversation_id)
     ensures: binding.outcome != ready
+}
+
+rule DuplicateReadinessOnAlreadyReadyIsIdempotent {
+    when: CreationReadinessBarrierSatisfied(reducer, binding)
+    requires: binding.readiness_barrier.status = satisfied
+    requires: binding.workflow.generation = binding.readiness_barrier.declaring_transition.generation
+    requires: binding.outcome = ready
+    ensures: ConversationCreationReady(binding.conversation_id)
+    ensures: binding.outcome = ready
 }
 
 rule ReadinessCannotPrecedeFirstDispatchReceipt {

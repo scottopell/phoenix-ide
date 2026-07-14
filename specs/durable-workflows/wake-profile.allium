@@ -365,10 +365,12 @@ rule RegistrationRejectsClosedOrUnavailableConversation {
 rule EvidenceScheduleRecordsReconciliationObservation {
     when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
     requires: binding.observe_effect.status not in {receipted, invalidated}
+    requires: active_claim_authority(binding.observe_effect) = binding.authority
     requires: evidence_matches_resource(evidence, binding.resource)
     ensures: observable_reconciliation_applied(binding.observe_effect)
     ensures: no_external_replay_during_reconciliation(binding.observe_effect)
     ensures: WakeEvidenceRecorded(binding, evidence, evidence_occurrence_time(evidence))
+    ensures: CoreObservationRequestedForWake(binding.observe_effect, binding.authority, evidence)
 }
 
 rule EvidenceBeforeDeadlineWins {
@@ -448,6 +450,8 @@ rule LosingCancellationIsIdempotent {
 rule TerminalReceiptMaterializesDurableObservation {
     when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
     requires: receipt.effect = binding.observe_effect
+    requires: receipt.attempt.claim.authority = binding.authority
+    requires: active_claim_authority(binding.observe_effect) = binding.authority
     requires: terminal.contract_id = binding.contract_id
     requires: terminal.cause != cancelled
     requires: not terminal_receipt_already_materialized(receipt)
@@ -472,6 +476,7 @@ rule CancelledReceiptMaterializesWithoutAutoResume {
     when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
     requires: terminal.cause = cancelled
     requires: exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
+    requires: receipt.attempt.claim.authority = binding.authority
     requires: not terminal_receipt_already_materialized(receipt)
     ensures: WakeObservationInboxItem.created(
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
