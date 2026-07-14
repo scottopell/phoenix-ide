@@ -483,13 +483,28 @@ class PreparationTests(unittest.TestCase):
              mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
              mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SAME": "repo"})):
             self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-                "HOME": "/Users/test", "PHOENIX_PASSWORD": "legacy-secret",
+                "HOME": str(Path.home()), "PHOENIX_PASSWORD": "legacy-secret",
                 "PHOENIX_PORT": "9443", "SAME": "repo",
             }}))
             overrides = self.dev._launchd_override_env()
             mode = self.dev.LAUNCHD_OVERRIDE_PATH.stat().st_mode & 0o777
         self.assertEqual({"PHOENIX_PASSWORD": "legacy-secret", "PHOENIX_PORT": "9443"}, overrides)
         self.assertEqual(0o600, mode)
+
+    def test_legacy_custom_generated_key_value_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", return_value=None):
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+                "PHOENIX_DB_PATH": "/custom/prod.db",
+                "PHOENIX_LOG_STDOUT": "true",
+            }}))
+            overrides = self.dev._launchd_override_env()
+        self.assertEqual({
+            "PHOENIX_DB_PATH": "/custom/prod.db",
+            "PHOENIX_LOG_STDOUT": "true",
+        }, overrides)
 
     def test_generated_plist_values_do_not_shadow_repo_env(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -541,6 +556,20 @@ class PreparationTests(unittest.TestCase):
                 self.dev.launchd_prod_deploy()
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
 
+    def test_rollback_binary_identity_mismatch_is_rejected(self):
+        running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        rollback = {"version": "1.0.0", "git_sha": "bbbbbbbbbbbb"}
+        self.assertFalse(running["git_sha"].startswith(rollback["git_sha"].removesuffix("-dirty")))
+
+    def test_candidate_env_snapshot_is_reused(self):
+        snapshot = {"PHOENIX_PORT": "9443", "PHOENIX_PASSWORD": "one"}
+        with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(snapshot, Path("env"))) as load:
+            first, source = self.dev._launchd_candidate_env()
+            staged = dict(first)
+        self.assertEqual(snapshot, staged)
+        self.assertEqual(Path("env"), source)
+        load.assert_called_once()
+
     def test_helper_rejects_incompatible_manifest_protocol(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -559,10 +588,15 @@ class PreparationTests(unittest.TestCase):
                 self.dev._refuse_launchd_override_during_deploy()
 
     def test_prod_status_uses_effective_launchd_env(self):
-        with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({"PHOENIX_PORT": "9555"}, None)), \
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
              mock.patch.object(self.dev, "_current_prod_identity", return_value=None) as identity, \
              mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "state = running\n", "")), \
              mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {},
+                "Sockets": {"Listeners": {"SockServiceName": "9555"}},
+            }))
             self.dev.launchd_prod_status()
         identity.assert_called_once_with({"PHOENIX_PORT": "9555"})
         self.assertTrue(any("Port: 9555" in str(call) for call in output.call_args_list))

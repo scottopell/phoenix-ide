@@ -6405,9 +6405,13 @@ def _systemd_override_env() -> dict[str, str]:
     return env
 
 
-_GENERATED_LAUNCHD_ENV_KEYS = {
-    "HOME", "PATH", "RUST_LOG", "PHOENIX_DB",
-    "PHOENIX_LOG", "PHOENIX_VERSION", "PHOENIX_LAUNCHD",
+_GENERATED_LAUNCHD_ENV_DEFAULTS = {
+    "HOME": str(Path.home()),
+    "PATH": None,
+    "PHOENIX_DB_PATH": str(PROD_DB_PATH),
+    "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
+    "PHOENIX_LOG_STDOUT": "false",
+    "PHOENIX_VERSION": None,
 }
 
 
@@ -6424,7 +6428,13 @@ def _migrate_launchd_override_env() -> dict[str, str]:
     overrides = {
         key: str(value)
         for key, value in plist_env.items()
-        if key not in _GENERATED_LAUNCHD_ENV_KEYS
+        if not (
+            key in _GENERATED_LAUNCHD_ENV_DEFAULTS
+            and (
+                _GENERATED_LAUNCHD_ENV_DEFAULTS[key] is None
+                or _GENERATED_LAUNCHD_ENV_DEFAULTS[key] == str(value)
+            )
+        )
         and repo_env.get(key, str(PROD_PORT) if key == "PHOENIX_PORT" else None) != str(value)
     }
     _write_launchd_override_env(overrides)
@@ -7490,7 +7500,8 @@ def launchd_prod_deploy(release: str | None = None):
                 f"local candidate identity {identity['git_sha']} does not match selected HEAD {source_commit[:12]}"
             )
 
-        env_overrides, env_file = _launchd_candidate_env()
+        env_overrides = dict(launchd_env)
+        env_file = _env_file
         if env_file:
             print(f"  Loaded env from {env_file}")
         path_str, path_source = capture_login_shell_path()
@@ -7514,19 +7525,28 @@ def launchd_prod_deploy(release: str | None = None):
         previous_identity = _current_prod_identity(previous_env)
         previous_health_url, previous_health_insecure_tls = _launchd_health_probe(previous_env)
         previous_health_json = previous_identity is not None
-        if target_binary.exists() and previous_identity is None:
-            legacy = _legacy_prod_identity(previous_env)
-            if legacy is not None:
-                previous_identity, previous_health_url, previous_health_insecure_tls = legacy
-                previous_health_json = False
-            else:
-                try:
-                    previous_identity = _binary_identity(target_binary)
+        if target_binary.exists():
+            try:
+                rollback_identity = _binary_identity(rollback_binary)
+            except (OSError, subprocess.SubprocessError, SystemExit) as exc:
+                raise SystemExit(
+                    "installed production identity is unavailable; refusing an unverifiable rollback"
+                ) from exc
+            if previous_identity is None:
+                legacy = _legacy_prod_identity(previous_env)
+                if legacy is not None:
+                    previous_identity, previous_health_url, previous_health_insecure_tls = legacy
+                    previous_health_json = False
+                else:
+                    previous_identity = rollback_identity
                     previous_health_json = True
-                except (OSError, subprocess.SubprocessError, SystemExit) as exc:
-                    raise SystemExit(
-                        "installed production identity is unavailable; refusing an unverifiable rollback"
-                    ) from exc
+            if (
+                rollback_identity["version"] != previous_identity["version"]
+                or not previous_identity["git_sha"].startswith(rollback_identity["git_sha"].removesuffix("-dirty"))
+            ):
+                raise SystemExit(
+                    "staged rollback binary identity does not match the previous production identity"
+                )
 
         helper = staging / "activate.py"
         _materialize_helper(source_commit, helper, source_kind)
@@ -7689,7 +7709,7 @@ def launchd_prod_status():
 
     print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
 
-    status_env, _env_file = _launchd_candidate_env()
+    status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
     identity = _current_prod_identity(status_env)
     if identity:
         print(f"  Version: {identity['version']} ({identity['git_sha']})")
