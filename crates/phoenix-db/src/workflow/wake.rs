@@ -926,7 +926,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
         exact_deadline: DateTime<Utc>,
     ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
         self.repository
-            .schedule_retry(authority, now, exact_deadline)
+            .schedule_retry(authority, &authority.worker_id, now, exact_deadline)
             .await
     }
 

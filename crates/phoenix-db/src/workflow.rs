@@ -240,6 +240,7 @@ pub struct DurableManualResolutionChoice {
 pub struct DurableManualResolutionRequest {
     pub resolution_id: String,
     pub authority: DurableClaimAuthority,
+    pub requesting_worker_id: String,
     pub now: DateTime<Utc>,
     pub evidence: DurablePayload,
     pub evidence_links: Vec<(String, String)>,
@@ -288,6 +289,7 @@ pub struct DurableClaimRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableClaimRenewal {
     pub authority: DurableClaimAuthority,
+    pub requesting_worker_id: String,
     pub now: DateTime<Utc>,
     pub lease_until: DateTime<Utc>,
 }
@@ -1215,7 +1217,8 @@ impl WorkflowRepository {
         &self,
         renewal: &DurableClaimRenewal,
     ) -> WorkflowRepositoryResult<RenewClaimResult> {
-        if renewal.lease_until <= renewal.now
+        if renewal.requesting_worker_id != renewal.authority.worker_id
+            || renewal.lease_until <= renewal.now
             || renewal.lease_until <= renewal.authority.lease_until
         {
             return Ok(RenewClaimResult::StaleAuthority);
@@ -1296,10 +1299,11 @@ impl WorkflowRepository {
     pub async fn schedule_retry(
         &self,
         authority: &DurableClaimAuthority,
+        requesting_worker_id: &str,
         now: DateTime<Utc>,
         next_eligible_at: DateTime<Utc>,
     ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
-        if next_eligible_at < now {
+        if requesting_worker_id != authority.worker_id || next_eligible_at < now {
             return Ok(ReconcileEffectResult::StaleAuthority);
         }
 
@@ -1350,6 +1354,10 @@ impl WorkflowRepository {
         request: &DurableManualResolutionRequest,
         failpoint: Option<WorkflowFailpoint>,
     ) -> WorkflowRepositoryResult<ReconcileEffectResult> {
+        if request.requesting_worker_id != request.authority.worker_id {
+            return Ok(ReconcileEffectResult::StaleAuthority);
+        }
+
         let mut tx = self.pool.begin().await?;
         let Some(context) =
             load_reconcilable_effect_context(&mut tx, &request.authority, request.now).await?
@@ -3872,6 +3880,7 @@ mod tests {
         DurableManualResolutionRequest {
             resolution_id: "mr-1".to_owned(),
             authority: authority.clone(),
+            requesting_worker_id: authority.worker_id.clone(),
             now,
             evidence: DurablePayload {
                 codec: DurableCodecRef {
@@ -4129,6 +4138,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_bearer_cannot_mutate_for_another_worker() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool);
+        seed_claimable_effect(&repo).await;
+        let now = Utc::now();
+        let authority = match repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap()
+        {
+            ClaimEffectResult::Claimed { authority, .. } => authority,
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claim, got {other:?}")
+            }
+        };
+
+        assert_eq!(
+            repo.renew_claim(&DurableClaimRenewal {
+                authority: authority.clone(),
+                requesting_worker_id: "worker-b".to_owned(),
+                now,
+                lease_until: now + chrono::Duration::seconds(60),
+            })
+            .await
+            .unwrap(),
+            RenewClaimResult::StaleAuthority
+        );
+        assert_eq!(
+            repo.schedule_retry(
+                &authority,
+                "worker-b",
+                now,
+                now + chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap(),
+            ReconcileEffectResult::StaleAuthority
+        );
+        let mut manual = manual_resolution_request(&authority, now);
+        manual.requesting_worker_id = "worker-b".to_owned();
+        assert_eq!(
+            repo.require_manual_resolution(&manual).await.unwrap(),
+            ReconcileEffectResult::StaleAuthority
+        );
+    }
+
+    #[tokio::test]
     async fn renew_rejects_shorten_and_takeover_rejects_pre_expiry() {
         let pool = test_pool().await;
         let repo = WorkflowRepository::new(pool.clone());
@@ -4149,6 +4205,7 @@ mod tests {
         let shortened = repo
             .renew_claim(&DurableClaimRenewal {
                 authority: authority.clone(),
+                requesting_worker_id: authority.worker_id.clone(),
                 now: now + chrono::Duration::seconds(5),
                 lease_until: now + chrono::Duration::seconds(20),
             })
@@ -4160,6 +4217,7 @@ mod tests {
         let renewed = repo
             .renew_claim(&DurableClaimRenewal {
                 authority: authority.clone(),
+                requesting_worker_id: authority.worker_id.clone(),
                 now: now + chrono::Duration::seconds(5),
                 lease_until: renewed_until,
             })
@@ -4238,6 +4296,7 @@ mod tests {
         let renewed_old = repo
             .renew_claim(&DurableClaimRenewal {
                 authority: authority.clone(),
+                requesting_worker_id: authority.worker_id.clone(),
                 now: takeover_now,
                 lease_until: takeover_now + chrono::Duration::seconds(60),
             })
@@ -5090,7 +5149,10 @@ mod tests {
         };
 
         let due_at = now + chrono::Duration::seconds(45);
-        let result = repo.schedule_retry(&authority, now, due_at).await.unwrap();
+        let result = repo
+            .schedule_retry(&authority, &authority.worker_id, now, due_at)
+            .await
+            .unwrap();
         assert_eq!(result, ReconcileEffectResult::ScheduledRetry);
 
         let effect = sqlx::query(
@@ -5141,6 +5203,7 @@ mod tests {
         let result = repo
             .schedule_retry(
                 &authority,
+                &authority.worker_id,
                 authority.lease_until,
                 authority.lease_until + chrono::Duration::seconds(1),
             )
@@ -5171,7 +5234,12 @@ mod tests {
 
         let now = authority.issued_at + chrono::Duration::seconds(3);
         let result = repo
-            .schedule_retry(&authority, now, now + chrono::Duration::seconds(10))
+            .schedule_retry(
+                &authority,
+                &authority.worker_id,
+                now,
+                now + chrono::Duration::seconds(10),
+            )
             .await
             .unwrap();
         assert_eq!(result, ReconcileEffectResult::ManualOnly);
