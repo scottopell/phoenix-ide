@@ -265,8 +265,9 @@ config {
 -- invalid_wait_bound(requested_max_wait_seconds), invalid_wait_bound_reason(requested_max_wait_seconds)
 -- terminal_receipt_already_materialized(receipt), exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
 -- forgotten_reason_for_deadline_unevaluable(resource), forgotten_reason_for_startup_forget(resource)
--- existing_owed_wake_obligation(conversation), obligation_payload_inbox(obligation)
+-- existing_owed_wake_obligation(workflow), obligation_payload_inbox(obligation)
 -- wake_protocol_selection(), authority_is_immutable(binding)
+-- observation_inbox_row_persisted(item), wake_batches_partition_by_workflow_authority(conversation)
 
 -- legacy_projection(contract_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding)
@@ -454,6 +455,7 @@ rule TerminalReceiptMaterializesDurableObservation {
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
         terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
     )
+    ensures: observation_inbox_row_persisted(WakeObservationInboxItem{terminal_receipt: receipt})
     ensures: WakeInboxSchedulingRequested(binding.conversation)
 }
 
@@ -475,6 +477,7 @@ rule CancelledReceiptMaterializesWithoutAutoResume {
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
         terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
     )
+    ensures: observation_inbox_row_persisted(WakeObservationInboxItem{terminal_receipt: receipt})
     ensures: no_resume_scheduled_only_for_cancel(binding)
 }
 
@@ -492,29 +495,35 @@ rule IdleScheduleCreatesBoundedCoalescedObligation {
     requires: exists WakeObservationInboxItem{
         binding: WakeWorkflowBinding{conversation: conversation}, consumed_at: null
     }
-    requires: existing_owed_wake_obligation(conversation) = null
+    requires: wake_batches_partition_by_workflow_authority(conversation)
+    requires: existing_owed_wake_obligation(conversation_wake_workflow(conversation)) = null
 
-    let upper_bound = snapshot_upper_bound(conversation)
-    let eligible = undelivered_items_through(conversation, upper_bound)
+    let upper_bound = snapshot_upper_bound(conversation_wake_workflow(conversation))
+    let eligible = undelivered_items_through(conversation_wake_workflow(conversation), upper_bound)
     let batch = bounded_prefix(eligible, config.max_acceptance_batch_items)
     let obligation_id = next_obligation_id()
+    let inbox_id = next_reducer_inbox_id()
+    ensures: dwf/ReducerInbox.created(
+        id: inbox_id, workflow: conversation_wake_workflow(conversation),
+        receipt: null, barrier: null,
+        event_codec: acceptance_payload_codec(conversation_wake_workflow(conversation), batch, upper_bound),
+        event_payload: exact_acceptance_payload(conversation_wake_workflow(conversation), batch, upper_bound),
+        delivery_status: pending, consumed_by: null
+    )
     ensures: dwf/OwedAcceptance.created(
         id: obligation_id, workflow: conversation_wake_workflow(conversation),
-        reducer_inbox: obligation_payload_inbox(WakeRuntimeObligation{id: obligation_id}),
-        source_kind: "wake_runtime_acceptance",
-        event_codec: acceptance_payload_codec(conversation, batch, upper_bound),
-        event_payload: exact_acceptance_payload(conversation, batch, upper_bound),
+        reducer_inbox: dwf/ReducerInbox{id: inbox_id},
         status: owed, accepting_transition: null
     )
     ensures: WakeRuntimeObligation.created(
         id: obligation_id, conversation: conversation,
-        payload: exact_acceptance_payload(conversation, batch, upper_bound),
+        payload: exact_acceptance_payload(conversation_wake_workflow(conversation), batch, upper_bound),
         owed_acceptance: dwf/OwedAcceptance{id: obligation_id}, created_at: now()
     )
-    ensures: wake_obligation_and_core_owed_acceptance_commit_atomically(conversation, obligation_id)
+    ensures: wake_obligation_and_core_owed_acceptance_commit_atomically(conversation_wake_workflow(conversation), obligation_id)
     ensures: count(batch) >= 1
     ensures: count(batch) <= config.max_acceptance_batch_items
-    ensures: AtMostOneOwedWakeRuntimeObligation(conversation)
+    ensures: AtMostOneOwedWakeRuntimeObligation(conversation_wake_workflow(conversation))
 }
 
 rule DuplicateIdleScheduleReusesExistingOwedObligation {
@@ -523,9 +532,9 @@ rule DuplicateIdleScheduleReusesExistingOwedObligation {
     requires: exists WakeObservationInboxItem{
         binding: WakeWorkflowBinding{conversation: conversation}, consumed_at: null
     }
-    requires: existing_owed_wake_obligation(conversation) != null
+    requires: existing_owed_wake_obligation(conversation_wake_workflow(conversation)) != null
     ensures: owed_items_remain_durable(conversation)
-    ensures: AtMostOneOwedWakeRuntimeObligation(conversation)
+    ensures: AtMostOneOwedWakeRuntimeObligation(conversation_wake_workflow(conversation))
 }
 
 rule BusyScheduleLeavesDeliveryOwed {
@@ -754,6 +763,10 @@ invariant LlmRequestingAndAcceptanceAreAtomic {
 
 invariant OwedAcceptanceHasSingleWritableAuthority {
     wake_runtime_acceptance_status_is_written_only_through_dwf_owed_acceptance
+}
+
+invariant WakeBatchingPartitionsByWorkflowAuthority {
+    wake_batches_partition_by_workflow_authority
 }
 
 invariant ContinuationTransfersOnlyOutstandingSemanticWork {

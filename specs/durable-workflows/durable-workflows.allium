@@ -18,8 +18,8 @@ enum ProtocolSelectionStatus { accepting | drained }
 enum DeliveryStatus { pending | consumed }
 enum SuppressionReason { cancelled | superseded | lifecycle_terminal | operator_rejected }
 enum ReceiptFamily { current_generation_effect | compensation_effect }
-enum ManualChoiceKind { adopt | retry | compensate | fail | suppress }
-enum WorkflowStatus { active | cancelling | cancelled | deletion_pending | completed | failed }
+enum ManualChoiceKind { retry | compensate | suppress | accept_as_terminal }
+enum WorkflowStatus { active | cancelling | cancelled | deletion_pending | completed | deleted | failed }
 enum EffectRole { required | optional | compensation }
 enum AmbiguityPolicy {
     observable_reconciliation
@@ -259,8 +259,10 @@ entity Workflow {
         active -> failed
         cancelling -> cancelled
         cancelling -> deletion_pending
-        deletion_pending -> completed
-        terminal: cancelled, completed, failed
+        cancelled -> deletion_pending
+        failed -> deletion_pending
+        deletion_pending -> deleted
+        terminal: completed, cancelled, deleted, failed
     }
 
     invariant VersionNonnegative { version >= 0 }
@@ -466,6 +468,7 @@ entity ShadowDivergence {
 -- transition_plan_rows_exist_atomically(transition)
 -- no_rows_from_rejected_plan(workflow, expected_version, plan)
 -- effect_dependencies_compatible(effect), compatible_terminal_receipt(effect)
+-- effect_belongs_to_current_generation(effect), reducer_inbox_belongs_to_current_generation(inbox)
 -- all_barrier_members_compatibly_receipted(barrier)
 -- effect_family_policy_registered_exactly_once(effect)
 -- live_matching_authority(effect, authority)
@@ -483,8 +486,11 @@ entity ShadowDivergence {
 -- prior_generation_claims_revoked(workflow), incompatible_effects_invalidated(workflow)
 -- compensation_effects_follow_core_contracts(workflow)
 -- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
+-- manual_choice_is_control_only(choice), manual_choice_creates_terminal_receipt(choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
+-- reducer_authorized_suppression(decision, owed, reason)
+-- all_current_generation_compensation_effects_terminal(workflow)
 -- committed_transition_for_decision(workflow, decision)
 -- consumer_is_independent_from_reducer_and_runtime(consumer), consumer_kind(consumer)
 -- disposition_consumed_at(status), reducer_inbox_delivery_unchanged(inbox)
@@ -777,6 +783,7 @@ rule RejectInvalidReducerPlan {
 rule DependenciesMakeEffectEligible {
     when: DependencyEligibilityEvaluated(effect)
     requires: effect.status in {blocked, retry_wait}
+    requires: effect_belongs_to_current_generation(effect)
     requires: effect.generation = effect.workflow.generation
     requires: effect.next_eligible_at = null or effect.next_eligible_at <= now()
     requires: effect_dependencies_compatible(effect)
@@ -846,6 +853,7 @@ rule RejectStaleClaimRenewal {
 rule BeginEffectAttempt {
     when: EffectAttemptBegins(worker, effect, authority)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: not claimed_external_operation(execute)
         or effect.destructive_resource = null
         or physical_resource_lock_held(effect, authority)
@@ -863,6 +871,7 @@ rule BeginEffectAttempt {
 rule RecordAuthoritativeObservation {
     when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: attempt.effect = effect
     requires: attempt.claim = Claim{effect: effect}
     requires: claim_row_matches_authority(effect, authority)
@@ -898,6 +907,7 @@ rule RejectUnsupportedObservationCodec {
 rule AcceptTerminalReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: claim_row_matches_authority(effect, authority)
     requires: attempt.effect = effect
     requires: attempt.claim = Claim{effect: effect}
@@ -923,6 +933,7 @@ rule AcceptTerminalReceipt {
 rule RejectDuplicateOrStaleReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
     requires: not live_matching_authority(effect, authority)
+        or authority.worker_id != worker
         or accepted_receipt_count(effect) = 1
     requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: TerminalReceiptOutcome(stale_or_duplicate)
@@ -943,11 +954,9 @@ rule RejectUnsupportedTerminalReceiptCodec {
 
 rule RejectUnavailableOrClosedTerminalReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
-    requires: not live_matching_authority(effect, authority)
-        or attempt.effect != effect
+    requires: attempt.effect != effect
         or attempt.claim != Claim{effect: effect}
         or not claim_row_matches_authority(effect, authority)
-        or accepted_receipt_count(effect) = 1
     ensures: TerminalReceiptOutcome(closed_or_unavailable)
     ensures: accepted_receipt_count(effect) <= 1
 }
@@ -1038,10 +1047,25 @@ rule DeleteWorkflow {
     ensures: compensation_effects_follow_core_contracts(workflow)
 }
 
-rule CommitManualResolution {
+rule CompleteWorkflowCancellation {
+    when: WorkflowLifecycleCompletionEvaluated(workflow)
+    requires: workflow.status = cancelling
+    requires: all_current_generation_compensation_effects_terminal(workflow)
+    ensures: workflow.status = cancelled
+}
+
+rule CompleteWorkflowDeletion {
+    when: WorkflowLifecycleCompletionEvaluated(workflow)
+    requires: workflow.status = deletion_pending
+    requires: all_current_generation_compensation_effects_terminal(workflow)
+    ensures: workflow.status = deleted
+}
+
+rule CommitTerminalManualResolution {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
     requires: resolution.status = required
     requires: manual_choice_permitted(resolution, choice)
+    requires: manual_choice_creates_terminal_receipt(choice)
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
     requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
@@ -1066,10 +1090,27 @@ rule CommitManualResolution {
     ensures: ManualResolutionAudited(resolution)
 }
 
+rule CommitControlOnlyManualResolution {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: manual_choice_permitted(resolution, choice)
+    requires: manual_choice_is_control_only(choice)
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
+    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
+    ensures: resolution.status = resolved
+    ensures: resolution.accepted_choice = choice
+    ensures: resolution.resolved_by = operator
+    ensures: accepted_receipt_count(resolution.effect) = 0
+    ensures: resolution.effect.status in {ambiguity_wait, retry_wait, invalidated}
+    ensures: ManualResolutionAudited(resolution)
+}
+
 rule RejectUnsupportedManualResolutionChoiceCodec {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
     requires: resolution.status = required
     requires: manual_choice_permitted(resolution, choice)
+    requires: manual_choice_creates_terminal_receipt(choice)
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
     requires: not profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
@@ -1078,16 +1119,26 @@ rule RejectUnsupportedManualResolutionChoiceCodec {
     ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
 }
 
-rule RejectUnavailableManualResolutionChoice {
+rule RejectUnavailableTerminalManualResolutionChoice {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
     requires: resolution.status = required
     requires: manual_choice_permitted(resolution, choice)
+    requires: manual_choice_creates_terminal_receipt(choice)
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
     requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
     requires: accepted_receipt_count(resolution.effect) = 1
     ensures: ManualResolutionOutcome(closed_or_unavailable)
     ensures: resolution.status = required
+}
+
+rule RejectUnpermittedManualResolutionChoice {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: not manual_choice_permitted(resolution, choice)
+    ensures: ManualResolutionOutcome(rejected)
+    ensures: resolution.status = required
+    ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
 }
 
 rule RejectStaleManualResolution {
@@ -1121,6 +1172,7 @@ rule ReducerAcceptsInboxEvent {
     when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
     requires: inbox.workflow.authority = engine_protocol and inbox.workflow.execution_mode = authoritative
     requires: inbox.delivery_status = pending
+    requires: reducer_inbox_belongs_to_current_generation(inbox)
     requires: decision.expected_workflow_version = inbox.workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
     requires: committed_transition_for_decision(inbox.workflow, decision) = null
@@ -1155,6 +1207,15 @@ rule DuplicateRuntimeAcceptanceIsIdempotent {
     when: RuntimeAcceptanceRequested(runtime, owed, decision)
     requires: owed.status in {accepted, suppressed}
     ensures: duplicate_acceptance_starts_no_product_action(owed)
+}
+
+rule ReducerSuppressesOwedAcceptance {
+    when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
+    let owed = OwedAcceptance{reducer_inbox: inbox}
+    requires: owed.status = owed
+    requires: reducer_authorized_suppression(decision, owed, operator_rejected)
+    ensures: owed.status = suppressed
+    ensures: owed.suppression_reason = operator_rejected
 }
 
 rule EnforceDerivedCapability {
@@ -1286,6 +1347,7 @@ surface WorkflowLifecycleSurface {
         WorkflowCancellationRequested(client, workflow, decision)
         WorkflowDeletionRequested(client, workflow, decision)
         CapabilityActionRequested(client, workflow, capability)
+        WorkflowLifecycleCompletionEvaluated(workflow)
 }
 
 surface ManualResolutionSurface {
