@@ -1221,6 +1221,12 @@ impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
             Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
         })
     }
+
+    fn get_cheap_model(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+        ModelRegistry::get_cheap_model(self).map(|svc| {
+            Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
+        })
+    }
 }
 
 /// Result of [`ModelRegistry::reload_codex_credential`]. Surfaced so the

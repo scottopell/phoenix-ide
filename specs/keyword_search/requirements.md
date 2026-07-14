@@ -81,13 +81,10 @@ THE SYSTEM SHALL advise:
 ### REQ-KWS-005: LLM Selection
 
 WHEN selecting LLM for result filtering
-THE SYSTEM SHALL prefer fast, cheap models in order:
-1. Fireworks Qwen coder
-2. GPT-5 mini variants
-3. Claude Sonnet
-4. Any available model
+THE SYSTEM SHALL use the application's shared cheap/fast model selection
+AND that selection SHALL span the supported providers and fall back to the default model
 
 WHEN no LLM is available
 THE SYSTEM SHALL return error
 
-**Rationale:** Keyword search is a high-frequency tool; using expensive models would be cost-prohibitive. Fast models provide adequate filtering quality.
+**Rationale:** Keyword search is a high-frequency tool; using expensive models would be cost-prohibitive, and fast models provide adequate filtering quality. Filtering reuses the one shared cheap-model selector rather than a tool-local list, so it resolves correctly under every deployment shape — Anthropic models only, OpenAI/GPT models only, or both — and cannot drift from the rest of the app. The concrete model roster is an implementation detail that changes as models are added and retired, so it lives in the code (the shared selector) and `executive.md`, not pinned in a normative requirement where it would rot into spec-versus-code conflicts.

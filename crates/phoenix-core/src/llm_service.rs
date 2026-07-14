@@ -31,4 +31,12 @@ pub trait LlmSelector: Send + Sync {
     fn get(&self, model_id: &str) -> Option<Arc<dyn CompletionService>>;
     /// Default/fallback service, if any model is configured.
     fn default_service(&self) -> Option<Arc<dyn CompletionService>>;
+    /// A fast, cheap model for auxiliary work (result filtering, titles). The
+    /// concrete preference list spans the supported providers and is owned by
+    /// the implementor so there is one source of truth; the default here just
+    /// uses the default service for selectors that make no cheap-versus-capable
+    /// distinction.
+    fn get_cheap_model(&self) -> Option<Arc<dyn CompletionService>> {
+        self.default_service()
+    }
 }

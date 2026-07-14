@@ -29,9 +29,6 @@ const BROAD_TERM_MATCH_LIMIT: usize = 400;
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
 
-/// Preferred models for filtering (fast and cheap)
-const PREFERRED_MODELS: &[&str] = &["claude-haiku-4-5", "claude-sonnet-5", "claude-sonnet-4-6"];
-
 use phoenix_core::llm_language::KEYWORD_SEARCH_FILTER_SYSTEM as FILTER_SYSTEM_PROMPT;
 
 #[derive(Debug, Deserialize)]
@@ -89,15 +86,16 @@ impl KeywordSearchTool {
     /// Count matches for a single term, aborting the scan the instant the
     /// running total crosses `BROAD_TERM_MATCH_LIMIT`.
     ///
-    /// This is the breadth probe. `rg --count` emits `path:count` lazily as it
-    /// walks; we accumulate the total and early-exit (kill `rg`) once it crosses
-    /// the limit, so a broad term is rejected after finding ~limit matches
-    /// rather than after walking the entire tree — an intentionally broad search
-    /// root (a multi-repo container) stays cheap. `rg --count` emits a file's
-    /// total only after fully scanning it, so `--max-count = limit + 1` both
-    /// bounds each file's scan and ensures a term dense in one giant file
-    /// (a generated bundle, a huge log) alone trips the limit rather than
-    /// reporting a small count and being wrongly accepted as narrow.
+    /// This is the breadth probe. `rg --count-matches` emits `path:count` lazily
+    /// as it walks; we accumulate the total and early-exit (kill `rg`) once it
+    /// crosses the limit, so a broad term is rejected after finding ~limit
+    /// matches rather than after walking the entire tree — an intentionally
+    /// broad search root (a multi-repo container) stays cheap. `--count-matches`
+    /// (not `--count`) counts individual matches, so a term repeated many times
+    /// on one long line still reads as broad. A file's total is emitted only
+    /// after that file is scanned, so `--max-count = limit + 1` both bounds each
+    /// file's scan and ensures a term dense in one giant file (a generated
+    /// bundle, a huge log) alone trips the limit rather than being accepted.
     ///
     /// Returns the accumulated match count (just past the limit when the early
     /// exit fires). A non-`{matches, no-matches}` exit status — e.g. an invalid
@@ -121,7 +119,10 @@ impl KeywordSearchTool {
         let max_count = (BROAD_TERM_MATCH_LIMIT + 1).to_string();
         let mut child = Self::spawn_rg(
             dir,
-            &["--count", "--max-count", &max_count],
+            // `--count-matches`, not `--count`: the latter counts matching
+            // *lines*, so a broad term repeated thousands of times on one long
+            // line (a minified bundle) would report `1` and be wrongly accepted.
+            &["--count-matches", "--max-count", &max_count],
             std::slice::from_ref(&term.to_string()),
             Stdio::null(),
         )?;
@@ -259,18 +260,13 @@ impl KeywordSearchTool {
         Ok((String::from_utf8_lossy(&buf).to_string(), truncated))
     }
 
-    /// Select an LLM for filtering
+    /// Select an LLM for filtering: the shared cheap/fast model (spans the
+    /// supported providers, falls back to the default service), so the tool
+    /// has no model list of its own to drift from the registry's.
     fn select_filter_llm(
         ctx: &ToolContext,
     ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
-        // Try preferred models in order
-        for model_id in PREFERRED_MODELS {
-            if let Some(svc) = ctx.llm_selector().get(model_id) {
-                return Some(svc);
-            }
-        }
-        // Fall back to any available model
-        ctx.llm_selector().default_service()
+        ctx.llm_selector().get_cheap_model()
     }
 
     /// Filter results using LLM
@@ -433,6 +429,14 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         let dropped = full_term_count - usable_terms.len();
 
         if results.is_empty() || results == "No matches found" {
+            // The retained terms matched nothing — but if peeling dropped a
+            // term that *did* match (to fit the budget), say so rather than
+            // reporting a bare "no matches" that hides the dropped hits.
+            if dropped > 0 {
+                return ToolOutput::success(format!(
+                    "No matches found for the retained search terms. {dropped} lower-priority term(s) were dropped to fit the result budget; narrow your terms and retry to see their matches."
+                ));
+            }
             return ToolOutput::success("No matches found for the given search terms.");
         }
 
@@ -648,6 +652,25 @@ mod tests {
         assert!(
             count > BROAD_TERM_MATCH_LIMIT,
             "a single file exceeding the limit must be flagged broad, got {count}"
+        );
+    }
+
+    /// Many matches on a *single line* (a minified bundle) must read as broad —
+    /// guards against `--count` (matching-line count), which would report 1.
+    #[tokio::test]
+    async fn count_matches_flags_single_long_line_as_broad() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // One line, no newline, term repeated well past the limit.
+        let line = "needle ".repeat(BROAD_TERM_MATCH_LIMIT * 2);
+        std::fs::write(dir.path().join("bundle.min.js"), line).unwrap();
+        let tool = KeywordSearchTool;
+        let count = tool
+            .count_matches(dir.path(), "needle", &CancellationToken::new())
+            .await
+            .expect("count");
+        assert!(
+            count > BROAD_TERM_MATCH_LIMIT,
+            "many matches on one line must be flagged broad, got {count}"
         );
     }
 
