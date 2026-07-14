@@ -216,7 +216,6 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_creation_cleanup_claims",
         sql: MIGRATION_040,
     },
-<<<<<<< HEAD
     Migration {
         version: 41,
         name: "create_work_scope_observed_branches",
@@ -232,17 +231,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_pr_feedback_baselines_by_full_identity",
         sql: MIGRATION_043,
     },
-||||||| parent of 97974b6e (feat: replace recall surface with coordinator foundation)
-=======
     Migration {
-        version: 41,
+        version: 44,
         name: "replace_global_recall_with_coordinator",
-        sql: MIGRATION_041,
+        sql: MIGRATION_044,
     },
->>>>>>> 97974b6e (feat: replace recall surface with coordinator foundation)
 ];
 
-const MIGRATION_041: &str = r"
+const MIGRATION_044: &str = r"
 CREATE TABLE coordinator (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     conversation_id TEXT NOT NULL UNIQUE

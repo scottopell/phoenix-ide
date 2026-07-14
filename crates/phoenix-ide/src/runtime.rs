@@ -2817,6 +2817,40 @@ impl RuntimeManager {
         // removing a replacement entry created after eviction.
         let identity = Arc::new(());
         let cleanup_identity = identity.clone();
+        let handle = ConversationHandle {
+            event_tx: event_tx.clone(),
+            turn_trigger: turn_trigger.clone(),
+            broadcast_tx: broadcaster.clone(),
+            identity: identity.clone(),
+            state_rx: state_rx.clone(),
+        };
+
+        // Another caller may have completed construction while this caller was
+        // awaiting DB/tool setup. Publish exactly one runtime and discard the
+        // losing, not-yet-spawned executor.
+        {
+            let mut runtimes = self.runtimes.write().await;
+            if let Some(existing) = runtimes.get(conversation_id) {
+                return Ok(ConversationHandle {
+                    event_tx: existing.event_tx.clone(),
+                    turn_trigger: existing.turn_trigger.clone(),
+                    broadcast_tx: existing.broadcast_tx.clone(),
+                    identity: existing.identity.clone(),
+                    state_rx: existing.state_rx.clone(),
+                });
+            }
+            runtimes.insert(
+                conversation_id.to_string(),
+                ConversationHandle {
+                    event_tx,
+                    turn_trigger,
+                    broadcast_tx: broadcaster,
+                    identity,
+                    state_rx,
+                },
+            );
+        }
+
         tokio::spawn(async move {
             runtime.run().await;
 
@@ -2837,26 +2871,6 @@ impl RuntimeManager {
                 );
             }
         });
-
-        let handle = ConversationHandle {
-            event_tx: event_tx.clone(),
-            turn_trigger: turn_trigger.clone(),
-            broadcast_tx: broadcaster.clone(),
-            identity: identity.clone(),
-            state_rx: state_rx.clone(),
-        };
-
-        // Store handle
-        self.runtimes.write().await.insert(
-            conversation_id.to_string(),
-            ConversationHandle {
-                event_tx,
-                turn_trigger,
-                broadcast_tx: broadcaster,
-                identity,
-                state_rx,
-            },
-        );
 
         Ok(handle)
     }
