@@ -139,6 +139,28 @@ active PR supplied by `pr-association`. The bar SHALL NOT silently choose among 
 associated actionable PRs on its own, and SHALL NOT treat any compatibility singular primary-PR
 projection as authority over an explicit pinned or inferred active selection.
 
+### REQ-WAB-034: Server-Owned Address Feedback Submission
+
+WHEN the user invokes `Address feedback`, THE SYSTEM SHALL capture the selected PR context and submit the resulting conversation message through one server-owned operation.
+
+### REQ-WAB-035: Address Feedback Message Bundle
+
+THE SYSTEM SHALL represent an Address Feedback message as an XML bundle containing the exact repository and PR identity, the escaped captured context and artifact identity, and escaped guidance.
+
+### REQ-WAB-036: Address Feedback Guidance
+
+WHEN the Address Feedback request supplies nonblank user guidance, THE SYSTEM SHALL use that guidance.
+
+WHEN user guidance is blank or absent, THE SYSTEM SHALL instruct the agent to address the captured feedback while deferring to the captured context for exact details.
+
+### REQ-WAB-037: Address Feedback Steering
+
+WHEN conversation execution is in progress, an accepted Address Feedback message SHALL use the same steering-message insertion behavior as an ordinary user message.
+
+### REQ-WAB-038: Address Feedback Idempotency
+
+ONCE an Address Feedback message is accepted, retries using the same message identity SHALL NOT create another conversation message.
+
 The **FINISH sub-table** is a single shared selector (used by `stuck` and by the idle FINISH
 rows), total over PR state:
 

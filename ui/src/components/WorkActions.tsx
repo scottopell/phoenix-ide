@@ -245,7 +245,6 @@ export function WorkControlBar({
   };
 
   const note = disposition.note;
-  const addressLocked = capturing || addressSubmitted;
   const addressFeedbackLabel = capturing
     ? `Capturing ${activePrLabel}…`
     : addressSubmitted

@@ -8,6 +8,7 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
 };
+use super::git_handlers::capture_pr_auto_fix_context_for_conversation;
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -21,9 +22,10 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
-    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
-    ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
+    AddressPrFeedbackRequest, AddressPrFeedbackResponse, AttachmentUploadResponse, CancelResponse,
+    ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery, CodeSearchResponse,
+    ConflictErrorResponse, ContinueConversationResponse, ConversationListResponse,
+    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
@@ -373,6 +375,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/pr-auto-fix-context",
             post(create_pr_auto_fix_context),
+        )
+        .route(
+            "/api/conversations/:id/address-pr-feedback",
+            post(address_pr_feedback),
         )
         // Project task files available before a conversation exists
         .route("/api/tasks", get(list_project_tasks))
@@ -3272,6 +3278,69 @@ async fn upload_conversation_attachments(
     Ok(Json(AttachmentUploadResponse { files }))
 }
 
+const DEFAULT_ADDRESS_FEEDBACK_GUIDANCE: &str =
+    "Address the captured PR feedback. Defer to the attached context for the exact target and details.";
+
+fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn address_feedback_message(
+    context: &super::types::PrAutoFixContextResponse,
+    guidance: Option<&str>,
+) -> String {
+    let guidance = guidance
+        .map(str::trim)
+        .filter(|guidance| !guidance.is_empty())
+        .unwrap_or(DEFAULT_ADDRESS_FEEDBACK_GUIDANCE);
+    format!(
+        "<address_pr_feedback>\n  <target repository=\"{}/{}\" pr=\"{}\" />\n  <context artifact=\"{}\">{}</context>\n  <guidance>{}</guidance>\n</address_pr_feedback>",
+        escape_xml_text(&context.repo_owner),
+        escape_xml_text(&context.repo_name),
+        context.pr_number,
+        escape_xml_text(&context.artifact_path),
+        escape_xml_text(&context.message),
+        escape_xml_text(guidance),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn address_feedback_xml_uses_default_guidance_and_escapes_context() {
+    let context = super::types::PrAutoFixContextResponse {
+        artifact_path: ".phoenix/pr-context/a&b.md".to_owned(),
+        pr_number: 42,
+        repo_owner: "owner<one>".to_owned(),
+        repo_name: "repo&two".to_owned(),
+        message: "Read <artifact> & address feedback".to_owned(),
+    };
+
+    assert_eq!(
+        address_feedback_message(&context, None),
+        "<address_pr_feedback>\n  <target repository=\"owner&lt;one&gt;/repo&amp;two\" pr=\"42\" />\n  <context artifact=\".phoenix/pr-context/a&amp;b.md\">Read &lt;artifact&gt; &amp; address feedback</context>\n  <guidance>Address the captured PR feedback. Defer to the attached context for the exact target and details.</guidance>\n</address_pr_feedback>"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn address_feedback_xml_prefers_nonblank_user_guidance() {
+    let context = super::types::PrAutoFixContextResponse {
+        artifact_path: ".phoenix/pr-context/context.md".to_owned(),
+        pr_number: 7,
+        repo_owner: "owner".to_owned(),
+        repo_name: "repo".to_owned(),
+        message: "context".to_owned(),
+    };
+
+    let message = address_feedback_message(&context, Some("  Focus on <correctness> & tests.  "));
+    assert!(message.contains("<guidance>Focus on &lt;correctness&gt; &amp; tests.</guidance>"));
+}
+
 async fn address_pr_feedback(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3295,7 +3364,7 @@ async fn address_pr_feedback(
         &state,
         &id,
         SubmitUserMessageInput {
-            text: context.message,
+            text: address_feedback_message(&context, req.guidance.as_deref()),
             message_id,
             images: Vec::new(),
             files: Vec::new(),

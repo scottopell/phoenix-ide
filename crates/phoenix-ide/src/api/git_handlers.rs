@@ -1246,10 +1246,10 @@ async fn attach_pr_feedback_freshness(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn create_pr_auto_fix_context(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+pub(crate) async fn capture_pr_auto_fix_context_for_conversation(
+    state: &AppState,
+    id: &str,
+) -> Result<PrAutoFixContextResponse, AppError> {
     let conv = state
         .runtime
         .db()
@@ -1271,7 +1271,7 @@ pub(crate) async fn create_pr_auto_fix_context(
             branch_name.to_string(),
             worktree_path.to_string(),
             crate::work_scope::WorkScope::resolve(
-                id,
+                id.to_owned(),
                 Some(std::path::Path::new(worktree_path.as_str())),
             ),
         ),
@@ -1374,6 +1374,15 @@ pub(crate) async fn create_pr_auto_fix_context(
     }
 
     response
+}
+
+pub(crate) async fn create_pr_auto_fix_context(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+    capture_pr_auto_fix_context_for_conversation(&state, &id)
+        .await
+        .map(Json)
 }
 
 fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {

@@ -229,6 +229,9 @@ pub struct AddressPrFeedbackRequest {
     /// Browser user agent for display when the request originated from the UI.
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Optional user direction. Blank or absent guidance uses the default remediation instruction.
+    #[serde(default)]
+    pub guidance: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

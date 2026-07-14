@@ -2007,11 +2007,15 @@ export const api = {
     return resp.json();
   },
 
-  async addressPrFeedback(conversationId: string, messageId: string): Promise<AddressPrFeedbackResponse> {
+  async addressPrFeedback(
+    conversationId: string,
+    messageId: string,
+    guidance?: string,
+  ): Promise<AddressPrFeedbackResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/address-pr-feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message_id: messageId, user_agent: navigator.userAgent }),
+      body: JSON.stringify({ message_id: messageId, user_agent: navigator.userAgent, guidance }),
     });
     if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to address PR feedback'); }
     return resp.json();

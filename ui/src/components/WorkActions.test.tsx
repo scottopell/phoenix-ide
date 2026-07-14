@@ -49,9 +49,7 @@ vi.mock('../api', () => ({
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
     getPrStatus: vi.fn(),
-    createPrAutoFixContext: vi
-      .fn()
-      .mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
+    addressPrFeedback: vi.fn().mockResolvedValue({ accepted: true, message_id: 'message-1' }),
   },
 }));
 
@@ -1081,9 +1079,12 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
   });
 
   it('keeps remediation loading until send completes and then refreshes PR status', async () => {
-    let resolveSend!: () => void;
-    const sendPromise = new Promise<void>((resolve) => { resolveSend = resolve; });
-    const onSendMessage = vi.fn(() => sendPromise);
+    let resolveAddress!: (value: { accepted: boolean; message_id: string }) => void;
+    const addressPromise = new Promise<{ accepted: boolean; message_id: string }>((resolve) => {
+      resolveAddress = resolve;
+    });
+    vi.mocked(api.addressPrFeedback).mockReturnValueOnce(addressPromise);
+    const onSendMessage = vi.fn();
     const handle = prStatusHandle({
       found: true,
       number: 139,
@@ -1110,28 +1111,31 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     const button = screen.getByTestId('address-feedback-button');
     fireEvent.click(button);
 
-    // createPrAutoFixContext → onSendMessage with the captured message.
     await waitFor(() => {
-      expect(api.createPrAutoFixContext).toHaveBeenCalledWith('conv-remediate');
-      expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`');
+      expect(api.addressPrFeedback).toHaveBeenCalledWith(
+        'conv-remediate',
+        expect.any(String),
+      );
     });
+    expect(onSendMessage).not.toHaveBeenCalled();
 
-    // Loading state holds while send is in flight; refresh not yet called.
+    // Loading state holds while the server-owned submission is in flight; refresh not yet called.
     expect(button.textContent).toMatch(/Capturing/i);
     // Button is disabled while capturing — no double-submit (codex #2).
     expect((screen.getByTestId('address-feedback-button') as HTMLButtonElement).disabled).toBe(true);
     expect(handle.refresh).not.toHaveBeenCalled();
 
-    resolveSend();
+    resolveAddress({ accepted: true, message_id: 'message-1' });
 
-    // Once send completes, PR status refreshes and the label settles back.
+    // Once the server accepts the message, PR status refreshes and duplicate submission stays locked.
     await waitFor(() => {
       expect(handle.refresh).toHaveBeenCalledTimes(1);
     });
     await waitFor(() => {
       expect(screen.getByTestId('address-feedback-button').textContent).toMatch(
-        /Address PR #139 feedback/i,
+        /Addressing PR #139/i,
       );
+      expect((screen.getByTestId('address-feedback-button') as HTMLButtonElement).disabled).toBe(true);
     });
   });
 });
