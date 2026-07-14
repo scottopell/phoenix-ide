@@ -253,10 +253,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn renew_claim(
         &mut self,
         authority: &ClaimAuthority,
+        requesting_worker_id: &'static str,
         now: Timestamp,
         new_lease_until: LeaseExpiry,
     ) -> RenewalResult {
-        if !new_lease_until.is_live_at(now) {
+        if authority.worker_id != requesting_worker_id || !new_lease_until.is_live_at(now) {
             return stale_renewal();
         }
         match self.effect_authorized_mut(authority, now) {
@@ -546,10 +547,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn schedule_retry(
         &mut self,
         authority: &ClaimAuthority,
+        requesting_worker_id: &'static str,
         now: Timestamp,
         retry_at: Timestamp,
     ) -> ReconciliationOutcome<P> {
-        if self.ensure_executable().is_err() {
+        if authority.worker_id != requesting_worker_id || self.ensure_executable().is_err() {
             return stale_reconciliation_outcome();
         }
         match self.effect_authorized_mut(authority, now) {
@@ -579,10 +581,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn require_manual_resolution(
         &mut self,
         authority: &ClaimAuthority,
+        requesting_worker_id: &'static str,
         now: Timestamp,
         permitted_choices: Vec<ManualChoice<P>>,
     ) -> ReconciliationOutcome<P> {
-        if self.ensure_executable().is_err()
+        if authority.worker_id != requesting_worker_id
+            || self.ensure_executable().is_err()
             || permitted_choices.is_empty()
             || permitted_choices.iter().any(|choice| {
                 choice.codec.family.is_empty()
