@@ -14,7 +14,7 @@ const noop = () => {};
 export function WorkActionsFixture({ scenario }: Props) {
   const handle = {
     state: scenario.prState,
-    refresh: async () => {},
+    refresh: async () => undefined,
   };
 
   return (

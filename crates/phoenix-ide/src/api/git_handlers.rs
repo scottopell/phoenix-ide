@@ -1070,6 +1070,18 @@ pub(crate) async fn get_conversation_pr_status(
                     )
                     .await
                     .map_err(|e| AppError::Internal(e.to_string()))?;
+                    associated_snapshot = db
+                        .list_work_scope_pr_associations(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    active_snapshot = db
+                        .active_work_scope_pr_selection(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    observed_snapshot = db
+                        .list_work_scope_observed_branches(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
                 }
                 attach_pr_feedback_freshness(
                     retargeted_refresh.response,

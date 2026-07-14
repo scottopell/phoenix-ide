@@ -94,10 +94,11 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     ...prStatus,
   };
   const selectionValue = (status.selection ?? selection()) as NonNullable<PrStatusResponse['selection']>;
+  const committedStatus = selectionValue ? { ...status, selection: selectionValue } : status;
   const associated = selectionValue?.associated_prs ?? [];
   return {
-    state: { status: 'ready' as const, prStatus: selectionValue ? { ...status, selection: selectionValue } : status },
-    refresh: vi.fn().mockResolvedValue(undefined),
+    state: { status: 'ready' as const, prStatus: committedStatus },
+    refresh: vi.fn().mockResolvedValue(committedStatus),
     activeSelection: selectionValue,
     activePrSummary: selectionValue?.active_pr
       ? associated.find((pr) => pr.repo_owner === selectionValue.active_pr?.pr.repo_owner
@@ -687,6 +688,37 @@ describe('WorkControlBar — active PR interactions', () => {
 
     fireEvent.click(screen.getByTestId('active-pr-ambiguity-note'));
     expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+  });
+
+  it('commits a newly ambiguous safety refresh before opening the selector', async () => {
+    const latest = {
+      found: false,
+      refresh: { state: 'fresh' as const, stale: false, last_attempted_at: '', last_refreshed_at: '' },
+      work_change: cleanWorkChange(),
+      associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'main', head: 'task-123', feedback_status: 'open' as const },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'task-123', head: 'follow-up', feedback_status: 'open' as const },
+      ],
+    };
+    const handle = prStatusHandle({ found: false }, {
+      refresh: vi.fn().mockResolvedValue(latest),
+    });
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('clean-up-button'));
+
+    await waitFor(() => expect(handle.refresh).toHaveBeenCalledTimes(1));
+    expect(api.markMerged).not.toHaveBeenCalled();
+    expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
   });
 
   it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {

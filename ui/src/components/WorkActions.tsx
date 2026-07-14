@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
@@ -114,6 +114,7 @@ export function WorkControlBar({
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
@@ -138,6 +139,11 @@ export function WorkControlBar({
     [activePrLabel, canShowPrDiff],
   );
   const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
+  useEffect(() => {
+    if (!openSelectorAfterRefresh || !prStatusHandle.ambiguous) return;
+    requestActivePrSelectorOpen();
+    setOpenSelectorAfterRefresh(false);
+  }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
   const disposition = deriveWorkDisposition({
     convModeLabel,
     phaseType,
@@ -184,12 +190,13 @@ export function WorkControlBar({
   if (!disposition.visible) return null;
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
-    const latest = await api.getPrStatus(conversationId);
+    const latest = await prStatusHandle.refresh();
+    if (!latest) return false;
     const actionable = (latest.associated_prs ?? []).filter(
       (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
     );
     if (actionable.length > 1 && !latest.active_pr) {
-      requestActivePrSelectorOpen();
+      setOpenSelectorAfterRefresh(true);
       setError('Select an active PR before cleaning up or abandoning this task.');
       return false;
     }

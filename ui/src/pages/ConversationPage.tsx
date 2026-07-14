@@ -227,19 +227,13 @@ function ConversationPageContent() {
     ? `${prStatusHandle.activeSelection.active_pr.pr.repo_owner}/${prStatusHandle.activeSelection.active_pr.pr.repo_name}#${prStatusHandle.activeSelection.active_pr.pr.pr_number}`
     : null;
 
-  const terminalBashHandlesRef = useRef<Set<string> | null>(null);
+  const observedWorkScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    const terminalHandles = new Set(
-      (workScopeInventory?.bash ?? [])
-        .filter((handle) => handle.state === 'tombstoned')
-        .map((handle) => handle.handle_id),
-    );
-    const previous = terminalBashHandlesRef.current;
-    terminalBashHandlesRef.current = terminalHandles;
-    if (!previous || !confirmedLive) return;
-    if ([...terminalHandles].some((handleId) => !previous.has(handleId))) {
-      void refreshPrStatus();
-    }
+    if (!workScopeInventory) return;
+    const previousScope = observedWorkScopeRef.current;
+    observedWorkScopeRef.current = workScopeInventory.scope_key;
+    if (previousScope !== workScopeInventory.scope_key || !confirmedLive) return;
+    void refreshPrStatus();
   }, [workScopeInventory, confirmedLive, refreshPrStatus]);
 
   useEffect(() => {

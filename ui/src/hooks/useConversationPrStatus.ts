@@ -18,7 +18,7 @@ type InternalConversationPrStatusState = ConversationPrStatusState & { scopeKey:
 
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
-  refresh: () => Promise<void>;
+  refresh: () => Promise<PrStatusResponse | undefined>;
   activeSelection?: AssociatedPrStatusEnvelope | null;
   activePrSummary?: AssociatedPrSummaryResponse | null;
   ambiguous?: boolean;
@@ -186,49 +186,45 @@ export function useConversationPrStatus({
   ));
 
   const refresh = useCallback(async () => {
-    if (!scopeKey || !conversationId) return;
-    if (activeScopeRef.current !== scopeKey) return;
+    if (!scopeKey || !conversationId) return undefined;
+    if (activeScopeRef.current !== scopeKey) return undefined;
     const seq = ++latestSeqRef.current;
     try {
       const prStatus = await api.getPrStatus(conversationId);
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
       setInternalState({ scopeKey, status: 'ready', prStatus });
+      return prStatus;
     } catch {
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
       const fallback = cachedSeedRef.current;
       if (fallback) {
-        setInternalState({
-          scopeKey,
-          status: 'ready',
-          prStatus: {
-            ...fallback,
-            unavailable_reason: 'command_failed',
-            refresh: {
-              ...fallback.refresh,
-              state: 'unavailable',
-              reason: 'command_failed',
-              last_attempted_at: new Date().toISOString(),
-              stale: true,
-            },
-          },
-        });
-        return;
-      }
-      setInternalState({
-        scopeKey,
-        status: 'ready',
-        prStatus: {
-          found: false,
+        const unavailable: PrStatusResponse = {
+          ...fallback,
           unavailable_reason: 'command_failed',
           refresh: {
+            ...fallback.refresh,
             state: 'unavailable',
             reason: 'command_failed',
             last_attempted_at: new Date().toISOString(),
-            stale: false,
+            stale: true,
           },
-          work_change: { kind: 'unavailable', reason: 'command_failed' },
+        };
+        setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
+        return unavailable;
+      }
+      const unavailable: PrStatusResponse = {
+        found: false,
+        unavailable_reason: 'command_failed',
+        refresh: {
+          state: 'unavailable',
+          reason: 'command_failed',
+          last_attempted_at: new Date().toISOString(),
+          stale: false,
         },
-      });
+        work_change: { kind: 'unavailable', reason: 'command_failed' },
+      };
+      setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
+      return unavailable;
     }
   }, [conversationId, scopeKey]);
 
