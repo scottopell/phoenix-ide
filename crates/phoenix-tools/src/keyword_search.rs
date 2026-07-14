@@ -143,8 +143,8 @@ impl KeywordSearchTool {
                 line = lines.next_line() => {
                     match line.map_err(|e| format!("Failed to read ripgrep output: {e}"))? {
                         Some(l) => {
-                            // `rg --count` prints `path:count`; the count is the
-                            // trailing field after the last colon.
+                            // `rg --count-matches` prints `path:count`; the count
+                            // is the trailing field after the last colon.
                             if let Some(n) = l.rsplit(':').next().and_then(|c| c.parse::<usize>().ok()) {
                                 total += n;
                                 if total > BROAD_TERM_MATCH_LIMIT {
@@ -169,7 +169,9 @@ impl KeywordSearchTool {
             .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
         match status.code() {
             Some(0 | 1) => Ok(total),
-            other => Err(format!("ripgrep exited with status {other:?} (invalid term?)")),
+            other => Err(format!(
+                "ripgrep exited with status {other:?} (invalid term?)"
+            )),
         }
     }
 
@@ -409,7 +411,12 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         let full_term_count = usable_terms.len();
         let (results, capped) = loop {
             match self
-                .ripgrep_capped(&search_root, &usable_terms, &ctx.cancel, MAX_COMBINED_RESULTS)
+                .ripgrep_capped(
+                    &search_root,
+                    &usable_terms,
+                    &ctx.cancel,
+                    MAX_COMBINED_RESULTS,
+                )
                 .await
             {
                 Ok((out, was_capped)) => {
