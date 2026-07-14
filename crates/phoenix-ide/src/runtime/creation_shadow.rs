@@ -162,31 +162,17 @@ impl CreationShadowCoordinator {
                 oracle.intent.job_id
             ),
         });
-        let observed = if matches!(oracle.status, AuthoritativeCreationStatus::Ready) {
-            let committed_state = match &oracle.intent.kind {
-                CreationKind::InitialTurn { .. } => ConvState::LlmRequesting { attempt: 1 },
-                CreationKind::SeededEmpty => ConvState::Idle,
-            };
-            oracle.runtime_evidence.initial_llm_dispatched =
-                matches!(&oracle.intent.kind, CreationKind::InitialTurn { .. });
-            oracle.runtime_evidence.runtime_bootstrapped = true;
-            oracle.runtime_evidence.ready_capabilities =
-                Some(capabilities_for_state(&committed_state));
-            observed_projection(&committed_state, false, &oracle.status)
-        } else {
-            let visible = self
-                .db
-                .get_conversation(&oracle.intent.conversation_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            oracle.runtime_evidence.initial_llm_dispatched =
-                initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
-            oracle.runtime_evidence.runtime_bootstrapped =
-                runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
-            oracle.runtime_evidence.ready_capabilities =
-                Some(capabilities_for_state(&visible.state));
-            observed_projection(&visible.state, visible.archived, &oracle.status)
-        };
+        let visible = self
+            .db
+            .get_conversation(&oracle.intent.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        oracle.runtime_evidence.initial_llm_dispatched =
+            initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
+        oracle.runtime_evidence.runtime_bootstrapped =
+            runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
+        oracle.runtime_evidence.ready_capabilities = Some(capabilities_for_state(&visible.state));
+        let observed = observed_projection(&visible.state, visible.archived, &oracle.status);
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,
@@ -300,19 +286,20 @@ fn oracle_from_committed(
         attempt: job.protocol.attempt,
         generation: job.protocol.generation,
         revision: job.shadow_projection_revision,
-        cleanup_ownership: if reservations
-            .iter()
-            .any(|reservation| reservation.status != "released")
-        {
-            CleanupOwnership::OwnedResources
-        } else {
-            CleanupOwnership::None
-        },
+        cleanup_ownership: cleanup_ownership(reservations),
         runtime_evidence: CreationRuntimeEvidence {
             runtime_bootstrapped,
             initial_llm_dispatched,
             ready_capabilities: Some(capabilities_for_state(conversation_state)),
         },
+    }
+}
+
+fn cleanup_ownership(reservations: &[CreationResourceReservation]) -> CleanupOwnership {
+    if reservations.is_empty() {
+        CleanupOwnership::None
+    } else {
+        CleanupOwnership::OwnedResources
     }
 }
 
@@ -603,6 +590,23 @@ mod tests {
     #[test]
     fn unresolved_auto_without_resource_evidence_is_not_worktree_backed() {
         assert!(!uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
+    }
+
+    #[test]
+    fn released_reservation_preserves_owned_cleanup_evidence() {
+        let reservations = vec![CreationResourceReservation {
+            id: "reservation".to_owned(),
+            job_id: "job".to_owned(),
+            generation: 1,
+            resource_identity: "/tmp/worktree".to_owned(),
+            repository_identity: "/tmp/repo".to_owned(),
+            status: "released".to_owned(),
+        }];
+        assert_eq!(
+            cleanup_ownership(&reservations),
+            CleanupOwnership::OwnedResources
+        );
+        assert_eq!(cleanup_ownership(&[]), CleanupOwnership::None);
     }
 
     #[test]
