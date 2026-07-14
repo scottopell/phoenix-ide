@@ -25,12 +25,6 @@ use tokio_util::sync::CancellationToken;
 /// probe kills `rg` the instant the total is exceeded, so the cost of rejecting
 /// a broad term is O(limit), independent of the size of the tree being scanned.
 const BROAD_TERM_MATCH_LIMIT: usize = 400;
-/// Per-file match cap for the breadth probe (`rg --max-count`). `rg --count`
-/// only emits a file's total once that file is fully scanned, so without a cap
-/// a term dense in one giant file (a generated bundle, a huge log) would scan
-/// that whole file before the early-exit could fire. Capping per file bounds
-/// each file's scan cost and keeps the probe O(limit) across the whole tree.
-const PROBE_PER_FILE_MATCH_CAP: &str = "100";
 /// Always-on ceiling on the combined context output. The scan is killed once
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
@@ -99,9 +93,11 @@ impl KeywordSearchTool {
     /// walks; we accumulate the total and early-exit (kill `rg`) once it crosses
     /// the limit, so a broad term is rejected after finding ~limit matches
     /// rather than after walking the entire tree — an intentionally broad search
-    /// root (a multi-repo container) stays cheap. `--max-count` bounds each
-    /// file's scan so a term dense in one giant file cannot defeat the early
-    /// exit (a per-file count is only emitted once that file is fully scanned).
+    /// root (a multi-repo container) stays cheap. `rg --count` emits a file's
+    /// total only after fully scanning it, so `--max-count = limit + 1` both
+    /// bounds each file's scan and ensures a term dense in one giant file
+    /// (a generated bundle, a huge log) alone trips the limit rather than
+    /// reporting a small count and being wrongly accepted as narrow.
     ///
     /// Returns the accumulated match count (just past the limit when the early
     /// exit fires). A non-`{matches, no-matches}` exit status — e.g. an invalid
@@ -117,9 +113,15 @@ impl KeywordSearchTool {
         term: &str,
         cancel: &CancellationToken,
     ) -> Result<usize, String> {
+        // Cap per-file matches at the breadth limit + 1. This bounds each
+        // file's scan (rg stops once a file hits the cap) *and* makes a single
+        // file that alone exceeds the limit trip the early exit — a lower cap
+        // would let a term dense in one generated file/log report a small count
+        // and be wrongly accepted as narrow.
+        let max_count = (BROAD_TERM_MATCH_LIMIT + 1).to_string();
         let mut child = Self::spawn_rg(
             dir,
-            &["--count", "--max-count", PROBE_PER_FILE_MATCH_CAP],
+            &["--count", "--max-count", &max_count],
             std::slice::from_ref(&term.to_string()),
             Stdio::null(),
         )?;
@@ -401,24 +403,34 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             );
         }
 
-        // Single combined scan, capped mid-stream at MAX_COMBINED_RESULTS.
-        let (results, truncated) = match self
-            .ripgrep_capped(
-                &search_root,
-                &usable_terms,
-                &ctx.cancel,
-                MAX_COMBINED_RESULTS,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                if ctx.cancel.is_cancelled() {
-                    return ToolOutput::error("keyword_search cancelled");
+        // Combined scan, capped mid-stream at MAX_COMBINED_RESULTS. If the
+        // combined output would exceed the ceiling, drop the lowest-priority
+        // term and retry: `search_terms` is ordered by importance (REQ-KWS-004),
+        // so peeling from the tail preserves the most important terms rather
+        // than letting a low-priority term crowd them out of the byte budget in
+        // filesystem-traversal order. Each retry is byte-bounded by
+        // `ripgrep_capped`, so this cannot regress to an unbounded rescan.
+        let full_term_count = usable_terms.len();
+        let (results, capped) = loop {
+            match self
+                .ripgrep_capped(&search_root, &usable_terms, &ctx.cancel, MAX_COMBINED_RESULTS)
+                .await
+            {
+                Ok((out, was_capped)) => {
+                    if !was_capped || usable_terms.len() == 1 {
+                        break (out, was_capped);
+                    }
+                    usable_terms.pop(); // drop lowest-priority term, retry
                 }
-                return ToolOutput::error(e);
+                Err(e) => {
+                    if ctx.cancel.is_cancelled() {
+                        return ToolOutput::error("keyword_search cancelled");
+                    }
+                    return ToolOutput::error(e);
+                }
             }
         };
+        let dropped = full_term_count - usable_terms.len();
 
         if results.is_empty() || results == "No matches found" {
             return ToolOutput::success("No matches found for the given search terms.");
@@ -447,9 +459,16 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             }
         };
 
-        let output = if truncated {
+        // Signal incompleteness on the FINAL output. Two distinct cases: the
+        // remaining terms' output still overran the ceiling (capped), or lower-
+        // priority terms were dropped to make it fit (dropped).
+        let output = if capped {
             format!(
-                "{filtered}\n\n[results truncated: search scope is large — narrow your search terms for complete results]"
+                "{filtered}\n\n[results truncated: search scope is large — use more specific search terms for complete results]"
+            )
+        } else if dropped > 0 {
+            format!(
+                "{filtered}\n\n[note: {dropped} lower-priority term(s) were dropped to fit the result budget — narrow your terms for full coverage]"
             )
         } else {
             filtered
@@ -607,6 +626,29 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 2, "case-insensitive match should count both lines");
+    }
+
+    /// A term concentrated in a single file that alone exceeds the limit must
+    /// still be flagged broad — the per-file `--max-count` is `limit + 1`, so
+    /// one hot file trips the early exit rather than reporting a small count.
+    #[tokio::test]
+    async fn count_matches_flags_single_hot_file_as_broad() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // One file, many matches, no others — mimics a generated bundle/log.
+        std::fs::write(
+            dir.path().join("bundle.js"),
+            "hotmatch\n".repeat(BROAD_TERM_MATCH_LIMIT * 3),
+        )
+        .unwrap();
+        let tool = KeywordSearchTool;
+        let count = tool
+            .count_matches(dir.path(), "hotmatch", &CancellationToken::new())
+            .await
+            .expect("count");
+        assert!(
+            count > BROAD_TERM_MATCH_LIMIT,
+            "a single file exceeding the limit must be flagged broad, got {count}"
+        );
     }
 
     /// An invalid regex term makes `rg` exit with an error status and no stdout;
