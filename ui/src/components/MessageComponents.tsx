@@ -43,7 +43,7 @@ import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
 import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
-import { formatCommissionReviewInput, parseCommissionReviewDisplayData, parseCommissionReviewInput } from '../features/commissionReview/model';
+import { formatCommissionReviewInput, parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
 import './MessageComponents.css';
 
 const CheckIcon = () => (
@@ -2311,7 +2311,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
     ? 'Copy operation'
     : 'Copy command';
   const commissionReviewDisplayData = name === 'commission_review'
-    ? parseCommissionReviewDisplayData(result?.display_data)
+    ? parseCommissionReviewResult(result?.display_data, resultText)
     : null;
   const commissionReviewInput = name === 'commission_review'
     ? parseCommissionReviewInput(input as Record<string, unknown>)

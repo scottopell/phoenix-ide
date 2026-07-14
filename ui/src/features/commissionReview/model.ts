@@ -259,6 +259,37 @@ export function parseCommissionReviewDisplayData(value: unknown): CommissionRevi
   };
 }
 
+export function parseCommissionReviewResult(displayData: unknown, rawContent: string): CommissionReviewDisplayData | null {
+  const structured = parseCommissionReviewDisplayData(displayData);
+  if (structured) return structured;
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rawContent);
+  } catch {
+    return null;
+  }
+  const record = asRecord(raw);
+  if (!record || record['status'] !== 'rejected') return null;
+  const summary = asRecord(record['summary']);
+  if (!summary || !Array.isArray(record['findings']) || !Array.isArray(record['warnings'])) return null;
+
+  return {
+    kind: 'commission_review',
+    status: 'rejected',
+    reviewStatus: 'rejected',
+    findingsStatus: 'unavailable',
+    findingsTrust: 'low',
+    retryRecommendation: 'do_not_retry',
+    stageStatus: {},
+    warningsSummary: [],
+    reviewerSummary: asString(summary['reviewer_summary']),
+    unreviewed: [],
+    findings: parseFindings(record['findings']),
+    warnings: parseWarnings(record['warnings']),
+  };
+}
+
 export function commissionReviewOutcomeLabel(data: CommissionReviewDisplayData): string {
   switch (data.status) {
     case 'success': return data.findingSummary.total > 0 ? 'Findings' : 'Clean';

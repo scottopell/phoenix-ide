@@ -292,7 +292,6 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
   });
 
-<<<<<<< HEAD
   it('cold-loads a UUID route via id metadata and id full-history paths', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-archived', archived: true });
@@ -323,9 +322,15 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
   });
 
-  it('only exposes commission review sidepanel actions on wide desktop', async () => {
+  it('keeps commission review actions available for non-terminal narrow layouts', async () => {
     viewportFlags.isWideDesktop = false;
     renderPage(makeConversation());
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
+  });
+
+  it('hides commission review actions when the conversation cannot open sidepanels', async () => {
+    renderPage(makeConversation({ archived: true }));
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(navStackProps.onOpenCommissionReview).toBeUndefined();
   });

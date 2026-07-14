@@ -3,6 +3,7 @@ import {
   commissionReviewOutcomeLabel,
   formatCommissionReviewInput,
   parseCommissionReviewDisplayData,
+  parseCommissionReviewResult,
   parseCommissionReviewInput,
 } from './model';
 
@@ -87,6 +88,28 @@ describe('commission review model', () => {
     expect(parsed?.stageStatus.llmReview).toBe('skipped');
     if (!parsed || parsed.status !== 'rejected') throw new Error('expected rejected review data');
     expect(parsed.reviewerSummary).toBe('The user rejected this paid review.');
+  });
+
+  it('parses the state-machine rejected result from raw tool content', () => {
+    const parsed = parseCommissionReviewResult(undefined, JSON.stringify({
+      status: 'rejected',
+      summary: {
+        brief: 'Review this change',
+        focus: null,
+        reviewer_summary: 'Commission review rejected before LLM execution',
+      },
+      findings: [],
+      warnings: [],
+    }));
+
+    expect(parsed?.status).toBe('rejected');
+    if (!parsed || parsed.status !== 'rejected') throw new Error('expected rejected review data');
+    expect(parsed.reviewerSummary).toBe('Commission review rejected before LLM execution');
+  });
+
+  it('does not interpret arbitrary raw tool JSON as commission review data', () => {
+    expect(parseCommissionReviewResult(undefined, '{"status":"rejected"}')).toBeNull();
+    expect(parseCommissionReviewResult(undefined, 'not json')).toBeNull();
   });
 
   it('preserves findings with empty rationale for renderer fallback', () => {

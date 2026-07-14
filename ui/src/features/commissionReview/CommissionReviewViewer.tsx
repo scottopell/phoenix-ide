@@ -1,7 +1,7 @@
 import type { Message, ToolResultContent } from '../../api';
 import { ViewerShell } from '../../components/viewer/ViewerShell';
 import { CommissionReviewSummaryCard } from './CommissionReviewSummary';
-import { parseCommissionReviewDisplayData } from './model';
+import { parseCommissionReviewResult } from './model';
 import './CommissionReviewViewer.css';
 
 interface CommissionReviewViewerProps {
@@ -19,8 +19,8 @@ interface ResolvedReview {
 
 export function CommissionReviewViewer({ sequenceId, messages, onClose, inline }: CommissionReviewViewerProps) {
   const resolved = resolveCommissionReviewBySequence(sequenceId, messages);
-  const parsed = resolved?.resultMessage ? parseCommissionReviewDisplayData(resolved.resultMessage.display_data) : null;
   const rawResult = resolved?.resultContent?.content ?? resolved?.resultContent?.result ?? resolved?.resultContent?.error ?? '';
+  const parsed = resolved?.resultMessage ? parseCommissionReviewResult(resolved.resultMessage.display_data, rawResult) : null;
 
   return (
     <ViewerShell

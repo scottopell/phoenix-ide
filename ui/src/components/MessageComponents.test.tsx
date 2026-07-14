@@ -413,6 +413,36 @@ describe('commission review tool rendering', () => {
     expect(screen.queryByText('Finding 5')).not.toBeInTheDocument();
   });
 
+  it('renders the state-machine rejected result from raw tool content', () => {
+    const rejected = toolMessage('tool-commission-review-raw-rejected', JSON.stringify({
+      status: 'rejected',
+      summary: {
+        brief: 'Review before merge',
+        focus: null,
+        reviewer_summary: 'Commission review rejected before LLM execution',
+      },
+      findings: [],
+      warnings: [],
+    }));
+
+    render(
+      <AgentMessage
+        message={agentMessage('agent-commission-review-raw-rejected', [{
+          type: 'tool_use',
+          id: 'tool-commission-review-raw-rejected',
+          name: 'commission_review',
+          input: { brief: 'Review before merge' },
+        }])}
+        toolResults={new Map([['tool-commission-review-raw-rejected', rejected]])}
+        onOpenFile={undefined}
+      />,
+    );
+
+    expect(screen.getByText('Rejected')).toBeInTheDocument();
+    expect(screen.getByText('Commission review rejected before LLM execution')).toBeInTheDocument();
+    expect(screen.queryByText(/"status":\s*"rejected"/)).not.toBeInTheDocument();
+  });
+
   it('falls back to generic output when display_data is malformed and renders failed/rejected/skipped states when valid', () => {
     const malformed = toolMessage('tool-commission-review-malformed', '{"status":"failed"}');
     malformed.display_data = { kind: 'commission_review', status: 'failed' };

@@ -383,9 +383,8 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // reader sits beside the chat as a resizable sibling pane.
   const isWideDesktop = useIsWideDesktop();
   const handleOpenCommissionReview = useCallback((requestSequenceId: number) => {
-    if (!isWideDesktop) return;
     viewerSlot.openCommissionReview(requestSequenceId);
-  }, [isWideDesktop, viewerSlot]);
+  }, [viewerSlot]);
   const VIEWER_PANE_MIN = 360;
   const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({
@@ -1987,7 +1986,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         onRetry={handleRetry}
         onCancelSteering={isArchived ? undefined : handleCancelSteering}
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
-        onOpenCommissionReview={isArchived || !isWideDesktop ? undefined : handleOpenCommissionReview}
+        onOpenCommissionReview={canOpenMessageSidepanel ? handleOpenCommissionReview : undefined}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         enableMessageSidepanel={canOpenMessageSidepanel}
