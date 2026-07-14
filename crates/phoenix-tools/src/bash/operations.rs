@@ -1674,8 +1674,15 @@ mod tests {
             None,
         );
 
+        // The `trap '' TERM` sets SIGTERM to SIG_IGN, inherited by the child
+        // `sleep`, so the whole process group ignores TERM. The kill below
+        // must arrive AFTER the trap builtin has run, or SIGTERM hits a
+        // group with the default disposition and kills it — producing a fast
+        // exit and a `Terminal` edge instead of `KillPendingKernel`. Announce
+        // readiness on stdout after installing the trap and wait for the
+        // marker rather than betting on a fixed sleep (which races under load).
         let run = run_run(
-            "trap '' TERM; sleep 3600",
+            "trap '' TERM; echo trap-installed; sleep 3600",
             None,
             0,
             ReadArgs::default(),
@@ -1689,7 +1696,33 @@ mod tests {
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
         assert_eq!(spawned.work_scope, ctx.work_scope);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Wait for the trap-installed marker to appear in the ring. Deterministic
+        // proof the trap is in place; no wall-clock assumption about bash startup.
+        let ready_handle = lookup_handle(&ctx, &handle_id)
+            .await
+            .expect("lookup handle for readiness");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let state = ready_handle.state().await;
+                    if let HandleState::Live(live) = state.as_ref() {
+                        let ring = live.ring.lock().await;
+                        if ring
+                            .since(0)
+                            .lines
+                            .iter()
+                            .any(|l| l.bytes == b"trap-installed")
+                        {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("trap-installed marker did not appear within 10s");
 
         let kill_task = tokio::spawn({
             let ctx = ctx.clone();
