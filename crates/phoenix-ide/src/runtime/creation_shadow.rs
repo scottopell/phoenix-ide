@@ -160,17 +160,31 @@ impl CreationShadowCoordinator {
                 oracle.intent.job_id
             ),
         });
-        let visible = self
-            .db
-            .get_conversation(&oracle.intent.conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        oracle.runtime_evidence.initial_llm_dispatched =
-            initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
-        oracle.runtime_evidence.runtime_bootstrapped =
-            runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
-        oracle.runtime_evidence.ready_capabilities = Some(capabilities_for_state(&visible.state));
-        let observed = observed_projection(&visible.state, visible.archived, &oracle.status);
+        let observed = if matches!(oracle.status, AuthoritativeCreationStatus::Ready) {
+            let committed_state = match &oracle.intent.kind {
+                CreationKind::InitialTurn { .. } => ConvState::LlmRequesting { attempt: 1 },
+                CreationKind::SeededEmpty => ConvState::Idle,
+            };
+            oracle.runtime_evidence.initial_llm_dispatched =
+                matches!(&oracle.intent.kind, CreationKind::InitialTurn { .. });
+            oracle.runtime_evidence.runtime_bootstrapped = true;
+            oracle.runtime_evidence.ready_capabilities =
+                Some(capabilities_for_state(&committed_state));
+            observed_projection(&committed_state, false, &oracle.status)
+        } else {
+            let visible = self
+                .db
+                .get_conversation(&oracle.intent.conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            oracle.runtime_evidence.initial_llm_dispatched =
+                initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
+            oracle.runtime_evidence.runtime_bootstrapped =
+                runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
+            oracle.runtime_evidence.ready_capabilities =
+                Some(capabilities_for_state(&visible.state));
+            observed_projection(&visible.state, visible.archived, &oracle.status)
+        };
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
             &persistence,

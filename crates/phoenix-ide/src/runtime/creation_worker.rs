@@ -56,6 +56,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         let CreationClaimOutcome::Claimed(job) = outcome else {
             return Ok(());
         };
+        manager.mirror_creation_after_commit(job.id.clone());
         if let Err(error) = process_claimed_job(manager, *job).await {
             tracing::error!(error = %error, "conversation creation job processing failed");
         }

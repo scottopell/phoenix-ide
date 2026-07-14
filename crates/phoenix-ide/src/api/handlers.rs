@@ -4461,13 +4461,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             .request_conversation_creation_deletion(id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
-        if let Err(error) = state.runtime.mirror_creation_before_cleanup(&job_id).await {
-            tracing::warn!(
-                job_id,
-                error,
-                "creation shadow sync failed before deletion cleanup; continuing"
-            );
-        }
+        state.runtime.mirror_creation_after_commit(job_id);
         state
             .runtime
             .evict_runtime(id, crate::runtime::EvictionReason::CreationProvisioned)
