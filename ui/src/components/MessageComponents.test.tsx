@@ -2275,6 +2275,53 @@ describe('compact tool summaries', () => {
     expect(container.querySelectorAll('[data-fragment-id^="read-file-line:"]')).toHaveLength(1);
     expect(container.querySelector('[data-fragment-id^="read-file-line:"]')?.textContent).not.toContain('more chars');
   });
+
+  it('keeps long read_file content capped for an active path match', () => {
+    mockDensity = 'full';
+    const longLine = `     1\t${'x'.repeat(5100)}`;
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-path-cap', [
+            { type: 'tool_use', id: 'path-cap', name: 'read_file', input: { path: 'long.ts', offset: 1, limit: 1 } },
+          ])}
+          toolResults={new Map([['path-cap', toolMessage('path-cap', longLine)]])}
+          onOpenFile={undefined}
+          activeHighlight={{ owner: 'tool-result', toolUseId: 'path-cap', fragmentId: 'read-file-path', start: 0, end: 7 }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('long.ts');
+    expect(container.querySelector('.read-file-results')?.textContent?.length).toBeLessThan(5100);
+  });
+});
+
+describe('console log find parity', () => {
+  it('uses opaque highlighting for failed console-log results', () => {
+    const errorText = 'console log capture failed';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-console-error', [
+            { type: 'tool_use', id: 'console-error', name: 'browser_recent_console_logs', input: {} },
+          ])}
+          toolResults={new Map([['console-error', {
+            ...toolMessage('console-error', errorText),
+            content: { tool_use_id: 'console-error', error: errorText, is_error: true },
+          }]])}
+          onOpenFile={undefined}
+          activeHighlight={{
+            owner: 'tool-result',
+            toolUseId: 'console-error',
+            fragmentId: 'terminal-result:opaque',
+            start: 0,
+            end: 'console'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('console');
+  });
 });
 
 describe('bash tool inspector affordance', () => {

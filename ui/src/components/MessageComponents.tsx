@@ -2330,11 +2330,15 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
   const profileAction = name === 'browser_profile' && typeof input['action'] === 'string' ? input['action'] : null;
   const terminalResultFamily: TerminalToolResultFamily = name === 'bash' || name === 'tmux'
     ? name
-    : name === 'browser_recent_console_logs'
-      ? 'console-logs'
-      : profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
+    : isError
+      ? profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
         ? 'browser-profile'
-        : 'opaque';
+        : 'opaque'
+      : name === 'browser_recent_console_logs'
+        ? 'console-logs'
+        : profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
+          ? 'browser-profile'
+          : 'opaque';
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;
@@ -2588,7 +2592,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'read_file' && !isError ? (
             <>
               <ReadFileResultView
-                rawText={toolActiveHighlight ? resultText : cappedResultText}
+                rawText={toolActiveHighlight && toolActiveHighlight.fragmentId !== 'read-file-path' ? resultText : cappedResultText}
                 input={input as Record<string, unknown>}
                 onOpenFile={onOpenFile}
                 toolUseId={toolId}
