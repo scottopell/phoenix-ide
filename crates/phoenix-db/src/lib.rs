@@ -723,6 +723,29 @@ async fn insert_creation_shadow_evidence_tx(
 }
 
 impl Database {
+    /// Persist the execution mode resolved by the authoritative creation worker.
+    ///
+    /// # Errors
+    /// Returns a database error when the evidence row cannot be updated.
+    pub async fn record_creation_shadow_execution_mode(
+        &self,
+        job_id: &str,
+        uses_worktree: bool,
+        branch_name: Option<&str>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE creation_shadow_creation_evidence
+             SET uses_worktree = ?1, branch_name = ?2
+             WHERE creation_job_id = ?3",
+        )
+        .bind(uses_worktree)
+        .bind(branch_name)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {

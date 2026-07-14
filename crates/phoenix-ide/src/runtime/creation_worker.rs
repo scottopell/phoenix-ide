@@ -336,6 +336,25 @@ async fn provision_conversation(
     let initial_cwd = valid_cwd.into_raw();
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
+    let resolved_uses_worktree = matches!(requested_mode, "managed" | "branch")
+        || (requested_mode == "auto" && repo_root.is_some());
+    let resolved_branch = (resolved_uses_worktree && matches!(requested_mode, "managed" | "auto"))
+        .then(|| {
+            format!(
+                "task-pending-{}",
+                job.conversation_id.chars().take(8).collect::<String>()
+            )
+        });
+    manager
+        .db()
+        .record_creation_shadow_execution_mode(
+            &job.id,
+            resolved_uses_worktree,
+            resolved_branch.as_deref(),
+        )
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+    manager.mirror_creation_after_commit(job.id.clone());
 
     let registry_default = manager.llm_registry.default_model_id();
     let mut resolved_model = intent.model.clone().unwrap_or_else(|| {

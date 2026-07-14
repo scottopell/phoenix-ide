@@ -131,13 +131,15 @@ impl CreationShadowCoordinator {
             .get_creation_resource_reservations(job_id)
             .await
             .map_err(|error| error.to_string())?;
-        let preserved_evidence: Option<(String, i64)> = sqlx::query_as(
-            "SELECT cwd, attachment_count FROM creation_shadow_creation_evidence WHERE creation_job_id = ?1",
-        )
-        .bind(job_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| error.to_string())?;
+        let preserved_evidence: Option<(String, i64, Option<i64>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT cwd, attachment_count, uses_worktree, branch_name
+             FROM creation_shadow_creation_evidence WHERE creation_job_id = ?1",
+            )
+            .bind(job_id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(|error| error.to_string())?;
         let conversation = self
             .db
             .get_conversation(&job.conversation_id)
@@ -217,12 +219,12 @@ fn oracle_from_committed(
     image_count: usize,
     reservations: &[CreationResourceReservation],
     conv_mode: Option<&ConvMode>,
-    preserved_evidence: Option<&(String, i64)>,
+    preserved_evidence: Option<&(String, i64, Option<i64>, Option<String>)>,
     conversation_state: &ConvState,
 ) -> AuthoritativeCreationOracle {
     let live_attachment_count = files.len().saturating_add(image_count);
     let attachment_count = preserved_evidence
-        .and_then(|(_, count)| usize::try_from(*count).ok())
+        .and_then(|(_, count, _, _)| usize::try_from(*count).ok())
         .unwrap_or(live_attachment_count);
     let attachment_ids = (0..attachment_count)
         .map(|ordinal| format!("attachment:{ordinal}"))
@@ -231,7 +233,12 @@ fn oracle_from_committed(
         .iter()
         .find(|reservation| reservation.status != "released")
         .or_else(|| reservations.first());
-    let preserved_cwd = preserved_evidence.map(|(cwd, _)| cwd.clone());
+    let preserved_cwd = preserved_evidence.map(|(cwd, _, _, _)| cwd.clone());
+    let preserved_uses_worktree = preserved_evidence
+        .and_then(|(_, _, uses_worktree, _)| *uses_worktree)
+        .map(|value| value != 0);
+    let preserved_branch =
+        preserved_evidence.and_then(|(_, _, _, branch_name)| branch_name.clone());
     let repository_path = reservation.map_or_else(
         || {
             preserved_cwd
@@ -262,6 +269,7 @@ fn oracle_from_committed(
                 })
             })
         })
+        .or(preserved_branch)
         .or_else(|| job.intent.base_branch.clone())
         .unwrap_or_default();
     let kind = match &job.protocol.kind {
@@ -272,7 +280,8 @@ fn oracle_from_committed(
     };
     let initial_llm_dispatched = initial_llm_dispatched(&job.protocol.status, conversation_state);
     let runtime_bootstrapped = runtime_bootstrapped(&job.protocol.status, conversation_state);
-    let uses_worktree = uses_worktree(job.intent.mode.as_deref(), reservations, conv_mode);
+    let uses_worktree = preserved_uses_worktree
+        .unwrap_or_else(|| uses_worktree(job.intent.mode.as_deref(), reservations, conv_mode));
     AuthoritativeCreationOracle {
         intent: CreationIntent {
             job_id: job.id.clone(),
@@ -344,7 +353,7 @@ fn uses_worktree(
 ) -> bool {
     !reservations.is_empty()
         || conv_mode.is_some_and(|mode| mode.worktree_path().is_some())
-        || matches!(requested_mode, Some("managed" | "auto" | "branch"))
+        || matches!(requested_mode, Some("managed" | "branch"))
 }
 
 fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
@@ -592,8 +601,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_intends_worktree_before_resource_evidence_exists() {
-        assert!(uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
+    fn unresolved_auto_without_resource_evidence_is_not_worktree_backed() {
+        assert!(!uses_worktree(Some("auto"), &[], Some(&ConvMode::Direct)));
     }
 
     #[test]

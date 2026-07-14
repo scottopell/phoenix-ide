@@ -271,6 +271,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "align_creation_shadow_divergence_actions",
         sql: MIGRATION_051,
     },
+    Migration {
+        version: 52,
+        name: "persist_creation_shadow_execution_mode",
+        sql: MIGRATION_052,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -2304,6 +2309,13 @@ DROP TABLE creation_shadow_divergences_legacy;
 CREATE UNIQUE INDEX idx_creation_shadow_one_active_divergence
     ON creation_shadow_divergences(shadow_workflow_id, evidence_identity)
     WHERE resolved_at IS NULL;
+";
+
+const MIGRATION_052: &str = r"
+ALTER TABLE creation_shadow_creation_evidence
+    ADD COLUMN uses_worktree INTEGER CHECK (uses_worktree IS NULL OR uses_worktree IN (0, 1));
+ALTER TABLE creation_shadow_creation_evidence
+    ADD COLUMN branch_name TEXT;
 ";
 
 /// Run all pending migrations against the database.
