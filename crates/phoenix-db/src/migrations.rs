@@ -2529,7 +2529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_044_upgrades_a_database_already_stamped_at_043() {
+    async fn migration_047_replays_creation_shadow_schema() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         run_pending_migrations(&pool).await.unwrap();
@@ -2542,7 +2542,7 @@ mod tests {
              DROP TABLE creation_shadow_readiness_effects;
              DROP TABLE creation_shadow_projections;
              DROP TABLE creation_shadow_bindings;
-             DELETE FROM _migrations WHERE version = 44;",
+             DELETE FROM _migrations WHERE version = 47;",
         )
         .execute(&pool)
         .await
