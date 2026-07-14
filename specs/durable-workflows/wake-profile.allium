@@ -17,10 +17,14 @@ use "../tmux-integration/tmux-integration.allium" as tmux
 enum WakeHandleKind { bash | tmux_window }
 enum WakeTerminalCause { fired | expired | cancelled | forgotten }
 enum WakeCancellationReason { explicit_cancel }
-enum WakeForgottenReason { handle_missing | runtime_unrecoverable_after_restart }
+enum WakeForgottenReason {
+    phoenix_restart
+    | cascade_destroyed_handle
+    | subagent_handle_missing
+    | tmux_handle_missing
+}
 enum BashTerminalStatus { exited | killed | kill_pending_kernel }
 enum TmuxTerminalStatus { exit_marker_observed | window_killed }
-enum WakeAcceptanceStatus { owed | accepted | suppressed }
 enum WakeObligationSuppressionReason { lifecycle_terminal | superseded }
 enum WakeRegistrationFenceStatus { open | closed }
 enum LifecycleFenceStatus { open | closed }
@@ -196,16 +200,8 @@ entity WakeRuntimeObligation {
     id: String
     conversation: bedrock/Conversation
     payload: WakeAcceptancePayload
-    status: WakeAcceptanceStatus
+    owed_acceptance: dwf/OwedAcceptance
     created_at: Timestamp
-    accepted_at: Timestamp? when status = accepted
-    terminal_reason: WakeObligationSuppressionReason? when status = suppressed
-
-    transitions status {
-        owed -> accepted
-        owed -> suppressed
-        terminal: accepted, suppressed
-    }
 }
 
 entity WakeShadowParity {
@@ -256,6 +252,7 @@ config {
 -- no_overlapping_llm_request(conversation), owed_items_remain_durable(conversation)
 -- accepting_llm_requesting_persisted_atomically(obligation)
 -- later_items_excluded_from(obligation), duplicate_acceptance_starts_no_llm(obligation)
+-- duplicate_acceptance_starts_no_llm(obligation)
 -- transferable_pending_bindings(predecessor), transferable_unconsumed_items(predecessor)
 -- transferable_unaccepted_obligations(predecessor)
 -- successor_safe_item_identity(item, successor)
@@ -264,7 +261,13 @@ config {
 -- lifecycle_action_is_destructive(action), pending_wake_count(conversation)
 -- registration_fence_version(conversation), registration_and_lifecycle_share_cas(conversation, version)
 -- lifecycle_fence_serializes_with_registration(conversation)
+-- active_registration_fence(conversation), registration_rejection_reason(conversation)
+-- invalid_wait_bound(requested_max_wait_seconds), invalid_wait_bound_reason(requested_max_wait_seconds)
+-- terminal_receipt_already_materialized(receipt), exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
+-- forgotten_reason_for_deadline_unevaluable(resource), forgotten_reason_for_startup_forget(resource)
+-- existing_owed_wake_obligation(conversation), obligation_payload_inbox(obligation)
 -- wake_protocol_selection(), authority_is_immutable(binding)
+
 -- legacy_projection(contract_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding)
 -- wake_canonical_divergence_kind(kind): dwf/ShadowDivergenceKind
@@ -278,13 +281,13 @@ config {
 
 rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
-    requires: requested_max_wait_seconds >= 1
-    requires: requested_max_wait_seconds <= config.max_max_wait_seconds
+    requires: not invalid_wait_bound(requested_max_wait_seconds)
     requires: resource.kind in {bash, tmux_window}
     requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
     requires: resource_identity_is_stable(resource)
     requires: wake_protocol_selection().authority = engine_protocol
     requires: wake_protocol_selection().accepting = true
+    requires: active_registration_fence(conversation)
     requires: not conversation.archived
     requires: not conversation.is_terminal
 
@@ -336,6 +339,28 @@ rule RegistrationRejectsForeignOrUnstableResource {
     ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
 }
 
+rule RegistrationRejectsOutOfRangeWaitBound {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: invalid_wait_bound(requested_max_wait_seconds)
+    ensures: WakeRegistrationRejected(invalid_wait_bound_reason(requested_max_wait_seconds))
+    ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
+}
+
+rule RegistrationRejectsClosedOrUnavailableConversation {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: not invalid_wait_bound(requested_max_wait_seconds)
+    requires: resource.kind in {bash, tmux_window}
+    requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource_identity_is_stable(resource)
+    requires: wake_protocol_selection().authority != engine_protocol
+        or wake_protocol_selection().accepting != true
+        or not active_registration_fence(conversation)
+        or conversation.archived
+        or conversation.is_terminal
+    ensures: WakeRegistrationRejected(registration_rejection_reason(conversation))
+    ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
+}
+
 rule EvidenceScheduleRecordsReconciliationObservation {
     when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
     requires: binding.observe_effect.status not in {receipted, invalidated}
@@ -378,7 +403,22 @@ rule DeadlineScheduleForgetsUnevaluableResource {
     requires: terminal_winner(binding) = forgotten
     ensures: terminal_receipt_for(binding, WakeTerminalPayload{
         contract_id: binding.contract_id, resource: binding.resource,
-        cause: forgotten, forgotten_reason: handle_missing, resolved_at: now
+        cause: forgotten,
+        forgotten_reason: forgotten_reason_for_deadline_unevaluable(binding.resource),
+        resolved_at: now
+    })
+}
+
+rule StartupScheduleForgetsUnevaluableResourceImmediately {
+    when: WakeStartupReconciliationRequested(adapter, binding)
+    requires: not durable_terminal_evidence_at_or_before(binding, binding.expires_at)
+    requires: not resource_is_evaluable(binding.resource)
+    requires: terminal_winner(binding) = forgotten
+    ensures: terminal_receipt_for(binding, WakeTerminalPayload{
+        contract_id: binding.contract_id, resource: binding.resource,
+        cause: forgotten,
+        forgotten_reason: forgotten_reason_for_startup_forget(binding.resource),
+        resolved_at: now()
     })
 }
 
@@ -409,6 +449,7 @@ rule TerminalReceiptMaterializesDurableObservation {
     requires: receipt.effect = binding.observe_effect
     requires: terminal.contract_id = binding.contract_id
     requires: terminal.cause != cancelled
+    requires: not terminal_receipt_already_materialized(receipt)
     ensures: WakeObservationInboxItem.created(
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
         terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
@@ -416,13 +457,32 @@ rule TerminalReceiptMaterializesDurableObservation {
     ensures: WakeInboxSchedulingRequested(binding.conversation)
 }
 
+rule DuplicateTerminalReceiptMaterializationIsIdempotent {
+    when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
+    requires: receipt.effect = binding.observe_effect
+    requires: terminal.contract_id = binding.contract_id
+    requires: terminal.cause != cancelled
+    requires: terminal_receipt_already_materialized(receipt)
+    ensures: WakeInboxSchedulingRequested(binding.conversation)
+}
+
 rule CancelledReceiptMaterializesWithoutAutoResume {
     when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
     requires: terminal.cause = cancelled
+    requires: exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
+    requires: not terminal_receipt_already_materialized(receipt)
     ensures: WakeObservationInboxItem.created(
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
         terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
     )
+    ensures: no_resume_scheduled_only_for_cancel(binding)
+}
+
+rule DuplicateCancelledReceiptMaterializationIsIdempotent {
+    when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
+    requires: terminal.cause = cancelled
+    requires: exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
+    requires: terminal_receipt_already_materialized(receipt)
     ensures: no_resume_scheduled_only_for_cancel(binding)
 }
 
@@ -432,6 +492,7 @@ rule IdleScheduleCreatesBoundedCoalescedObligation {
     requires: exists WakeObservationInboxItem{
         binding: WakeWorkflowBinding{conversation: conversation}, consumed_at: null
     }
+    requires: existing_owed_wake_obligation(conversation) = null
 
     let upper_bound = snapshot_upper_bound(conversation)
     let eligible = undelivered_items_through(conversation, upper_bound)
@@ -440,10 +501,21 @@ rule IdleScheduleCreatesBoundedCoalescedObligation {
     ensures: WakeRuntimeObligation.created(
         id: obligation_id, conversation: conversation,
         payload: exact_acceptance_payload(conversation, batch, upper_bound),
-        status: owed, created_at: now()
+        owed_acceptance: dwf/OwedAcceptance{id: obligation_id}, created_at: now()
     )
     ensures: count(batch) >= 1
     ensures: count(batch) <= config.max_acceptance_batch_items
+    ensures: AtMostOneOwedWakeRuntimeObligation(conversation)
+}
+
+rule DuplicateIdleScheduleReusesExistingOwedObligation {
+    when: WakeInboxSchedulingRequested(conversation)
+    requires: conversation_runtime_idle(conversation)
+    requires: exists WakeObservationInboxItem{
+        binding: WakeWorkflowBinding{conversation: conversation}, consumed_at: null
+    }
+    requires: existing_owed_wake_obligation(conversation) != null
+    ensures: owed_items_remain_durable(conversation)
     ensures: AtMostOneOwedWakeRuntimeObligation(conversation)
 }
 
@@ -457,11 +529,11 @@ rule BusyScheduleLeavesDeliveryOwed {
 
 rule RuntimeAcceptanceScheduleIsAtomic {
     when: WakeRuntimeAcceptanceRequested(runtime, obligation)
-    requires: obligation.status = owed
+    requires: obligation.owed_acceptance.status = owed
     requires: conversation_runtime_idle(obligation.conversation)
+    requires: obligation.owed_acceptance.reducer_inbox = obligation_payload_inbox(obligation)
     ensures: accepting_llm_requesting_persisted_atomically(obligation)
-    ensures: obligation.status = accepted
-    ensures: obligation.accepted_at = now()
+    ensures: obligation.owed_acceptance.status = accepted
     ensures: WakeObservationInboxItemsConsumedExactly(obligation.payload.items)
     ensures: later_items_excluded_from(obligation)
     ensures: LlmInvocationPermittedAfterCommit(obligation.conversation)
@@ -469,7 +541,7 @@ rule RuntimeAcceptanceScheduleIsAtomic {
 
 rule DuplicateRuntimeAcceptanceStartsNothing {
     when: WakeRuntimeAcceptanceRequested(runtime, obligation)
-    requires: obligation.status in {accepted, suppressed}
+    requires: obligation.owed_acceptance.status in {accepted, suppressed}
     ensures: duplicate_acceptance_starts_no_llm(obligation)
 }
 
@@ -575,6 +647,7 @@ surface WakeEffectSurface {
     provides:
         WakeTerminalEvidenceObserved(adapter, binding, evidence)
         WakeDeadlineDue(adapter, binding, now)
+        WakeStartupReconciliationRequested(adapter, binding)
 }
 
 surface WakeReducerSurface {
@@ -663,6 +736,10 @@ invariant BusyWakeRemainsOwed {
 
 invariant LlmRequestingAndAcceptanceAreAtomic {
     no_llm_invocation_can_begin_without_the_exact_obligation_and_llm_requesting_state_committed_together
+}
+
+invariant OwedAcceptanceHasSingleWritableAuthority {
+    wake_runtime_acceptance_status_is_written_only_through_dwf_owed_acceptance
 }
 
 invariant ContinuationTransfersOnlyOutstandingSemanticWork {

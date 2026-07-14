@@ -175,23 +175,27 @@ mirrors the existing bash `reaper.rs` and tmux registry patterns.
 
 ---
 
-### REQ-WAKE-004: `is_busy()` Derivation
+### REQ-WAKE-004: Pending-Wake Lifecycle Guard
 
-THE conversation `is_busy()` derivation SHALL return true when the
-conversation has at least one pending wake contract
+THE conversation `is_busy()` derivation SHALL remain unchanged by pending wake
+contracts alone
 
-WHEN `is_busy()` would otherwise return false (state == Idle) AND
+WHEN a conversation would otherwise remain idle AND
 `has_pending_wake_contracts(conv)` is true
-THE SYSTEM SHALL return true
+THE SYSTEM SHALL keep runtime busy/idle semantics unchanged and SHALL instead
+expose the pending wake through wake-specific presentation detail, capability
+guards, and lifecycle conflict checks driven directly by the pending-wake
+lifecycle
 
-**Rationale:** Pit-of-success at the lifecycle boundary. Archive,
-hard-delete, abandon, and mark-merged today all check `is_busy()`
-before proceeding. A conversation with pending wake contracts that
-returned `false` from `is_busy()` would be silently archive-able,
-which would mean either (a) the cascade silently cancels contracts
-the user did not know existed, or (b) the contracts orphan. Neither
-is acceptable. The is_busy() augmentation is a single SQLite count
-query on `wake_contracts WHERE conv_id = ? AND status = pending`.
+Archive, hard-delete, abandon, mark-merged, and any equivalent destructive
+lifecycle operation SHALL query pending wake contracts directly and SHALL reject
+or serialize the lifecycle transition until those contracts are resolved
+
+**Rationale:** Wake waits are runtime-owned obligations, not proof that the LLM
+is actively executing. Fabricating `is_busy()` would create a duplicate semantic
+state alongside the durable wake rows and would misrepresent an otherwise idle
+conversation. Lifecycle safety still matters, so the pit-of-success guard moves
+to an explicit pending-wake conflict check rather than overloading runtime busy.
 
 ---
 

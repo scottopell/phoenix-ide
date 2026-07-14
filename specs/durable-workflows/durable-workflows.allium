@@ -158,12 +158,12 @@ value TransitionPlan {
     snapshot_payload: String
     event_codec: CodecRef
     event_payload: String
-    effects: EffectDeclaration
-    dependencies: DependencyDeclaration
-    barriers: BarrierDeclaration
-    barrier_members: BarrierMemberDeclaration
-    invalidations: EffectInvalidationDeclaration
-    owed_acceptances: OwedAcceptanceDeclaration
+    effects: List<EffectDeclaration>
+    dependencies: List<DependencyDeclaration>
+    barriers: List<BarrierDeclaration>
+    barrier_members: List<BarrierMemberDeclaration>
+    invalidations: List<EffectInvalidationDeclaration>
+    owed_acceptances: List<OwedAcceptanceDeclaration>
 }
 
 value ReducerDecision {
@@ -221,10 +221,11 @@ entity DrainProof {
 }
 
 entity ExternalAcceptanceBinding {
-    selection: ProfileProtocolSelection
+    profile: ProfileRef
     authority_scope: String
     idempotency_key: String
     intent_fingerprint: String
+    selected_protocol: ProfileProtocolSelection
     workflow: Workflow
     receipt: ExternalAcceptanceReceipt
     accepted_at: Timestamp
@@ -240,7 +241,7 @@ entity InboxConsumerDisposition {
 entity Workflow {
     id: String
     profile: ProfileRef
-    authority: SemanticAuthority
+    authority: SemanticAuthority? when execution_mode = authoritative
     execution_mode: ExecutionMode
     authoritative_workflow: Workflow? when execution_mode = shadow
     protocol_selection: ProfileProtocolSelection
@@ -371,6 +372,7 @@ entity Barrier {
 entity BarrierMember {
     barrier: Barrier
     effect: Effect
+    receipt_family: ReceiptFamily
 }
 
 entity ReducerInbox {
@@ -450,8 +452,9 @@ entity ShadowDivergence {
 -- next_shadow_divergence_id(), next_drain_proof_id(), opaque_claim_token()
 -- profile_registered(profile), profile_accepting_new_work(profile)
 -- profile_declares_external_acceptance(profile)
--- external_acceptance_binding_exists(selection, authority_scope, idempotency_key)
--- external_acceptance_binding(selection, authority_scope, idempotency_key)
+-- selector_cutover_authorized(selection), selector_has_no_blocking_divergence(selection)
+-- external_acceptance_binding_exists(profile, authority_scope, idempotency_key)
+-- external_acceptance_binding(profile, authority_scope, idempotency_key)
 -- external_acceptance_receipt(request, workflow): ExternalAcceptanceReceipt
 -- accepted_workflow(), no_additional_workflow_created_for(binding)
 -- profile_has_lossless_decoder(profile, codec), profile_executor_available(profile)
@@ -474,6 +477,7 @@ entity ShadowDivergence {
 -- capabilities_for(workflow), capability_allowed(workflow, capability)
 -- earliest_durable_deadline(), due_or_abandoned_effects(now)
 -- retry_deadline_for(effect, decision), claim_is_expired(claim)
+-- begun_attempt_count(effect), claim_row_matches_authority(effect, authority)
 -- ambiguity_recovery_allowed(effect, decision)
 -- cancellation_plan_complete(workflow, plan), deletion_plan_complete(workflow, plan)
 -- prior_generation_claims_revoked(workflow), incompatible_effects_invalidated(workflow)
@@ -481,6 +485,7 @@ entity ShadowDivergence {
 -- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
+-- committed_transition_for_decision(workflow, decision)
 -- consumer_is_independent_from_reducer_and_runtime(consumer), consumer_kind(consumer)
 -- disposition_consumed_at(status), reducer_inbox_delivery_unchanged(inbox)
 -- runtime_acceptance_unchanged(inbox)
@@ -516,6 +521,8 @@ rule SelectProfileProtocolForAcceptance {
     when: ProfileAcceptanceSelectionRequested(registry, selection)
     requires: selection.accepting = false
     requires: profile_executor_and_codecs_available(selection)
+    requires: selector_cutover_authorized(selection)
+    requires: selector_has_no_blocking_divergence(selection)
     ensures: ExactlyOneAcceptingSelectionPersistedAtomically(selection.profile, selection)
 }
 
@@ -543,6 +550,9 @@ rule ProduceProtocolDrainProof {
 rule RetireProtocolOnlyAfterCompleteZeroDrainProof {
     when: ProtocolRetirementRequested(operator, selection, proof)
     requires: proof.selection = selection
+    requires: selection.accepting = false
+    requires: proof.query_identity = drain_query_identity(selection)
+    requires: proof.query_version = drain_query_version(selection)
     requires: proof.complete = true
     requires: every_drain_category_is_zero(proof.evidence)
     ensures: ProfileProtocolRetirementPermitted(selection)
@@ -561,8 +571,7 @@ rule AcceptWorkflow {
 
     let selection = accepting_selection_for(profile)
     requires: selection.accepting = true
-    requires: execution_mode in {authoritative, shadow}
-    requires: execution_mode = authoritative or authoritative_workflow != null
+    requires: execution_mode = authoritative
     requires: profile_has_lossless_decoder(profile, snapshot_codec)
     requires: profile_executor_available(profile)
 
@@ -570,7 +579,36 @@ rule AcceptWorkflow {
         id: next_workflow_id(),
         profile: profile,
         authority: selection.authority,
-        execution_mode: execution_mode,
+        execution_mode: authoritative,
+        authoritative_workflow: null,
+        protocol_selection: selection,
+        version: 0,
+        generation: 0,
+        status: active,
+        snapshot_codec: snapshot_codec,
+        snapshot_payload: snapshot_payload,
+        accepted_at: now()
+    )
+    ensures: AcceptanceOutcome(accepted)
+}
+
+rule AcceptShadowWorkflow {
+    when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
+
+    let selection = latest_registered_selection_for(profile, engine_protocol)
+    requires: execution_mode = shadow
+    requires: authoritative_workflow != null
+    requires: authoritative_workflow.profile = profile
+    requires: authoritative_workflow.execution_mode = authoritative
+    requires: authoritative_workflow.authority = legacy_protocol
+    requires: profile_has_lossless_decoder(profile, snapshot_codec)
+    requires: profile_executor_available(profile)
+
+    ensures: Workflow.created(
+        id: next_workflow_id(),
+        profile: profile,
+        authority: null,
+        execution_mode: shadow,
         authoritative_workflow: authoritative_workflow,
         protocol_selection: selection,
         version: 0,
@@ -588,7 +626,7 @@ rule AcceptExternallyRetryableWorkflow {
     let selection = accepting_selection_for(request.profile)
     requires: selection.accepting = true
     requires: selection.external_acceptance_enabled = true
-    requires: not external_acceptance_binding_exists(selection, request.authority_scope, request.idempotency_key)
+    requires: not external_acceptance_binding_exists(request.profile, request.authority_scope, request.idempotency_key)
     requires: profile_has_lossless_decoder(request.profile, request.snapshot_codec)
     ensures: Workflow.created(
         id: next_workflow_id(), profile: request.profile,
@@ -599,9 +637,11 @@ rule AcceptExternallyRetryableWorkflow {
         snapshot_payload: request.snapshot_payload, accepted_at: now()
     )
     ensures: ExternalAcceptanceBinding.created(
-        selection: selection, authority_scope: request.authority_scope,
+        profile: request.profile,
+        authority_scope: request.authority_scope,
         idempotency_key: request.idempotency_key,
         intent_fingerprint: request.intent_fingerprint,
+        selected_protocol: selection,
         workflow: accepted_workflow(), receipt: external_acceptance_receipt(request, accepted_workflow()),
         accepted_at: now()
     )
@@ -610,8 +650,7 @@ rule AcceptExternallyRetryableWorkflow {
 
 rule ReplayExternallyRetryableAcceptance {
     when: ExternalWorkflowAcceptanceRequested(client, request)
-    let selection = accepting_selection_for(request.profile)
-    let binding = external_acceptance_binding(selection, request.authority_scope, request.idempotency_key)
+    let binding = external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key)
     requires: binding != null
     requires: binding.intent_fingerprint = request.intent_fingerprint
     ensures: ExternalAcceptanceOutcome(binding.receipt)
@@ -620,12 +659,18 @@ rule ReplayExternallyRetryableAcceptance {
 
 rule RejectConflictingExternalAcceptanceKey {
     when: ExternalWorkflowAcceptanceRequested(client, request)
-    let selection = accepting_selection_for(request.profile)
-    let binding = external_acceptance_binding(selection, request.authority_scope, request.idempotency_key)
+    let binding = external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key)
     requires: binding != null
     requires: binding.intent_fingerprint != request.intent_fingerprint
     ensures: ExternalAcceptanceConflict(request.idempotency_key)
     ensures: no_additional_workflow_created_for(binding)
+}
+
+rule RejectUnsupportedExternalAcceptanceCodec {
+    when: ExternalWorkflowAcceptanceRequested(client, request)
+    requires: not profile_has_lossless_decoder(request.profile, request.snapshot_codec)
+    ensures: ExternalAcceptanceOutcome(unsupported_codec)
+    ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
 }
 
 rule RejectUnsupportedWorkflowCodec {
@@ -683,6 +728,7 @@ rule RejectStaleReducerPlan {
 
 rule RejectInvalidReducerPlan {
     when: ReducerPlanCommitRequested(reducer, workflow, decision)
+    requires: decision.expected_workflow_version = workflow.version
     requires: not plan_codecs_supported(workflow.profile, decision.plan)
         or not plan_is_complete(decision.plan)
         or not plan_effect_ids_unique(decision.plan)
@@ -740,6 +786,18 @@ rule RejectIneligibleClaim {
     ensures: not Claim.created(effect: effect, issued_at: now())
 }
 
+rule RejectUnclaimableEligibleEffect {
+    when: EffectClaimRequested(worker, effect, lease_until)
+    requires: effect.status = eligible
+    requires: effect.generation = effect.workflow.generation
+    requires: effect.workflow.authority = engine_protocol and effect.workflow.execution_mode = authoritative
+    requires: lease_until <= now()
+        or not effect_family_policy_registered_exactly_once(effect)
+        or not profile_has_lossless_decoder(effect.workflow.profile, effect.codec)
+    ensures: EffectClaimOutcome(unsupported_codec)
+    ensures: not Claim.created(effect: effect, issued_at: now())
+}
+
 rule RenewLiveClaim {
     when: ClaimRenewalRequested(worker, effect, authority, new_lease_until)
     requires: live_matching_authority(effect, authority)
@@ -765,7 +823,7 @@ rule BeginEffectAttempt {
         id: next_attempt_id(),
         effect: effect,
         claim: Claim{effect: effect},
-        ordinal: accepted_attempt_count(effect) + 1,
+        ordinal: begun_attempt_count(effect) + 1,
         status: begun,
         begun_at: now()
     )
@@ -795,6 +853,9 @@ rule RetainStaleObservationAsDiagnostic {
 rule AcceptTerminalReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
     requires: live_matching_authority(effect, authority)
+    requires: claim_row_matches_authority(effect, authority)
+    requires: attempt.effect = effect
+    requires: attempt.claim = Claim{effect: effect}
     requires: accepted_receipt_count(effect) = 0
     requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     requires: origin in {execution, adoption, reconciliation}
@@ -808,8 +869,9 @@ rule AcceptTerminalReceipt {
     ensures: attempt.status = receipt_accepted
     ensures: ReducerInbox.created(
         id: next_reducer_inbox_id(), workflow: effect.workflow,
-        receipt: Receipt{effect: effect}, event_codec: codec,
-        event_payload: reducer_event_for_receipt(Receipt{effect: effect})
+        receipt: Receipt{effect: effect}, barrier: null, event_codec: codec,
+        event_payload: reducer_event_for_receipt(Receipt{effect: effect}),
+        delivery_status: pending, consumed_by: null
     )
 }
 
@@ -817,7 +879,15 @@ rule RejectDuplicateOrStaleReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
     requires: not live_matching_authority(effect, authority)
         or accepted_receipt_count(effect) = 1
+    requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: TerminalReceiptOutcome(stale_or_duplicate)
+    ensures: accepted_receipt_count(effect) <= 1
+}
+
+rule RejectUnsupportedTerminalReceiptCodec {
+    when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: not profile_has_lossless_decoder(effect.workflow.profile, codec)
+    ensures: TerminalReceiptOutcome(unsupported_codec)
     ensures: accepted_receipt_count(effect) <= 1
 }
 
@@ -859,6 +929,8 @@ rule SchedulerDiscoversDurableWork {
 rule ExpiredClaimPermitsTakeover {
     when: EffectTakeoverRequested(worker, effect, expired_claim, lease_until)
     requires: effect.status = claimed
+    requires: expired_claim.effect = effect
+    requires: expired_claim = Claim{effect: effect}
     requires: claim_is_expired(expired_claim)
     requires: effect.generation = effect.workflow.generation
     requires: lease_until > now()
@@ -870,6 +942,7 @@ rule ExpiredClaimPermitsTakeover {
 rule CancelWorkflow {
     when: WorkflowCancellationRequested(client, workflow, decision)
     requires: workflow.status = active
+    requires: workflow.authority = engine_protocol and workflow.execution_mode = authoritative
     requires: decision.expected_workflow_version = workflow.version
     requires: cancellation_plan_complete(workflow, decision.plan)
     ensures: workflow.generation = workflow.generation + 1
@@ -883,6 +956,7 @@ rule CancelWorkflow {
 rule DeleteWorkflow {
     when: WorkflowDeletionRequested(client, workflow, decision)
     requires: workflow.status in {active, cancelling, cancelled, failed}
+    requires: workflow.authority = engine_protocol and workflow.execution_mode = authoritative
     requires: decision.expected_workflow_version = workflow.version
     requires: deletion_plan_complete(workflow, decision.plan)
     ensures: workflow.generation = workflow.generation + 1
@@ -906,11 +980,18 @@ rule CommitManualResolution {
     ensures: resolution.resolved_by = operator
     ensures: Receipt.created(
         id: next_receipt_id(), effect: resolution.effect,
-        codec: choice.codec, payload: choice.payload,
+        attempt: null, codec: choice.codec, payload: choice.payload,
         origin: manual, accepted_at: now(),
         generation: resolution.workflow.generation
     )
     ensures: resolution.effect.status = receipted
+    ensures: ReducerInbox.created(
+        id: next_reducer_inbox_id(), workflow: resolution.workflow,
+        receipt: Receipt{effect: resolution.effect}, barrier: null,
+        event_codec: choice.codec,
+        event_payload: reducer_event_for_receipt(Receipt{effect: resolution.effect}),
+        delivery_status: pending, consumed_by: null
+    )
     ensures: ManualResolutionAudited(resolution)
 }
 
@@ -934,8 +1015,9 @@ rule SatisfyCompletionBarrier {
     ensures: barrier.satisfied_at = now()
     ensures: ReducerInbox.created(
         id: next_reducer_inbox_id(), workflow: barrier.workflow,
-        barrier: barrier, event_codec: barrier_event_codec(barrier),
-        event_payload: reducer_event_for_barrier(barrier)
+        receipt: null, barrier: barrier, event_codec: barrier_event_codec(barrier),
+        event_payload: reducer_event_for_barrier(barrier),
+        delivery_status: pending, consumed_by: null
     )
     ensures: not ProductCompletionPublishedByEngine(barrier.workflow)
 }
@@ -946,9 +1028,11 @@ rule ReducerAcceptsInboxEvent {
     requires: inbox.delivery_status = pending
     requires: decision.expected_workflow_version = inbox.workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
+    requires: committed_transition_for_decision(inbox.workflow, decision) = null
     ensures: ReducerPlanCommitRequested(reducer, inbox.workflow, decision)
+    ensures: committed_transition_for_decision(inbox.workflow, decision) != null
     ensures: inbox.delivery_status = consumed
-    ensures: inbox.consumed_by = latest_transition(inbox.workflow)
+    ensures: inbox.consumed_by = committed_transition_for_decision(inbox.workflow, decision)
 }
 
 rule RuntimeAcceptsOwedAcceptance {
@@ -956,10 +1040,20 @@ rule RuntimeAcceptsOwedAcceptance {
     requires: owed.status = owed
     requires: decision.expected_workflow_version = owed.workflow.version
     requires: capability_allowed(owed.workflow, runtime_start)
-    ensures: RuntimeProductStateAndReducerPlanPersistedAtomically(owed.workflow, decision)
+    requires: reducer_decision_is_product_authoritative(decision)
+    requires: plan_codecs_supported(owed.workflow.profile, decision.plan)
+    requires: plan_is_complete(decision.plan)
+    requires: plan_effect_ids_unique(decision.plan)
+    requires: plan_barrier_ids_unique(decision.plan)
+    requires: plan_references_only_declared_effects(decision.plan)
+    requires: plan_dependency_graph_acyclic(decision.plan)
+    requires: plan_barriers_have_only_required_members(decision.plan)
+    requires: committed_transition_for_decision(owed.workflow, decision) = null
+    ensures: ReducerPlanCommitRequested(runtime, owed.workflow, decision)
+    ensures: committed_transition_for_decision(owed.workflow, decision) != null
     ensures: runtime_acceptance_state_persisted(owed.workflow, owed.reducer_inbox)
     ensures: owed.status = accepted
-    ensures: owed.accepting_transition = latest_transition(owed.workflow)
+    ensures: owed.accepting_transition = committed_transition_for_decision(owed.workflow, decision)
 }
 
 rule DuplicateRuntimeAcceptanceIsIdempotent {
@@ -1008,6 +1102,21 @@ rule RecordShadowDivergence {
         recorded_at: now()
     )
     ensures: shadow_has_no_execution_authority(shadow)
+}
+
+rule BlockingShadowDivergenceHaltsAcceptance {
+    when: ShadowComparisonCompleted(shadow, authoritative_workflow, kind, profile_detail_kind,
+                                    expected_codec, expected_payload,
+                                    actual_codec, actual_payload)
+    let selection = shadow.protocol_selection
+    requires: shadow.execution_mode = shadow
+    requires: expected_payload != actual_payload or expected_codec != actual_codec
+    requires: divergence_severity(kind) = blocking
+    requires: selection.authority = engine_protocol
+    requires: selection.accepting = true
+    ensures: selection.accepting = false
+    ensures: selection.drained_at = now()
+    ensures: ProfileAcceptanceClosedAtomically(selection)
 }
 
 ------------------------------------------------------------

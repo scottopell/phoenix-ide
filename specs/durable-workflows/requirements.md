@@ -317,15 +317,17 @@ shown diagnostically but SHALL NOT alter product meaning.
 WHEN a profile permits acceptance requests to be retried across a client-server
 boundary
 THE profile SHALL require a client-supplied stable idempotency key, atomically
-bind that key to exactly one accepted workflow, and return a typed acceptance
-receipt that echoes the key and identifies the durable workflow or product handle
-the client can observe.
+bind that key under the accepting profile plus client authority scope to exactly
+one accepted workflow, and return a typed acceptance receipt that echoes the key
+and identifies the durable workflow or product handle the client can observe.
 
-A retry with the same profile, authority scope, and idempotency key SHALL return
-the same acceptance receipt without creating another workflow or repeating
-acceptance effects. A conflicting request that reuses the key for different
-intent SHALL be rejected. Profiles without an externally retryable acceptance
-boundary SHALL omit this capability rather than fabricate a key.
+The accepted protocol selection MAY be retained as replay evidence, but selector
+roll-forward, rollback, or drain SHALL NOT change the binding key. A retry with
+the same profile, authority scope, and idempotency key SHALL return the same
+acceptance receipt without creating another workflow or repeating acceptance
+effects. A conflicting request that reuses the key for different intent SHALL be
+rejected. Profiles without an externally retryable acceptance boundary SHALL omit
+this capability rather than fabricate a key.
 
 ### REQ-DWF-030: Cross-Client Projection Parity
 
@@ -339,7 +341,8 @@ Equivalent accepted intent SHALL produce equivalent visible state,
 presentation detail, capabilities, and terminal meaning on every supported
 client surface. A conversation holding pending wake obligations SHALL remain
 runtime-idle when otherwise idle and SHALL expose those obligations through
-presentation detail and capabilities rather than a fabricated busy state.
+presentation detail, capability guards, and lifecycle conflict surfaces rather
+than a fabricated busy state.
 
 ### REQ-DWF-031: Independent Inbox Consumers
 
@@ -380,7 +383,11 @@ tool round SHALL persist normally, and the later terminal outcome SHALL be a
 runtime observation correlated by contract identity, never a delayed tool result.
 
 Registration SHALL preserve the timeout range, WorkScope authorization, and
-receipt shape required by `specs/wake-contracts/requirements.md`.
+receipt shape required by `specs/wake-contracts/requirements.md`. It SHALL
+reject registration with a typed rejection when the requested timeout is out of
+range, when the conversation is archived or terminal, when the shared
+registration/lifecycle fence is closed, or when the wake profile selector is not
+accepting new authoritative wake work.
 
 ### REQ-DWF-WAKE-002: Terminal Evidence and Deadline Precedence
 
@@ -392,20 +399,29 @@ window identity.
 Durable terminal evidence with occurrence time at or before `expires_at` SHALL
 win over later scheduler observation. In the absence of such evidence, an
 evaluable handle at or after the deadline SHALL map to `Expired`, and an
-unevaluable handle SHALL map to `Forgotten`. Each accepted contract SHALL yield
-exactly one terminal receipt.
+unevaluable handle SHALL map to `Forgotten` using the contract-compatible
+forgotten reasons refined by `specs/wake-contracts/requirements.md`. Startup
+reconciliation SHALL forget an unrecoverable non-terminal wake before normal
+serving resumes rather than waiting for the original deadline. Each accepted
+contract SHALL yield exactly one terminal receipt.
 
 ### REQ-DWF-WAKE-003: Delivery, Coalescing, and Acceptance
 
 A wake terminal receipt SHALL enter the existing product reducer, which SHALL
-materialize one durable inbox observation per contract. Auto-resuming observations
+materialize exactly one durable inbox observation per contract receipt. Replayed,
+duplicated, or restarted reducer delivery of the same accepted receipt SHALL
+reuse that observation rather than append another one. Auto-resuming observations
 for an idle conversation SHALL be coalesced in committed order into a bounded
-runtime-acceptance obligation; busy arrivals SHALL remain owed without overlapping
-LLM requests.
+runtime-acceptance obligation; while that obligation remains owed, duplicate kicks
+or restart recovery SHALL preserve the same owed acceptance rather than creating
+another one. Busy arrivals SHALL remain owed without overlapping LLM requests.
 
 Runtime acceptance SHALL atomically persist the accepting `LlmRequesting` product
-state and accept the exact obligation before invoking the LLM. Items committed
-after the accepted snapshot SHALL remain for a later batch.
+state and accept the exact obligation before invoking the LLM. The owed/accepted
+lifecycle for that runtime-start boundary SHALL have one writable authority,
+using the core durable-workflows owed-acceptance record rather than a profile-local
+parallel status. Items committed after the accepted snapshot SHALL remain for a
+later batch.
 
 ### REQ-DWF-WAKE-004: Wake Cancellation and Lifecycle
 
