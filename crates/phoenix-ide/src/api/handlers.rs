@@ -2138,6 +2138,15 @@ enum StreamDbMessageSelection {
     None,
 }
 
+impl StreamDbMessageSelection {
+    fn message_snapshot(self) -> crate::runtime::MessageSnapshotMode {
+        match self {
+            Self::Full => crate::runtime::MessageSnapshotMode::Full,
+            Self::AfterFloor(_) | Self::None => crate::runtime::MessageSnapshotMode::Suffix,
+        }
+    }
+}
+
 const STREAM_LAST_SEQUENCE_READ_FAILED: &str = "stream_last_sequence_read_failed";
 
 fn stream_last_sequence_read_failed(
@@ -3218,6 +3227,7 @@ async fn stream_conversation(
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
+        message_snapshot: db_message_selection.message_snapshot(),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -6511,6 +6521,7 @@ async fn shared_sse_stream(
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
+        message_snapshot: crate::runtime::MessageSnapshotMode::Full,
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -8864,6 +8875,22 @@ pub(crate) mod hard_delete_cascade_tests {
             SseEvent::Token { text, .. } => assert_eq!(text, "token-b"),
             other => panic!("expected token replay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn db_message_selection_advertises_authoritative_snapshot_mode() {
+        assert!(matches!(
+            StreamDbMessageSelection::Full.message_snapshot(),
+            crate::runtime::MessageSnapshotMode::Full
+        ));
+        assert!(matches!(
+            StreamDbMessageSelection::AfterFloor(7).message_snapshot(),
+            crate::runtime::MessageSnapshotMode::Suffix
+        ));
+        assert!(matches!(
+            StreamDbMessageSelection::None.message_snapshot(),
+            crate::runtime::MessageSnapshotMode::Suffix
+        ));
     }
 
     #[test]

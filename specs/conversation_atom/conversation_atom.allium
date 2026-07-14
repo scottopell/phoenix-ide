@@ -203,7 +203,7 @@ rule SseInitFreshConnect {
     -- payload.pending_anchor_sequence_id (NOT payload.last_sequence_id)
     -- so the per-event rules below can apply each pending entry via
     -- their normal applyIfNewer guard.
-    ensures: atom.messages = payload.messages
+    ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
     ensures: atom.phase = payload.phase
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
@@ -241,10 +241,11 @@ rule SseInitFreshConnect {
         -- cause every pending entry to be dropped as a replay.
 }
 
--- `init` on reconnect: merge by message_id, then apply pending
--- events the same way SseInitFreshConnect does. The merge captures
--- mutations that happened while disconnected; pending replay restores
--- the in-flight UI state for the active turn (if any).
+-- `init` on reconnect: reconcile messages according to the server-declared
+-- snapshot mode, then apply pending events the same way SseInitFreshConnect
+-- does. A suffix merges with generation-matched local messages; a full
+-- snapshot replaces them. Pending replay restores the in-flight UI state
+-- for the active turn (if any).
 --
 -- Unlike fresh-connect, the atom's pre-existing lastSequenceId may
 -- already be above the snapshot's pending_anchor. In that case the
@@ -268,7 +269,7 @@ rule SseInitReconnectMerge {
     -- because the cleared buffer cannot be rebuilt from already-
     -- observed tokens). Cleared when payload.phase is anything
     -- else, because the turn ended while disconnected.
-    ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
+    ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
     ensures: atom.phase = payload.phase
     ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
     ensures: atom.uiError = null
@@ -306,15 +307,16 @@ rule SseInitReconnectMerge {
         -- (at seqs above the new tip) append onto, producing a gapped
         -- and corrupted message. Truncated → fall back to DB-only.
         --
-        -- merge_by_id (ui/src/conversation/atom.ts:sse_init case):
-        --   1. Build a Map<message_id, Message> from payload.messages.
-        --   2. For each existing m in atom.messages: replace with the
-        --      incoming version if present, else keep as-is.
-        --   3. Filter payload.messages for entries whose message_id is
-        --      not already in atom.messages (genuinely new messages).
-        --   4. Concatenate (replaced ++ appended).
-        -- The merge is what lets a reconnect after a broadcast-lag close
-        -- resurrect messages that were lost to the silent-drop window.
+        -- reconcile_snapshot(existing, incoming, mode, localGeneration,
+        --                    incomingGeneration):
+        --   if mode = suffix and localGeneration = incomingGeneration
+        --     then merge incoming into existing by message_id/sequence_id
+        --     else replace existing with incoming
+        --   sort the result by sequence_id
+        -- Full mode is server-authoritative even on reconnect: retaining
+        -- local-only rows would preserve stale transcript state after a
+        -- generation fallback. Suffix mode merges only when both sides prove
+        -- they describe the same transcript generation.
         --
         -- payload.pending_events: the ReplayRing contents at subscribe
         -- time. Carries events the server emitted since the last

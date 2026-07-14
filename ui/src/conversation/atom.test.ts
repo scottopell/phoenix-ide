@@ -56,6 +56,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
+    messageSnapshot: 'full',
     ...overrides,
   };
 }
@@ -88,15 +89,38 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastAppliedEventSeq: 3,
         messages: [existing],
+        transcriptGeneration: 1,
       };
       const newMsg = makeMessage(4);
-      const payload = makeInitPayload({ messages: [newMsg], lastAppliedEventSeq: 4 });
+      const payload = makeInitPayload({
+        messages: [newMsg],
+        lastAppliedEventSeq: 4,
+        messageSnapshot: 'suffix',
+      });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages).toHaveLength(2);
       expect(next.messages[0]!.sequence_id).toBe(3);
       expect(next.messages[1]!.sequence_id).toBe(4);
+    });
+
+    it('replaces and sorts a full snapshot on reconnect', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 10,
+        messages: [makeMessage(3), makeMessage(99)],
+        transcriptGeneration: 1,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(2), makeMessage(1)],
+        lastAppliedEventSeq: 10,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2]);
     });
 
     it('replaces messages on fresh connect (lastAppliedEventSeq = 0)', () => {
@@ -1173,6 +1197,29 @@ describe('conversationReducer', () => {
       expect(withPending.transcriptGeneration).toBe(12);
     });
 
+    it('replayed message_updated advances transcript generation', () => {
+      const target = makeMessage(1);
+      const payload = makeInitPayload({
+        messages: [target],
+        transcriptGeneration: 4,
+        lastAppliedEventSeq: 12,
+        pendingAnchorSequenceId: 11,
+        pendingEvents: [{
+          type: 'message_updated',
+          sequence_id: 12,
+          message_id: target.message_id,
+          transcript_generation: 5,
+          display_data: { replayed: true },
+          content: null,
+        }],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.transcriptGeneration).toBe(5);
+      expect(next.messages[0]!.display_data).toEqual({ replayed: true });
+    });
+
     it('merges durationMs into display_data, preserving existing keys', () => {
       const original: Message = {
         ...makeMessage(5),
@@ -2224,6 +2271,37 @@ describe('conversationReducer', () => {
 
       expect(next.messages[0]).toEqual(restMessage);
       expect(next.pendingMessagePatches).toEqual({});
+    });
+
+    it('merge_conversation_data applies a deferred patch when history materializes its target', () => {
+      const target = makeMessage(1, { display_data: { base: true } });
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        pendingMessagePatches: {
+          [target.message_id]: {
+            lastAppliedPatchEventSeq: 0,
+            patches: [{ eventSeq: 9, displayData: { duration_ms: 321 } }],
+          },
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [target],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 8,
+      });
+
+      expect(next.messages[0]!.display_data).toEqual({ base: true, duration_ms: 321 });
+      expect(next.pendingMessagePatches[target.message_id]).toEqual({
+        lastAppliedPatchEventSeq: 9,
+        patches: [],
+      });
     });
 
     it('merge_conversation_data preserves live conversation metadata over older REST rows', () => {

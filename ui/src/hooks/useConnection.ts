@@ -171,7 +171,7 @@ function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, ini
     : `/api/conversations/${conversationId}/stream`;
 }
 
-function transformInitData(raw: SseInitData, requestMode?: InitialSseRequestMode): InitPayload {
+function transformInitData(raw: SseInitData): InitPayload {
   const conversation = raw.project_name != null
     ? { ...raw.conversation, project_name: raw.project_name }
     : raw.conversation;
@@ -190,10 +190,7 @@ function transformInitData(raw: SseInitData, requestMode?: InitialSseRequestMode
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
-    messageSnapshot: requestMode?.kind === 'messages_after_floor'
-      && requestMode.transcriptGeneration === raw.transcript_generation
-      ? 'suffix'
-      : 'full',
+    messageSnapshot: raw.message_snapshot,
   };
 }
 
@@ -332,7 +329,7 @@ export function useConnection({
             if (!res.ok) return;
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
-            const payload = transformInitData(res.data, initialRequestMode);
+            const payload = transformInitData(res.data);
             latestConversationRef.current = payload.conversation;
             latestPhaseRef.current = payload.phase;
             stampedDispatch({

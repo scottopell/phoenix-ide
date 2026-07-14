@@ -99,6 +99,7 @@ function makeInitPayload(convId: string, slug: string) {
       message_count: 0,
       transcript_generation: 1,
     },
+    message_snapshot: 'full',
     messages: [],
     agent_working: false,
     last_sequence_id: 0,
@@ -138,6 +139,28 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(FakeEventSource.instances[0]!.url).toBe(
       '/api/conversations/conv-A/stream?after_event_sequence=42',
     );
+  });
+
+  it('uses the server snapshot mode when a requested suffix falls back to full', () => {
+    const captured: SSEAction[] = [];
+    const dispatch = (action: SSEAction) => captured.push(action);
+
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
+    }));
+
+    act(() => {
+      FakeEventSource.instances[0]!.emit('init', {
+        ...makeInitPayload('conv-A', 'slug-A'),
+        transcript_generation: 4,
+        message_snapshot: 'full',
+      });
+    });
+
+    const init = captured.find((action) => action.type === 'sse_init');
+    expect(init?.type === 'sse_init' ? init.payload.messageSnapshot : undefined).toBe('full');
   });
 
   it('uses demand-driven init query params before an event cursor exists', () => {

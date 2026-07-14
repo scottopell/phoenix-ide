@@ -574,6 +574,18 @@ function applyPendingMessagePatchesToMessage(
   };
 }
 
+function materializeMessages(atom: ConversationAtom, messages: Message[]): ConversationAtom {
+  let nextAtom = atom;
+  const materialized: Message[] = [];
+  for (const message of messages) {
+    let nextMessage = message;
+    ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
+    materialized.push(nextMessage);
+  }
+  materialized.sort((left, right) => left.sequence_id - right.sequence_id);
+  return withDerivedMessageSyncState(nextAtom, materialized);
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -892,6 +904,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_message_updated',
         sequenceId: data.sequence_id,
         messageId: data.message_id,
+        ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
         ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
         ...(data.content != null && { content: data.content as Message['content'] }),
         ...(data.duration_ms != null && { durationMs: data.duration_ms }),
@@ -1083,14 +1096,10 @@ export function conversationReducer(
         ? (knownGenerationMatches && hadMessagesBeforeInit ? atom.transcriptCoverage : 'tail')
         : 'complete';
       let mergedMessages: Message[];
-      if ((!isFreshConnect && !snapshotIsSuffix) || mergesMessageSuffix) {
-        const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
-        const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
-        const existingIds = new Set(atom.messages.map((m) => m.message_id));
-        const appended = p.messages.filter((m) => !existingIds.has(m.message_id));
-        mergedMessages = [...replaced, ...appended];
+      if (mergesMessageSuffix) {
+        mergedMessages = mergeMessagesByIdentity(atom.messages, p.messages);
       } else {
-        mergedMessages = p.messages;
+        mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);
       }
 
       const snapshotMessageAnchor = p.messages.reduce(
@@ -1166,6 +1175,8 @@ export function conversationReducer(
         // re-stamps it.
         turnRetryContext: null,
       };
+
+      next = materializeMessages(next, mergedMessages);
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
       // wire-format SseWireEvent; per-entry validation gates against the
@@ -1314,7 +1325,7 @@ export function conversationReducer(
       const conversation = atom.conversationLastAppliedEventSeq > action.snapshotStartedAtEventSeq && atom.conversation
         ? atom.conversation
         : action.conversation;
-      const merged: ConversationAtom = {
+      let merged: ConversationAtom = {
         ...atom,
         conversationId: action.conversationId,
         conversation,
@@ -1332,6 +1343,7 @@ export function conversationReducer(
         lastAppliedEventSeq,
         ...deriveMessageSyncState(messages),
       };
+      merged = materializeMessages(merged, messages);
       return lastAppliedEventSeq > atom.lastAppliedEventSeq ? drainBufferedEventEnvelopes(merged) : merged;
     }
 
