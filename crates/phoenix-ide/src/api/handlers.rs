@@ -3056,15 +3056,24 @@ async fn get_system_prompt(
     } else {
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
-    let system_prompt = crate::system_prompt::build_system_prompt(
-        &cwd,
-        &tasks_dir_name,
-        is_sub_agent,
-        Some(&mode_context),
-        conversation.llm_language,
-        persona.as_deref(),
-        explore_bash,
-    );
+    let system_prompt = if state
+        .db
+        .is_coordinator_conversation(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
+    } else {
+        crate::system_prompt::build_system_prompt(
+            &cwd,
+            &tasks_dir_name,
+            is_sub_agent,
+            Some(&mode_context),
+            conversation.llm_language,
+            persona.as_deref(),
+            explore_bash,
+        )
+    };
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }

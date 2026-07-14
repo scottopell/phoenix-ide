@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
@@ -159,6 +159,9 @@ pub struct RuntimeManager {
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
+    /// Serializes the slow runtime-construction path. Fast lookups remain
+    /// lock-free; eviction state therefore has exactly one consumer.
+    runtime_creation_lock: AsyncMutex<()>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1241,6 +1244,7 @@ impl RuntimeManager {
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
+            runtime_creation_lock: AsyncMutex::new(()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -2480,6 +2484,20 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
         // Check if already running
+        {
+            let runtimes = self.runtimes.read().await;
+            if let Some(handle) = runtimes.get(conversation_id) {
+                return Ok(ConversationHandle {
+                    event_tx: handle.event_tx.clone(),
+                    turn_trigger: handle.turn_trigger.clone(),
+                    broadcast_tx: handle.broadcast_tx.clone(),
+                    identity: handle.identity.clone(),
+                    state_rx: handle.state_rx.clone(),
+                });
+            }
+        }
+
+        let _creation_guard = self.runtime_creation_lock.lock().await;
         {
             let runtimes = self.runtimes.read().await;
             if let Some(handle) = runtimes.get(conversation_id) {

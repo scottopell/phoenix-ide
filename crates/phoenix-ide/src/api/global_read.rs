@@ -626,7 +626,10 @@ async fn resolve_conversation_read_target(
             message_id: message_id.map(str::to_string),
         });
     }
-    if let Some(rest) = reference.strip_prefix("/c/") {
+    if let Some(rest) = reference
+        .strip_prefix("/c/")
+        .or_else(|| reference.strip_prefix("/global/"))
+    {
         let (slug, fragment) = split_fragment(rest);
         let conv = load_conversation_by_slug_or_id(service, slug)
             .await
@@ -967,7 +970,10 @@ async fn resolve_reference_impl(
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
-    if let Some(rest) = reference.strip_prefix("/c/") {
+    if let Some(rest) = reference
+        .strip_prefix("/c/")
+        .or_else(|| reference.strip_prefix("/global/"))
+    {
         let (slug, fragment) = split_fragment(rest);
         let conv = load_conversation_by_slug_or_id(service, slug).await?;
         if let Some(message_id) = fragment.and_then(message_id_fragment) {
