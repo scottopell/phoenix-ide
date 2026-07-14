@@ -560,7 +560,10 @@ rule RetireProtocolOnlyAfterCompleteZeroDrainProof {
 
 rule RejectProtocolRetirementWithoutCompleteZeroDrainProof {
     when: ProtocolRetirementRequested(operator, selection, proof)
-    requires: proof.selection != selection or proof.complete = false
+    requires: proof.selection != selection
+        or proof.query_identity != drain_query_identity(selection)
+        or proof.query_version != drain_query_version(selection)
+        or proof.complete = false
         or not every_drain_category_is_zero(proof.evidence)
     ensures: ProfileProtocolRetirementRejected(selection)
     ensures: not ProfileProtocolRetirementPermitted(selection)
@@ -626,6 +629,7 @@ rule AcceptExternallyRetryableWorkflow {
     let selection = accepting_selection_for(request.profile)
     requires: selection.accepting = true
     requires: selection.external_acceptance_enabled = true
+    requires: profile_executor_available(request.profile)
     requires: not external_acceptance_binding_exists(request.profile, request.authority_scope, request.idempotency_key)
     requires: profile_has_lossless_decoder(request.profile, request.snapshot_codec)
     ensures: Workflow.created(
@@ -669,6 +673,16 @@ rule RejectConflictingExternalAcceptanceKey {
 rule RejectUnsupportedExternalAcceptanceCodec {
     when: ExternalWorkflowAcceptanceRequested(client, request)
     requires: not profile_has_lossless_decoder(request.profile, request.snapshot_codec)
+    ensures: ExternalAcceptanceOutcome(unsupported_codec)
+    ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
+}
+
+rule RejectUnavailableExternalAcceptance {
+    when: ExternalWorkflowAcceptanceRequested(client, request)
+    let selection = accepting_selection_for(request.profile)
+    requires: selection.accepting != true
+        or selection.external_acceptance_enabled != true
+        or not profile_executor_available(request.profile)
     ensures: ExternalAcceptanceOutcome(unsupported_codec)
     ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
 }
@@ -834,6 +848,8 @@ rule RecordAuthoritativeObservation {
     when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
     requires: live_matching_authority(effect, authority)
     requires: attempt.effect = effect
+    requires: attempt.claim = Claim{effect: effect}
+    requires: claim_row_matches_authority(effect, authority)
     requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: Observation.created(
         id: next_observation_id(), effect: effect, attempt: attempt,
@@ -848,6 +864,18 @@ rule RetainStaleObservationAsDiagnostic {
     requires: not live_matching_authority(effect, authority)
     ensures: StaleObservationEvidenceRetainedWhenUseful(effect, codec, payload, observed_at)
     ensures: stale_evidence_is_diagnostic_only(effect, authority)
+}
+
+rule RejectUnsupportedObservationCodec {
+    when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
+    requires: live_matching_authority(effect, authority)
+    requires: attempt.effect = effect
+    requires: attempt.claim = Claim{effect: effect}
+    requires: claim_row_matches_authority(effect, authority)
+    requires: not profile_has_lossless_decoder(effect.workflow.profile, codec)
+    ensures: ObservationOutcome(unsupported_codec)
+    ensures: not Observation.created(effect: effect, attempt: attempt, codec: codec)
+    ensures: attempt.status = begun
 }
 
 rule AcceptTerminalReceipt {
@@ -937,6 +965,16 @@ rule ExpiredClaimPermitsTakeover {
     ensures: expired_claim.revoked_at = now()
     ensures: effect.status = eligible
     ensures: TakeoverMustReconcileBeforeReplay(effect, effect.ambiguity_policy)
+}
+
+rule ExpiredClaimTakeoverReleasesPhysicalResourceLock {
+    when: EffectTakeoverRequested(worker, effect, expired_claim, lease_until)
+    requires: effect.status = claimed
+    requires: expired_claim.effect = effect
+    requires: expired_claim = Claim{effect: effect}
+    requires: claim_is_expired(expired_claim)
+    requires: effect.generation = effect.workflow.generation
+    ensures: ExpiredAuthorityOwnedLocksReleased(effect, expired_claim.authority)
 }
 
 rule CancelWorkflow {

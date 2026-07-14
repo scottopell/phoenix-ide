@@ -553,6 +553,11 @@ rule ContinuationScheduleTransfersOutstandingWakeWork {
     ensures: WakeInboxItemsTransferred(transferable_unconsumed_items(predecessor), successor,
         successor_safe_item_identity)
     ensures: WakeRuntimeObligationsTransferred(transferable_unaccepted_obligations(predecessor), successor)
+    ensures: TransferredWakeSemanticsAreDisjointAndExact(
+        transferable_unconsumed_items(predecessor),
+        transferable_unaccepted_obligations(predecessor),
+        successor
+    )
     ensures: transfer_is_atomic(predecessor, successor)
     ensures: predecessor_history_unchanged(predecessor)
     ensures: WakeRegistrationFenceClosed(predecessor)

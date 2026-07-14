@@ -667,25 +667,19 @@ rule PhoenixStartupResyncsContracts {
         -- evidence.
 }
 
--- REQ-WAKE-004: is_busy() consults the contract table.
-rule IsBusyConsultsContractTable {
+-- REQ-WAKE-004: pending wake obligations do not fabricate runtime busy state.
+rule PendingWakeLeavesRuntimeIdleSemanticsUnchanged {
     when: IsBusyEvaluated(conversation)
 
-    ensures: IsBusyReturnsTrue(conversation)
+    ensures: PendingWakeDoesNotChangeRuntimeBusy(conversation)
         when count(Contract{conversation: conversation, status: pending}) > 0
 
     @guidance
-        -- is_busy() in this codebase is the precondition for
-        -- archive/hard-delete/abandon/mark-merged proceeding. By
-        -- making is_busy() return true when pending contracts exist,
-        -- those lifecycle endpoints will reject with 409
-        -- (cancel-first) until contracts are explicitly cancelled
-        -- or have fired. This prevents the silent-cancel-then-
-        -- cascade failure mode.
-        --
-        -- The augmentation is conjunctive with the existing state-
-        -- based check: is_busy(c) = state_says_busy(c) OR
-        -- has_pending_contracts(c).
+        -- Pending wake contracts are durable lifecycle obligations, not proof that
+        -- the LLM is executing. Runtime busy/idle semantics stay owned by the
+        -- normal conversation execution state machine, while archive/hard-delete/
+        -- abandon/mark-merged consult the pending-contract rows directly and reject
+        -- or serialize on that lifecycle conflict instead of overloading is_busy().
 }
 
 ------------------------------------------------------------

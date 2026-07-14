@@ -238,6 +238,7 @@ config {
 -- compensation_dependency_exists(binding, successor_kind, predecessor_kind)
 -- lifecycle_publication_precedes_cleanup_completion(binding, lifecycle_kind)
 -- compensation_failure_preserves_lifecycle_publication(binding, effect)
+-- owned_worktree_cleanup_required(binding), compensation_effects_absent(plan, effect_kinds)
 -- all_compensations_terminal(binding), cancellation_deadline(binding), deletion_deadline(binding)
 -- legacy_projection(conversation_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding), parity_compared_for_every_authoritative_fact(binding)
@@ -385,14 +386,15 @@ rule InitialTurnCreationDagDeclared {
         resolve_repository, reserve_worktree, materialize_or_adopt_worktree
     }
     ensures: binding.intent.workspace.mode = direct implies workspace_effects(binding) = {resolve_repository}
-    ensures: initial_turn_effects(binding) = {
-        resolve_repository, finalize_attachments, commit_metadata,
-        expand_initial_message, bootstrap_runtime, dispatch_first_llm
-    }
-    ensures: binding.intent.workspace.mode in {managed, branch} implies initial_turn_effects(binding) = {
+    ensures: initial_turn_effects(binding) = workflow_effect_set(binding)
+    ensures: binding.intent.workspace.mode in {managed, branch} implies workflow_effect_set(binding) = {
         resolve_repository, reserve_worktree, materialize_or_adopt_worktree,
         finalize_attachments, commit_metadata, expand_initial_message,
         bootstrap_runtime, dispatch_first_llm
+    }
+    ensures: binding.intent.workspace.mode = direct implies workflow_effect_set(binding) = {
+        resolve_repository, finalize_attachments, commit_metadata,
+        expand_initial_message, bootstrap_runtime, dispatch_first_llm
     }
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
     ensures: binding.intent.workspace.mode in {managed, branch} implies dependency_exists(binding, reserve_worktree, resolve_repository)
@@ -417,12 +419,13 @@ rule SeededEmptyCreationDagOmitsTurnRuntimeWork {
         resolve_repository, reserve_worktree, materialize_or_adopt_worktree
     }
     ensures: binding.intent.workspace.mode = direct implies workspace_effects(binding) = {resolve_repository}
-    ensures: seeded_empty_effects(binding) = {
-        resolve_repository, finalize_attachments, commit_metadata
-    }
-    ensures: binding.intent.workspace.mode in {managed, branch} implies seeded_empty_effects(binding) = {
+    ensures: seeded_empty_effects(binding) = workflow_effect_set(binding)
+    ensures: binding.intent.workspace.mode in {managed, branch} implies workflow_effect_set(binding) = {
         resolve_repository, reserve_worktree, materialize_or_adopt_worktree,
         finalize_attachments, commit_metadata
+    }
+    ensures: binding.intent.workspace.mode = direct implies workflow_effect_set(binding) = {
+        resolve_repository, finalize_attachments, commit_metadata
     }
     ensures: not effect_is_declared(binding, expand_initial_message)
     ensures: not effect_is_declared(binding, bootstrap_runtime)
@@ -495,6 +498,17 @@ rule RepositoryLockReleasesWhenRepositoryMutationEffectFinishes {
     ensures: repository_lock_released_after_effect(lock, effect)
 }
 
+rule RepositoryLockReleasesWhenRepositoryMutationAuthorityExpiresOrIsTakenOver {
+    when: CreationEffectAuthorityReplaced(adapter, binding, effect, authority)
+    let lock = PhysicalRepositoryLock{holder_effect: effect}
+    requires: lock.released_at = null
+    requires: repository_lock_effect_kind(effect) in {
+        reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree
+    }
+    requires: lock.holder_authority = authority
+    ensures: lock.released_at = now()
+}
+
 rule MatchingWorktreeIsAdopted {
     when: WorktreeReconciliationObserved(adapter, binding, effect, observation)
     requires: reconciliation_result(effect, observation) = matching
@@ -537,10 +551,24 @@ rule ObservationPermitsAbsentResourceExecution {
 rule ForeignResourceRequiresManualResolution {
     when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
     requires: reconciliation_result(effect, observation) = foreign
+    requires: creation_effect_kind(effect) != remove_owned_worktree
     ensures: ForeignResourceConflictRecorded(binding, effect, foreign_resource_evidence(effect, observation))
     ensures: CreationManualResolutionRequested(binding, effect, foreign_resource)
     ensures: CreationManualResolutionIntent{
         effect_kind: creation_effect_kind(effect), reason: foreign_resource
+    }
+    ensures: binding.outcome = manual_resolution
+    ensures: not CreationEffectExecutionPermitted(effect)
+    ensures: not ForeignResourceMutated(effect)
+}
+
+rule OwnedWorktreeCompensationOwnershipConflictRequiresManualResolution {
+    when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
+    requires: reconciliation_result(effect, observation) = foreign
+    requires: creation_effect_kind(effect) = remove_owned_worktree
+    ensures: CreationManualResolutionRequested(binding, effect, compensation_ownership_conflict)
+    ensures: CreationManualResolutionIntent{
+        effect_kind: creation_effect_kind(effect), reason: compensation_ownership_conflict
     }
     ensures: binding.outcome = manual_resolution
     ensures: not CreationEffectExecutionPermitted(effect)
@@ -628,9 +656,20 @@ rule FirstDispatchFollowsCommittedRuntimeBootstrap {
 rule ReadinessBarrierPublishesReady {
     when: CreationReadinessBarrierSatisfied(reducer, binding)
     requires: binding.readiness_barrier.status = satisfied
+    requires: binding.workflow.generation = binding.readiness_barrier.declaring_transition.generation
+    requires: binding.outcome in {provisioning, manual_resolution}
     requires: conversation_projection_ready(binding)
     ensures: binding.outcome = ready
     ensures: ConversationCreationReady(binding.conversation_id)
+}
+
+rule ReadinessIgnoresLateTerminalGeneration {
+    when: CreationReadinessBarrierSatisfied(reducer, binding)
+    requires: binding.readiness_barrier.status = satisfied
+    requires: binding.workflow.generation != binding.readiness_barrier.declaring_transition.generation
+        or binding.outcome not in {provisioning, manual_resolution}
+    ensures: not ConversationCreationReady(binding.conversation_id)
+    ensures: binding.outcome != ready
 }
 
 rule ReadinessCannotPrecedeFirstDispatchReceipt {
@@ -652,8 +691,9 @@ rule CancellationBumpsGenerationAndDeclaresCompensationDag {
     ensures: CreationCancellationGenerationTransitionRequested(binding, plan)
     ensures: compensation_dag_complete(binding, plan)
     ensures: compensation_targets_only_owned_resources(binding, plan)
-    ensures: compensation_dependency_exists(binding, remove_owned_worktree, remove_finalized_attachments)
-    ensures: compensation_dependency_exists(binding, release_worktree_reservation, remove_owned_worktree)
+    ensures: owned_worktree_cleanup_required(binding) implies compensation_dependency_exists(binding, remove_owned_worktree, remove_finalized_attachments)
+    ensures: owned_worktree_cleanup_required(binding) implies compensation_dependency_exists(binding, release_worktree_reservation, remove_owned_worktree)
+    ensures: not owned_worktree_cleanup_required(binding) implies compensation_effects_absent(plan, {remove_owned_worktree, release_worktree_reservation})
     ensures: lifecycle_publication_precedes_cleanup_completion(binding, cancel)
     ensures: binding.outcome = cancelled
     ensures: binding.outcome = cancelled when all_compensations_terminal(binding)
@@ -669,9 +709,10 @@ rule DeletionBumpsGenerationHidesShellAndDeclaresCompensationDag {
     ensures: binding.outcome = deletion_pending
     ensures: compensation_dag_complete(binding, plan)
     ensures: compensation_targets_only_owned_resources(binding, plan)
-    ensures: compensation_dependency_exists(binding, remove_owned_worktree, remove_finalized_attachments)
-    ensures: compensation_dependency_exists(binding, remove_conversation_metadata, remove_owned_worktree)
-    ensures: compensation_dependency_exists(binding, release_worktree_reservation, remove_conversation_metadata)
+    ensures: owned_worktree_cleanup_required(binding) implies compensation_dependency_exists(binding, remove_owned_worktree, remove_finalized_attachments)
+    ensures: owned_worktree_cleanup_required(binding) implies compensation_dependency_exists(binding, remove_conversation_metadata, remove_owned_worktree)
+    ensures: owned_worktree_cleanup_required(binding) implies compensation_dependency_exists(binding, release_worktree_reservation, remove_conversation_metadata)
+    ensures: not owned_worktree_cleanup_required(binding) implies compensation_effects_absent(plan, {remove_owned_worktree, release_worktree_reservation})
     ensures: binding.outcome = deleted when all_compensations_terminal(binding)
 }
 
