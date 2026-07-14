@@ -69,7 +69,11 @@ from httpx_sse import aconnect_sse
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target" / "debug" / "phoenix_ide"
 STARTUP_ATTEMPTS = 3
-STARTUP_TIMEOUT_SECONDS = 30.0
+# A crash is caught immediately via proc.poll() with its log, so this ceiling
+# only bounds the "alive but not yet serving" case. 30s was too tight when the
+# e2e server cold-starts while the rest of ./dev.py check saturates the machine;
+# 60s covers a CPU-starved start without masking a real startup hang.
+STARTUP_TIMEOUT_SECONDS = 60.0
 SCENARIO_TIMEOUT_SECONDS = 45.0
 
 # 1x1 transparent PNG, base64-encoded.
