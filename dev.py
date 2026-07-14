@@ -201,6 +201,7 @@ LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
 LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
+LAUNCHD_OVERRIDE_PATH = Path.home() / ".phoenix-ide" / "launchd-overrides.json"
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # Dev ports are assigned deterministically from the worktree path hash. Keep
@@ -6404,19 +6405,25 @@ def _systemd_override_env() -> dict[str, str]:
 
 
 def _launchd_override_env() -> dict[str, str]:
-    """Environment values baked into the launchd plist's EnvironmentVariables
-    (written by `./dev.py prod set`), which the running service uses. The deploy
-    preflight must honour them for the same reason as the systemd drop-ins."""
-    if not LAUNCHD_PLIST_PATH.exists():
+    """Explicit launchd overrides written by `prod set`.
+
+    Generated plist environment is deliberately not an override source: values
+    from a previous deploy must not shadow edits to `.phoenix-ide.env`.
+    """
+    if not LAUNCHD_OVERRIDE_PATH.exists():
         return {}
     try:
-        import plistlib
+        value = json.loads(LAUNCHD_OVERRIDE_PATH.read_text())
+        if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+            raise ValueError("launchd overrides must be a string map")
+        return value
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(f"invalid launchd override store {LAUNCHD_OVERRIDE_PATH}: {exc}") from exc
 
-        with open(LAUNCHD_PLIST_PATH, "rb") as f:
-            plist = plistlib.load(f)
-        return dict(plist.get("EnvironmentVariables", {}))
-    except Exception:
-        return {}
+
+def _write_launchd_override_env(overrides: dict[str, str]) -> None:
+    _write_json_atomic(LAUNCHD_OVERRIDE_PATH, overrides)
+    LAUNCHD_OVERRIDE_PATH.chmod(0o600)
 
 
 def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
@@ -7670,6 +7677,9 @@ def launchd_prod_override_set(name: str, value: str):
     if "EnvironmentVariables" not in plist:
         plist["EnvironmentVariables"] = {}
     plist["EnvironmentVariables"][name] = value
+    overrides = _launchd_override_env()
+    overrides[name] = value
+    _write_launchd_override_env(overrides)
     if name == "PHOENIX_PORT":
         _sync_launchd_socket_port(plist)
 
@@ -7698,12 +7708,19 @@ def launchd_prod_override_unset(name: str):
     with open(LAUNCHD_PLIST_PATH, "rb") as f:
         plist = plistlib.load(f)
 
-    env_vars = plist.get("EnvironmentVariables", {})
-    if name not in env_vars:
-        print(f"No override '{name}' found in plist")
+    overrides = _launchd_override_env()
+    if name not in overrides:
+        print(f"No explicit override '{name}' found")
         return
+    del overrides[name]
+    _write_launchd_override_env(overrides)
 
-    del env_vars[name]
+    env_vars = plist.get("EnvironmentVariables", {})
+    env_vars.pop(name, None)
+    repo_env: dict[str, str] = {}
+    _load_env_file(repo_env)
+    if name in repo_env:
+        env_vars[name] = repo_env[name]
     if name == "PHOENIX_PORT":
         _sync_launchd_socket_port(plist)
 

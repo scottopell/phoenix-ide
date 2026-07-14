@@ -469,6 +469,28 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(1, helper.main())
             self.assertEqual(manifest.transaction_id, claim.read_text().strip())
 
+    def test_precondition_failure_is_terminal_and_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            helper.write_status(manifest, "precondition_failed", failure="bad staged plist")
+            self.assertTrue(helper.status_is_durable_terminal(manifest))
+            self.assertIn("precondition_failed", helper.TERMINAL_STATES)
+
+    def test_generated_plist_values_do_not_shadow_repo_env(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("9443", env["PHOENIX_PORT"])
+
+    def test_explicit_launchd_override_wins_over_repo_env(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+            self.dev._write_launchd_override_env({"PHOENIX_PORT": "9555"})
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("9555", env["PHOENIX_PORT"])
+
     def test_candidate_env_includes_prod_set_overrides(self):
         with mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"BASE": "yes"})), \
              mock.patch.object(self.dev, "_launchd_override_env", return_value={"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "9443"}):
@@ -485,6 +507,8 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
         self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
         self.assertIn("runner: macos-15-intel", workflow)
+        self.assertIn("runner: macos-15", workflow)
+        self.assertNotIn("runner: macos-14", workflow)
         self.assertNotIn("runner: macos-13", workflow)
 
     def test_helper_plist_uses_active_interpreter(self):

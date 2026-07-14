@@ -25,7 +25,13 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-TERMINAL_STATES = {"committed", "activation_failed_rolled_back", "activation_failed_rollback_failed", "rejected_concurrent"}
+TERMINAL_STATES = {
+    "committed",
+    "precondition_failed",
+    "activation_failed_rolled_back",
+    "activation_failed_rollback_failed",
+    "rejected_concurrent",
+}
 
 
 @dataclasses.dataclass(frozen=True)
