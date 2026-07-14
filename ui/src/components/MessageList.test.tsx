@@ -140,6 +140,7 @@ vi.mock('./VirtualTranscript', async () => {
       renderItem,
       getKey,
       scrollerRef,
+      scrollerId,
       onTotalExtentChange,
       onPinnedChange,
       onRangeChange,
@@ -150,6 +151,7 @@ vi.mock('./VirtualTranscript', async () => {
       renderItem: (item: T, index: number) => React.ReactNode;
       getKey?: (item: T, index: number) => React.Key;
       scrollerRef?: (ref: HTMLDivElement | null) => void;
+      scrollerId?: string;
       onTotalExtentChange?: (height: number) => void;
       onPinnedChange?: (pinned: boolean) => void;
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
@@ -185,6 +187,7 @@ vi.mock('./VirtualTranscript', async () => {
       return (
         <div
           data-testid="mock-virtual-transcript"
+          id={scrollerId}
           ref={containerRef}
           style={{ overflowY: 'auto', height: '100%' }}
         >
@@ -301,6 +304,7 @@ describe('MessageList', () => {
     ));
 
     const transcript = screen.getByTestId('mock-virtual-transcript');
+    expect(transcript).toHaveAttribute('id', 'messages');
     transcript.focus();
     fireEvent.keyDown(window, { key: 'f', metaKey: true });
     const input = await screen.findByRole('textbox', { name: 'Find in viewer' });

@@ -17,6 +17,7 @@ import {
   type RestoreBasis,
 } from '../conversation/historyExpansion';
 import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { messageCacheWrite } from '../conversation/messageCachePersistence';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -459,13 +460,13 @@ function ConversationPageContent() {
   // conversation. Honest UI: if the new conversation's data isn't ready, the
   // `if (!conversation)` early-return below paints a clean skeleton.
   //
-  // Refs (sendingMessagesRef, seedHydratedRef, cachedMsgCountRef) are also
+  // Refs (sendingMessagesRef, seedHydratedRef, cachedMessagesRef) are also
   // reset here. Mutating .current during render is safe because refs don't
   // trigger re-renders. The refs live alongside this block (vs. their
   // original declaration sites further down the file) so the reset can see
   // them and the contract "these are per-slug state" is colocated.
   const seedHydratedRef = useRef<string | null>(null);
-  const cachedMsgCountRef = useRef(0);
+  const cachedMessagesRef = useRef<readonly Message[]>([]);
   const cachedRowsGenerationRef = useRef<number | null>(null);
   const cacheWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
@@ -485,7 +486,7 @@ function ConversationPageContent() {
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
-    cachedMsgCountRef.current = 0;
+    cachedMessagesRef.current = [];
     cachedRowsGenerationRef.current = null;
     cacheWriteQueueRef.current = Promise.resolve();
   }
@@ -1127,19 +1128,26 @@ function ConversationPageContent() {
   useEffect(() => {
     if (!atom.conversationId || atom.transcriptGeneration === null) return;
     const generationChanged = cachedRowsGenerationRef.current !== atom.transcriptGeneration;
-    const rowsToWrite = generationChanged
-      ? atom.messages
-      : atom.messages.slice(cachedMsgCountRef.current);
-    cachedMsgCountRef.current = atom.messages.length;
+    const cacheWrite = messageCacheWrite(
+      atom.conversationId,
+      cachedMessagesRef.current,
+      atom.messages,
+      generationChanged,
+    );
+    cachedMessagesRef.current = atom.messages;
     cachedRowsGenerationRef.current = atom.transcriptGeneration;
-    if (rowsToWrite.length === 0) return;
+    if (cacheWrite.kind === 'append' && cacheWrite.messages.length === 0) return;
     const conversationId = atom.conversationId;
     const transcriptGeneration = atom.transcriptGeneration;
     const latestSequenceId = latestMessageSequenceId(atom.messages);
     cacheWriteQueueRef.current = cacheWriteQueueRef.current
       .catch(() => undefined)
       .then(async () => {
-        await cacheDB.putMessages(rowsToWrite);
+        if (cacheWrite.kind === 'replace') {
+          await cacheDB.replaceMessages(cacheWrite.conversationId, cacheWrite.messages);
+        } else {
+          await cacheDB.putMessages(cacheWrite.messages);
+        }
         await cacheDB.putReplicaMeta({
           conversationId,
           latestMessageSequenceId: latestSequenceId,

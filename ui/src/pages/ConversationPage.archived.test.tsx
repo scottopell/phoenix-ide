@@ -50,6 +50,7 @@ vi.mock('../cache', () => ({
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
     putMessages: vi.fn(() => Promise.resolve()),
+    replaceMessages: vi.fn(() => Promise.resolve()),
     putReplicaMeta: vi.fn(() => Promise.resolve()),
   },
 }));
@@ -448,7 +449,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.queryByText('stale cached tail')).not.toBeInTheDocument();
     expect(api.getConversationMessagesAfter).not.toHaveBeenCalled();
     expect(api.getConversationMessagesLatest).toHaveBeenCalledWith(conversationId, 50);
-    expect(cacheDB.putMessages).toHaveBeenLastCalledWith([authoritativeTail]);
+    expect(cacheDB.replaceMessages).toHaveBeenLastCalledWith(conversationId, [authoritativeTail]);
     await waitFor(() => {
       expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
         expect.objectContaining({

@@ -274,6 +274,28 @@ export class CacheDB {
     }
   }
 
+  async replaceMessages(conversationId: string, messages: Message[]): Promise<void> {
+    await this.init();
+    const tx = this.db!.transaction(['messages'], 'readwrite');
+    const store = tx.objectStore('messages');
+    const index = store.index('by-conversation');
+    const request = index.openKeyCursor(IDBKeyRange.only(conversationId));
+    await new Promise<void>((resolve, reject) => {
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          store.delete(cursor.primaryKey);
+          cursor.continue();
+          return;
+        }
+        for (const message of messages) store.put(message);
+      };
+      request.onerror = () => reject(request.error ?? new Error('Failed to replace cached messages'));
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error('Failed to replace cached messages'));
+    });
+  }
+
   async getLatestCachedMessages(conversationId: string, limit: number): Promise<Message[]> {
     const messages = await this.getMessages(conversationId);
     return messages.toSorted((a, b) => b.sequence_id - a.sequence_id).slice(0, limit);

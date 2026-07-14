@@ -59,6 +59,7 @@ export interface VirtualTranscriptProps<T> {
   initialTail?: boolean;
   estimatedExtent: number | ((item: T, index: number) => number);
   className?: string;
+  scrollerId?: string;
   scrollerRef?: (element: HTMLDivElement | null) => void;
   onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
   onTotalExtentChange?: (totalExtent: number) => void;
@@ -372,6 +373,7 @@ function VirtualTranscriptInner<T>(
     overscan = 0,
     estimatedExtent,
     className,
+    scrollerId,
     scrollerRef,
     onRangeChange,
     onTotalExtentChange,
@@ -603,6 +605,7 @@ function VirtualTranscriptInner<T>(
   return (
     <div
       ref={scrollerCallback}
+      id={scrollerId}
       className={rootClassName}
       style={{ overflowAnchor: 'none' }}
       onScroll={handleScroll}

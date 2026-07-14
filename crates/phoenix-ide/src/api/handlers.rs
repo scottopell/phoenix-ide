@@ -2203,19 +2203,21 @@ async fn get_conversation(
     Path(id): Path<String>,
     Query(query): Query<GetConversationQuery>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    let messages = if let Some(after) = query.after_sequence {
-        state.runtime.db().get_messages_after(&id, after).await
-    } else {
-        state.runtime.db().get_messages(&id).await
-    }
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let db = state.runtime.db();
+    let after_sequence = query.after_sequence;
+    let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
+        Box::pin(async move {
+            if let Some(after) = after_sequence {
+                db.get_messages_after(id, after).await
+            } else {
+                db.get_messages(id).await
+            }
+            .map_err(|e| AppError::Internal(e.to_string()))
+        })
+    })
+    .await?;
+    let conversation = stable.conversation;
+    let messages = stable.value;
 
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
@@ -4770,12 +4772,17 @@ async fn get_by_slug(
         Err(e) => return Err(AppError::NotFound(e.to_string())),
     };
 
-    let messages = state
-        .runtime
-        .db()
-        .get_messages(&conversation.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let stable =
+        stable_transcript_read(state.runtime.db(), &conversation.id, |db, id, _attempt| {
+            Box::pin(async move {
+                db.get_messages(id)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))
+            })
+        })
+        .await?;
+    let conversation = stable.conversation;
+    let messages = stable.value;
 
     let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
         .iter()
@@ -8972,6 +8979,70 @@ pub(crate) mod hard_delete_cascade_tests {
             ),
             StreamDbMessageSelection::Full
         );
+    }
+
+    #[tokio::test]
+    async fn full_conversation_read_retries_after_generation_race() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("full-read-race", "full-read-race", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                "full-read-race-message",
+                "full-read-race",
+                &crate::db::MessageContent::user("message"),
+                None,
+                None,
+            )
+            .await
+            .expect("add message");
+
+        bump_generation_after_next_stable_read_value("full-read-race");
+        let Json(response) = get_conversation(
+            State(state),
+            Path("full-read-race".to_string()),
+            Query(GetConversationQuery {
+                after_sequence: None,
+            }),
+        )
+        .await
+        .expect("stable full conversation read");
+
+        assert_eq!(response.conversation["transcript_generation"], 2);
+        assert_eq!(response.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_conversation_by_slug_read_retries_after_generation_race() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("slug-read-race", "slug-read-race", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                "slug-read-race-message",
+                "slug-read-race",
+                &crate::db::MessageContent::user("message"),
+                None,
+                None,
+            )
+            .await
+            .expect("add message");
+
+        bump_generation_after_next_stable_read_value("slug-read-race");
+        let Json(response) = get_by_slug(State(state), Path("slug-read-race".to_string()))
+            .await
+            .expect("stable slug conversation read");
+
+        assert_eq!(response.conversation["transcript_generation"], 2);
+        assert_eq!(response.messages.len(), 1);
     }
 
     #[tokio::test]

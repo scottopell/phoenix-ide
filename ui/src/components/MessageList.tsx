@@ -1093,6 +1093,7 @@ function MessageListImpl({
         <VirtualTranscript
           key={conversationId ?? '__empty__'}
           ref={transcriptRef}
+          scrollerId="messages"
           scrollerRef={handleScrollerRef}
           items={allUnits}
           renderItem={itemContent}
