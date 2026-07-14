@@ -4468,10 +4468,7 @@ where
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = if is_coordinator {
-                crate::system_prompt::build_coordinator_system_prompt(
-                    llm_language,
-                    persona.as_deref().unwrap_or("You are Phoenix Coordinator."),
-                )
+                crate::system_prompt::build_coordinator_system_prompt(llm_language)
             } else {
                 build_system_prompt(
                     &working_dir,

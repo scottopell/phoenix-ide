@@ -2324,10 +2324,12 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             />
           </Suspense>
         )}
-        <ExploreOnboardingBanner
-          convModeLabel={conversation.conv_mode_label}
-          messageCount={conversation.message_count}
-        />
+        {routePrefix !== '/global' && (
+          <ExploreOnboardingBanner
+            convModeLabel={conversation.conv_mode_label}
+            messageCount={conversation.message_count}
+          />
+        )}
         <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}

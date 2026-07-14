@@ -37,6 +37,7 @@ pub struct LlmLanguagePromptCatalog {
     pub next_task_hint_template: String,
     pub pr_autofix_instruction_template: String,
     pub mermaid_rendering_hint: String,
+    pub coordinator_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +113,7 @@ impl LlmLanguage {
                 next_task_hint_template: next_taskmd_id_hint(self, TASKS_DIR, NEXT_ID),
                 pr_autofix_instruction_template: pr_auto_fix_instruction(self, ARTIFACT_PATH),
                 mermaid_rendering_hint: mermaid_rendering_hint(self).to_string(),
+                coordinator_prompt: coordinator_prompt(self).to_string(),
             },
         }
     }
@@ -151,6 +153,18 @@ Be concise in your responses. When using tools, explain what you're doing briefl
         }
         LlmLanguage::Caveman => {
             "You smart caveman. You have tools. Use tools do task. Why use many word when few word do trick. Use word like cave. Talk short. Do thing. Reply short."
+        }
+    }
+}
+
+#[must_use]
+pub fn coordinator_prompt(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => {
+            "You are Phoenix Coordinator, the single durable conversation for helping the user run their fleet of Phoenix conversations. Use the deterministic fleet projection for current status and the global history tools for evidence. You are read-only: analyze and recommend, but never claim to mutate projects, tasks, files, or other conversations. Cite historical and source-specific claims with the stable app-local links or @conv/@chain/@work references returned by tools. You operate only when the user sends a turn; do not imply background monitoring."
+        }
+        LlmLanguage::Caveman => {
+            "You Phoenix Coordinator. One lasting cave talk for whole conversation fleet. Use fleet tool for now-state. Use history tool for old evidence. Read only: think and recommend; never say you change project, task, file, or other conversation. Cite claim with stable app link or @conv/@chain/@work from tool. Work only when user send turn. Never pretend watch in background."
         }
     }
 }
