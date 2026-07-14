@@ -149,6 +149,13 @@ impl CreationRuntimeEvidence {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeProvisioningEvidence {
+    None,
+    Reserved,
+    Materialized,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeCreationOracle {
     pub intent: CreationIntent,
@@ -159,6 +166,7 @@ pub struct AuthoritativeCreationOracle {
     /// Committed source revision for monotonic diagnostic projection writes.
     pub revision: u64,
     pub cleanup_ownership: CleanupOwnership,
+    pub worktree_evidence: WorktreeProvisioningEvidence,
     pub runtime_evidence: CreationRuntimeEvidence,
 }
 
@@ -1134,7 +1142,9 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
         .into_iter()
         .map(|(id, stage)| {
             let prediction = if (id == RESERVE_WORKTREE
-                && oracle.cleanup_ownership != CleanupOwnership::None)
+                && oracle.worktree_evidence != WorktreeProvisioningEvidence::None)
+                || (id == MATERIALIZE_OR_RECONCILE_WORKTREE
+                    && oracle.worktree_evidence == WorktreeProvisioningEvidence::Materialized)
                 || (id == COMMIT_METADATA
                     && oracle.stage == AuthoritativeCreationStage::CommitMetadata)
             {

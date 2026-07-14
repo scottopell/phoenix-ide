@@ -2251,13 +2251,15 @@ CREATE TABLE creation_shadow_creation_evidence (
     creation_job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
     cwd TEXT NOT NULL,
     attachment_count INTEGER NOT NULL CHECK (attachment_count >= 0),
+    creation_kind TEXT NOT NULL CHECK (creation_kind IN ('initial_turn', 'seeded_empty')),
     accepted_at TEXT NOT NULL
 );
 
-INSERT INTO creation_shadow_creation_evidence (creation_job_id, cwd, attachment_count, accepted_at)
+INSERT INTO creation_shadow_creation_evidence (creation_job_id, cwd, attachment_count, creation_kind, accepted_at)
 SELECT j.id, c.cwd,
        (SELECT COUNT(*) FROM conversation_creation_job_files f WHERE f.job_id = j.id)
        + (SELECT COUNT(*) FROM conversation_creation_job_images i WHERE i.job_id = j.id),
+       CASE WHEN j.message_id IS NULL THEN 'seeded_empty' ELSE 'initial_turn' END,
        j.accepted_at
 FROM conversation_creation_jobs j
 JOIN conversations c ON c.id = j.conversation_id;

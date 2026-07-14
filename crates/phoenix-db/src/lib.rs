@@ -711,11 +711,21 @@ async fn insert_creation_shadow_evidence_tx(
         .map_err(|_| DbError::Serialization("attachment count exceeds i64".to_string()))?;
     sqlx::query(
         "INSERT INTO creation_shadow_creation_evidence
-         (creation_job_id, cwd, attachment_count, accepted_at) VALUES (?1, ?2, ?3, ?4)",
+         (creation_job_id, cwd, attachment_count, creation_kind, accepted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(&job.id)
     .bind(&job.intent.cwd)
     .bind(attachment_count)
+    .bind(
+        if (job.intent.seed_parent_id.is_some() || job.intent.seed_label.is_some())
+            && job.intent.text.is_empty()
+        {
+            "seeded_empty"
+        } else {
+            "initial_turn"
+        },
+    )
     .bind(accepted_at)
     .execute(&mut **tx)
     .await?;

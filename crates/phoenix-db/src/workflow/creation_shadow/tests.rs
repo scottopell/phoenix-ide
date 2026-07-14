@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CleanupOwnership, CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence,
-    CreationStart, CreationWorkspace,
+    CreationStart, CreationWorkspace, WorktreeProvisioningEvidence,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -65,6 +65,7 @@ fn oracle() -> AuthoritativeCreationOracle {
         generation: 0,
         revision: 0,
         cleanup_ownership: CleanupOwnership::None,
+        worktree_evidence: WorktreeProvisioningEvidence::None,
         runtime_evidence: CreationRuntimeEvidence::no_runtime_signals(),
     }
 }

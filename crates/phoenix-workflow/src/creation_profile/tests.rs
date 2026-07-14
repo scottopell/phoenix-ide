@@ -12,11 +12,12 @@ use super::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CompensationPrediction, CompletionPrediction,
     CreationFailure, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
-    CreationWorkspace, EffectPrediction, WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME,
-    COMMIT_METADATA, COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS,
-    DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS,
-    FINISH_CANCELLATION_OR_DELETION, MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION,
-    REMOVE_OWNED_WORKTREE, RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
+    CreationWorkspace, EffectPrediction, WorktreeProvisioningEvidence,
+    WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME, COMMIT_METADATA,
+    COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS, DISPATCH_INITIAL_LLM_REQUEST,
+    EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS, FINISH_CANCELLATION_OR_DELETION,
+    MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE,
+    RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
 };
 
 fn oracle(start: CreationStart) -> AuthoritativeCreationOracle {
@@ -39,6 +40,7 @@ fn oracle(start: CreationStart) -> AuthoritativeCreationOracle {
         generation: 3,
         revision: 7,
         cleanup_ownership: CleanupOwnership::None,
+        worktree_evidence: WorktreeProvisioningEvidence::None,
         runtime_evidence: CreationRuntimeEvidence::no_runtime_signals(),
     }
 }
@@ -587,6 +589,7 @@ fn committed_boundaries_complete_effects_before_later_stage_checkpoints() {
     });
     oracle.stage = AuthoritativeCreationStage::ReserveResources;
     oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
+    oracle.worktree_evidence = WorktreeProvisioningEvidence::Reserved;
     let reservation_projection = project_authoritative_creation(&oracle);
     let reservation_by_id = reservation_projection
         .effect_predictions

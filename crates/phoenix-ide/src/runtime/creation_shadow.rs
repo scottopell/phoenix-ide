@@ -18,10 +18,18 @@ use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CreationCapabilities, CreationFailure,
     CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
-    CreationWorkspace,
+    CreationWorkspace, WorktreeProvisioningEvidence,
 };
 
 const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
+
+struct CreationShadowEvidenceRow {
+    cwd: String,
+    attachment_count: i64,
+    creation_kind: String,
+    uses_worktree: Option<i64>,
+    branch_name: Option<String>,
+}
 
 #[derive(Default)]
 struct JobSyncGate {
@@ -132,15 +140,34 @@ impl CreationShadowCoordinator {
             .get_creation_resource_reservations(job_id)
             .await
             .map_err(|error| error.to_string())?;
-        let preserved_evidence: Option<(String, i64, Option<i64>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT cwd, attachment_count, uses_worktree, branch_name
-             FROM creation_shadow_creation_evidence WHERE creation_job_id = ?1",
-            )
-            .bind(job_id)
-            .fetch_optional(self.db.pool())
-            .await
-            .map_err(|error| error.to_string())?;
+        let preserved_evidence = sqlx::query(
+            "SELECT cwd, attachment_count, creation_kind, uses_worktree, branch_name
+             FROM creation_shadow_creation_evidence
+             WHERE creation_job_id = ?1 AND creation_kind IN ('initial_turn', 'seeded_empty')",
+        )
+        .bind(job_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|row| CreationShadowEvidenceRow {
+            cwd: sqlx::Row::get(&row, "cwd"),
+            attachment_count: sqlx::Row::get(&row, "attachment_count"),
+            creation_kind: sqlx::Row::get(&row, "creation_kind"),
+            uses_worktree: sqlx::Row::get(&row, "uses_worktree"),
+            branch_name: sqlx::Row::get(&row, "branch_name"),
+        });
+        if preserved_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.uses_worktree)
+            .is_some_and(|uses_worktree| uses_worktree != 0)
+            && reservations.is_empty()
+        {
+            tracing::debug!(
+                job_id,
+                "creation shadow awaiting durable worktree reservation evidence"
+            );
+            return Ok(());
+        }
         let conversation = self
             .db
             .get_conversation(&job.conversation_id)
@@ -206,12 +233,12 @@ fn oracle_from_committed(
     image_count: usize,
     reservations: &[CreationResourceReservation],
     conv_mode: Option<&ConvMode>,
-    preserved_evidence: Option<&(String, i64, Option<i64>, Option<String>)>,
+    preserved_evidence: Option<&CreationShadowEvidenceRow>,
     conversation_state: &ConvState,
 ) -> AuthoritativeCreationOracle {
     let live_attachment_count = files.len().saturating_add(image_count);
     let attachment_count = preserved_evidence
-        .and_then(|(_, count, _, _)| usize::try_from(*count).ok())
+        .and_then(|evidence| usize::try_from(evidence.attachment_count).ok())
         .unwrap_or(live_attachment_count);
     let attachment_ids = (0..attachment_count)
         .map(|ordinal| format!("attachment:{ordinal}"))
@@ -220,12 +247,11 @@ fn oracle_from_committed(
         .iter()
         .find(|reservation| reservation.status != "released")
         .or_else(|| reservations.first());
-    let preserved_cwd = preserved_evidence.map(|(cwd, _, _, _)| cwd.clone());
+    let preserved_cwd = preserved_evidence.map(|evidence| evidence.cwd.clone());
     let preserved_uses_worktree = preserved_evidence
-        .and_then(|(_, _, uses_worktree, _)| *uses_worktree)
+        .and_then(|evidence| evidence.uses_worktree)
         .map(|value| value != 0);
-    let preserved_branch =
-        preserved_evidence.and_then(|(_, _, _, branch_name)| branch_name.clone());
+    let preserved_branch = preserved_evidence.and_then(|evidence| evidence.branch_name.clone());
     let repository_path = reservation.map_or_else(
         || {
             preserved_cwd
@@ -259,12 +285,16 @@ fn oracle_from_committed(
         .or(preserved_branch)
         .or_else(|| job.intent.base_branch.clone())
         .unwrap_or_default();
-    let start = match &job.protocol.kind {
-        CoreCreationKind::InitialTurn { message_id } => CreationStart::InitialTurn {
-            message_id: message_id.clone(),
+    let start = match preserved_evidence.map(|evidence| evidence.creation_kind.as_str()) {
+        Some("seeded_empty") => CreationStart::SeededEmpty,
+        Some("initial_turn") | None => CreationStart::InitialTurn {
+            message_id: match &job.protocol.kind {
+                CoreCreationKind::InitialTurn { message_id } => message_id.clone(),
+                CoreCreationKind::SeededEmpty => job.message_id.clone().unwrap_or_default(),
+            },
             text: job.intent.text.clone(),
         },
-        CoreCreationKind::SeededEmpty => CreationStart::SeededEmpty,
+        Some(_) => unreachable!("creation kind is constrained by the evidence query"),
     };
     let uses_worktree = preserved_uses_worktree
         .unwrap_or_else(|| uses_worktree(job.intent.mode.as_deref(), reservations, conv_mode));
@@ -294,7 +324,21 @@ fn oracle_from_committed(
         generation: job.protocol.generation,
         revision: job.shadow_projection_revision,
         cleanup_ownership: cleanup_ownership(reservations),
+        worktree_evidence: worktree_evidence(reservations),
         runtime_evidence,
+    }
+}
+
+fn worktree_evidence(reservations: &[CreationResourceReservation]) -> WorktreeProvisioningEvidence {
+    if reservations
+        .iter()
+        .any(|reservation| reservation.status == "present")
+    {
+        WorktreeProvisioningEvidence::Materialized
+    } else if reservations.is_empty() {
+        WorktreeProvisioningEvidence::None
+    } else {
+        WorktreeProvisioningEvidence::Reserved
     }
 }
 
