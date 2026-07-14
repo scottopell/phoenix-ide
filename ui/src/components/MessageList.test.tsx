@@ -3058,6 +3058,7 @@ it('find navigation searches the canonical patch display diff and carries its ty
       onRetry={vi.fn()}
       onOpenFile={undefined}
       conversationId="conv-find-patch"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-patch', generation: 1, transcriptGeneration: 1 } }}
     />,
   ));
 
@@ -3074,7 +3075,7 @@ it('find navigation searches the canonical patch display diff and carries its ty
   expect(renderedAgent?.message.message_id).toBe('agent-patch');
   expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-patch-1', fragmentId: 'patch-diff' });
   expect(renderedAgent?.activeHighlight?.fragmentId).toBe('patch-diff');
-  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
 
 it('find navigation carries read_file fragment reveal target for offscreen navigation', async () => {
@@ -3104,6 +3105,7 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
       onRetry={vi.fn()}
       onOpenFile={undefined}
       conversationId="conv-find-read-file"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-read-file', generation: 1, transcriptGeneration: 1 } }}
     />,
   ));
 
@@ -3120,7 +3122,7 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
   expect(renderedAgent?.message.message_id).toBe('agent-read-file');
   expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-read-1', lineNumber: 8 });
   expect(renderedAgent?.activeHighlight?.fragmentId).toBe('read-file-line:second%20alpha%20line:0');
-  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
 
 it('find navigation carries keyword_search fragment reveal target for offscreen navigation', async () => {
@@ -3150,6 +3152,7 @@ it('find navigation carries keyword_search fragment reveal target for offscreen 
       onRetry={vi.fn()}
       onOpenFile={undefined}
       conversationId="conv-find-keyword-search"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-keyword-search', generation: 1, transcriptGeneration: 1 } }}
     />,
   ));
 
@@ -3163,7 +3166,7 @@ it('find navigation carries keyword_search fragment reveal target for offscreen 
   });
   const renderedAgent = agentMessageProps.at(-1);
   expect(renderedAgent?.message.message_id).toBe('agent-keyword-search');
-  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
 
 it('find navigation carries search fragment reveal target for offscreen navigation', async () => {
@@ -3193,6 +3196,7 @@ it('find navigation carries search fragment reveal target for offscreen navigati
       onRetry={vi.fn()}
       onOpenFile={undefined}
       conversationId="conv-find-search"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-search', generation: 1, transcriptGeneration: 1 } }}
     />,
   ));
 
@@ -3206,7 +3210,7 @@ it('find navigation carries search fragment reveal target for offscreen navigati
   });
   const renderedAgent = agentMessageProps.at(-1);
   expect(renderedAgent?.message.message_id).toBe('agent-search');
-  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
 
 it('find navigation requests reveal for compact hidden assistant second-line matches', async () => {
@@ -3222,6 +3226,7 @@ it('find navigation requests reveal for compact hidden assistant second-line mat
       onRetry={vi.fn()}
       onOpenFile={undefined}
       conversationId="conv-find-reveal"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-reveal', generation: 1, transcriptGeneration: 1 } }}
     />,
   ));
 
@@ -3233,5 +3238,5 @@ it('find navigation requests reveal for compact hidden assistant second-line mat
     const highlighted = document.querySelector('[data-highlight-fragment="agent-text-0"]');
     expect(highlighted).not.toBeNull();
   });
-  expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
