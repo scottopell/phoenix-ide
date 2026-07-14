@@ -509,6 +509,16 @@ mod tests {
         assert_eq!(root, PathBuf::from("/tmp"));
     }
 
+    /// `rg` may be absent from a minimal CI image. Tests that assert on real
+    /// ripgrep output skip themselves rather than fail when it isn't installed,
+    /// matching how `rg_child_alive` degrades when `pgrep` is missing.
+    fn rg_available() -> bool {
+        std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
     /// Returns true if an `rg` process whose argv mentions `needle` is alive.
     /// We match on the unique search term, which `spawn_rg()` passes verbatim as
     /// `-e <term>` — the scanned directory is set via `current_dir` and so does
@@ -538,6 +548,9 @@ mod tests {
     /// so the reap path is exercised.
     #[tokio::test]
     async fn ripgrep_reaps_child_on_cancel() {
+        if !rg_available() {
+            return; // no real child to spawn/reap without ripgrep
+        }
         // Small tree — correctness no longer depends on scan duration.
         let dir = tempfile::tempdir().expect("create tempdir");
         for f in 0..8 {
@@ -590,6 +603,9 @@ mod tests {
     /// `BROAD_TERM_MATCH_LIMIT` and `rg` is killed before walking the whole tree.
     #[tokio::test]
     async fn count_matches_early_exits_on_broad_term() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         for f in 0..50 {
             std::fs::write(
@@ -618,6 +634,9 @@ mod tests {
     /// A narrow term completes and reports its exact match-line count.
     #[tokio::test]
     async fn count_matches_returns_exact_for_narrow_term() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(
             dir.path().join("a.rs"),
@@ -637,6 +656,9 @@ mod tests {
     /// one hot file trips the early exit rather than reporting a small count.
     #[tokio::test]
     async fn count_matches_flags_single_hot_file_as_broad() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         // One file, many matches, no others — mimics a generated bundle/log.
         std::fs::write(
@@ -659,6 +681,9 @@ mod tests {
     /// guards against `--count` (matching-line count), which would report 1.
     #[tokio::test]
     async fn count_matches_flags_single_long_line_as_broad() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         // One line, no newline, term repeated well past the limit.
         let line = "needle ".repeat(BROAD_TERM_MATCH_LIMIT * 2);
@@ -679,6 +704,9 @@ mod tests {
     /// rather than feeding the bad pattern into the combined scan.
     #[tokio::test]
     async fn count_matches_errors_on_invalid_regex() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join("a.rs"), "hello world\n").unwrap();
         let tool = KeywordSearchTool;
@@ -696,6 +724,9 @@ mod tests {
     /// and the truncation flag is set.
     #[tokio::test]
     async fn ripgrep_capped_truncates_at_cap() {
+        if !rg_available() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("create tempdir");
         let filler = "filler line\n".repeat(20);
         for f in 0..40 {
