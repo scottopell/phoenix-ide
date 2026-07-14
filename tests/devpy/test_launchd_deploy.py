@@ -559,7 +559,21 @@ class PreparationTests(unittest.TestCase):
     def test_rollback_binary_identity_mismatch_is_rejected(self):
         running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
         rollback = {"version": "1.0.0", "git_sha": "bbbbbbbbbbbb"}
-        self.assertFalse(running["git_sha"].startswith(rollback["git_sha"].removesuffix("-dirty")))
+        self.assertFalse(self.dev._rollback_identity_matches(rollback, running, True))
+
+    def test_modern_rollback_rejects_dirty_or_short_prefix_identity(self):
+        running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        self.assertFalse(self.dev._rollback_identity_matches(
+            {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa-dirty"}, running, True
+        ))
+        self.assertFalse(self.dev._rollback_identity_matches(
+            {"version": "1.0.0", "git_sha": "aaaaaa"}, running, True
+        ))
+
+    def test_legacy_rollback_allows_exact_twelve_char_commit_prefix(self):
+        legacy = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa" + "b" * 28}
+        rollback = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        self.assertTrue(self.dev._rollback_identity_matches(rollback, legacy, False))
 
     def test_candidate_env_snapshot_is_reused(self):
         snapshot = {"PHOENIX_PORT": "9443", "PHOENIX_PASSWORD": "one"}

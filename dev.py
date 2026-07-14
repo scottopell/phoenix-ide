@@ -7193,6 +7193,22 @@ def _launchd_env_from_plist(path: Path) -> dict[str, str]:
     return env
 
 
+def _rollback_identity_matches(
+    rollback_identity: dict[str, str],
+    previous_identity: dict[str, str],
+    previous_health_json: bool,
+) -> bool:
+    rollback_sha = rollback_identity["git_sha"]
+    if re.fullmatch(r"[0-9a-f]{12}", rollback_sha) is None:
+        return False
+    if previous_health_json:
+        return rollback_identity == previous_identity
+    return (
+        rollback_identity["version"] == previous_identity["version"]
+        and previous_identity["git_sha"].startswith(rollback_sha)
+    )
+
+
 def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, bool] | None:
     import ssl
     import urllib.request
@@ -7540,12 +7556,13 @@ def launchd_prod_deploy(release: str | None = None):
                 else:
                     previous_identity = rollback_identity
                     previous_health_json = True
-            if (
-                rollback_identity["version"] != previous_identity["version"]
-                or not previous_identity["git_sha"].startswith(rollback_identity["git_sha"].removesuffix("-dirty"))
+            if not _rollback_identity_matches(
+                rollback_identity,
+                previous_identity,
+                previous_health_json,
             ):
                 raise SystemExit(
-                    "staged rollback binary identity does not match the previous production identity"
+                    "staged rollback binary identity does not exactly match the previous production identity"
                 )
 
         helper = staging / "activate.py"
