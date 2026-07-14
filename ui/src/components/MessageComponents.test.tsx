@@ -1480,6 +1480,37 @@ describe('read_file structured result view', () => {
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
   });
 
+  it('keeps every returned line accessible when the full-file viewer is unavailable', async () => {
+    const lines = Array.from({ length: 25 }, (_, index) => `${index + 1}\toutside line ${index + 1}`).join('\n');
+    const copyMock = vi.mocked(copyToClipboard);
+    copyMock.mockClear();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-unviewable', [
+            { type: 'tool_use', id: 'tool-read-unviewable', name: 'read_file', input: { path: '/tmp/outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-unviewable', toolMessage('tool-read-unviewable', lines, 2, {
+            type: 'read_file', path: '/tmp/outside.txt', requested_offset: 1, requested_limit: 25,
+            returned_start_line: 1, returned_end_line: 25, returned_line_count: 25,
+            total_line_count: 25, remaining_line_count: 0, viewer_available: false,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('outside line 25')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show all returned lines' }));
+    expect(screen.getByText('outside line 25')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines));
+  });
+
   it('caps structured previews and copy payloads by characters', async () => {
     const longLine = 'x'.repeat(20_000);
     const copyMock = vi.mocked(copyToClipboard);

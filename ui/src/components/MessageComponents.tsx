@@ -1757,8 +1757,11 @@ function ReadFileResultView({
   const request = useMemo(() => parseReadFileRequest(input), [input]);
   const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
   const preview = useMemo(() => boundedReadFileLines(parsed.lines), [parsed.lines]);
-  const visibleLines = preview.lines;
+  const [showAllReturnedLines, setShowAllReturnedLines] = useState(false);
+  const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
   const hasMore = preview.truncated;
+  const canExpandReturnedOutput = !fullFileViewerAvailable && hasMore;
+  const visibleLines = showAllReturnedLines ? parsed.lines : preview.lines;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
 
@@ -1787,7 +1790,7 @@ function ReadFileResultView({
   }
 
   const rangeLabel = formatReadFileRange(request, parsed);
-  const copyText = buildReadFileCopyText(parsed, rawText);
+  const copyText = fullFileViewerAvailable ? buildReadFileCopyText(parsed, rawText) : rawText;
 
   return (
     <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
@@ -1801,17 +1804,30 @@ function ReadFileResultView({
           <span className="read-file-result-summary">requested {metadata.requested_limit}</span>
         </div>
         <div className="read-file-result-actions">
-          {onOpenFile && metadata.viewer_available && (
+          {fullFileViewerAvailable && (
             <button
               type="button"
               className="read-file-result-open"
-              onClick={() => onOpenFile(request.path, new Set(), firstVisibleLine, lastVisibleLine)}
+              onClick={() => onOpenFile?.(request.path, new Set(), firstVisibleLine, lastVisibleLine)}
               title="View the complete current file focused on this range"
             >
               View full file
             </button>
           )}
-          <CopyButton text={copyText} title="Copy file excerpt" />
+          {canExpandReturnedOutput && (
+            <button
+              type="button"
+              className="read-file-result-open"
+              onClick={() => setShowAllReturnedLines((visible) => !visible)}
+              aria-expanded={showAllReturnedLines}
+            >
+              {showAllReturnedLines ? 'Show preview' : 'Show all returned lines'}
+            </button>
+          )}
+          <CopyButton
+            text={copyText}
+            title={fullFileViewerAvailable ? 'Copy file excerpt' : 'Copy all returned lines'}
+          />
         </div>
       </div>
       <div className="read-file-result-preview" role="table" aria-label="read_file preview">
@@ -1824,12 +1840,12 @@ function ReadFileResultView({
       </div>
       {(hasMore || metadata.remaining_line_count > 0) && (
         <div className="read-file-result-more">
-          {hasMore && (parsed.lines.length > visibleLines.length
+          {hasMore && !showAllReturnedLines && (parsed.lines.length > visibleLines.length
             ? `${parsed.lines.length - visibleLines.length} more returned lines`
             : 'returned line truncated for preview')}
-          {hasMore && metadata.remaining_line_count > 0 && ' · '}
+          {hasMore && !showAllReturnedLines && metadata.remaining_line_count > 0 && ' · '}
           {metadata.remaining_line_count > 0 && `${metadata.remaining_line_count} file lines not returned`}
-          {' · view the complete current file for full context'}
+          {fullFileViewerAvailable && ' · view the complete current file for full context'}
         </div>
       )}
     </div>
