@@ -988,7 +988,7 @@ function MessageListImpl({
       return () => timers.forEach(clearTimeout);
     }
     const unitMatch = match.target;
-    transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'center');
+    transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;

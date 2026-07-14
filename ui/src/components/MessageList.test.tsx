@@ -296,10 +296,11 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-find"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find', generation: 1, transcriptGeneration: 1 } }}
       />,
     ));
 
-    const transcript = screen.getByTestId('mock-virtuoso');
+    const transcript = screen.getByTestId('mock-virtual-transcript');
     transcript.focus();
     fireEvent.keyDown(window, { key: 'f', metaKey: true });
     const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
@@ -334,6 +335,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-find-normalized"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-normalized', generation: 1, transcriptGeneration: 1 } }}
       />,
     ));
 
@@ -354,6 +356,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-find-normalized"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-normalized', generation: 1, transcriptGeneration: 1 } }}
       />,
     ));
     expect(screen.getByText('2 of 2')).toBeInTheDocument();
@@ -374,6 +377,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-system-prompt-find"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-system-prompt-find', generation: 1, transcriptGeneration: 1 } }}
         systemPrompt="alpha directive\nsecond line"
       />,
     ));
@@ -395,6 +399,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-system-prompt-target"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-system-prompt-target', generation: 1, transcriptGeneration: 1 } }}
         systemPrompt="alpha directive\nsecond line"
       />,
     ));
@@ -426,6 +431,7 @@ describe('MessageList', () => {
             onRetry={vi.fn()}
             onOpenFile={undefined}
             conversationId="conv-stream-find"
+            transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-stream-find', generation: 1, transcriptGeneration: 1 } }}
           />
         </FocusScopeProvider>
       </ConversationContext.Provider>,
@@ -467,6 +473,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-lazy-find"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-lazy-find', generation: 1, transcriptGeneration: 1 } }}
         systemPrompt="alpha directive"
       />,
     ));
@@ -490,6 +497,7 @@ describe('MessageList', () => {
           onRetry={vi.fn()}
           onOpenFile={undefined}
           conversationId="conv-escape-scope"
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-escape-scope', generation: 1, transcriptGeneration: 1 } }}
         />
       </PushScopeOnMount>,
     ));
@@ -518,6 +526,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-skill-find"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-skill-find', generation: 1, transcriptGeneration: 1 } }}
       />,
     ));
 
@@ -540,6 +549,7 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-subagent-find"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-subagent-find', generation: 1, transcriptGeneration: 1 } }}
       />,
     ));
 
