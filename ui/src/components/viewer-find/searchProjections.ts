@@ -1065,7 +1065,23 @@ function semanticObjectText(value: unknown, label?: string): string {
       .filter(Boolean)
       .join('\n');
   }
+  if (typeof value === 'number' && label) {
+    const formatted = formatProfileMetricValue(label, value);
+    return formatted === String(value)
+      ? `${label}: ${formatted}`
+      : `${label}: ${formatted}\n${label}: ${String(value)}`;
+  }
   return label ? `${label}: ${String(value)}` : String(value);
+}
+
+function formatProfileMetricValue(label: string, value: number): string {
+  if (/HeapUsedSize|HeapTotalSize|Size$/i.test(label)) {
+    if (Math.abs(value) >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    if (Math.abs(value) >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${value} B`;
+  }
+  if (/Duration|Time$/i.test(label)) return `${value.toFixed(3)} s`;
+  return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(3);
 }
 
 export function buildPatchOutputProjection(
@@ -1223,14 +1239,22 @@ export function buildKeywordSearchOutputProjection(
   const lines = text.split('\n').filter((l) => l.trim());
   const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
   if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
-    const fragment: KeywordSearchFragment = {
-      fragmentId: 'keyword-search-fallback',
-      semanticText: text,
-      display: { title: 'Raw ripgrep results — LLM filter unavailable', body: text },
+    const title = 'Raw ripgrep results — LLM filter unavailable';
+    const titleFragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback-title',
+      semanticText: title,
+      display: { title },
       revealTarget,
       kind: 'fallback',
     };
-    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [fragment] };
+    const bodyFragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback-body',
+      semanticText: text,
+      display: { title, body: text },
+      revealTarget,
+      kind: 'fallback',
+    };
+    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [titleFragment, bodyFragment] };
   }
 
   const hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }> = [];

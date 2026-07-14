@@ -322,6 +322,18 @@ describe('browser tool semantic projection parity', () => {
     expect(projection.fullText).toContain('error: Scenario blocked before measurement');
   });
 
+  it('indexes formatted metric values shown by the renderer', () => {
+    const projection = buildTerminalToolResultProjection(
+      'browser-profile',
+      'metrics captured',
+      { metrics: { JSHeapUsedSize: 1_572_864, TaskDuration: 1.25, Nodes: 1234 } },
+      { toolUseId: 'metrics-1' },
+    );
+    expect(projection.fullText).toContain('JSHeapUsedSize: 1.5 MB');
+    expect(projection.fullText).toContain('TaskDuration: 1.250 s');
+    expect(projection.fullText).toContain('Nodes: 1,234');
+  });
+
   it('normalizes console-log entries, empty labels, and visible tallies', () => {
     const logs = buildTerminalToolResultProjection(
       'console-logs',

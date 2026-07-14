@@ -2217,14 +2217,22 @@ export function KeywordSearchView({
   }
 
   if (parsed.rawFallback) {
-    const fragment = parsed.fragments[0] ?? null;
-    const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
+    const titleFragment = parsed.fragments.find((fragment) => fragment.fragmentId === 'keyword-search-fallback-title') ?? null;
+    const bodyFragment = parsed.fragments.find((fragment) => fragment.fragmentId === 'keyword-search-fallback-body') ?? null;
+    const titleHighlight = activeHighlight?.fragmentId === titleFragment?.fragmentId ? activeHighlight : null;
+    const bodyHighlight = activeHighlight?.fragmentId === bodyFragment?.fragmentId ? activeHighlight : null;
     return (
       <div className="keyword-search-results keyword-search-raw">
-        <div className="keyword-search-fallback-note" data-fragment-id={fragment?.fragmentId}>
-          Raw ripgrep results — LLM filter unavailable
+        <div className="keyword-search-fallback-note" data-fragment-id={titleFragment?.fragmentId}>
+          {titleHighlight && titleFragment
+            ? renderHighlightedText(titleFragment.semanticText, titleHighlight.start, titleHighlight.end)
+            : 'Raw ripgrep results — LLM filter unavailable'}
         </div>
-        <pre className="keyword-search-raw-text">{highlight && fragment ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : rawText}</pre>
+        <pre className="keyword-search-raw-text" data-fragment-id={bodyFragment?.fragmentId}>
+          {bodyHighlight && bodyFragment
+            ? renderHighlightedText(bodyFragment.semanticText, bodyHighlight.start, bodyHighlight.end)
+            : rawText}
+        </pre>
       </div>
     );
   }

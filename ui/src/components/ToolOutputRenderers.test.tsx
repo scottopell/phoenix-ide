@@ -104,9 +104,11 @@ describe('buildKeywordSearchOutputProjection parity', () => {
     ].join('\n');
     const built = buildKeywordSearchOutputProjection(raw, { toolUseId: 'tool-2' });
     expect(built.rawFallback).toBe(true);
-    expect(built.fragments).toHaveLength(1);
-    expect(built.fragments[0]?.semanticText).toBe(raw);
-    expect(built.fragments[0]?.fragmentId).toBe('keyword-search-fallback');
+    expect(built.fragments).toHaveLength(2);
+    expect(built.fragments[0]?.semanticText).toBe('Raw ripgrep results — LLM filter unavailable');
+    expect(built.fragments[0]?.fragmentId).toBe('keyword-search-fallback-title');
+    expect(built.fragments[1]?.semanticText).toBe(raw);
+    expect(built.fragments[1]?.fragmentId).toBe('keyword-search-fallback-body');
   });
 });
 
@@ -483,6 +485,27 @@ describe('KeywordSearchView', () => {
     const { container } = render(<KeywordSearchView rawText={raw} onOpenFile={undefined} />);
     expect(screen.getByText(/Raw ripgrep results/)).toBeTruthy();
     expect(container.querySelector('pre.keyword-search-raw-text')?.textContent).toBe(raw);
+  });
+
+  it('searches and marks the raw-fallback notice separately from body text', () => {
+    const raw = [
+      'src/a.ts:1:alpha',
+      'src/b.ts:2:beta',
+      '--',
+      'src/c.ts:3:gamma',
+    ].join('\n');
+    const projection = buildKeywordSearchOutputProjection(raw, { toolUseId: 'keyword-1' });
+    const title = projection.fragments.find((fragment) => fragment.fragmentId === 'keyword-search-fallback-title')!;
+    const { container } = render(
+      <KeywordSearchView
+        rawText={raw}
+        onOpenFile={undefined}
+        toolUseId="keyword-1"
+        activeHighlight={{ fragmentId: title.fragmentId, start: 4, end: 11 }}
+      />,
+    );
+    expect(container.querySelector('.keyword-search-fallback-note .viewer-find-inline-match--active')?.textContent).toBe('ripgrep');
+    expect(container.querySelector('.keyword-search-raw-text .viewer-find-inline-match--active')).toBeNull();
   });
 
   it('renders the empty/none-found state', () => {
