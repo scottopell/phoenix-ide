@@ -878,7 +878,6 @@ fn prediction_sql(value: EffectPrediction) -> &'static str {
         EffectPrediction::Completed => "completed",
         EffectPrediction::Eligible => "eligible",
         EffectPrediction::Blocked => "blocked",
-        EffectPrediction::Omitted => "omitted",
     }
 }
 fn role_sql(value: phoenix_workflow::EffectRole) -> &'static str {

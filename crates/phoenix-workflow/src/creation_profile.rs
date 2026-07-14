@@ -26,9 +26,21 @@ pub const DELETE_STAGED_ATTACHMENTS: EffectId = EffectId(104);
 pub const FINISH_CANCELLATION_OR_DELETION: EffectId = EffectId(105);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreationKind {
-    InitialTurn { message_id: String },
+pub enum CreationWorkspace {
+    Direct {
+        cwd: String,
+    },
+    Worktree {
+        repository_path: String,
+        worktree_path: String,
+        branch_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreationStart {
     SeededEmpty,
+    InitialTurn { message_id: String, text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,13 +48,9 @@ pub struct CreationIntent {
     pub job_id: String,
     pub conversation_id: String,
     pub idempotency_key: String,
-    pub repository_path: String,
-    pub worktree_path: String,
-    pub uses_worktree: bool,
-    pub branch_name: String,
-    pub initial_text: String,
+    pub workspace: CreationWorkspace,
     pub attachment_ids: Vec<String>,
-    pub kind: CreationKind,
+    pub start: CreationStart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,11 +96,57 @@ pub enum CleanupOwnership {
     OwnedResources,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CreationRuntimeEvidence {
-    pub runtime_bootstrapped: bool,
-    pub initial_llm_dispatched: bool,
-    pub ready_capabilities: Option<CreationCapabilities>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationRuntimeEvidence {
+    NoRuntimeSignals,
+    RuntimeBootstrapped,
+    InitialRequestDispatched,
+    Ready { capabilities: CreationCapabilities },
+}
+
+impl CreationRuntimeEvidence {
+    #[must_use]
+    pub const fn no_runtime_signals() -> Self {
+        Self::NoRuntimeSignals
+    }
+
+    #[must_use]
+    pub const fn runtime_bootstrapped() -> Self {
+        Self::RuntimeBootstrapped
+    }
+
+    #[must_use]
+    pub const fn initial_request_dispatched() -> Self {
+        Self::InitialRequestDispatched
+    }
+
+    #[must_use]
+    pub const fn ready(capabilities: CreationCapabilities) -> Self {
+        Self::Ready { capabilities }
+    }
+
+    #[must_use]
+    pub const fn runtime_bootstrapped_observed(self) -> bool {
+        matches!(
+            self,
+            Self::RuntimeBootstrapped | Self::InitialRequestDispatched | Self::Ready { .. }
+        )
+    }
+
+    #[must_use]
+    pub const fn initial_request_dispatched_observed(self) -> bool {
+        matches!(self, Self::InitialRequestDispatched | Self::Ready { .. })
+    }
+
+    #[must_use]
+    pub const fn ready_capabilities(self) -> Option<CreationCapabilities> {
+        match self {
+            Self::Ready { capabilities } => Some(capabilities),
+            Self::NoRuntimeSignals | Self::RuntimeBootstrapped | Self::InitialRequestDispatched => {
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +354,6 @@ pub enum EffectPrediction {
     Completed,
     Eligible,
     Blocked,
-    Omitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +375,7 @@ pub enum CompensationPrediction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreationProjection {
     pub conversation_id: String,
-    pub kind: CreationKind,
+    pub start: CreationStart,
     pub readiness_effects: Vec<EffectId>,
     pub status: CreationProjectionStatus,
     pub capabilities: CreationCapabilities,
@@ -391,6 +444,40 @@ pub struct CreationShadowAdapter {
     pub workflow: WorkflowState<CreationProfile>,
     pub plan: TransitionPlan<CreationProfile>,
     pub projection: CreationProjection,
+}
+
+impl CreationIntent {
+    #[must_use]
+    pub fn workspace_path(&self) -> &str {
+        match &self.workspace {
+            CreationWorkspace::Direct { cwd } => cwd,
+            CreationWorkspace::Worktree { worktree_path, .. } => worktree_path,
+        }
+    }
+}
+
+fn initial_turn(start: &CreationStart) -> Option<(&str, &str)> {
+    match start {
+        CreationStart::SeededEmpty => None,
+        CreationStart::InitialTurn { message_id, text } => {
+            Some((message_id.as_str(), text.as_str()))
+        }
+    }
+}
+
+fn worktree_workspace(intent: &CreationIntent) -> Option<(&str, &str, &str)> {
+    match &intent.workspace {
+        CreationWorkspace::Direct { .. } => None,
+        CreationWorkspace::Worktree {
+            repository_path,
+            worktree_path,
+            branch_name,
+        } => Some((
+            repository_path.as_str(),
+            worktree_path.as_str(),
+            branch_name.as_str(),
+        )),
+    }
 }
 
 #[must_use]
@@ -506,24 +593,23 @@ fn uses_compensation_plan(oracle: &AuthoritativeCreationOracle) -> bool {
 }
 
 fn creation_dependencies(oracle: &AuthoritativeCreationOracle) -> Vec<DependencyDecl> {
-    let mut dependencies = if oracle.intent.uses_worktree {
-        vec![
+    let mut dependencies = match &oracle.intent.workspace {
+        CreationWorkspace::Direct { .. } => vec![
+            dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
+            dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
+        ],
+        CreationWorkspace::Worktree { .. } => vec![
             dependency(RESERVE_WORKTREE, RESOLVE_REPOSITORY),
             dependency(MATERIALIZE_OR_RECONCILE_WORKTREE, RESERVE_WORKTREE),
             dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
             dependency(COMMIT_METADATA, MATERIALIZE_OR_RECONCILE_WORKTREE),
             dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        ]
-    } else {
-        vec![
-            dependency(FINALIZE_ATTACHMENTS, RESOLVE_REPOSITORY),
-            dependency(COMMIT_METADATA, FINALIZE_ATTACHMENTS),
-        ]
+        ],
     };
-    if matches!(oracle.intent.kind, CreationKind::InitialTurn { .. }) {
+    if initial_turn(&oracle.intent.start).is_some() {
         dependencies.retain(|dependency| dependency.effect_id != COMMIT_METADATA);
         dependencies.push(dependency(EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS));
-        if oracle.intent.uses_worktree {
+        if matches!(oracle.intent.workspace, CreationWorkspace::Worktree { .. }) {
             dependencies.push(dependency(
                 EXPAND_INITIAL_MESSAGE,
                 MATERIALIZE_OR_RECONCILE_WORKTREE,
@@ -543,38 +629,26 @@ pub fn creation_plan(
     oracle: &AuthoritativeCreationOracle,
     snapshot: CreationSnapshot,
 ) -> TransitionPlan<CreationProfile> {
-    let initial_turn = match &oracle.intent.kind {
-        CreationKind::InitialTurn { message_id } => Some(message_id.clone()),
-        CreationKind::SeededEmpty => None,
-    };
     let mut effects = base_effects(&oracle.intent, oracle.generation);
-    if !oracle.intent.uses_worktree {
-        effects.retain(|effect| {
-            !matches!(
-                effect.effect_id,
-                RESERVE_WORKTREE | MATERIALIZE_OR_RECONCILE_WORKTREE
-            )
-        });
-    }
     effects.push(effect(
         COMMIT_METADATA,
         "commit_metadata",
         CreationEffectIntent::CommitMetadata {
             conversation_id: oracle.intent.conversation_id.clone(),
-            worktree_path: oracle.intent.worktree_path.clone(),
+            worktree_path: oracle.intent.workspace_path().to_owned(),
         },
         oracle.generation,
         EffectAmbiguity::ExternalIdempotency,
         None,
     ));
-    if let Some(message_id) = initial_turn {
+    if let Some((message_id, text)) = initial_turn(&oracle.intent.start) {
         effects.push(effect(
             EXPAND_INITIAL_MESSAGE,
             "expand_initial_message",
             CreationEffectIntent::ExpandInitialMessage {
                 conversation_id: oracle.intent.conversation_id.clone(),
-                message_id: message_id.clone(),
-                text: oracle.intent.initial_text.clone(),
+                message_id: message_id.to_owned(),
+                text: text.to_owned(),
             },
             oracle.generation,
             EffectAmbiguity::ExternalIdempotency,
@@ -595,7 +669,7 @@ pub fn creation_plan(
             "dispatch_initial_llm_request",
             CreationEffectIntent::DispatchInitialLlmRequest {
                 conversation_id: oracle.intent.conversation_id.clone(),
-                message_id,
+                message_id: message_id.to_owned(),
             },
             oracle.generation,
             EffectAmbiguity::ExternalIdempotency,
@@ -633,53 +707,59 @@ pub fn creation_plan(
 }
 
 fn base_effects(intent: &CreationIntent, generation: u64) -> Vec<EffectDecl<CreationEffectIntent>> {
-    vec![
-        effect(
-            RESOLVE_REPOSITORY,
-            "resolve_repository",
-            CreationEffectIntent::ResolveRepository {
-                repository_path: intent.repository_path.clone(),
+    let mut effects = vec![effect(
+        RESOLVE_REPOSITORY,
+        "resolve_repository",
+        CreationEffectIntent::ResolveRepository {
+            repository_path: match &intent.workspace {
+                CreationWorkspace::Direct { cwd } => cwd.clone(),
+                CreationWorkspace::Worktree {
+                    repository_path, ..
+                } => repository_path.clone(),
             },
-            generation,
-            EffectAmbiguity::ObservableReconciliation,
-            None,
-        ),
-        effect(
+        },
+        generation,
+        EffectAmbiguity::ObservableReconciliation,
+        None,
+    )];
+    if let Some((repository_path, worktree_path, branch_name)) = worktree_workspace(intent) {
+        effects.push(effect(
             RESERVE_WORKTREE,
             "reserve_worktree",
             CreationEffectIntent::ReserveWorktree {
-                repository_path: intent.repository_path.clone(),
-                worktree_path: intent.worktree_path.clone(),
-                branch_name: intent.branch_name.clone(),
+                repository_path: repository_path.to_owned(),
+                worktree_path: worktree_path.to_owned(),
+                branch_name: branch_name.to_owned(),
             },
             generation,
             EffectAmbiguity::ObservableReconciliation,
             Some("repository"),
-        ),
-        effect(
+        ));
+        effects.push(effect(
             MATERIALIZE_OR_RECONCILE_WORKTREE,
             "materialize_or_reconcile_worktree",
             CreationEffectIntent::MaterializeOrReconcileWorktree {
-                repository_path: intent.repository_path.clone(),
-                worktree_path: intent.worktree_path.clone(),
-                branch_name: intent.branch_name.clone(),
+                repository_path: repository_path.to_owned(),
+                worktree_path: worktree_path.to_owned(),
+                branch_name: branch_name.to_owned(),
             },
             generation,
             EffectAmbiguity::ObservableReconciliation,
             Some("repository"),
-        ),
-        effect(
-            FINALIZE_ATTACHMENTS,
-            "finalize_attachments",
-            CreationEffectIntent::FinalizeAttachments {
-                conversation_id: intent.conversation_id.clone(),
-                attachment_ids: intent.attachment_ids.clone(),
-            },
-            generation,
-            EffectAmbiguity::ObservableReconciliation,
-            None,
-        ),
-    ]
+        ));
+    }
+    effects.push(effect(
+        FINALIZE_ATTACHMENTS,
+        "finalize_attachments",
+        CreationEffectIntent::FinalizeAttachments {
+            conversation_id: intent.conversation_id.clone(),
+            attachment_ids: intent.attachment_ids.clone(),
+        },
+        generation,
+        EffectAmbiguity::ObservableReconciliation,
+        None,
+    ));
+    effects
 }
 
 fn effect(
@@ -745,8 +825,13 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
             REMOVE_OWNED_WORKTREE,
             "remove_owned_worktree",
             CreationEffectIntent::RemoveOwnedWorktree {
-                repository_path: oracle.intent.repository_path.clone(),
-                worktree_path: oracle.intent.worktree_path.clone(),
+                repository_path: match &oracle.intent.workspace {
+                    CreationWorkspace::Worktree {
+                        repository_path, ..
+                    } => repository_path.clone(),
+                    CreationWorkspace::Direct { cwd } => cwd.clone(),
+                },
+                worktree_path: oracle.intent.workspace_path().to_owned(),
             },
             Some("repository"),
         ),
@@ -755,7 +840,7 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
             "release_reservation",
             CreationEffectIntent::ReleaseReservation {
                 conversation_id: oracle.intent.conversation_id.clone(),
-                worktree_path: oracle.intent.worktree_path.clone(),
+                worktree_path: oracle.intent.workspace_path().to_owned(),
             },
             Some("repository"),
         ),
@@ -824,6 +909,33 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
     }
 }
 
+fn ready_projection(
+    oracle: &AuthoritativeCreationOracle,
+) -> (
+    CreationProjectionStatus,
+    CreationCapabilities,
+    CompletionPrediction,
+    CompensationPrediction,
+    bool,
+) {
+    match oracle.runtime_evidence.ready_capabilities() {
+        Some(ready_capabilities) => (
+            CreationProjectionStatus::Ready,
+            ready_capabilities,
+            completion_for_ready(oracle),
+            CompensationPrediction::None,
+            false,
+        ),
+        None => (
+            CreationProjectionStatus::Provisioning,
+            capabilities([false, false, false, false, false, false]),
+            CompletionPrediction::Pending,
+            CompensationPrediction::None,
+            false,
+        ),
+    }
+}
+
 #[must_use]
 pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> CreationProjection {
     let (status, capabilities, completion, compensation, hidden) = match &oracle.status {
@@ -868,16 +980,7 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
             CompensationPrediction::RequiredForDeletion,
             true,
         ),
-        AuthoritativeCreationStatus::Ready => (
-            CreationProjectionStatus::Ready,
-            oracle
-                .runtime_evidence
-                .ready_capabilities
-                .unwrap_or_else(|| capabilities([true, true, true, false, false, true])),
-            completion_for_ready(oracle),
-            CompensationPrediction::None,
-            false,
-        ),
+        AuthoritativeCreationStatus::Ready => ready_projection(oracle),
     };
     let readiness_effects = if uses_compensation_plan(oracle) {
         vec![
@@ -888,8 +991,8 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
             FINISH_CANCELLATION_OR_DELETION,
         ]
     } else {
-        match &oracle.intent.kind {
-            CreationKind::InitialTurn { .. } => vec![
+        match &oracle.intent.start {
+            CreationStart::InitialTurn { .. } => vec![
                 RESOLVE_REPOSITORY,
                 RESERVE_WORKTREE,
                 MATERIALIZE_OR_RECONCILE_WORKTREE,
@@ -899,7 +1002,7 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
                 BOOTSTRAP_RUNTIME,
                 DISPATCH_INITIAL_LLM_REQUEST,
             ],
-            CreationKind::SeededEmpty => vec![
+            CreationStart::SeededEmpty => vec![
                 RESOLVE_REPOSITORY,
                 RESERVE_WORKTREE,
                 MATERIALIZE_OR_RECONCILE_WORKTREE,
@@ -910,7 +1013,7 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
     };
     CreationProjection {
         conversation_id: oracle.intent.conversation_id.clone(),
-        kind: oracle.intent.kind.clone(),
+        start: oracle.intent.start.clone(),
         readiness_effects,
         status,
         capabilities,
@@ -926,15 +1029,16 @@ pub fn project_authoritative_creation(oracle: &AuthoritativeCreationOracle) -> C
 }
 
 fn completion_for_ready(oracle: &AuthoritativeCreationOracle) -> CompletionPrediction {
-    match oracle.intent.kind {
-        CreationKind::SeededEmpty => CompletionPrediction::Complete,
-        CreationKind::InitialTurn { .. }
-            if oracle.runtime_evidence.runtime_bootstrapped
-                && oracle.runtime_evidence.initial_llm_dispatched =>
+    match oracle.intent.start {
+        CreationStart::SeededEmpty => CompletionPrediction::Complete,
+        CreationStart::InitialTurn { .. }
+            if oracle
+                .runtime_evidence
+                .initial_request_dispatched_observed() =>
         {
             CompletionPrediction::Complete
         }
-        CreationKind::InitialTurn { .. } => CompletionPrediction::Pending,
+        CreationStart::InitialTurn { .. } => CompletionPrediction::Pending,
     }
 }
 
@@ -993,25 +1097,25 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
             AuthoritativeCreationStage::ResolveRepository,
         ),
         (
-            RESERVE_WORKTREE,
-            AuthoritativeCreationStage::ReserveResources,
-        ),
-        (
-            MATERIALIZE_OR_RECONCILE_WORKTREE,
-            AuthoritativeCreationStage::MaterializeWorktree,
-        ),
-        (
             FINALIZE_ATTACHMENTS,
             AuthoritativeCreationStage::FinalizeAttachments,
         ),
         (COMMIT_METADATA, AuthoritativeCreationStage::CommitMetadata),
     ];
-    if !oracle.intent.uses_worktree {
-        effects
-            .retain(|(id, _)| !matches!(*id, RESERVE_WORKTREE | MATERIALIZE_OR_RECONCILE_WORKTREE));
+    if matches!(oracle.intent.workspace, CreationWorkspace::Worktree { .. }) {
+        effects.extend([
+            (
+                RESERVE_WORKTREE,
+                AuthoritativeCreationStage::ReserveResources,
+            ),
+            (
+                MATERIALIZE_OR_RECONCILE_WORKTREE,
+                AuthoritativeCreationStage::MaterializeWorktree,
+            ),
+        ]);
     }
-    match oracle.intent.kind {
-        CreationKind::InitialTurn { .. } => effects.extend([
+    if matches!(oracle.intent.start, CreationStart::InitialTurn { .. }) {
+        effects.extend([
             (
                 EXPAND_INITIAL_MESSAGE,
                 AuthoritativeCreationStage::ExpandInitialMessage,
@@ -1024,32 +1128,19 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
                 DISPATCH_INITIAL_LLM_REQUEST,
                 AuthoritativeCreationStage::BootstrapInitialTurn,
             ),
-        ]),
-        CreationKind::SeededEmpty => effects.extend([
-            (EXPAND_INITIAL_MESSAGE, AuthoritativeCreationStage::Finalize),
-            (BOOTSTRAP_RUNTIME, AuthoritativeCreationStage::Finalize),
-            (
-                DISPATCH_INITIAL_LLM_REQUEST,
-                AuthoritativeCreationStage::Finalize,
-            ),
-        ]),
+        ]);
     }
     effects
         .into_iter()
         .map(|(id, stage)| {
-            let prediction = if matches!(oracle.intent.kind, CreationKind::SeededEmpty)
-                && matches!(
-                    id,
-                    EXPAND_INITIAL_MESSAGE | BOOTSTRAP_RUNTIME | DISPATCH_INITIAL_LLM_REQUEST
-                ) {
-                EffectPrediction::Omitted
-            } else if (id == RESERVE_WORKTREE && oracle.cleanup_ownership != CleanupOwnership::None)
+            let prediction = if (id == RESERVE_WORKTREE
+                && oracle.cleanup_ownership != CleanupOwnership::None)
                 || (id == COMMIT_METADATA
                     && oracle.stage == AuthoritativeCreationStage::CommitMetadata)
             {
                 EffectPrediction::Completed
             } else if id == BOOTSTRAP_RUNTIME {
-                if oracle.runtime_evidence.runtime_bootstrapped {
+                if oracle.runtime_evidence.runtime_bootstrapped_observed() {
                     EffectPrediction::Completed
                 } else if oracle.stage >= AuthoritativeCreationStage::BootstrapInitialTurn {
                     EffectPrediction::Eligible
@@ -1057,9 +1148,12 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
                     EffectPrediction::Blocked
                 }
             } else if id == DISPATCH_INITIAL_LLM_REQUEST {
-                if oracle.runtime_evidence.initial_llm_dispatched {
+                if oracle
+                    .runtime_evidence
+                    .initial_request_dispatched_observed()
+                {
                     EffectPrediction::Completed
-                } else if oracle.runtime_evidence.runtime_bootstrapped {
+                } else if oracle.runtime_evidence.runtime_bootstrapped_observed() {
                     EffectPrediction::Eligible
                 } else {
                     EffectPrediction::Blocked

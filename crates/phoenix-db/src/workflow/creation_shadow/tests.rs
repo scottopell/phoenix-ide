@@ -3,8 +3,8 @@ use std::{str::FromStr, time::Duration};
 use chrono::{TimeZone, Utc};
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
-    CleanupOwnership, CreationIntent, CreationKind, CreationProjectionStatus,
-    CreationRuntimeEvidence,
+    CleanupOwnership, CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence,
+    CreationStart, CreationWorkspace,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -48,14 +48,15 @@ fn oracle() -> AuthoritativeCreationOracle {
             job_id: "job-shadow".to_owned(),
             conversation_id: "conv-shadow".to_owned(),
             idempotency_key: "key".to_owned(),
-            repository_path: "/repo".to_owned(),
-            worktree_path: "/repo/wt".to_owned(),
-            uses_worktree: true,
-            branch_name: "shadow".to_owned(),
-            initial_text: "authoritative semantic bytes must not be copied".to_owned(),
+            workspace: CreationWorkspace::Worktree {
+                repository_path: "/repo".to_owned(),
+                worktree_path: "/repo/wt".to_owned(),
+                branch_name: "shadow".to_owned(),
+            },
             attachment_ids: vec!["attachment-secret".to_owned()],
-            kind: CreationKind::InitialTurn {
+            start: CreationStart::InitialTurn {
                 message_id: "message-secret".to_owned(),
+                text: "authoritative semantic bytes must not be copied".to_owned(),
             },
         },
         status: AuthoritativeCreationStatus::Accepted,
@@ -64,7 +65,7 @@ fn oracle() -> AuthoritativeCreationOracle {
         generation: 0,
         revision: 0,
         cleanup_ownership: CleanupOwnership::None,
-        runtime_evidence: CreationRuntimeEvidence::default(),
+        runtime_evidence: CreationRuntimeEvidence::no_runtime_signals(),
     }
 }
 

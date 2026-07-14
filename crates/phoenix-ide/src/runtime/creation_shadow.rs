@@ -17,7 +17,8 @@ use phoenix_db::workflow::{
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CreationCapabilities, CreationFailure,
-    CreationIntent, CreationKind, CreationProjectionStatus, CreationRuntimeEvidence,
+    CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
+    CreationWorkspace,
 };
 
 const ENABLE_ENV: &str = "PHOENIX_CREATION_SHADOW_ENABLED";
@@ -167,11 +168,11 @@ impl CreationShadowCoordinator {
             .get_conversation(&oracle.intent.conversation_id)
             .await
             .map_err(|error| error.to_string())?;
-        oracle.runtime_evidence.initial_llm_dispatched =
-            initial_llm_dispatched_from_projection(&oracle.status, &visible.state);
-        oracle.runtime_evidence.runtime_bootstrapped =
-            runtime_bootstrapped_from_projection(&oracle.status, &visible.state);
-        oracle.runtime_evidence.ready_capabilities = Some(capabilities_for_state(&visible.state));
+        oracle.runtime_evidence = runtime_evidence_from_projection(
+            &oracle.status,
+            &visible.state,
+            capabilities_for_state(&visible.state),
+        );
         let observed = observed_projection(&visible.state, visible.archived, &oracle.status);
         CreationShadowAdapter::new(
             &WorkflowRepository::new(self.db.pool().clone()),
@@ -258,40 +259,42 @@ fn oracle_from_committed(
         .or(preserved_branch)
         .or_else(|| job.intent.base_branch.clone())
         .unwrap_or_default();
-    let kind = match &job.protocol.kind {
-        CoreCreationKind::InitialTurn { message_id } => CreationKind::InitialTurn {
+    let start = match &job.protocol.kind {
+        CoreCreationKind::InitialTurn { message_id } => CreationStart::InitialTurn {
             message_id: message_id.clone(),
+            text: job.intent.text.clone(),
         },
-        CoreCreationKind::SeededEmpty => CreationKind::SeededEmpty,
+        CoreCreationKind::SeededEmpty => CreationStart::SeededEmpty,
     };
-    let initial_llm_dispatched = initial_llm_dispatched(&job.protocol.status, conversation_state);
-    let runtime_bootstrapped = runtime_bootstrapped(&job.protocol.status, conversation_state);
     let uses_worktree = preserved_uses_worktree
         .unwrap_or_else(|| uses_worktree(job.intent.mode.as_deref(), reservations, conv_mode));
+    let runtime_evidence = runtime_evidence(&job.protocol.status, conversation_state);
+    let status = map_status(job.protocol.status);
+    let stage = map_stage(job.protocol.stage);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
             job_id: job.id.clone(),
             conversation_id: job.conversation_id,
             idempotency_key: job.id,
-            repository_path,
-            worktree_path,
-            uses_worktree,
-            branch_name,
-            initial_text: job.intent.text,
+            workspace: if uses_worktree {
+                CreationWorkspace::Worktree {
+                    repository_path,
+                    worktree_path,
+                    branch_name,
+                }
+            } else {
+                CreationWorkspace::Direct { cwd: worktree_path }
+            },
             attachment_ids,
-            kind,
+            start,
         },
-        status: map_status(job.protocol.status),
-        stage: map_stage(job.protocol.stage),
+        status,
+        stage,
         attempt: job.protocol.attempt,
         generation: job.protocol.generation,
         revision: job.shadow_projection_revision,
         cleanup_ownership: cleanup_ownership(reservations),
-        runtime_evidence: CreationRuntimeEvidence {
-            runtime_bootstrapped,
-            initial_llm_dispatched,
-            ready_capabilities: Some(capabilities_for_state(conversation_state)),
-        },
+        runtime_evidence,
     }
 }
 
@@ -308,11 +311,20 @@ fn cleanup_ownership(reservations: &[CreationResourceReservation]) -> CleanupOwn
     }
 }
 
-fn initial_llm_dispatched_from_projection(
+fn runtime_evidence_from_projection(
     status: &AuthoritativeCreationStatus,
     state: &ConvState,
-) -> bool {
-    matches!(status, AuthoritativeCreationStatus::Ready) || active_runtime_evidence(state)
+    capabilities: CreationCapabilities,
+) -> CreationRuntimeEvidence {
+    if matches!(status, AuthoritativeCreationStatus::Ready) {
+        CreationRuntimeEvidence::ready(capabilities)
+    } else if active_runtime_evidence(state) {
+        CreationRuntimeEvidence::initial_request_dispatched()
+    } else if runtime_bootstrapped_from_projection(status, state) {
+        CreationRuntimeEvidence::runtime_bootstrapped()
+    } else {
+        CreationRuntimeEvidence::no_runtime_signals()
+    }
 }
 
 fn runtime_bootstrapped_from_projection(
@@ -334,10 +346,6 @@ fn runtime_bootstrapped_from_projection(
         )
 }
 
-fn initial_llm_dispatched(status: &CreationStatus, state: &ConvState) -> bool {
-    matches!(status, CreationStatus::Ready) || active_runtime_evidence(state)
-}
-
 fn uses_worktree(
     requested_mode: Option<&str>,
     reservations: &[CreationResourceReservation],
@@ -348,19 +356,26 @@ fn uses_worktree(
         || matches!(requested_mode, Some("managed" | "branch"))
 }
 
-fn runtime_bootstrapped(status: &CreationStatus, state: &ConvState) -> bool {
-    matches!(status, CreationStatus::Ready)
-        || matches!(
-            state,
-            ConvState::LlmRequesting { .. }
-                | ConvState::SeededLlmRequesting { .. }
-                | ConvState::ToolExecuting { .. }
-                | ConvState::AwaitingSubAgents { .. }
-                | ConvState::AwaitingContinuation { .. }
-                | ConvState::AwaitingRecovery { .. }
-                | ConvState::CancellingTool { .. }
-                | ConvState::CancellingSubAgents { .. }
-        )
+fn runtime_evidence(status: &CreationStatus, state: &ConvState) -> CreationRuntimeEvidence {
+    if matches!(status, CreationStatus::Ready) {
+        CreationRuntimeEvidence::ready(capabilities_for_state(state))
+    } else if active_runtime_evidence(state) {
+        CreationRuntimeEvidence::initial_request_dispatched()
+    } else if matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::CancellingSubAgents { .. }
+    ) {
+        CreationRuntimeEvidence::runtime_bootstrapped()
+    } else {
+        CreationRuntimeEvidence::no_runtime_signals()
+    }
 }
 
 fn map_status(status: CreationStatus) -> AuthoritativeCreationStatus {
@@ -586,9 +601,9 @@ mod tests {
 
     #[test]
     fn settled_ready_turn_preserves_dispatch_evidence() {
-        assert!(initial_llm_dispatched(
-            &CreationStatus::Ready,
-            &ConvState::Idle
+        assert!(matches!(
+            runtime_evidence(&CreationStatus::Ready, &ConvState::Idle),
+            CreationRuntimeEvidence::Ready { .. }
         ));
     }
 
@@ -634,46 +649,58 @@ mod tests {
 
     #[test]
     fn terminal_pre_bootstrap_shells_do_not_count_as_runtime_bootstrapped() {
-        assert!(!runtime_bootstrapped(
-            &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
-                kind: "failed".to_owned(),
-                message: "failed".to_owned(),
-            }),
-            &ConvState::CreationFailed {
-                job_id: "job".to_owned(),
-                error: "failed".to_owned(),
-                error_kind: crate::db::ErrorKind::ServerError,
-            },
+        assert!(matches!(
+            runtime_evidence(
+                &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
+                    kind: "failed".to_owned(),
+                    message: "failed".to_owned(),
+                }),
+                &ConvState::CreationFailed {
+                    job_id: "job".to_owned(),
+                    error: "failed".to_owned(),
+                    error_kind: crate::db::ErrorKind::ServerError,
+                },
+            ),
+            CreationRuntimeEvidence::NoRuntimeSignals
         ));
-        assert!(!runtime_bootstrapped(
-            &CreationStatus::Cancelled,
-            &ConvState::CreationCancelled {
-                job_id: "job".to_owned(),
-            },
+        assert!(matches!(
+            runtime_evidence(
+                &CreationStatus::Cancelled,
+                &ConvState::CreationCancelled {
+                    job_id: "job".to_owned(),
+                },
+            ),
+            CreationRuntimeEvidence::NoRuntimeSignals
         ));
-        assert!(runtime_bootstrapped(
-            &CreationStatus::Claimed(phoenix_core::domain::creation_protocol::CreationClaim {
-                worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
-                    "worker".to_owned(),
-                ),
-                generation: 1,
-                token: phoenix_core::domain::creation_protocol::CreationClaimToken(
-                    "token".to_owned(),
-                ),
-                lease_until: 2,
-            }),
-            &ConvState::LlmRequesting { attempt: 1 },
+        assert!(matches!(
+            runtime_evidence(
+                &CreationStatus::Claimed(phoenix_core::domain::creation_protocol::CreationClaim {
+                    worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                        "worker".to_owned(),
+                    ),
+                    generation: 1,
+                    token: phoenix_core::domain::creation_protocol::CreationClaimToken(
+                        "token".to_owned(),
+                    ),
+                    lease_until: 2,
+                }),
+                &ConvState::LlmRequesting { attempt: 1 },
+            ),
+            CreationRuntimeEvidence::InitialRequestDispatched
         ));
-        assert!(!runtime_bootstrapped(
-            &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
-                kind: "failed".to_owned(),
-                message: "failed".to_owned(),
-            }),
-            &ConvState::CreationFailed {
-                job_id: "job".to_owned(),
-                error: "late failure".to_owned(),
-                error_kind: crate::db::ErrorKind::ServerError,
-            },
+        assert!(matches!(
+            runtime_evidence(
+                &CreationStatus::Failed(phoenix_core::domain::creation_protocol::CreationError {
+                    kind: "failed".to_owned(),
+                    message: "failed".to_owned(),
+                }),
+                &ConvState::CreationFailed {
+                    job_id: "job".to_owned(),
+                    error: "late failure".to_owned(),
+                    error_kind: crate::db::ErrorKind::ServerError,
+                },
+            ),
+            CreationRuntimeEvidence::NoRuntimeSignals
         ));
     }
 

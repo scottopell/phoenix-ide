@@ -11,27 +11,27 @@ use super::{
     adapt_authoritative_creation, compensation_plan, project_authoritative_creation,
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CompensationPrediction, CompletionPrediction,
-    CreationFailure, CreationKind, CreationProjectionStatus, CreationRuntimeEvidence,
-    EffectPrediction, WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME, COMMIT_METADATA,
-    COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS, DISPATCH_INITIAL_LLM_REQUEST,
-    EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS, FINISH_CANCELLATION_OR_DELETION,
-    MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION, REMOVE_OWNED_WORKTREE,
-    RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
+    CreationFailure, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
+    CreationWorkspace, EffectPrediction, WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME,
+    COMMIT_METADATA, COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS,
+    DISPATCH_INITIAL_LLM_REQUEST, EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS,
+    FINISH_CANCELLATION_OR_DELETION, MATERIALIZE_OR_RECONCILE_WORKTREE, RELEASE_RESERVATION,
+    REMOVE_OWNED_WORKTREE, RESERVE_WORKTREE, RESOLVE_REPOSITORY, REVOKE_RUNTIME,
 };
 
-fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
+fn oracle(start: CreationStart) -> AuthoritativeCreationOracle {
     AuthoritativeCreationOracle {
         intent: super::CreationIntent {
             job_id: "job-1".into(),
             conversation_id: "conv-1".into(),
             idempotency_key: "request-1".into(),
-            repository_path: "/repo".into(),
-            worktree_path: "/repo-worktree".into(),
-            uses_worktree: true,
-            branch_name: "task-1".into(),
-            initial_text: "do the thing".into(),
+            workspace: CreationWorkspace::Worktree {
+                repository_path: "/repo".into(),
+                worktree_path: "/repo-worktree".into(),
+                branch_name: "task-1".into(),
+            },
             attachment_ids: vec!["attachment-1".into()],
-            kind,
+            start,
         },
         status: AuthoritativeCreationStatus::Accepted,
         stage: AuthoritativeCreationStage::ValidateIntent,
@@ -39,7 +39,7 @@ fn oracle(kind: CreationKind) -> AuthoritativeCreationOracle {
         generation: 3,
         revision: 7,
         cleanup_ownership: CleanupOwnership::None,
-        runtime_evidence: CreationRuntimeEvidence::default(),
+        runtime_evidence: CreationRuntimeEvidence::no_runtime_signals(),
     }
 }
 
@@ -59,8 +59,9 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
     let adapter = adapt_authoritative_creation(
         WorkflowId(10),
         WorkflowId(77),
-        &oracle(CreationKind::InitialTurn {
+        &oracle(CreationStart::InitialTurn {
             message_id: "message-1".into(),
+            text: "do the thing".into(),
         }),
     )
     .expect("shadow adapter");
@@ -120,8 +121,10 @@ fn initial_turn_dag_has_required_order_and_completion_barrier() {
 
 #[test]
 fn direct_creation_omits_worktree_effects() {
-    let mut oracle = oracle(CreationKind::SeededEmpty);
-    oracle.intent.uses_worktree = false;
+    let mut oracle = oracle(CreationStart::SeededEmpty);
+    oracle.intent.workspace = CreationWorkspace::Direct {
+        cwd: "/repo-direct".into(),
+    };
     let adapted = adapt_authoritative_creation(WorkflowId(31), WorkflowId(101), &oracle).unwrap();
     let plan = adapted.plan;
     let ids = plan
@@ -138,7 +141,7 @@ fn seeded_empty_has_distinct_required_dag_without_expansion_or_dispatch() {
     let adapter = adapt_authoritative_creation(
         WorkflowId(11),
         WorkflowId(78),
-        &oracle(CreationKind::SeededEmpty),
+        &oracle(CreationStart::SeededEmpty),
     )
     .expect("shadow adapter");
     let ids = adapter
@@ -173,20 +176,16 @@ fn seeded_empty_has_distinct_required_dag_without_expansion_or_dispatch() {
     assert!(adapter
         .projection
         .effect_predictions
-        .contains(&(EXPAND_INITIAL_MESSAGE, EffectPrediction::Omitted)));
-    assert!(adapter
-        .projection
-        .effect_predictions
-        .contains(&(BOOTSTRAP_RUNTIME, EffectPrediction::Omitted)));
-    assert!(adapter
-        .projection
-        .effect_predictions
-        .contains(&(DISPATCH_INITIAL_LLM_REQUEST, EffectPrediction::Omitted)));
+        .iter()
+        .all(|(id, _)| !matches!(
+            id,
+            &EXPAND_INITIAL_MESSAGE | &BOOTSTRAP_RUNTIME | &DISPATCH_INITIAL_LLM_REQUEST
+        )));
 }
 
 #[test]
 fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
-    let mut oracle = oracle(CreationKind::SeededEmpty);
+    let mut oracle = oracle(CreationStart::SeededEmpty);
     oracle.status = AuthoritativeCreationStatus::DeletionPending;
     oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
     let plan = compensation_plan(&oracle);
@@ -237,7 +236,7 @@ fn compensation_dag_orders_destructive_cleanup_and_finish_barrier() {
 
 #[test]
 fn compensation_projection_predicts_every_selected_effect() {
-    let mut oracle = oracle(CreationKind::SeededEmpty);
+    let mut oracle = oracle(CreationStart::SeededEmpty);
     oracle.status = AuthoritativeCreationStatus::DeletionPending;
     let adapter = adapt_authoritative_creation(WorkflowId(13), WorkflowId(80), &oracle)
         .expect("compensation adapter");
@@ -266,8 +265,9 @@ fn compensation_projection_predicts_every_selected_effect() {
 
 #[test]
 fn declared_effect_policies_and_prebootstrap_readiness_match_profile() {
-    let oracle = oracle(CreationKind::InitialTurn {
+    let oracle = oracle(CreationStart::InitialTurn {
         message_id: "msg-policy".to_owned(),
+        text: "do the thing".to_owned(),
     });
     let adapter = adapt_authoritative_creation(WorkflowId(14), WorkflowId(81), &oracle)
         .expect("initial-turn adapter");
@@ -304,7 +304,7 @@ fn adapter_has_no_execution_or_semantic_authority_leakage() {
     let mut adapter = adapt_authoritative_creation(
         WorkflowId(12),
         WorkflowId(79),
-        &oracle(CreationKind::SeededEmpty),
+        &oracle(CreationStart::SeededEmpty),
     )
     .expect("shadow adapter");
     assert_eq!(
@@ -359,6 +359,14 @@ fn all_reconciliation_classifications_are_typed_and_distinct() {
         WorktreeReconciliationClassification::TransientInfrastructureFailure,
     ]);
     assert_eq!(classifications.len(), 7);
+}
+
+fn add_ready_evidence(oracle: &mut AuthoritativeCreationOracle) {
+    if matches!(oracle.status, AuthoritativeCreationStatus::Ready) {
+        oracle.runtime_evidence = CreationRuntimeEvidence::ready(super::capabilities([
+            true, true, true, false, false, true,
+        ]));
+    }
 }
 
 #[test]
@@ -444,8 +452,9 @@ fn status_table_maps_visibility_capabilities_and_predictions() {
     for (status, expected_status, runtime, hidden, cancel, start_over, completion, compensation) in
         cases
     {
-        let mut oracle = oracle(CreationKind::SeededEmpty);
+        let mut oracle = oracle(CreationStart::SeededEmpty);
         oracle.status = status;
+        add_ready_evidence(&mut oracle);
         let projection = project_authoritative_creation(&oracle);
         assert_eq!(projection.status, expected_status);
         let availability = |allowed| {
@@ -471,7 +480,7 @@ fn cleanup_states_adapt_to_compensation_graphs() {
         AuthoritativeCreationStatus::DeletionPending,
     ];
     for status in statuses {
-        let mut oracle = oracle(CreationKind::SeededEmpty);
+        let mut oracle = oracle(CreationStart::SeededEmpty);
         oracle.status = status;
         oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
         let adapted =
@@ -488,7 +497,7 @@ fn cleanup_states_adapt_to_compensation_graphs() {
 
 #[test]
 fn completed_cancellation_has_no_compensation_effects() {
-    let mut cancelled = oracle(CreationKind::SeededEmpty);
+    let mut cancelled = oracle(CreationStart::SeededEmpty);
     cancelled.status = AuthoritativeCreationStatus::Cancelled;
     cancelled.cleanup_ownership = CleanupOwnership::OwnedResources;
     let adapted = adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &cancelled).unwrap();
@@ -501,7 +510,7 @@ fn completed_cancellation_has_no_compensation_effects() {
 
 #[test]
 fn early_cancellation_omits_unowned_resource_cleanup() {
-    let mut oracle = oracle(CreationKind::SeededEmpty);
+    let mut oracle = oracle(CreationStart::SeededEmpty);
     oracle.status = AuthoritativeCreationStatus::Cancelling;
     oracle.cleanup_ownership = CleanupOwnership::None;
     let adapted = adapt_authoritative_creation(WorkflowId(21), WorkflowId(91), &oracle).unwrap();
@@ -518,7 +527,7 @@ fn early_cancellation_omits_unowned_resource_cleanup() {
 
 #[test]
 fn failed_jobs_only_adapt_to_compensation_when_cleanup_resources_are_owned() {
-    let mut failed = oracle(CreationKind::SeededEmpty);
+    let mut failed = oracle(CreationStart::SeededEmpty);
     failed.status = AuthoritativeCreationStatus::Failed(CreationFailure {
         kind: "validation".into(),
         message: "failed before reservation".into(),
@@ -543,8 +552,9 @@ fn failed_jobs_only_adapt_to_compensation_when_cleanup_resources_are_owned() {
 
 #[test]
 fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_evidence() {
-    let mut pending = oracle(CreationKind::InitialTurn {
+    let mut pending = oracle(CreationStart::InitialTurn {
         message_id: "message-1".into(),
+        text: "do the thing".into(),
     });
     pending.stage = AuthoritativeCreationStage::Finalize;
     pending.status = AuthoritativeCreationStatus::Ready;
@@ -560,11 +570,8 @@ fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_eviden
     );
     assert_eq!(projection.completion, CompletionPrediction::Pending);
 
-    pending.runtime_evidence = CreationRuntimeEvidence {
-        runtime_bootstrapped: true,
-        initial_llm_dispatched: true,
-        ready_capabilities: Some(super::capabilities([true, true, true, false, false, true])),
-    };
+    pending.runtime_evidence =
+        CreationRuntimeEvidence::ready(super::capabilities([true, true, true, false, false, true]));
     let complete = project_authoritative_creation(&pending);
     assert_eq!(complete.completion, CompletionPrediction::Complete);
     assert!(complete
@@ -574,8 +581,9 @@ fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_eviden
 
 #[test]
 fn committed_boundaries_complete_effects_before_later_stage_checkpoints() {
-    let mut oracle = oracle(CreationKind::InitialTurn {
+    let mut oracle = oracle(CreationStart::InitialTurn {
         message_id: "message-1".into(),
+        text: "do the thing".into(),
     });
     oracle.stage = AuthoritativeCreationStage::ReserveResources;
     oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
@@ -633,10 +641,16 @@ proptest! {
         generation in 0_u64..1000,
         attempt in 0_u32..100,
     ) {
-        let mut oracle = oracle(CreationKind::InitialTurn { message_id: format!("message-{job_id}") });
+        let mut oracle = oracle(CreationStart::InitialTurn {
+            message_id: format!("message-{job_id}"),
+            text: "do the thing".into(),
+        });
         oracle.intent.job_id = job_id.clone();
         oracle.intent.conversation_id = conversation_id.clone();
-        oracle.intent.initial_text = format!("runtime text {job_id}");
+        oracle.intent.start = CreationStart::InitialTurn {
+            message_id: format!("message-{job_id}"),
+            text: format!("runtime text {job_id}"),
+        };
         oracle.generation = generation;
         oracle.attempt = attempt;
         let first = adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &oracle).unwrap();
@@ -661,7 +675,10 @@ proptest! {
             AuthoritativeCreationStage::BootstrapInitialTurn,
             AuthoritativeCreationStage::Finalize,
         ];
-        let mut oracle = oracle(CreationKind::InitialTurn { message_id: "message-1".into() });
+        let mut oracle = oracle(CreationStart::InitialTurn {
+            message_id: "message-1".into(),
+            text: "do the thing".into(),
+        });
         oracle.stage = stages[stage_index];
         let projection = project_authoritative_creation(&oracle);
         let by_id = projection.effect_predictions.into_iter().collect::<BTreeMap<_, _>>();
