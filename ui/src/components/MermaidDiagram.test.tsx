@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { MermaidDiagram } from './MermaidDiagram';
 
 // Real mermaid.render injects a temporary measuring node into <body> with id
@@ -27,13 +27,76 @@ vi.mock('mermaid', () => ({
 }));
 
 const orphans = () => document.querySelectorAll('[id^="dphoenix-mermaid-"]');
+const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:phoenix-mermaid');
+const revokeObjectURL = vi.fn<(url: string) => void>();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubGlobal('URL', class extends URL {
+    static override createObjectURL(blob: Blob) {
+      return createObjectURL(blob);
+    }
+
+    static override revokeObjectURL(url: string) {
+      revokeObjectURL(url);
+    }
+  });
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe('MermaidDiagram fullscreen viewing', () => {
+  it('exposes a successful render as a standalone SVG browser document', async () => {
+    render(<MermaidDiagram code="flowchart TD\n  A --> B" />);
+
+    expect(screen.queryByRole('link', { name: 'Open Mermaid diagram fullscreen' })).not.toBeInTheDocument();
+
+    const link = await screen.findByRole('link', { name: 'Open Mermaid diagram fullscreen' });
+    expect(link).toHaveAttribute('href', 'blob:phoenix-mermaid');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(createObjectURL).toHaveBeenCalledOnce();
+
+    const blob = createObjectURL.mock.calls[0]?.[0];
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob?.type).toBe('image/svg+xml');
+    expect(await blob?.text()).toContain('flowchart TD');
+  });
+
+  it('hides the fullscreen action in source mode and after a render error', async () => {
+    const { rerender } = render(<MermaidDiagram code="flowchart TD\n  A --> B" />);
+    await screen.findByRole('link', { name: 'Open Mermaid diagram fullscreen' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Source' }));
+    expect(screen.queryByRole('link', { name: 'Open Mermaid diagram fullscreen' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Diagram' }));
+    expect(screen.getByRole('link', { name: 'Open Mermaid diagram fullscreen' })).toBeInTheDocument();
+
+    rerender(<MermaidDiagram code="boom not a diagram" />);
+    await screen.findByRole('alert');
+    expect(screen.queryByRole('link', { name: 'Open Mermaid diagram fullscreen' })).not.toBeInTheDocument();
+  });
+
+  it('revokes standalone resources when replacing a render and unmounting', async () => {
+    createObjectURL
+      .mockReturnValueOnce('blob:first-mermaid')
+      .mockReturnValueOnce('blob:second-mermaid');
+    const { rerender, unmount } = render(<MermaidDiagram code="flowchart TD\n  A --> B" />);
+    expect(await screen.findByRole('link', { name: 'Open Mermaid diagram fullscreen' }))
+      .toHaveAttribute('href', 'blob:first-mermaid');
+
+    rerender(<MermaidDiagram code="flowchart LR\n  C --> D" />);
+    expect(await screen.findByRole('link', { name: 'Open Mermaid diagram fullscreen' }))
+      .toHaveAttribute('href', 'blob:second-mermaid');
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:first-mermaid');
+
+    unmount();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:second-mermaid');
+  });
 });
 
 describe('MermaidDiagram orphan node cleanup', () => {
