@@ -157,6 +157,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
         replacement.install_barriers(&decision.plan, barrier_events)?;
+        if workflow_status_is_terminal(replacement.status) {
+            replacement.retire_terminal_work(transition.transition_id);
+        }
         if decision.plan.owed_acceptances.is_some() {
             return Err(EngineError::InvalidInbox);
         }
@@ -182,7 +185,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         lease_until: LeaseExpiry,
     ) -> ClaimResult {
-        if self.binding.execution_mode() == ExecutionMode::Shadow {
+        if self.ensure_executable().is_err() {
             return denied_claim();
         }
         if workflow_status_is_terminal(self.status) {
@@ -295,6 +298,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         lease_until: LeaseExpiry,
     ) -> ClaimResult {
+        if self.ensure_executable().is_err() {
+            return denied_claim();
+        }
         if workflow_status_is_terminal(self.status) {
             return ineligible_claim();
         }
@@ -549,11 +555,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         match self.effect_authorized_mut(authority, now) {
             Some(effect) => {
                 if effect.declaration.ambiguity.is_manual_only() {
-                    return ReconciliationOutcome {
-                        outcome: AuthorityOutcome::Authorized,
-                        decision: Some(ReconciliationDecision::RequestManualResolution),
-                        manual_resolution: None,
-                    };
+                    return stale_reconciliation_outcome();
                 }
                 effect.status = EffectStatus::RetryWait;
                 effect.declaration.next_eligible_at = Some(retry_at);
@@ -711,6 +713,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             .iter()
             .map(|inbox| inbox.id)
             .collect::<Vec<_>>();
+        if inbox_ids.is_empty() {
+            return Err(EngineError::InvalidInbox);
+        }
         if inbox_ids.iter().copied().collect::<BTreeSet<_>>().len() != inbox_ids.len() {
             return Err(EngineError::InvalidInbox);
         }
@@ -752,6 +757,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             };
             inbox.delivery_status = DeliveryStatus::Consumed;
             inbox.consumed_by = Some(transition.transition_id);
+        }
+        if workflow_status_is_terminal(replacement.status) {
+            replacement.retire_terminal_work(transition.transition_id);
         }
         replacement.refresh_eligibility(Timestamp(0));
         *self = replacement;
@@ -886,7 +894,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
         let deletion_from_terminal = matches!(
             self.status,
-            WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            WorkflowStatus::Cancelling | WorkflowStatus::Failed | WorkflowStatus::Cancelled
         ) && request.compensation_plan.next_status
             == WorkflowStatus::DeletionPending;
         if self.status != WorkflowStatus::Active && !deletion_from_terminal {
@@ -1409,6 +1417,40 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
     }
 
+    fn retire_terminal_work(&mut self, transition: TransitionId) {
+        for effect in self.effects.values_mut() {
+            if effect.status != EffectStatus::Receipted {
+                effect.status = EffectStatus::Invalidated;
+                effect.claim = None;
+                effect.destructive_lock = None;
+                effect.pending_reconciliation = false;
+            }
+        }
+        for inbox in self.reducer_inbox.values_mut() {
+            if inbox.delivery_status == DeliveryStatus::Pending {
+                inbox.delivery_status = DeliveryStatus::Suppressed {
+                    reason: SuppressionReason::LifecycleTerminal,
+                };
+            }
+        }
+        for resolution in self.manual_resolutions.values_mut() {
+            if resolution.status == ResolutionStatus::Required {
+                resolution.status = ResolutionStatus::Suppressed {
+                    transition,
+                    reason: SuppressionReason::LifecycleTerminal,
+                };
+            }
+        }
+        for owed in self.owed_acceptances.values_mut() {
+            if owed.disposition == OwedAcceptanceDisposition::Owed {
+                owed.disposition = OwedAcceptanceDisposition::Suppressed {
+                    transition,
+                    reason: SuppressionReason::LifecycleTerminal,
+                };
+            }
+        }
+    }
+
     fn suppress_cancellation_work(&mut self, transition: TransitionId) {
         for inbox in self.reducer_inbox.values_mut() {
             if inbox.delivery_status == DeliveryStatus::Pending {
@@ -1605,7 +1647,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
             OwedAcceptanceDisposition::Owed => unreachable!("resolution must be terminal"),
         };
-        let owed_acceptance = owed.clone();
+        if workflow_status_is_terminal(replacement.status) {
+            replacement.retire_terminal_work(transition.transition_id);
+        }
+        let owed_acceptance = replacement
+            .owed_acceptances
+            .get(&owed_id)
+            .expect("validated owed exists")
+            .clone();
         replacement.refresh_eligibility(Timestamp(0));
         *self = replacement;
         Ok(RuntimeAcceptanceResult {
@@ -1736,6 +1785,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
     ) -> Option<&mut EffectState<P>> {
         if self.binding.execution_mode() == ExecutionMode::Shadow
+            || self.semantic_authority != Some(SemanticAuthority::EngineProtocol)
+            || self.crashed_workers.contains(&authority.worker_id)
             || authority.workflow_id != self.binding.workflow_id()
         {
             return None;
@@ -1853,6 +1904,10 @@ fn manual_choice_permitted<P: WorkflowProfile>(
         candidate.kind == choice.kind
             && candidate.codec == choice.codec
             && candidate.payload == choice.payload
+            && candidate.receipt == choice.receipt
+            && candidate.receipt_codec == choice.receipt_codec
+            && candidate.receipt_event == choice.receipt_event
+            && candidate.receipt_event_codec == choice.receipt_event_codec
     })
 }
 

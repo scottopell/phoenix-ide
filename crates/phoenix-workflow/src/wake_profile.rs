@@ -508,22 +508,37 @@ pub fn registration_receipt(intent: &WakeRegistrationIntent) -> WakeRegistration
     }
 }
 
-#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeRegistrationError {
+    ResourceScopeMismatch,
+}
+
+/// Builds the durable registration transition and fence event.
+///
+/// # Errors
+/// Returns [`WakeRegistrationError::ResourceScopeMismatch`] when the resource belongs to a
+/// different work scope than the registration.
 pub fn registration_decision(
     expected_workflow_version: Version,
     intent: &WakeRegistrationIntent,
     fence_version: Version,
-) -> (
-    ReducerDecision<WakeProfile>,
-    BTreeMap<BarrierId, WakeBarrierEvent>,
-) {
+) -> Result<
+    (
+        ReducerDecision<WakeProfile>,
+        BTreeMap<BarrierId, WakeBarrierEvent>,
+    ),
+    WakeRegistrationError,
+> {
+    if intent.registration_scope != *intent.resource.work_scope() {
+        return Err(WakeRegistrationError::ResourceScopeMismatch);
+    }
     let receipt = registration_receipt(intent);
     let observe_intent = ObserveHandleIntent {
         contract_id: intent.contract_id.clone(),
         resource: intent.resource.clone(),
         expires_at: intent.expires_at,
     };
-    (
+    Ok((
         ReducerDecision {
             expected_workflow_version,
             plan: TransitionPlan {
@@ -559,7 +574,7 @@ pub fn registration_decision(
             },
         },
         barrier_events(receipt),
-    )
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

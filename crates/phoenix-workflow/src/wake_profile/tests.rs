@@ -106,10 +106,24 @@ fn persistence_domain_accepts_runtime_owned_strings() {
 }
 
 #[test]
+fn registration_rejects_resource_from_another_work_scope() {
+    let mut intent = registration_intent(bash_identity("b-wrong-scope"));
+    intent.registration_scope = WorkScopeIdentity {
+        kind: WorkScopeKind::Worktree,
+        stable_key: "another-worktree".into(),
+    };
+
+    assert_eq!(
+        registration_decision(Version(0), &intent, Version(9)),
+        Err(super::WakeRegistrationError::ResourceScopeMismatch)
+    );
+}
+
+#[test]
 fn registration_installs_required_observe_handle_without_destructive_lock_or_owed_acceptance() {
     let mut workflow = workflow();
     let intent = registration_intent(bash_identity("b-7"));
-    let (decision, events) = registration_decision(Version(0), &intent, Version(9));
+    let (decision, events) = registration_decision(Version(0), &intent, Version(9)).unwrap();
     let result = workflow
         .commit_transition(&decision, &events)
         .expect("registration commit succeeds");
@@ -302,7 +316,7 @@ fn receipt_comparison_requires_exact_identity_and_exact_deadline_equality() {
 fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload_helper() {
     let mut workflow = workflow();
     let intent = registration_intent(bash_identity("b-10"));
-    let (decision, events) = registration_decision(Version(0), &intent, Version(4));
+    let (decision, events) = registration_decision(Version(0), &intent, Version(4)).unwrap();
     workflow
         .commit_transition(&decision, &events)
         .expect("registration commit succeeds");
@@ -366,7 +380,7 @@ fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload
 fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection() {
     let intent = registration_intent(bash_identity("seed"));
     let mut workflow = workflow();
-    let (decision, barriers) = registration_decision(Version(0), &intent, Version(3));
+    let (decision, barriers) = registration_decision(Version(0), &intent, Version(3)).unwrap();
     workflow
         .commit_transition(&decision, &barriers)
         .expect("registration commit");
@@ -523,7 +537,8 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
         Version(0),
         &registration_intent(tmux_identity("win-14")),
         Version(3),
-    );
+    )
+    .unwrap();
     workflow
         .commit_transition(&decision, &events)
         .expect("registration commit succeeds");
@@ -605,7 +620,8 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         Version(0),
         &registration_intent(bash_identity("b-15")),
         Version(3),
-    );
+    )
+    .unwrap();
     workflow
         .commit_transition(&decision, &events)
         .expect("registration commit succeeds");
