@@ -1,3 +1,4 @@
+import datetime
 import fcntl
 import importlib.util
 import json
@@ -449,6 +450,26 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("SHA256SUMS", workflow)
         self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
         self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
+        self.assertIn("runner: macos-15-intel", workflow)
+        self.assertNotIn("runner: macos-13", workflow)
+
+    def test_helper_plist_uses_active_interpreter(self):
+        plist = plistlib.loads(self.dev._helper_plist(
+            "test.helper", Path("helper.py"), Path("manifest.json"), Path("helper.log"), Path("/opt/python3")
+        ))
+        self.assertEqual("/opt/python3", plist["ProgramArguments"][0])
+
+    def test_preparing_transaction_reports_stale_recovery(self):
+        stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "preparing", "source_kind": "local_head",
+                "expected_version": None, "expected_git_sha": None, "updated_at": stale,
+            }))
+            self.dev._print_launchd_deploy_status()
+        self.assertTrue(any("STALE:" in str(call) for call in output.call_args_list))
 
     def test_socket_activation_shape_is_preserved(self):
         plist = self.dev.generate_launchd_plist("1.0.0", path_override="/usr/bin")

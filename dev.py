@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -7336,11 +7337,17 @@ def _materialize_helper(source_commit: str, destination: Path, source_kind: str)
     destination.chmod(0o700)
 
 
-def _helper_plist(label: str, helper: Path, manifest: Path, log_path: Path) -> bytes:
+def _helper_plist(
+    label: str,
+    helper: Path,
+    manifest: Path,
+    log_path: Path,
+    python_executable: Path,
+) -> bytes:
     return plistlib.dumps({
         "Label": label,
         "ProgramArguments": [
-            "/usr/bin/python3", str(helper), "activate", "--manifest", str(manifest),
+            str(python_executable), str(helper), "activate", "--manifest", str(manifest),
             "--helper-label", label, "--uid", str(os.getuid()),
         ],
         "RunAtLoad": True,
@@ -7462,10 +7469,25 @@ def launchd_prod_deploy(release: str | None = None):
 
         helper = staging / "activate.py"
         _materialize_helper(source_commit, helper, source_kind)
+        python_executable = Path(sys.executable).resolve()
+        interpreter_check = subprocess.run(
+            [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request"],
+            capture_output=True,
+        )
+        if interpreter_check.returncode != 0:
+            raise SystemExit(f"active Python interpreter cannot run the launchd helper: {python_executable}")
         helper_log = LAUNCHD_DEPLOY_DIR / "activation.log"
         helper_label = f"{LAUNCHD_DEPLOY_HELPER_PREFIX}.{transaction_id}"
         helper_plist = staging / "helper.plist"
-        helper_plist.write_bytes(_helper_plist(helper_label, helper, staging / "manifest.json", helper_log))
+        helper_plist.write_bytes(
+            _helper_plist(
+                helper_label,
+                helper,
+                staging / "manifest.json",
+                helper_log,
+                python_executable,
+            )
+        )
         helper_plist.chmod(0o600)
         subprocess.run(["plutil", "-lint", str(helper_plist)], check=True, capture_output=True)
 
@@ -7555,7 +7577,7 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Failure: {deploy['failure']}")
         if deploy.get("rollback_failure"):
             print(f"    Rollback failure: {deploy['rollback_failure']}")
-        if deploy.get("state") in {"prepared", "activating"}:
+        if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
             if age.total_seconds() > 120:
                 print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
