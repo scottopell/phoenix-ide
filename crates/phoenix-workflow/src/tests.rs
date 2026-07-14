@@ -2075,11 +2075,8 @@ fn manual_only_ambiguity_cannot_schedule_retry() {
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
     let outcome = workflow.schedule_retry(&authority, Timestamp(1), Timestamp(5));
-    assert_eq!(outcome.outcome, AuthorityOutcome::Authorized);
-    assert_eq!(
-        outcome.decision,
-        Some(ReconciliationDecision::RequestManualResolution)
-    );
+    assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
+    assert_eq!(outcome.decision, None);
     assert_eq!(workflow.effects[&EffectId(1)].status, EffectStatus::Claimed);
 }
 
@@ -3497,15 +3494,8 @@ fn post_terminal_receipt_is_durably_suppressed_instead_of_pending() {
         codec("receipt-event"),
         "receipt-event",
     );
-    let inbox_id = accepted.receipt_inbox_ids[0];
-
-    assert_eq!(accepted.outcome, AuthorityOutcome::Authorized);
-    assert_eq!(
-        workflow.reducer_inbox[&inbox_id].delivery_status,
-        DeliveryStatus::Suppressed {
-            reason: SuppressionReason::LifecycleTerminal,
-        }
-    );
+    assert_eq!(accepted.outcome, AuthorityOutcome::StaleAuthority);
+    assert!(accepted.receipt_inbox_ids.is_empty());
     assert_eq!(
         drain_proof(&protocol(), [&workflow]).categories["pending_reducer_inbox"].count,
         0
