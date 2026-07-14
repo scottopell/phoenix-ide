@@ -5940,6 +5940,12 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
 
     print("Building UI...")
     subprocess.run(["pnpm", "run", "build"], cwd=ui_dir, check=True, env=pnpm_env)
+    subprocess.run(["git", "restore", "ui/dist/.gitkeep"], cwd=worktree, check=True)
+    build_tree_status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=worktree, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    if build_tree_status:
+        raise SystemExit(f"production build worktree is dirty before Rust compilation:\n{build_tree_status}")
     
     # Build Rust
     build_env = os.environ.copy()
@@ -7492,6 +7498,7 @@ def launchd_prod_deploy(release: str | None = None):
         subprocess.run(["plutil", "-lint", str(helper_plist)], check=True, capture_output=True)
 
         health_url, health_insecure_tls = _launchd_health_probe(env_overrides)
+        previous_deployed_sha = PROD_SHA_PATH.read_text().strip() if PROD_SHA_PATH.exists() else None
         manifest = {
             "transaction_id": transaction_id,
             "source_kind": source_kind,
@@ -7500,6 +7507,7 @@ def launchd_prod_deploy(release: str | None = None):
             "release_commit": release_commit,
             "expected": identity,
             "previous": previous_identity,
+            "previous_deployed_sha": previous_deployed_sha,
             "candidate_binary": str(candidate_binary),
             "candidate_binary_sha256": _file_sha256(candidate_binary),
             "candidate_plist": str(candidate_plist),
@@ -7543,17 +7551,19 @@ def launchd_prod_deploy(release: str | None = None):
             raise SystemExit(f"could not hand activation to launchd (exit {result.returncode})")
     except BaseException as exc:
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "precondition_failed",
-            "source_kind": locals().get("source_kind"), "source_commit": locals().get("source_commit"),
-            "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
-            "expected_version": locals().get("identity", {}).get("version"),
-            "expected_git_sha": locals().get("identity", {}).get("git_sha"),
-            "created_at": claimed_at, "updated_at": failed_at,
-            "failure": f"{type(exc).__name__}: preparation failed before handoff",
-            "rollback_failure": None,
-        })
-        _release_launchd_deploy_claim(transaction_id)
+        try:
+            _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+                "transaction_id": transaction_id, "state": "precondition_failed",
+                "source_kind": locals().get("source_kind"), "source_commit": locals().get("source_commit"),
+                "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
+                "expected_version": locals().get("identity", {}).get("version"),
+                "expected_git_sha": locals().get("identity", {}).get("git_sha"),
+                "created_at": claimed_at, "updated_at": failed_at,
+                "failure": f"{type(exc).__name__}: preparation failed before handoff",
+                "rollback_failure": None,
+            })
+        finally:
+            _release_launchd_deploy_claim(transaction_id)
         raise
     _report_launchd_handoff(transaction_id, identity)
 
@@ -7565,7 +7575,7 @@ def _print_launchd_deploy_status() -> None:
     try:
         deploy = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
         print(f"  Last deploy: {deploy.get('state', 'unknown')} ({deploy.get('transaction_id', 'unknown')})")
-        source = deploy.get("source_kind", "unknown")
+        source = deploy.get("source_kind") or "unknown"
         if deploy.get("release_tag"):
             source += f" {deploy['release_tag']}"
         if deploy.get("release_commit"):

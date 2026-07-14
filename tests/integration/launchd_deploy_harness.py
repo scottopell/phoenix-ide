@@ -139,6 +139,7 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
     manifest = {
         "transaction_id": suffix, "source_kind": "local_head", "source_commit": "newsha",
         "release_tag": None, "release_commit": None, "expected": new_identity, "previous": old_identity,
+        "previous_deployed_sha": "oldsha",
         "candidate_binary": str(candidate_binary), "candidate_binary_sha256": digest(candidate_binary),
         "candidate_plist": str(candidate_plist), "candidate_plist_sha256": digest(candidate_plist),
         "rollback_binary": str(rollback_binary), "rollback_binary_sha256": digest(rollback_binary),
@@ -193,8 +194,8 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
             wait_identity(url, old_identity, time.monotonic() + 3)
             if digest(target_binary) != old_binary_hash or digest(target_plist_path) != old_plist_hash:
                 raise RuntimeError("rollback did not restore exact binary and plist")
-            if Path(manifest["deployed_sha_path"]).exists():
-                raise RuntimeError("failed candidate advanced deployed.sha")
+            if Path(manifest["deployed_sha_path"]).read_text().strip() != "oldsha":
+                raise RuntimeError("failed candidate did not restore previous deployed.sha")
         print(f"PASS: {expected_state} after external SIGKILL of initiating process group")
     finally:
         subprocess.run(["launchctl", "bootout", f"{domain}/{helper_label}"], capture_output=True)

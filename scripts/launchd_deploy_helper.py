@@ -43,6 +43,7 @@ class Manifest:
     release_commit: Optional[str]
     expected: Identity
     previous: Optional[Identity]
+    previous_deployed_sha: Optional[str]
     candidate_binary: str
     candidate_binary_sha256: str
     candidate_plist: str
@@ -271,6 +272,16 @@ def wait_for_identity(
     )
 
 
+def restore_deployed_sha(manifest: Manifest) -> None:
+    deployed_sha = Path(manifest.deployed_sha_path)
+    if manifest.previous_deployed_sha is None:
+        deployed_sha.unlink(missing_ok=True)
+        if deployed_sha.parent.exists():
+            fsync_dir(deployed_sha.parent)
+    else:
+        atomic_write(deployed_sha, (manifest.previous_deployed_sha + "\n").encode(), 0o600)
+
+
 def restore(manifest: Manifest, launchctl: Launchctl) -> None:
     try:
         launchctl.stop()
@@ -286,6 +297,7 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
         state, pid = launchctl.inspect()
         if state != "not_loaded" or pid is not None:
             raise ActivationError("failed first-install candidate remains loaded")
+        restore_deployed_sha(manifest)
         return
     rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
     rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
@@ -306,6 +318,7 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
         health_insecure_tls=manifest.previous_health_insecure_tls,
         health_json=manifest.previous_health_json,
     )
+    restore_deployed_sha(manifest)
 
 
 def release_claim(manifest: Manifest) -> bool:

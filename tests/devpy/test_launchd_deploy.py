@@ -64,6 +64,7 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         transaction_id="tx", source_kind="published_release", source_commit="newsha",
         release_tag="v2.0.0", release_commit="newsha0000000000000000000000000000000000",
         expected=expected, previous=previous,
+        previous_deployed_sha="old-full-sha" if previous is not None else None,
         candidate_binary=str(files["candidate_binary"]), candidate_binary_sha256=helper.sha256(files["candidate_binary"]),
         candidate_plist=str(files["candidate_plist"]), candidate_plist_sha256=helper.sha256(files["candidate_plist"]),
         rollback_binary=str(files["rollback_binary"]), rollback_binary_sha256=helper.sha256(files["rollback_binary"]),
@@ -132,6 +133,7 @@ class ActivationTests(unittest.TestCase):
             manifest = make_manifest(root, previous=None)
             manifest = helper.dataclasses.replace(
                 manifest, previous=None, rollback_binary=None, rollback_binary_sha256=None,
+                previous_deployed_sha=None,
                 rollback_plist=None, rollback_plist_sha256=None,
             )
             launchctl = FakeLaunchctl(manifest)
@@ -158,9 +160,18 @@ class ActivationTests(unittest.TestCase):
                 state = helper.activate(manifest)
             self.assertEqual("activation_failed_rolled_back", state)
             self.assertEqual(["newsha", "oldsha"], identities)
-            self.assertFalse(Path(manifest.deployed_sha_path).exists())
+            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
             self.assertEqual(b"old binary", Path(manifest.target_binary).read_bytes())
             self.assertEqual(state, json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_rollback_restores_previous_deployed_sha_after_commit_status_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.deployed_sha_path).write_text("candidate-sha\n")
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "wait_for_identity"):
+                helper.restore(manifest, launchctl)
+            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
 
     def test_failed_rollback_is_explicit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -458,6 +469,20 @@ class PreparationTests(unittest.TestCase):
             "test.helper", Path("helper.py"), Path("manifest.json"), Path("helper.log"), Path("/opt/python3")
         ))
         self.assertEqual("/opt/python3", plist["ProgramArguments"][0])
+
+    def test_null_source_kind_status_remains_readable(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "preparing", "source_kind": None,
+                "release_tag": "v1.2.3", "expected_version": None, "expected_git_sha": None,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }))
+            self.dev._print_launchd_deploy_status()
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("unknown v1.2.3", rendered)
+        self.assertNotIn("unreadable status", rendered)
 
     def test_preparing_transaction_reports_stale_recovery(self):
         stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
