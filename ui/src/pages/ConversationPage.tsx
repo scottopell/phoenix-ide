@@ -1677,7 +1677,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
+  const fileRootPath = routePrefix === '/global' || isArchived || !conversation
+    ? null
+    : (conversation.worktree_path ?? conversation.cwd);
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
