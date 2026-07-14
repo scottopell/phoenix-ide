@@ -476,9 +476,24 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(helper.status_is_durable_terminal(manifest))
             self.assertIn("precondition_failed", helper.TERMINAL_STATES)
 
+    def test_legacy_plist_overrides_are_migrated_once(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SAME": "repo"})):
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+                "HOME": "/Users/test", "PHOENIX_PASSWORD": "legacy-secret",
+                "PHOENIX_PORT": "9443", "SAME": "repo",
+            }}))
+            overrides = self.dev._launchd_override_env()
+            mode = self.dev.LAUNCHD_OVERRIDE_PATH.stat().st_mode & 0o777
+        self.assertEqual({"PHOENIX_PASSWORD": "legacy-secret", "PHOENIX_PORT": "9443"}, overrides)
+        self.assertEqual(0o600, mode)
+
     def test_generated_plist_values_do_not_shadow_repo_env(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
              mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
             env, _path = self.dev._launchd_candidate_env()
         self.assertEqual("9443", env["PHOENIX_PORT"])
@@ -486,6 +501,7 @@ class PreparationTests(unittest.TestCase):
     def test_explicit_launchd_override_wins_over_repo_env(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
              mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
             self.dev._write_launchd_override_env({"PHOENIX_PORT": "9555"})
             env, _path = self.dev._launchd_candidate_env()
@@ -498,6 +514,31 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual("yes", env["BASE"])
         self.assertEqual("secret", env["PHOENIX_PASSWORD"])
         self.assertEqual("9443", env["PHOENIX_PORT"])
+
+    def test_rollback_endpoint_is_derived_from_rollback_plist(self):
+        with tempfile.TemporaryDirectory() as td:
+            plist_path = Path(td) / "rollback.plist"
+            plist_path.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {"PHOENIX_TLS": "auto"},
+                "Sockets": {"Listeners": {"SockServiceName": "9555"}},
+            }))
+            env = self.dev._launchd_env_from_plist(plist_path)
+            url, insecure = self.dev._launchd_health_probe(env)
+        self.assertEqual("https://localhost:9555/api/version", url)
+        self.assertTrue(insecure)
+
+    def test_initial_status_failure_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td)), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
+             mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+             mock.patch.object(self.dev, "_write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.dev.launchd_prod_deploy()
+            self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

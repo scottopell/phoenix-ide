@@ -6404,6 +6404,32 @@ def _systemd_override_env() -> dict[str, str]:
     return env
 
 
+_GENERATED_LAUNCHD_ENV_KEYS = {
+    "HOME", "PATH", "RUST_LOG", "PHOENIX_DB",
+    "PHOENIX_LOG", "PHOENIX_VERSION", "PHOENIX_LAUNCHD",
+}
+
+
+def _migrate_launchd_override_env() -> dict[str, str]:
+    if not LAUNCHD_PLIST_PATH.exists():
+        return {}
+    try:
+        with LAUNCHD_PLIST_PATH.open("rb") as stream:
+            plist_env = dict(plistlib.load(stream).get("EnvironmentVariables", {}))
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise SystemExit(f"cannot migrate launchd overrides from {LAUNCHD_PLIST_PATH}: {exc}") from exc
+    repo_env: dict[str, str] = {}
+    _load_env_file(repo_env)
+    overrides = {
+        key: str(value)
+        for key, value in plist_env.items()
+        if key not in _GENERATED_LAUNCHD_ENV_KEYS
+        and repo_env.get(key, str(PROD_PORT) if key == "PHOENIX_PORT" else None) != str(value)
+    }
+    _write_launchd_override_env(overrides)
+    return overrides
+
+
 def _launchd_override_env() -> dict[str, str]:
     """Explicit launchd overrides written by `prod set`.
 
@@ -6411,7 +6437,7 @@ def _launchd_override_env() -> dict[str, str]:
     from a previous deploy must not shadow edits to `.phoenix-ide.env`.
     """
     if not LAUNCHD_OVERRIDE_PATH.exists():
-        return {}
+        return _migrate_launchd_override_env()
     try:
         value = json.loads(LAUNCHD_OVERRIDE_PATH.read_text())
         if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
@@ -6422,8 +6448,7 @@ def _launchd_override_env() -> dict[str, str]:
 
 
 def _write_launchd_override_env(overrides: dict[str, str]) -> None:
-    _write_json_atomic(LAUNCHD_OVERRIDE_PATH, overrides)
-    LAUNCHD_OVERRIDE_PATH.chmod(0o600)
+    _write_json_atomic(LAUNCHD_OVERRIDE_PATH, overrides, mode=0o600)
 
 
 def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
@@ -7145,6 +7170,18 @@ def _launchd_health_probe(env: dict[str, str]) -> tuple[str, bool]:
     )
 
 
+def _launchd_env_from_plist(path: Path) -> dict[str, str]:
+    with path.open("rb") as stream:
+        plist = plistlib.load(stream)
+    env = {str(key): str(value) for key, value in plist.get("EnvironmentVariables", {}).items()}
+    try:
+        socket_port = plist["Sockets"]["Listeners"]["SockServiceName"]
+        env["PHOENIX_PORT"] = str(socket_port)
+    except (KeyError, TypeError):
+        pass
+    return env
+
+
 def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, bool] | None:
     import ssl
     import urllib.request
@@ -7321,15 +7358,20 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
             os.fsync(stream.fileno())
 
 
-def _write_json_atomic(path: Path, value: dict) -> None:
+def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    with temporary.open("w") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _materialize_helper(source_commit: str, destination: Path, source_kind: str) -> None:
@@ -7397,15 +7439,15 @@ def launchd_prod_deploy(release: str | None = None):
     transaction_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-        "transaction_id": transaction_id, "state": "preparing", "source_kind": None,
-        "source_commit": None, "release_commit": None, "release_tag": release,
-        "expected_version": None, "expected_git_sha": None,
-        "created_at": claimed_at, "updated_at": claimed_at,
-        "failure": None, "rollback_failure": None,
-    })
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     try:
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+            "transaction_id": transaction_id, "state": "preparing", "source_kind": None,
+            "source_commit": None, "release_commit": None, "release_tag": release,
+            "expected_version": None, "expected_git_sha": None,
+            "created_at": claimed_at, "updated_at": claimed_at,
+            "failure": None, "rollback_failure": None,
+        })
         transactions_dir = LAUNCHD_DEPLOY_DIR / "transactions"
         transactions_dir.mkdir(parents=True, exist_ok=True)
         old_transactions = sorted(
@@ -7467,11 +7509,12 @@ def launchd_prod_deploy(release: str | None = None):
             shutil.copy2(target_binary, rollback_binary)
             shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
             rollback_plist.chmod(0o600)
-        previous_identity = _current_prod_identity(launchd_env)
-        previous_health_url, previous_health_insecure_tls = _launchd_health_probe(launchd_env)
+        previous_env = _launchd_env_from_plist(rollback_plist) if rollback_plist.exists() else {}
+        previous_identity = _current_prod_identity(previous_env)
+        previous_health_url, previous_health_insecure_tls = _launchd_health_probe(previous_env)
         previous_health_json = previous_identity is not None
         if target_binary.exists() and previous_identity is None:
-            legacy = _legacy_prod_identity(launchd_env)
+            legacy = _legacy_prod_identity(previous_env)
             if legacy is not None:
                 previous_identity, previous_health_url, previous_health_insecure_tls = legacy
                 previous_health_json = False
