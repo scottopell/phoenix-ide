@@ -172,10 +172,15 @@ directory trees.
 
 ---
 
-### REQ-SA-009: Terminal Handle Identity for Wake Contracts
+### REQ-SA-009: Durable Wake Handle Identity for Sub-Agent Terminals
 
 WHEN a sub-agent is spawned
-THE SYSTEM SHALL expose a stable terminal-wait handle identified by the child
+THE SYSTEM SHALL durably bind the child conversation / agent id to the wake-plane
+resource identity, durable terminal-evidence source, and wake terminal-payload
+mapping before any later engine selection, resume, or restart-time observation uses
+that handle
+
+THE SYSTEM SHALL expose that stable terminal-wait handle identified by the child
 conversation / agent id
 
 WHEN that handle is watched by a wake contract

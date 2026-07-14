@@ -691,6 +691,13 @@ rule ReadinessCannotPrecedeFirstDispatchReceipt {
     ensures: not ConversationCreationReady(binding.conversation_id)
 }
 
+rule StaleCreationReadinessEvaluationCannotOverwriteLifecycleOutcome {
+    when: CreationReadinessEvaluated(reducer, binding)
+    requires: binding.outcome in {cancelled, deletion_pending, deleted}
+    ensures: binding.outcome in {cancelled, deletion_pending, deleted}
+    ensures: not ConversationCreationReady(binding.conversation_id)
+}
+
 ------------------------------------------------------------
 -- Cancellation, deletion, and compensation
 ------------------------------------------------------------
@@ -733,6 +740,13 @@ rule DeletionCompletionPublishesDeleted {
     requires: all_compensations_terminal(binding)
     ensures: binding.outcome = deleted
     ensures: CreationDeletionCompleted(binding.conversation_id)
+}
+
+rule StaleDeletionCompletionCannotOverwriteLifecycleOutcome {
+    when: CreationDeletionCompletionEvaluated(manager, binding)
+    requires: binding.outcome in {cancelled, deleted}
+    ensures: binding.outcome in {cancelled, deleted}
+    ensures: not CreationDeletionCompleted(binding.conversation_id)
 }
 
 rule CompensationNeverDeletesForeignResource {
@@ -877,6 +891,7 @@ surface CreationLifecycleSurface {
     provides:
         CreationCancellationRequested(manager, binding)
         CreationDeletionRequested(manager, binding)
+        CreationDeletionCompletionEvaluated(manager, binding)
         CreationCompensationDeadlineReached(manager, binding, lifecycle_kind: CreationLifecycleKind)
 }
 

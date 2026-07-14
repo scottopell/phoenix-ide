@@ -417,11 +417,11 @@ or restart recovery SHALL preserve the same owed acceptance rather than creating
 another one. Busy arrivals SHALL remain owed without overlapping LLM requests.
 
 Runtime acceptance SHALL atomically persist the accepting `LlmRequesting` product
-state and accept the exact obligation before invoking the LLM. The owed/accepted
-lifecycle for that runtime-start boundary SHALL have one writable authority,
-using the core durable-workflows owed-acceptance record rather than a profile-local
-parallel status. Items committed after the accepted snapshot SHALL remain for a
-later batch.
+state, consume the exact reducer inbox carried by that obligation, and accept the
+exact obligation before invoking the LLM. The owed/accepted lifecycle for that
+runtime-start boundary SHALL have one writable authority, using the core durable-
+workflows owed-acceptance record rather than a profile-local parallel status.
+Items committed after the accepted snapshot SHALL remain for a later batch.
 
 ### REQ-DWF-WAKE-004: Wake Cancellation and Lifecycle
 
@@ -496,6 +496,10 @@ intent while atomically declaring compensation for runtime revocation, owned
 worktree removal, reservation release, and staged-attachment cleanup as applicable.
 Deletion SHALL hide the shell immediately and retain a durable tombstone until the
 required compensation barrier is accepted by the reducer.
+
+Reducer publication from stale generation-bound creation effects or stale lifecycle
+completion evaluations SHALL NOT overwrite a later cancel, delete, or deleted
+outcome.
 
 ### REQ-DWF-CREATE-005: Creation Capabilities
 

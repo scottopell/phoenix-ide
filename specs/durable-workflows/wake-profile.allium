@@ -14,7 +14,7 @@ use "../tmux-integration/tmux-integration.allium" as tmux
 -- Types
 ------------------------------------------------------------
 
-enum WakeHandleKind { bash | tmux_window }
+enum WakeHandleKind { bash | tmux_window | subagent }
 enum WakeTerminalCause { fired | expired | cancelled | forgotten }
 enum WakeCancellationReason { explicit_cancel }
 enum WakeForgottenReason {
@@ -25,6 +25,7 @@ enum WakeForgottenReason {
 }
 enum BashTerminalStatus { exited | killed | kill_pending_kernel }
 enum TmuxTerminalStatus { exit_marker_observed | window_killed }
+enum SubagentTerminalStatus { completed | failed | cancelled }
 enum WakeObligationSuppressionReason { lifecycle_terminal | superseded }
 enum WakeRegistrationFenceStatus { open | closed }
 enum LifecycleFenceStatus { open | closed }
@@ -49,10 +50,16 @@ value TmuxResourceIdentity {
     window_id: String
 }
 
+value SubagentResourceIdentity {
+    work_scope: WorkScopeIdentity
+    child_conversation_id: String
+}
+
 value WakeResourceIdentity {
     kind: WakeHandleKind
     bash: BashResourceIdentity? when kind = bash
     tmux_window: TmuxResourceIdentity? when kind = tmux_window
+    subagent: SubagentResourceIdentity? when kind = subagent
 }
 
 value WakeRegistrationIntent {
@@ -97,16 +104,24 @@ value TmuxTerminalEvidence {
     final_tail: List<String>
 }
 
+value SubagentTerminalEvidence {
+    occurred_at: Timestamp
+    child_conversation_id: String
+    status: SubagentTerminalStatus
+}
+
 value WakeTerminalEvidence {
     kind: WakeHandleKind
     bash: BashTerminalEvidence? when kind = bash
     tmux_window: TmuxTerminalEvidence? when kind = tmux_window
+    subagent: SubagentTerminalEvidence? when kind = subagent
 }
 
 value WakeFiredPayload {
     kind: WakeHandleKind
     bash: BashTerminalEvidence? when kind = bash
     tmux_window: TmuxTerminalEvidence? when kind = tmux_window
+    subagent: SubagentTerminalEvidence? when kind = subagent
 }
 
 value WakeTerminalPayload {
@@ -240,6 +255,7 @@ config {
 -- evidence_matches_resource(evidence, resource), evidence_occurrence_time(evidence)
 -- durable_terminal_evidence_at_or_before(binding, deadline)
 -- fired_payload_from(evidence), terminal_receipt_for(binding, payload)
+-- subagent_resource_matches_child_conversation(resource), subagent_terminal_status_is_durable(evidence)
 -- observable_reconciliation_applied(effect), no_external_replay_during_reconciliation(effect)
 -- cancellation_winner(binding), terminal_winner(binding)
 -- cancellation_compensation_plan(binding), compensation_does_not_kill_resource(binding)
@@ -367,6 +383,8 @@ rule EvidenceScheduleRecordsReconciliationObservation {
     requires: binding.observe_effect.status not in {receipted, invalidated}
     requires: active_claim_authority(binding.observe_effect) = binding.authority
     requires: evidence_matches_resource(evidence, binding.resource)
+    requires: evidence.kind = subagent implies subagent_resource_matches_child_conversation(binding.resource)
+    requires: evidence.kind = subagent implies subagent_terminal_status_is_durable(evidence)
     ensures: observable_reconciliation_applied(binding.observe_effect)
     ensures: no_external_replay_during_reconciliation(binding.observe_effect)
     ensures: WakeEvidenceRecorded(binding, evidence, evidence_occurrence_time(evidence))
@@ -450,8 +468,7 @@ rule LosingCancellationIsIdempotent {
 rule TerminalReceiptMaterializesDurableObservation {
     when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
     requires: receipt.effect = binding.observe_effect
-    requires: receipt.attempt.claim.authority = binding.authority
-    requires: active_claim_authority(binding.observe_effect) = binding.authority
+    requires: receipt.attempt.claim.authority = active_claim_authority(binding.observe_effect)
     requires: terminal.contract_id = binding.contract_id
     requires: terminal.cause != cancelled
     requires: not terminal_receipt_already_materialized(receipt)
@@ -476,7 +493,7 @@ rule CancelledReceiptMaterializesWithoutAutoResume {
     when: WakeTerminalReceiptAccepted(reducer, binding, receipt, terminal)
     requires: terminal.cause = cancelled
     requires: exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
-    requires: receipt.attempt.claim.authority = binding.authority
+    requires: receipt.attempt.claim.authority = active_claim_authority(binding.observe_effect)
     requires: not terminal_receipt_already_materialized(receipt)
     ensures: WakeObservationInboxItem.created(
         id: next_inbox_item_id(), binding: binding, terminal_receipt: receipt,
@@ -557,6 +574,7 @@ rule RuntimeAcceptanceScheduleIsAtomic {
     requires: obligation.owed_acceptance.reducer_inbox = obligation_payload_inbox(obligation)
     ensures: accepting_llm_requesting_persisted_atomically(obligation)
     ensures: obligation.owed_acceptance.status = accepted
+    ensures: obligation.owed_acceptance.reducer_inbox.delivery_status = consumed
     ensures: WakeObservationInboxItemsConsumedExactly(obligation.payload.items)
     ensures: later_items_excluded_from(obligation)
     ensures: LlmInvocationPermittedAfterCommit(obligation.conversation)

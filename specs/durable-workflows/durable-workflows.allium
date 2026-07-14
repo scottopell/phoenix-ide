@@ -491,6 +491,8 @@ entity ShadowDivergence {
 -- duplicate_acceptance_starts_no_product_action(owed)
 -- reducer_authorized_suppression(decision, owed, reason)
 -- all_current_generation_compensation_effects_terminal(workflow)
+-- manual_retry_deadline(choice), compensation_plan_declared_from_manual_choice(effect, choice)
+-- manual_suppression_committed(effect, choice)
 -- committed_transition_for_decision(workflow, decision)
 -- consumer_is_independent_from_reducer_and_runtime(consumer), consumer_kind(consumer)
 -- disposition_consumed_at(status), reducer_inbox_delivery_unchanged(inbox)
@@ -925,7 +927,8 @@ rule AcceptTerminalReceipt {
     ensures: attempt.status = receipt_accepted
     ensures: ReducerInbox.created(
         id: next_reducer_inbox_id(), workflow: effect.workflow,
-        receipt: Receipt{effect: effect}, barrier: null, event_codec: codec,
+        receipt: Receipt{effect: effect}, barrier: null,
+        event_codec: reducer_event_codec_for_receipt(Receipt{effect: effect}),
         event_payload: reducer_event_for_receipt(Receipt{effect: effect}),
         delivery_status: pending, consumed_by: null
     )
@@ -936,7 +939,6 @@ rule RejectDuplicateOrStaleReceipt {
     requires: not live_matching_authority(effect, authority)
         or authority.worker_id != worker
         or accepted_receipt_count(effect) = 1
-    requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: TerminalReceiptOutcome(stale_or_duplicate)
     ensures: accepted_receipt_count(effect) <= 1
 }
@@ -944,6 +946,7 @@ rule RejectDuplicateOrStaleReceipt {
 rule RejectUnsupportedTerminalReceiptCodec {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: attempt.effect = effect
     requires: attempt.claim = Claim{effect: effect}
     requires: claim_row_matches_authority(effect, authority)
@@ -1082,11 +1085,12 @@ rule CommitTerminalManualResolution {
         origin: manual, accepted_at: now(),
         generation: resolution.workflow.generation
     )
+    ensures: exact_manual_choice_committed(choice)
     ensures: resolution.effect.status = receipted
     ensures: ReducerInbox.created(
         id: next_reducer_inbox_id(), workflow: resolution.workflow,
         receipt: Receipt{effect: resolution.effect}, barrier: null,
-        event_codec: choice.codec,
+        event_codec: reducer_event_codec_for_receipt(Receipt{effect: resolution.effect}),
         event_payload: reducer_event_for_receipt(Receipt{effect: resolution.effect}),
         delivery_status: pending, consumed_by: null
     )
@@ -1105,7 +1109,12 @@ rule CommitControlOnlyManualResolution {
     ensures: resolution.accepted_choice = choice
     ensures: resolution.resolved_by = operator
     ensures: accepted_receipt_count(resolution.effect) = 0
-    ensures: resolution.effect.status in {ambiguity_wait, retry_wait, invalidated}
+    ensures: choice.kind = retry implies resolution.effect.status = retry_wait
+    ensures: choice.kind = retry implies resolution.effect.next_eligible_at = manual_retry_deadline(choice)
+    ensures: choice.kind = compensate implies compensation_plan_declared_from_manual_choice(resolution.effect, choice)
+    ensures: choice.kind = compensate implies resolution.effect.status = invalidated
+    ensures: choice.kind = suppress implies resolution.effect.status = invalidated
+    ensures: choice.kind = suppress implies manual_suppression_committed(resolution.effect, choice)
     ensures: ManualResolutionAudited(resolution)
 }
 
@@ -1180,6 +1189,8 @@ rule ReducerAcceptsInboxEvent {
     requires: reducer_decision_is_product_authoritative(decision)
     requires: committed_transition_for_decision(inbox.workflow, decision) = null
     requires: reducer_plan_commit_outcome_for(inbox.workflow, decision) = committed
+    requires: decision.plan.event_codec = inbox.event_codec
+    requires: decision.plan.event_payload = inbox.event_payload
     ensures: ReducerPlanCommitRequested(reducer, inbox.workflow, decision)
     ensures: committed_transition_for_decision(inbox.workflow, decision) != null
     ensures: inbox.delivery_status = consumed
@@ -1195,6 +1206,8 @@ rule ReducerRejectedPlanLeavesInboxPending {
     requires: reducer_decision_is_product_authoritative(decision)
     requires: committed_transition_for_decision(inbox.workflow, decision) = null
     requires: reducer_plan_commit_outcome_for(inbox.workflow, decision) in {unsupported_codec, invalid_plan}
+        or decision.plan.event_codec != inbox.event_codec
+        or decision.plan.event_payload != inbox.event_payload
     ensures: inbox.delivery_status = pending
     ensures: inbox.consumed_by = null
 }
@@ -1213,6 +1226,8 @@ rule RuntimeAcceptsOwedAcceptance {
     requires: plan_dependency_graph_acyclic(decision.plan)
     requires: plan_barriers_have_only_required_members(decision.plan)
     requires: committed_transition_for_decision(owed.workflow, decision) = null
+    requires: decision.plan.event_codec = owed.reducer_inbox.event_codec
+    requires: decision.plan.event_payload = owed.reducer_inbox.event_payload
     ensures: ReducerPlanCommitRequested(runtime, owed.workflow, decision)
     ensures: committed_transition_for_decision(owed.workflow, decision) != null
     ensures: runtime_acceptance_state_persisted(owed.workflow, owed.reducer_inbox)

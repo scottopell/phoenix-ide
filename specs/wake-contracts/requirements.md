@@ -160,13 +160,14 @@ THE SYSTEM SHALL atomically:
   1. mark the contract row as fired with cause and observed payload,
   2. construct a synthetic tool result per REQ-WAKE-006,
   3. append the tool result to the conversation message log,
-  4. trigger the conversation's next LLM turn (same path as a normal
-     user message arrival or tool result completion), and
+  4. route that durable observation through the same owed-acceptance /
+     reducer path that governs normal wake delivery rather than invoking
+     the LLM directly, and
   5. emit `WakeContractFired` SSE
 
 WHEN a contract's `expires_at` passes without firing
-THE SYSTEM SHALL fire the contract with cause `Expired` and the same
-delivery path as a normal fire
+THE SYSTEM SHALL resolve the contract with cause `Expired` and the same
+durable observation / owed-acceptance delivery path as a normal fire
 
 **Rationale:** The router is the single writer of contract terminal
 state. Per-condition-kind evaluators are pure functions over (handle
@@ -256,7 +257,8 @@ would create a parallel scheduler inside the handle-wake plane.
 WHEN a contract fires
 THE SYSTEM SHALL deliver to the conversation a synthetic tool result
 shaped as the tool result the equivalent successful synchronous wait would have
-returned.
+returned, but wake delivery SHALL enter the conversation only through the durable
+observation / owed-acceptance path rather than an immediate direct-to-LLM wake-up.
 
 For `HandleTerminal/Bash`, the tool result MUST carry the handle's terminal
 status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
