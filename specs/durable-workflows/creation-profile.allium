@@ -464,7 +464,9 @@ rule WorktreeMaterializeOrAdoptRequiresPhysicalRepositoryLock {
     requires: binding.intent.workspace.mode in {managed, branch}
     requires: effect.status = claimed
     requires: effect.generation = binding.workflow.generation
+    requires: live_lock_authority(effect, authority)
     requires: PhysicalRepositoryLock{holder_effect: effect}.released_at = null
+    requires: PhysicalRepositoryLock{holder_effect: effect}.holder_authority = authority
     requires: lock_covers_effect(PhysicalRepositoryLock{holder_effect: effect}, effect)
     ensures: WorktreeReservationInspected(binding)
     ensures: WorktreeMaterializeOrMatchingAdoptAttempted(binding, authority)
@@ -657,7 +659,7 @@ rule ReadinessBarrierPublishesReady {
     when: CreationReadinessBarrierSatisfied(reducer, binding)
     requires: binding.readiness_barrier.status = satisfied
     requires: binding.workflow.generation = binding.readiness_barrier.declaring_transition.generation
-    requires: binding.outcome in {provisioning, manual_resolution}
+    requires: binding.outcome = provisioning
     requires: conversation_projection_ready(binding)
     ensures: binding.outcome = ready
     ensures: ConversationCreationReady(binding.conversation_id)
@@ -667,7 +669,7 @@ rule ReadinessIgnoresLateTerminalGeneration {
     when: CreationReadinessBarrierSatisfied(reducer, binding)
     requires: binding.readiness_barrier.status = satisfied
     requires: binding.workflow.generation != binding.readiness_barrier.declaring_transition.generation
-        or binding.outcome not in {provisioning, manual_resolution}
+        or binding.outcome != provisioning
     ensures: not ConversationCreationReady(binding.conversation_id)
     ensures: binding.outcome != ready
 }

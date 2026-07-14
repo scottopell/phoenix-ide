@@ -498,11 +498,20 @@ rule IdleScheduleCreatesBoundedCoalescedObligation {
     let eligible = undelivered_items_through(conversation, upper_bound)
     let batch = bounded_prefix(eligible, config.max_acceptance_batch_items)
     let obligation_id = next_obligation_id()
+    ensures: dwf/OwedAcceptance.created(
+        id: obligation_id, workflow: conversation_wake_workflow(conversation),
+        reducer_inbox: obligation_payload_inbox(WakeRuntimeObligation{id: obligation_id}),
+        source_kind: "wake_runtime_acceptance",
+        event_codec: acceptance_payload_codec(conversation, batch, upper_bound),
+        event_payload: exact_acceptance_payload(conversation, batch, upper_bound),
+        status: owed, accepting_transition: null
+    )
     ensures: WakeRuntimeObligation.created(
         id: obligation_id, conversation: conversation,
         payload: exact_acceptance_payload(conversation, batch, upper_bound),
         owed_acceptance: dwf/OwedAcceptance{id: obligation_id}, created_at: now()
     )
+    ensures: wake_obligation_and_core_owed_acceptance_commit_atomically(conversation, obligation_id)
     ensures: count(batch) >= 1
     ensures: count(batch) <= config.max_acceptance_batch_items
     ensures: AtMostOneOwedWakeRuntimeObligation(conversation)

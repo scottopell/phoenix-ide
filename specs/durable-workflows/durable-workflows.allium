@@ -558,8 +558,16 @@ rule RetireProtocolOnlyAfterCompleteZeroDrainProof {
     ensures: ProfileProtocolRetirementPermitted(selection)
 }
 
+rule RejectStillAcceptingProtocolRetirement {
+    when: ProtocolRetirementRequested(operator, selection, proof)
+    requires: selection.accepting = true
+    ensures: ProfileProtocolRetirementRejected(selection)
+    ensures: not ProfileProtocolRetirementPermitted(selection)
+}
+
 rule RejectProtocolRetirementWithoutCompleteZeroDrainProof {
     when: ProtocolRetirementRequested(operator, selection, proof)
+    requires: selection.accepting = false
     requires: proof.selection != selection
         or proof.query_identity != drain_query_identity(selection)
         or proof.query_version != drain_query_version(selection)
@@ -652,7 +660,7 @@ rule AcceptExternallyRetryableWorkflow {
     ensures: ExternalAcceptanceOutcome(external_acceptance_receipt(request, accepted_workflow()))
 }
 
-rule ReplayExternallyRetryableAcceptance {
+rule ReplayExternalAcceptanceBindingBeforeAvailabilityChecks {
     when: ExternalWorkflowAcceptanceRequested(client, request)
     let binding = external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key)
     requires: binding != null
@@ -683,7 +691,7 @@ rule RejectUnavailableExternalAcceptance {
     requires: selection.accepting != true
         or selection.external_acceptance_enabled != true
         or not profile_executor_available(request.profile)
-    ensures: ExternalAcceptanceOutcome(unsupported_codec)
+    ensures: ExternalAcceptanceOutcome(closed_or_unavailable)
     ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
 }
 
@@ -740,11 +748,19 @@ rule RejectStaleReducerPlan {
     ensures: no_rows_from_rejected_plan(workflow, decision.expected_workflow_version, decision.plan)
 }
 
-rule RejectInvalidReducerPlan {
+rule RejectUnsupportedReducerPlanCodec {
     when: ReducerPlanCommitRequested(reducer, workflow, decision)
     requires: decision.expected_workflow_version = workflow.version
     requires: not plan_codecs_supported(workflow.profile, decision.plan)
-        or not plan_is_complete(decision.plan)
+    ensures: ReducerPlanCommitOutcome(unsupported_codec)
+    ensures: no_rows_from_rejected_plan(workflow, decision.expected_workflow_version, decision.plan)
+}
+
+rule RejectInvalidReducerPlan {
+    when: ReducerPlanCommitRequested(reducer, workflow, decision)
+    requires: decision.expected_workflow_version = workflow.version
+    requires: plan_codecs_supported(workflow.profile, decision.plan)
+    requires: not plan_is_complete(decision.plan)
         or not plan_effect_ids_unique(decision.plan)
         or not plan_barrier_ids_unique(decision.plan)
         or not plan_references_only_declared_effects(decision.plan)
@@ -875,7 +891,8 @@ rule RejectUnsupportedObservationCodec {
     requires: not profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: ObservationOutcome(unsupported_codec)
     ensures: not Observation.created(effect: effect, attempt: attempt, codec: codec)
-    ensures: attempt.status = begun
+    ensures: attempt.status = prior_attempt_status(effect, attempt)
+    ensures: observation_codec_rejection_is_non_mutating(effect, attempt)
 }
 
 rule AcceptTerminalReceipt {
@@ -914,8 +931,24 @@ rule RejectDuplicateOrStaleReceipt {
 
 rule RejectUnsupportedTerminalReceiptCodec {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: live_matching_authority(effect, authority)
+    requires: attempt.effect = effect
+    requires: attempt.claim = Claim{effect: effect}
+    requires: claim_row_matches_authority(effect, authority)
+    requires: accepted_receipt_count(effect) = 0
     requires: not profile_has_lossless_decoder(effect.workflow.profile, codec)
     ensures: TerminalReceiptOutcome(unsupported_codec)
+    ensures: accepted_receipt_count(effect) <= 1
+}
+
+rule RejectUnavailableOrClosedTerminalReceipt {
+    when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: not live_matching_authority(effect, authority)
+        or attempt.effect != effect
+        or attempt.claim != Claim{effect: effect}
+        or not claim_row_matches_authority(effect, authority)
+        or accepted_receipt_count(effect) = 1
+    ensures: TerminalReceiptOutcome(closed_or_unavailable)
     ensures: accepted_receipt_count(effect) <= 1
 }
 
@@ -1031,6 +1064,30 @@ rule CommitManualResolution {
         delivery_status: pending, consumed_by: null
     )
     ensures: ManualResolutionAudited(resolution)
+}
+
+rule RejectUnsupportedManualResolutionChoiceCodec {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: manual_choice_permitted(resolution, choice)
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
+    requires: not profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
+    ensures: ManualResolutionOutcome(unsupported_codec)
+    ensures: resolution.status = required
+    ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
+}
+
+rule RejectUnavailableManualResolutionChoice {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: manual_choice_permitted(resolution, choice)
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
+    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
+    requires: accepted_receipt_count(resolution.effect) = 1
+    ensures: ManualResolutionOutcome(closed_or_unavailable)
+    ensures: resolution.status = required
 }
 
 rule RejectStaleManualResolution {
