@@ -268,13 +268,13 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
     let forgotten = forgotten_terminal_payload(
         "contract-1",
         resource.clone(),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(20),
     );
     assert!(matches!(
         forgotten,
         WakeTerminalPayload::Forgotten {
-            reason: WakeForgottenReason::HandleMissing,
+            reason: WakeForgottenReason::CascadeDestroyedHandle,
             ..
         }
     ));
@@ -694,13 +694,13 @@ fn runtime_acceptance_decision_names_the_exact_owed_terminal() {
     let owed = forgotten_terminal_payload(
         "contract-1",
         bash_identity("b-15"),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(20),
     );
     let other = forgotten_terminal_payload(
         "contract-2",
         bash_identity("b-16"),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(21),
     );
 
@@ -735,7 +735,7 @@ fn manual_choices_export_expected_codec_payloads_and_terminal_receipts() {
     let terminal = forgotten_terminal_payload(
         "contract-1",
         bash_identity("b-15"),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(20),
     );
     let choices = manual_choices(&terminal);
@@ -757,7 +757,7 @@ fn terminal_receipt_requires_exact_terminal_projection_event() {
     let terminal = forgotten_terminal_payload(
         "contract-1",
         bash_identity("b-terminal"),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(12),
     );
     let inbox = ReducerInboxPayload::Receipt(terminal.clone());
@@ -779,7 +779,7 @@ fn suppress_manual_choice_is_typed_as_suppress() {
     let terminal = forgotten_terminal_payload(
         "contract-1",
         bash_identity("b-suppress"),
-        WakeForgottenReason::HandleMissing,
+        WakeForgottenReason::CascadeDestroyedHandle,
         Timestamp(12),
     );
     let choices = manual_choices(&terminal);

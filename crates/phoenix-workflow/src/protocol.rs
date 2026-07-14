@@ -42,7 +42,7 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
             return ExternalAcceptanceOutcome::Unsupported;
         };
         let key = ExternalAcceptanceKey {
-            selection: ProtocolSelectionIdentity::from(selection),
+            profile: selection.profile.clone(),
             authority_scope,
             idempotency_key: idempotency_key.clone(),
         };
@@ -64,6 +64,7 @@ impl<H: Clone + Eq> ExternalAcceptanceRegistry<H> {
         self.bindings.insert(
             key,
             ExternalAcceptanceBinding {
+                accepted_protocol: ProtocolSelectionIdentity::from(selection),
                 intent_fingerprint: intent_fingerprint.to_owned(),
                 receipt: receipt.clone(),
             },
