@@ -1328,7 +1328,7 @@ export function conversationReducer(
         ),
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? atom.transcriptGeneration ?? 1,
-        transcriptCoverage: action.transcriptCoverage ?? 'complete',
+        transcriptCoverage: action.transcriptCoverage ?? atom.transcriptCoverage,
         lastAppliedEventSeq,
         ...deriveMessageSyncState(messages),
       };

@@ -750,7 +750,7 @@ function ConversationPageContent() {
                     view: {
                       conversationId: authoritativeConversation.id,
                       generation: historyGenerationRef.current,
-                      transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                      transcriptGeneration: latestTranscriptGeneration,
                     },
                     hasEarlierHistory: latestWindow.has_older_messages,
                   });
@@ -763,7 +763,7 @@ function ConversationPageContent() {
                       ? parseConversationState(authoritativeConversation.state)
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
-                    transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                    transcriptGeneration: latestTranscriptGeneration,
                     transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
                     eventCursorFloor: snapshotStartedAtEventSeq,
                     snapshotStartedAtEventSeq,

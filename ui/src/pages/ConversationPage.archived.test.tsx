@@ -81,7 +81,14 @@ vi.mock('../components/ConversationNavStack', () => ({
     hasOlderMessages?: boolean;
     onLoadOlderMessages?: () => void;
     loadingOlderMessages?: boolean;
-    transcriptPositioning?: { kind: 'idle' } | { kind: 'positioning'; command: { kind: string; token: number } };
+    transcriptPositioning?: {
+      kind: 'idle';
+      view?: { conversationId: string; generation: number; transcriptGeneration: number };
+    } | {
+      kind: 'positioning';
+      command: { kind: string; token: number };
+      view?: { conversationId: string; generation: number; transcriptGeneration: number };
+    };
     olderHistoryError?: string | null;
   }) => (
     <div>
@@ -107,6 +114,7 @@ vi.mock('../components/ConversationNavStack', () => ({
           ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
           : 'none'}
       </div>
+      <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
       {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
     </div>
   ),
@@ -656,6 +664,172 @@ describe('ConversationPage archived read-only rendering', () => {
         expect.objectContaining({ latestMessageSequenceId: 4 }),
       );
     });
+  });
+
+  it('records latest transcript generation from warm-cache catch-up responses', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
+    const message3 = {
+      ...catchUpMessage,
+      message_id: 'm3',
+      sequence_id: 3,
+      content: [{ type: 'text', text: 'generation eight tail' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [message3],
+      tombstones: [],
+      transcript_generation: 8,
+      server_message_tail: 3,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [message3],
+      tombstones: [],
+      transcript_generation: 8,
+      server_message_tail: 3,
+      has_older_messages: true,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('generation eight tail')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId('history-transcript-generation')).toHaveTextContent('8');
+    });
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({ transcriptGeneration: 8, latestMessageSequenceId: 3 }),
+      );
+    });
+  });
+
+  it('metadata-only archive confirmation arriving during pending latest refresh keeps tail coverage until refresh resolves', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
+    let resolveLatest: undefined | ((value: {
+      messages: Message[];
+      tombstones: [];
+      transcript_generation: number;
+      server_message_tail: number;
+      has_older_messages: boolean;
+    }) => void);
+    const latestWindow = new Promise<{
+      messages: Message[];
+      tombstones: [];
+      transcript_generation: number;
+      server_message_tail: number;
+      has_older_messages: boolean;
+    }>((resolve) => {
+      resolveLatest = resolve;
+    });
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockReturnValue(latestWindow);
+
+    const { store } = renderPage(cachedConversation);
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+
+    store.dispatch(cachedConversation.slug, {
+      type: 'sse_conversation_update',
+      sequenceId: 1,
+      updates: { archived: true },
+    });
+
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('no');
+    expect(screen.getByTestId('history-transcript-generation')).toHaveTextContent('7');
+
+    resolveLatest?.({
+      messages: [historyMessage],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 1,
+      has_older_messages: false,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('history-loading')).toHaveTextContent('idle');
+    });
+  });
+
+  it('metadata-only archive confirmation arriving during failed latest refresh keeps tail coverage', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 7 });
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getReplicaMeta).mockResolvedValue({
+      conversationId,
+      latestMessageSequenceId: 1,
+      latestEventSequenceId: null,
+      transcriptGeneration: 7,
+      lastHydratedAt: '2024-01-01T00:00:02Z',
+    });
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockRejectedValue(new Error('latest failed'));
+
+    const { store } = renderPage(cachedConversation);
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+
+    store.dispatch(cachedConversation.slug, {
+      type: 'sse_conversation_update',
+      sequenceId: 1,
+      updates: { archived: true },
+    });
+
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('no');
+    expect(screen.getByTestId('history-transcript-generation')).toHaveTextContent('7');
+    expect(await screen.findByTestId('history-loading')).toHaveTextContent('idle');
   });
 
   it('uses the id metadata path for UUID-route archive confirmation', async () => {

@@ -2256,6 +2256,82 @@ describe('conversationReducer', () => {
       expect(next.conversation?.cwd).toBe('/newer/live/cwd');
     });
 
+    it('merge_conversation_data preserves existing tail coverage when transcriptCoverage is omitted', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'tail',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('merge_conversation_data preserves existing complete coverage when transcriptCoverage is omitted', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'complete',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('complete');
+    });
+
+    it('merge_conversation_data lets explicit transcriptCoverage override existing coverage', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'complete',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        transcriptCoverage: 'tail',
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
     it('set_initial_data can reset a stale cached conversation to the fetched slug owner', () => {
       const replacementConversation: Conversation = {
         ...testConversation,
