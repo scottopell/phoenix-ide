@@ -55,7 +55,7 @@ new acceptances.
 - ADR-012 separates workflow-version serialization from leased effect authority.
 - ADR-013 separates observation, receipt, and runtime acceptance and permits the
   normalized owed-acceptance capability only for profiles that need it.
-- ADR-013 makes externally retryable acceptance a typed profile capability,
+- ADR-014 makes externally retryable acceptance a typed profile capability,
   extends semantic projection parity across supported clients, isolates additional
   inbox consumers, and defines the engine adoption perimeter.
 - ADR-007 remains historical authority for creation's fenced reconciliation.
