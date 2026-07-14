@@ -2723,12 +2723,6 @@ async fn get_conversation_message_range(
     Path(id): Path<String>,
     Query(query): Query<MessageRangeQuery>,
 ) -> Result<Json<ConversationMessageRangeResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
     if query.start_message_sequence <= 0 || query.end_message_sequence <= 0 {
         return Err(AppError::BadRequest(
             "start_message_sequence and end_message_sequence must be greater than 0".to_string(),
@@ -2746,20 +2740,25 @@ async fn get_conversation_message_range(
         )));
     }
     let db = state.runtime.db();
-    let messages = db
-        .get_message_range(
-            &id,
-            query.start_message_sequence,
-            query.end_message_sequence,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let server_message_tail = get_server_message_tail(db, &id).await?;
+    let start_message_sequence = query.start_message_sequence;
+    let end_message_sequence = query.end_message_sequence;
+    let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
+        Box::pin(async move {
+            let messages = db
+                .get_message_range(id, start_message_sequence, end_message_sequence)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let server_message_tail = get_server_message_tail(db, id).await?;
+            Ok((messages, server_message_tail))
+        })
+    })
+    .await?;
+    let (messages, server_message_tail) = stable.value;
     Ok(Json(build_message_range_response(
         &messages,
-        query.start_message_sequence,
-        query.end_message_sequence,
-        conversation.transcript_generation,
+        start_message_sequence,
+        end_message_sequence,
+        stable.conversation.transcript_generation,
         server_message_tail,
     )))
 }
@@ -2769,24 +2768,25 @@ async fn get_conversation_messages_around(
     Path((id, sequence)): Path<(String, i64)>,
     Query(query): Query<AroundMessagesQuery>,
 ) -> Result<Json<ConversationMessagesAroundResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
     let before = validate_message_history_limit("before", query.before, 50)?;
     let after = validate_message_history_limit("after", query.after, 50)?;
     let db = state.runtime.db();
-    let (before_messages, after_messages) = db
-        .get_messages_around(&id, sequence, before, after)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let server_message_tail = get_server_message_tail(db, &id).await?;
+    let stable = stable_transcript_read(db, &id, |db, id, _attempt| {
+        Box::pin(async move {
+            let (before_messages, after_messages) = db
+                .get_messages_around(id, sequence, before, after)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let server_message_tail = get_server_message_tail(db, id).await?;
+            Ok((before_messages, after_messages, server_message_tail))
+        })
+    })
+    .await?;
+    let (before_messages, after_messages, server_message_tail) = stable.value;
     Ok(Json(build_messages_around_response(
         &before_messages,
         &after_messages,
-        conversation.transcript_generation,
+        stable.conversation.transcript_generation,
         server_message_tail,
     )))
 }
@@ -8979,6 +8979,79 @@ pub(crate) mod hard_delete_cascade_tests {
             ),
             StreamDbMessageSelection::Full
         );
+    }
+
+    async fn create_generation_race_history(state: &AppState, conversation_id: &str) {
+        state
+            .db
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        for sequence in 1..=3 {
+            state
+                .db
+                .add_message(
+                    &format!("{conversation_id}-message-{sequence}"),
+                    conversation_id,
+                    &crate::db::MessageContent::user(format!("message {sequence}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add message");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_range_read_retries_after_generation_race() {
+        let state = make_test_state().await;
+        create_generation_race_history(&state, "range-read-race").await;
+
+        bump_generation_after_next_stable_read_value("range-read-race");
+        let Json(response) = get_conversation_message_range(
+            State(state),
+            Path("range-read-race".to_string()),
+            Query(MessageRangeQuery {
+                start_message_sequence: 1,
+                end_message_sequence: 2,
+            }),
+        )
+        .await
+        .expect("stable exact-range read");
+
+        assert_eq!(response.transcript_generation, Some(2));
+        assert_eq!(
+            response
+                .messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(response.server_message_tail, Some(3));
+    }
+
+    #[tokio::test]
+    async fn around_history_read_retries_after_generation_race() {
+        let state = make_test_state().await;
+        create_generation_race_history(&state, "around-read-race").await;
+
+        bump_generation_after_next_stable_read_value("around-read-race");
+        let Json(response) = get_conversation_messages_around(
+            State(state),
+            Path(("around-read-race".to_string(), 2)),
+            Query(AroundMessagesQuery {
+                before: Some(1),
+                after: Some(1),
+            }),
+        )
+        .await
+        .expect("stable around-history read");
+
+        assert_eq!(response.transcript_generation, Some(2));
+        assert_eq!(response.before[0].sequence_id, 1);
+        assert_eq!(response.after[0].sequence_id, 3);
+        assert_eq!(response.server_message_tail, Some(3));
     }
 
     #[tokio::test]
