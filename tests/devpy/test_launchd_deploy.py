@@ -454,6 +454,29 @@ class PreparationTests(unittest.TestCase):
                 helper.restore(manifest, launchctl)
             self.assertEqual(manifest.previous.git_sha, fetch.call_args.kwargs["expected_git_sha"])
 
+    def test_status_failure_keeps_claim_for_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            claim = Path(manifest.active_path)
+            claim.write_text(manifest.transaction_id + "\n")
+            argv = ["helper", "activate", "--manifest", str(Path(td) / "manifest.json"),
+                    "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            Path(argv[3]).write_text(json.dumps(helper.dataclasses.asdict(manifest)))
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "activate", side_effect=helper.ActivationError("status write failed")), \
+                 mock.patch.object(helper, "status_is_durable_terminal", return_value=False), \
+                 mock.patch.object(helper, "request_helper_bootout"):
+                self.assertEqual(1, helper.main())
+            self.assertEqual(manifest.transaction_id, claim.read_text().strip())
+
+    def test_candidate_env_includes_prod_set_overrides(self):
+        with mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"BASE": "yes"})), \
+             mock.patch.object(self.dev, "_launchd_override_env", return_value={"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "9443"}):
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("yes", env["BASE"])
+        self.assertEqual("secret", env["PHOENIX_PASSWORD"])
+        self.assertEqual("9443", env["PHOENIX_PORT"])
+
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
         self.assertIn("phoenix_ide-aarch64-apple-darwin", workflow)

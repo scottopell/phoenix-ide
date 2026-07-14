@@ -401,6 +401,17 @@ def activate(manifest: Manifest) -> str:
                 return "activation_failed_rollback_failed"
 
 
+def status_is_durable_terminal(manifest: Manifest) -> bool:
+    try:
+        status = json.loads(Path(manifest.status_path).read_text())
+        return (
+            status.get("transaction_id") == manifest.transaction_id
+            and status.get("state") in TERMINAL_STATES
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("activate", nargs="?")
@@ -414,18 +425,21 @@ def main() -> int:
         if manifest.helper_label != args.helper_label or manifest.uid != args.uid:
             raise ActivationError("helper identity does not match the immutable manifest")
         state = activate(manifest)
-        if state in TERMINAL_STATES:
+        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(state, flush=True)
         return 0 if state == "committed" else 1
     except ConcurrentDeploy as exc:
         if manifest is not None:
-            write_status(manifest, "rejected_concurrent", failure=str(exc))
-            release_claim(manifest)
+            try:
+                write_status(manifest, "rejected_concurrent", failure=str(exc))
+            finally:
+                if status_is_durable_terminal(manifest):
+                    release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        if manifest is not None:
+        if manifest is not None and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(f"activation helper failed: {exc}", file=sys.stderr)
         return 1

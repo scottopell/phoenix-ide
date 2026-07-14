@@ -7373,13 +7373,18 @@ def _report_launchd_handoff(transaction_id: str, identity: dict[str, str]) -> No
         pass
 
 
+def _launchd_candidate_env() -> tuple[dict[str, str], Path | None]:
+    env: dict[str, str] = {}
+    env_file = _load_env_file(env)
+    env.update(_launchd_override_env())
+    return env, env_file
+
+
 def launchd_prod_deploy(release: str | None = None):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
 
-    launchd_env: dict[str, str] = {}
-    _load_env_file(launchd_env)
-    launchd_env.update(_launchd_override_env())
+    launchd_env, _env_file = _launchd_candidate_env()
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     transaction_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -7435,8 +7440,7 @@ def launchd_prod_deploy(release: str | None = None):
                 f"local candidate identity {identity['git_sha']} does not match selected HEAD {source_commit[:12]}"
             )
 
-        env_overrides: dict[str, str] = {}
-        env_file = _load_env_file(env_overrides)
+        env_overrides, env_file = _launchd_candidate_env()
         if env_file:
             print(f"  Loaded env from {env_file}")
         path_str, path_source = capture_login_shell_path()
