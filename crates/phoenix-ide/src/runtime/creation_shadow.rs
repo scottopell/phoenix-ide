@@ -296,10 +296,15 @@ fn oracle_from_committed(
 }
 
 fn cleanup_ownership(reservations: &[CreationResourceReservation]) -> CleanupOwnership {
-    if reservations.is_empty() {
+    if reservations
+        .iter()
+        .any(|reservation| reservation.status != "released")
+    {
+        CleanupOwnership::OwnedResources
+    } else if reservations.is_empty() {
         CleanupOwnership::None
     } else {
-        CleanupOwnership::OwnedResources
+        CleanupOwnership::HistoricalReservation
     }
 }
 
@@ -593,17 +598,23 @@ mod tests {
     }
 
     #[test]
-    fn released_reservation_preserves_owned_cleanup_evidence() {
-        let reservations = vec![CreationResourceReservation {
+    fn released_reservation_preserves_history_without_owing_cleanup() {
+        let mut reservation = CreationResourceReservation {
             id: "reservation".to_owned(),
             job_id: "job".to_owned(),
             generation: 1,
             resource_identity: "/tmp/worktree".to_owned(),
             repository_identity: "/tmp/repo".to_owned(),
             status: "released".to_owned(),
-        }];
+        };
         assert_eq!(
-            cleanup_ownership(&reservations),
+            cleanup_ownership(std::slice::from_ref(&reservation)),
+            CleanupOwnership::HistoricalReservation
+        );
+
+        reservation.status = "reserved".to_owned();
+        assert_eq!(
+            cleanup_ownership(&[reservation]),
             CleanupOwnership::OwnedResources
         );
         assert_eq!(cleanup_ownership(&[]), CleanupOwnership::None);

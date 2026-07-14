@@ -84,6 +84,7 @@ pub enum AuthoritativeCreationStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOwnership {
     None,
+    HistoricalReservation,
     OwnedResources,
 }
 
@@ -1042,6 +1043,11 @@ fn effect_predictions(oracle: &AuthoritativeCreationOracle) -> Vec<(EffectId, Ef
                     EXPAND_INITIAL_MESSAGE | BOOTSTRAP_RUNTIME | DISPATCH_INITIAL_LLM_REQUEST
                 ) {
                 EffectPrediction::Omitted
+            } else if (id == RESERVE_WORKTREE && oracle.cleanup_ownership != CleanupOwnership::None)
+                || (id == COMMIT_METADATA
+                    && oracle.stage == AuthoritativeCreationStage::CommitMetadata)
+            {
+                EffectPrediction::Completed
             } else if id == BOOTSTRAP_RUNTIME {
                 if oracle.runtime_evidence.runtime_bootstrapped {
                     EffectPrediction::Completed

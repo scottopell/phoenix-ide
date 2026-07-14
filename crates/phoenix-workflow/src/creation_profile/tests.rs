@@ -572,6 +572,59 @@ fn finalize_stage_does_not_predict_runtime_or_dispatch_completion_without_eviden
         .contains(&(DISPATCH_INITIAL_LLM_REQUEST, EffectPrediction::Completed)));
 }
 
+#[test]
+fn committed_boundaries_complete_effects_before_later_stage_checkpoints() {
+    let mut oracle = oracle(CreationKind::InitialTurn {
+        message_id: "message-1".into(),
+    });
+    oracle.stage = AuthoritativeCreationStage::ReserveResources;
+    oracle.cleanup_ownership = CleanupOwnership::OwnedResources;
+    let reservation_projection = project_authoritative_creation(&oracle);
+    let reservation_by_id = reservation_projection
+        .effect_predictions
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        reservation_by_id[&RESERVE_WORKTREE],
+        EffectPrediction::Completed
+    );
+
+    oracle.cleanup_ownership = CleanupOwnership::HistoricalReservation;
+    let released_projection = project_authoritative_creation(&oracle);
+    let released_by_id = released_projection
+        .effect_predictions
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        released_by_id[&RESERVE_WORKTREE],
+        EffectPrediction::Completed
+    );
+    oracle.status = AuthoritativeCreationStatus::Failed(CreationFailure {
+        kind: "failed".into(),
+        message: "failed".into(),
+    });
+    let released_adapter =
+        adapt_authoritative_creation(WorkflowId(21), WorkflowId(91), &oracle).unwrap();
+    assert!(!released_adapter.plan.effects.iter().any(|effect| matches!(
+        effect.effect_id,
+        REMOVE_OWNED_WORKTREE | RELEASE_RESERVATION
+    )));
+
+    oracle.status = AuthoritativeCreationStatus::Claimed {
+        worker_id: "worker-1".into(),
+    };
+    oracle.stage = AuthoritativeCreationStage::CommitMetadata;
+    let metadata_projection = project_authoritative_creation(&oracle);
+    let metadata_by_id = metadata_projection
+        .effect_predictions
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        metadata_by_id[&COMMIT_METADATA],
+        EffectPrediction::Completed
+    );
+}
+
 proptest! {
     #[test]
     fn adapter_is_deterministic_and_preserves_owned_runtime_strings(
