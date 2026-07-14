@@ -345,7 +345,7 @@ async fn provision_conversation(
                 job.conversation_id.chars().take(8).collect::<String>()
             )
         });
-    manager
+    match manager
         .db()
         .record_creation_shadow_execution_mode(
             &job.id,
@@ -353,8 +353,14 @@ async fn provision_conversation(
             resolved_branch.as_deref(),
         )
         .await
-        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
-    manager.mirror_creation_after_commit(job.id.clone());
+    {
+        Ok(()) => manager.mirror_creation_after_commit(job.id.clone()),
+        Err(error) => tracing::warn!(
+            job_id = %job.id,
+            %error,
+            "creation shadow execution evidence failed; continuing authoritative creation"
+        ),
+    }
 
     let registry_default = manager.llm_registry.default_model_id();
     let mut resolved_model = intent.model.clone().unwrap_or_else(|| {

@@ -733,6 +733,7 @@ impl Database {
         uses_worktree: bool,
         branch_name: Option<&str>,
     ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE creation_shadow_creation_evidence
              SET uses_worktree = ?1, branch_name = ?2
@@ -741,8 +742,17 @@ impl Database {
         .bind(uses_worktree)
         .bind(branch_name)
         .bind(job_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET shadow_projection_revision = shadow_projection_revision + 1
+             WHERE id = ?1",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3647,12 +3657,18 @@ impl Database {
             .bind(&cleanup.worker_id)
             .bind(&cleanup.token)
             .execute(&mut *tx)
-            .await?;
-            if archived.rows_affected() != 1 {
-                tx.rollback().await?;
-                return Err(DbError::Serialization(
-                    "creation cleanup diagnostic archive failed".to_string(),
-                ));
+            .await;
+            match archived {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => tracing::warn!(
+                    job_id = %cleanup.job_id,
+                    "creation cleanup diagnostic archive matched no authoritative row"
+                ),
+                Err(error) => tracing::warn!(
+                    job_id = %cleanup.job_id,
+                    %error,
+                    "creation cleanup diagnostic archive failed; continuing deletion"
+                ),
             }
             let deleted = sqlx::query(
                 "DELETE FROM conversations
