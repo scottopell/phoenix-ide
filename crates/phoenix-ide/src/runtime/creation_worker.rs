@@ -349,6 +349,7 @@ async fn provision_conversation(
         .db()
         .record_creation_shadow_execution_mode(
             &job.id,
+            requested_mode,
             resolved_uses_worktree,
             resolved_branch.as_deref(),
         )

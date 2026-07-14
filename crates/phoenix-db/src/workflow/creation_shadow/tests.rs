@@ -3,8 +3,8 @@ use std::{str::FromStr, time::Duration};
 use chrono::{TimeZone, Utc};
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
-    CleanupOwnership, CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence,
-    CreationStart, CreationWorkspace, WorktreeProvisioningEvidence,
+    CleanupOwnership, CreationIntent, CreationMode, CreationProjectionStatus,
+    CreationRuntimeEvidence, CreationStart, CreationWorkspace, WorktreeProvisioningEvidence,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -45,6 +45,7 @@ async fn pool() -> SqlitePool {
 fn oracle() -> AuthoritativeCreationOracle {
     AuthoritativeCreationOracle {
         intent: CreationIntent {
+            requested_mode: Some(CreationMode::Direct),
             job_id: "job-shadow".to_owned(),
             conversation_id: "conv-shadow".to_owned(),
             idempotency_key: "key".to_owned(),

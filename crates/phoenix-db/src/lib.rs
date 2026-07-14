@@ -740,15 +740,17 @@ impl Database {
     pub async fn record_creation_shadow_execution_mode(
         &self,
         job_id: &str,
+        requested_mode: &str,
         uses_worktree: bool,
         branch_name: Option<&str>,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE creation_shadow_creation_evidence
-             SET uses_worktree = ?1, branch_name = ?2
-             WHERE creation_job_id = ?3",
+             SET requested_mode = ?1, uses_worktree = ?2, branch_name = ?3
+             WHERE creation_job_id = ?4",
         )
+        .bind(requested_mode)
         .bind(uses_worktree)
         .bind(branch_name)
         .bind(job_id)

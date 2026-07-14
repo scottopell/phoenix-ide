@@ -25,6 +25,14 @@ pub const RELEASE_RESERVATION: EffectId = EffectId(103);
 pub const DELETE_STAGED_ATTACHMENTS: EffectId = EffectId(104);
 pub const FINISH_CANCELLATION_OR_DELETION: EffectId = EffectId(105);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationMode {
+    Direct,
+    Managed,
+    Branch,
+    Auto,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreationWorkspace {
     Direct {
@@ -45,6 +53,7 @@ pub enum CreationStart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreationIntent {
+    pub requested_mode: Option<CreationMode>,
     pub job_id: String,
     pub conversation_id: String,
     pub idempotency_key: String,

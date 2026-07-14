@@ -11,8 +11,8 @@ use super::{
     adapt_authoritative_creation, compensation_plan, project_authoritative_creation,
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CompensationPrediction, CompletionPrediction,
-    CreationFailure, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
-    CreationWorkspace, EffectPrediction, WorktreeProvisioningEvidence,
+    CreationFailure, CreationMode, CreationProjectionStatus, CreationRuntimeEvidence,
+    CreationStart, CreationWorkspace, EffectPrediction, WorktreeProvisioningEvidence,
     WorktreeReconciliationClassification, BOOTSTRAP_RUNTIME, COMMIT_METADATA,
     COMPENSATION_BARRIER_ID, DELETE_STAGED_ATTACHMENTS, DISPATCH_INITIAL_LLM_REQUEST,
     EXPAND_INITIAL_MESSAGE, FINALIZE_ATTACHMENTS, FINISH_CANCELLATION_OR_DELETION,
@@ -23,6 +23,7 @@ use super::{
 fn oracle(start: CreationStart) -> AuthoritativeCreationOracle {
     AuthoritativeCreationOracle {
         intent: super::CreationIntent {
+            requested_mode: Some(CreationMode::Managed),
             job_id: "job-1".into(),
             conversation_id: "conv-1".into(),
             idempotency_key: "request-1".into(),

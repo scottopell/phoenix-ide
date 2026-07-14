@@ -17,7 +17,7 @@ use phoenix_db::workflow::{
 use phoenix_workflow::creation_profile::{
     AuthoritativeCreationOracle, AuthoritativeCreationStage, AuthoritativeCreationStatus,
     CapabilityAvailability, CleanupOwnership, CreationCapabilities, CreationFailure,
-    CreationIntent, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
+    CreationIntent, CreationMode, CreationProjectionStatus, CreationRuntimeEvidence, CreationStart,
     CreationWorkspace, WorktreeProvisioningEvidence,
 };
 
@@ -29,6 +29,7 @@ struct CreationShadowEvidenceRow {
     creation_kind: String,
     uses_worktree: Option<i64>,
     branch_name: Option<String>,
+    requested_mode: Option<String>,
 }
 
 #[derive(Default)]
@@ -141,7 +142,7 @@ impl CreationShadowCoordinator {
             .await
             .map_err(|error| error.to_string())?;
         let preserved_evidence = sqlx::query(
-            "SELECT cwd, attachment_count, creation_kind, uses_worktree, branch_name
+            "SELECT cwd, attachment_count, creation_kind, uses_worktree, branch_name, requested_mode
              FROM creation_shadow_creation_evidence
              WHERE creation_job_id = ?1 AND creation_kind IN ('initial_turn', 'seeded_empty')",
         )
@@ -155,6 +156,7 @@ impl CreationShadowCoordinator {
             creation_kind: sqlx::Row::get(&row, "creation_kind"),
             uses_worktree: sqlx::Row::get(&row, "uses_worktree"),
             branch_name: sqlx::Row::get(&row, "branch_name"),
+            requested_mode: sqlx::Row::get(&row, "requested_mode"),
         });
         if preserved_evidence
             .as_ref()
@@ -303,6 +305,7 @@ fn oracle_from_committed(
     let stage = map_stage(job.protocol.stage);
     AuthoritativeCreationOracle {
         intent: CreationIntent {
+            requested_mode: creation_mode(preserved_evidence),
             job_id: job.id.clone(),
             conversation_id: job.conversation_id,
             idempotency_key: job.id,
@@ -329,10 +332,21 @@ fn oracle_from_committed(
     }
 }
 
+fn creation_mode(evidence: Option<&CreationShadowEvidenceRow>) -> Option<CreationMode> {
+    match evidence.and_then(|evidence| evidence.requested_mode.as_deref()) {
+        Some("managed") => Some(CreationMode::Managed),
+        Some("branch") => Some(CreationMode::Branch),
+        Some("auto") => Some(CreationMode::Auto),
+        Some("direct") => Some(CreationMode::Direct),
+        None => None,
+        Some(_) => unreachable!("requested mode is constrained by the evidence table"),
+    }
+}
+
 fn worktree_evidence(reservations: &[CreationResourceReservation]) -> WorktreeProvisioningEvidence {
     if reservations
         .iter()
-        .any(|reservation| reservation.status == "present")
+        .any(|reservation| matches!(reservation.status.as_str(), "present" | "released"))
     {
         WorktreeProvisioningEvidence::Materialized
     } else if reservations.is_empty() {
@@ -657,6 +671,19 @@ mod tests {
     }
 
     #[test]
+    fn requested_mode_remains_distinct_from_resolved_workspace() {
+        let evidence = CreationShadowEvidenceRow {
+            cwd: "/tmp".to_owned(),
+            attachment_count: 0,
+            creation_kind: "seeded_empty".to_owned(),
+            uses_worktree: Some(0),
+            branch_name: None,
+            requested_mode: Some("auto".to_owned()),
+        };
+        assert_eq!(creation_mode(Some(&evidence)), Some(CreationMode::Auto));
+    }
+
+    #[test]
     fn released_reservation_preserves_history_without_owing_cleanup() {
         let mut reservation = CreationResourceReservation {
             id: "reservation".to_owned(),
@@ -669,6 +696,10 @@ mod tests {
         assert_eq!(
             cleanup_ownership(std::slice::from_ref(&reservation)),
             CleanupOwnership::HistoricalReservation
+        );
+        assert_eq!(
+            worktree_evidence(std::slice::from_ref(&reservation)),
+            WorktreeProvisioningEvidence::Materialized
         );
 
         reservation.status = "reserved".to_owned();

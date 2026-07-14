@@ -2318,6 +2318,9 @@ ALTER TABLE creation_shadow_creation_evidence
     ADD COLUMN uses_worktree INTEGER CHECK (uses_worktree IS NULL OR uses_worktree IN (0, 1));
 ALTER TABLE creation_shadow_creation_evidence
     ADD COLUMN branch_name TEXT;
+ALTER TABLE creation_shadow_creation_evidence
+    ADD COLUMN requested_mode TEXT
+    CHECK (requested_mode IS NULL OR requested_mode IN ('direct', 'managed', 'branch', 'auto'));
 ";
 
 /// Run all pending migrations against the database.
