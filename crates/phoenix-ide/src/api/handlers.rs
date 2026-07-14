@@ -3349,7 +3349,7 @@ async fn address_pr_feedback(
     let message_id = req
         .message_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if let Some(chat) = preflight_user_message_submission(&state, &id, &message_id).await? {
+    if let Some(chat) = find_existing_user_message_submission(&state, &id, &message_id).await? {
         return Ok(Json(AddressPrFeedbackResponse {
             queued: chat.queued,
             steering: chat.steering,
@@ -3396,7 +3396,7 @@ fn transition_error_type(err: &TransitionError) -> &'static str {
     }
 }
 
-async fn preflight_user_message_submission(
+async fn find_existing_user_message_submission(
     state: &AppState,
     conversation_id: &str,
     message_id: &str,
@@ -3408,65 +3408,20 @@ async fn preflight_user_message_submission(
         }));
     }
 
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(conversation_id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
     let steering_queue = state
         .runtime
         .db()
         .get_steering_queue(conversation_id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    if steering_queue.iter().any(|e| e.message_id == message_id) {
+    if steering_queue
+        .iter()
+        .any(|entry| entry.message_id == message_id)
+    {
         return Ok(Some(ChatResponse {
             queued: true,
             steering: true,
         }));
-    }
-
-    let effective_state = if let Some(live_state) = state
-        .runtime
-        .effective_conversation_state(conversation_id)
-        .await
-    {
-        live_state
-    } else {
-        conversation.state.clone()
-    };
-
-    if !matches!(effective_state, ConvState::Idle) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Address feedback can only be submitted while the conversation is idle.".to_string(),
-            "address_feedback_not_idle",
-        ))));
-    }
-
-    if let Err(err) = check_user_message_acceptable(&effective_state) {
-        let steer = matches!(
-            err,
-            TransitionError::AgentBusy | TransitionError::CancellationInProgress
-        );
-        if steer {
-            const MAX_STEER_QUEUE_DEPTH: usize = 5;
-            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Steering queue is full; try again once a queued message has been delivered."
-                        .to_string(),
-                    "steering_queue_full",
-                ))));
-            }
-            return Ok(None);
-        }
-
-        let error_type = transition_error_type(&err);
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            err.to_string(),
-            error_type,
-        ))));
     }
 
     Ok(None)
