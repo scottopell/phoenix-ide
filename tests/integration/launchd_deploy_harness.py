@@ -137,6 +137,7 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
     manifest_path = root / f"manifest-{suffix}.json"
     url = f"http://127.0.0.1:{port}/api/version"
     manifest = {
+        "manifest_version": 1,
         "transaction_id": suffix, "source_kind": "local_head", "source_commit": "newsha",
         "release_tag": None, "release_commit": None, "expected": new_identity, "previous": old_identity,
         "previous_deployed_sha": "oldsha",

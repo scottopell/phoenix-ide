@@ -202,6 +202,7 @@ LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
 LAUNCHD_OVERRIDE_PATH = Path.home() / ".phoenix-ide" / "launchd-overrides.json"
+LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # Dev ports are assigned deterministically from the worktree path hash. Keep
@@ -7530,6 +7531,15 @@ def launchd_prod_deploy(release: str | None = None):
         helper = staging / "activate.py"
         _materialize_helper(source_commit, helper, source_kind)
         python_executable = Path(sys.executable).resolve()
+        protocol = subprocess.run(
+            [str(python_executable), str(helper), "--protocol-version"],
+            capture_output=True, text=True,
+        )
+        if protocol.returncode != 0 or protocol.stdout.strip() != str(LAUNCHD_HANDOFF_PROTOCOL_VERSION):
+            raise SystemExit(
+                f"selected helper uses incompatible handoff protocol {protocol.stdout.strip()!r}; "
+                f"expected {LAUNCHD_HANDOFF_PROTOCOL_VERSION}"
+            )
         interpreter_check = subprocess.run(
             [str(python_executable), "-c", "import fcntl, plistlib, ssl, urllib.request"],
             capture_output=True,
@@ -7554,6 +7564,7 @@ def launchd_prod_deploy(release: str | None = None):
         health_url, health_insecure_tls = _launchd_health_probe(env_overrides)
         previous_deployed_sha = PROD_SHA_PATH.read_text().strip() if PROD_SHA_PATH.exists() else None
         manifest = {
+            "manifest_version": LAUNCHD_HANDOFF_PROTOCOL_VERSION,
             "transaction_id": transaction_id,
             "source_kind": source_kind,
             "source_commit": source_commit,
@@ -7678,7 +7689,8 @@ def launchd_prod_status():
 
     print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
 
-    identity = _current_prod_identity(_repo_env())
+    status_env, _env_file = _launchd_candidate_env()
+    identity = _current_prod_identity(status_env)
     if identity:
         print(f"  Version: {identity['version']} ({identity['git_sha']})")
     else:
@@ -7688,10 +7700,10 @@ def launchd_prod_status():
 
     if sha := read_deployed_sha():
         print(f"  Commit: {sha}")
-    print(f"  Port: {PROD_PORT}")
+    print(f"  Port: {status_env.get('PHOENIX_PORT', str(PROD_PORT))}")
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
-    print(f"  URL: {_prod_display_url()}")
+    print(f"  URL: {_prod_display_url(status_env)}")
 
 
 def launchd_prod_stop():
@@ -7706,8 +7718,18 @@ def _sync_launchd_socket_port(plist: dict) -> None:
     plist.setdefault("Sockets", {}).setdefault("Listeners", {})["SockServiceName"] = socket_port
 
 
+def _refuse_launchd_override_during_deploy() -> None:
+    owner = _deploy_claim_owner()
+    if owner is not None:
+        raise SystemExit(
+            f"cannot modify production overrides while deployment {owner} owns the active claim; "
+            "run './dev.py prod status'"
+        )
+
+
 def launchd_prod_override_set(name: str, value: str):
     """Set an environment variable in the launchd plist and reload."""
+    _refuse_launchd_override_during_deploy()
     import plistlib
 
     if not LAUNCHD_PLIST_PATH.exists():
@@ -7742,6 +7764,7 @@ def launchd_prod_override_set(name: str, value: str):
 
 def launchd_prod_override_unset(name: str):
     """Remove an environment variable from the launchd plist and reload."""
+    _refuse_launchd_override_during_deploy()
     import plistlib
 
     if not LAUNCHD_PLIST_PATH.exists():

@@ -61,6 +61,7 @@ def make_manifest(root: Path, *, expected=None, previous=None):
         path.write_bytes(content)
         files[name] = path
     return helper.Manifest(
+        manifest_version=helper.HANDOFF_PROTOCOL_VERSION,
         transaction_id="tx", source_kind="published_release", source_commit="newsha",
         release_tag="v2.0.0", release_commit="newsha0000000000000000000000000000000000",
         expected=expected, previous=previous,
@@ -539,6 +540,32 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.dev.launchd_prod_deploy()
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+
+    def test_helper_rejects_incompatible_manifest_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            path = Path(td) / "manifest.json"
+            value = helper.dataclasses.asdict(manifest)
+            value["manifest_version"] = helper.HANDOFF_PROTOCOL_VERSION + 1
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(helper.ActivationError, "unsupported handoff protocol"):
+                helper.Manifest.load(path)
+
+    def test_override_mutation_refuses_active_deploy(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"):
+            self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("deploy-owner\n")
+            with self.assertRaisesRegex(SystemExit, "deploy-owner"):
+                self.dev._refuse_launchd_override_during_deploy()
+
+    def test_prod_status_uses_effective_launchd_env(self):
+        with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({"PHOENIX_PORT": "9555"}, None)), \
+             mock.patch.object(self.dev, "_current_prod_identity", return_value=None) as identity, \
+             mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "state = running\n", "")), \
+             mock.patch("builtins.print") as output:
+            self.dev.launchd_prod_status()
+        identity.assert_called_once_with({"PHOENIX_PORT": "9555"})
+        self.assertTrue(any("Port: 9555" in str(call) for call in output.call_args_list))
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

@@ -25,6 +25,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+HANDOFF_PROTOCOL_VERSION = 1
+
 TERMINAL_STATES = {
     "committed",
     "precondition_failed",
@@ -42,6 +44,7 @@ class Identity:
 
 @dataclasses.dataclass(frozen=True)
 class Manifest:
+    manifest_version: int
     transaction_id: str
     source_kind: str
     source_commit: str
@@ -80,6 +83,10 @@ class Manifest:
     @classmethod
     def load(cls, path: Path) -> "Manifest":
         raw = json.loads(path.read_text())
+        if raw.get("manifest_version") != HANDOFF_PROTOCOL_VERSION:
+            raise ActivationError(
+                f"unsupported handoff protocol {raw.get('manifest_version')!r}; expected {HANDOFF_PROTOCOL_VERSION}"
+            )
         raw["expected"] = Identity(**raw["expected"])
         raw["previous"] = Identity(**raw["previous"]) if raw.get("previous") else None
         return cls(**raw)
@@ -421,10 +428,16 @@ def status_is_durable_terminal(manifest: Manifest) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("activate", nargs="?")
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--helper-label", required=True)
-    parser.add_argument("--uid", type=int, required=True)
+    parser.add_argument("--protocol-version", action="store_true")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--helper-label")
+    parser.add_argument("--uid", type=int)
     args = parser.parse_args()
+    if args.protocol_version:
+        print(HANDOFF_PROTOCOL_VERSION)
+        return 0
+    if args.manifest is None or args.helper_label is None or args.uid is None:
+        parser.error("activation requires --manifest, --helper-label, and --uid")
     manifest = None
     try:
         manifest = Manifest.load(args.manifest)
