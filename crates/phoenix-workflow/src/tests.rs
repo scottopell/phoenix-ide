@@ -624,7 +624,7 @@ fn retry_wait_becomes_eligible_only_after_deadline() {
         .expect("commit succeeds");
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
-    let _ = workflow.schedule_retry(&authority, Timestamp(1), Timestamp(5));
+    let _ = workflow.schedule_retry(&authority, authority.worker_id, Timestamp(1), Timestamp(5));
     assert_eq!(
         workflow.effects[&EffectId(1)].status,
         EffectStatus::RetryWait
@@ -705,6 +705,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -818,6 +819,7 @@ fn manual_resolution_version_has_matching_transition_history() {
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -1054,7 +1056,12 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
     assert_eq!(workflow.generation, Generation(1));
     assert_eq!(
         workflow
-            .renew_claim(&authority, Timestamp(1), LeaseExpiry(30))
+            .renew_claim(
+                &authority,
+                authority.worker_id,
+                Timestamp(1),
+                LeaseExpiry(30)
+            )
             .outcome,
         AuthorityOutcome::StaleAuthority
     );
@@ -1204,6 +1211,7 @@ fn invalid_manual_resolution_does_not_mutate_state() {
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -1305,6 +1313,7 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -2088,7 +2097,8 @@ fn manual_only_ambiguity_cannot_schedule_retry() {
         .expect("commit succeeds");
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
-    let outcome = workflow.schedule_retry(&authority, Timestamp(1), Timestamp(5));
+    let outcome =
+        workflow.schedule_retry(&authority, authority.worker_id, Timestamp(1), Timestamp(5));
     assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
     assert_eq!(outcome.decision, None);
     assert_eq!(workflow.effects[&EffectId(1)].status, EffectStatus::Claimed);
@@ -2120,6 +2130,7 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -2399,12 +2410,13 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
         sim.workflow.effects[&EffectId(1)].status,
         EffectStatus::Claimed
     );
-    assert_eq!(
-        sim.workflow
-            .schedule_retry(&authority, Timestamp(10), Timestamp(15))
-            .outcome,
-        AuthorityOutcome::StaleAuthority
+    let stale_retry = sim.workflow.schedule_retry(
+        &authority,
+        authority.worker_id,
+        Timestamp(10),
+        Timestamp(15),
     );
+    assert_eq!(stale_retry.outcome, AuthorityOutcome::StaleAuthority);
     let reconciliation_attempt = takeover.attempt.expect("reconciliation attempt issued");
     let mut receipt_path = sim.workflow.clone();
     assert_eq!(
@@ -2437,12 +2449,13 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
             .outcome,
         AuthorityOutcome::Authorized
     );
-    assert_eq!(
-        sim.workflow
-            .schedule_retry(&reconciliation, Timestamp(10), Timestamp(15))
-            .outcome,
-        AuthorityOutcome::Authorized
+    let accepted_retry = sim.workflow.schedule_retry(
+        &reconciliation,
+        reconciliation.worker_id,
+        Timestamp(10),
+        Timestamp(15),
     );
+    assert_eq!(accepted_retry.outcome, AuthorityOutcome::Authorized);
     assert!(!sim.workflow.effects[&EffectId(1)].pending_reconciliation);
 }
 
@@ -2822,6 +2835,44 @@ fn shadow_drain_excludes_all_authority_categories_except_unresolved_blocking_div
 }
 
 #[test]
+fn claim_bearer_cannot_renew_or_reconcile_for_another_worker() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let authority = workflow
+        .claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10))
+        .authority
+        .expect("authority");
+
+    assert_eq!(
+        workflow
+            .renew_claim(&authority, "worker-b", Timestamp(1), LeaseExpiry(20))
+            .outcome,
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        workflow
+            .schedule_retry(&authority, "worker-b", Timestamp(1), Timestamp(5))
+            .outcome,
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(
+        workflow
+            .require_manual_resolution(&authority, "worker-b", Timestamp(1), vec![])
+            .outcome,
+        AuthorityOutcome::StaleAuthority
+    );
+    assert_eq!(workflow.effects[&EffectId(1)].status, EffectStatus::Claimed);
+}
+
+#[test]
 fn monotonic_renewal_uses_stored_lease_and_updates_destructive_lock() {
     let mut workflow = workflow();
     let mut destructive_plan = plan();
@@ -2846,19 +2897,34 @@ fn monotonic_renewal_uses_stored_lease_and_updates_destructive_lock() {
     let authority = claim.authority.expect("authority");
     assert_eq!(
         workflow
-            .renew_claim(&authority, Timestamp(1), LeaseExpiry(10))
+            .renew_claim(
+                &authority,
+                authority.worker_id,
+                Timestamp(1),
+                LeaseExpiry(10)
+            )
             .outcome,
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(
         workflow
-            .renew_claim(&authority, Timestamp(1), LeaseExpiry(9))
+            .renew_claim(
+                &authority,
+                authority.worker_id,
+                Timestamp(1),
+                LeaseExpiry(9)
+            )
             .outcome,
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(
         workflow
-            .renew_claim(&authority, Timestamp(1), LeaseExpiry(20))
+            .renew_claim(
+                &authority,
+                authority.worker_id,
+                Timestamp(1),
+                LeaseExpiry(20)
+            )
             .outcome,
         AuthorityOutcome::Authorized
     );
@@ -2934,7 +3000,8 @@ fn empty_manual_choices_are_rejected() {
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority");
     let before = workflow.clone();
-    let outcome = workflow.require_manual_resolution(&authority, Timestamp(1), vec![]);
+    let outcome =
+        workflow.require_manual_resolution(&authority, authority.worker_id, Timestamp(1), vec![]);
     assert_eq!(outcome.outcome, AuthorityOutcome::StaleAuthority);
     assert_eq!(workflow, before);
 }
@@ -3006,6 +3073,7 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -3367,7 +3435,12 @@ fn review_regressions_preserve_renewed_authority_and_ambiguity_family_contract()
     let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
     let attempt = claim.attempt.expect("attempt");
     let authority = claim.authority.expect("authority");
-    let renewed = workflow.renew_claim(&authority, Timestamp(1), LeaseExpiry(20));
+    let renewed = workflow.renew_claim(
+        &authority,
+        authority.worker_id,
+        Timestamp(1),
+        LeaseExpiry(20),
+    );
     let renewed_authority = renewed.authority.expect("renewed authority returned");
     assert_eq!(renewed_authority.lease_until, LeaseExpiry(20));
     assert_eq!(
@@ -3438,7 +3511,12 @@ fn renewed_claim_rejects_the_pre_renewal_authority_for_non_destructive_effects()
     let original_authority = claim.authority.expect("authority");
     let attempt = claim.attempt.expect("attempt");
     let renewed_authority = workflow
-        .renew_claim(&original_authority, Timestamp(1), LeaseExpiry(20))
+        .renew_claim(
+            &original_authority,
+            original_authority.worker_id,
+            Timestamp(1),
+            LeaseExpiry(20),
+        )
         .authority
         .expect("renewed authority");
 
@@ -3535,6 +3613,7 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -3748,6 +3827,7 @@ fn review_regressions_cancellation_suppresses_manual_and_owed_work_atomically() 
     let resolution = workflow
         .require_manual_resolution(
             &authority,
+            authority.worker_id,
             Timestamp(1),
             vec![ManualChoice {
                 kind: ManualChoiceKind::Adopt,
@@ -3929,6 +4009,7 @@ fn manual_resolution_requirement_rejects_any_empty_choice_codec() {
         let before = workflow.clone();
         let outcome = workflow.require_manual_resolution(
             &claim.authority.expect("authority"),
+            "worker-a",
             Timestamp(1),
             vec![choice],
         );
@@ -3954,6 +4035,7 @@ fn review_regression_rejects_empty_manual_choice_codec() {
     let before = workflow.clone();
     let outcome = workflow.require_manual_resolution(
         &claim.authority.expect("authority"),
+        "worker",
         Timestamp(1),
         vec![ManualChoice {
             kind: ManualChoiceKind::Adopt,
@@ -4145,6 +4227,7 @@ fn retry_and_compensate_manual_choices_do_not_receipt_or_satisfy_barriers() {
         let resolution = workflow
             .require_manual_resolution(
                 &claim.authority.expect("authority"),
+                "worker",
                 Timestamp(1),
                 vec![choice.clone()],
             )
@@ -4275,6 +4358,7 @@ fn terminal_manual_receipt_and_post_terminal_barrier_are_suppressed() {
     let resolution = manual
         .require_manual_resolution(
             &claim.authority.expect("authority"),
+            "worker",
             Timestamp(1),
             vec![choice.clone()],
         )

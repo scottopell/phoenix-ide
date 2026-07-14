@@ -22,6 +22,7 @@ pub enum SimOp<P: WorkflowProfile> {
     },
     Renew {
         authority: ClaimAuthority,
+        worker_id: &'static str,
         lease_until: LeaseExpiry,
     },
     Observe {
@@ -32,6 +33,7 @@ pub enum SimOp<P: WorkflowProfile> {
     },
     Retry {
         authority: ClaimAuthority,
+        worker_id: &'static str,
         retry_at: Timestamp,
     },
     AdvanceTime(Timestamp),
@@ -83,9 +85,12 @@ impl<P: WorkflowProfile> Simulator<P> {
             }
             SimOp::Renew {
                 authority,
+                worker_id,
                 lease_until,
             } => {
-                let _ = self.workflow.renew_claim(&authority, self.now, lease_until);
+                let _ = self
+                    .workflow
+                    .renew_claim(&authority, worker_id, self.now, lease_until);
             }
             SimOp::Observe {
                 authority,
@@ -103,9 +108,12 @@ impl<P: WorkflowProfile> Simulator<P> {
             }
             SimOp::Retry {
                 authority,
+                worker_id,
                 retry_at,
             } => {
-                let _ = self.workflow.schedule_retry(&authority, self.now, retry_at);
+                let _ = self
+                    .workflow
+                    .schedule_retry(&authority, worker_id, self.now, retry_at);
             }
             SimOp::AdvanceTime(now) => {
                 self.now = now;
