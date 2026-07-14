@@ -59,11 +59,16 @@ function NewConversationFixtureBody({ scenario }: Props) {
     const root = rootRef.current;
     if (!root) return undefined;
 
-    const update = () => setReady(pageHasSettled(root, scenario));
-    update();
-    const observer = new MutationObserver(update);
-    observer.observe(root, { attributes: true, childList: true, subtree: true });
-    return () => observer.disconnect();
+    let frame: number;
+    const checkUntilSettled = () => {
+      if (pageHasSettled(root, scenario)) {
+        setReady(true);
+        return;
+      }
+      frame = requestAnimationFrame(checkUntilSettled);
+    };
+    checkUntilSettled();
+    return () => cancelAnimationFrame(frame);
   }, [scenario]);
 
   return (
