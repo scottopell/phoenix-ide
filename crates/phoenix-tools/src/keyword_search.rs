@@ -25,6 +25,12 @@ use tokio_util::sync::CancellationToken;
 /// probe kills `rg` the instant the total is exceeded, so the cost of rejecting
 /// a broad term is O(limit), independent of the size of the tree being scanned.
 const BROAD_TERM_MATCH_LIMIT: usize = 400;
+/// Per-file match cap for the breadth probe (`rg --max-count`). `rg --count`
+/// only emits a file's total once that file is fully scanned, so without a cap
+/// a term dense in one giant file (a generated bundle, a huge log) would scan
+/// that whole file before the early-exit could fire. Capping per file bounds
+/// each file's scan cost and keeps the probe O(limit) across the whole tree.
+const PROBE_PER_FILE_MATCH_CAP: &str = "100";
 /// Always-on ceiling on the combined context output. The scan is killed once
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
@@ -89,15 +95,19 @@ impl KeywordSearchTool {
     /// Count matches for a single term, aborting the scan the instant the
     /// running total crosses `BROAD_TERM_MATCH_LIMIT`.
     ///
-    /// This is the breadth probe. Because `rg -c` emits `path:count` lazily as
-    /// it walks and we early-exit (kill `rg`) once the total is exceeded, a
-    /// broad term is rejected after finding ~limit matches rather than after
-    /// walking the entire tree — so an intentionally broad search root (a
-    /// multi-repo container) stays cheap. A narrow term completes on its own.
+    /// This is the breadth probe. `rg --count` emits `path:count` lazily as it
+    /// walks; we accumulate the total and early-exit (kill `rg`) once it crosses
+    /// the limit, so a broad term is rejected after finding ~limit matches
+    /// rather than after walking the entire tree — an intentionally broad search
+    /// root (a multi-repo container) stays cheap. `--max-count` bounds each
+    /// file's scan so a term dense in one giant file cannot defeat the early
+    /// exit (a per-file count is only emitted once that file is fully scanned).
     ///
-    /// Returns the total match count, saturated at `BROAD_TERM_MATCH_LIMIT + 1`
-    /// when the early-exit fires. `stderr` is discarded: per-file IO errors
-    /// (unreadable paths) do not affect a breadth estimate.
+    /// Returns the accumulated match count (just past the limit when the early
+    /// exit fires). A non-`{matches, no-matches}` exit status — e.g. an invalid
+    /// regex term, which yields no stdout — is surfaced as `Err` so the caller
+    /// skips that one term instead of feeding a bad pattern into the combined
+    /// scan. `stderr` is discarded: per-file IO errors do not affect breadth.
     ///
     /// Cooperative cancellation (REQ-BED-005): the child is raced against
     /// `cancel` and killed+reaped on cancel.
@@ -109,7 +119,7 @@ impl KeywordSearchTool {
     ) -> Result<usize, String> {
         let mut child = Self::spawn_rg(
             dir,
-            &["--count"],
+            &["--count", "--max-count", PROBE_PER_FILE_MATCH_CAP],
             std::slice::from_ref(&term.to_string()),
             Stdio::null(),
         )?;
@@ -145,8 +155,19 @@ impl KeywordSearchTool {
                 }
             }
         }
-        let _ = child.wait().await;
-        Ok(total)
+        // Natural EOF: rg's exit status distinguishes an error (e.g. an invalid
+        // regex term, which produces no stdout) from 0 = matches / 1 = no
+        // matches. Surface the error so the caller skips just this term rather
+        // than feeding an invalid pattern into the combined scan and failing the
+        // whole search.
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
+        match status.code() {
+            Some(0 | 1) => Ok(total),
+            other => Err(format!("ripgrep exited with status {other:?} (invalid term?)")),
+        }
     }
 
     /// Run ripgrep with 10 lines of context for `terms`, streaming stdout into a
@@ -381,7 +402,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
 
         // Single combined scan, capped mid-stream at MAX_COMBINED_RESULTS.
-        let (mut results, truncated) = match self
+        let (results, truncated) = match self
             .ripgrep_capped(
                 &search_root,
                 &usable_terms,
@@ -403,32 +424,37 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             return ToolOutput::success("No matches found for the given search terms.");
         }
 
-        if truncated {
-            results.push_str(
-                "\n\n[results truncated: search scope is large — narrow your search terms for complete results]",
-            );
-        }
-
-        // Filter with LLM
-        match self
+        // Filter with LLM. The scope-truncation marker is appended to the FINAL
+        // output below, not folded into `results` here: folding it in would put
+        // it in the filter prompt, which returns a plain file list and can drop
+        // it — losing the signal that results are incomplete.
+        let filtered = match self
             .filter_with_llm(&ctx, &input.query, &search_root, &results)
             .await
         {
-            Ok(filtered) => ToolOutput::success(filtered),
+            Ok(filtered) => filtered,
             Err(e) => {
-                // If LLM fails, return raw results (truncated)
+                // If LLM fails, return raw results (size-truncated).
                 tracing::warn!(error = %e, "LLM filtering failed, returning raw results");
-                let truncated = if results.len() > 8000 {
+                if results.len() > 8000 {
                     format!(
                         "{}\n\n[results truncated]",
                         results.get(..8000).unwrap_or(&results)
                     )
                 } else {
                     results
-                };
-                ToolOutput::success(truncated)
+                }
             }
-        }
+        };
+
+        let output = if truncated {
+            format!(
+                "{filtered}\n\n[results truncated: search scope is large — narrow your search terms for complete results]"
+            )
+        } else {
+            filtered
+        };
+        ToolOutput::success(output)
     }
 }
 
@@ -581,6 +607,24 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 2, "case-insensitive match should count both lines");
+    }
+
+    /// An invalid regex term makes `rg` exit with an error status and no stdout;
+    /// the probe must surface that as `Err` so the caller skips only that term
+    /// rather than feeding the bad pattern into the combined scan.
+    #[tokio::test]
+    async fn count_matches_errors_on_invalid_regex() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("a.rs"), "hello world\n").unwrap();
+        let tool = KeywordSearchTool;
+        // Unbalanced parenthesis: not a valid regex, so `rg` exits with status 2.
+        let res = tool
+            .count_matches(dir.path(), "(", &CancellationToken::new())
+            .await;
+        assert!(
+            res.is_err(),
+            "invalid regex term must surface an error, got {res:?}"
+        );
     }
 
     /// The combined scan is capped mid-stream: output never exceeds `max_bytes`
