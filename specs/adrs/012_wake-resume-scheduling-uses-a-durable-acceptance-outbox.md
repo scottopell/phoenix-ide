@@ -1,13 +1,13 @@
-# ADR-010: Wake-resume scheduling uses a durable acceptance outbox
+# ADR-012: Wake-resume scheduling uses a durable acceptance outbox
 
 - **Status:** Accepted
 - **Date:** 2026-07-10
-- **Supersedes:** ADR-009 for the guarantee that a persisted inbox observation alone makes resume scheduling idempotent
+- **Supersedes:** ADR-011 for the guarantee that a persisted inbox observation alone makes resume scheduling idempotent
 - **Affects:** REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012, `ResumeRequest`
 
 ## Context
 
-ADR-009 separates durable terminal observations from their later LLM resume, but
+ADR-011 separates durable terminal observations from their later LLM resume, but
 its scheduling decision leaves a crash boundary between consuming an inbox
 snapshot and the runtime accepting the corresponding turn. Retrying only the
 inbox is insufficient after those rows are consumed; retrying only an in-memory
@@ -65,7 +65,7 @@ successor message nor another pending semantic observation.
 
 ## References
 
-- Superseded scheduling guarantee: ADR-009
+- Superseded scheduling guarantee: ADR-011
 - Feature spec: `specs/wake-contracts/requirements.md`
 - Behavioral model: `specs/wake-contracts/wake-contracts.allium`
 - Code: `Database::persist_wake_inbox_snapshot_message`,

@@ -154,6 +154,6 @@ The next task is **Build the Pure Durable Workflow Engine**. It must treat these
 
 ## Umbrella authority and dependency
 
-Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-011 through ADR-014.
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-013 through ADR-014.
 
 This specification task is superseded by task 47003 Milestone 1; its body remains design input.

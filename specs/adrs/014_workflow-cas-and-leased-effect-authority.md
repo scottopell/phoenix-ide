@@ -1,4 +1,4 @@
-# ADR-012: Workflow transitions use CAS and every claimed effect uses leased authority
+# ADR-014: Workflow transitions use CAS and every claimed effect uses leased authority
 
 - **Status:** Accepted
 - **Date:** 2026-07-11
@@ -63,5 +63,5 @@ copying an untyped choice payload.
 
 ## References
 
-- Related ADRs: ADR-007, ADR-011, ADR-013
+- Related ADRs: ADR-007, ADR-013, ADR-015
 - Feature spec: `specs/durable-workflows/requirements.md`

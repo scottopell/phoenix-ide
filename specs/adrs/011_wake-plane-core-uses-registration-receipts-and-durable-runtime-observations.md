@@ -1,4 +1,4 @@
-# ADR-009: Wake-plane core uses registration receipts and durable runtime observations
+# ADR-011: Wake-plane core uses registration receipts and durable runtime observations
 
 - **Status:** Accepted
 - **Date:** 2026-07-03

@@ -1,4 +1,4 @@
-# ADR-011: Durable workflows use an engine-owned normalized core and typed profiles
+# ADR-013: Durable workflows use an engine-owned normalized core and typed profiles
 
 - **Status:** Accepted
 - **Date:** 2026-07-11
@@ -71,6 +71,6 @@ order is a delivery decision, not a wake-specific limitation on the engine.
 
 ## References
 
-- Related ADRs: ADR-007, ADR-009, ADR-010, ADR-012, ADR-013
+- Related ADRs: ADR-007, ADR-011, ADR-012, ADR-014, ADR-015
 - Feature spec: `specs/durable-workflows/requirements.md`
 - Profile specs: `specs/wake-contracts/requirements.md`, `specs/conversation-creation/requirements.md`

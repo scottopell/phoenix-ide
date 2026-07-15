@@ -1,4 +1,4 @@
-# ADR-013: Observation, receipt, and runtime acceptance are distinct durable facts
+# ADR-015: Observation, receipt, and runtime acceptance are distinct durable facts
 
 - **Status:** Accepted
 - **Date:** 2026-07-11
@@ -65,6 +65,6 @@ step whose product contract actually crosses that boundary.
 
 ## References
 
-- Related ADRs: ADR-009, ADR-010, ADR-011, ADR-012
+- Related ADRs: ADR-011, ADR-012, ADR-013, ADR-014
 - Feature spec: `specs/durable-workflows/requirements.md`
 - Wake profile: `specs/wake-contracts/requirements.md`

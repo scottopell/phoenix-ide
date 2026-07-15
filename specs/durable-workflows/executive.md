@@ -114,15 +114,15 @@ retirement debt for any path that does not extend the target workflow profile.
 
 ## Related Decisions
 
-- ADR-011 owns the normalized-core/profile boundary and wake-first adoption.
-- ADR-012 separates workflow-version serialization from leased effect authority.
-- ADR-013 separates observation, receipt, and runtime acceptance and permits the
+- ADR-013 owns the normalized-core/profile boundary and wake-first adoption.
+- ADR-014 separates workflow-version serialization from leased effect authority.
+- ADR-015 separates observation, receipt, and runtime acceptance and permits the
   normalized owed-acceptance capability only for profiles that need it.
 - ADR-014 makes externally retryable acceptance a typed profile capability,
   extends semantic projection parity across supported clients, isolates additional
   inbox consumers, and defines the engine adoption perimeter.
 - ADR-007 remains historical authority for creation's fenced reconciliation.
-- ADR-009 and ADR-010 remain historical authority for wake registration,
+- ADR-011 and ADR-012 remain historical authority for wake registration,
   observations, and durable resume acceptance.
 
 ## Implementation Gate
