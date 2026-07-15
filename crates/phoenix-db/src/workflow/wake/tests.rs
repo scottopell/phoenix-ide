@@ -383,7 +383,43 @@ async fn pending_lookup_and_scope_rekey_follow_live_resource_ownership() {
 }
 
 #[tokio::test]
-async fn ensure_protocol_selection_reports_existing_accepting_selection_without_altering_it() {
+async fn concurrent_exact_protocol_selection_ensure_is_idempotent() {
+    let pool = pool().await;
+    let first_repo = WorkflowRepository::new(pool.clone());
+    let second_repo = WorkflowRepository::new(pool.clone());
+    let first = WakeWorkflowAdapter::new(&first_repo);
+    let second = WakeWorkflowAdapter::new(&second_repo);
+    let at = Utc.timestamp_opt(1_000, 0).single().unwrap();
+    let (left, right) = tokio::join!(
+        first.ensure_protocol_selection(at),
+        second.ensure_protocol_selection(at)
+    );
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workflow_protocol_selections WHERE id = ?1"
+        )
+        .bind(SELECTION_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workflow_profile_codecs WHERE selection_id = ?1"
+        )
+        .bind(SELECTION_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn ensure_protocol_selection_atomically_replaces_existing_accepting_selection() {
     let pool = pool().await;
     let repo = WorkflowRepository::new(pool.clone());
     let competing = DurableProtocolSelectionRegistration {
@@ -403,20 +439,10 @@ async fn ensure_protocol_selection_reports_existing_accepting_selection_without_
     };
     repo.register_protocol_selection(&competing).await.unwrap();
 
-    let error = WakeWorkflowAdapter::new(&repo)
+    WakeWorkflowAdapter::new(&repo)
         .ensure_protocol_selection(Utc.timestamp_opt(1_000, 0).single().unwrap())
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        WorkflowRepositoryError::ProtocolSelectionIncompatible {
-            requested_selection_id,
-            existing_selection_id,
-            profile_id,
-        } if requested_selection_id == SELECTION_ID
-            && existing_selection_id == "wake-competing"
-            && profile_id == phoenix_workflow::wake_profile::PROFILE_ID
-    ));
+        .unwrap();
 
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT id, accepting, selector_version FROM workflow_protocol_selections ORDER BY id",
@@ -424,7 +450,44 @@ async fn ensure_protocol_selection_reports_existing_accepting_selection_without_
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(rows, vec![("wake-competing".to_owned(), 1, 9)]);
+    assert_eq!(
+        rows,
+        vec![
+            ("wake-competing".to_owned(), 0, 9),
+            (SELECTION_ID.to_owned(), 1, 1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn same_id_with_incompatible_exact_selection_fails() {
+    let pool = pool().await;
+    let repo = WorkflowRepository::new(pool.clone());
+    let mut incompatible = DurableProtocolSelectionRegistration {
+        selection_id: SELECTION_ID.to_owned(),
+        profile_id: phoenix_workflow::wake_profile::PROFILE_ID.to_owned(),
+        selector_identity: SELECTOR_IDENTITY.to_owned(),
+        selector_version: 1,
+        protocol_version: phoenix_workflow::wake_profile::PROTOCOL_VERSION,
+        authority: phoenix_workflow::SemanticAuthority::EngineProtocol,
+        accepting: true,
+        runtime_acceptance_enabled: true,
+        external_acceptance_enabled: true,
+        registered_at: Utc.timestamp_opt(900, 0).single().unwrap(),
+        drained_at: None,
+        supported_codecs: vec![],
+        executor_kinds: vec![],
+    };
+    incompatible.selector_version = 2;
+    repo.register_protocol_selection(&incompatible)
+        .await
+        .unwrap();
+    assert!(matches!(
+        WakeWorkflowAdapter::new(&repo)
+            .ensure_protocol_selection(Utc.timestamp_opt(1_000, 0).single().unwrap())
+            .await,
+        Err(WorkflowRepositoryError::ProtocolSelectionIncompatible { .. })
+    ));
 }
 
 #[tokio::test]
