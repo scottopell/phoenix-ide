@@ -61,6 +61,7 @@ import {
   type TailActivity,
 } from '../conversation/scrollMachine';
 import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion';
+import { ProjectInstructionsRefresh } from './ProjectInstructionsRefresh';
 import {
   initialTranscriptPositioningState,
   reduceTranscriptPositioning,
@@ -290,6 +291,8 @@ interface SystemPromptHeaderProps {
   expanded: boolean;
   onToggle: () => void;
   contentRef: React.RefObject<HTMLPreElement>;
+  conversationId: string | undefined;
+  conversationState: ConversationState;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -297,15 +300,27 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   expanded,
   onToggle,
   contentRef,
+  conversationId,
+  conversationState,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
       <div className={`system-prompt-block${expanded ? ' expanded' : ''}`}>
         <div className="system-prompt-header" onClick={onToggle}>
           <span className="system-prompt-label">System prompt</span>
-          <span className="system-prompt-toggle">
-            {expanded ? <ChevronDown /> : <ChevronRight />}
-            {expanded ? ' hide' : ' show'}
+          <span className="system-prompt-header-actions">
+            {conversationId && (
+              <span onClick={(event) => event.stopPropagation()}>
+                <ProjectInstructionsRefresh
+                  conversationId={conversationId}
+                  conversationState={conversationState}
+                />
+              </span>
+            )}
+            <span className="system-prompt-toggle">
+              {expanded ? <ChevronDown /> : <ChevronRight />}
+              {expanded ? ' hide' : ' show'}
+            </span>
           </span>
         </div>
         {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
@@ -1116,6 +1131,8 @@ function MessageListImpl({
               expanded={systemPromptExpanded}
               onToggle={toggleSystemPrompt}
               contentRef={systemPromptRef}
+              conversationId={conversationId}
+              conversationState={convState}
             />
           ) : null}
           empty={<EmptyTranscriptState />}
