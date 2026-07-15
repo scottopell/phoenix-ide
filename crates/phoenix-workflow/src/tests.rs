@@ -3646,7 +3646,7 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
             .as_ref()
             .expect("ambiguity lock retained")
             .lease_until,
-        LeaseExpiry(u64::MAX)
+        LeaseExpiry::MAX_FINITE
     );
 
     workflow
