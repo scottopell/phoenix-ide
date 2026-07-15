@@ -761,11 +761,16 @@ pub fn transition_core(
         }
 
         (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
+            let resume_llm = results.iter().any(|result| result.resume_llm);
             let inbox_ids = results
                 .iter()
                 .map(|result| result.inbox_id.clone())
                 .collect();
-            let mut transition = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
+            let mut transition = if resume_llm {
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+            } else {
+                CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
+            };
             for wake_result in results {
                 transition = transition.with_effect(Effect::PersistMessage {
                     content: MessageContent::user(&wake_result.content),
@@ -775,10 +780,13 @@ pub fn transition_core(
                     idempotent: true,
                 });
             }
-            Ok(transition
+            transition = transition
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::AcceptWakeObservations { inbox_ids })
-                .with_effect(Effect::RequestLlm))
+                .with_effect(Effect::AcceptWakeObservations { inbox_ids });
+            if resume_llm {
+                transition = transition.with_effect(Effect::RequestLlm);
+            }
+            Ok(transition)
         }
 
         // Context Continuation (REQ-BED-019 through REQ-BED-024)

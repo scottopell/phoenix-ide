@@ -740,6 +740,17 @@ impl WorkflowRepository {
         failpoint: Option<WorkflowFailpoint>,
     ) -> WorkflowRepositoryResult<()> {
         let mut tx = self.pool.begin().await?;
+        if registration.accepting {
+            sqlx::query(
+                "UPDATE workflow_protocol_selections SET accepting = 0, drained_at = COALESCE(drained_at, ?1) \
+                 WHERE profile_id = ?2 AND id != ?3 AND accepting = 1",
+            )
+            .bind(registration.registered_at.to_rfc3339())
+            .bind(&registration.profile_id)
+            .bind(&registration.selection_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         insert_protocol_selection(&mut tx, registration).await?;
         maybe_fail(failpoint, WorkflowFailpoint::AfterWorkflowInsert)?;
         tx.commit().await?;
@@ -1847,10 +1858,17 @@ async fn resolve_external_acceptance_race(
         return Err(WorkflowRepositoryError::Sqlx(err));
     }
 
-    for _ in 0..20 {
-        if let Some(existing) = lookup_existing_binding(pool, acceptance).await? {
-            return Ok(existing);
+    for attempt in 0..100 {
+        match lookup_existing_binding(pool, acceptance).await {
+            Ok(Some(existing)) => return Ok(existing),
+            Ok(None) => {}
+            Err(WorkflowRepositoryError::Sqlx(error)) if is_busy_or_locked(&error) => {}
+            Err(error) => return Err(error),
         }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            1 + u64::try_from(attempt).unwrap_or(99),
+        ))
+        .await;
     }
 
     Ok(ExternalAcceptanceResult::Retryable)

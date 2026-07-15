@@ -30,6 +30,7 @@ pub struct WakeObservationResult {
     pub inbox_id: String,
     pub message_id: String,
     pub content: String,
+    pub resume_llm: bool,
 }
 
 /// Events that trigger state transitions

@@ -507,12 +507,19 @@ async fn deliver_owed(
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(
-                |(inbox_id, registering_tool_use_id, output)| WakeObservationResult {
-                    message_id: format!("wake-result-{inbox_id}"),
-                    content: format!(
-                        "Durable wait observation for registration {registering_tool_use_id}: {output}"
-                    ),
-                    inbox_id,
+                |(inbox_id, registering_tool_use_id, output)| {
+                    let resume_llm = serde_json::from_str::<serde_json::Value>(&output)
+                        .ok()
+                        .and_then(|value| value.get("status").and_then(|status| status.as_str()).map(str::to_owned))
+                        .is_none_or(|status| status != "cancelled");
+                    WakeObservationResult {
+                        message_id: format!("wake-result-{inbox_id}"),
+                        content: format!(
+                            "Durable wait observation for registration {registering_tool_use_id}: {output}"
+                        ),
+                        inbox_id,
+                        resume_llm,
+                    }
                 },
             )
             .collect();
