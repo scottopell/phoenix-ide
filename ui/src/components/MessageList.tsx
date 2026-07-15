@@ -540,6 +540,9 @@ function MessageListImpl({
   const transcriptPositioningViewKeyRef = useRef(historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
+  const currentHistoryViewKey = historyViewKey(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  );
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
   const earlierHistoryRequestScheduledRef = useRef(false);
@@ -939,7 +942,7 @@ function MessageListImpl({
 
   useEffect(() => {
     earlierHistoryRequestScheduledRef.current = false;
-  }, [conversationId]);
+  }, [conversationId, currentHistoryViewKey]);
 
   useEffect(() => {
     if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;
