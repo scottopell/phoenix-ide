@@ -99,6 +99,36 @@ describe('parseKeywordSearchOutput', () => {
     expect(parsed.empty).toBe(false);
     expect(parsed.hits).toEqual([]);
   });
+
+  it('extracts bracketed notes without treating them as hits', () => {
+    const text = [
+      '/abs/path/to/foo.rs: primary hit',
+      '',
+      '[note: 2 lower-priority term(s) were dropped to fit the result budget — narrow your terms for full coverage]',
+      '[results truncated: search scope is large — use more specific search terms for complete results]',
+    ].join('\n');
+    const parsed = parseKeywordSearchOutput(text);
+    expect(parsed.rawFallback).toBe(false);
+    expect(parsed.empty).toBe(false);
+    expect(parsed.hits).toHaveLength(1);
+    expect(parsed.hits[0]!.path).toBe('/abs/path/to/foo.rs');
+    expect(parsed.notes).toHaveLength(2);
+    expect(parsed.notes[0]).toMatch(/lower-priority term/);
+    expect(parsed.notes[1]).toMatch(/results truncated/);
+  });
+
+  it('treats the skipped-broad no-match variant as empty and keeps the note', () => {
+    const text = [
+      'No matches found for the given search terms.',
+      '',
+      '[note: 1 search term(s) skipped as too broad — narrow them to include their matches.]',
+    ].join('\n');
+    const parsed = parseKeywordSearchOutput(text);
+    expect(parsed.empty).toBe(true);
+    expect(parsed.rawFallback).toBe(false);
+    expect(parsed.notes).toHaveLength(1);
+    expect(parsed.notes[0]).toMatch(/skipped as too broad/);
+  });
 });
 
 describe('BrowserConsoleLogsView', () => {

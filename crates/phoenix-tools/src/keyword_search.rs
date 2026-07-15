@@ -38,6 +38,15 @@ struct KeywordSearchInput {
     search_terms: Vec<String>,
 }
 
+/// Parse the trailing `:count` from one `rg --count-matches` output line.
+/// The line is `path:count`; the path may be non-UTF-8, but the count after the
+/// last `:` is ASCII, so we slice from the last colon and parse that lossily.
+fn parse_trailing_count(line: &[u8]) -> Option<usize> {
+    let colon = line.iter().rposition(|&b| b == b':')?;
+    let tail = std::str::from_utf8(&line[colon + 1..]).ok()?;
+    tail.trim().parse::<usize>().ok()
+}
+
 /// Keyword search tool
 ///
 /// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir` and `llm_registry`
@@ -133,30 +142,35 @@ impl KeywordSearchTool {
             .stdout
             .take()
             .ok_or_else(|| "ripgrep stdout pipe missing".to_string())?;
-        let mut lines = BufReader::new(stdout_pipe).lines();
+        // Read byte-delimited lines rather than `lines()`: a non-UTF-8 file path
+        // in `rg`'s output would make a UTF-8 line decoder error and abort the
+        // whole probe. We only need the trailing `:count`, which is ASCII, so we
+        // parse it out of the raw bytes and ignore the (possibly non-UTF-8) path.
+        let mut reader = BufReader::new(stdout_pipe);
 
         let mut total = 0usize;
+        let mut line = Vec::new();
         loop {
+            line.clear();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     let _ = child.kill().await;
                     return Err("ripgrep cancelled".to_string());
                 }
-                line = lines.next_line() => {
-                    match line.map_err(|e| format!("Failed to read ripgrep output: {e}"))? {
-                        Some(l) => {
-                            // `rg --count-matches` prints `path:count`; the count
-                            // is the trailing field after the last colon.
-                            if let Some(n) = l.rsplit(':').next().and_then(|c| c.parse::<usize>().ok()) {
-                                total += n;
-                                if total > BROAD_TERM_MATCH_LIMIT {
-                                    let _ = child.kill().await;
-                                    return Ok(total);
-                                }
-                            }
+                read = reader.read_until(b'\n', &mut line) => {
+                    let n_read = read.map_err(|e| format!("Failed to read ripgrep output: {e}"))?;
+                    if n_read == 0 {
+                        break; // EOF
+                    }
+                    // `rg --count-matches` prints `path:count`; the count is the
+                    // trailing field after the last colon.
+                    if let Some(n) = parse_trailing_count(&line) {
+                        total += n;
+                        if total > BROAD_TERM_MATCH_LIMIT {
+                            let _ = child.kill().await;
+                            return Ok(total);
                         }
-                        None => break,
                     }
                 }
             }
@@ -331,8 +345,11 @@ impl KeywordSearchTool {
                 ));
             }
             if broad_count > 0 {
+                // Keep the canonical empty sentinel on its own line so the UI
+                // still renders this as "no matches"; carry the skipped-term
+                // coverage warning as a bracketed note the renderer surfaces.
                 return Err(ToolOutput::success(format!(
-                    "No matches found. {broad_count} search term(s) were skipped as too broad — narrow them to include their matches."
+                    "No matches found for the given search terms.\n\n[note: {broad_count} search term(s) skipped as too broad — narrow them to include their matches.]"
                 )));
             }
             return Err(ToolOutput::success(
@@ -767,6 +784,33 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0, "absent term must count to zero");
+    }
+
+    /// A non-UTF-8 file path in `rg`'s output must not abort the probe: the
+    /// trailing `:count` is parsed from raw bytes, ignoring the path encoding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn count_matches_tolerates_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        if !rg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // Filename containing an invalid UTF-8 byte (0xFF).
+        let mut name = std::ffi::OsString::from("bad_");
+        name.push(std::ffi::OsStr::from_bytes(b"\xff"));
+        name.push(".txt");
+        // Some filesystems (macOS/APFS) reject non-UTF-8 names outright; if the
+        // name can't be created here there's nothing to exercise, so skip.
+        if std::fs::write(dir.path().join(&name), "needle\nneedle\n").is_err() {
+            return;
+        }
+        let tool = KeywordSearchTool;
+        let count = tool
+            .count_matches(dir.path(), "needle", &CancellationToken::new())
+            .await
+            .expect("count");
+        assert_eq!(count, 2, "a non-UTF-8 path must not abort the count");
     }
 
     /// Many matches on a *single line* (a minified bundle) must read as broad —

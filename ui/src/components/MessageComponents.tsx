@@ -1757,24 +1757,42 @@ type KeywordHit = { path: string; explanation: string };
 // eslint-disable-next-line react-refresh/only-export-components
 export function parseKeywordSearchOutput(text: string): {
   hits: KeywordHit[];
+  notes: string[];
   rawFallback: boolean;
   empty: boolean;
 } {
-  const trimmed = text.trim();
+  // Bracketed `[...]` lines are coverage/incompleteness notes (terms dropped to
+  // fit the budget, results truncated, broad terms skipped). Pull them out
+  // first so they neither pollute the hit parser (a note like `[note: ...]`
+  // otherwise matches the `path: explanation` shape) nor the empty/fallback
+  // heuristics — and so the renderer can surface them.
+  const notes: string[] = [];
+  const body: string[] = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    if (t.startsWith('[') && t.endsWith(']')) {
+      notes.push(t.slice(1, -1));
+    } else {
+      body.push(line);
+    }
+  }
+
+  const trimmed = body.join('\n').trim();
   if (
     trimmed === '' ||
     trimmed === 'No matches found for the given search terms.' ||
     trimmed.startsWith('No relevant files found')
   ) {
-    return { hits: [], rawFallback: false, empty: true };
+    return { hits: [], notes, rawFallback: false, empty: true };
   }
 
-  const lines = text.split('\n').filter((l) => l.trim());
+  const lines = body.filter((l) => l.trim());
   // Raw ripgrep -C output has `path:NN:` or `path-NN-` per line plus `--` separators.
   // If a meaningful fraction of lines look like that, treat as fallback.
   const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
   if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
-    return { hits: [], rawFallback: true, empty: false };
+    return { hits: [], notes, rawFallback: true, empty: false };
   }
 
   const hits: KeywordHit[] = [];
@@ -1791,9 +1809,9 @@ export function parseKeywordSearchOutput(text: string): {
   // If very few lines parsed cleanly, the output likely isn't the LLM-filtered
   // shape — bail to plain rendering rather than show a tiny misleading list.
   if (hits.length === 0 || hits.length * 3 < lines.length) {
-    return { hits: [], rawFallback: true, empty: false };
+    return { hits: [], notes, rawFallback: true, empty: false };
   }
-  return { hits, rawFallback: false, empty: false };
+  return { hits, notes, rawFallback: false, empty: false };
 }
 
 export function KeywordSearchView({
@@ -1805,10 +1823,25 @@ export function KeywordSearchView({
 }) {
   const parsed = useMemo(() => parseKeywordSearchOutput(rawText), [rawText]);
 
+  // Coverage/incompleteness notes (terms dropped, results truncated, broad
+  // terms skipped). Surfaced in every branch so the signal is never silently
+  // dropped by the renderer.
+  const notesEl =
+    parsed.notes.length > 0 ? (
+      <div className="search-results-notes">
+        {parsed.notes.map((n, i) => (
+          <div key={i} className="search-results-note">
+            {n}
+          </div>
+        ))}
+      </div>
+    ) : null;
+
   if (parsed.empty) {
     return (
       <div className="keyword-search-results">
         <div className="search-results-empty">No relevant files found.</div>
+        {notesEl}
       </div>
     );
   }
@@ -1819,6 +1852,7 @@ export function KeywordSearchView({
         <div className="keyword-search-fallback-note">
           Raw ripgrep results — LLM filter unavailable
         </div>
+        {notesEl}
         <pre className="keyword-search-raw-text">{rawText}</pre>
       </div>
     );
@@ -1831,6 +1865,7 @@ export function KeywordSearchView({
           {parsed.hits.length} relevant file{parsed.hits.length === 1 ? '' : 's'}
         </span>
       </div>
+      {notesEl}
       <div className="keyword-search-list">
         {parsed.hits.map((hit, i) => (
           <div key={i} className="keyword-search-hit">
