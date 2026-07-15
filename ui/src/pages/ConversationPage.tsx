@@ -18,6 +18,7 @@ import {
   type RestoreBasis,
 } from '../conversation/historyExpansion';
 import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { messageCacheWrite } from '../conversation/messageCachePersistence';
 import {
   buildHistoricalUnits,
@@ -590,6 +591,17 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   const atomRef = useRef(atom);
   atomRef.current = atom;
+  const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
+  const conversationRouteOwnerRef = useRef({ identity: conversationRouteIdentity, generation: 1 });
+  if (conversationRouteOwnerRef.current.identity !== conversationRouteIdentity) {
+    conversationRouteOwnerRef.current = {
+      identity: conversationRouteIdentity,
+      generation: conversationRouteOwnerRef.current.generation + 1,
+    };
+  }
+  useEffect(() => () => {
+    conversationRouteOwnerRef.current.generation += 1;
+  }, []);
 
   useEffect(() => {
     if (!conversationId || atom.transcriptGeneration === null) return;
@@ -1358,6 +1370,35 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     }
   }, [conversationId, dismiss]);
 
+  const openConversationById = useCallback(async (
+    targetConversationId: string,
+    missingMessage: string,
+    failureMessage: string,
+  ) => {
+    const ownerGeneration = conversationRouteOwnerRef.current.generation;
+    const resolution = await resolveOwnedConversationTarget(
+      targetConversationId,
+      ownerGeneration,
+      () => conversationRouteOwnerRef.current.generation,
+      failureMessage,
+    );
+    switch (resolution.kind) {
+      case 'found':
+        navigate(`/c/${resolution.slug}`);
+        break;
+      case 'missing':
+        showInfo(missingMessage);
+        break;
+      case 'failed':
+        showInfo(resolution.message);
+        break;
+      case 'stale':
+        break;
+      default:
+        resolution satisfies never;
+    }
+  }, [navigate, showInfo]);
+
   // Fork proposal review outcomes (REQ-PROJ-034 / 037): navigate to the new
   // fork / refinement conversation, or toast a terminal/conflict result.
   const handleForkOutcome = useCallback(
@@ -1367,13 +1408,11 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         case 'promoted':
           if (outcome.conversationId) {
             const label = outcome.kind === 'spawned' ? 'fork' : 'refinement';
-            api
-              .getConversationSlug(outcome.conversationId)
-              .then((s) => {
-                if (s) navigate(`/c/${s}`);
-                else showInfo(`Created ${label} conversation.`);
-              })
-              .catch(() => showInfo(`Created ${label} conversation.`));
+            void openConversationById(
+              outcome.conversationId,
+              `Created ${label} conversation.`,
+              `Created ${label} conversation.`,
+            );
           }
           break;
         case 'dismissed':
@@ -1386,7 +1425,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           outcome.kind satisfies never;
       }
     },
-    [navigate, showInfo],
+    [openConversationById, showInfo],
   );
 
   const handleTriggerContinuation = useCallback(async () => {
@@ -2239,13 +2278,11 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   ? convStateForChildren.successor_conv_id
                   : null;
               if (!successorId) return;
-              try {
-                const slug = await api.getConversationSlug(successorId);
-                if (slug) navigate(`/c/${slug}`);
-                else showInfo('Work conversation no longer exists');
-              } catch (err) {
-                showInfo(err instanceof Error ? err.message : 'Failed to open work conversation');
-              }
+              await openConversationById(
+                successorId,
+                'Work conversation no longer exists',
+                'Failed to open work conversation',
+              );
             }}
           >
             {'→'} Open work conversation

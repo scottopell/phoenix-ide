@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
+import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { DesktopLayout } from '../components/DesktopLayout';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
@@ -32,6 +33,7 @@ vi.mock('../api', async () => {
       getPrStatus: vi.fn(() => Promise.resolve({ found: false })),
       getCredentialStatus: vi.fn(() => Promise.resolve('valid')),
       getConversationUsage: vi.fn(() => Promise.resolve({ total_tokens: 0, turns: [] })),
+      getConversationSlug: vi.fn(),
       getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
@@ -249,6 +251,70 @@ afterEach(() => {
   viewportFlags.isWideDesktop = true;
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe('owned conversation navigation', () => {
+  it('drops a successful slug resolution after the initiating conversation changes', async () => {
+    let resolveSlug!: (slug: string) => void;
+    vi.mocked(api.getConversationSlug).mockReturnValue(new Promise((resolve) => { resolveSlug = resolve; }));
+    let ownerGeneration = 1;
+
+    const pending = resolveOwnedConversationTarget(
+      'successor-id',
+      ownerGeneration,
+      () => ownerGeneration,
+      'Failed to open work conversation',
+    );
+    ownerGeneration += 1;
+    resolveSlug('successor-slug');
+
+    await expect(pending).resolves.toEqual({ kind: 'stale' });
+  });
+
+  it('drops a failed slug resolution after the initiating conversation changes', async () => {
+    let rejectSlug!: (error: Error) => void;
+    vi.mocked(api.getConversationSlug).mockReturnValue(new Promise((_resolve, reject) => { rejectSlug = reject; }));
+    let ownerGeneration = 1;
+
+    const pending = resolveOwnedConversationTarget(
+      'fork-id',
+      ownerGeneration,
+      () => ownerGeneration,
+      'Created fork conversation.',
+    );
+    ownerGeneration += 1;
+    rejectSlug(new Error('network unavailable'));
+
+    await expect(pending).resolves.toEqual({ kind: 'stale' });
+  });
+
+  it('drops a resolution after an owner leaves and returns to the same route identity', async () => {
+    let resolveSlug!: (slug: string) => void;
+    vi.mocked(api.getConversationSlug).mockReturnValue(new Promise((resolve) => { resolveSlug = resolve; }));
+    let ownerGeneration = 1;
+
+    const pending = resolveOwnedConversationTarget(
+      'successor-id',
+      ownerGeneration,
+      () => ownerGeneration,
+      'Failed to open work conversation',
+    );
+    ownerGeneration += 2;
+    resolveSlug('successor-slug');
+
+    await expect(pending).resolves.toEqual({ kind: 'stale' });
+  });
+
+  it('returns a target only while the initiating conversation still owns navigation', async () => {
+    vi.mocked(api.getConversationSlug).mockResolvedValue('successor-slug');
+
+    await expect(resolveOwnedConversationTarget(
+      'successor-id',
+      1,
+      () => 1,
+      'Failed to open work conversation',
+    )).resolves.toEqual({ kind: 'found', slug: 'successor-slug' });
+  });
 });
 
 describe('ConversationPage archived read-only rendering', () => {
