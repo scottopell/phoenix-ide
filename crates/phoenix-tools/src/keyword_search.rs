@@ -271,10 +271,11 @@ impl KeywordSearchTool {
     /// full-tree scan only to rediscover they match nothing.
     ///
     /// On a terminal condition returns `Err(ToolOutput)` — the response the
-    /// caller returns directly: a term was over-broad (ask for narrower terms),
-    /// every probe failed (surface an error rather than mask infra failure such
-    /// as ripgrep missing as an empty result), the probes ran and found nothing
-    /// (no matches), or cancellation fired mid-probe.
+    /// caller returns directly: every probe failed (surface an error rather than
+    /// mask infra failure such as ripgrep missing as an empty result); broadness
+    /// was the sole reason nothing is usable (ask for narrower terms); the
+    /// probes ran and found nothing, possibly with some broad terms skipped (no
+    /// matches); or cancellation fired mid-probe.
     async fn probe_usable_terms(
         &self,
         search_root: &Path,
@@ -282,12 +283,14 @@ impl KeywordSearchTool {
         cancel: &CancellationToken,
     ) -> Result<Vec<String>, ToolOutput> {
         let mut usable_terms = Vec::new();
-        let mut any_broad = false;
+        let mut broad_count = 0usize;
+        let mut any_zero = false;
         let mut any_ok = false;
         for term in terms {
             match self.count_matches(search_root, term, cancel).await {
                 Ok(0) => {
                     any_ok = true;
+                    any_zero = true;
                     tracing::debug!(term = %term, "No matches for term");
                 }
                 Ok(count) if count <= BROAD_TERM_MATCH_LIMIT => {
@@ -296,7 +299,7 @@ impl KeywordSearchTool {
                 }
                 Ok(count) => {
                     any_ok = true;
-                    any_broad = true;
+                    broad_count += 1;
                     tracing::debug!(term = %term, matches = count, "Skipping broad term");
                 }
                 Err(e) => {
@@ -312,18 +315,28 @@ impl KeywordSearchTool {
         }
 
         if usable_terms.is_empty() {
-            if any_broad {
+            if !any_ok {
+                return Err(ToolOutput::error(
+                    "keyword_search could not run any search term (is ripgrep installed and on PATH?)",
+                ));
+            }
+            // Broad terms are skipped, not fatal (REQ-KWS-001): the "too broad"
+            // error is only right when broadness is the *sole* reason nothing is
+            // usable — i.e. no term also matched zero. With a zero-match term
+            // present, the honest outcome is no matches, noting any skipped broad
+            // terms so the caller knows coverage was reduced.
+            if broad_count > 0 && !any_zero {
                 return Err(ToolOutput::error(
                     "Each of those search terms yielded too many results. Try more specific terms.",
                 ));
             }
-            if any_ok {
-                return Err(ToolOutput::success(
-                    "No matches found for the given search terms.",
-                ));
+            if broad_count > 0 {
+                return Err(ToolOutput::success(format!(
+                    "No matches found. {broad_count} search term(s) were skipped as too broad — narrow them to include their matches."
+                )));
             }
-            return Err(ToolOutput::error(
-                "keyword_search could not run any search term (is ripgrep installed and on PATH?)",
+            return Err(ToolOutput::success(
+                "No matches found for the given search terms.",
             ));
         }
         Ok(usable_terms)
