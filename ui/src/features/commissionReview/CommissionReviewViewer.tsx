@@ -1,5 +1,6 @@
 import type { Message, ToolResultContent } from '../../api';
 import { ViewerShell } from '../../components/viewer/ViewerShell';
+import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { CommissionReviewSummaryCard } from './CommissionReviewSummary';
 import { parseCommissionReviewResult } from './model';
 import './CommissionReviewViewer.css';
@@ -18,6 +19,7 @@ interface ResolvedReview {
 }
 
 export function CommissionReviewViewer({ sequenceId, messages, onClose, inline }: CommissionReviewViewerProps) {
+  useRegisterFocusScope('commission-review-viewer');
   const resolved = resolveCommissionReviewBySequence(sequenceId, messages);
   const rawResult = resolved?.resultContent?.content ?? resolved?.resultContent?.result ?? resolved?.resultContent?.error ?? '';
   const parsed = resolved?.resultMessage ? parseCommissionReviewResult(resolved.resultMessage.display_data, rawResult) : null;
