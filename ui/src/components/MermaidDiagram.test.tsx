@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { MermaidDiagram } from './MermaidDiagram';
+import { ThemeContext } from '../hooks/useTheme';
 
 // Real mermaid.render injects a temporary measuring node into <body> with id
 // `d${id}`, removes it on success, but on a syntax error throws before cleanup —
@@ -63,7 +64,25 @@ describe('MermaidDiagram fullscreen viewing', () => {
     const blob = createObjectURL.mock.calls[0]?.[0];
     expect(blob).toBeInstanceOf(Blob);
     expect(blob?.type).toBe('image/svg+xml');
-    expect(await blob?.text()).toContain('flowchart TD');
+    const standalone = await blob?.text();
+    expect(standalone).toContain(
+      '<svg role="img"><rect width="100%" height="100%" fill="#0d1117"/>',
+    );
+    expect(standalone).toContain('flowchart TD');
+  });
+
+  it('paints the light theme canvas into the standalone SVG', async () => {
+    render(
+      <ThemeContext.Provider value={{ theme: 'light', toggleTheme: vi.fn() }}>
+        <MermaidDiagram code="flowchart TD\n  A --> B" />
+      </ThemeContext.Provider>,
+    );
+
+    await screen.findByRole('link', { name: 'Open Mermaid diagram fullscreen' });
+    const blob = createObjectURL.mock.calls[0]?.[0];
+    expect(await blob?.text()).toContain(
+      '<svg role="img"><rect width="100%" height="100%" fill="#ffffff"/>',
+    );
   });
 
   it('hides the fullscreen action in source mode and after a render error', async () => {

@@ -64,6 +64,13 @@ function mermaidThemeVariables(theme: Theme) {
   };
 }
 
+function standaloneSvg(svg: string, background: string): string {
+  return svg.replace(
+    /(<svg\b[^>]*>)/,
+    `$1<rect width="100%" height="100%" fill="${background}"/>`,
+  );
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   if (typeof error === 'string' && error.trim()) return error;
@@ -92,6 +99,7 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
 
   useEffect(() => {
     let cancelled = false;
+    const themeVariables = mermaidThemeVariables(theme);
     if (standaloneUrlRef.current) {
       URL.revokeObjectURL(standaloneUrlRef.current);
       standaloneUrlRef.current = null;
@@ -110,7 +118,7 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
           startOnLoad: false,
           theme: 'base',
           securityLevel: 'strict',
-          themeVariables: mermaidThemeVariables(theme),
+          themeVariables,
           flowchart: {
             curve: 'basis',
             htmlLabels: false,
@@ -124,7 +132,9 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
       .then((result) => {
         if (cancelled || !result) return;
         const { svg, bindFunctions } = result;
-        standaloneUrlRef.current = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+        standaloneUrlRef.current = URL.createObjectURL(
+          new Blob([standaloneSvg(svg, themeVariables.background)], { type: 'image/svg+xml' }),
+        );
         setRenderState({ status: 'rendered', svg });
         window.requestAnimationFrame(() => {
           if (cancelled || !bindFunctions || !svgContainerRef.current) return;
