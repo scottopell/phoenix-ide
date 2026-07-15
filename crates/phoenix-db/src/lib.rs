@@ -14,6 +14,10 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
+use phoenix_core::domain::project_instruction_bundle::{
+    NewProjectInstructionBundle, ProjectGuidanceSnapshot, ProjectInstructionBundle,
+    ProjectInstructionBundleRole, ProjectSkillSnapshot,
+};
 
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
@@ -690,6 +694,78 @@ async fn insert_creation_job_images_tx(
         .bind(ordinal)
         .bind(&image.media_type)
         .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn project_instruction_role_from_db(value: &str) -> DbResult<ProjectInstructionBundleRole> {
+    match value {
+        "active" => Ok(ProjectInstructionBundleRole::Active),
+        "queued" => Ok(ProjectInstructionBundleRole::Queued),
+        "candidate" => Ok(ProjectInstructionBundleRole::Candidate),
+        "historical" => Ok(ProjectInstructionBundleRole::Historical),
+        other => Err(DbError::Serialization(format!(
+            "invalid project instruction bundle role: {other}"
+        ))),
+    }
+}
+
+async fn insert_project_instruction_bundle_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    conversation_id: &str,
+    role: ProjectInstructionBundleRole,
+    bundle: &NewProjectInstructionBundle,
+    created_at: &str,
+) -> DbResult<()> {
+    let estimated_tokens = i64::try_from(bundle.estimated_tokens).map_err(|_| {
+        DbError::Serialization("project instruction token estimate exceeds i64".to_string())
+    })?;
+    sqlx::query(
+        "INSERT INTO project_instruction_bundles
+         (id, conversation_id, role, estimated_tokens, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(conversation_id)
+    .bind(role.as_str())
+    .bind(estimated_tokens)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    for (ordinal, guidance) in bundle.guidance.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("guidance ordinal exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO project_instruction_guidance
+             (bundle_id, ordinal, relative_path, content, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .bind(&guidance.relative_path)
+        .bind(&guidance.content)
+        .bind(&guidance.content_hash)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (ordinal, skill) in bundle.skills.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("skill ordinal exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO project_instruction_skills
+             (bundle_id, ordinal, name, description, source_label, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .bind(&skill.name)
+        .bind(&skill.description)
+        .bind(&skill.source_label)
+        .bind(&skill.content_hash)
         .execute(&mut **tx)
         .await?;
     }
@@ -2242,6 +2318,226 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the initial active bundle only when the conversation has none.
+    pub async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conversation_id: &str,
+        bundle: &NewProjectInstructionBundle,
+    ) -> DbResult<ProjectInstructionBundle> {
+        let mut tx = self.pool.begin().await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = 'active')",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            let id = uuid::Uuid::new_v4().to_string();
+            insert_project_instruction_bundle_tx(
+                &mut tx,
+                &id,
+                conversation_id,
+                ProjectInstructionBundleRole::Active,
+                bundle,
+                &Utc::now().to_rfc3339(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        self.load_active_project_instruction_bundle(conversation_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("active bundle disappeared after initialization".to_string())
+            })
+    }
+
+    /// Load the active bundle and its ordered normalized children.
+    pub async fn load_active_project_instruction_bundle(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ProjectInstructionBundle>> {
+        self.load_project_instruction_bundle_by_role(
+            conversation_id,
+            ProjectInstructionBundleRole::Active,
+        )
+        .await
+    }
+
+    /// Replace only the unconfirmed candidate. Active and queued snapshots are untouched.
+    pub async fn persist_or_replace_project_instruction_candidate(
+        &self,
+        conversation_id: &str,
+        bundle: &NewProjectInstructionBundle,
+    ) -> DbResult<ProjectInstructionBundle> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = 'candidate'",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        insert_project_instruction_bundle_tx(
+            &mut tx,
+            &id,
+            conversation_id,
+            ProjectInstructionBundleRole::Candidate,
+            bundle,
+            &Utc::now().to_rfc3339(),
+        )
+        .await?;
+        tx.commit().await?;
+        self.load_project_instruction_bundle_by_role(
+            conversation_id,
+            ProjectInstructionBundleRole::Candidate,
+        )
+        .await?
+        .ok_or_else(|| {
+            DbError::Serialization("candidate disappeared after persistence".to_string())
+        })
+    }
+
+    /// Atomically promote the reviewed candidate to queued, replacing an older queue.
+    pub async fn confirm_project_instruction_candidate(
+        &self,
+        conversation_id: &str,
+        candidate_id: &str,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let candidate_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project_instruction_bundles
+             WHERE id = ?1 AND conversation_id = ?2 AND role = 'candidate')",
+        )
+        .bind(candidate_id)
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !candidate_exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "DELETE FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = 'queued'",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "UPDATE project_instruction_bundles SET role = 'queued'
+             WHERE id = ?1 AND conversation_id = ?2 AND role = 'candidate'",
+        )
+        .bind(candidate_id)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically activate the exact queued snapshot and advance transcript generation.
+    /// Returns the new generation, or `None` when no queued bundle exists.
+    pub async fn activate_queued_project_instruction_bundle(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let queued_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = 'queued'",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(queued_id) = queued_id else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE project_instruction_bundles SET role = 'historical'
+             WHERE conversation_id = ?1 AND role = 'active'",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE project_instruction_bundles SET role = 'active' WHERE id = ?1")
+            .bind(queued_id)
+            .execute(&mut *tx)
+            .await?;
+        let generation = sqlx::query_scalar(
+            "UPDATE conversations SET transcript_generation = transcript_generation + 1
+             WHERE id = ?1 RETURNING transcript_generation",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        tx.commit().await?;
+        Ok(Some(generation))
+    }
+
+    async fn load_project_instruction_bundle_by_role(
+        &self,
+        conversation_id: &str,
+        role: ProjectInstructionBundleRole,
+    ) -> DbResult<Option<ProjectInstructionBundle>> {
+        let row = sqlx::query(
+            "SELECT id, conversation_id, role, estimated_tokens, created_at
+             FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = ?2",
+        )
+        .bind(conversation_id)
+        .bind(role.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let id: String = row.get("id");
+        let guidance = sqlx::query(
+            "SELECT relative_path, content, content_hash
+             FROM project_instruction_guidance WHERE bundle_id = ?1 ORDER BY ordinal",
+        )
+        .bind(&id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| ProjectGuidanceSnapshot {
+            relative_path: row.get("relative_path"),
+            content: row.get("content"),
+            content_hash: row.get("content_hash"),
+        })
+        .collect();
+        let skills = sqlx::query(
+            "SELECT name, description, source_label, content_hash
+             FROM project_instruction_skills WHERE bundle_id = ?1 ORDER BY ordinal",
+        )
+        .bind(&id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| ProjectSkillSnapshot {
+            name: row.get("name"),
+            description: row.get("description"),
+            source_label: row.get("source_label"),
+            content_hash: row.get("content_hash"),
+        })
+        .collect();
+        let estimated_tokens: i64 = row.get("estimated_tokens");
+        Ok(Some(ProjectInstructionBundle {
+            id,
+            conversation_id: row.get("conversation_id"),
+            role: project_instruction_role_from_db(&row.get::<String, _>("role"))?,
+            estimated_tokens: estimated_tokens.cast_unsigned(),
+            created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                .map_err(|error| DbError::Serialization(error.to_string()))?
+                .with_timezone(&Utc),
+            guidance,
+            skills,
+        }))
+    }
+
+    // ==================== Conversation Operations ====================
     // ==================== Conversation Operations ====================
 
     /// Create a conversation with explore-mode defaults — a test convenience
@@ -8268,6 +8564,189 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    fn instruction_bundle(label: &str) -> NewProjectInstructionBundle {
+        NewProjectInstructionBundle {
+            estimated_tokens: 42,
+            guidance: vec![ProjectGuidanceSnapshot {
+                relative_path: "AGENTS.md".to_string(),
+                content: format!("guidance-{label}"),
+                content_hash: format!("guidance-hash-{label}"),
+            }],
+            skills: vec![ProjectSkillSnapshot {
+                name: format!("skill-{label}"),
+                description: format!("description-{label}"),
+                source_label: format!("source-{label}"),
+                content_hash: format!("skill-hash-{label}"),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn project_instruction_initialize_if_absent_preserves_first_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bundle-init", "bundle-init", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let first = db
+            .initialize_project_instruction_bundle_if_absent(
+                "bundle-init",
+                &instruction_bundle("first"),
+            )
+            .await
+            .unwrap();
+        let second = db
+            .initialize_project_instruction_bundle_if_absent(
+                "bundle-init",
+                &instruction_bundle("second"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second.guidance[0].content, "guidance-first");
+    }
+
+    #[tokio::test]
+    async fn project_instruction_confirmed_queue_survives_newer_candidate_and_activates_exactly() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bundle-queue", "bundle-queue", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.initialize_project_instruction_bundle_if_absent(
+            "bundle-queue",
+            &instruction_bundle("active"),
+        )
+        .await
+        .unwrap();
+        let reviewed = db
+            .persist_or_replace_project_instruction_candidate(
+                "bundle-queue",
+                &instruction_bundle("reviewed"),
+            )
+            .await
+            .unwrap();
+        assert!(db
+            .confirm_project_instruction_candidate("bundle-queue", &reviewed.id)
+            .await
+            .unwrap());
+
+        let newer = db
+            .persist_or_replace_project_instruction_candidate(
+                "bundle-queue",
+                &instruction_bundle("newer"),
+            )
+            .await
+            .unwrap();
+        let generation = db
+            .activate_queued_project_instruction_bundle("bundle-queue")
+            .await
+            .unwrap();
+        assert_eq!(generation, Some(2));
+        let active = db
+            .load_active_project_instruction_bundle("bundle-queue")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, reviewed.id);
+        assert_eq!(active.guidance[0].content, "guidance-reviewed");
+        let candidate_role: String =
+            sqlx::query_scalar("SELECT role FROM project_instruction_bundles WHERE id = ?1")
+                .bind(newer.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(candidate_role, "candidate");
+    }
+
+    #[tokio::test]
+    async fn project_instruction_schema_rejects_invalid_and_duplicate_live_roles() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "bundle-constraints",
+            "bundle-constraints",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let active = db
+            .initialize_project_instruction_bundle_if_absent(
+                "bundle-constraints",
+                &instruction_bundle("active"),
+            )
+            .await
+            .unwrap();
+
+        let invalid = sqlx::query(
+            "INSERT INTO project_instruction_bundles
+             (id, conversation_id, role, estimated_tokens, created_at)
+             VALUES ('invalid', 'bundle-constraints', 'other', 0, '2025-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await;
+        assert!(invalid.is_err());
+        let duplicate = sqlx::query(
+            "INSERT INTO project_instruction_bundles
+             (id, conversation_id, role, estimated_tokens, created_at)
+             VALUES ('duplicate', 'bundle-constraints', 'active', 0, '2025-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await;
+        assert!(duplicate.is_err());
+
+        sqlx::query("UPDATE project_instruction_bundles SET role = 'historical' WHERE id = ?1")
+            .bind(active.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO project_instruction_bundles
+             (id, conversation_id, role, estimated_tokens, created_at)
+             VALUES ('historical-2', 'bundle-constraints', 'historical', 0, '2025-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_instruction_rows_cascade_with_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bundle-cascade", "bundle-cascade", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.initialize_project_instruction_bundle_if_absent(
+            "bundle-cascade",
+            &instruction_bundle("cascade"),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM conversations WHERE id = 'bundle-cascade'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let bundle_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_instruction_bundles")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let guidance_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_instruction_guidance")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let skill_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_instruction_skills")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((bundle_count, guidance_count, skill_count), (0, 0, 0));
+    }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
