@@ -8,7 +8,13 @@
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use phoenix_core::domain::project_instruction_bundle::{
+    NewProjectInstructionBundle, ProjectGuidanceSnapshot, ProjectInstructionBundle,
+    ProjectSkillSnapshot,
+};
+use sha2::{Digest, Sha256};
 
 use crate::llm_language::{self, LlmLanguage};
 
@@ -70,6 +76,165 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
     });
 
     files
+}
+
+/// Borrowed project-instruction data accepted by prompt construction.
+///
+/// Both newly discovered bundles and persisted bundles implement this view, so
+/// callers can render an immutable snapshot without re-reading its source files.
+pub trait ProjectInstructionView {
+    fn guidance(&self) -> &[ProjectGuidanceSnapshot];
+    fn skills(&self) -> &[ProjectSkillSnapshot];
+}
+
+impl ProjectInstructionView for NewProjectInstructionBundle {
+    fn guidance(&self) -> &[ProjectGuidanceSnapshot] {
+        &self.guidance
+    }
+
+    fn skills(&self) -> &[ProjectSkillSnapshot] {
+        &self.skills
+    }
+}
+
+impl ProjectInstructionView for ProjectInstructionBundle {
+    fn guidance(&self) -> &[ProjectGuidanceSnapshot] {
+        &self.guidance
+    }
+
+    fn skills(&self) -> &[ProjectSkillSnapshot] {
+        &self.skills
+    }
+}
+
+fn sha256_hex(content: &str) -> String {
+    Sha256::digest(content.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+fn relative_display_path(base: &Path, target: &Path) -> String {
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    let common = base_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for component in &base_components[common..] {
+        if matches!(component, Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    for component in &target_components[common..] {
+        relative.push(component.as_os_str());
+    }
+
+    if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().into_owned()
+    }
+}
+
+fn skill_source_label(working_dir: &Path, skill: &crate::skills::SkillMetadata) -> String {
+    match &skill.source {
+        SkillSource::Filesystem { path, .. } => {
+            format!("(`{}`)", relative_display_path(working_dir, path))
+        }
+        SkillSource::Builtin { .. } => "(built-in)".to_string(),
+    }
+}
+
+fn render_project_instructions(project: &impl ProjectInstructionView) -> String {
+    let mut rendered = String::new();
+    if !project.guidance().is_empty() {
+        rendered.push_str("\n\n<project_guidance>\n");
+        for (index, guidance) in project.guidance().iter().enumerate() {
+            if index > 0 {
+                rendered.push_str("\n---\n\n");
+            }
+            let _ = writeln!(rendered, "<!-- From: {} -->", guidance.relative_path);
+            rendered.push_str(&guidance.content);
+            if !guidance.content.ends_with('\n') {
+                rendered.push('\n');
+            }
+        }
+        rendered.push_str("</project_guidance>");
+    }
+
+    if !project.skills().is_empty() {
+        rendered.push_str("\n\n<available_skills>\n");
+        rendered.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
+        for skill in project.skills() {
+            let _ = writeln!(
+                rendered,
+                "\n- **{}** — {} {}",
+                skill.name, skill.description, skill.source_label
+            );
+        }
+        rendered.push_str("</available_skills>");
+    }
+    rendered
+}
+
+/// Discover and normalize the project-owned portion of the system prompt.
+#[must_use]
+#[allow(dead_code)] // Public extraction seam for project-bundle persistence integration.
+pub fn discover_project_instruction_bundle(working_dir: &Path) -> NewProjectInstructionBundle {
+    let builtin_dir = crate::skills::builtin::default_extract_dir();
+    discover_project_instruction_bundle_with_options(working_dir, None, builtin_dir.as_deref())
+}
+
+/// Discovery variant with explicit skill roots for deterministic tests.
+#[must_use]
+pub fn discover_project_instruction_bundle_with_options(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+    builtin_dir: Option<&Path>,
+) -> NewProjectInstructionBundle {
+    let guidance = discover_guidance_files(working_dir)
+        .into_iter()
+        .map(|file| ProjectGuidanceSnapshot {
+            relative_path: relative_display_path(working_dir, &file.path),
+            content_hash: sha256_hex(&file.content),
+            content: file.content,
+        })
+        .collect();
+
+    let skills = discover_skills_with_options(working_dir, home_override, builtin_dir)
+        .into_iter()
+        .map(|skill| {
+            let source_label = skill_source_label(working_dir, &skill);
+            let content_hash = sha256_hex(&format!(
+                "{}\0{}\0{source_label}",
+                skill.name, skill.description
+            ));
+            ProjectSkillSnapshot {
+                name: skill.name,
+                description: skill.description,
+                source_label,
+                content_hash,
+            }
+        })
+        .collect();
+
+    let mut bundle = NewProjectInstructionBundle {
+        estimated_tokens: 0,
+        guidance,
+        skills,
+    };
+    bundle.estimated_tokens = render_project_instructions(&bundle)
+        .len()
+        .div_ceil(4)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    bundle
 }
 
 /// Compute the next taskmd ID for this worktree, but only if the project
@@ -150,6 +315,32 @@ pub fn build_system_prompt_with_options(
     persona: Option<&str>,
     explore_bash: ExploreBashCapability,
 ) -> String {
+    let project =
+        discover_project_instruction_bundle_with_options(working_dir, home_override, builtin_dir);
+    build_system_prompt_with_project_instructions(
+        working_dir,
+        tasks_dir_name,
+        is_sub_agent,
+        mode,
+        language,
+        persona,
+        explore_bash,
+        &project,
+    )
+}
+
+/// Build a prompt from immutable project instructions and live conversation state.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One match arm per ModeContext variant; splitting hurts readability
+pub fn build_system_prompt_with_project_instructions(
+    working_dir: &Path,
+    tasks_dir_name: &str,
+    is_sub_agent: bool,
+    mode: Option<&ModeContext>,
+    language: LlmLanguage,
+    persona: Option<&str>,
+    explore_bash: ExploreBashCapability,
+    project: &impl ProjectInstructionView,
+) -> String {
     // REQ-AG-006: a named agent's persona replaces the generic assistant
     // preamble at the head of the prompt. Everything below (guidance, skills,
     // mode context, sub-agent suffix) is appended regardless of persona.
@@ -160,42 +351,7 @@ pub fn build_system_prompt_with_options(
     prompt.push_str("\n\n");
     prompt.push_str(llm_language::mermaid_rendering_hint(language));
 
-    // Add guidance from discovered files
-    let guidance_files = discover_guidance_files(working_dir);
-    if !guidance_files.is_empty() {
-        prompt.push_str("\n\n<project_guidance>\n");
-
-        for (i, file) in guidance_files.iter().enumerate() {
-            if i > 0 {
-                prompt.push_str("\n---\n\n");
-            }
-            // Include the relative path for context
-            let display_path = file.path.display();
-            let _ = writeln!(prompt, "<!-- From: {display_path} -->");
-            prompt.push_str(&file.content);
-            if !file.content.ends_with('\n') {
-                prompt.push('\n');
-            }
-        }
-
-        prompt.push_str("</project_guidance>");
-    }
-
-    // Inject skill catalog (metadata only — full instructions loaded on demand via bash)
-    let skills = discover_skills_with_options(working_dir, home_override, builtin_dir);
-    if !skills.is_empty() {
-        prompt.push_str("\n\n<available_skills>\n");
-        prompt.push_str("The following skills are available. Invoke them with the `skill` tool (e.g. skill(skill_name=\"build\")). Do not cat SKILL.md files directly.\n");
-        for skill in &skills {
-            let location = skill.display_location();
-            let _ = writeln!(
-                prompt,
-                "\n- **{}** — {} {location}",
-                skill.name, skill.description
-            );
-        }
-        prompt.push_str("</available_skills>");
-    }
+    prompt.push_str(&render_project_instructions(project));
 
     // Worktree grounding when cwd is inside .phoenix/worktrees/. The Work and
     // Branch mode blocks below already state the worktree boundary (with the
@@ -444,6 +600,120 @@ mod tests {
         assert!(prompt.contains("# Project Rules"));
         assert!(prompt.contains("Be nice."));
         assert!(prompt.contains("</project_guidance>"));
+    }
+
+    #[test]
+    fn discovered_bundle_is_normalized_and_deterministic() {
+        let temp = TempDir::new().unwrap();
+        let child = temp.path().join("project");
+        fs::create_dir(&child).unwrap();
+        fs::write(temp.path().join("AGENTS.md"), "parent guidance").unwrap();
+        fs::write(child.join("AGENTS.md"), "project guidance").unwrap();
+        write_skill(&child, ".claude/skills", "zeta", "zeta", "Zeta skill.");
+        write_skill(&child, ".claude/skills", "alpha", "alpha", "Alpha skill.");
+
+        let first = discover_project_instruction_bundle_with_options(&child, Some(&child), None);
+        let second = discover_project_instruction_bundle_with_options(&child, Some(&child), None);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .guidance
+                .iter()
+                .map(|source| source.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["../AGENTS.md", "AGENTS.md"]
+        );
+        assert_eq!(
+            first
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(
+            first.skills[0].source_label,
+            "(`.claude/skills/alpha/SKILL.md`)"
+        );
+        assert!(first
+            .guidance
+            .iter()
+            .all(|source| source.content_hash.len() == 64));
+        assert!(first
+            .skills
+            .iter()
+            .all(|skill| skill.content_hash.len() == 64));
+        assert!(first.estimated_tokens > 0);
+    }
+
+    #[test]
+    fn provided_bundle_is_stable_while_live_mode_changes_render() {
+        let temp = TempDir::new().unwrap();
+        let guidance_path = temp.path().join("AGENTS.md");
+        fs::write(&guidance_path, "original guidance").unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "build",
+            "build",
+            "Original skill.",
+        );
+        let bundle =
+            discover_project_instruction_bundle_with_options(temp.path(), Some(temp.path()), None);
+        let direct = build_system_prompt_with_project_instructions(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Direct),
+            LlmLanguage::default(),
+            None,
+            ExploreBashCapability::Unavailable,
+            &bundle,
+        );
+
+        fs::write(&guidance_path, "mutated guidance").unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "build",
+            "build",
+            "Mutated skill.",
+        );
+        let direct_after_mutation = build_system_prompt_with_project_instructions(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Direct),
+            LlmLanguage::default(),
+            None,
+            ExploreBashCapability::Unavailable,
+            &bundle,
+        );
+        assert_eq!(direct, direct_after_mutation);
+        assert!(direct.contains("original guidance"));
+        assert!(direct.contains("Original skill."));
+        assert!(!direct.contains("mutated guidance"));
+
+        let work_mode = ModeContext::Work {
+            branch_name: "task-live-mode".into(),
+            base_branch: "main".into(),
+            worktree_path: temp.path().to_string_lossy().into_owned(),
+        };
+        let work = build_system_prompt_with_project_instructions(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&work_mode),
+            LlmLanguage::default(),
+            None,
+            ExploreBashCapability::Unavailable,
+            &bundle,
+        );
+        assert!(work.contains("task-live-mode"));
+        assert!(work.contains("original guidance"));
+        assert!(!work.contains("mutated guidance"));
+        assert_ne!(direct, work);
     }
 
     #[test]
