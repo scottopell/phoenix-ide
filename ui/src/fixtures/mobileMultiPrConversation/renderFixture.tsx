@@ -7,6 +7,9 @@ import type { ConversationPrStatusHandle } from '../../hooks/useConversationPrSt
 import '../../index.css';
 import './renderFixture.css';
 import {
+  mobileMixedBranchPrs,
+  mobileMixedBranchSelection,
+  mobileMixedBranchStatus,
   mobileMultiPrActiveSelection,
   mobileMultiPrActiveStatus,
   mobileMultiPrAssociatedPrs,
@@ -58,6 +61,17 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
 
 export function MobileMultiPrConversationFixture({ scenario }: Props) {
   const prStatusHandle = useMemo<ConversationPrStatusHandle>(() => {
+    if (scenario.id === 'mixed-branch-history') {
+      return {
+        state: { status: 'ready', prStatus: mobileMixedBranchStatus },
+        refresh: async () => mobileMixedBranchStatus,
+        activeSelection: mobileMixedBranchSelection,
+        activePrSummary: mobileMixedBranchPrs[1]!,
+        ambiguous: false,
+        pinActivePr: async () => undefined,
+        resumeInference: async () => undefined,
+      };
+    }
     const hasActivePr = scenario.id === 'active-pr-actions';
     const status = hasActivePr ? mobileMultiPrActiveStatus : mobileMultiPrStatus;
     return {

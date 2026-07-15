@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { MobileMultiPrConversationFixture } from './renderFixture';
 import {
   getMobileMultiPrConversationScenario,
+  mobileMixedBranchPrs,
   mobileMultiPrAssociatedPrs,
   mobileMultiPrSelection,
 } from './scenarios';
@@ -30,6 +31,7 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(mobileMultiPrAssociatedPrs).toHaveLength(2);
     expect(mobileMultiPrAssociatedPrs.every((pr) => pr.display_state === 'open')).toBe(true);
     expect(mobileMultiPrSelection.active_pr).toBeUndefined();
+    expect(new Set(mobileMultiPrAssociatedPrs.map((pr) => pr.head)).size).toBe(2);
   });
 
   it('shows PR-specific Work Actions when one of the same two open PRs is active', async () => {
@@ -45,6 +47,25 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #423 feedback');
     expect(screen.getByTestId('open-pr-link')).toHaveTextContent('Open PR #423');
     expect(screen.queryByTestId('active-pr-ambiguity-note')).not.toBeInTheDocument();
+  });
+
+  it('shows new comments on an open branch alongside a closed-unmerged sibling branch', async () => {
+    setMobileViewport();
+    const scenario = getMobileMultiPrConversationScenario('mixed-branch-history');
+    expect(mobileMixedBranchPrs.map((pr) => [pr.head, pr.display_state])).toEqual([
+      ['feature/multi-pr-association', 'closed'],
+      ['feature/mobile-pr-selector', 'open'],
+    ]);
+    render(<MobileMultiPrConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
+    });
+
+    expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #423 feedback3 new');
+    expect(screen.getByTestId('merge-pr-link')).toHaveTextContent('Merge on GitHub #423');
+    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 1 open/draft · 1 closed');
+    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
   });
 
   it('renders the production mobile StateBar with the two-PR chooser open', async () => {

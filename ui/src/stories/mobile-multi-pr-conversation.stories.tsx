@@ -22,3 +22,6 @@ ChooserOpen.storyName = 'chooser-open';
 
 export const ActivePrActions = storyFor('active-pr-actions');
 ActivePrActions.storyName = 'active-pr-actions';
+
+export const MixedBranchHistory = storyFor('mixed-branch-history');
+MixedBranchHistory.storyName = 'mixed-branch-history';

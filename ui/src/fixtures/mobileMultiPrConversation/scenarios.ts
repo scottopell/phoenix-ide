@@ -128,3 +128,53 @@ export const mobileMultiPrActiveStatus: PrStatusResponse = {
   work_change: { kind: 'clean' },
   selection: mobileMultiPrActiveSelection,
 };
+
+export const mobileMixedBranchPrs: AssociatedPrSummaryResponse[] = [
+  {
+    repo_owner: 'phoenix-ide',
+    repo_name: 'phoenix-ide',
+    pr_number: 417,
+    title: 'Add durable multi-PR conversation association',
+    url: 'https://github.com/phoenix-ide/phoenix-ide/pull/417',
+    state: 'CLOSED',
+    draft: false,
+    display_state: 'closed',
+    base: 'main',
+    head: 'feature/multi-pr-association',
+    github_updated_at: '2026-07-15T14:24:00Z',
+    feedback_status: 'open',
+  },
+  {
+    repo_owner: 'phoenix-ide',
+    repo_name: 'phoenix-ide',
+    pr_number: 423,
+    title: 'Follow up with mobile active-PR selection',
+    url: 'https://github.com/phoenix-ide/phoenix-ide/pull/423',
+    state: 'OPEN',
+    draft: false,
+    display_state: 'open',
+    base: 'main',
+    head: 'feature/mobile-pr-selector',
+    github_updated_at: '2026-07-15T14:29:00Z',
+    feedback_status: 'open',
+  },
+];
+
+export const mobileMixedBranchSelection: AssociatedPrStatusEnvelope = {
+  associated_prs: mobileMixedBranchPrs,
+  active_pr: {
+    pr: { repo_owner: 'phoenix-ide', repo_name: 'phoenix-ide', pr_number: 423 },
+    provenance: 'inferred',
+  },
+  latest_observed_branch: {
+    repository_identity: 'phoenix-ide/phoenix-ide',
+    branch_name: 'feature/mobile-pr-selector',
+  },
+};
+
+export const mobileMixedBranchStatus: PrStatusResponse = {
+  ...mobileMultiPrActiveStatus,
+  check_state: 'passing',
+  feedback_freshness: { state: 'new', count: 3 },
+  selection: mobileMixedBranchSelection,
+};
