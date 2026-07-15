@@ -289,6 +289,7 @@ config {
 -- terminal_receipt_already_materialized(receipt), exact_cancelled_receipt_matches_binding(receipt, binding, terminal)
 -- forgotten_reason_for_deadline_unevaluable(resource), forgotten_reason_for_startup_forget(resource)
 -- existing_owed_wake_obligation(workflow), obligation_payload_inbox(obligation)
+-- unconsumed_wake_delivery_count(conversation), owed_wake_acceptance_count(conversation)
 -- wake_protocol_selection(), authority_is_immutable(binding)
 -- observation_inbox_row_persisted(item), wake_batches_partition_by_workflow_authority(conversation)
 
@@ -306,8 +307,9 @@ config {
 rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
     requires: not invalid_wait_bound(requested_max_wait_seconds)
-    requires: resource.kind in {bash, tmux_window}
-    requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource.kind in {bash, tmux_window, subagent}
+    requires: resource.kind in {bash, tmux_window} implies resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource.kind = subagent implies subagent_resource_matches_child_conversation(resource)
     requires: resource_identity_is_stable(resource)
     requires: wake_protocol_selection().authority = engine_protocol
     requires: wake_protocol_selection().accepting = true
@@ -617,6 +619,8 @@ rule LifecycleScheduleClosesFenceWhenNoPendingWake {
     when: DestructiveLifecycleRequested(manager, conversation, action)
     requires: lifecycle_action_is_destructive(action)
     requires: pending_wake_count(conversation) = 0
+    requires: unconsumed_wake_delivery_count(conversation) = 0
+    requires: owed_wake_acceptance_count(conversation) = 0
     let fence_version = registration_fence_version(conversation)
     ensures: WakeLifecycleFenceClosed(conversation)
     ensures: registration_and_lifecycle_share_cas(conversation, fence_version)

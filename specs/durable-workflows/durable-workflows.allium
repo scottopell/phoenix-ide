@@ -488,6 +488,7 @@ entity ShadowDivergence {
 -- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
 -- manual_choice_is_control_only(choice), manual_choice_creates_terminal_receipt(choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
+-- no_owed_acceptance_for_inbox(inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
 -- reducer_authorized_suppression(decision, owed, reason)
 -- suppression_disposes_exact_inbox_atomically(owed, decision)
@@ -882,6 +883,7 @@ rule RecordAuthoritativeObservation {
     requires: attempt.claim = Claim{effect: effect}
     requires: claim_row_matches_authority(effect, authority)
     requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
+    requires: attempt.status in {begun, observation_recorded}
     ensures: Observation.created(
         id: next_observation_id(), effect: effect, attempt: attempt,
         codec: codec, payload: payload, observed_at: observed_at,
@@ -1126,12 +1128,19 @@ rule RejectUnsupportedManualResolutionChoiceCodec {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
     requires: resolution.status = required
     requires: manual_choice_permitted(resolution, choice)
-    requires: manual_choice_creates_terminal_receipt(choice)
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
     requires: not profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
     ensures: ManualResolutionOutcome(unsupported_codec)
     ensures: resolution.status = required
+    ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
+}
+
+rule DuplicateResolvedManualResolutionIsIdempotent {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = resolved
+    requires: resolution.accepted_choice = choice
+    ensures: ManualResolutionOutcome(already_committed)
     ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
 }
 
@@ -1203,6 +1212,7 @@ rule ReducerAcceptsInboxEvent {
     requires: inbox.workflow.authority = engine_protocol and inbox.workflow.execution_mode = authoritative
     requires: inbox.delivery_status = pending
     requires: reducer_inbox_belongs_to_current_generation(inbox)
+    requires: no_owed_acceptance_for_inbox(inbox)
     requires: decision.expected_workflow_version = inbox.workflow.version
     requires: reducer_decision_is_product_authoritative(decision)
     requires: committed_transition_for_decision(inbox.workflow, decision) = null
@@ -1213,6 +1223,14 @@ rule ReducerAcceptsInboxEvent {
     ensures: committed_transition_for_decision(inbox.workflow, decision) != null
     ensures: inbox.delivery_status = consumed
     ensures: inbox.consumed_by = committed_transition_for_decision(inbox.workflow, decision)
+}
+
+rule ReducerInboxAcceptanceVersionConflict {
+    when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
+    requires: inbox.delivery_status = pending
+    requires: decision.expected_workflow_version != inbox.workflow.version
+    ensures: ReducerInboxAcceptanceOutcome(version_conflict)
+    ensures: inbox.delivery_status = pending
 }
 
 rule ReducerRejectedPlanLeavesInboxPending {
@@ -1251,6 +1269,14 @@ rule RuntimeAcceptsOwedAcceptance {
     ensures: runtime_acceptance_state_persisted(owed.workflow, owed.reducer_inbox)
     ensures: owed.status = accepted
     ensures: owed.accepting_transition = committed_transition_for_decision(owed.workflow, decision)
+}
+
+rule RuntimeAcceptanceVersionConflict {
+    when: RuntimeAcceptanceRequested(runtime, owed, decision)
+    requires: owed.status = owed
+    requires: decision.expected_workflow_version != owed.workflow.version
+    ensures: RuntimeAcceptanceOutcome(version_conflict)
+    ensures: owed.status = owed
 }
 
 rule DuplicateRuntimeAcceptanceIsIdempotent {

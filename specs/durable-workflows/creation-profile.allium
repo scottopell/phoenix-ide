@@ -333,19 +333,6 @@ rule UnavailableProfileRejectedBeforeShell {
         creation_acceptance_scope(raw_intent), creation_acceptance_key(raw_intent)
     )
     let intent = normalized_intent(raw_intent)
-    ensures: CreationAcceptanceRecord.created(
-        conversation_id: intent.conversation_id, accepted: false,
-        reject_reason: profile_unavailable, committed_at: now()
-    )
-    ensures: CreationAcceptanceBinding.created(
-        authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent),
-        request_fingerprint: creation_request_fingerprint(raw_intent),
-        acceptance: CreationAcceptanceRecord{conversation_id: intent.conversation_id},
-        accepted_protocol: null,
-        workflow_binding: null,
-        committed_at: now()
-    )
     ensures: CreationProfileAcceptanceRejected(profile_unavailable)
     ensures: not CreationWorkflowBinding.created(conversation_id: intent.conversation_id)
 }
@@ -552,6 +539,8 @@ rule ObservationPermitsAbsentResourceExecution {
 
 rule ForeignResourceRequiresManualResolution {
     when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
+    requires: binding.outcome = provisioning
+    requires: effect.generation = binding.workflow.generation
     requires: reconciliation_result(effect, observation) = foreign
     requires: creation_effect_kind(effect) != remove_owned_worktree
     ensures: ForeignResourceConflictRecorded(binding, effect, foreign_resource_evidence(effect, observation))
@@ -566,6 +555,8 @@ rule ForeignResourceRequiresManualResolution {
 
 rule OwnedWorktreeCompensationOwnershipConflictRequiresManualResolution {
     when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
+    requires: binding.outcome in {cancelled, deletion_pending}
+    requires: effect.generation = binding.workflow.generation
     requires: reconciliation_result(effect, observation) = foreign
     requires: creation_effect_kind(effect) = remove_owned_worktree
     ensures: CreationManualResolutionRequested(binding, effect, compensation_ownership_conflict)
@@ -579,6 +570,8 @@ rule OwnedWorktreeCompensationOwnershipConflictRequiresManualResolution {
 
 rule IndeterminateResourceRequiresManualResolution {
     when: CreationEffectObservationInterpreted(adapter, binding, effect, observation, result)
+    requires: binding.outcome in {provisioning, cancelled, deletion_pending}
+    requires: effect.generation = binding.workflow.generation
     requires: reconciliation_result(effect, observation) = indeterminate
     ensures: CreationManualResolutionRequested(binding, effect, indeterminate_external_state)
     ensures: CreationManualResolutionIntent{
@@ -766,6 +759,8 @@ rule CompensationDeadlineEscalatesWithoutFalseCompletion {
     when: CreationCompensationDeadlineReached(manager, binding, lifecycle_kind)
     requires: lifecycle_kind = cancel and now() >= cancellation_deadline(binding)
         or lifecycle_kind = delete and now() >= deletion_deadline(binding)
+    requires: lifecycle_kind = cancel implies binding.outcome = cancelled
+    requires: lifecycle_kind = delete implies binding.outcome = deletion_pending
     requires: not all_compensations_terminal(binding)
     ensures: CreationCleanupRequiresManualResolution(binding)
     ensures: lifecycle_kind = cancel implies binding.outcome = cancelled
