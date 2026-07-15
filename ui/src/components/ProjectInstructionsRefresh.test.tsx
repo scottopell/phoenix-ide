@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, ConflictError } from '../api';
 import type { ProjectInstructionRefreshStatus } from '../generated/ProjectInstructionRefreshStatus';
@@ -164,9 +164,9 @@ describe('ProjectInstructionsRefresh', () => {
     );
     rerender(<ProjectInstructionsRefresh conversationId="conv-1" conversationState={{ type: 'awaiting_llm' }} />);
 
-    second.resolve(changedStatus);
+    await act(async () => second.resolve(changedStatus));
     expect(await screen.findByText('↻ changed')).toBeInTheDocument();
-    first.resolve(currentStatus);
+    await act(async () => first.resolve(currentStatus));
     await waitFor(() => expect(screen.getByText('↻ changed')).toBeInTheDocument());
     expect(screen.queryByLabelText('Project instructions current')).not.toBeInTheDocument();
   });
@@ -200,7 +200,7 @@ describe('ProjectInstructionsRefresh', () => {
     fireEvent.click(button);
 
     expect(getPreview).toHaveBeenCalledTimes(1);
-    preview.resolve(changedStatus);
+    await act(async () => preview.resolve(changedStatus));
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
   });
 
