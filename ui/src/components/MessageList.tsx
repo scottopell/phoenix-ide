@@ -543,6 +543,7 @@ function MessageListImpl({
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
   const earlierHistoryRequestScheduledRef = useRef(false);
+  const requestEarlierHistoryRef = useRef<(retry: boolean) => void>(() => {});
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -676,7 +677,11 @@ function MessageListImpl({
       const onWheel = (e: WheelEvent) => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
-        if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
+        if (e.deltaY < 0) {
+          dispatchScrollEvent({ type: 'upwardIntent' });
+          const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
+          if (visibleRange && visibleRange.startIndex <= 2) requestEarlierHistoryRef.current(false);
+        }
       };
       const onScroll = () => {
         if (continuityRestoreInFlightRef.current) {
@@ -887,7 +892,9 @@ function MessageListImpl({
 
   const requestEarlierHistory = useCallback((retry: boolean) => {
     const machine = scrollMachineRef.current;
-    const readerOwnsViewport = machine.kind === 'live' && machine.follow.kind === 'reading';
+    const readerOwnsViewport = machine.kind === 'live'
+      && machine.conversationId === conversationId
+      && machine.follow.kind === 'reading';
     if (
       earlierHistoryRequestScheduledRef.current
       || !hasOlderMessages
@@ -898,7 +905,8 @@ function MessageListImpl({
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis();
     queueMicrotask(() => onLoadOlderMessages(restoreBasis));
-  }, [captureHistoryRestoreBasis, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
+  }, [captureHistoryRestoreBasis, conversationId, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
+  requestEarlierHistoryRef.current = requestEarlierHistory;
 
   useEffect(() => {
     earlierHistoryRequestScheduledRef.current = false;
