@@ -1,0 +1,74 @@
+# Project Instruction Snapshots
+
+## User Story
+
+As a user, I need an active conversation to keep following the project instructions I reviewed, even when repository guidance or installed skills change, so agent behavior and prompt-cache use do not change silently.
+
+As a user, I need to see which instruction sources changed and deliberately refresh them, so I can trade a known one-time cache rewarm for updated behavior without losing conversation history.
+
+## Requirements
+
+### REQ-PI-001 — Stable Active Bundle
+
+WHEN a conversation prepares a model request
+THE SYSTEM SHALL use one immutable project-instruction bundle containing the applicable `AGENTS.md` / `AGENT.md` guidance and skill-catalog metadata
+AND SHALL keep that bundle unchanged throughout a user turn and its tool loop.
+
+The system SHALL keep live runtime state, including conversation mode, permissions, and tool availability, outside the project-instruction bundle.
+
+**Rationale:** Project files can change during agent work. Re-reading them for every model request silently changes behavior and invalidates a large cached prefix, while freezing runtime authority could apply obsolete permissions.
+
+### REQ-PI-002 — Explicit Refresh
+
+WHEN instruction sources differ from the active or already-queued bundle
+THE SYSTEM SHALL indicate that newer project instructions are available
+AND SHALL NOT apply them until the user confirms **Refresh project instructions**.
+
+New conversations SHALL resolve the latest applicable sources for their initial bundle.
+
+### REQ-PI-003 — Source Manifest
+
+WHEN the system presents a refresh candidate
+THE SYSTEM SHALL identify each changed guidance source by conversation-working-directory-relative path and `added`, `changed`, or `removed` status
+AND SHALL identify changed skill-catalog entries separately by skill name and status
+AND SHALL NOT display guidance-file contents in the manifest.
+
+Unchanged sources SHALL be summarized or collapsed by default.
+
+The conversation-scoped refresh preview endpoint SHALL discover current sources, persist the exact candidate represented by its response, compare it with the queued bundle when one exists and otherwise with the active bundle, and return only bundle identities, source-change metadata, and estimate-labeling data.
+
+The conversation-scoped confirmation endpoint SHALL accept a candidate bundle identity and SHALL reject the request when that exact candidate is missing or has been replaced.
+
+### REQ-PI-004 — Cache-Rewarm Estimate
+
+WHEN the system presents a refresh candidate
+THE SYSTEM SHALL show an estimated one-time input-token rewarm size
+AND SHALL label the value as an estimate whose actual provider cache behavior may differ.
+
+**Rationale:** Refreshing a large leading prefix can consume materially more quota on the next request, so the user needs the likely cost before confirming.
+
+### REQ-PI-005 — Exact Confirmation
+
+WHEN the user confirms a refresh candidate
+THE SYSTEM SHALL preserve the exact normalized bundle represented by the reviewed manifest
+AND SHALL NOT replace it with later filesystem contents before activation.
+
+IF sources change again after confirmation
+THEN THE SYSTEM SHALL keep the confirmed bundle queued and expose the newer sources as another refresh opportunity.
+
+### REQ-PI-006 — Turn-Boundary Activation
+
+WHEN a confirmed bundle is waiting to activate
+THE SYSTEM SHALL finish any active user turn and complete tool loop under the existing bundle
+AND SHALL activate the confirmed bundle before processing the next user-authored turn.
+
+Activation SHALL preserve conversation history, create a visible instruction-refresh timeline event, advance the transcript generation, and invalidate incompatible provider continuation state.
+
+### REQ-PI-007 — Durable Recovery
+
+WHEN Phoenix restarts
+THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles
+AND SHALL preserve the same activation boundary and source manifest.
+
+WHEN a conversation predates project-instruction snapshots
+THE SYSTEM SHALL resolve and persist its initial bundle before its next model request without dropping or rewriting conversation history.

@@ -4,6 +4,8 @@ pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use phoenix_core::domain::project_instruction_bundle::ProjectInstructionRefreshStatus;
+
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
@@ -1291,4 +1293,16 @@ impl ErrorResponse {
             error_type: Some(error_type.into()),
         }
     }
+}
+
+#[derive(Debug, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConfirmProjectInstructionsRequest {
+    pub candidate_bundle_id: String,
+}
+
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConfirmProjectInstructionsResponse {
+    pub status: ProjectInstructionRefreshStatus,
 }

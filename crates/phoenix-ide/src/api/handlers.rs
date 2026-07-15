@@ -22,7 +22,8 @@ use super::lifecycle_handlers::{
 use super::sse::sse_stream;
 use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
-    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+    CodeSearchQuery, CodeSearchResponse, ConfirmProjectInstructionsRequest,
+    ConfirmProjectInstructionsResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
@@ -43,6 +44,10 @@ use crate::git_ops::{
 };
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use crate::system_prompt::discover_project_instruction_bundle;
+use phoenix_core::domain::project_instruction_bundle::{
+    ProjectInstructionChangeManifest, ProjectInstructionRefreshStatus,
+};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -246,6 +251,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/system-prompt",
             get(get_system_prompt),
+        )
+        .route(
+            "/api/conversations/:id/project-instructions",
+            get(get_project_instructions),
+        )
+        .route(
+            "/api/conversations/:id/project-instructions/confirm",
+            post(confirm_project_instructions),
         )
         // One-shot shell-command suggestion. Stateless: a single LLM
         // completion with no conversation, no tools, no persistence. The
@@ -3036,6 +3049,117 @@ async fn inspect_bash_handle(
     }
 
     Ok(Json(assembly.inspection))
+}
+
+const REWARM_ESTIMATE_NOTICE: &str =
+    "Estimated one-time input-token rewarm; actual provider cache behavior may differ.";
+
+async fn ensure_active_project_instructions(
+    state: &AppState,
+    conversation_id: &str,
+    cwd: &FsPath,
+) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, AppError> {
+    if let Some(active) = state
+        .db
+        .load_active_project_instruction_bundle(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Ok(active);
+    }
+    let discovered = discover_project_instruction_bundle(cwd);
+    state
+        .db
+        .initialize_project_instruction_bundle_if_absent(conversation_id, &discovered)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+async fn get_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProjectInstructionRefreshStatus>, AppError> {
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let cwd = FsPath::new(&conversation.cwd);
+    let active = ensure_active_project_instructions(&state, &id, cwd).await?;
+    let queued = state
+        .db
+        .load_queued_project_instruction_bundle(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let discovered = discover_project_instruction_bundle(cwd);
+    let candidate = state
+        .db
+        .persist_or_replace_project_instruction_candidate(&id, &discovered)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let comparison = queued.as_ref().unwrap_or(&active);
+    let changed_manifest = ProjectInstructionChangeManifest::between(comparison, &candidate);
+
+    Ok(Json(ProjectInstructionRefreshStatus {
+        active_bundle_id: active.id,
+        queued_bundle_id: queued.as_ref().map(|bundle| bundle.id.clone()),
+        candidate_bundle_id: Some(candidate.id),
+        changed_manifest,
+        estimated_rewarm_tokens: candidate.estimated_tokens,
+        rewarm_tokens_are_estimate: true,
+        rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
+        is_queued: queued.is_some(),
+    }))
+}
+
+async fn confirm_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmProjectInstructionsRequest>,
+) -> Result<Json<ConfirmProjectInstructionsResponse>, AppError> {
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let active =
+        ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
+    let candidate = state
+        .db
+        .load_project_instruction_candidate(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let Some(candidate) = candidate.filter(|bundle| bundle.id == request.candidate_bundle_id)
+    else {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "The project-instruction preview is missing or has been replaced; preview again before confirming",
+            "stale_project_instruction_candidate",
+        ))));
+    };
+    let confirmed = state
+        .db
+        .confirm_project_instruction_candidate(&id, &request.candidate_bundle_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if !confirmed {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "The project-instruction preview is missing or has been replaced; preview again before confirming",
+            "stale_project_instruction_candidate",
+        ))));
+    }
+    let changed_manifest = ProjectInstructionChangeManifest::between(&active, &candidate);
+    Ok(Json(ConfirmProjectInstructionsResponse {
+        status: ProjectInstructionRefreshStatus {
+            active_bundle_id: active.id,
+            queued_bundle_id: Some(candidate.id),
+            candidate_bundle_id: None,
+            changed_manifest,
+            estimated_rewarm_tokens: candidate.estimated_tokens,
+            rewarm_tokens_are_estimate: true,
+            rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
+            is_queued: true,
+        },
+    }))
 }
 
 async fn get_system_prompt(
@@ -7238,6 +7362,143 @@ mod conversation_cwd_validation_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod project_instruction_refresh_tests {
+    use super::*;
+    use phoenix_core::domain::project_instruction_bundle::ProjectInstructionSourceChangeKind;
+
+    async fn setup() -> (AppState, tempfile::TempDir) {
+        let state = super::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "initial-secret").unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let skill = cwd.join(".agents/skills/alpha");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: alpha\ndescription: initial skill secret\n---\nbody",
+        )
+        .unwrap();
+        state
+            .db
+            .create_conversation(
+                "instruction-api",
+                "instruction-api",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        (state, root)
+    }
+
+    #[tokio::test]
+    async fn preview_reports_content_free_path_skill_and_estimate_data() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "changed-secret").unwrap();
+        std::fs::write(root.path().join("project/AGENTS.md"), "added-secret").unwrap();
+        std::fs::remove_dir_all(root.path().join("project/.agents/skills/alpha")).unwrap();
+        let beta = root.path().join("project/.agents/skills/beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(
+            beta.join("SKILL.md"),
+            "---\nname: beta\ndescription: beta skill secret\n---\nbody",
+        )
+        .unwrap();
+
+        let Json(status) =
+            get_project_instructions(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+
+        assert!(status.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "../AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Changed
+        }));
+        assert!(status.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Added
+        }));
+        assert!(status.changed_manifest.skills.iter().any(|change| {
+            change.name == "alpha" && change.status == ProjectInstructionSourceChangeKind::Removed
+        }));
+        assert!(status.changed_manifest.skills.iter().any(|change| {
+            change.name == "beta" && change.status == ProjectInstructionSourceChangeKind::Added
+        }));
+        assert!(status.rewarm_tokens_are_estimate);
+        assert!(status
+            .rewarm_estimate_notice
+            .contains("actual provider cache behavior"));
+        assert!(status.estimated_rewarm_tokens > 0);
+        let wire = serde_json::to_string(&status).unwrap();
+        assert!(!wire.contains("changed-secret"));
+        assert!(!wire.contains("added-secret"));
+        assert!(!wire.contains("skill secret"));
+    }
+
+    #[tokio::test]
+    async fn confirm_is_exact_and_later_preview_preserves_queue() {
+        let (state, root) = setup().await;
+        let Json(first) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "reviewed-secret").unwrap();
+        let Json(reviewed) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let reviewed_id = reviewed.candidate_bundle_id.clone().unwrap();
+
+        let stale_confirmation = confirm_project_instructions(
+            State(state.clone()),
+            Path("instruction-api".to_string()),
+            Json(ConfirmProjectInstructionsRequest {
+                candidate_bundle_id: first.candidate_bundle_id.unwrap(),
+            }),
+        )
+        .await;
+        assert!(matches!(stale_confirmation, Err(AppError::Conflict(_))));
+        let _ = confirm_project_instructions(
+            State(state.clone()),
+            Path("instruction-api".to_string()),
+            Json(ConfirmProjectInstructionsRequest {
+                candidate_bundle_id: reviewed_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(root.path().join("AGENTS.md"), "later-secret").unwrap();
+        let Json(later) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(
+            later.queued_bundle_id.as_deref(),
+            Some(reviewed_id.as_str())
+        );
+        assert!(later.is_queued);
+        assert!(later.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "../AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Changed
+        }));
+        let queued = state
+            .db
+            .load_queued_project_instruction_bundle("instruction-api")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.guidance[0].content, "reviewed-secret");
     }
 }
 

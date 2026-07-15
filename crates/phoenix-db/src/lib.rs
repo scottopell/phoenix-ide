@@ -2372,6 +2372,38 @@ impl Database {
         .await
     }
 
+    /// Load the queued bundle and its ordered normalized children.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bundle or its normalized children cannot be read.
+    pub async fn load_queued_project_instruction_bundle(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ProjectInstructionBundle>> {
+        self.load_project_instruction_bundle_by_role(
+            conversation_id,
+            ProjectInstructionBundleRole::Queued,
+        )
+        .await
+    }
+
+    /// Load the unconfirmed preview candidate and its ordered normalized children.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bundle or its normalized children cannot be read.
+    pub async fn load_project_instruction_candidate(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ProjectInstructionBundle>> {
+        self.load_project_instruction_bundle_by_role(
+            conversation_id,
+            ProjectInstructionBundleRole::Candidate,
+        )
+        .await
+    }
+
     /// Replace only the unconfirmed candidate. Active and queued snapshots are untouched.
     ///
     /// # Errors
@@ -8678,6 +8710,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(candidate_role, "candidate");
+    }
+
+    #[tokio::test]
+    async fn project_instruction_confirmation_requires_exact_current_candidate() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("bundle-exact", "bundle-exact", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.initialize_project_instruction_bundle_if_absent(
+            "bundle-exact",
+            &instruction_bundle("active"),
+        )
+        .await
+        .unwrap();
+        let stale = db
+            .persist_or_replace_project_instruction_candidate(
+                "bundle-exact",
+                &instruction_bundle("stale"),
+            )
+            .await
+            .unwrap();
+        let current = db
+            .persist_or_replace_project_instruction_candidate(
+                "bundle-exact",
+                &instruction_bundle("current"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!db
+            .confirm_project_instruction_candidate("bundle-exact", &stale.id)
+            .await
+            .unwrap());
+        assert!(db
+            .load_queued_project_instruction_bundle("bundle-exact")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.load_project_instruction_candidate("bundle-exact")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            current.id
+        );
+        assert!(db
+            .confirm_project_instruction_candidate("bundle-exact", &current.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.load_queued_project_instruction_bundle("bundle-exact")
+                .await
+                .unwrap()
+                .unwrap()
+                .guidance[0]
+                .content,
+            "guidance-current"
+        );
     }
 
     #[tokio::test]
