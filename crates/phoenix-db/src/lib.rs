@@ -15,8 +15,8 @@ use phoenix_core::domain::creation_protocol::{
 };
 use phoenix_core::domain::db_schema as schema;
 use phoenix_core::domain::project_instruction_bundle::{
-    NewProjectInstructionBundle, ProjectGuidanceSnapshot, ProjectInstructionBundle,
-    ProjectInstructionBundleRole, ProjectSkillSnapshot,
+    NewProjectInstructionBundle, ProjectGuidanceSnapshot, ProjectInstructionActivation,
+    ProjectInstructionBundle, ProjectInstructionBundleRole, ProjectSkillSnapshot,
 };
 
 pub use migrations::run_pending_migrations;
@@ -2485,16 +2485,21 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Atomically activate the exact queued snapshot and advance transcript generation.
-    /// Returns the new generation, or `None` when no queued bundle exists.
+    /// Stable marker for the content-free, UI-visible activation timeline entry.
+    pub const PROJECT_INSTRUCTIONS_ACTIVATED_MARKER: &'static str =
+        "[project-instructions-activated] Project instructions updated.";
+
+    /// Atomically activate the exact queued snapshot, advance transcript generation,
+    /// and append the UI-visible activation timeline entry.
     ///
     /// # Errors
     ///
-    /// Returns an error when activation, generation bump, or transaction commit fails.
+    /// Returns an error when activation, message persistence, generation bump, or commit fails.
     pub async fn activate_queued_project_instruction_bundle(
         &self,
         conversation_id: &str,
-    ) -> DbResult<Option<i64>> {
+        sequence_id: i64,
+    ) -> DbResult<Option<ProjectInstructionActivation>> {
         let mut tx = self.pool.begin().await?;
         let queued_id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM project_instruction_bundles
@@ -2526,8 +2531,45 @@ impl Database {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+
+        let now = Utc::now();
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let content = MessageContent::System(SystemContent {
+            text: Self::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER.to_string(),
+        });
+        let content_json = serde_json::to_string(&content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+        )
+        .bind(&message_id)
+        .bind(conversation_id)
+        .bind(sequence_id)
+        .bind(content_json)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
-        Ok(Some(generation))
+
+        Ok(Some(ProjectInstructionActivation {
+            transcript_generation: generation,
+            message: Message {
+                message_id,
+                conversation_id: conversation_id.to_string(),
+                sequence_id,
+                message_type: MessageType::System,
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            },
+        }))
     }
 
     async fn load_project_instruction_bundle_by_role(
@@ -8691,11 +8733,23 @@ mod tests {
             )
             .await
             .unwrap();
-        let generation = db
-            .activate_queued_project_instruction_bundle("bundle-queue")
+        let activation = db
+            .activate_queued_project_instruction_bundle("bundle-queue", 17)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(generation, Some(2));
+        assert_eq!(activation.transcript_generation, 2);
+        assert_eq!(activation.message.sequence_id, 17);
+        assert!(matches!(
+            &activation.message.content,
+            MessageContent::System(content)
+                if content.text == Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+        ));
+        let recovered = db.get_messages("bundle-queue").await.unwrap();
+        assert!(recovered.iter().any(|message| {
+            message.message_id == activation.message.message_id
+                && message.content == activation.message.content
+        }));
         let active = db
             .load_active_project_instruction_bundle("bundle-queue")
             .await

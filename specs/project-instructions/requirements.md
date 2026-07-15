@@ -37,6 +37,8 @@ Unchanged sources SHALL be summarized or collapsed by default.
 
 The conversation-scoped refresh preview endpoint SHALL discover current sources, persist the exact candidate represented by its response, compare it with the queued bundle when one exists and otherwise with the active bundle, and return only bundle identities, source-change metadata, and estimate-labeling data.
 
+The conversation-scoped status endpoint SHALL discover current sources and compute its manifest transiently, SHALL NOT create or replace a candidate, and SHALL report the identity of any existing candidate unchanged.
+
 The conversation-scoped confirmation endpoint SHALL accept a candidate bundle identity and SHALL reject the request when that exact candidate is missing or has been replaced.
 
 ### REQ-PI-004 — Cache-Rewarm Estimate
@@ -62,13 +64,17 @@ WHEN a confirmed bundle is waiting to activate
 THE SYSTEM SHALL finish any active user turn and complete tool loop under the existing bundle
 AND SHALL activate the confirmed bundle before processing the next user-authored turn.
 
-Activation SHALL preserve conversation history, create a visible instruction-refresh timeline event, advance the transcript generation, and invalidate incompatible provider continuation state.
+A direct user message and a steering message drained while entering idle SHALL each start such a boundary. A steering drain during an existing tool loop SHALL NOT activate the bundle.
+
+Activation SHALL atomically preserve conversation history, persist a visible content-free System instruction-refresh timeline event, advance the transcript generation, and invalidate incompatible provider continuation state. The system SHALL emit the durable event after commit, and System timeline events SHALL remain excluded from model context.
 
 ### REQ-PI-007 — Durable Recovery
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles
 AND SHALL preserve the same activation boundary and source manifest.
+
+The system-prompt inspection surface SHALL render the persisted active bundle rather than rediscovering mutable filesystem sources.
 
 WHEN a conversation predates project-instruction snapshots
 THE SYSTEM SHALL resolve and persist its initial bundle before its next model request without dropping or rewriting conversation history.

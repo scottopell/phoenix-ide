@@ -2502,17 +2502,19 @@ where
     }
 
     async fn activate_queued_project_instructions(&self) -> Result<(), String> {
+        let sequence_id = self.broadcast_tx.next_seq();
         match self
             .storage
-            .activate_queued_project_instruction_bundle(&self.context.conversation_id)
+            .activate_queued_project_instruction_bundle(&self.context.conversation_id, sequence_id)
             .await
         {
-            Ok(Some(transcript_generation)) => {
+            Ok(Some(activation)) => {
                 tracing::info!(
                     conv_id = %self.context.conversation_id,
-                    transcript_generation,
+                    transcript_generation = activation.transcript_generation,
                     "Activated queued project instructions at user-turn boundary"
                 );
+                let _ = self.broadcast_tx.send_persisted_message(activation.message);
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -2920,6 +2922,12 @@ where
         // LlmRequesting state-change. Mid-turn drains enter from LlmRequesting,
         // not Idle, so their state-change is correct and not suppressed.
         let suppress_intermediate_state_change = matches!(self.state, ConvState::Idle);
+        // An idle-entry drain starts a new user-authored turn. Activate before
+        // persisting any drained user message. The LlmRequesting mid-turn drain
+        // deliberately skips this boundary action.
+        if suppress_intermediate_state_change {
+            self.activate_queued_project_instructions().await?;
+        }
         for effect in original_effects {
             if matches!(effect, Effect::RequestLlm) {
                 deferred_request_llm = Some(effect);
@@ -9344,6 +9352,34 @@ mod explore_prompt_cache_shape_tests {
         assert!(!requests[1].system[0].text.contains("live guidance changed"));
         assert!(requests[2].system[0].text.contains("exact queued guidance"));
         assert!(!requests[2].system[0].text.contains("live guidance changed"));
+        let messages = storage.get_all_messages(conv_id);
+        let activation_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    &message.content,
+                    MessageContent::System(system)
+                        if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+                )
+            })
+            .expect("activation timeline message");
+        let second_user_index = messages
+            .iter()
+            .position(|message| message.message_id == "user-msg-2")
+            .expect("second user message");
+        assert!(activation_index < second_user_index);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::System(system)
+                        if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+                ))
+                .count(),
+            1,
+            "the mid-turn tool-loop request must not activate the queue"
+        );
         assert_eq!(
             requests[0].cache_key.as_str(),
             requests[1].cache_key.as_str()
@@ -9650,6 +9686,14 @@ mod steer_drain_detector_tests {
             ConvState::LlmRequesting { attempt: 1 },
             queue,
         );
+        storage.queue_project_instruction_bundle(
+            "conv-drain-idle",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
 
         let result = TransitionResult::new(ConvState::Idle);
         rt.apply_transition_result(result)
@@ -9658,7 +9702,15 @@ mod steer_drain_detector_tests {
 
         // Persists ran inline → messages now in storage in FIFO order.
         let msgs = storage.get_all_messages("conv-drain-idle");
-        let persisted_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert!(matches!(
+            &msgs[0].content,
+            MessageContent::System(system)
+                if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+        ));
+        let persisted_ids: Vec<&str> = msgs[1..]
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
         assert_eq!(persisted_ids, vec!["s1", "s2", "s3"]);
 
         assert!(

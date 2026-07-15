@@ -977,9 +977,16 @@ impl StateStore for InMemoryStorage {
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,
-    ) -> Result<Option<i64>, String> {
-        use phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole;
+        sequence_id: i64,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionActivation>,
+        String,
+    > {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionActivation, ProjectInstructionBundleRole,
+        };
         let mut bundles = self.project_instruction_bundles.lock().unwrap();
+        let mut messages = self.messages.lock().unwrap();
         let entry = bundles.entry(conv_id.to_string()).or_default();
         let Some(mut queued) = entry.queued.take() else {
             return Ok(None);
@@ -987,7 +994,27 @@ impl StateStore for InMemoryStorage {
         queued.role = ProjectInstructionBundleRole::Active;
         entry.active = Some(queued);
         entry.transcript_generation += 1;
-        Ok(Some(entry.transcript_generation))
+        let content = MessageContent::System(crate::db::SystemContent {
+            text: crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER.to_string(),
+        });
+        let message = Message {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        messages
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        Ok(Some(ProjectInstructionActivation {
+            transcript_generation: entry.transcript_generation,
+            message,
+        }))
     }
 
     async fn update_steering_queue(

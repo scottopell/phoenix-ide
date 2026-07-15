@@ -276,6 +276,7 @@ pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
 }
 
 /// Build the complete system prompt for a conversation.
+#[allow(dead_code)]
 pub fn build_system_prompt(
     working_dir: &Path,
     tasks_dir_name: &str,
@@ -304,6 +305,7 @@ pub fn build_system_prompt(
 /// filesystem-only behavior; production callers go through
 /// [`build_system_prompt`] which uses the live extract location.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One match arm per ModeContext variant; splitting hurts readability
+#[allow(dead_code)]
 pub fn build_system_prompt_with_options(
     working_dir: &Path,
     tasks_dir_name: &str,

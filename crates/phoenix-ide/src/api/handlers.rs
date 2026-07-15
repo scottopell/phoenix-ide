@@ -257,6 +257,10 @@ pub fn create_router(state: AppState) -> Router {
             get(get_project_instructions),
         )
         .route(
+            "/api/conversations/:id/project-instructions/preview",
+            post(preview_project_instructions),
+        )
+        .route(
             "/api/conversations/:id/project-instructions/confirm",
             post(confirm_project_instructions),
         )
@@ -3075,41 +3079,75 @@ async fn ensure_active_project_instructions(
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
+async fn project_instruction_status(
+    state: &AppState,
+    id: &str,
+    persist_preview: bool,
+) -> Result<ProjectInstructionRefreshStatus, AppError> {
+    let conversation = state
+        .db
+        .get_conversation(id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let cwd = FsPath::new(&conversation.cwd);
+    let active = ensure_active_project_instructions(state, id, cwd).await?;
+    let queued = state
+        .db
+        .load_queued_project_instruction_bundle(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let discovered = discover_project_instruction_bundle(cwd);
+    let transient = phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle {
+        id: String::new(),
+        conversation_id: id.to_string(),
+        role: phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Candidate,
+        estimated_tokens: discovered.estimated_tokens,
+        created_at: chrono::Utc::now(),
+        guidance: discovered.guidance.clone(),
+        skills: discovered.skills.clone(),
+    };
+    let candidate = if persist_preview {
+        Some(
+            state
+                .db
+                .persist_or_replace_project_instruction_candidate(id, &discovered)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        )
+    } else {
+        state
+            .db
+            .load_project_instruction_candidate(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    };
+    let comparison = queued.as_ref().unwrap_or(&active);
+    let changed_manifest = ProjectInstructionChangeManifest::between(comparison, &transient);
+
+    Ok(ProjectInstructionRefreshStatus {
+        active_bundle_id: active.id,
+        queued_bundle_id: queued.as_ref().map(|bundle| bundle.id.clone()),
+        candidate_bundle_id: candidate.map(|bundle| bundle.id),
+        changed_manifest,
+        estimated_rewarm_tokens: transient.estimated_tokens,
+        rewarm_tokens_are_estimate: true,
+        rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
+        is_queued: queued.is_some(),
+    })
+}
+
 async fn get_project_instructions(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ProjectInstructionRefreshStatus>, AppError> {
-    let conversation = state
-        .db
-        .get_conversation(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let cwd = FsPath::new(&conversation.cwd);
-    let active = ensure_active_project_instructions(&state, &id, cwd).await?;
-    let queued = state
-        .db
-        .load_queued_project_instruction_bundle(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let discovered = discover_project_instruction_bundle(cwd);
-    let candidate = state
-        .db
-        .persist_or_replace_project_instruction_candidate(&id, &discovered)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let comparison = queued.as_ref().unwrap_or(&active);
-    let changed_manifest = ProjectInstructionChangeManifest::between(comparison, &candidate);
+    Ok(Json(project_instruction_status(&state, &id, false).await?))
+}
 
-    Ok(Json(ProjectInstructionRefreshStatus {
-        active_bundle_id: active.id,
-        queued_bundle_id: queued.as_ref().map(|bundle| bundle.id.clone()),
-        candidate_bundle_id: Some(candidate.id),
-        changed_manifest,
-        estimated_rewarm_tokens: candidate.estimated_tokens,
-        rewarm_tokens_are_estimate: true,
-        rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
-        is_queued: queued.is_some(),
-    }))
+async fn preview_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProjectInstructionRefreshStatus>, AppError> {
+    Ok(Json(project_instruction_status(&state, &id, true).await?))
 }
 
 async fn confirm_project_instructions(
@@ -3213,7 +3251,8 @@ async fn get_system_prompt(
     {
         crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
     } else {
-        crate::system_prompt::build_system_prompt(
+        let project_instructions = ensure_active_project_instructions(&state, &id, &cwd).await?;
+        crate::system_prompt::build_system_prompt_with_project_instructions(
             &cwd,
             &tasks_dir_name,
             is_sub_agent,
@@ -3221,6 +3260,7 @@ async fn get_system_prompt(
             conversation.llm_language,
             persona.as_deref(),
             explore_bash,
+            &project_instructions,
         )
     };
 
@@ -7416,7 +7456,7 @@ mod project_instruction_refresh_tests {
         .unwrap();
 
         let Json(status) =
-            get_project_instructions(State(state), Path("instruction-api".to_string()))
+            preview_project_instructions(State(state), Path("instruction-api".to_string()))
                 .await
                 .unwrap();
 
@@ -7446,18 +7486,44 @@ mod project_instruction_refresh_tests {
     }
 
     #[tokio::test]
+    async fn system_prompt_inspection_uses_persisted_active_bundle_after_source_mutation() {
+        let (state, root) = setup().await;
+        let Json(initial) =
+            get_system_prompt(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert!(initial.system_prompt.contains("initial-secret"));
+
+        std::fs::write(root.path().join("AGENTS.md"), "mutated-secret").unwrap();
+        let Json(after) = get_system_prompt(State(state), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        assert!(after.system_prompt.contains("initial-secret"));
+        assert!(!after.system_prompt.contains("mutated-secret"));
+    }
+
+    #[tokio::test]
     async fn confirm_is_exact_and_later_preview_preserves_queue() {
         let (state, root) = setup().await;
         let Json(first) =
-            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            preview_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
                 .await
                 .unwrap();
         std::fs::write(root.path().join("AGENTS.md"), "reviewed-secret").unwrap();
         let Json(reviewed) =
-            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            preview_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
                 .await
                 .unwrap();
         let reviewed_id = reviewed.candidate_bundle_id.clone().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "background-secret").unwrap();
+        let Json(background) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(
+            background.candidate_bundle_id.as_deref(),
+            Some(reviewed_id.as_str())
+        );
 
         let stale_confirmation = confirm_project_instructions(
             State(state.clone()),

@@ -62,6 +62,15 @@ pub struct NewProjectInstructionBundle {
     pub skills: Vec<ProjectSkillSnapshot>,
 }
 
+/// Durable result of activating a queued bundle at a user-turn boundary.
+/// The timeline message is committed in the same transaction as the role swap
+/// and generation bump, so runtimes can broadcast it only after it is durable.
+#[derive(Debug, Clone)]
+pub struct ProjectInstructionActivation {
+    pub transcript_generation: i64,
+    pub message: crate::domain::db_schema::Message,
+}
+
 /// How one instruction source differs from the comparison bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
