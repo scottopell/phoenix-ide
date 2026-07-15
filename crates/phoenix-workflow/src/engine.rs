@@ -206,13 +206,24 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         lease_until: LeaseExpiry,
     ) -> ClaimResult {
+        self.claim_effect_with_resource_locks(effect_id, worker_id, now, lease_until, &[])
+    }
+
+    pub fn claim_effect_with_resource_locks(
+        &mut self,
+        effect_id: EffectId,
+        worker_id: &'static str,
+        now: Timestamp,
+        lease_until: LeaseExpiry,
+        active_resource_locks: &[ResourceLockGrant],
+    ) -> ClaimResult {
         if self.ensure_executable().is_err() {
             return denied_claim();
         }
         if workflow_status_is_terminal(self.status) {
             return ineligible_claim();
         }
-        if !lease_until.is_live_at(now) {
+        if !lease_until.is_live_at(now) || lease_until == LeaseExpiry(u64::MAX) {
             return ineligible_claim();
         }
         if self.crashed_workers.contains(&worker_id) {
@@ -234,9 +245,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return ineligible_claim();
         };
         let claim_token = self.next_claim_token;
-        let Ok(resource_lock) =
-            self.lock_grant_for_claim(effect_id, worker_id, claim_token, now, lease_until)
-        else {
+        let Ok(resource_lock) = self.lock_grant_for_claim(
+            effect_id,
+            worker_id,
+            claim_token,
+            now,
+            lease_until,
+            active_resource_locks,
+        ) else {
             return denied_claim();
         };
         let authority = ClaimAuthority {
@@ -346,7 +362,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         };
         let claim_token = self.next_claim_token;
         let Ok(resource_lock) =
-            self.lock_grant_for_claim(effect_id, worker_id, claim_token, now, lease_until)
+            self.lock_grant_for_claim(effect_id, worker_id, claim_token, now, lease_until, &[])
         else {
             return denied_claim();
         };
@@ -636,7 +652,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         effect.status = EffectStatus::AmbiguityWait;
         effect.claim = None;
         if let Some(lock) = &mut effect.destructive_lock {
-            lock.lease_until = LeaseExpiry(u64::MAX);
+            lock.lease_until = LeaseExpiry::MAX_FINITE;
         }
         let resolution = ManualResolutionRecord {
             id: resolution_id,
@@ -692,6 +708,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             || choice.receipt_codec.family.is_empty()
             || choice.receipt_event_codec.family.is_empty()
             || matches!(choice.kind, ManualChoiceKind::Retry) != commit.retry_at.is_some()
+            || (choice.kind == ManualChoiceKind::Fail
+                && commit.next_status != WorkflowStatus::Failed)
             || validate_status_transition(self.status, commit.next_status).is_err()
         {
             return invalid_manual_resolution(Some(existing));
@@ -1115,8 +1133,28 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     }
 
     fn apply_invalidations(&mut self, invalidations: &[EffectInvalidationDecl]) {
-        for invalidation in invalidations {
-            if let Some(effect) = self.effects.get_mut(&invalidation.effect_id) {
+        let mut targets: BTreeSet<EffectId> =
+            invalidations.iter().map(|item| item.effect_id).collect();
+        loop {
+            let dependents: Vec<_> = self
+                .effects
+                .iter()
+                .filter(|(id, effect)| {
+                    !targets.contains(id)
+                        && effect
+                            .dependencies
+                            .iter()
+                            .any(|dependency| targets.contains(dependency))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if dependents.is_empty() {
+                break;
+            }
+            targets.extend(dependents);
+        }
+        for effect_id in targets {
+            if let Some(effect) = self.effects.get_mut(&effect_id) {
                 if matches!(
                     effect.status,
                     EffectStatus::Blocked
@@ -1297,6 +1335,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             next_status,
             retry_at,
         } = commit;
+        debug_assert!(
+            choice.kind != ManualChoiceKind::Fail || next_status == WorkflowStatus::Failed,
+            "manual Fail must terminalize the workflow"
+        );
         let transition = WorkflowTransition {
             transition_id: TransitionId(self.next_transition_id),
             from_version: self.version,
@@ -1566,11 +1608,18 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         claim_token: u64,
         now: Timestamp,
         lease_until: LeaseExpiry,
+        active_resource_locks: &[ResourceLockGrant],
     ) -> Result<Option<ResourceLockGrant>, ()> {
         let effect = self.effects.get(&effect_id).ok_or(())?;
         let Some(resource) = effect.declaration.destructive_resource else {
             return Ok(None);
         };
+        if active_resource_locks
+            .iter()
+            .any(|lock| lock.resource == resource && lock.lease_until.is_live_at(now))
+        {
+            return Err(());
+        }
         for (other_effect_id, other) in &self.effects {
             if *other_effect_id == effect_id {
                 continue;
