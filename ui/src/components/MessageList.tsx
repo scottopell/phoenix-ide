@@ -543,9 +543,12 @@ function MessageListImpl({
   const currentHistoryViewKey = historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   );
+  const currentHistoryViewKeyRef = useRef(currentHistoryViewKey);
+  currentHistoryViewKeyRef.current = currentHistoryViewKey;
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
   const earlierHistoryRequestScheduledRef = useRef(false);
+  const cancelScheduledEarlierHistoryRef = useRef<(() => void) | null>(null);
   const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
   const touchStartYRef = useRef<number | null>(null);
 
@@ -936,13 +939,25 @@ function MessageListImpl({
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');
-    queueMicrotask(() => onLoadOlderMessages(restoreBasis));
-  }, [captureHistoryRestoreBasis, conversationId, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
+    const ownerViewKey = currentHistoryViewKey;
+    cancelScheduledEarlierHistoryRef.current = scheduleDeferred(() => {
+      cancelScheduledEarlierHistoryRef.current = null;
+      if (currentHistoryViewKeyRef.current !== ownerViewKey) return;
+      onLoadOlderMessages(restoreBasis);
+    });
+  }, [captureHistoryRestoreBasis, conversationId, currentHistoryViewKey, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
   requestEarlierHistoryRef.current = requestEarlierHistory;
 
   useEffect(() => {
+    cancelScheduledEarlierHistoryRef.current?.();
+    cancelScheduledEarlierHistoryRef.current = null;
     earlierHistoryRequestScheduledRef.current = false;
   }, [conversationId, currentHistoryViewKey]);
+
+  useEffect(() => () => {
+    cancelScheduledEarlierHistoryRef.current?.();
+    cancelScheduledEarlierHistoryRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;

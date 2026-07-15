@@ -1820,6 +1820,31 @@ describe('history expansion feedback', () => {
     expect(onLoadOlderMessages).toHaveBeenCalledTimes(1);
   });
 
+  it('drops a scheduled retry when the conversation view is replaced', async () => {
+    const onLoadOlderMessages = vi.fn();
+    const renderList = (conversationId: string) => withConvContext(
+      <MessageList
+        messages={[makeMessage(1, 'user')]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId={conversationId}
+        hasOlderMessages
+        olderHistoryError="network unavailable"
+        onLoadOlderMessages={onLoadOlderMessages}
+        transcriptPositioning={{ kind: 'idle', view: { conversationId, generation: 1, transcriptGeneration: 1 } }}
+      />,
+    );
+    const { rerender } = render(renderList('conversation-a'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    rerender(renderList('conversation-b'));
+    await act(async () => Promise.resolve());
+
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
+  });
+
   it('renders deep-link failures after coverage becomes complete', () => {
     render(
       withConvContext(
