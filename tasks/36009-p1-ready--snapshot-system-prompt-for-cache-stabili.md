@@ -14,7 +14,7 @@ Implement a persisted, versioned project-instruction bundle with an explicit use
 - If the agent is working, the captured bundle is queued. The current user turn and its complete tool loop finish under one bundle version. The queued version activates before the next user-authored turn.
 - Conversation history is preserved across activation. Activation creates a visible transcript-generation boundary, invalidates incompatible continuation state, and records a visible timeline event.
 - New conversations use the latest resolved project bundle.
-- Path-scoped nested guidance discovered while accessing deeper files is separate work tracked by task 36012; this task must leave a composable bundle/generation contract for it.
+- Path-scoped nested guidance discovered while accessing deeper files is separate work tracked by task 36019; this task must leave a composable bundle/generation contract for it.
 
 ## Acceptance criteria
 
