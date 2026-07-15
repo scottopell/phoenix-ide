@@ -48,6 +48,8 @@ vi.mock('../api', () => {
       getProjectTaskAvailability: vi.fn(),
       getProjects: vi.fn(),
       listProjectTasks: vi.fn(),
+      listProjectSkills: vi.fn(),
+      searchProjectFiles: vi.fn(),
       createConversation: vi.fn(),
       listConversations: vi.fn().mockResolvedValue([]),
       listArchivedConversations: vi.fn().mockResolvedValue([]),
@@ -165,6 +167,8 @@ describe('/new workflow modes', () => {
     vi.mocked(api.getProjectTaskAvailability).mockResolvedValue({ available: true });
     vi.mocked(api.getProjects).mockResolvedValue([]);
     vi.mocked(api.listProjectTasks).mockResolvedValue({ tasks: [task] });
+    vi.mocked(api.listProjectSkills).mockResolvedValue({ skills: [] });
+    vi.mocked(api.searchProjectFiles).mockResolvedValue({ items: [] });
     vi.mocked(api.createConversation).mockResolvedValue({
       id: 'c1',
       slug: 'conv-1',
@@ -180,6 +184,48 @@ describe('/new workflow modes', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.clearAllMocks();
+  });
+
+  it('waits for the authoritative branch root before showing project skills', async () => {
+    const validation = deferred<{ valid: boolean; is_git: boolean }>();
+    const branchMetadata = deferred<{ branches: typeof branches; current: string; default_branch: string }>();
+    vi.mocked(api.validateCwd).mockReturnValue(validation.promise);
+    vi.mocked(api.listGitBranches).mockReturnValue(branchMetadata.promise);
+    vi.mocked(api.listProjectSkills).mockResolvedValue({
+      skills: [{
+        name: 'phoenix-development',
+        description: 'Develop Phoenix',
+        argument_hint: null,
+        source: '.agents/skills',
+        path: '.agents/skills/phoenix-development/SKILL.md',
+      }],
+    });
+
+    renderPage();
+    const textarea = screen.getAllByPlaceholderText('What would you like to work on?')[0]!;
+    fireEvent.focus(textarea);
+    fireEvent.change(textarea, { target: { value: '/phoenix' } });
+
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 350));
+    });
+    expect(api.listProjectSkills).not.toHaveBeenCalled();
+    expect(screen.queryByRole('listbox', { name: '/ autocomplete' })).not.toBeInTheDocument();
+
+    await act(async () => { validation.resolve({ valid: true, is_git: true }); });
+    expect(api.listProjectSkills).not.toHaveBeenCalled();
+
+    await act(async () => {
+      branchMetadata.resolve({ branches, current: 'feature/demo', default_branch: 'main' });
+    });
+
+    expect((await screen.findAllByRole('listbox', { name: '/ autocomplete' })).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('phoenix-development').length).toBeGreaterThan(0);
+    expect(api.listProjectSkills).toHaveBeenCalledTimes(1);
+    expect(api.listProjectSkills).toHaveBeenCalledWith('/repo', {
+      mode: 'managed',
+      baseBranch: 'main',
+    });
   });
 
   it('preserves typed draft text across unmount and remount', async () => {

@@ -71,8 +71,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // a mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
   // is focused so trigger detection reads the right caret.
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
+  const inlineReferenceRootReady = conv.dirStatus === 'exists'
+    && conv.isGitDir !== null
+    && (conv.submission.mode === 'direct' || conv.submission.baseBranch !== null);
   const ir = useInlineReferences({
     cwd: conv.cwd,
+    discoveryReady: inlineReferenceRootReady,
     mode: conv.submission.mode,
     baseBranch: conv.submission.baseBranch,
     // The new-conversation composer's identity is its directory: switching the

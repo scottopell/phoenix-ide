@@ -37,6 +37,11 @@ export interface UseInlineReferencesParams {
    */
   cwd: string | undefined;
   /**
+   * Whether the caller has finished resolving the root represented by `cwd`,
+   * `mode`, and `baseBranch`. False keeps trigger UI state but defers discovery.
+   */
+  discoveryReady?: boolean;
+  /**
    * Creation mode of the composer's workflow. With `baseBranch`, branch/managed
    * modes discover candidates from the chosen branch's committed tree (what the
    * conversation's worktree will hold) rather than the live `cwd`, so a
@@ -90,6 +95,7 @@ export interface InlineReferences {
 
 export function useInlineReferences({
   cwd,
+  discoveryReady = true,
   mode,
   baseBranch,
   scopeKey,
@@ -147,7 +153,7 @@ export function useInlineReferences({
    * stored in `fileAcItems` by the debounced fetcher.
    */
   const acItems = useMemo<AutocompleteItem[]>(() => {
-    if (!activeTrigger) return [];
+    if (!activeTrigger || !discoveryReady) return [];
     if (activeTrigger.mode === 'skill') {
       return skillItems.map((s) => ({
         id: s.name,
@@ -160,7 +166,7 @@ export function useInlineReferences({
       return fileAcItems;
     }
     return [];
-  }, [activeTrigger, skillItems, fileAcItems]);
+  }, [activeTrigger, discoveryReady, skillItems, fileAcItems]);
 
   const fetchFileItems = useCallback(
     async (query: string) => {
@@ -226,7 +232,7 @@ export function useInlineReferences({
   // Fire side effects (fetch) on trigger change. No state derivation here —
   // `acItems` is computed during render via the useMemo above.
   useEffect(() => {
-    if (!activeTrigger) {
+    if (!activeTrigger || !discoveryReady) {
       setFileAcItems([]);
       return;
     }
@@ -251,7 +257,7 @@ export function useInlineReferences({
     return () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     };
-  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems.length, setFileAcItems]);
+  }, [activeTrigger, discoveryReady, fetchFileItems, fetchSkillItems, skillItems.length, setFileAcItems]);
 
   // Cleanup on unmount
   useEffect(() => {

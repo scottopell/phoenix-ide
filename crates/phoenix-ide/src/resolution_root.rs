@@ -20,7 +20,7 @@
 //! Both therefore resolve against the same branch ref; neither trusts the live
 //! checkout, which is what closes the discovery-vs-expansion divergence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -320,8 +320,6 @@ fn list_files_in_tree(
 /// works unchanged. Only `SKILL.md` files are written — discovery and
 /// invocation read nothing else from a skill directory.
 fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
-    // On any failure, fall back to an empty temp dir: discovery still surfaces
-    // global (`$HOME`) and built-in skills, just no repo-local ones.
     let Ok(temp) = TempDir::new() else {
         return SkillsView {
             dir: repo_root.to_path_buf(),
@@ -329,37 +327,123 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         };
     };
 
-    // Reuse the cached full tree listing and pick out `SKILL.md` files under a
-    // `.claude/skills` / `.agents/skills` directory at any depth. This matches
-    // `discover_skills`' scan scope against a real working directory — the repo
-    // root *and* immediate child projects (e.g. `service/.agents/skills/...`).
-    // Filtering in Rust avoids fragile pathspec-wildcard semantics; deeper
-    // matches that slip in are written but never surfaced, because
-    // `discover_skills` only scans depth-1 children of the materialized root.
-    for rel_path in tree_paths(repo_root, reference).iter() {
-        if !rel_path.ends_with("SKILL.md") {
-            continue;
-        }
-        if !(rel_path.contains(".claude/skills/") || rel_path.contains(".agents/skills/")) {
-            continue;
-        }
-        let spec = format!("{reference}:{rel_path}");
-        let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
+    let paths = tree_paths(repo_root, reference);
+    for rel_path in paths.iter().filter(|path| is_skill_metadata_path(path)) {
+        copy_tree_blob(repo_root, reference, rel_path, temp.path(), rel_path);
+    }
+
+    let symlinks = tree_symlinks(repo_root, reference);
+    for link_path in symlinks.keys().filter(|path| is_skill_directory_link(path)) {
+        let Some(target_root) = resolve_tree_link_chain(link_path, &symlinks) else {
             continue;
         };
-        let dest = temp.path().join(rel_path);
-        if let Some(parent) = dest.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+        let target_prefix = format!("{target_root}/");
+        for target_path in paths.iter().filter(|path| {
+            path.strip_prefix(&target_prefix)
+                .is_some_and(is_relative_skill_metadata_path)
+        }) {
+            let Some(suffix) = target_path.strip_prefix(&target_prefix) else {
                 continue;
-            }
+            };
+            let logical_path = format!("{link_path}/{suffix}");
+            copy_tree_blob(
+                repo_root,
+                reference,
+                target_path,
+                temp.path(),
+                &logical_path,
+            );
         }
-        let _ = std::fs::write(&dest, bytes);
     }
 
     SkillsView {
         dir: temp.path().to_path_buf(),
         _temp: Some(temp),
     }
+}
+
+fn is_skill_metadata_path(path: &str) -> bool {
+    path.ends_with("SKILL.md")
+        && (path.contains(".claude/skills/") || path.contains(".agents/skills/"))
+}
+
+fn is_relative_skill_metadata_path(path: &str) -> bool {
+    path == "SKILL.md" || path.ends_with("/SKILL.md")
+}
+
+fn copy_tree_blob(
+    repo_root: &Path,
+    reference: &str,
+    source: &str,
+    destination_root: &Path,
+    destination: &str,
+) {
+    let spec = format!("{reference}:{source}");
+    let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
+        return;
+    };
+    let destination = destination_root.join(destination);
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_ok() {
+        let _ = std::fs::write(destination, bytes);
+    }
+}
+
+fn tree_symlinks(repo_root: &Path, reference: &str) -> HashMap<String, String> {
+    let Ok(listing) = run_git(repo_root, &["ls-tree", "-r", reference]) else {
+        return HashMap::new();
+    };
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (metadata, path) = line.split_once('\t')?;
+            if !metadata.starts_with("120000 ") {
+                return None;
+            }
+            let spec = format!("{reference}:{path}");
+            let target = run_git_bytes(repo_root, &["cat-file", "blob", &spec]).ok()?;
+            Some((path.to_string(), String::from_utf8(target).ok()?))
+        })
+        .collect()
+}
+
+fn is_skill_directory_link(path: &str) -> bool {
+    let components: Vec<&str> = path.split('/').collect();
+    components.windows(3).enumerate().any(|(index, parts)| {
+        index + 3 == components.len()
+            && matches!(parts[0], ".claude" | ".agents")
+            && parts[1] == "skills"
+    })
+}
+
+fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) -> Option<String> {
+    let mut link = link_path.to_string();
+    let mut visited = HashSet::new();
+    while let Some(target) = symlinks.get(&link) {
+        if !visited.insert(link.clone()) {
+            return None;
+        }
+        link = resolve_tree_link(&link, target)?;
+    }
+    Some(link)
+}
+
+fn resolve_tree_link(link_path: &str, target: &str) -> Option<String> {
+    let parent = Path::new(link_path).parent()?;
+    let mut resolved = Vec::new();
+    for component in parent.join(target).components() {
+        match component {
+            std::path::Component::Normal(part) => resolved.push(part.to_str()?.to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!resolved.is_empty()).then(|| resolved.join("/"))
 }
 
 #[cfg(test)]
@@ -608,6 +692,133 @@ mod tests {
             Some("main"),
             "a checked-out branch can't be fast-forwarded, so creation keeps the local tip"
         );
+    }
+
+    #[test]
+    fn git_tree_skills_view_matches_checkout_for_repo_relative_symlinked_skill() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("skills/phoenix-development")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/phoenix-development/SKILL.md"),
+            "---\nname: phoenix-development\ndescription: Develop Phoenix\n---\n\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/phoenix-development/skills/review"))
+            .unwrap();
+        std::fs::write(
+            repo.path()
+                .join("skills/phoenix-development/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review Phoenix\n---\n\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".agents/skills")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "../../skills/phoenix-development",
+            repo.path().join(".agents/skills/phoenix-development"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(
+            "../../skills/phoenix-development",
+            repo.path().join(".agents/skills/phoenix-development"),
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo.path())
+            .into_iter()
+            .filter(|skill| skill.name.starts_with("phoenix-development"))
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name.starts_with("phoenix-development"))
+            .map(|skill| skill.name)
+            .collect();
+
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(
+            tree_names,
+            ["phoenix-development", "phoenix-development:review"]
+        );
+    }
+
+    #[test]
+    fn tree_link_resolution_rejects_paths_outside_committed_tree() {
+        assert_eq!(
+            resolve_tree_link(
+                ".agents/skills/phoenix-development",
+                "../../skills/phoenix-development"
+            ),
+            Some("skills/phoenix-development".to_string())
+        );
+        assert_eq!(
+            resolve_tree_link(".agents/skills/escape", "../../../outside"),
+            None
+        );
+        assert_eq!(resolve_tree_link(".agents/skills/escape", "/outside"), None);
+
+        let chained = HashMap::from([
+            (
+                ".agents/skills/phoenix-development".to_string(),
+                "../../aliases/development".to_string(),
+            ),
+            (
+                "aliases/development".to_string(),
+                "../skills/phoenix-development".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_tree_link_chain(".agents/skills/phoenix-development", &chained),
+            Some("skills/phoenix-development".to_string())
+        );
+        let cyclic = HashMap::from([
+            (".agents/skills/a".to_string(), "b".to_string()),
+            (".agents/skills/b".to_string(), "a".to_string()),
+        ]);
+        assert_eq!(resolve_tree_link_chain(".agents/skills/a", &cyclic), None);
+    }
+
+    #[test]
+    fn git_tree_skills_view_ignores_broken_and_escaping_symlinks() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../../missing", repo.path().join(".agents/skills/broken"))
+                .unwrap();
+            std::os::unix::fs::symlink(
+                "../../../outside",
+                repo.path().join(".agents/skills/escape"),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(
+                "../../missing",
+                repo.path().join(".agents/skills/broken"),
+            )
+            .unwrap();
+            std::os::windows::fs::symlink_dir(
+                "../../../outside",
+                repo.path().join(".agents/skills/escape"),
+            )
+            .unwrap();
+        }
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        assert!(!view.dir.join(".agents/skills/broken").exists());
+        assert!(!view.dir.join(".agents/skills/escape").exists());
     }
 
     #[test]
