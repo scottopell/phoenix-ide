@@ -11,9 +11,11 @@ rule:
     context: expect($$$).$MATCHER($$$)
     selector: expression_statement
   follows:
-    kind: expression_statement
-    has:
-      any:
-        - pattern: $DEFERRED.resolve($$$)
-        - pattern: $DEFERRED.reject($$$)
+    any:
+      - pattern:
+          context: $DEFERRED.resolve($$$);
+          selector: expression_statement
+      - pattern:
+          context: $DEFERRED.reject($$$);
+          selector: expression_statement
     stopBy: neighbor

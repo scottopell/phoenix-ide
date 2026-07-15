@@ -12,4 +12,7 @@ rule:
     - pattern: await new Promise(($RESOLVE) => setTimeout($RESOLVE, $DURATION))
     - pattern: await new Promise(($RESOLVE) => window.setTimeout($RESOLVE, $DURATION))
     - pattern: await new Promise(($RESOLVE) => globalThis.setTimeout($RESOLVE, $DURATION))
+    - pattern: await new Promise(($RESOLVE) => { setTimeout($RESOLVE, $DURATION); })
+    - pattern: await new Promise(($RESOLVE) => { window.setTimeout($RESOLVE, $DURATION); })
+    - pattern: await new Promise(($RESOLVE) => { globalThis.setTimeout($RESOLVE, $DURATION); })
     - pattern: await new Promise(function ($RESOLVE) { setTimeout($RESOLVE, $DURATION) })

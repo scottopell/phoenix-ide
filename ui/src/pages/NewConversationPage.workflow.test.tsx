@@ -86,19 +86,26 @@ function deferred<T>() {
 }
 
 async function settleValidation(options: { metadata?: 'started' | 'settled' } = {}) {
-  const path = screen.getAllByPlaceholderText('/path/to/project')[0]?.getAttribute('value');
-  await waitFor(() => expect(api.validateCwd).toHaveBeenCalledWith(path));
-  const validation = await vi.mocked(api.validateCwd).mock.results.at(-1)?.value;
+  const input = screen.getAllByPlaceholderText('/path/to/project')[0] as HTMLInputElement;
+  const path = input.value;
+  const validateCwd = vi.mocked(api.validateCwd);
+  await waitFor(() => expect(validateCwd).toHaveBeenCalledWith(path));
+  const validationIndex = validateCwd.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const validation = await validateCwd.mock.results[validationIndex]?.value;
   if (!validation?.is_git) return;
 
+  const listGitBranches = vi.mocked(api.listGitBranches);
+  const getTaskAvailability = vi.mocked(api.getProjectTaskAvailability);
   await waitFor(() => {
-    expect(api.listGitBranches).toHaveBeenCalledWith(path);
-    expect(api.getProjectTaskAvailability).toHaveBeenCalledWith(path);
+    expect(listGitBranches).toHaveBeenCalledWith(path);
+    expect(getTaskAvailability).toHaveBeenCalledWith(path);
   });
   if (options.metadata === 'started') return;
 
-  const branchRequest = vi.mocked(api.listGitBranches).mock.results.at(-1)?.value;
-  const availabilityRequest = vi.mocked(api.getProjectTaskAvailability).mock.results.at(-1)?.value;
+  const branchIndex = listGitBranches.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const availabilityIndex = getTaskAvailability.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const branchRequest = listGitBranches.mock.results[branchIndex]?.value;
+  const availabilityRequest = getTaskAvailability.mock.results[availabilityIndex]?.value;
   let availability: Awaited<typeof availabilityRequest>;
   await act(async () => {
     [, availability] = await Promise.all([branchRequest, availabilityRequest]);
