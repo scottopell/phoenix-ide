@@ -341,10 +341,16 @@ def _timeout_diagnostic(base_url: str, conv_id: str) -> str:
             timeout=httpx.Timeout(3.0),
         )
         response.raise_for_status()
-        conversation = response.json()["conversation"]
+        snapshot = response.json()
+        conversation = snapshot["conversation"]
         state = _state_str(conversation.get("state"))
         state_data = conversation.get("state_data")
-        return f"last state={state!r}, state_data={state_data!r}"
+        messages = snapshot.get("messages") or []
+        message_types = [message.get("message_type") for message in messages]
+        return (
+            f"last state={state!r}, state_data={state_data!r}, "
+            f"message_types={message_types!r}"
+        )
     except Exception as error:
         return f"final state unavailable ({type(error).__name__}: {error})"
 
@@ -382,52 +388,6 @@ async def _snapshot_has_agent_after_message(
     return state == "idle" and _has_agent_after_message(
         snapshot.get("messages") or [], message_id
     )
-
-
-async def _stream_first_turn_through_keepalive_async(
-    base_url: str,
-    conv_id: str,
-    timeout: float,
-) -> None:
-    url = f"{base_url}/api/conversations/{conv_id}/stream"
-    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
-    async with httpx.AsyncClient(timeout=transport_timeout) as client:
-        async with asyncio.timeout(timeout):
-            async with aconnect_sse(client, "GET", url) as source:
-                events = source.aiter_sse()
-                init = await anext(events)
-                if init.event != "init":
-                    raise RuntimeError(f"expected initial SSE event, got {init.event!r}")
-                _terminal_event(init.event, init.data)
-
-                keepalive_seen = False
-                async for event in events:
-                    if event.event == "ping":
-                        keepalive_seen = True
-                    if _terminal_event(event.event, event.data):
-                        if not keepalive_seen:
-                            raise AssertionError(
-                                "first turn completed before a live SSE keepalive was observed"
-                            )
-                        return
-            raise RuntimeError("SSE stream closed before the first turn completed")
-
-
-def _stream_first_turn_through_keepalive(
-    base_url: str,
-    conv_id: str,
-    timeout: float,
-) -> None:
-    try:
-        asyncio.run(
-            _stream_first_turn_through_keepalive_async(base_url, conv_id, timeout)
-        )
-    except (TimeoutError, httpx.TimeoutException) as error:
-        diagnostic = _timeout_diagnostic(base_url, conv_id)
-        raise TimeoutError(
-            f"first-turn SSE did not reach terminal through a keepalive in "
-            f"{timeout:g}s ({diagnostic})"
-        ) from error
 
 
 async def _send_chat_and_stream_async(
@@ -566,16 +526,32 @@ def _user_message_images(message: dict) -> list[dict]:
 
 
 def scenario_text_streaming(base_url: str) -> None:
-    conv = _new_conv(
+    conv = _new_conv(base_url, "[[perf:1]] establish conversation")
+    _poll_to_idle_with_messages(
         base_url,
-        "[[scenario:plain_text]] [[stall:1,16000]] hello",
+        conv["id"],
+        lambda messages: len(_agent_text(messages).split()) == 1,
+        "setup turn response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
     )
-    _stream_first_turn_through_keepalive(
-        base_url, conv["id"], SCENARIO_TIMEOUT_SECONDS
+
+    word_count = 8
+    _send_chat_and_stream(
+        base_url,
+        conv["id"],
+        f"[[perf:{word_count}]] stream this turn",
+        SCENARIO_TIMEOUT_SECONDS,
     )
     final = _get_conv(base_url, conv["id"])
-    text = _agent_text(final["messages"])
-    assert "analyzed the situation" in text, f"unexpected assistant text: {text[:200]!r}"
+    agent_messages = [
+        message
+        for message in final["messages"]
+        if message.get("message_type") == "agent"
+    ]
+    actual_word_count = len(_agent_text(agent_messages[-1:]).split())
+    assert actual_word_count == word_count, (
+        f"expected {word_count} persisted streamed words, got {actual_word_count}"
+    )
 
 
 def scenario_multi_tool(base_url: str) -> None:

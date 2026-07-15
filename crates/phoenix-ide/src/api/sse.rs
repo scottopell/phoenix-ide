@@ -18,6 +18,14 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+const CONVERSATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+fn conversation_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(CONVERSATION_KEEPALIVE_INTERVAL)
+        .event(Event::default().event("ping").data("ping"))
+}
+
 /// Stream `init_event` followed by broadcast events to an SSE client.
 ///
 /// On `BroadcastStreamRecvError::Lagged` — the client fell far enough behind
@@ -74,11 +82,7 @@ pub fn sse_stream(
     // alives. axum's `Event::data` drops empty-data events so the payload
     // MUST be non-empty; the listener bumps lastSseEventAt and discards
     // the body.
-    let sse = Sse::new(combined).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .event(Event::default().event("ping").data("ping")),
-    );
+    let sse = Sse::new(combined).keep_alive(conversation_keep_alive());
 
     let mut headers = HeaderMap::new();
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -1047,6 +1051,18 @@ mod tests {
         assert_eq!(typed["pending_anchor_sequence_id"], 5);
         assert_eq!(typed["pending_truncated"], false);
         assert!(typed["pending_events"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversation_keepalive_is_typed_ping_with_nonempty_data() {
+        let keep_alive = conversation_keep_alive();
+        let encoded = format!("{keep_alive:?}");
+
+        assert_eq!(CONVERSATION_KEEPALIVE_INTERVAL, Duration::from_secs(15));
+        assert!(
+            encoded.contains(r"event: ping\ndata: ping\n\n"),
+            "expected a client-observable typed ping keepalive: {encoded}"
+        );
     }
 
     #[test]
