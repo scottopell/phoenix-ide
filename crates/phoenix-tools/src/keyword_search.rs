@@ -47,6 +47,32 @@ fn parse_trailing_count(line: &[u8]) -> Option<usize> {
     tail.trim().parse::<usize>().ok()
 }
 
+/// Build the incompleteness notes for a result, one bracketed `[...]` line per
+/// applicable cause. Bracketed so the UI renderer surfaces them as notes rather
+/// than parsing them as file hits (see `parseKeywordSearchOutput`). Every result
+/// path funnels through this so no signal is dropped on any branch.
+fn incompleteness_notes(skipped_broad: usize, dropped: usize, capped: bool) -> String {
+    let mut s = String::new();
+    if skipped_broad > 0 {
+        let _ = write!(
+            s,
+            "\n\n[note: {skipped_broad} search term(s) skipped as too broad — narrow them to include their matches.]"
+        );
+    }
+    if dropped > 0 {
+        let _ = write!(
+            s,
+            "\n\n[note: {dropped} lower-priority term(s) dropped to fit the result budget — narrow your terms for full coverage.]"
+        );
+    }
+    if capped {
+        s.push_str(
+            "\n\n[results truncated: search scope is large — use more specific search terms for complete results.]",
+        );
+    }
+    s
+}
+
 /// Keyword search tool
 ///
 /// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir` and `llm_registry`
@@ -290,12 +316,15 @@ impl KeywordSearchTool {
     /// was the sole reason nothing is usable (ask for narrower terms); the
     /// probes ran and found nothing, possibly with some broad terms skipped (no
     /// matches); or cancellation fired mid-probe.
+    /// Returns `(usable_terms, broad_count)` on success — `broad_count` is the
+    /// number of terms skipped as too broad, which the caller surfaces as an
+    /// incompleteness note even when usable terms remain.
     async fn probe_usable_terms(
         &self,
         search_root: &Path,
         terms: &[String],
         cancel: &CancellationToken,
-    ) -> Result<Vec<String>, ToolOutput> {
+    ) -> Result<(Vec<String>, usize), ToolOutput> {
         let mut usable_terms = Vec::new();
         let mut broad_count = 0usize;
         let mut any_zero = false;
@@ -345,18 +374,19 @@ impl KeywordSearchTool {
                 ));
             }
             if broad_count > 0 {
-                // Keep the canonical empty sentinel on its own line so the UI
-                // still renders this as "no matches"; carry the skipped-term
-                // coverage warning as a bracketed note the renderer surfaces.
+                // Keep the canonical empty sentinel so the UI still renders this
+                // as "no matches"; carry the skipped-term coverage warning as a
+                // bracketed note the renderer surfaces.
                 return Err(ToolOutput::success(format!(
-                    "No matches found for the given search terms.\n\n[note: {broad_count} search term(s) skipped as too broad — narrow them to include their matches.]"
+                    "No matches found for the given search terms.{}",
+                    incompleteness_notes(broad_count, 0, false)
                 )));
             }
             return Err(ToolOutput::success(
                 "No matches found for the given search terms.",
             ));
         }
-        Ok(usable_terms)
+        Ok((usable_terms, broad_count))
     }
 
     /// Combined context scan over `usable_terms`, capped at `MAX_COMBINED_RESULTS`.
@@ -497,11 +527,11 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
         tracing::info!(root = %search_root.display(), terms = input.search_terms.len(), "keyword_search scope resolved");
 
-        let usable_terms = match self
+        let (usable_terms, skipped_broad) = match self
             .probe_usable_terms(&search_root, &input.search_terms, &ctx.cancel)
             .await
         {
-            Ok(terms) => terms,
+            Ok(t) => t,
             Err(terminal) => return terminal,
         };
 
@@ -519,21 +549,20 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         };
 
         if results.is_empty() || results == "No matches found" {
-            // The retained terms matched nothing — but if peeling dropped a
-            // term that *did* match (to fit the budget), say so rather than
-            // reporting a bare "no matches" that hides the dropped hits.
-            if dropped > 0 {
-                return ToolOutput::success(format!(
-                    "No matches found for the retained search terms. {dropped} lower-priority term(s) were dropped to fit the result budget; narrow your terms and retry to see their matches."
-                ));
-            }
-            return ToolOutput::success("No matches found for the given search terms.");
+            // Retained terms matched nothing. Keep the canonical empty sentinel
+            // (so the UI renders it as empty) and carry any incompleteness as
+            // bracketed notes — a broad term skipped or a matching lower-priority
+            // term dropped means "no matches" is not the whole story.
+            return ToolOutput::success(format!(
+                "No matches found for the given search terms.{}",
+                incompleteness_notes(skipped_broad, dropped, capped)
+            ));
         }
 
-        // Filter with LLM. The scope-truncation marker is appended to the FINAL
-        // output below, not folded into `results` here: folding it in would put
-        // it in the filter prompt, which returns a plain file list and can drop
-        // it — losing the signal that results are incomplete.
+        // Filter with LLM. Incompleteness notes are appended to the FINAL output
+        // below, not folded into `results` here: folding them in would put them
+        // in the filter prompt, which returns a plain file list and can drop
+        // them — losing the signal that results are incomplete.
         let filtered = match self
             .filter_with_llm(&ctx, &input.query, &search_root, &results)
             .await
@@ -543,8 +572,11 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
                 // If LLM fails, return raw results (size-truncated).
                 tracing::warn!(error = %e, "LLM filtering failed, returning raw results");
                 if results.len() > 8000 {
+                    // Distinct from the byte-cap note in `incompleteness_notes`:
+                    // this is a display-length cut of the *raw* fallback text,
+                    // not the search-scope truncation.
                     format!(
-                        "{}\n\n[results truncated]",
+                        "{}\n\n[raw output shortened for display]",
                         results.get(..8000).unwrap_or(&results)
                     )
                 } else {
@@ -553,23 +585,10 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             }
         };
 
-        // Signal incompleteness on the FINAL output. The two causes are
-        // independent and can co-occur: the retained terms' output still overran
-        // the ceiling (capped), and/or lower-priority terms were dropped to make
-        // it fit (dropped). Emit a marker for each that applies.
-        let mut output = filtered;
-        if dropped > 0 {
-            let _ = write!(
-                output,
-                "\n\n[note: {dropped} lower-priority term(s) were dropped to fit the result budget — narrow your terms for full coverage]"
-            );
-        }
-        if capped {
-            output.push_str(
-                "\n\n[results truncated: search scope is large — use more specific search terms for complete results]",
-            );
-        }
-        ToolOutput::success(output)
+        ToolOutput::success(format!(
+            "{filtered}{}",
+            incompleteness_notes(skipped_broad, dropped, capped)
+        ))
     }
 }
 
@@ -784,6 +803,29 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0, "absent term must count to zero");
+    }
+
+    /// `incompleteness_notes` must produce one single-line, fully-bracketed
+    /// `[...]` note per active cause (nothing when all are inactive), joined by
+    /// blank lines — the exact shape the UI note extractor relies on.
+    #[test]
+    fn incompleteness_notes_are_bracketed_per_cause() {
+        assert_eq!(incompleteness_notes(0, 0, false), "");
+
+        let all = incompleteness_notes(2, 3, true);
+        let notes: Vec<&str> = all.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert_eq!(notes.len(), 3, "one note per active cause");
+        for n in &notes {
+            assert!(!n.contains('\n'), "note must be single-line: {n}");
+            let inner = n
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("not bracketed: {n}"));
+            assert!(!inner.contains(']'), "stray ] in note: {n}");
+        }
+        assert!(notes[0].contains("skipped as too broad"));
+        assert!(notes[1].contains("dropped"));
+        assert!(notes[2].contains("truncated"));
     }
 
     /// A non-UTF-8 file path in `rg`'s output must not abort the probe: the
