@@ -48,7 +48,7 @@ fn oracle() -> AuthoritativeCreationOracle {
             requested_mode: Some(CreationMode::Direct),
             job_id: "job-shadow".to_owned(),
             conversation_id: "conv-shadow".to_owned(),
-            idempotency_key: "key".to_owned(),
+            idempotency_key: Some("key".to_owned()),
             workspace: CreationWorkspace::Worktree {
                 repository_path: "/repo".to_owned(),
                 worktree_path: "/repo/wt".to_owned(),

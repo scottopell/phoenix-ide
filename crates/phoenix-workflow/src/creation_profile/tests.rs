@@ -26,7 +26,7 @@ fn oracle(start: CreationStart) -> AuthoritativeCreationOracle {
             requested_mode: Some(CreationMode::Managed),
             job_id: "job-1".into(),
             conversation_id: "conv-1".into(),
-            idempotency_key: "request-1".into(),
+            idempotency_key: Some("request-1".into()),
             workspace: CreationWorkspace::Worktree {
                 repository_path: "/repo".into(),
                 worktree_path: "/repo-worktree".into(),

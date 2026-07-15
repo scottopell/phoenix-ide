@@ -156,6 +156,31 @@ pub struct CreationResourceReservation {
     pub repository_identity: String,
     pub resource_identity: String,
     pub status: String,
+    pub materialized_at: Option<DateTime<Utc>>,
+}
+
+struct CreationResourceReservationRow {
+    id: String,
+    job_id: String,
+    generation: i64,
+    repository_identity: String,
+    resource_identity: String,
+    status: String,
+    materialized_at: Option<String>,
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for CreationResourceReservationRow {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            job_id: row.try_get("job_id")?,
+            generation: row.try_get("generation")?,
+            repository_identity: row.try_get("repository_identity")?,
+            resource_identity: row.try_get("resource_identity")?,
+            status: row.try_get("status")?,
+            materialized_at: row.try_get("materialized_at")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -711,8 +736,8 @@ async fn insert_creation_shadow_evidence_tx(
         .map_err(|_| DbError::Serialization("attachment count exceeds i64".to_string()))?;
     sqlx::query(
         "INSERT INTO creation_shadow_creation_evidence
-         (creation_job_id, cwd, attachment_count, creation_kind, accepted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         (creation_job_id, cwd, attachment_count, creation_kind, client_idempotency_key, accepted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(&job.id)
     .bind(&job.intent.cwd)
@@ -726,6 +751,7 @@ async fn insert_creation_shadow_evidence_tx(
             "initial_turn"
         },
     )
+    .bind(job.message_id.as_deref())
     .bind(accepted_at)
     .execute(&mut **tx)
     .await?;
@@ -3809,7 +3835,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversation_creation_resource_reservations
-             SET status = 'present', updated_at = ?1
+             SET status = 'present', materialized_at = COALESCE(materialized_at, ?1), updated_at = ?1
              WHERE job_id = ?2 AND generation = ?3 AND resource_identity = ?4
                AND EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
@@ -3852,8 +3878,8 @@ impl Database {
         &self,
         job_id: &str,
     ) -> DbResult<Vec<CreationResourceReservation>> {
-        let rows: Vec<(String, String, i64, String, String, String)> = sqlx::query_as(
-            "SELECT id, job_id, generation, repository_identity, resource_identity, status
+        let rows: Vec<CreationResourceReservationRow> = sqlx::query_as(
+            "SELECT id, job_id, generation, repository_identity, resource_identity, status, materialized_at
              FROM conversation_creation_resource_reservations
              WHERE job_id = ?1 ORDER BY id",
         )
@@ -3861,20 +3887,19 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(
-                |(id, job_id, generation, repository_identity, resource_identity, status)| {
-                    Ok(CreationResourceReservation {
-                        id,
-                        job_id,
-                        generation: u64::try_from(generation).map_err(|_| {
-                            DbError::Serialization("negative reservation generation".to_string())
-                        })?,
-                        repository_identity,
-                        resource_identity,
-                        status,
-                    })
-                },
-            )
+            .map(|row| {
+                Ok(CreationResourceReservation {
+                    id: row.id,
+                    job_id: row.job_id,
+                    generation: u64::try_from(row.generation).map_err(|_| {
+                        DbError::Serialization("negative reservation generation".to_string())
+                    })?,
+                    repository_identity: row.repository_identity,
+                    resource_identity: row.resource_identity,
+                    status: row.status,
+                    materialized_at: row.materialized_at.map(|value| parse_datetime(&value)),
+                })
+            })
             .collect()
     }
 

@@ -56,7 +56,7 @@ pub struct CreationIntent {
     pub requested_mode: Option<CreationMode>,
     pub job_id: String,
     pub conversation_id: String,
-    pub idempotency_key: String,
+    pub idempotency_key: Option<String>,
     pub workspace: CreationWorkspace,
     pub attachment_ids: Vec<String>,
     pub start: CreationStart,

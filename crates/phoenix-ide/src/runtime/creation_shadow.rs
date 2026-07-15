@@ -30,6 +30,7 @@ struct CreationShadowEvidenceRow {
     uses_worktree: Option<i64>,
     branch_name: Option<String>,
     requested_mode: Option<String>,
+    client_idempotency_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -142,7 +143,7 @@ impl CreationShadowCoordinator {
             .await
             .map_err(|error| error.to_string())?;
         let preserved_evidence = sqlx::query(
-            "SELECT cwd, attachment_count, creation_kind, uses_worktree, branch_name, requested_mode
+            "SELECT cwd, attachment_count, creation_kind, uses_worktree, branch_name, requested_mode, client_idempotency_key
              FROM creation_shadow_creation_evidence
              WHERE creation_job_id = ?1 AND creation_kind IN ('initial_turn', 'seeded_empty')",
         )
@@ -157,6 +158,7 @@ impl CreationShadowCoordinator {
             uses_worktree: sqlx::Row::get(&row, "uses_worktree"),
             branch_name: sqlx::Row::get(&row, "branch_name"),
             requested_mode: sqlx::Row::get(&row, "requested_mode"),
+            client_idempotency_key: sqlx::Row::get(&row, "client_idempotency_key"),
         });
         if preserved_evidence
             .as_ref()
@@ -308,7 +310,8 @@ fn oracle_from_committed(
             requested_mode: creation_mode(preserved_evidence),
             job_id: job.id.clone(),
             conversation_id: job.conversation_id,
-            idempotency_key: job.id,
+            idempotency_key: preserved_evidence
+                .and_then(|evidence| evidence.client_idempotency_key.clone()),
             workspace: if uses_worktree {
                 CreationWorkspace::Worktree {
                     repository_path,
@@ -346,7 +349,7 @@ fn creation_mode(evidence: Option<&CreationShadowEvidenceRow>) -> Option<Creatio
 fn worktree_evidence(reservations: &[CreationResourceReservation]) -> WorktreeProvisioningEvidence {
     if reservations
         .iter()
-        .any(|reservation| matches!(reservation.status.as_str(), "present" | "released"))
+        .any(|reservation| reservation.materialized_at.is_some())
     {
         WorktreeProvisioningEvidence::Materialized
     } else if reservations.is_empty() {
@@ -563,6 +566,7 @@ fn creation_capabilities(flags: [bool; 6]) -> CreationCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     async fn database() -> Database {
         Database::open_in_memory().await.unwrap()
@@ -679,6 +683,7 @@ mod tests {
             uses_worktree: Some(0),
             branch_name: None,
             requested_mode: Some("auto".to_owned()),
+            client_idempotency_key: Some("message-1".to_owned()),
         };
         assert_eq!(creation_mode(Some(&evidence)), Some(CreationMode::Auto));
     }
@@ -692,6 +697,7 @@ mod tests {
             resource_identity: "/tmp/worktree".to_owned(),
             repository_identity: "/tmp/repo".to_owned(),
             status: "released".to_owned(),
+            materialized_at: Some(Utc::now()),
         };
         assert_eq!(
             cleanup_ownership(std::slice::from_ref(&reservation)),
@@ -701,6 +707,12 @@ mod tests {
             worktree_evidence(std::slice::from_ref(&reservation)),
             WorktreeProvisioningEvidence::Materialized
         );
+        reservation.materialized_at = None;
+        assert_eq!(
+            worktree_evidence(std::slice::from_ref(&reservation)),
+            WorktreeProvisioningEvidence::Reserved
+        );
+        reservation.materialized_at = Some(Utc::now());
 
         reservation.status = "reserved".to_owned();
         assert_eq!(

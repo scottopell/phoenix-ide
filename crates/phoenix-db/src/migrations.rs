@@ -2319,6 +2319,13 @@ ALTER TABLE creation_shadow_creation_evidence
 ALTER TABLE creation_shadow_creation_evidence
     ADD COLUMN branch_name TEXT;
 ALTER TABLE creation_shadow_creation_evidence
+    ADD COLUMN client_idempotency_key TEXT;
+ALTER TABLE conversation_creation_resource_reservations
+    ADD COLUMN materialized_at TEXT;
+UPDATE conversation_creation_resource_reservations
+SET materialized_at = updated_at
+WHERE status = 'present';
+ALTER TABLE creation_shadow_creation_evidence
     ADD COLUMN requested_mode TEXT
     CHECK (requested_mode IS NULL OR requested_mode IN ('direct', 'managed', 'branch', 'auto'));
 ";
