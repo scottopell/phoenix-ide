@@ -262,7 +262,8 @@ config {
 -- evidence_matches_resource(evidence, resource), evidence_occurrence_time(evidence)
 -- durable_terminal_evidence_at_or_before(binding, deadline)
 -- fired_payload_from(evidence), terminal_receipt_for(binding, payload)
--- subagent_resource_matches_child_conversation(resource), subagent_terminal_status_is_durable(evidence)
+-- subagent_resource_matches_child_conversation(resource), registering_conversation_owns_child(conversation, resource)
+-- subagent_terminal_status_is_durable(evidence)
 -- observable_reconciliation_applied(effect), no_external_replay_during_reconciliation(effect)
 -- cancellation_winner(binding), terminal_winner(binding)
 -- cancellation_compensation_plan(binding), compensation_does_not_kill_resource(binding)
@@ -310,6 +311,7 @@ rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     requires: resource.kind in {bash, tmux_window, subagent}
     requires: resource.kind in {bash, tmux_window} implies resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
     requires: resource.kind = subagent implies subagent_resource_matches_child_conversation(resource)
+    requires: resource.kind = subagent implies registering_conversation_owns_child(conversation, resource)
     requires: resource_identity_is_stable(resource)
     requires: wake_protocol_selection().authority = engine_protocol
     requires: wake_protocol_selection().accepting = true
@@ -354,6 +356,7 @@ rule RegistrationScheduleUsesDefaultBound {
     when: WakeRegistrationRequested(agent, conversation, resource, omitted, tool_use_id)
     requires: resource.kind in {bash, tmux_window} implies resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
     requires: resource.kind = subagent implies subagent_resource_matches_child_conversation(resource)
+    requires: resource.kind = subagent implies registering_conversation_owns_child(conversation, resource)
     ensures: WakeRegistrationRequested(agent, conversation, resource,
         config.default_max_wait_seconds, tool_use_id)
 }
@@ -361,7 +364,10 @@ rule RegistrationScheduleUsesDefaultBound {
 rule RegistrationRejectsForeignOrUnstableResource {
     when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
     requires: resource.kind in {bash, tmux_window} and not resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
-        or resource.kind = subagent and not subagent_resource_matches_child_conversation(resource)
+        or resource.kind = subagent and (
+            not subagent_resource_matches_child_conversation(resource)
+            or not registering_conversation_owns_child(conversation, resource)
+        )
         or not resource_identity_is_stable(resource)
     ensures: WakeRegistrationRejected("wake_unauthorized_handle")
     ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)

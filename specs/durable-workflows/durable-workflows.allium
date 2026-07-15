@@ -489,6 +489,7 @@ entity ShadowDivergence {
 -- manual_choice_is_control_only(choice), manual_choice_creates_terminal_receipt(choice)
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- no_owed_acceptance_for_inbox(inbox)
+-- profile_event_is_success_terminal(payload), profile_event_is_failure_terminal(payload)
 -- duplicate_acceptance_starts_no_product_action(owed)
 -- reducer_authorized_suppression(decision, owed, reason)
 -- suppression_disposes_exact_inbox_atomically(owed, decision)
@@ -533,7 +534,8 @@ rule SelectProfileProtocolForAcceptance {
     requires: profile_executor_and_codecs_available(selection)
     requires: selector_cutover_authorized(selection)
     requires: selector_has_no_blocking_divergence(selection)
-    ensures: ExactlyOneAcceptingSelectionPersistedAtomically(selection.profile, selection)
+    ensures: ExactlyOneAcceptingSelectionPersistedAtomically(selection.profile.profile_id, selection)
+    ensures: all_competing_protocol_versions_closed_atomically(selection.profile.profile_id, selection)
 }
 
 rule DrainProfileProtocol {
@@ -1243,6 +1245,8 @@ rule ReducerAcceptsInboxEvent {
     ensures: committed_transition_for_decision(inbox.workflow, decision) != null
     ensures: inbox.delivery_status = consumed
     ensures: inbox.consumed_by = committed_transition_for_decision(inbox.workflow, decision)
+    ensures: profile_event_is_success_terminal(inbox.event_payload) implies inbox.workflow.status = completed
+    ensures: profile_event_is_failure_terminal(inbox.event_payload) implies inbox.workflow.status = failed
 }
 
 rule ReducerInboxAcceptanceVersionConflict {
@@ -1573,7 +1577,7 @@ invariant ReducerDeliveryAndRuntimeAcceptanceAreDisjoint {
 }
 
 invariant ProfileAcceptanceCapabilityIsStructural {
-    every_consumed_reducer_inbox_for_a_profile_without_runtime_acceptance_has_no_owed_acceptance_and_every_consumed_reducer_inbox_for_a_profile_with_runtime_acceptance_creates_exactly_one_owed_acceptance_atomically
+    every_consumed_runtime_acceptance_payload_inbox_for_a_profile_with_runtime_acceptance_creates_exactly_one_owed_acceptance_atomically_and_other_consumed_inboxes_create_none
 }
 
 invariant BarrierReceiptCompatibilityIsTyped {
