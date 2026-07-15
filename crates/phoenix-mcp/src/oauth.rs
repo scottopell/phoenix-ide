@@ -352,6 +352,15 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value, String
         .map_err(|e| format!("GET {url}: invalid JSON: {e}"))
 }
 
+fn origin_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let mut origin = parsed;
+    origin.set_path("");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    Some(origin.to_string().trim_end_matches('/').to_string())
+}
+
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -386,6 +395,23 @@ fn prm_well_known_candidates(mcp_url: &str) -> Vec<String> {
     }
     candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
     candidates
+}
+
+fn auth_server_issuer_from_metadata(doc: &Value) -> Option<&str> {
+    let issuer = doc.get("issuer").and_then(Value::as_str).unwrap_or("");
+    let authorization_endpoint = doc
+        .get("authorization_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let token_endpoint = doc
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if issuer.is_empty() || authorization_endpoint.is_empty() || token_endpoint.is_empty() {
+        None
+    } else {
+        Some(issuer)
+    }
 }
 
 /// Locate the Protected Resource Metadata for an MCP endpoint (REQ-MCP-009):
@@ -424,6 +450,38 @@ pub async fn fetch_protected_resource_metadata(
             Err(e) => errors.push(e),
         }
     }
+    // Compatibility fallback for providers that protect an MCP resource with
+    // OAuth but have not yet published RFC 9728 Protected Resource Metadata.
+    // If the configured resource origin itself serves RFC 8414/OIDC
+    // Authorization Server Metadata, treat that origin as the advertised AS.
+    // The normal AS metadata resolver will then accept the metadata's declared
+    // issuer as the registration key under resource-advertised trust. This
+    // keeps PRM-first behavior while unblocking servers like Atlassian's hosted
+    // MCP endpoint.
+    if let Some(origin) = origin_from_url(mcp_url) {
+        for candidate in as_metadata_candidates(&origin) {
+            match fetch_json(client, &candidate).await {
+                Ok(doc) => {
+                    let Some(issuer) = auth_server_issuer_from_metadata(&doc) else {
+                        errors.push(format!("{candidate}: not authorization server metadata"));
+                        continue;
+                    };
+                    tracing::warn!(
+                        mcp_url = %mcp_url,
+                        metadata_url = %candidate,
+                        issuer = %issuer,
+                        "protected resource metadata missing; falling back to same-origin authorization server metadata"
+                    );
+                    return Ok(ProtectedResourceMetadata {
+                        authorization_servers: vec![origin],
+                        scopes_supported: Vec::new(),
+                    });
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+
     Err(format!(
         "protected resource metadata not found (RFC 9728): {}",
         errors.join("; ")
@@ -1072,6 +1130,38 @@ mod tests {
             prm_well_known_candidates("https://h.example/"),
             vec!["https://h.example/.well-known/oauth-protected-resource"]
         );
+    }
+
+    #[test]
+    fn origin_from_resource_drives_same_origin_authorization_metadata_candidates() {
+        let origin = origin_from_url("https://mcp.atlassian.com/v1/mcp").expect("origin");
+        assert_eq!(origin, "https://mcp.atlassian.com");
+        assert_eq!(
+            as_metadata_candidates(&origin),
+            vec![
+                "https://mcp.atlassian.com/.well-known/oauth-authorization-server",
+                "https://mcp.atlassian.com/.well-known/openid-configuration",
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_server_metadata_issuer_requires_core_fields() {
+        let metadata = serde_json::json!({
+            "issuer": "https://cf.mcp.atlassian.com",
+            "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
+            "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
+        });
+        assert_eq!(
+            auth_server_issuer_from_metadata(&metadata),
+            Some("https://cf.mcp.atlassian.com")
+        );
+
+        let incomplete = serde_json::json!({
+            "issuer": "https://cf.mcp.atlassian.com",
+            "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
+        });
+        assert_eq!(auth_server_issuer_from_metadata(&incomplete), None);
     }
 
     #[test]

@@ -2960,6 +2960,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_discovery_falls_back_to_same_origin_as_metadata_when_prm_missing() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![status_response(
+            401,
+            &[("www-authenticate", "Bearer realm=\"OAuth\"")],
+        )]);
+        let base = server.base();
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            status_response(404, &[]),
+        );
+        server.route(
+            "/.well-known/oauth-protected-resource",
+            status_response(404, &[]),
+        );
+        server.route(
+            "/.well-known/oauth-authorization-server",
+            json_doc(&serde_json::json!({
+                // Atlassian serves this document from the MCP resource origin
+                // while declaring a different issuer. Resource-advertised trust
+                // must still accept the declared issuer as the registration key.
+                "issuer": format!("{base}/issuer"),
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+        );
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({
+                "client_id": "cid-1",
+                "token_endpoint_auth_method": "none",
+            })),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+
+        let err = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("unauthorized connect must surface auth URL");
+        assert!(err.contains("requires OAuth authorization"), "got: {err}");
+
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let params = query_params(&auth_url);
+        assert_eq!(params.get("client_id").map(String::as_str), Some("cid-1"));
+        assert_eq!(
+            params.get("resource").map(String::as_str),
+            Some(oauth::canonical_resource(&server.url).as_str())
+        );
+
+        let registration = manager
+            .oauth
+            .store()
+            .registration(&format!("{base}/issuer"))
+            .await
+            .unwrap()
+            .expect("registration persisted under declared issuer");
+        assert_eq!(registration.client_id, "cid-1");
+    }
+
+    #[tokio::test]
     async fn cached_registration_with_stale_redirect_is_reregistered() {
         let server = TestServer::start(vec![]).await;
         server.push_responses(vec![unauthorized(&server)]);
