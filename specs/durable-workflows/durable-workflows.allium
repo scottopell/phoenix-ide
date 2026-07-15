@@ -490,6 +490,7 @@ entity ShadowDivergence {
 -- runtime_acceptance_state_persisted(workflow, inbox)
 -- duplicate_acceptance_starts_no_product_action(owed)
 -- reducer_authorized_suppression(decision, owed, reason)
+-- suppression_disposes_exact_inbox_atomically(owed, decision)
 -- all_current_generation_compensation_effects_terminal(workflow)
 -- manual_retry_deadline(choice), compensation_plan_declared_from_manual_choice(effect, choice)
 -- manual_suppression_committed(effect, choice)
@@ -688,6 +689,7 @@ rule RejectConflictingExternalAcceptanceKey {
 
 rule RejectUnsupportedExternalAcceptanceCodec {
     when: ExternalWorkflowAcceptanceRequested(client, request)
+    requires: external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key) = null
     requires: not profile_has_lossless_decoder(request.profile, request.snapshot_codec)
     ensures: ExternalAcceptanceOutcome(unsupported_codec)
     ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
@@ -696,6 +698,7 @@ rule RejectUnsupportedExternalAcceptanceCodec {
 rule RejectUnavailableExternalAcceptance {
     when: ExternalWorkflowAcceptanceRequested(client, request)
     let selection = accepting_selection_for(request.profile)
+    requires: external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key) = null
     requires: selection.accepting != true
         or selection.external_acceptance_enabled != true
         or not profile_executor_available(request.profile)
@@ -1102,6 +1105,7 @@ rule CommitControlOnlyManualResolution {
     requires: resolution.status = required
     requires: manual_choice_permitted(resolution, choice)
     requires: manual_choice_is_control_only(choice)
+    requires: accepted_receipt_count(resolution.effect) = 0
     requires: expected_workflow_version = resolution.workflow.version
     requires: resolution.effect.generation = resolution.workflow.generation
     requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
@@ -1142,6 +1146,20 @@ rule RejectUnavailableTerminalManualResolutionChoice {
     requires: accepted_receipt_count(resolution.effect) = 1
     ensures: ManualResolutionOutcome(closed_or_unavailable)
     ensures: resolution.status = required
+}
+
+rule RejectUnavailableControlOnlyManualResolutionChoice {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: manual_choice_permitted(resolution, choice)
+    requires: manual_choice_is_control_only(choice)
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
+    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.codec)
+    requires: accepted_receipt_count(resolution.effect) = 1
+    ensures: ManualResolutionOutcome(closed_or_unavailable)
+    ensures: resolution.status = required
+    ensures: manual_resolution_choice_rejection_is_non_mutating(resolution)
 }
 
 rule RejectUnpermittedManualResolutionChoice {
@@ -1248,6 +1266,7 @@ rule ReducerSuppressesOwedAcceptance {
     requires: reducer_authorized_suppression(decision, owed, operator_rejected)
     ensures: owed.status = suppressed
     ensures: owed.suppression_reason = operator_rejected
+    ensures: suppression_disposes_exact_inbox_atomically(owed, decision)
 }
 
 rule EnforceDerivedCapability {

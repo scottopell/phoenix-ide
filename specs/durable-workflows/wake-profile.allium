@@ -25,7 +25,16 @@ enum WakeForgottenReason {
 }
 enum BashTerminalStatus { exited | killed | kill_pending_kernel }
 enum TmuxTerminalStatus { exit_marker_observed | window_killed }
-enum SubagentTerminalStatus { completed | failed | cancelled }
+enum SubagentTerminalStatus {
+    submit_result
+    | submit_error
+    | wall_clock_timeout
+    | independently_observed_cancellation
+    | turn_limit_hard_stop
+    | implicit_text_completion
+    | runtime_failure
+    | context_exhausted
+}
 enum WakeObligationSuppressionReason { lifecycle_terminal | superseded }
 enum WakeRegistrationFenceStatus { open | closed }
 enum LifecycleFenceStatus { open | closed }
@@ -51,7 +60,6 @@ value TmuxResourceIdentity {
 }
 
 value SubagentResourceIdentity {
-    work_scope: WorkScopeIdentity
     child_conversation_id: String
 }
 
@@ -126,7 +134,6 @@ value WakeFiredPayload {
 
 value WakeTerminalPayload {
     contract_id: String
-    resource: WakeResourceIdentity
     cause: WakeTerminalCause
     fired: WakeFiredPayload? when cause = fired
     cancellation_reason: WakeCancellationReason? when cause = cancelled
@@ -381,14 +388,15 @@ rule RegistrationRejectsClosedOrUnavailableConversation {
 rule EvidenceScheduleRecordsReconciliationObservation {
     when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
     requires: binding.observe_effect.status not in {receipted, invalidated}
-    requires: active_claim_authority(binding.observe_effect) = binding.authority
+    let authority = active_claim_authority(binding.observe_effect)
+    requires: authority != null
     requires: evidence_matches_resource(evidence, binding.resource)
     requires: evidence.kind = subagent implies subagent_resource_matches_child_conversation(binding.resource)
     requires: evidence.kind = subagent implies subagent_terminal_status_is_durable(evidence)
     ensures: observable_reconciliation_applied(binding.observe_effect)
     ensures: no_external_replay_during_reconciliation(binding.observe_effect)
     ensures: WakeEvidenceRecorded(binding, evidence, evidence_occurrence_time(evidence))
-    ensures: CoreObservationRequestedForWake(binding.observe_effect, binding.authority, evidence)
+    ensures: CoreObservationRequestedForWake(binding.observe_effect, authority, evidence)
 }
 
 rule EvidenceBeforeDeadlineWins {
@@ -398,7 +406,7 @@ rule EvidenceBeforeDeadlineWins {
     requires: terminal_winner(binding) = evidence
 
     let payload = WakeTerminalPayload{
-        contract_id: binding.contract_id, resource: binding.resource,
+        contract_id: binding.contract_id,
         cause: fired, fired: fired_payload_from(evidence), resolved_at: now()
     }
     ensures: terminal_receipt_for(binding, payload)
@@ -411,7 +419,7 @@ rule DeadlineScheduleExpiresEvaluableResource {
     requires: resource_is_evaluable(binding.resource)
     requires: terminal_winner(binding) = deadline
     ensures: terminal_receipt_for(binding, WakeTerminalPayload{
-        contract_id: binding.contract_id, resource: binding.resource,
+        contract_id: binding.contract_id,
         cause: expired, resolved_at: now
     })
 }
@@ -423,7 +431,7 @@ rule DeadlineScheduleForgetsUnevaluableResource {
     requires: not resource_is_evaluable(binding.resource)
     requires: terminal_winner(binding) = forgotten
     ensures: terminal_receipt_for(binding, WakeTerminalPayload{
-        contract_id: binding.contract_id, resource: binding.resource,
+        contract_id: binding.contract_id,
         cause: forgotten,
         forgotten_reason: forgotten_reason_for_deadline_unevaluable(binding.resource),
         resolved_at: now
@@ -436,7 +444,7 @@ rule StartupScheduleForgetsUnevaluableResourceImmediately {
     requires: not resource_is_evaluable(binding.resource)
     requires: terminal_winner(binding) = forgotten
     ensures: terminal_receipt_for(binding, WakeTerminalPayload{
-        contract_id: binding.contract_id, resource: binding.resource,
+        contract_id: binding.contract_id,
         cause: forgotten,
         forgotten_reason: forgotten_reason_for_startup_forget(binding.resource),
         resolved_at: now()
@@ -452,7 +460,7 @@ rule CancellationScheduleArbitratesAndCompensates {
     ensures: cancellation_compensation_plan(binding)
     ensures: compensation_does_not_kill_resource(binding)
     ensures: terminal_receipt_for(binding, WakeTerminalPayload{
-        contract_id: binding.contract_id, resource: binding.resource,
+        contract_id: binding.contract_id,
         cause: cancelled, cancellation_reason: explicit_cancel, resolved_at: now()
     })
     ensures: no_resume_scheduled_only_for_cancel(binding)

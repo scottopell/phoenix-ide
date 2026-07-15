@@ -32,6 +32,41 @@ new acceptances.
    new creation acceptances while legacy jobs drain.
 5. Retire each legacy scheduler only after durable zero-authority proof.
 
+## Workflow Migration Register
+
+Every temporal subsystem is tracked through one migration register. Each entry
+records the subsystem, current semantic authority, target workflow profile,
+shadow-parity evidence, cutover gate, rollback selector, complete drain-proof
+identity, and remaining authority-retirement debt. Creation and wake are active
+entries; sub-agents, tool execution, and later temporal subsystems remain visible
+until their direct orchestration paths are retired.
+
+| Subsystem | Current authority | Target profile | Migration state | Retirement debt |
+| --- | --- | --- | --- | --- |
+| Wake | Mixed legacy and engine paths | Wake workflow | Engine integration and parity hardening | Legacy registration, scheduling, and delivery paths |
+| Creation | Legacy creation worker | Creation workflow | Non-authoritative shadow comparison | Legacy worker and cleanup orchestration |
+| Sub-agents | Conversation runtime/state machine | Sub-agent workflow | Tracked for profile specification and shadow adoption | Direct spawn, timeout, cancellation, continuation, and terminal delivery |
+| Tool execution | Conversation runtime | Typed effect execution | Profile inventory required | Ad hoc retry and recovery paths |
+
+A profile may accept engine-authoritative work only after:
+
+1. deterministic and representative production schedule classes pass;
+2. blocking divergence count is zero;
+3. mixed-authority user semantics match;
+4. required executors and codecs are available;
+5. rollback selection is verified; and
+6. operator authorization is recorded.
+
+A protocol may retire only after its selector is closed and a category-complete
+proof reports no nonterminal workflows, executable effects, live claims, pending
+reducer inboxes, owed runtime acceptances, unresolved manual resolutions, or
+blocking divergences.
+
+New temporal features are reviewed against the same checklist: semantic
+authority, restart boundary, idempotency key, claim and attempt fence, ambiguous
+external-work reconciliation, lifecycle and drain behavior, and explicit
+retirement debt for any path that does not extend the target workflow profile.
+
 ## Requirement Coverage
 
 | Requirement group | Status | Intended verification / code surface |

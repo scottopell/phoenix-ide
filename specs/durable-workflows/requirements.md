@@ -405,6 +405,14 @@ reconciliation SHALL forget an unrecoverable non-terminal wake before normal
 serving resumes rather than waiting for the original deadline. Each accepted
 contract SHALL yield exactly one terminal receipt.
 
+Sub-agent terminal waits SHALL be a first-class wake substrate. Their durable
+resource identity SHALL be the child conversation or agent ID, independent of
+the parent's WorkScope. Observation SHALL use persisted child terminal evidence
+and SHALL preserve the exact durable child terminal cause required by
+`specs/subagents/requirements.md`; it SHALL NOT collapse distinct causes into a
+generic failed state. Parent scope and continuation SHALL govern delivery
+ownership without changing child resource identity.
+
 ### REQ-DWF-WAKE-003: Delivery, Coalescing, and Acceptance
 
 A wake terminal receipt SHALL enter the existing product reducer, which SHALL
