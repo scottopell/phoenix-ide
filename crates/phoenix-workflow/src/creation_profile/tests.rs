@@ -320,7 +320,7 @@ fn adapter_has_no_execution_or_semantic_authority_leakage() {
     ));
     assert_eq!(adapter.workflow.semantic_authority, None);
     let protocol = adapter.workflow.binding.accepted_protocol();
-    assert_eq!(protocol.authority, SemanticAuthority::LegacyProtocol);
+    assert_eq!(protocol.authority, SemanticAuthority::EngineProtocol);
     assert!(!protocol.runtime_acceptance_enabled);
     assert!(!protocol.external_acceptance_enabled);
     assert_eq!(
