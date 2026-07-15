@@ -6588,7 +6588,8 @@ def _prod_display_url(env: dict[str, str] | None = None) -> str:
     if url := env.get("PHOENIX_PUBLIC_URL"):
         return url
     scheme = "https" if tls_enabled_from_env(env) else "http"
-    return f"{scheme}://localhost:{PROD_PORT}"
+    port = env.get("PHOENIX_PORT", str(PROD_PORT))
+    return f"{scheme}://localhost:{port}"
 
 
 def _prod_local_health_url(env: dict[str, str] | None = None) -> str:
@@ -7249,6 +7250,49 @@ def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
         return None
 
 
+def _resolve_rollback_identity(
+    rollback_binary: Path,
+    previous_env: dict[str, str],
+) -> tuple[dict[str, str], str, bool, bool]:
+    previous_identity = _current_prod_identity(previous_env)
+    previous_health_url, previous_health_insecure_tls = _launchd_health_probe(previous_env)
+    previous_health_json = previous_identity is not None
+    rollback_identity = None
+    try:
+        rollback_identity = _binary_identity(rollback_binary)
+    except (OSError, subprocess.SubprocessError, SystemExit):
+        if previous_identity is not None:
+            raise SystemExit(
+                "installed production identity is unavailable; refusing an unverifiable rollback"
+            )
+    if previous_identity is None:
+        legacy = _legacy_prod_identity(previous_env)
+        if legacy is not None:
+            previous_identity, previous_health_url, previous_health_insecure_tls = legacy
+            previous_health_json = False
+        elif rollback_identity is not None:
+            previous_identity = rollback_identity
+            previous_health_json = True
+        else:
+            raise SystemExit(
+                "installed production identity is unavailable; refusing an unverifiable rollback"
+            )
+    if rollback_identity is not None and not _rollback_identity_matches(
+        rollback_identity,
+        previous_identity,
+        previous_health_json,
+    ):
+        raise SystemExit(
+            "staged rollback binary identity does not exactly match the previous production identity"
+        )
+    return (
+        previous_identity,
+        previous_health_url,
+        previous_health_insecure_tls,
+        previous_health_json,
+    )
+
+
 def _release_asset_name() -> str:
     import platform
     machine = platform.machine().lower()
@@ -7546,32 +7590,16 @@ def launchd_prod_deploy(release: str | None = None):
             shutil.copy2(LAUNCHD_PLIST_PATH, rollback_plist)
             rollback_plist.chmod(0o600)
         previous_env = _launchd_env_from_plist(rollback_plist) if rollback_plist.exists() else {}
-        previous_identity = _current_prod_identity(previous_env)
+        previous_identity = None
         previous_health_url, previous_health_insecure_tls = _launchd_health_probe(previous_env)
-        previous_health_json = previous_identity is not None
+        previous_health_json = False
         if target_binary.exists():
-            try:
-                rollback_identity = _binary_identity(rollback_binary)
-            except (OSError, subprocess.SubprocessError, SystemExit) as exc:
-                raise SystemExit(
-                    "installed production identity is unavailable; refusing an unverifiable rollback"
-                ) from exc
-            if previous_identity is None:
-                legacy = _legacy_prod_identity(previous_env)
-                if legacy is not None:
-                    previous_identity, previous_health_url, previous_health_insecure_tls = legacy
-                    previous_health_json = False
-                else:
-                    previous_identity = rollback_identity
-                    previous_health_json = True
-            if not _rollback_identity_matches(
-                rollback_identity,
+            (
                 previous_identity,
+                previous_health_url,
+                previous_health_insecure_tls,
                 previous_health_json,
-            ):
-                raise SystemExit(
-                    "staged rollback binary identity does not exactly match the previous production identity"
-                )
+            ) = _resolve_rollback_identity(rollback_binary, previous_env)
 
         helper = staging / "activate.py"
         _materialize_helper(source_commit, helper, source_kind)
@@ -7734,7 +7762,11 @@ def launchd_prod_status():
 
     print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
 
-    status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
+    try:
+        status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        status_env = {}
+        print(f"  Config: unreadable launchd plist ({type(exc).__name__})")
     identity = _current_prod_identity(status_env)
     if identity is None:
         legacy = _legacy_prod_identity(status_env)

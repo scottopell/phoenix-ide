@@ -149,6 +149,30 @@ def atomic_install(staged: Path, target: Path, mode: int) -> None:
     fsync_dir(target.parent)
 
 
+def prepare_atomic_install(staged: Path, target: Path, mode: int) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.install-", dir=target.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as destination:
+            fd = -1
+            with staged.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        return Path(temporary)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def commit_atomic_install(prepared: Path, target: Path) -> None:
+    os.replace(prepared, target)
+    fsync_dir(target.parent)
+
+
 def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = None, rollback_failure: Optional[str] = None) -> None:
     status = {
         "transaction_id": manifest.transaction_id,
@@ -306,7 +330,11 @@ def restore_deployed_sha(manifest: Manifest) -> None:
         atomic_write(deployed_sha, (manifest.previous_deployed_sha + "\n").encode(), 0o600)
 
 
-def restore(manifest: Manifest, launchctl: Launchctl) -> None:
+def restore(
+    manifest: Manifest,
+    launchctl: Launchctl,
+    prepared_rollback: Optional[tuple[Path, Path]] = None,
+) -> None:
     try:
         launchctl.stop()
     except ActivationError:
@@ -323,10 +351,15 @@ def restore(manifest: Manifest, launchctl: Launchctl) -> None:
             raise ActivationError("failed first-install candidate remains loaded")
         restore_deployed_sha(manifest)
         return
-    rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
-    rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
-    atomic_install(rollback_binary, Path(manifest.target_binary), 0o755)
-    atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
+    if prepared_rollback is None:
+        rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+        rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
+        atomic_install(rollback_binary, Path(manifest.target_binary), 0o755)
+        atomic_install(rollback_plist, Path(manifest.target_plist), 0o600)
+    else:
+        prepared_binary, prepared_plist = prepared_rollback
+        commit_atomic_install(prepared_binary, Path(manifest.target_binary))
+        commit_atomic_install(prepared_plist, Path(manifest.target_plist))
     old_pid = launchctl.inspect()[1]
     launchctl.start(old_pid)
     if (
@@ -376,16 +409,36 @@ def activate(manifest: Manifest) -> str:
         except BlockingIOError as exc:
             raise ConcurrentDeploy("another deployment is already activating") from exc
 
+        prepared_installs: list[Path] = []
+        prepared_rollback: Optional[tuple[Path, Path]] = None
         try:
             candidate_binary = verify_staged(manifest.candidate_binary, manifest.candidate_binary_sha256, "candidate binary")
             candidate_plist = verify_staged(manifest.candidate_plist, manifest.candidate_plist_sha256, "candidate plist")
             with candidate_plist.open("rb") as stream:
                 plistlib.load(stream)
+            prepared_candidate_binary = prepare_atomic_install(
+                candidate_binary, Path(manifest.target_binary), 0o755
+            )
+            prepared_installs.append(prepared_candidate_binary)
+            prepared_candidate_plist = prepare_atomic_install(
+                candidate_plist, Path(manifest.target_plist), 0o600
+            )
+            prepared_installs.append(prepared_candidate_plist)
+            prepared_candidate = (prepared_candidate_binary, prepared_candidate_plist)
             if manifest.previous is not None:
-                verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
+                rollback_binary = verify_staged(manifest.rollback_binary, manifest.rollback_binary_sha256, "rollback binary")
                 rollback_plist = verify_staged(manifest.rollback_plist, manifest.rollback_plist_sha256, "rollback plist")
                 with rollback_plist.open("rb") as stream:
                     plistlib.load(stream)
+                prepared_rollback_binary = prepare_atomic_install(
+                    rollback_binary, Path(manifest.target_binary), 0o755
+                )
+                prepared_installs.append(prepared_rollback_binary)
+                prepared_rollback_plist = prepare_atomic_install(
+                    rollback_plist, Path(manifest.target_plist), 0o600
+                )
+                prepared_installs.append(prepared_rollback_plist)
+                prepared_rollback = (prepared_rollback_binary, prepared_rollback_plist)
             elif any((
                 manifest.rollback_binary,
                 manifest.rollback_binary_sha256,
@@ -394,6 +447,8 @@ def activate(manifest: Manifest) -> str:
             )):
                 raise ActivationError("first-install rollback inputs are inconsistent")
         except Exception as exc:
+            for prepared in prepared_installs:
+                prepared.unlink(missing_ok=True)
             write_status(manifest, "precondition_failed", failure=str(exc))
             raise
 
@@ -403,8 +458,8 @@ def activate(manifest: Manifest) -> str:
         try:
             old_pid = launchctl.stop()
             disrupted = True
-            atomic_install(candidate_binary, Path(manifest.target_binary), 0o755)
-            atomic_install(candidate_plist, Path(manifest.target_plist), 0o600)
+            commit_atomic_install(prepared_candidate[0], Path(manifest.target_binary))
+            commit_atomic_install(prepared_candidate[1], Path(manifest.target_plist))
             launchctl.start(old_pid)
             wait_for_identity(manifest, manifest.expected)
             atomic_write(Path(manifest.deployed_sha_path), (manifest.source_commit + "\n").encode(), 0o600)
@@ -417,12 +472,15 @@ def activate(manifest: Manifest) -> str:
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
             try:
-                restore(manifest, launchctl)
+                restore(manifest, launchctl, prepared_rollback)
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 write_status(manifest, "activation_failed_rollback_failed", failure=failure, rollback_failure=str(rollback_exc))
                 return "activation_failed_rollback_failed"
+        finally:
+            for prepared in prepared_installs:
+                prepared.unlink(missing_ok=True)
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
