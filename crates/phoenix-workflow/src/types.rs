@@ -96,6 +96,7 @@ pub enum WorkflowStatus {
     Cancelling,
     Cancelled,
     DeletionPending,
+    Deleted,
     Completed,
     Failed,
 }
@@ -719,6 +720,7 @@ pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_codec: CodecRef,
     pub transition_event: P::Event,
     pub next_status: WorkflowStatus,
+    pub retry_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

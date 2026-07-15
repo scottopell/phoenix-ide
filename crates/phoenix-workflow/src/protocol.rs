@@ -224,7 +224,10 @@ fn nonterminal_workflows_evidence<P: WorkflowProfile>(
 ) -> DrainCategoryEvidence {
     let terminal = matches!(
         workflow.status,
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+        WorkflowStatus::Cancelled
+            | WorkflowStatus::Deleted
+            | WorkflowStatus::Completed
+            | WorkflowStatus::Failed
     );
     DrainCategoryEvidence {
         count: usize::from(!terminal),

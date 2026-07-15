@@ -736,6 +736,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(stale.outcome, CommitOutcome::VersionConflict);
@@ -756,6 +757,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(invalid.outcome, CommitOutcome::InvalidPlan);
@@ -777,6 +779,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(committed.outcome, CommitOutcome::Committed);
@@ -851,6 +854,7 @@ fn manual_resolution_version_has_matching_transition_history() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::Committed);
@@ -893,7 +897,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         snapshot: "accepted",
         snapshot_codec: codec("snapshot"),
         event: "consume",
-        event_codec: codec("event"),
+        event_codec: codec("receipt-event"),
         effects: vec![],
         dependencies: vec![],
         barriers: vec![],
@@ -955,7 +959,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
                     snapshot: "wrong-terminal",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
-                    event_codec: codec("event"),
+                    event_codec: codec("terminal"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -1243,6 +1247,7 @@ fn invalid_manual_resolution_does_not_mutate_state() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -1344,6 +1349,7 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(
@@ -1400,7 +1406,7 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
                     snapshot: "accepted",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -1442,7 +1448,7 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
                     snapshot: "accepted",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -1621,7 +1627,7 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
                     snapshot: "consumed",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -1679,7 +1685,7 @@ fn runtime_required_inbox_is_rejected_when_protocol_runtime_acceptance_is_disabl
                     snapshot: "consumed",
                     snapshot_codec: codec("snapshot"),
                     event: "consume",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -1812,7 +1818,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
                         snapshot: "accepted",
                         snapshot_codec: codec("snapshot"),
                         event: "consume",
-                        event_codec: codec("event"),
+                        event_codec: codec("receipt-event"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -1839,7 +1845,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
             snapshot: "runtime-accepted",
             snapshot_codec: codec("snapshot"),
             event: "accept",
-            event_codec: codec("event"),
+            event_codec: codec("receipt-event"),
             effects: vec![],
             dependencies: vec![],
             barriers: vec![],
@@ -1913,7 +1919,7 @@ fn suppression_persists_typed_disposition() {
                         snapshot: "accepted",
                         snapshot_codec: codec("snapshot"),
                         event: "consume",
-                        event_codec: codec("event"),
+                        event_codec: codec("receipt-event"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -1943,7 +1949,7 @@ fn suppression_persists_typed_disposition() {
                         snapshot: "suppressed",
                         snapshot_codec: codec("snapshot"),
                         event: "suppress-receipt-event",
-                        event_codec: codec("event"),
+                        event_codec: codec("receipt-event"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -2161,6 +2167,7 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(
@@ -2202,6 +2209,7 @@ fn shadow_mutation_apis_reject_manual_resolution() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -2614,6 +2622,7 @@ fn generic_commits_reserve_generation_bump_edges_and_reject_terminal_self_loops(
 
     for terminal in [
         WorkflowStatus::Cancelled,
+        WorkflowStatus::Deleted,
         WorkflowStatus::Completed,
         WorkflowStatus::Failed,
     ] {
@@ -2740,7 +2749,7 @@ fn reducer_only_inbox_consumes_without_owed_but_receipt_requires_exact_runtime_a
                         snapshot: "reducer-only-consumed",
                         snapshot_codec: codec("snapshot"),
                         event: "consume-reducer-only",
-                        event_codec: codec("event"),
+                        event_codec: codec("barrier"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -2783,7 +2792,7 @@ fn reducer_only_inbox_consumes_without_owed_but_receipt_requires_exact_runtime_a
                     snapshot: "missing-owed",
                     snapshot_codec: codec("snapshot"),
                     event: "consume-receipt",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -3108,6 +3117,7 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             },
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(empty_codec.outcome, CommitOutcome::InvalidPlan);
@@ -3131,6 +3141,7 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             transition_codec: codec("manual-transition"),
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(invalid_status.outcome, CommitOutcome::InvalidPlan);
@@ -3310,6 +3321,7 @@ proptest! {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn review_regressions_validate_identity_codecs_status_and_compensation_path() {
     let empty = CodecRef {
         family: "",
@@ -3390,8 +3402,8 @@ fn review_regressions_validate_identity_codecs_status_and_compensation_path() {
     );
 
     workflow.status = WorkflowStatus::DeletionPending;
-    let completed = TransitionPlan {
-        next_status: WorkflowStatus::Completed,
+    let deleted = TransitionPlan {
+        next_status: WorkflowStatus::Deleted,
         snapshot: "deleted",
         snapshot_codec: codec("snapshot"),
         event: "cleanup-complete",
@@ -3408,14 +3420,15 @@ fn review_regressions_validate_identity_codecs_status_and_compensation_path() {
             .commit_transition(
                 &ReducerDecision {
                     expected_workflow_version: Version(0),
-                    plan: completed,
+                    plan: deleted,
                 },
                 &BTreeMap::new(),
             )
-            .expect("deletion cleanup can complete")
+            .expect("deletion cleanup can publish deleted")
             .outcome,
         CommitOutcome::Committed
     );
+    assert_eq!(workflow.status, WorkflowStatus::Deleted);
 }
 
 #[test]
@@ -3666,6 +3679,7 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual",
             next_status: WorkflowStatus::Active,
+            retry_at: None,
         },
     );
     assert_eq!(resolved.outcome, CommitOutcome::Committed);
@@ -3713,8 +3727,8 @@ fn review_regressions_reject_misbound_inbox_and_cross_workflow_observation() {
                         next_status: WorkflowStatus::Active,
                         snapshot: "wrong",
                         snapshot_codec: codec("snapshot"),
-                        event: "event-b",
-                        event_codec: codec("event"),
+                        event: "event-a",
+                        event_codec: codec("wrong-event-codec"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -3932,8 +3946,8 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
                         next_status: WorkflowStatus::Active,
                         snapshot: "wrong",
                         snapshot_codec: codec("snapshot"),
-                        event: "event-b",
-                        event_codec: codec("event"),
+                        event: "event-a",
+                        event_codec: codec("wrong-event-codec"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -4173,7 +4187,7 @@ fn terminal_inbox_transition_cannot_install_owed_runtime_acceptance() {
                     snapshot: "completed",
                     snapshot_codec: codec("snapshot"),
                     event: "complete",
-                    event_codec: codec("event"),
+                    event_codec: codec("receipt-event"),
                     effects: vec![],
                     dependencies: vec![],
                     barriers: vec![],
@@ -4242,6 +4256,7 @@ fn retry_and_compensate_manual_choices_do_not_receipt_or_satisfy_barriers() {
                 transition_codec: codec("manual-transition"),
                 transition_event: "manual-more-work",
                 next_status: WorkflowStatus::Active,
+                retry_at: matches!(kind, ManualChoiceKind::Retry).then_some(Timestamp(5)),
             },
         );
 
@@ -4253,6 +4268,26 @@ fn retry_and_compensate_manual_choices_do_not_receipt_or_satisfy_barriers() {
             BarrierStatus::Waiting
         );
         assert_eq!(workflow.effects[&EffectId(2)].status, EffectStatus::Blocked);
+        if kind == ManualChoiceKind::Retry {
+            assert_eq!(
+                workflow.effects[&EffectId(1)].status,
+                EffectStatus::RetryWait
+            );
+            assert_eq!(
+                workflow.effects[&EffectId(1)].declaration.next_eligible_at,
+                Some(Timestamp(5))
+            );
+            workflow.refresh_eligibility(Timestamp(4));
+            assert_eq!(
+                workflow.effects[&EffectId(1)].status,
+                EffectStatus::RetryWait
+            );
+            workflow.refresh_eligibility(Timestamp(5));
+            assert_eq!(
+                workflow.effects[&EffectId(1)].status,
+                EffectStatus::Eligible
+            );
+        }
     }
 }
 
@@ -4373,6 +4408,7 @@ fn terminal_manual_receipt_and_post_terminal_barrier_are_suppressed() {
             transition_codec: codec("manual-transition"),
             transition_event: "manual-terminal",
             next_status: WorkflowStatus::Completed,
+            retry_at: None,
         },
     );
     let ManualEffectOutcome::Receipt { reducer_event, .. } =
