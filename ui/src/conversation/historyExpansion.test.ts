@@ -17,7 +17,7 @@ const manualRequest = (currentView: HistoryView, token = 1): ActiveHistoryReques
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
-  intent: { kind: 'manual_expansion', restore: { kind: 'reader_anchor', messageId: 'm50', viewportStartOffset: 12 } },
+  intent: { kind: 'reader_expansion', restore: { kind: 'reader_anchor', messageId: 'm50', viewportStartOffset: 12 } },
 });
 
 const deepLinkRequest = (currentView: HistoryView, token = 1): ActiveHistoryRequest => ({
@@ -64,11 +64,11 @@ describe('history expansion reducer', () => {
     expect(duplicate).toBe(state);
   });
 
-  it('manual expansion while following creates no positioning command', () => {
+  it('reader expansion while following creates no positioning command', () => {
     const currentView = view('a', 1);
     const request: ActiveHistoryRequest = {
       ...manualRequest(currentView),
-      intent: { kind: 'manual_expansion', restore: { kind: 'following_tail' } },
+      intent: { kind: 'reader_expansion', restore: { kind: 'following_tail' } },
     };
     let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
       type: 'request_started', request,
@@ -280,7 +280,7 @@ describe('history expansion reducer', () => {
     expect(state.pendingCommand).toBeNull();
   });
 
-  it('keeps manual expansion active when the deep-link target changes', () => {
+  it('keeps reader expansion active when the deep-link target changes', () => {
     const currentView = view('a', 1);
     const state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
       type: 'request_started', request: manualRequest(currentView),

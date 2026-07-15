@@ -1705,6 +1705,86 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 });
 
 describe('history expansion feedback', () => {
+  it('automatically loads earlier history when the reader approaches the loaded start', async () => {
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    fireEvent.wheel(scroller, { deltaY: -50 });
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 2, endIndex: 2 },
+      viewportTop: 240,
+      layoutRevision: 2,
+    }));
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderMessages).toHaveBeenCalledWith({
+      kind: 'reader_anchor',
+      messageId: 'msg-1',
+      viewportStartOffset: 14,
+    });
+
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 3,
+    }));
+    expect(onLoadOlderMessages).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: /load earlier history/i })).not.toBeInTheDocument();
+  });
+
+  it('shows a compact retry only after automatic earlier-history loading fails', async () => {
+    const onLoadOlderMessages = vi.fn();
+    render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          hasOlderMessages
+          olderHistoryError="network unavailable"
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not load earlier history.');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledWith({ kind: 'following_tail' }));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 0 },
+      visibleRange: { startIndex: 0, endIndex: 0 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    expect(onLoadOlderMessages).toHaveBeenCalledTimes(1);
+  });
+
   it('renders deep-link failures after coverage becomes complete', () => {
     render(
       withConvContext(

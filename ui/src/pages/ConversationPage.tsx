@@ -970,7 +970,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
     void loadOlderMessagesForIntent({
-      kind: 'manual_expansion',
+      kind: 'reader_expansion',
       restore: restoreBasis ?? { kind: 'following_tail' },
     });
   }, [loadOlderMessagesForIntent]);

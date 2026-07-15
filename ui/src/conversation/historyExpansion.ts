@@ -9,7 +9,7 @@ export type RestoreBasis =
   | { kind: 'following_tail' };
 
 export type HistoryIntent =
-  | { kind: 'manual_expansion'; restore: RestoreBasis }
+  | { kind: 'reader_expansion'; restore: RestoreBasis }
   | { kind: 'deep_link'; targetMessageId: string };
 
 export type ActiveHistoryRequest = {

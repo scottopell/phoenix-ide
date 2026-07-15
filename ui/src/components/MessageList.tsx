@@ -542,6 +542,7 @@ function MessageListImpl({
   ));
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
+  const earlierHistoryRequestScheduledRef = useRef(false);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -884,6 +885,29 @@ function MessageListImpl({
     return { kind: 'reader_anchor', messageId, viewportStartOffset: anchor.offset };
   }, [historicalUnits, messageIdForHistoricalUnit]);
 
+  const requestEarlierHistory = useCallback((retry: boolean) => {
+    const machine = scrollMachineRef.current;
+    const readerOwnsViewport = machine.kind === 'live' && machine.follow.kind === 'reading';
+    if (
+      earlierHistoryRequestScheduledRef.current
+      || !hasOlderMessages
+      || loadingOlderMessages
+      || !onLoadOlderMessages
+      || (!retry && (olderHistoryError || !readerOwnsViewport))
+    ) return;
+    earlierHistoryRequestScheduledRef.current = true;
+    const restoreBasis = captureHistoryRestoreBasis();
+    queueMicrotask(() => onLoadOlderMessages(restoreBasis));
+  }, [captureHistoryRestoreBasis, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
+
+  useEffect(() => {
+    earlierHistoryRequestScheduledRef.current = false;
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;
+  }, [hasOlderMessages, olderHistoryError]);
+
   useImperativeHandle(
     ref,
     () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
@@ -1042,8 +1066,11 @@ function MessageListImpl({
         targetMeasured: physicalSnapshot.targetMeasured ?? false,
       });
     }
-    if (visibleRange) onVisibleRangeChange?.(visibleRange);
-  }, [onVisibleRangeChange]);
+    if (visibleRange) {
+      onVisibleRangeChange?.(visibleRange);
+      if (visibleRange.startIndex <= 2) requestEarlierHistory(false);
+    }
+  }, [onVisibleRangeChange, requestEarlierHistory]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);
@@ -1086,23 +1113,15 @@ function MessageListImpl({
         </>
       )}
       <section id="chat-view" className="view active">
-        {(hasOlderMessages && onLoadOlderMessages) && (
-          <div>
-            <button
-              type="button"
-              className="btn-secondary"
-              disabled={loadingOlderMessages}
-              onClick={() => onLoadOlderMessages()}
-            >
-              {loadingOlderMessages
-                ? 'Loading earlier history…'
-                : olderHistoryError
-                  ? 'Retry loading earlier history'
-                  : 'Load earlier history'}
+        {olderHistoryError && hasOlderMessages && onLoadOlderMessages && (
+          <div role="alert">
+            <span>Could not load earlier history.</span>
+            <button type="button" onClick={() => requestEarlierHistory(true)}>
+              Retry
             </button>
           </div>
         )}
-        {olderHistoryError && (
+        {olderHistoryError && !hasOlderMessages && (
           <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
         <VirtualTranscript
