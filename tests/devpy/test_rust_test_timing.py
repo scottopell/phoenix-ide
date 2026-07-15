@@ -62,8 +62,15 @@ class RustTestTimingTests(unittest.TestCase):
             }
             #[tokio::test]
             async fn bounded() {
-                tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap();
-                tokio::time::timeout(Duration::from_secs(1), done.notified()).await.unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    async {
+                        rx.recv().await;
+                        done.notified().await;
+                    },
+                )
+                .await
+                .unwrap();
             }
             """
         )
@@ -100,6 +107,25 @@ class RustTestTimingTests(unittest.TestCase):
             )
         self.assertEqual(1, len(diagnostics))
         self.assertIn("recv", diagnostics[0])
+
+    def test_changed_continuation_line_flags_multiline_smell(self):
+        source = """
+            #[tokio::test]
+            async fn multiline_smell() {
+                tokio::time::sleep(
+                    Duration::from_millis(10),
+                ).await;
+            }
+        """
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "fixture.rs"
+            path.write_text(source)
+            relative = str(path.relative_to(ROOT))
+            diagnostics = self.checker.findings(
+                [str(path)], changed_lines={relative: {5}}
+            )
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("sleep", diagnostics[0])
 
 
 if __name__ == "__main__":

@@ -168,9 +168,12 @@ def findings(
         items = kinds["phoenix-rust-test-item"]
         timeouts = kinds["phoenix-rust-test-timeout"]
         for smell in kinds["phoenix-rust-test-timing-smell"]:
-            line_number = smell["range"]["start"]["line"] + 1
+            start_line = smell["range"]["start"]["line"] + 1
+            end_line = smell["range"]["end"]["line"] + 1
             relative = _relative_path(filename)
-            if changed_lines is not None and line_number not in changed_lines.get(relative, set()):
+            if changed_lines is not None and not changed_lines.get(relative, set()).intersection(
+                range(start_line, end_line + 1)
+            ):
                 continue
             if not _is_test_scope(source, smell, items):
                 continue
