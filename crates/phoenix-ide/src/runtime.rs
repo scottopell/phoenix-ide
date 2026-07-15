@@ -2924,6 +2924,12 @@ impl RuntimeManager {
         db.update_steering_queue(conversation_id, &queue)
             .await
             .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+        tracing::info!(
+            conversation_id,
+            message_id,
+            queue_depth = queue.len(),
+            "Persisted steering message before executor delivery"
+        );
 
         // DB is durable; now update the executor's in-memory queue via channel.
         let handle = self.get_or_create(conversation_id).await?;

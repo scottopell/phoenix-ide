@@ -21,18 +21,19 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
-    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+    AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
+    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
+    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
     FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
     MkdirResponse, ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery,
-    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
-    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, ReconcileAcceptedMessagesRequest,
+    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
+    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -145,6 +146,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/messages/latest",
             get(get_conversation_messages_latest),
+        )
+        .route(
+            "/api/conversations/:id/messages/reconcile",
+            post(reconcile_accepted_messages),
         )
         .route(
             "/api/conversations/:id/messages",
@@ -2712,6 +2717,67 @@ async fn get_server_message_tail(
     Ok((tail > 0).then_some(tail))
 }
 
+async fn reconcile_accepted_messages(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ReconcileAcceptedMessagesRequest>,
+) -> Result<Json<ReconcileAcceptedMessagesResponse>, AppError> {
+    const MAX_MESSAGE_IDS: usize = 100;
+    if req.message_ids.is_empty() || req.message_ids.len() > MAX_MESSAGE_IDS {
+        return Err(AppError::BadRequest(format!(
+            "message_ids must contain between 1 and {MAX_MESSAGE_IDS} entries"
+        )));
+    }
+
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|_| AppError::NotFound("Conversation not found".into()))?;
+    let steering_queue = state
+        .db
+        .get_steering_queue(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let queued_ids: std::collections::HashSet<&str> = steering_queue
+        .iter()
+        .map(|entry| entry.message_id.as_str())
+        .collect();
+
+    let mut entries = Vec::with_capacity(req.message_ids.len());
+    for message_id in req.message_ids {
+        let disposition = match state.db.get_message_by_id(&message_id).await {
+            Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
+                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+            },
+            Err(crate::db::DbError::MessageNotFound(_))
+                if queued_ids.contains(message_id.as_str()) =>
+            {
+                AcceptedMessageDisposition::SteeringQueued
+            }
+            Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
+                AcceptedMessageDisposition::Absent
+            }
+            Err(error) => return Err(AppError::Internal(error.to_string())),
+        };
+        entries.push(AcceptedMessageReconciliation {
+            message_id,
+            disposition,
+        });
+    }
+
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or(conversation.state);
+
+    Ok(Json(ReconcileAcceptedMessagesResponse {
+        conversation_idle: matches!(effective_state, ConvState::Idle),
+        entries,
+    }))
+}
+
 async fn get_conversation_messages_latest(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3426,6 +3492,11 @@ async fn send_chat(
         .iter()
         .any(|e| e.message_id == req.message_id)
     {
+        tracing::info!(
+            conversation_id = %id,
+            message_id = %req.message_id,
+            "Steering message retry matched durable queue entry"
+        );
         return Ok(Json(ChatResponse {
             queued: true,
             steering: true,
@@ -3531,6 +3602,7 @@ async fn send_chat(
             let chat_llm_text =
                 (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
             let display_text = expanded.display_text;
+            let steering_message_id = req.message_id.clone();
             let steer_event = Event::SteerMessage {
                 text: display_text.clone(),
                 llm_text: chat_llm_text,
@@ -3541,9 +3613,10 @@ async fn send_chat(
                 skill_invocation: expanded.skill_invocation,
             };
             tracing::info!(
-                conv_id = %id,
+                conversation_id = %id,
+                message_id = %steering_message_id,
                 state = effective_state.variant_name(),
-                "Chat queued as steering message (conversation busy)"
+                "Accepting chat as durable steering message"
             );
             state
                 .runtime
@@ -7341,6 +7414,74 @@ pub(crate) mod hard_delete_cascade_tests {
                 read_conversation_id == conversation_id
             }));
         });
+    }
+
+    #[tokio::test]
+    async fn accepted_message_reconciliation_finds_messages_outside_latest_history_window() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-reconcile", "reconcile", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        for idx in 1..=105 {
+            state
+                .db
+                .add_message(
+                    &format!("reconcile-msg-{idx}"),
+                    "conv-reconcile",
+                    &crate::db::MessageContent::user(format!("m{idx}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add message");
+        }
+
+        state
+            .db
+            .update_steering_queue(
+                "conv-reconcile",
+                &[crate::state_machine::event::SteerEntry {
+                    text: "queued".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "still-queued".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }],
+            )
+            .await
+            .expect("persist steering queue");
+
+        let Json(response) = reconcile_accepted_messages(
+            State(state),
+            Path("conv-reconcile".to_string()),
+            Json(ReconcileAcceptedMessagesRequest {
+                message_ids: vec![
+                    "reconcile-msg-1".to_string(),
+                    "still-queued".to_string(),
+                    "missing".to_string(),
+                ],
+            }),
+        )
+        .await
+        .expect("reconcile messages");
+
+        assert!(matches!(
+            response.entries[0].disposition,
+            AcceptedMessageDisposition::Persisted { .. }
+        ));
+        assert!(matches!(
+            response.entries[1].disposition,
+            AcceptedMessageDisposition::SteeringQueued
+        ));
+        assert!(matches!(
+            response.entries[2].disposition,
+            AcceptedMessageDisposition::Absent
+        ));
     }
 
     #[tokio::test]

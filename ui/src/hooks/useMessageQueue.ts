@@ -15,7 +15,7 @@ import type { FileAttachment, ImageData } from '../api';
  * against `atom.messages[*].message_id`. Once the server echoes the message,
  * the consumer filters it out of the rendered pending list automatically.
  */
-export type MessageStatus = 'pending' | 'failed' | 'steering_queued';
+export type MessageStatus = 'pending' | 'failed' | 'steering_queued' | 'recoverable_inconsistency';
 
 export interface QueuedMessage {
   localId: string;
@@ -26,6 +26,8 @@ export interface QueuedMessage {
   files?: FileAttachment[];
   timestamp: number;
   status: MessageStatus;
+  /** Last authoritative phase-event sequence before steering acceptance. */
+  acceptedAfterEventSeq?: number;
 }
 
 /**
@@ -51,7 +53,9 @@ export function derivePendingMessages(
  * Derive the list of failed messages to render in the input area.
  */
 export function deriveFailedMessages(queuedMessages: QueuedMessage[]): QueuedMessage[] {
-  return queuedMessages.filter((q) => q.status === 'failed');
+  return queuedMessages.filter(
+    (q) => q.status === 'failed' || q.status === 'recoverable_inconsistency',
+  );
 }
 
 interface UseMessageQueueReturn {
@@ -62,7 +66,11 @@ interface UseMessageQueueReturn {
   /** Mark a message as failed. */
   markFailed: (localId: string) => void;
   /** Mark a message as steering_queued (server accepted but deferred). */
-  markSteeringQueued: (localId: string) => void;
+  markSteeringQueued: (localId: string, acceptedAfterEventSeq: number) => void;
+  /** Accepted entry is absent after authoritative idle reconciliation. */
+  markRecoverableInconsistency: (localId: string) => void;
+  /** Remove entries now present in authoritative server history. */
+  reconcileAuthoritative: (serverMessageIds: Iterable<string>) => void;
   /** Retry a failed message (transitions failed → pending). */
   retry: (localId: string) => void;
   /** Dismiss a message without retrying. Used for explicit user actions. */
@@ -186,12 +194,28 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   }, [updateMessages]);
 
   // Mark a message as steering_queued (server accepted but deferred)
-  const markSteeringQueued = useCallback((localId: string) => {
+  const markSteeringQueued = useCallback((localId: string, acceptedAfterEventSeq: number) => {
     updateMessages(prev =>
       prev.map(m =>
-        m.localId === localId ? { ...m, status: 'steering_queued' as const } : m
+        m.localId === localId
+          ? { ...m, status: 'steering_queued' as const, acceptedAfterEventSeq }
+          : m
       )
     );
+  }, [updateMessages]);
+
+  const markRecoverableInconsistency = useCallback((localId: string) => {
+    updateMessages(prev =>
+      prev.map(m =>
+        m.localId === localId ? { ...m, status: 'recoverable_inconsistency' as const } : m
+      )
+    );
+  }, [updateMessages]);
+
+  const reconcileAuthoritative = useCallback((serverMessageIds: Iterable<string>) => {
+    const ids = new Set(serverMessageIds);
+    if (ids.size === 0) return;
+    updateMessages(prev => prev.filter(m => !ids.has(m.localId)));
   }, [updateMessages]);
 
   // Retry a failed message (flip back to pending; the send effect picks it up)
@@ -213,6 +237,8 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     enqueue,
     markFailed,
     markSteeringQueued,
+    markRecoverableInconsistency,
+    reconcileAuthoritative,
     retry,
     dismiss,
   };

@@ -86,11 +86,11 @@ describe('derivePendingMessages', () => {
 });
 
 describe('deriveFailedMessages', () => {
-  it('returns only failed entries', () => {
+  it('returns failed and recoverable inconsistency entries', () => {
     const queue = [
       queued('a'),
       queued('b', { status: 'failed' }),
-      queued('c', { status: 'failed' }),
+      queued('c', { status: 'recoverable_inconsistency' }),
     ];
     const out = deriveFailedMessages(queue);
     expect(out.map((q) => q.localId)).toEqual(['b', 'c']);
@@ -171,6 +171,28 @@ describe('useMessageQueue', () => {
     const { result } = renderHook(() => useMessageQueue('conv-1'));
     // Runtime check: key absent on the hook's return value.
     expect('markSent' in (result.current as object)).toBe(false);
+  });
+
+  it('compacts entries observed in authoritative history from state and storage', () => {
+    seed('conv-1', { localId: 'echoed' }, { localId: 'waiting' });
+    const { result } = renderHook(() => useMessageQueue('conv-1'));
+
+    act(() => result.current.reconcileAuthoritative(['echoed']));
+
+    expect(result.current.queuedMessages.map((message) => message.localId)).toEqual(['waiting']);
+    const persisted = JSON.parse(localStorage.getItem('phoenix:queue:conv-1')!) as QueuedMessage[];
+    expect(persisted.map((message) => message.localId)).toEqual(['waiting']);
+  });
+
+  it('surfaces an accepted message as a recoverable inconsistency without resending it', () => {
+    seed('conv-1', { localId: 'accepted', status: 'steering_queued' });
+    const { result } = renderHook(() => useMessageQueue('conv-1'));
+
+    act(() => result.current.markRecoverableInconsistency('accepted'));
+
+    expect(result.current.queuedMessages[0]!.status).toBe('recoverable_inconsistency');
+    expect(derivePendingMessages(result.current.queuedMessages, [])).toEqual([]);
+    expect(deriveFailedMessages(result.current.queuedMessages).map((message) => message.localId)).toEqual(['accepted']);
   });
 
   it('persists to localStorage and rehydrates on mount', () => {

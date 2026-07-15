@@ -594,7 +594,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             <div key={msg.localId} className="failed-message">
               <span className="failed-message-icon">!</span>
               <span className="failed-message-text">
-                Failed to send: "{msg.text.length > 50 ? msg.text.slice(0, 50) + '...' : msg.text}"
+                {msg.status === 'recoverable_inconsistency'
+                  ? 'Accepted message was not found in server history: '
+                  : 'Failed to send: '}
+                "{msg.text.length > 50 ? msg.text.slice(0, 50) + '...' : msg.text}"
               </span>
               <button
                 className="failed-message-retry"

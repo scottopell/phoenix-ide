@@ -571,6 +571,16 @@ export interface ConversationMessageSliceResponse {
   has_older_messages: boolean;
 }
 
+export type AcceptedMessageReconciliation =
+  | { message_id: string; status: 'persisted'; message: Message }
+  | { message_id: string; status: 'steering_queued' }
+  | { message_id: string; status: 'absent' };
+
+export interface ReconcileAcceptedMessagesResponse {
+  conversation_idle: boolean;
+  entries: AcceptedMessageReconciliation[];
+}
+
 export interface ConversationMessageRangeResponse {
   messages: Message[];
   missing_sequences: number[];
@@ -1499,6 +1509,22 @@ export const api = {
     if (resp.status === 404) return null;
     if (!resp.ok) throw new Error('Failed to resolve conversation slug');
     return (await resp.json()).slug as string;
+  },
+
+  async reconcileAcceptedMessages(
+    conversationId: string,
+    messageIds: string[],
+  ): Promise<ReconcileAcceptedMessagesResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/messages/reconcile`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_ids: messageIds }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to reconcile accepted messages');
+    }
+    return resp.json();
   },
 
   async getConversationMessagesLatest(

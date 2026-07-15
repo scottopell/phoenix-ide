@@ -572,11 +572,20 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
+  const eventCursorRef = useConversationEventCursorRef(slug!);
+
   // Message queue management. `queuedMessages` is the raw store; the rendered
   // split between "pending in the message list" and "failed in the input area"
   // is derived below.
-  const { queuedMessages, enqueue, markFailed, markSteeringQueued, dismiss } =
-    useMessageQueue(conversationId);
+  const {
+    queuedMessages,
+    enqueue,
+    markFailed,
+    markSteeringQueued,
+    markRecoverableInconsistency,
+    reconcileAuthoritative,
+    dismiss,
+  } = useMessageQueue(conversationId);
 
   // Pending messages shown in the conversation are a pure derivation of the
   // queue and `atom.messages` — see `derivePendingMessages` for the rule.
@@ -584,6 +593,91 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     () => derivePendingMessages(queuedMessages, atom.messages.map((m) => m.message_id)),
     [atom.messages, queuedMessages],
   );
+
+  // Authoritative echoes are terminal for local queue ownership. Compact them
+  // from localStorage instead of merely filtering them from this render.
+  useEffect(() => {
+    reconcileAuthoritative(atom.messages.map((message) => message.message_id));
+  }, [atom.messages, reconcileAuthoritative]);
+
+  const idleReconciliationKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!conversationId || atom.phase.type !== 'idle') return;
+    const accepted = queuedMessages.filter(
+      (message) => message.status === 'steering_queued'
+        && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0),
+    );
+    if (accepted.length === 0) return;
+
+    const key = `${conversationId}:${accepted.map((message) => message.localId).join(',')}`;
+    if (idleReconciliationKeyRef.current === key) return;
+    idleReconciliationKeyRef.current = key;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await api.reconcileAcceptedMessages(
+          conversationId,
+          accepted.map((message) => message.localId),
+        );
+        if (cancelled) return;
+
+        const persisted = result.entries.filter((entry) => entry.status === 'persisted');
+        const current = atomRef.current;
+        if (
+          persisted.length > 0
+          && current.conversationId === conversationId
+          && current.conversation
+        ) {
+          dispatch({
+            type: 'merge_conversation_data',
+            conversationId,
+            conversation: current.conversation,
+            messages: persisted.map((entry) => entry.message),
+            phase: current.phase,
+            contextWindow: current.contextWindow,
+            ...(current.transcriptGeneration !== null && {
+              transcriptGeneration: current.transcriptGeneration,
+            }),
+            transcriptCoverage: current.transcriptCoverage,
+            snapshotStartedAtEventSeq: eventCursorRef.current,
+          });
+          reconcileAuthoritative(persisted.map((entry) => entry.message_id));
+        }
+
+        if (result.conversation_idle) {
+          for (const entry of result.entries) {
+            if (entry.status === 'absent') {
+              markRecoverableInconsistency(entry.message_id);
+            }
+          }
+        }
+      } catch (error) {
+        idleReconciliationKeyRef.current = null;
+        console.warn('[message-queue] authoritative idle reconciliation failed', {
+          conversationId,
+          messageIds: accepted.map((message) => message.localId),
+          error,
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (idleReconciliationKeyRef.current === key) {
+        idleReconciliationKeyRef.current = null;
+      }
+    };
+  }, [
+    conversationId,
+    atom.phase.type,
+    atom.phaseLastAppliedEventSeq,
+    queuedMessages,
+    markRecoverableInconsistency,
+    reconcileAuthoritative,
+    dispatch,
+    eventCursorRef,
+  ]);
   const viewableMessages = atom.messages;
 
   // Failed messages are rendered in InputArea with retry/dismiss controls.
@@ -613,8 +707,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       hasEarlierHistory: atom.transcriptCoverage === 'tail',
     });
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
-
-  const eventCursorRef = useConversationEventCursorRef(slug!);
 
   const connectionInfo = useConnection({
     conversationId,
@@ -1229,28 +1321,41 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
       sendingMessagesRef.current.add(localId);
 
+      const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
+      const phaseBeforePost = atomRef.current.phase;
+      const optimisticPhaseOwner = phaseBeforePost.type === 'idle' ? localId : null;
+
       try {
         if (isOnline) {
+          if (optimisticPhaseOwner) {
+            dispatch({
+              type: 'local_phase_change',
+              phase: { type: 'awaiting_llm' },
+              expectedConversationId: conversationId,
+            });
+          }
           const result = await api.sendMessage(conversationId, text, imgs, files, localId);
           // Don't touch the queue here. The entry stays `pending` until
           // `atom.messages` contains a row with `message_id == localId`
           // (SSE echo), at which point `pendingMessages` filters it out
           // via the derivation above.
           //
-          // Optimistic phase update: user pressed send, show awaiting_llm
-          // immediately. The authoritative server-side phase change arrives
-          // later via `sse_state_change` (with its own sequence_id) and
-          // takes precedence. `local_phase_change` exists precisely to
-          // carve out this "client-originated, not part of server total
-          // order" action from the `applyIfNewer` guard (task 02675).
           if (result.steering) {
             // Conversation was busy — message queued server-side for delivery
             // when the conversation next reaches Idle. Show a "Queued" pill
             // on the message bubble instead of the normal sending spinner.
-            markSteeringQueued(localId);
-            // No phase change: the conversation is already running.
-          } else {
-            dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' }, expectedConversationId: conversationId });
+            markSteeringQueued(localId, phaseEventSeqBeforePost);
+            if (
+              optimisticPhaseOwner
+              && atomRef.current.phase.type === 'awaiting_llm'
+              && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
+            ) {
+              dispatch({
+                type: 'local_phase_change',
+                phase: phaseBeforePost,
+                expectedConversationId: conversationId,
+              });
+            }
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -1261,7 +1366,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           // during the offline window. (task 02676)
           await queueOperation({
             type: 'send_message',
-              conversationId,
+            conversationId,
             payload: { text, images: imgs, files, localId },
             createdAt: new Date(),
             retryCount: 0,
@@ -1280,6 +1385,17 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         }
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
+        if (
+          optimisticPhaseOwner
+          && atomRef.current.phase.type === 'awaiting_llm'
+          && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
+        ) {
+          dispatch({
+            type: 'local_phase_change',
+            phase: phaseBeforePost,
+            expectedConversationId: conversationId,
+          });
+        }
       } finally {
         sendingMessagesRef.current.delete(localId);
       }

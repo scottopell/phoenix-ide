@@ -41,7 +41,7 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-CONV-001:** Conversation List | ✅ Complete | List with slug, cwd, timestamps |
 | **REQ-CONV-002:** Chat View | ✅ Complete | Messages, markdown, tool grouping, invisible reader-proximity history acquisition with localized retry |
 | **REQ-CONV-003:** Message Composition | ✅ Complete | Auto-resize and draft persistence; Enter/Shift+Enter and IME-safe submission; non-overlapping responsive controls; concurrent Stop and steering Queue actions while busy |
-| **REQ-CONV-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry |
+| **REQ-CONV-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry; accepted steering entries reconcile by authoritative message ID, compact from local storage, and surface a recoverable inconsistency if later authoritative idle evidence still lacks the message |
 | **REQ-CONV-005:** Connection Status | ✅ Complete | Reconnection with backoff |
 | **REQ-CONV-006:** Reconnection Data Integrity | ✅ Complete | Sequence-based deduplication |
 | **REQ-CONV-007:** Agent Activity Indicators | ✅ Complete | Tasks 579, 581. Discriminated union, exhaustive switch, sequenceId dedup |

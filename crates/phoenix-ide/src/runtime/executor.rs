@@ -3020,11 +3020,13 @@ where
         }
 
         let entries = std::mem::take(&mut self.steering_queue);
-        tracing::debug!(
+        tracing::info!(
+            conversation_id = %self.context.conversation_id,
+            message_ids = ?entries.iter().map(|entry| entry.message_id.as_str()).collect::<Vec<_>>(),
             count = entries.len(),
             entering_idle,
             mid_turn = entering_llm_requesting_from_tool_round,
-            "Draining all queued steering messages"
+            "Draining queued steering messages"
         );
         // DB queue is updated by `Effect::ClearSteeringQueueEntries` AFTER
         // persist effects run, so a crash mid-drain leaves the queue intact
@@ -3812,6 +3814,14 @@ where
                         usage_data.as_ref(),
                     )
                     .await?;
+                if idempotent {
+                    tracing::info!(
+                        conversation_id = %self.context.conversation_id,
+                        message_id = %message_id,
+                        sequence_id = seq,
+                        "Persisted drained steering message"
+                    );
+                }
 
                 // Broadcast to clients (display_data already computed at effect creation)
                 let _ = self.broadcast_tx.send_message(msg);
@@ -4160,7 +4170,18 @@ where
                     .remove_steering_entries(&self.context.conversation_id, &message_ids)
                     .await
                 {
-                    tracing::warn!(error = %e, "Failed to remove drained steering entries");
+                    tracing::warn!(
+                        conversation_id = %self.context.conversation_id,
+                        message_ids = ?message_ids,
+                        error = %e,
+                        "Failed to remove drained steering entries"
+                    );
+                } else {
+                    tracing::info!(
+                        conversation_id = %self.context.conversation_id,
+                        message_ids = ?message_ids,
+                        "Removed drained steering entries"
+                    );
                 }
                 Ok(None)
             }
