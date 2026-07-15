@@ -14,6 +14,10 @@
 
 export type TextRenderMode = 'rich' | 'plainLargeText';
 
+export type ViewerFocus =
+  | { kind: 'line'; lineNumber: number }
+  | { kind: 'range'; startLine: number; endLine: number };
+
 export interface PatchContext {
   modifiedLines: Set<number>;
   firstModifiedLine?: number | undefined;
@@ -29,16 +33,14 @@ interface CommonPayload {
   absolutePath: string;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
-  /** Initial search/jump target line. */
-  focusLine?: number | undefined;
-  /** Initial inclusive range to shade after opening from a ranged tool read. */
-  focusRange?: { startLine: number; endLine: number } | undefined;
   /** Render inline (desktop split-pane) instead of as an overlay. */
   inline?: boolean | undefined;
 }
 
 /** Shared shape for the four annotatable text render kinds. */
 interface TextLikePayload extends CommonPayload {
+  /** Initial line-addressable target; ranges require source-line rendering. */
+  focus?: ViewerFocus | undefined;
   filePath: string;
   rootDir: string;
   content: string;

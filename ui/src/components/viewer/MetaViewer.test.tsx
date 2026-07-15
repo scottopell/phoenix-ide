@@ -259,18 +259,17 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
-  it('uses the line-aware viewer when a large source has a focused read range', () => {
-    const largeContent = 'line\n'.repeat(2_001);
+  it('uses the line-aware source viewer for a focused markdown range regardless of file size', () => {
     const { container } = renderViewer({
       ...textCommon,
       kind: 'markdown',
-      content: largeContent,
-      renderMode: 'plainLargeText',
-      focusRange: { startLine: 100, endLine: 110 },
+      content: '# Heading\nparagraph first line\nparagraph second line\n```ts\nconst value = 1;\n```',
+      focus: { kind: 'range', startLine: 3, endLine: 5 },
     });
 
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
-    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Heading' })).not.toBeInTheDocument();
+    expect(screen.getByText(/focused on lines 3–5/)).toBeInTheDocument();
   });
 
   it('lets a focused large HTML file still toggle from line-aware source to sandboxed preview', () => {
@@ -282,7 +281,7 @@ describe('MetaViewer payload routing', () => {
       content: largeHtml,
       renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
-      focusRange: { startLine: 100, endLine: 110 },
+      focus: { kind: 'range', startLine: 100, endLine: 110 },
     });
 
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();

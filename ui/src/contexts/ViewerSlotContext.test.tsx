@@ -182,13 +182,13 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 42 }); });
     const validSlot = h.get().slot;
     expect(validSlot.kind).toBe('prose');
-    if (validSlot.kind === 'prose') expect(validSlot.file.focusLine).toBe(42);
+    if (validSlot.kind === 'prose') expect(validSlot.file.focus).toEqual({ kind: 'line', lineNumber: 42 });
     expect(h.search()).toContain('line=42');
 
     act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 0 }); });
     expect(h.search()).not.toContain('line=');
     const zeroSlot = h.get().slot;
-    if (zeroSlot.kind === 'prose') expect(zeroSlot.file.focusLine).toBeUndefined();
+    if (zeroSlot.kind === 'prose') expect(zeroSlot.file.focus).toBeUndefined();
 
     act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 1.5 }); });
     expect(h.search()).not.toContain('line=');
@@ -248,7 +248,7 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     const range = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fsrc%2Fmain.ts&root=%2Frepo&line=40&endLine=64');
     expect(range.get().slot).toEqual({
       kind: 'prose',
-      file: { path: '/repo/src/main.ts', rootDir: '/repo', focusLine: 40, focusEndLine: 64 },
+      file: { path: '/repo/src/main.ts', rootDir: '/repo', focus: { kind: 'range', startLine: 40, endLine: 64 } },
       patchContext: null,
     });
   });
@@ -257,12 +257,12 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     const junk = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo&line=42junk');
     expect(junk.get().slot.kind).toBe('prose');
     const junkSlot = junk.get().slot;
-    if (junkSlot.kind === 'prose') expect(junkSlot.file.focusLine).toBeUndefined();
+    if (junkSlot.kind === 'prose') expect(junkSlot.file.focus).toBeUndefined();
 
     const decimal = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo&line=1.5');
     expect(decimal.get().slot.kind).toBe('prose');
     const decimalSlot = decimal.get().slot;
-    if (decimalSlot.kind === 'prose') expect(decimalSlot.file.focusLine).toBeUndefined();
+    if (decimalSlot.kind === 'prose') expect(decimalSlot.file.focus).toBeUndefined();
   });
 });
 

@@ -38,10 +38,13 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
 
-  const { absolutePath, title, onClose, onSendNotes, inline, focusLine, focusRange } = payload;
+  const { absolutePath, title, onClose, onSendNotes, inline } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
+  const focus = textLike ? payload.focus : undefined;
+  const focusLine = focus?.kind === 'line' ? focus.lineNumber : undefined;
+  const focusRange = focus?.kind === 'range' ? focus : undefined;
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
 
@@ -53,11 +56,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // copy) is bypassed for them and handled by PhoenixFileCodeView via its typed
   // handle instead.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
-  const largeRangeFocus = focusRange !== undefined
-    && textLike
-    && payload.renderMode === 'plainLargeText'
-    && !htmlPreview;
-  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || largeRangeFocus;
+  const rangeSource = focusRange !== undefined && !htmlPreview;
+  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || rangeSource;
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());

@@ -1,4 +1,5 @@
 import { createContext } from 'react';
+import type { ViewerFocus } from '../viewer/metaViewerTypes';
 
 export interface PatchContext {
   modifiedLines: Set<number>;
@@ -14,8 +15,7 @@ export interface OpenFileState {
   path: string;
   rootDir: string;
   patchContext?: PatchContext;
-  focusLine?: number;
-  focusRange?: { startLine: number; endLine: number };
+  focus?: ViewerFocus;
 }
 
 export interface FileExplorerContextValue {

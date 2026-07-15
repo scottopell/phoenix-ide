@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../hooks/useScopedState';
 import type { OpenFileOptions, PatchContext } from '../components/FileExplorer/fileExplorerTypes';
+import type { ViewerFocus } from '../components/viewer/metaViewerTypes';
 import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
 /**
@@ -31,8 +32,7 @@ export type DiffPresentation = 'fullscreen' | 'pane';
 export interface ProseFile {
   path: string;
   rootDir: string;
-  focusLine?: number | undefined;
-  focusEndLine?: number | undefined;
+  focus?: ViewerFocus | undefined;
 }
 
 export type DiffTarget = 'workspace' | 'active_pr';
@@ -136,13 +136,15 @@ function deriveSlot(
   switch (effective) {
     case 'prose': {
       if (!file || !root) return { slot: { kind: 'none' }, malformed: true };
-      const focusLine = parseFocusLineParam(searchParams.get(LINE_PARAM));
-      const parsedEndLine = parseFocusLineParam(searchParams.get(END_LINE_PARAM));
-      const focusEndLine = focusLine !== undefined && parsedEndLine !== undefined && parsedEndLine >= focusLine
-        ? parsedEndLine
-        : undefined;
+      const lineNumber = parseFocusLineParam(searchParams.get(LINE_PARAM));
+      const endLine = parseFocusLineParam(searchParams.get(END_LINE_PARAM));
+      const focus: ViewerFocus | undefined = lineNumber === undefined
+        ? undefined
+        : endLine !== undefined && endLine >= lineNumber
+          ? { kind: 'range', startLine: lineNumber, endLine }
+          : { kind: 'line', lineNumber };
       return {
-        slot: { kind: 'prose', file: { path: file, rootDir: root, focusLine, focusEndLine }, patchContext },
+        slot: { kind: 'prose', file: { path: file, rootDir: root, focus }, patchContext },
         malformed: false,
       };
     }

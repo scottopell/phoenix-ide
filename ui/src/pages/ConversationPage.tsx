@@ -1727,7 +1727,7 @@ function ConversationPageContent() {
               onClose={handleCloseFileViewer}
               onSendNotes={handleSendNotes}
               patchContext={prs.patchContext ?? undefined}
-              focusLine={prs.focusLine}
+              focus={prs.focus}
               inline
             />
           </Suspense>
@@ -2424,8 +2424,7 @@ function ConversationPageContent() {
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
             patchContext={openFileState.patchContext ?? undefined}
-            focusLine={openFileState.focusLine}
-            focusRange={openFileState.focusRange}
+            focus={openFileState.focus}
           />
         </Suspense>
       )}
@@ -2544,7 +2543,7 @@ function ConversationPageContent() {
                   onClose={handleCloseFileViewer}
                   onSendNotes={handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
-                  focusLine={splitPanePrs.focusLine}
+                  focus={splitPanePrs.focus}
                   inline
                 />
               ) : browserViewerOpen && conversationId ? (

@@ -3,7 +3,7 @@ import { AlertCircle, Loader2 } from 'lucide-react';
 import { ViewerShell } from './viewer/ViewerShell';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
-import type { MetaViewerPayload, PatchContext, TextRenderMode } from './viewer/metaViewerTypes';
+import type { MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
 import type { TextCategory } from '../generated/TextCategory';
 
 /**
@@ -26,8 +26,7 @@ export interface FileViewerProps {
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
-  focusLine?: number | undefined;
-  focusRange?: { startLine: number; endLine: number } | undefined;
+  focus?: ViewerFocus | undefined;
   /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean | undefined;
 }
@@ -56,8 +55,7 @@ export function FileViewer({
   onClose,
   onSendNotes,
   patchContext,
-  focusLine,
-  focusRange,
+  focus,
   inline,
 }: FileViewerProps) {
   const [fileData, setFileData] = useState<ReadFileResult | null>(null);
@@ -98,8 +96,7 @@ export function FileViewer({
       onClose,
       onSendNotes,
       ...(patchContext !== undefined ? { patchContext } : {}),
-      ...(focusLine !== undefined ? { focusLine } : {}),
-      ...(focusRange !== undefined ? { focusRange } : {}),
+      ...(focus !== undefined ? { focus } : {}),
       ...(inline !== undefined ? { inline } : {}),
     });
     return <MetaViewer payload={payload} />;
@@ -159,8 +156,7 @@ interface PayloadContext {
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
-  focusLine?: number | undefined;
-  focusRange?: { startLine: number; endLine: number } | undefined;
+  focus?: ViewerFocus | undefined;
   inline?: boolean | undefined;
 }
 
@@ -170,8 +166,6 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     absolutePath: ctx.absolutePath,
     onClose: ctx.onClose,
     onSendNotes: ctx.onSendNotes,
-    ...(ctx.focusLine !== undefined ? { focusLine: ctx.focusLine } : {}),
-    ...(ctx.focusRange !== undefined ? { focusRange: ctx.focusRange } : {}),
     ...(ctx.inline !== undefined ? { inline: ctx.inline } : {}),
   };
 
@@ -189,6 +183,7 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     filePath: ctx.filePath,
     rootDir: ctx.rootDir,
     content: data.content,
+    ...(ctx.focus !== undefined ? { focus: ctx.focus } : {}),
     ...(renderMode !== 'rich' ? { renderMode } : {}),
     ...(ctx.patchContext !== undefined ? { patchContext: ctx.patchContext } : {}),
   };
