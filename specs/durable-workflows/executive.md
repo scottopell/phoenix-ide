@@ -48,6 +48,23 @@ until their direct orchestration paths are retired.
 | Sub-agents | Conversation runtime/state machine | Sub-agent workflow | Tracked for profile specification and shadow adoption | Direct spawn, timeout, cancellation, continuation, and terminal delivery |
 | Tool execution | Conversation runtime | Typed effect execution | Profile inventory required | Ad hoc retry and recovery paths |
 
+### Adoption candidates
+
+These flows are not equal to the load-bearing authority migrations above. They are
+tracked because they cross restart boundaries, coordinate multiple durable or
+external effects, or otherwise accumulate bespoke retry and completion logic.
+Priority reflects migration value after the core engine profiles are operational;
+it does not supersede creation, wake, or sub-agent cutover work.
+
+| Candidate | Priority | Current choreography | Durable boundary to investigate | Tracking |
+| --- | --- | --- | --- | --- |
+| Address Feedback | High | Fresh GitHub capture through `pr-auto-fix-context`, feedback-baseline commit, then idle dispatch or queued `UserMessage` | Exact-PR-head actionable snapshot, idempotent handoff, busy/idle dispatch, supersession, and completion verification | Task 47009 |
+| LLM turn dispatch | High | Runtime request, provider stream, persistence, retry, cancellation, and usage accounting | Durable request identity, ambiguous dispatch reconciliation, streamed-result receipt, and duplicate-result fencing | Task 40011 |
+| Work lifecycle cleanup | High | Abandon, mark-merged, continuation, worktree removal, branch cleanup, and artifact preservation | Typed cleanup/compensation DAG with owned-resource evidence and terminal barrier | Task 40011 |
+| Tool and process execution | High | Runtime-owned tool calls plus Bash/Tmux process and output ownership | Per-tool effect profiles, observable execution, cancellation, durable receipts, and orphan reconciliation | Task 40011 |
+| Runtime start, stop, eviction, and reconstruction | Medium | Manager-owned in-process lifecycle and publication | Reducer-derived capability, durable lifecycle intent, reconstruction receipt, and SSE as projection | Task 40011 |
+| Notifications, analytics, and optional projections | Low | Best-effort side effects coupled to product transitions | Optional effects with explicit retry/duplication policy that never block completion | Task 40011 |
+
 A profile may accept engine-authoritative work only after:
 
 1. deterministic and representative production schedule classes pass;
