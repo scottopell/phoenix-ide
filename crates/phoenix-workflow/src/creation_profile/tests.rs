@@ -499,16 +499,22 @@ fn cleanup_states_adapt_to_compensation_graphs() {
 }
 
 #[test]
-fn completed_cancellation_has_no_compensation_effects() {
+fn completed_cancellation_preserves_compensation_graph() {
     let mut cancelled = oracle(CreationStart::SeededEmpty);
     cancelled.status = AuthoritativeCreationStatus::Cancelled;
     cancelled.cleanup_ownership = CleanupOwnership::OwnedResources;
     let adapted = adapt_authoritative_creation(WorkflowId(20), WorkflowId(90), &cancelled).unwrap();
+    assert_eq!(adapted.plan.effects.len(), 5);
     assert!(adapted
         .plan
         .effects
         .iter()
-        .all(|effect| effect.role != crate::EffectRole::Compensation));
+        .all(|effect| effect.role == crate::EffectRole::Compensation));
+    assert!(adapted
+        .projection
+        .effect_predictions
+        .iter()
+        .all(|(_, prediction)| *prediction == EffectPrediction::Completed));
 }
 
 #[test]

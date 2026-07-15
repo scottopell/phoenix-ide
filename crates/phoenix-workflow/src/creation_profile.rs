@@ -599,7 +599,9 @@ pub fn adapt_authoritative_creation(
 fn uses_compensation_plan(oracle: &AuthoritativeCreationOracle) -> bool {
     matches!(
         oracle.status,
-        AuthoritativeCreationStatus::Cancelling | AuthoritativeCreationStatus::DeletionPending
+        AuthoritativeCreationStatus::Cancelling
+            | AuthoritativeCreationStatus::Cancelled
+            | AuthoritativeCreationStatus::DeletionPending
     ) || matches!(
         (&oracle.status, oracle.cleanup_ownership),
         (
@@ -879,7 +881,10 @@ pub fn compensation_plan(oracle: &AuthoritativeCreationOracle) -> TransitionPlan
             None,
         ),
     ];
-    let owns_resources = oracle.cleanup_ownership == CleanupOwnership::OwnedResources;
+    let owns_resources = matches!(
+        oracle.cleanup_ownership,
+        CleanupOwnership::OwnedResources | CleanupOwnership::HistoricalReservation
+    );
     let effects = intents
         .into_iter()
         .filter(|(id, ..)| {
@@ -1082,7 +1087,10 @@ fn compensation_effect_predictions(
     oracle: &AuthoritativeCreationOracle,
 ) -> Vec<(EffectId, EffectPrediction)> {
     let completed = matches!(oracle.status, AuthoritativeCreationStatus::Cancelled);
-    let owns_resources = oracle.cleanup_ownership == CleanupOwnership::OwnedResources;
+    let owns_resources = matches!(
+        oracle.cleanup_ownership,
+        CleanupOwnership::OwnedResources | CleanupOwnership::HistoricalReservation
+    );
     [
         (REVOKE_RUNTIME, EffectPrediction::Eligible),
         (DELETE_STAGED_ATTACHMENTS, EffectPrediction::Blocked),

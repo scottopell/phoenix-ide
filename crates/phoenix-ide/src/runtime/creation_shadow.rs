@@ -117,6 +117,7 @@ impl CreationShadowCoordinator {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn sync_committed_job_while_gated(&self, job_id: &str) -> Result<(), String> {
         let job = self
             .db
@@ -165,6 +166,12 @@ impl CreationShadowCoordinator {
             .and_then(|evidence| evidence.uses_worktree)
             .is_some_and(|uses_worktree| uses_worktree != 0)
             && reservations.is_empty()
+            && matches!(
+                job.protocol.status,
+                CreationStatus::Accepted
+                    | CreationStatus::Claimed(_)
+                    | CreationStatus::RetryScheduled { .. }
+            )
         {
             tracing::debug!(
                 job_id,
@@ -826,6 +833,25 @@ mod tests {
         let transitions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = 'creation-shadow:job-shadow-runtime'")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_pre_reservation_failure_persists_shadow() {
+        let db = database().await;
+        insert_job(&db).await;
+        sqlx::query("INSERT INTO creation_shadow_creation_evidence (creation_job_id, cwd, attachment_count, creation_kind, uses_worktree, requested_mode, accepted_at) VALUES ('job-shadow-runtime', '/tmp', 0, 'initial_turn', 1, 'managed', '2025-01-01')")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'failed', error = 'failed before reservation', failed_at = '2025-01-01' WHERE id = 'job-shadow-runtime'")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"creation_failed\",\"job_id\":\"job-shadow-runtime\",\"error\":\"failed before reservation\",\"error_kind\":\"server_error\"}' WHERE id = 'conv-shadow-runtime'")
+            .execute(db.pool()).await.unwrap();
+
+        CreationShadowCoordinator::with_enabled(db.clone(), true)
+            .sync_committed_job("job-shadow-runtime")
+            .await
+            .unwrap();
+
+        assert_eq!(binding_count(&db).await, 1);
     }
 
     #[tokio::test]

@@ -744,7 +744,8 @@ async fn insert_creation_shadow_evidence_tx(
     .bind(attachment_count)
     .bind(
         if (job.intent.seed_parent_id.is_some() || job.intent.seed_label.is_some())
-            && job.intent.text.is_empty()
+            && job.intent.text.trim().is_empty()
+            && attachment_count == 0
         {
             "seeded_empty"
         } else {

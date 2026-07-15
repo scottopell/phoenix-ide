@@ -844,6 +844,7 @@ fn status_sql(value: phoenix_workflow::WorkflowStatus) -> &'static str {
         phoenix_workflow::WorkflowStatus::Cancelling => "cancelling",
         phoenix_workflow::WorkflowStatus::Cancelled => "cancelled",
         phoenix_workflow::WorkflowStatus::DeletionPending => "deletion_pending",
+        phoenix_workflow::WorkflowStatus::Deleted => "deleted",
         phoenix_workflow::WorkflowStatus::Completed => "completed",
         phoenix_workflow::WorkflowStatus::Failed => "failed",
     }
