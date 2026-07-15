@@ -1,0 +1,19 @@
+id: deferred-resolve-immediate-assertion-tsx
+language: Tsx
+severity: error
+message: |
+  Resolving or rejecting a deferred promise and asserting immediately does not
+  prove the queued promise reaction ran. Await that exact promise path inside
+  `act(...)`, or wait for a postcondition that changes only after the reaction.
+note: "Anti-pattern: immediate assertion after deferred completion"
+rule:
+  pattern:
+    context: expect($$$).$MATCHER($$$)
+    selector: expression_statement
+  follows:
+    kind: expression_statement
+    has:
+      any:
+        - pattern: $DEFERRED.resolve($$$)
+        - pattern: $DEFERRED.reject($$$)
+    stopBy: neighbor

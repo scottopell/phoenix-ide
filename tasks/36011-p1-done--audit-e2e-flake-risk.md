@@ -119,6 +119,9 @@ Recent flake fixes repeat four bug classes: fixed-delay readiness, event drains 
 ### Prevention
 
 `tsx-no-real-timer-settle` rejects real `setTimeout` sleeps inside TSX tests. Tests must wait for observable state or use fake timers when elapsed time is itself the behavior under test. Existing Rust fixture timers and Python process-boundary polling are classified above rather than globally banned.
+Companion TypeScript/TSX rules reject additional real-sleep spellings, synchronous timer advancement followed by a one-microtask drain, and an immediate assertion after resolving/rejecting a deferred promise. Each rule is calibrated against synthetic positive/negative fixtures and the full current source tree.
+
+Generic Rust sleep and unbounded-receiver rules were prototyped but not adopted: this ast-grep version cannot reliably scope a nested call to an annotated `#[test]`/`#[tokio::test]` function, and global patterns conflate intentional mock behavior and production event loops with test synchronization. Rust prevention remains review/audit-driven until it can be structurally scoped without allowlist debt.
 
 ### Stress evidence
 

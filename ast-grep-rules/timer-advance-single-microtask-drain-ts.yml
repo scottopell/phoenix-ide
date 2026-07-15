@@ -1,0 +1,18 @@
+id: timer-advance-single-microtask-drain-ts
+language: TypeScript
+severity: error
+message: |
+  `vi.advanceTimersByTime(N); await Promise.resolve();` drains only one
+  microtask, while a timer callback's asynchronous reaction may span several
+  hops. Use `await vi.advanceTimersByTimeAsync(N)` so timer callbacks and their
+  chained microtasks settle before assertions.
+note: "Anti-pattern: synchronous timer advance followed by a single-microtask flush"
+rule:
+  kind: expression_statement
+  has:
+    pattern: await Promise.resolve()
+  follows:
+    kind: expression_statement
+    has:
+      pattern: vi.advanceTimersByTime($$$)
+    stopBy: neighbor
