@@ -706,6 +706,7 @@ mod tests {
                 pending: vec![],
                 completed_results: vec![],
                 spawn_tool_id: None,
+                completion: SubAgentCompletionDisposition::ResumeParent,
             },
             ConvState::CancellingSubAgents {
                 pending: vec![],
