@@ -1699,9 +1699,27 @@ export const api = {
     return (await resp.json()).system_prompt;
   },
 
-  async getProjectInstructionRefreshStatus(convId: string): Promise<ProjectInstructionRefreshStatus> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}/project-instructions`);
+  async getProjectInstructionRefreshStatus(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<ProjectInstructionRefreshStatus> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/project-instructions`,
+      signal ? { signal } : undefined,
+    );
     if (!resp.ok) throw new Error('Failed to fetch project-instruction refresh status');
+    return resp.json();
+  },
+
+  async previewProjectInstructionRefresh(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<ProjectInstructionRefreshStatus> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/project-instructions/preview`,
+      { method: 'POST', ...(signal ? { signal } : {}) },
+    );
+    if (!resp.ok) throw new Error('Failed to preview project-instruction refresh');
     return resp.json();
   },
 

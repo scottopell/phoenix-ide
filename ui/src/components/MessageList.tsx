@@ -293,6 +293,7 @@ interface SystemPromptHeaderProps {
   contentRef: React.RefObject<HTMLPreElement>;
   conversationId: string | undefined;
   conversationState: ConversationState;
+  projectInstructionsActivationMessageId: string | undefined;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -302,6 +303,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   contentRef,
   conversationId,
   conversationState,
+  projectInstructionsActivationMessageId,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
@@ -314,6 +316,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
                 <ProjectInstructionsRefresh
                   conversationId={conversationId}
                   conversationState={conversationState}
+                  activationMessageId={projectInstructionsActivationMessageId}
                 />
               </span>
             )}
@@ -418,6 +421,14 @@ function MessageListImpl({
     () => [...historicalUnits, ...tailUnits],
     [historicalUnits, tailUnits],
   );
+  const projectInstructionsActivationMessageId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      const text = (message?.content as { text?: string } | undefined)?.text;
+      if (text?.startsWith('[project-instructions-activated]')) return message?.message_id;
+    }
+    return undefined;
+  }, [messages]);
 
   const latestAgentKey = useMemo(() => {
     for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
@@ -1133,6 +1144,7 @@ function MessageListImpl({
               contentRef={systemPromptRef}
               conversationId={conversationId}
               conversationState={convState}
+              projectInstructionsActivationMessageId={projectInstructionsActivationMessageId}
             />
           ) : null}
           empty={<EmptyTranscriptState />}

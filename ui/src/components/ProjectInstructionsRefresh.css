@@ -32,7 +32,8 @@
   color: var(--text-secondary);
 }
 
-.project-instructions-refresh-button {
+.project-instructions-refresh-button,
+.project-instructions-check-button {
   padding: 1px 5px;
   border: 0;
   background: transparent;
@@ -42,6 +43,11 @@
   cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.project-instructions-check-button {
+  color: var(--text-muted);
+  font-weight: 500;
 }
 
 .project-instructions-dialog-backdrop {

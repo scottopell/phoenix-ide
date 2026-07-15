@@ -2502,7 +2502,10 @@ where
     }
 
     async fn activate_queued_project_instructions(&self) -> Result<(), String> {
-        let sequence_id = self.broadcast_tx.next_seq();
+        let (reserved_broadcast_range, reserved_seqs) =
+            self.broadcast_tx.reserve_next_persisted_message_range(1);
+        let _reserved_broadcast_range = reserved_broadcast_range;
+        let sequence_id = reserved_seqs[0];
         match self
             .storage
             .activate_queued_project_instruction_bundle(&self.context.conversation_id, sequence_id)
