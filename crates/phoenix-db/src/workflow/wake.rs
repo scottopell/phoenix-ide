@@ -376,20 +376,6 @@ impl<'a> WakeWorkflowAdapter<'a> {
             };
             cancelled += u64::from(self.cancel(&request).await?);
         }
-        let owed_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT wi.id FROM wake_runtime_obligations o \
-             JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
-             JOIN wake_observation_inbox wi ON wi.id = oi.inbox_item_id \
-             WHERE o.conversation_id = ?1 AND o.status = 'owed'",
-        )
-        .bind(conversation_id)
-        .fetch_all(self.repository.pool())
-        .await?;
-        if !owed_ids.is_empty() {
-            self.accept_owed_items(conversation_id, &owed_ids, now)
-                .await?;
-            cancelled += 1;
-        }
         Ok(cancelled)
     }
 

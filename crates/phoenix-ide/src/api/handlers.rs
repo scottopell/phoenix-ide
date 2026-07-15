@@ -3479,7 +3479,10 @@ async fn send_chat(
             .await
             .unwrap_or_else(|| conversation.state.clone())
     };
-    if matches!(effective_state, ConvState::Idle) {
+    if matches!(
+        effective_state,
+        ConvState::Idle | ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+    ) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
         let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
@@ -3712,7 +3715,10 @@ async fn cancel_conversation(
         }));
     }
 
-    if matches!(effective_state, ConvState::Idle) {
+    if matches!(
+        effective_state,
+        ConvState::Idle | ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+    ) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
         let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)

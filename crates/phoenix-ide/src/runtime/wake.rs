@@ -450,13 +450,25 @@ where
         } else {
             item
         };
+        let workflow_id = match &claimable {
+            DueEffect::Eligible { workflow_id, .. } | DueEffect::RetryWait { workflow_id, .. } => {
+                workflow_id
+            }
+            DueEffect::ExpiredClaim { authority } => &authority.workflow_id,
+        };
+        let expires_at = adapter
+            .load_binding(workflow_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .expires_at;
+        let lease_until = std::cmp::min(item_now + CLAIM_LEASE, expires_at);
         let Some(claim) = adapter
             .claim(
                 &claimable,
                 uuid::Uuid::new_v4().to_string(),
                 worker_id.to_owned(),
                 item_now,
-                item_now + CLAIM_LEASE,
+                lease_until,
             )
             .await
             .map_err(|error| error.to_string())?

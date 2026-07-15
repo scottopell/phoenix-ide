@@ -9490,6 +9490,7 @@ mod steer_drain_detector_tests {
 
     fn mk_awaiting_sub_agents() -> ConvState {
         ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![PendingSubAgent {
                 agent_id: "sub-1".to_string(),
                 task: "do thing".to_string(),
@@ -9883,6 +9884,7 @@ mod steer_drain_detector_tests {
     /// given `agent_id` (for cross-round drain tests).
     fn mk_awaiting_with_pending(agent_id: &str) -> ConvState {
         ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![PendingSubAgent {
                 agent_id: agent_id.to_string(),
                 task: "do thing".to_string(),

@@ -3396,6 +3396,7 @@ fn parse_workflow_status_sql(status: &str) -> Option<WorkflowStatus> {
         "cancelling" => Some(WorkflowStatus::Cancelling),
         "cancelled" => Some(WorkflowStatus::Cancelled),
         "deletion_pending" => Some(WorkflowStatus::DeletionPending),
+        "deleted" => Some(WorkflowStatus::Deleted),
         "completed" => Some(WorkflowStatus::Completed),
         "failed" => Some(WorkflowStatus::Failed),
         _ => None,
@@ -3429,6 +3430,7 @@ fn workflow_status_sql(status: WorkflowStatus) -> &'static str {
         WorkflowStatus::Cancelling => "cancelling",
         WorkflowStatus::Cancelled => "cancelled",
         WorkflowStatus::DeletionPending => "deletion_pending",
+        WorkflowStatus::Deleted => "deleted",
         WorkflowStatus::Completed => "completed",
         WorkflowStatus::Failed => "failed",
     }

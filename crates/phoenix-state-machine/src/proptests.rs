@@ -1624,6 +1624,7 @@ proptest! {
         pending: initial_pending,
         completed_results: vec![],
         spawn_tool_id: None,
+        completion: SubAgentCompletionDisposition::ResumeParent,
     };
 
     for agent_id in initial_ids {
@@ -1673,6 +1674,7 @@ proptest! {
         pending: initial_pending,
         completed_results: vec![],
         spawn_tool_id: None,
+        completion: SubAgentCompletionDisposition::ResumeParent,
     };
     let mut prev_pending = initial_ids.len();
 
@@ -1706,6 +1708,7 @@ proptest! {
         pending,
         completed_results: vec![],
         spawn_tool_id: None,
+        completion: SubAgentCompletionDisposition::ResumeParent,
     };
 
     let event = Event::SubAgentResult {
@@ -1732,6 +1735,7 @@ proptest! {
         pending,
         completed_results: vec![],
         spawn_tool_id: None,
+        completion: SubAgentCompletionDisposition::ResumeParent,
     };
 
     for (i, agent_id) in agent_ids.iter().enumerate() {
@@ -1766,6 +1770,7 @@ proptest! {
         pending: pending.clone(),
         completed_results: vec![],
         spawn_tool_id: None,
+        completion: SubAgentCompletionDisposition::ResumeParent,
     };
 
     let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested }).unwrap();

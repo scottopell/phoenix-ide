@@ -941,6 +941,14 @@ pub enum RecoveryResumeTarget {
     ConversationTurn,
     ContinuationSummary { request: ContinuationSummaryRequest },
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentCompletionDisposition {
+    #[default]
+    ResumeParent,
+    SuspendParent,
+}
+
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1019,6 +1027,9 @@ pub enum ConvState {
         completed_results: Vec<SubAgentResult>,
         /// `tool_use_id` of the `spawn_agents` call (to update `display_data` when done)
         spawn_tool_id: Option<String>,
+        // owned: pre-feature rows resumed the parent; that remains the exact default
+        #[serde(default)]
+        completion: SubAgentCompletionDisposition,
     },
 
     /// User requested cancellation while waiting for sub-agents.
@@ -1177,6 +1188,7 @@ pub enum CoreState {
         pending: Vec<PendingSubAgent>,
         completed_results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
+        completion: SubAgentCompletionDisposition,
     },
     CancellingSubAgents {
         pending: Vec<PendingSubAgent>,
@@ -1355,10 +1367,12 @@ impl From<CoreState> for ConvState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             } => ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             },
             CoreState::CancellingSubAgents {
                 pending,
@@ -1452,10 +1466,12 @@ impl TryFrom<ConvState> for ParentState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             } => Ok(ParentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             })),
             ConvState::CancellingSubAgents {
                 pending,
@@ -1586,10 +1602,12 @@ impl TryFrom<ConvState> for SubAgentState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             } => Ok(SubAgentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             })),
             ConvState::CancellingSubAgents {
                 pending,
