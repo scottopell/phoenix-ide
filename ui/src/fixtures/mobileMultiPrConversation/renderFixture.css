@@ -1,0 +1,54 @@
+.mobile-multi-pr-conversation-fixture {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.mobile-multi-pr-conversation-fixture-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 20px 16px;
+  display: flex;
+  align-items: flex-end;
+}
+
+.mobile-multi-pr-conversation-fixture-message {
+  max-width: 32rem;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mobile-multi-pr-conversation-fixture-message strong {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mobile-multi-pr-conversation-fixture-message p {
+  margin: 6px 0 0;
+}
+
+.mobile-multi-pr-conversation-fixture-input {
+  margin: 0 8px 8px;
+  min-height: 52px;
+  padding: 8px 8px 8px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.mobile-multi-pr-conversation-fixture-input button {
+  min-width: 64px;
+  min-height: 36px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent-blue);
+  color: white;
+}

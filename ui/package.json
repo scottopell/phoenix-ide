@@ -24,6 +24,7 @@
     "qa:task-approval": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-task-approval.mjs",
     "qa:mobile-conversation-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-mobile-conversation-list.mjs",
     "qa:coordinator": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-coordinator.mjs",
+    "qa:mobile-multi-pr-conversation": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-mobile-multi-pr-conversation.mjs",
     "qa:new-conversation": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-new-conversation.mjs",
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",
     "qa:work-actions": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-work-actions.mjs",
