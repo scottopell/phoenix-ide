@@ -29,14 +29,6 @@ const BROAD_TERM_MATCH_LIMIT: usize = 400;
 /// Always-on ceiling on the combined context output. The scan is killed once
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
-/// Files larger than this are skipped entirely (`rg --max-filesize`). This is
-/// the per-file work bound: `--max-count` limits matching *lines*, so it cannot
-/// bound a term that appears thousands of times on one enormous line (a
-/// minified bundle / single-line log). Conceptual code search over such a file
-/// is not useful anyway, so skipping it bounds scan time without meaningful
-/// loss. Applied to every `rg` invocation (probe and combined) so the two agree
-/// on which files exist.
-const MAX_FILE_SIZE: &str = "16M";
 
 use phoenix_core::llm_language::KEYWORD_SEARCH_FILTER_SYSTEM as FILTER_SYSTEM_PROMPT;
 
@@ -79,9 +71,7 @@ impl KeywordSearchTool {
         stderr: Stdio,
     ) -> Result<tokio::process::Child, String> {
         let mut cmd = Command::new("rg");
-        cmd.args(extra_args)
-            .arg("-i") // case insensitive
-            .args(["--max-filesize", MAX_FILE_SIZE]); // bound per-file scan work
+        cmd.args(extra_args).arg("-i"); // case insensitive
         for term in terms {
             cmd.args(["-e", term]);
         }
@@ -105,9 +95,10 @@ impl KeywordSearchTool {
     /// (not `--count`) counts individual matches, so a term repeated many times
     /// on one long line still reads as broad. `--max-count = limit + 1` makes a
     /// single file that alone exceeds the limit trip the early exit and bounds
-    /// scanning of a many-line file (rg stops after limit+1 matching lines);
-    /// `--max-filesize` (set in `spawn_rg`) bounds the remaining case — a term
-    /// dense on one enormous single line — by skipping oversized files.
+    /// scanning of a many-line file (rg stops after limit+1 matching lines). A
+    /// term dense on one enormous single line is read in full — bounded by that
+    /// file's size, and fast in practice; files are deliberately not size-capped
+    /// so the search never silently omits a file it was asked to cover.
     ///
     /// Returns the accumulated match count (just past the limit when the early
     /// exit fires). A non-`{matches, no-matches}` exit status — e.g. an invalid
@@ -274,6 +265,70 @@ impl KeywordSearchTool {
         Ok((String::from_utf8_lossy(&buf).to_string(), truncated))
     }
 
+    /// Probe every term and return those usable for the combined scan (positive
+    /// match count, not over-broad). Zero-count terms are dropped — they add
+    /// nothing to the combined OR-scan, so keeping them would force a second
+    /// full-tree scan only to rediscover they match nothing.
+    ///
+    /// On a terminal condition returns `Err(ToolOutput)` — the response the
+    /// caller returns directly: a term was over-broad (ask for narrower terms),
+    /// every probe failed (surface an error rather than mask infra failure such
+    /// as ripgrep missing as an empty result), the probes ran and found nothing
+    /// (no matches), or cancellation fired mid-probe.
+    async fn probe_usable_terms(
+        &self,
+        search_root: &Path,
+        terms: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, ToolOutput> {
+        let mut usable_terms = Vec::new();
+        let mut any_broad = false;
+        let mut any_ok = false;
+        for term in terms {
+            match self.count_matches(search_root, term, cancel).await {
+                Ok(0) => {
+                    any_ok = true;
+                    tracing::debug!(term = %term, "No matches for term");
+                }
+                Ok(count) if count <= BROAD_TERM_MATCH_LIMIT => {
+                    any_ok = true;
+                    usable_terms.push(term.clone());
+                }
+                Ok(count) => {
+                    any_ok = true;
+                    any_broad = true;
+                    tracing::debug!(term = %term, matches = count, "Skipping broad term");
+                }
+                Err(e) => {
+                    // Stop probing the moment cancellation fires — otherwise a
+                    // large term list churns one killed `rg` per remaining term
+                    // and delays the cooperative cancel path.
+                    if cancel.is_cancelled() {
+                        return Err(ToolOutput::error("keyword_search cancelled"));
+                    }
+                    tracing::warn!(term = %term, error = %e, "Error checking term");
+                }
+            }
+        }
+
+        if usable_terms.is_empty() {
+            if any_broad {
+                return Err(ToolOutput::error(
+                    "Each of those search terms yielded too many results. Try more specific terms.",
+                ));
+            }
+            if any_ok {
+                return Err(ToolOutput::success(
+                    "No matches found for the given search terms.",
+                ));
+            }
+            return Err(ToolOutput::error(
+                "keyword_search could not run any search term (is ripgrep installed and on PATH?)",
+            ));
+        }
+        Ok(usable_terms)
+    }
+
     /// Combined context scan over `usable_terms`, capped at `MAX_COMBINED_RESULTS`.
     /// If the output overruns the cap, drop the lowest-priority term and retry:
     /// `search_terms` is ordered by importance (REQ-KWS-004), so peeling from the
@@ -412,44 +467,13 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
         tracing::info!(root = %search_root.display(), terms = input.search_terms.len(), "keyword_search scope resolved");
 
-        // Classify each term with the early-exit match-count probe. Zero-count
-        // terms are excluded, not kept: they contribute nothing to the combined
-        // OR-scan, so keeping them would force a second full-tree scan only to
-        // rediscover they match nothing (doubling worst-case no-match latency on
-        // a broad root). Broad terms are dropped as too noisy.
-        let mut usable_terms = Vec::new();
-        let mut any_broad = false;
-        for term in &input.search_terms {
-            match self.count_matches(&search_root, term, &ctx.cancel).await {
-                Ok(0) => tracing::debug!(term = %term, "No matches for term"),
-                Ok(count) if count <= BROAD_TERM_MATCH_LIMIT => usable_terms.push(term.clone()),
-                Ok(count) => {
-                    any_broad = true;
-                    tracing::debug!(term = %term, matches = count, "Skipping broad term");
-                }
-                Err(e) => {
-                    // Stop probing the moment cancellation fires — otherwise a
-                    // large term list churns one killed `rg` per remaining term
-                    // and delays the cooperative cancel path.
-                    if ctx.cancel.is_cancelled() {
-                        return ToolOutput::error("keyword_search cancelled");
-                    }
-                    tracing::warn!(term = %term, error = %e, "Error checking term");
-                }
-            }
-        }
-
-        if usable_terms.is_empty() {
-            // No usable term. If any term was over-broad, tell the agent to be
-            // more specific; otherwise nothing matched (all zero / errored), so
-            // report no matches without a redundant combined scan.
-            if any_broad {
-                return ToolOutput::error(
-                    "Each of those search terms yielded too many results. Try more specific terms.",
-                );
-            }
-            return ToolOutput::success("No matches found for the given search terms.");
-        }
+        let usable_terms = match self
+            .probe_usable_terms(&search_root, &input.search_terms, &ctx.cancel)
+            .await
+        {
+            Ok(terms) => terms,
+            Err(terminal) => return terminal,
+        };
 
         let (results, capped, dropped) = match self
             .combined_scan(&search_root, usable_terms, &ctx.cancel)
