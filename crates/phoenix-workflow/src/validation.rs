@@ -96,7 +96,10 @@ pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     validate_plan_codecs(plan)?;
     if matches!(
         plan.next_status,
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+        WorkflowStatus::Cancelled
+            | WorkflowStatus::Deleted
+            | WorkflowStatus::Completed
+            | WorkflowStatus::Failed
     ) && !plan.effects.is_empty()
     {
         return Err(PlanError::TerminalPlanDeclaresEffects(plan.next_status));
@@ -127,8 +130,11 @@ pub(crate) fn validate_status_transition(
                     | WorkflowStatus::DeletionPending
             )
         }
-        WorkflowStatus::DeletionPending => matches!(next_status, WorkflowStatus::Completed),
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed => false,
+        WorkflowStatus::DeletionPending => matches!(next_status, WorkflowStatus::Deleted),
+        WorkflowStatus::Cancelled
+        | WorkflowStatus::Deleted
+        | WorkflowStatus::Completed
+        | WorkflowStatus::Failed => false,
     };
     if valid {
         Ok(())

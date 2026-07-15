@@ -523,7 +523,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             payload: ReducerInboxPayload::Receipt(receipt_event),
             delivery_status: if matches!(
                 self.status,
-                WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+                WorkflowStatus::Cancelled
+                    | WorkflowStatus::Deleted
+                    | WorkflowStatus::Completed
+                    | WorkflowStatus::Failed
             ) {
                 DeliveryStatus::Suppressed {
                     reason: SuppressionReason::LifecycleTerminal,
@@ -663,6 +666,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             || commit.transition_codec.family.is_empty()
             || choice.receipt_codec.family.is_empty()
             || choice.receipt_event_codec.family.is_empty()
+            || matches!(choice.kind, ManualChoiceKind::Retry) != commit.retry_at.is_some()
             || validate_status_transition(self.status, commit.next_status).is_err()
         {
             return invalid_manual_resolution(Some(existing));
@@ -678,6 +682,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         );
         if matches!(effect_outcome, ManualEffectOutcome::Receipt { .. }) {
             let _ = replacement.evaluate_barriers();
+        }
+        if workflow_status_is_terminal(replacement.status) {
+            let transition = TransitionId(replacement.next_transition_id - 1);
+            replacement.retire_terminal_work(transition);
         }
         let resolution = replacement
             .manual_resolutions
@@ -735,6 +743,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             };
             if !same_inbox_event(inbox, linked_inbox)
                 || inbox.delivery_status != DeliveryStatus::Pending
+                || decision.plan.event_codec != inbox.event_codec
                 || !P::decision_handles_inbox(&inbox.payload, &decision.plan.event)
             {
                 return Ok(AtomicInboxConsumeResult {
@@ -1261,6 +1270,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             transition_codec,
             transition_event,
             next_status,
+            retry_at,
         } = commit;
         let transition = WorkflowTransition {
             transition_id: TransitionId(self.next_transition_id),
@@ -1337,7 +1347,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             | ManualChoiceKind::Suppress) => {
                 if let Some(effect) = self.effects.get_mut(&existing.effect_id) {
                     effect.status = match kind {
-                        ManualChoiceKind::Retry => EffectStatus::Eligible,
+                        ManualChoiceKind::Retry => EffectStatus::RetryWait,
                         ManualChoiceKind::Compensate
                         | ManualChoiceKind::Fail
                         | ManualChoiceKind::Suppress => EffectStatus::Invalidated,
@@ -1346,6 +1356,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                     effect.claim = None;
                     effect.destructive_lock = None;
                     effect.pending_reconciliation = false;
+                    effect.declaration.next_eligible_at = retry_at;
                 }
                 match kind {
                     ManualChoiceKind::Retry => ManualEffectOutcome::Retry,
@@ -1399,6 +1410,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                     status @ (WorkflowStatus::Cancelling
                     | WorkflowStatus::Cancelled
                     | WorkflowStatus::DeletionPending
+                    | WorkflowStatus::Deleted
                     | WorkflowStatus::Completed
                     | WorkflowStatus::Failed) => status,
                 },
@@ -1603,7 +1615,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
             OwedAcceptanceDisposition::Owed => false,
         };
-        if !handles_owed {
+        if !handles_owed || decision.plan.event_codec != existing.event_codec {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::InvalidPlan,
                 transition: None,
@@ -1696,6 +1708,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 next @ (WorkflowStatus::Cancelling
                 | WorkflowStatus::Cancelled
                 | WorkflowStatus::DeletionPending
+                | WorkflowStatus::Deleted
                 | WorkflowStatus::Completed
                 | WorkflowStatus::Failed) => next,
             };
@@ -1940,7 +1953,10 @@ fn initial_effect_status<I>(
 const fn workflow_status_is_terminal(status: WorkflowStatus) -> bool {
     matches!(
         status,
-        WorkflowStatus::Cancelled | WorkflowStatus::Completed | WorkflowStatus::Failed
+        WorkflowStatus::Cancelled
+            | WorkflowStatus::Deleted
+            | WorkflowStatus::Completed
+            | WorkflowStatus::Failed
     )
 }
 
