@@ -7,6 +7,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
+import { canShowCommissionReviewViewer } from './commissionReviewViewerPrecedence';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyMergeEventCursorFloor,
@@ -1696,7 +1697,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const inspectViewerOpen = !isArchived && inspectOpen;
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
   const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
-  const commissionReviewViewerOpen = canOpenMessageSidepanel && commissionReviewOpen;
+  const commissionReviewViewerOpen = canShowCommissionReviewViewer(canOpenMessageSidepanel, commissionReviewOpen, atom.phase.type);
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }

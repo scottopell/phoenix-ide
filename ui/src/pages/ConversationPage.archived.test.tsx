@@ -181,14 +181,14 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
-function renderPage(conversation: Conversation, routeSegment: string = conversation.slug) {
+function renderPage(conversation: Conversation, routeSegment: string = conversation.slug, initialSearch = '') {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
     conversationId: conversation.id,
     conversation,
     messages: [{ ...historyMessage, conversation_id: conversation.id }],
-    phase: { type: 'idle' },
+    phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
   });
@@ -231,7 +231,7 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
         <ConversationReadinessProvider>
-          <MemoryRouter initialEntries={[`/c/${routeSegment}`]}>
+          <MemoryRouter initialEntries={[`/c/${routeSegment}${initialSearch}`]}>
             <Routes>
               <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
             </Routes>

@@ -1,4 +1,5 @@
 import { useId, useState } from 'react';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import './CommissionReviewApproval.css';
 
 export interface CommissionReviewApprovalProps {
@@ -35,6 +36,7 @@ export function CommissionReviewApproval({
   const headingId = useId();
   const summaryId = useId();
   const statusId = useId();
+  useRegisterFocusScope('commission-review-approval');
 
   const run = async (kind: 'approve' | 'reject', fn: () => Promise<void> | void) => {
     if (busy || settled) return;

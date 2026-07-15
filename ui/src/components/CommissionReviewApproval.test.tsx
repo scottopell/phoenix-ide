@@ -2,6 +2,12 @@ import '../index.css';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { CommissionReviewApproval } from './CommissionReviewApproval';
+import { FocusScopeProvider, useFocusScope } from '../hooks/useFocusScope';
+
+function ActiveScope() {
+  const { activeScope } = useFocusScope();
+  return <output data-testid="active-focus-scope">{activeScope ?? 'none'}</output>;
+}
 
 function renderApproval(overrides: Partial<React.ComponentProps<typeof CommissionReviewApproval>> = {}) {
   const onApprove = vi.fn();
@@ -43,6 +49,25 @@ describe('CommissionReviewApproval', () => {
     expect(screen.getByText('/repo/phoenix')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Reject' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Approve review' })).toBeEnabled();
+  });
+
+  it('owns the active focus scope while the dialog is mounted', async () => {
+    render(
+      <FocusScopeProvider>
+        <ActiveScope />
+        <CommissionReviewApproval
+          brief="Review the branch."
+          focus={null}
+          scope={undefined}
+          onApprove={() => {}}
+          onReject={() => {}}
+        />
+      </FocusScopeProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('active-focus-scope')).toHaveTextContent('commission-review-approval');
+    });
   });
 
   it('shows busy state and settles after approval', async () => {
