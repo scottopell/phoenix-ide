@@ -3130,7 +3130,8 @@ def _changed_paths_vs_base():
     return _changed_paths_memo[0]
 
 
-def _compute_changed_paths_vs_base():
+def _resolve_check_merge_base():
+    """Resolve the comparison commit used by incremental check planning."""
     def _git(args):
         return subprocess.run(
             ["git", *args], cwd=ROOT, capture_output=True, text=True,
@@ -3138,21 +3139,27 @@ def _compute_changed_paths_vs_base():
 
     base = os.environ.get("PHOENIX_CHECK_BASE")
     candidates = [base] if base else []
-    # origin/HEAD points at the remote's default branch when the symbolic ref
-    # is configured; fall back to common names.
     head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
     if head_ref.returncode == 0 and head_ref.stdout.strip():
         candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
     candidates += ["origin/main", "main", "origin/master", "master"]
 
-    merge_base = None
-    for cand in candidates:
-        if not cand:
+    for candidate in candidates:
+        if not candidate:
             continue
-        mb = _git(["merge-base", "HEAD", cand])
-        if mb.returncode == 0 and mb.stdout.strip():
-            merge_base = mb.stdout.strip()
-            break
+        merge_base = _git(["merge-base", "HEAD", candidate])
+        if merge_base.returncode == 0 and merge_base.stdout.strip():
+            return merge_base.stdout.strip()
+    return None
+
+
+def _compute_changed_paths_vs_base():
+    def _git(args):
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True,
+        )
+
+    merge_base = _resolve_check_merge_base()
     if merge_base is None:
         return None
 
@@ -4108,6 +4115,16 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             "ast-grep", "scan", "--inline-rules", inline_rules,
             "crates/", "ui/src/",
         ])
+        comparison_commit = _resolve_check_merge_base()
+        if os.environ.get("PHOENIX_CHECK_ALL") == "1" and _on_integration_base():
+            comparison_commit = "HEAD^"
+        if comparison_commit is None:
+            raise RuntimeError("cannot resolve comparison commit for Rust test timing lint")
+        timing_command = [
+            "uv", "run", "scripts/check_rust_test_timing.py",
+            "--base-sha", comparison_commit, "crates/",
+        ]
+        run_step("rust-test-timing", timing_command)
 
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
