@@ -21,7 +21,9 @@
 //! checkout, which is what closes the discovery-vs-expansion divergence.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tempfile::TempDir;
@@ -327,18 +329,18 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         };
     };
 
-    let paths = tree_paths(repo_root, reference);
-    for rel_path in paths.iter().filter(|path| is_skill_metadata_path(path)) {
+    let tree = tree_index(repo_root, reference);
+    for rel_path in tree.keys().filter(|path| is_skill_metadata_path(path)) {
         copy_tree_blob(repo_root, reference, rel_path, temp.path(), rel_path);
     }
 
-    let symlinks = tree_symlinks(repo_root, reference);
+    let symlinks = read_symlink_targets(repo_root, &tree);
     for link_path in symlinks.keys().filter(|path| is_skill_directory_link(path)) {
         let Some(target_root) = resolve_tree_link_chain(link_path, &symlinks) else {
             continue;
         };
         let target_prefix = format!("{target_root}/");
-        for target_path in paths.iter().filter(|path| {
+        for target_path in tree.keys().filter(|path| {
             path.strip_prefix(&target_prefix)
                 .is_some_and(is_relative_skill_metadata_path)
         }) {
@@ -363,8 +365,13 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
 }
 
 fn is_skill_metadata_path(path: &str) -> bool {
-    path.ends_with("SKILL.md")
-        && (path.contains(".claude/skills/") || path.contains(".agents/skills/"))
+    let Some(components) = validated_tree_components(path) else {
+        return false;
+    };
+    components.last() == Some(&"SKILL.md")
+        && components
+            .windows(2)
+            .any(|parts| matches!(parts[0], ".claude" | ".agents") && parts[1] == "skills")
 }
 
 fn is_relative_skill_metadata_path(path: &str) -> bool {
@@ -378,11 +385,16 @@ fn copy_tree_blob(
     destination_root: &Path,
     destination: &str,
 ) {
+    if validated_tree_components(source).is_none() {
+        return;
+    }
+    let Some(destination) = safe_tree_destination(destination_root, destination) else {
+        return;
+    };
     let spec = format!("{reference}:{source}");
     let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
         return;
     };
-    let destination = destination_root.join(destination);
     let Some(parent) = destination.parent() else {
         return;
     };
@@ -391,22 +403,126 @@ fn copy_tree_blob(
     }
 }
 
-fn tree_symlinks(repo_root: &Path, reference: &str) -> HashMap<String, String> {
-    let Ok(listing) = run_git(repo_root, &["ls-tree", "-r", reference]) else {
+#[derive(Clone)]
+struct TreeEntry {
+    oid: String,
+    symlink: bool,
+}
+
+fn tree_index(repo_root: &Path, reference: &str) -> HashMap<String, TreeEntry> {
+    let Ok(listing) = run_git_bytes(repo_root, &["ls-tree", "-rz", "--full-tree", reference])
+    else {
         return HashMap::new();
     };
     listing
-        .lines()
-        .filter_map(|line| {
-            let (metadata, path) = line.split_once('\t')?;
-            if !metadata.starts_with("120000 ") {
-                return None;
-            }
-            let spec = format!("{reference}:{path}");
-            let target = run_git_bytes(repo_root, &["cat-file", "blob", &spec]).ok()?;
-            Some((path.to_string(), String::from_utf8(target).ok()?))
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let record = std::str::from_utf8(record).ok()?;
+            let (metadata, path) = record.split_once('\t')?;
+            validated_tree_components(path)?;
+            let mut fields = metadata.split_whitespace();
+            let mode = fields.next()?;
+            fields.next()?;
+            let oid = fields.next()?.to_string();
+            Some((
+                path.to_string(),
+                TreeEntry {
+                    oid,
+                    symlink: mode == "120000",
+                },
+            ))
         })
         .collect()
+}
+
+fn read_symlink_targets(
+    repo_root: &Path,
+    tree: &HashMap<String, TreeEntry>,
+) -> HashMap<String, String> {
+    let links: Vec<(&str, &str)> = tree
+        .iter()
+        .filter(|(_, entry)| entry.symlink)
+        .map(|(path, entry)| (path.as_str(), entry.oid.as_str()))
+        .collect();
+    if links.is_empty() {
+        return HashMap::new();
+    }
+
+    let Ok(mut child) = phoenix_core::git::command()
+        .current_dir(repo_root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HashMap::new();
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashMap::new();
+    };
+    for (_, oid) in &links {
+        if writeln!(stdin, "{oid}").is_err() {
+            return HashMap::new();
+        }
+    }
+    drop(stdin);
+    let Ok(output) = child.wait_with_output() else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    parse_batch_blobs(&output.stdout, &links)
+}
+
+fn parse_batch_blobs(bytes: &[u8], links: &[(&str, &str)]) -> HashMap<String, String> {
+    let mut cursor = 0;
+    let mut targets = HashMap::new();
+    for (path, _) in links {
+        let Some(header_end) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let header_end = cursor + header_end;
+        let Some(size) = std::str::from_utf8(&bytes[cursor..header_end])
+            .ok()
+            .and_then(|header| header.split_whitespace().nth(2))
+            .and_then(|size| size.parse::<usize>().ok())
+        else {
+            break;
+        };
+        let content_start = header_end + 1;
+        let content_end = content_start.saturating_add(size);
+        if content_end >= bytes.len() {
+            break;
+        }
+        if let Ok(target) = std::str::from_utf8(&bytes[content_start..content_end]) {
+            targets.insert((*path).to_string(), target.to_string());
+        }
+        cursor = content_end + 1;
+    }
+    targets
+}
+
+fn validated_tree_components(path: &str) -> Option<Vec<&str>> {
+    if path.is_empty() || path.starts_with('/') || path.contains(['\\', '\0']) {
+        return None;
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    components
+        .iter()
+        .all(|part| !part.is_empty() && !matches!(*part, "." | ".."))
+        .then_some(components)
+}
+
+fn safe_tree_destination(root: &Path, path: &str) -> Option<PathBuf> {
+    let mut destination = root.to_path_buf();
+    for component in validated_tree_components(path)? {
+        destination.push(component);
+    }
+    Some(destination)
 }
 
 fn is_skill_directory_link(path: &str) -> bool {
@@ -419,15 +535,27 @@ fn is_skill_directory_link(path: &str) -> bool {
 }
 
 fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) -> Option<String> {
-    let mut link = link_path.to_string();
+    let mut path = link_path.to_string();
     let mut visited = HashSet::new();
-    while let Some(target) = symlinks.get(&link) {
+    loop {
+        let components = validated_tree_components(&path)?;
+        let Some((prefix_len, link, target)) = (1..=components.len()).find_map(|len| {
+            let prefix = components[..len].join("/");
+            symlinks
+                .get(&prefix)
+                .map(|target| (len, prefix, target.as_str()))
+        }) else {
+            return Some(path);
+        };
         if !visited.insert(link.clone()) {
             return None;
         }
-        link = resolve_tree_link(&link, target)?;
+        let resolved = resolve_tree_link(&link, target)?;
+        path = std::iter::once(resolved.as_str())
+            .chain(components[prefix_len..].iter().copied())
+            .collect::<Vec<_>>()
+            .join("/");
     }
-    Some(link)
 }
 
 fn resolve_tree_link(link_path: &str, target: &str) -> Option<String> {
@@ -766,7 +894,7 @@ mod tests {
         let chained = HashMap::from([
             (
                 ".agents/skills/phoenix-development".to_string(),
-                "../../aliases/development".to_string(),
+                "../../aliases/development/current".to_string(),
             ),
             (
                 "aliases/development".to_string(),
@@ -775,13 +903,51 @@ mod tests {
         ]);
         assert_eq!(
             resolve_tree_link_chain(".agents/skills/phoenix-development", &chained),
-            Some("skills/phoenix-development".to_string())
+            Some("skills/phoenix-development/current".to_string())
         );
         let cyclic = HashMap::from([
             (".agents/skills/a".to_string(), "b".to_string()),
             (".agents/skills/b".to_string(), "a".to_string()),
         ]);
         assert_eq!(resolve_tree_link_chain(".agents/skills/a", &cyclic), None);
+
+        let intermediate_cycle = HashMap::from([
+            (
+                ".agents/skills/a".to_string(),
+                "../../aliases/a/current".to_string(),
+            ),
+            ("aliases/a".to_string(), "b".to_string()),
+            ("aliases/b".to_string(), "a".to_string()),
+        ]);
+        assert_eq!(
+            resolve_tree_link_chain(".agents/skills/a", &intermediate_cycle),
+            None
+        );
+    }
+
+    #[test]
+    fn tree_destinations_reject_non_posix_and_traversing_paths() {
+        let root = Path::new("/safe/root");
+        assert_eq!(
+            safe_tree_destination(root, ".agents/skills/review/SKILL.md"),
+            Some(root.join(".agents/skills/review/SKILL.md"))
+        );
+        for unsafe_path in [
+            "../outside/SKILL.md",
+            ".agents/../outside/SKILL.md",
+            ".agents//skills/review/SKILL.md",
+            ".agents/./skills/review/SKILL.md",
+            "/outside/SKILL.md",
+            "C:\\outside\\SKILL.md",
+            ".agents\\skills\\review\\SKILL.md",
+            ".agents/skills/review/SKILL.md\0outside",
+        ] {
+            assert_eq!(
+                safe_tree_destination(root, unsafe_path),
+                None,
+                "unsafe committed-tree path must be rejected: {unsafe_path:?}"
+            );
+        }
     }
 
     #[test]
