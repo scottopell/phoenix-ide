@@ -85,15 +85,29 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-async function settleValidation() {
+async function settleValidation(options: { metadata?: 'started' | 'settled' } = {}) {
   const path = screen.getAllByPlaceholderText('/path/to/project')[0]?.getAttribute('value');
   await waitFor(() => expect(api.validateCwd).toHaveBeenCalledWith(path));
   const validation = await vi.mocked(api.validateCwd).mock.results.at(-1)?.value;
-  if (validation?.is_git) {
-    await waitFor(() => {
-      expect(api.listGitBranches).toHaveBeenCalledWith(path);
-      expect(api.getProjectTaskAvailability).toHaveBeenCalledWith(path);
-    });
+  if (!validation?.is_git) return;
+
+  await waitFor(() => {
+    expect(api.listGitBranches).toHaveBeenCalledWith(path);
+    expect(api.getProjectTaskAvailability).toHaveBeenCalledWith(path);
+  });
+  if (options.metadata === 'started') return;
+
+  const branchRequest = vi.mocked(api.listGitBranches).mock.results.at(-1)?.value;
+  const availabilityRequest = vi.mocked(api.getProjectTaskAvailability).mock.results.at(-1)?.value;
+  let availability: Awaited<typeof availabilityRequest>;
+  await act(async () => {
+    [, availability] = await Promise.all([branchRequest, availabilityRequest]);
+  });
+  await screen.findAllByText('Chat in a fresh worktree');
+  if (availability?.available) {
+    await screen.findAllByText('Start from a task');
+  } else {
+    expect(screen.queryAllByText('Loading tasks...')).toHaveLength(0);
   }
 }
 
@@ -509,7 +523,7 @@ describe('/new workflow modes', () => {
     vi.mocked(api.getProjectTaskAvailability).mockImplementation(() => new Promise(() => {}));
     renderPage();
 
-    await settleValidation();
+    await settleValidation({ metadata: 'started' });
     await screen.findAllByText('Loading tasks...');
     expect(screen.getAllByText('Start from a task').length).toBeGreaterThan(0);
     expect(api.listProjectTasks).not.toHaveBeenCalled();

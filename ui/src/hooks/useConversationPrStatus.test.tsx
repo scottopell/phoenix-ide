@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { useConversationPrStatus } from './useConversationPrStatus';
 import { api, type CachedPrSummary, type PrStatusResponse } from '../api';
 
@@ -81,10 +81,11 @@ describe('useConversationPrStatus', () => {
       expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
     });
 
-    first.resolve(prStatus(1));
-    await waitFor(() => {
-      expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
+    await act(async () => {
+      first.resolve(prStatus(1));
+      await first.promise;
     });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
   });
 
   it('seeds ready state from cached PR while the fresh status loads', async () => {
@@ -148,10 +149,11 @@ describe('useConversationPrStatus', () => {
     rerender(<Probe conversationId="conv-2" cached={null} />);
     expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
 
-    first.resolve(prStatus(1));
-    await waitFor(() => {
-      expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    await act(async () => {
+      first.resolve(prStatus(1));
+      await first.promise;
     });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
 
     second.resolve(prStatus(2));
     await waitFor(() => {

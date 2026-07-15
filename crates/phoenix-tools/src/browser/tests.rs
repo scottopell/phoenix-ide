@@ -706,7 +706,12 @@ async fn test_browser_console_logs_local() {
             ))
             .await
             .expect("session should exist after navigate");
-        session.read().await.wait_for_console_log_count(3).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.read().await.wait_for_console_log_count(3),
+        )
+        .await
+        .expect("console listener did not capture 3 events within 5s");
     }
 
     // Get logs
@@ -2142,13 +2147,28 @@ async fn test_screencast_attach_emits_frames_and_url() {
 
     // Third attach: a fresh broker should be allocated since the previous
     // one died with the last viewer.
-    let (broker_c, _rx_c, _) = {
+    let (broker_c, mut rx_c, _) = {
         let s = session_arc.read().await;
         s.attach_viewer().await.expect("attach_viewer #3")
     };
     assert!(
         !std::ptr::eq(broker_a_ptr, Arc::as_ptr(&broker_c)),
         "new broker after all viewers dropped"
+    );
+    let replacement_frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx_c.recv().await {
+                Ok(ScreencastEvent::Frame { jpeg }) => break jpeg,
+                Ok(ScreencastEvent::Url(_)) => {}
+                Err(error) => panic!("replacement screencast closed before a frame: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("replacement screencast did not emit a frame within 5s");
+    assert!(
+        !replacement_frame.is_empty(),
+        "replacement frame should have non-empty JPEG bytes"
     );
     drop(broker_c);
 
