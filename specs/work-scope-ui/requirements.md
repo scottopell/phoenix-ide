@@ -288,9 +288,11 @@ opening a separate dock.
 THE section SHALL carry its own collapse state and a live-count badge of
 running resources, and when expanded SHALL show per-resource rows with inline
 status glyphs, label, elapsed time, and the output byte count as the output
-signal. Detailed output (the bash ring-buffer tail) and per-process resource
-sampling are deliberately NOT rendered inline here — that depth belongs to a
-separate per-handle inspection surface, not this at-a-glance panel.
+signal. For each attributable live bash handle, the row SHALL also show compact
+CPU percentage, proportional memory, and process count from the shared
+demand-driven observation generation (`specs/deployment-info/`
+REQ-DEPLOY-007a). Detailed output (the bash ring-buffer tail) SHALL NOT be
+rendered inline here; that depth belongs to the per-handle inspection surface.
 
 THE per-resource status glyph SHALL distinguish liveness from outcome. A
 running or otherwise live resource (a running bash handle, a reachable tmux
@@ -309,6 +311,8 @@ rail badges.
 THE section SHALL update from the `WorkScopeUpdate` SSE event without churning
 the rest of the conversation view.
 
+THE section SHALL derive a deduplicated scope health aggregate from the same generation and MAY replace its ordinary summary with one centrally defined descriptive attention state (`high CPU`, `high memory`, or `process spike`). WHERE metrics are unavailable, the section SHALL retain lifecycle information without fabricating zero-valued health. The collapsed rail SHALL remain a live-count surface and SHALL use only a restrained attention treatment rather than rendering a resource dashboard.
+
 WHERE the browser section reports `state` `live` with an `idle_ms` past a
 frontend-chosen threshold
 THE section MAY present the browser row as "idle" — a purely client-side
@@ -323,9 +327,9 @@ belongs in the persistent left panel beside the other resource sections rather
 than in a separate right dock. Per the UI Design Philosophy (information
 density, inline status, progressive disclosure): the rail's badge answers "is
 anything running?" at a glance; the expanded rows answer "what, and for how
-long?"; "what is it doing?" — the live output tail and per-process resource
-sampling — is deliberately out of this panel's scope, left to a separate
-per-handle inspection surface rather than rendered inline. Field-level
+long?" and "which resource is hot?"; detailed command output remains in the
+per-handle inspector. Shared observations make health a compact read projection
+rather than an independent sampler owned by each row. Field-level
 render isolation keeps a resource change from re-rendering the transcript. The
 "idle" presentation lives in the section because it is a display threshold over
 `idle_ms`, not authoritative session state.

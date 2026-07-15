@@ -29,11 +29,12 @@
 //! two-refresh pattern `sample_resources` uses, so the first read is
 //! meaningful rather than `0`.
 
+#[cfg(test)]
 use phoenix_core::domain::process_inspection::ResourceSample;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProcessObservation {
+pub(crate) struct ProcessObservation {
     pub pid: u32,
     pub name: String,
     pub cpu_percent: Option<f32>,
@@ -87,7 +88,7 @@ pub fn process_pss_bytes(pid: u32) -> Option<u64> {
     process_pss_bytes_impl(pid)
 }
 
-pub async fn sample_process_observations(
+pub(crate) async fn sample_process_observations(
     expected_identities: &BTreeMap<u32, ProcessIdentity>,
 ) -> Vec<ProcessObservation> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -155,7 +156,7 @@ pub async fn sample_process_observations(
     rows
 }
 
-pub fn group_member_identities_for_sampling(
+pub(crate) fn group_member_identities_for_sampling(
     pgids: &BTreeSet<i32>,
 ) -> Option<BTreeMap<u32, ProcessIdentity>> {
     if pgids.is_empty() {
@@ -170,7 +171,7 @@ pub fn group_member_identities_for_sampling(
     )
 }
 
-pub fn session_member_identities_for_sampling(
+pub(crate) fn session_member_identities_for_sampling(
     session_ids: &BTreeSet<i32>,
 ) -> Option<BTreeMap<u32, ProcessIdentity>> {
     if session_ids.is_empty() {
@@ -186,12 +187,12 @@ pub fn session_member_identities_for_sampling(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessIdentity {
+pub(crate) struct ProcessIdentity {
     pub pid: u32,
     pub start_time: u128,
 }
 
-pub fn process_identity_for_sampling(pid: u32) -> Option<ProcessIdentity> {
+pub(crate) fn process_identity_for_sampling(pid: u32) -> Option<ProcessIdentity> {
     current_process_identity(pid)
 }
 
@@ -284,6 +285,7 @@ fn process_cpu_time_seconds_impl(_pid: u32) -> Option<f64> {
 /// Each field is `None` when that metric cannot be read on the host (an old
 /// kernel without `smaps_rollup`, a `proc_pid_rusage` failure, a pid that
 /// exited between enumeration and read); the gap is logged at `debug`.
+#[cfg(test)]
 pub async fn sample_process_group(pgid: i32) -> ResourceSample {
     let members = group_member_pids(&BTreeSet::from([pgid]));
 

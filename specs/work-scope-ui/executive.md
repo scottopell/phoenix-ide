@@ -18,7 +18,7 @@ reaches the client two ways: a pull endpoint
 page, and a `WorkScopeUpdate` SSE event that re-broadcasts the full snapshot
 when a resource changes state. The conversation page mounts a collapsed-by-
 default rail (live-count badge) that expands to per-resource rows with inline
-status glyphs, labels, and elapsed time, plus an on-demand bash ring tail. The
+status glyphs, labels, elapsed time, and shared CPU/proportional-memory/process-count health for live bash handles. Detailed output remains in the process inspector. The
 chain page renders the identical panel against the one scope key of the chain
 root.
 
@@ -43,6 +43,7 @@ inventory changes from churning the transcript. On the conversation page the
 work scope is a section in the left `FileExplorerPanel`, stacked with
 Files/Skills/Tasks and always present; the chain page, which has no left panel,
 uses a standalone right-adjacent dock that shares the same resource rows.
+The pull projection attaches one timestamped, deduplicated scope aggregate and per-handle health from the same demand-driven observation generation used by `/about` and process inspectors; lifecycle-only snapshots remain valid where native metrics are unavailable.
 
 No Allium spec accompanies this spec: the feature is a read-projection plus a
 full-snapshot push over resource state whose lifecycles are already modeled by

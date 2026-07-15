@@ -2822,13 +2822,26 @@ async fn get_work_scope_inventory(
     let work_scope = crate::work_scope::WorkScope::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
 
-    let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+    let mut inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
         &work_scope,
         state.runtime.bash_handles(),
         state.runtime.tmux_registry(),
         state.runtime.browser_sessions(),
     )
     .await;
+
+    if inventory.bash.iter().any(|handle| handle.state.is_live()) {
+        let generation = state.resource_monitor.observe(&state).await;
+        for handle in &mut inventory.bash {
+            if let Some(pids) = generation.handle_pids(&scope_key, &handle.handle_id) {
+                handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
+            }
+        }
+        let scope_pids = generation.scope_pids(&scope_key);
+        inventory.health = (!scope_pids.is_empty())
+            .then(|| super::resource_monitor::health_for_pids(&generation, &scope_pids));
+        inventory.health_sampled_at = Some(generation.sampled_at);
+    }
 
     Ok(Json(inventory))
 }
@@ -2925,11 +2938,23 @@ async fn inspect_bash_handle(
         ))
     })?;
 
-    // Sample resources only for a live handle (REQ-PINSP-004): a terminal
-    // handle has no process group, so `resources` stays `None`.
-    if let Some(pgid) = assembly.live_pgid {
+    if assembly.live_pgid.is_some() {
+        let generation = state.resource_monitor.observe(&state).await;
+        let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
+            || phoenix_core::domain::work_scope_inventory::ResourceHealth {
+                cpu_percent: None,
+                memory_bytes: None,
+                process_count: None,
+            },
+            |pids| super::resource_monitor::health_for_pids(&generation, pids),
+        );
+        assembly.inspection.resources_sampled_at = Some(generation.sampled_at);
         assembly.inspection.resources =
-            Some(super::process_sample::sample_process_group(pgid).await);
+            Some(phoenix_core::domain::process_inspection::ResourceSample {
+                cpu_pct: health.cpu_percent,
+                memory_bytes: health.memory_bytes,
+                process_count: health.process_count,
+            });
     }
 
     Ok(Json(assembly.inspection))
@@ -7168,6 +7193,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
     }
 
@@ -11712,6 +11738,7 @@ mod regenerate_conversation_name_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
     }
 
@@ -11916,6 +11943,7 @@ mod upgrade_model_state_guard_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
     }
 
@@ -12189,6 +12217,7 @@ mod file_read_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
     }
 
@@ -12816,6 +12845,7 @@ mod chat_authority_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
     }
 

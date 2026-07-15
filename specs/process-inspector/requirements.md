@@ -271,6 +271,8 @@ THE resource readout SHALL update on each poll (about once per second), and
 WHERE a trio metric is null the readout SHALL render it as unavailable rather
 than as zero.
 
+THE resource readout SHALL use the shared demand-driven observation generation defined by `specs/deployment-info/` REQ-DEPLOY-007a, while the output pane SHALL retain its independent bash ring-buffer cursor. Opening the inspector SHALL NOT create a second native process sample when a fresh shared generation already contains the handle.
+
 WHEN the snapshot reports `truncated_before`
 THE SYSTEM SHALL indicate inline that earlier output fell out of the ring window.
 

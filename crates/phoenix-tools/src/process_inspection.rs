@@ -100,6 +100,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     duration_ms: None,
                     output,
                     // Filled by the caller for live handles (REQ-PINSP-004).
+                    resources_sampled_at: None,
                     resources: None,
                 },
                 live_pgid: Some(live.pgid),
@@ -120,6 +121,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     signal_number: tomb.signal_number,
                     duration_ms: Some(tomb.duration_ms),
                     output,
+                    resources_sampled_at: None,
                     resources: None,
                 },
                 live_pgid: None,

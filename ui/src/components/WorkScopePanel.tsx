@@ -50,6 +50,7 @@ import './WorkScopePanel.css';
  *  is edge-triggered on bash state transitions only — between transitions the
  *  byte count would otherwise stay frozen. */
 const RUNNING_POLL_INTERVAL_MS = 2000;
+const HEALTH_STALE_AFTER_MS = RUNNING_POLL_INTERVAL_MS * 2;
 
 interface Props {
   /** The scope key to query (`work_scope_key` on the conversation, or the
@@ -117,6 +118,48 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const HEALTH_THRESHOLDS = {
+  cpu: { enter: 200, recover: 150 },
+  memory: { enter: 1024 * 1024 * 1024, recover: 768 * 1024 * 1024 },
+  processes: { enter: 32, recover: 24 },
+} as const;
+
+function formatHealth(health: BashHandleInventory['health']): string | null {
+  if (!health) return null;
+  const parts: string[] = [];
+  if (health.cpu_percent != null) parts.push(`${health.cpu_percent.toFixed(0)}%`);
+  if (health.memory_bytes != null) parts.push(formatBytes(health.memory_bytes));
+  if (health.process_count != null) parts.push(`${health.process_count}p`);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+function healthIsFresh(sampledAt: string | null | undefined, now: number): boolean {
+  return sampledAt != null && now - Date.parse(sampledAt) <= HEALTH_STALE_AFTER_MS;
+}
+
+type HealthAttention = 'high CPU' | 'high memory' | 'process spike';
+
+function healthAttention(
+  health: BashHandleInventory['health'],
+  previous: HealthAttention | null = null,
+): HealthAttention | null {
+  if (!health) return null;
+  const cpuThreshold = previous === 'high CPU' ? HEALTH_THRESHOLDS.cpu.recover : HEALTH_THRESHOLDS.cpu.enter;
+  const memoryThreshold = previous === 'high memory' ? HEALTH_THRESHOLDS.memory.recover : HEALTH_THRESHOLDS.memory.enter;
+  const processThreshold = previous === 'process spike' ? HEALTH_THRESHOLDS.processes.recover : HEALTH_THRESHOLDS.processes.enter;
+  if (health.cpu_percent != null && health.cpu_percent >= cpuThreshold) return 'high CPU';
+  if (health.memory_bytes != null && health.memory_bytes >= memoryThreshold) return 'high memory';
+  if (health.process_count != null && health.process_count >= processThreshold) return 'process spike';
+  return null;
+}
+
+function useHealthAttention(health: BashHandleInventory['health']): HealthAttention | null {
+  const previousRef = useRef<HealthAttention | null>(null);
+  const attention = healthAttention(health, previousRef.current);
+  previousRef.current = attention;
+  return attention;
 }
 
 /** The "inspect →" affordance. Isolated into its own component so the
@@ -191,16 +234,20 @@ function BashRow({
   now,
   scopeKey,
   inspectable,
+  healthFresh,
 }: {
   handle: BashHandleInventory;
   now: number;
   scopeKey: string;
   inspectable: boolean;
+  healthFresh: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const { glyph, cls, title } = bashGlyph(handle);
   const live = isLive(handle.state);
   const label = handle.label || handle.cmd;
+  const health = healthFresh ? handle.health : undefined;
+  const attention = healthAttention(health);
   return (
     <div className={`ws-row ws-row--bash${live ? '' : ' ws-row--dead'}`}>
       <button
@@ -214,7 +261,7 @@ function BashRow({
         <span className="ws-row-label" title={handle.cmd}>
           {label}
         </span>
-        <span className="ws-row-meta">{elapsedLabel(handle, now)}</span>
+        <span className="ws-row-meta">{formatHealth(health) ?? elapsedLabel(handle, now)}</span>
       </button>
       {open && (
         <div className="ws-row-detail">
@@ -239,6 +286,18 @@ function BashRow({
             <span className="ws-detail-key">output</span>
             <span className="ws-detail-val">{formatBytes(handle.output_bytes)}</span>
           </div>
+          {formatHealth(health) && (
+            <div className="ws-detail-line">
+              <span className="ws-detail-key">health</span>
+              <span className="ws-detail-val">{formatHealth(health)}</span>
+            </div>
+          )}
+          {attention && (
+            <div className="ws-detail-line ws-detail-line--attention">
+              <span className="ws-detail-key">attention</span>
+              <span className="ws-detail-val">{attention}</span>
+            </div>
+          )}
           {inspectable && <BashInspectButton scopeKey={scopeKey} handleId={handle.handle_id} />}
         </div>
       )}
@@ -502,7 +561,7 @@ function WorkScopeBody({
               <div className="ws-empty">no handles</div>
             ) : (
               inventory.bash.map((h) => (
-                <BashRow key={h.handle_id} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} />
+                <BashRow key={h.handle_id} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} healthFresh={healthIsFresh(inventory.health_sampled_at, now)} />
               ))
             )}
           </section>
@@ -570,15 +629,17 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
     expanded,
   );
   const count = workScopeLiveCount(inventory);
+  const freshHealth = healthIsFresh(inventory?.health_sampled_at, now) ? inventory?.health : undefined;
+  const healthWarning = useHealthAttention(freshHealth);
 
   return (
     <GroundingSection
       icon="●"
       title="Work"
-      summary={error ? 'inventory unavailable' : summarizeWorkScope(inventory, count)}
+      summary={error ? 'inventory unavailable' : healthWarning ?? summarizeWorkScope(inventory, count)}
       count={count}
       expanded={expanded}
-      attention={count > 0 || Boolean(error)}
+      attention={Boolean(healthWarning) || Boolean(error)}
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>

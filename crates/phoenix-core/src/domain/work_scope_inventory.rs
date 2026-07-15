@@ -35,6 +35,14 @@ pub struct WorkScopeInventory {
     pub tmux: Option<TmuxInventory>,
     /// The browser session, or `None` when no session is live for this scope.
     pub browser: Option<BrowserInventory>,
+    /// Timestamp of the shared resource observation attached to this snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub health_sampled_at: Option<DateTime<Utc>>,
+    /// Deduplicated health aggregate for attributable live resources in scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub health: Option<ResourceHealth>,
 }
 
 /// Lifecycle status of one bash handle, projected from `HandleState` +
@@ -52,6 +60,13 @@ pub enum BashHandleState {
     KillPendingKernel,
     /// Terminal — exited or killed.
     Tombstoned,
+}
+
+impl BashHandleState {
+    #[must_use]
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::KillPendingKernel)
+    }
 }
 
 /// One bash handle's observability projection.
@@ -110,6 +125,20 @@ pub struct BashHandleInventory {
     /// Always present: defined as 0 at spawn, grows as output is produced,
     /// and persisted into the tombstone so terminal handles report it too.
     pub output_bytes: u64,
+    /// Shared resource observation for this live handle's process group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub health: Option<ResourceHealth>,
+}
+
+/// CPU, proportional memory, and process-count observation over a deduplicated
+/// process set. Nullable metrics preserve unavailable vs. zero.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ResourceHealth {
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub process_count: Option<u32>,
 }
 
 /// In-memory probe status of a per-scope tmux server, projected from the
@@ -216,6 +245,7 @@ mod tests {
             exit_code: None,
             signal_number: None,
             output_bytes: 4096,
+            health: None,
         };
         let v = serde_json::to_value(&inv).unwrap();
         assert_eq!(v["state"], "running");
@@ -240,6 +270,7 @@ mod tests {
             exit_code: Some(0),
             signal_number: None,
             output_bytes: 512,
+            health: None,
         };
         let v = serde_json::to_value(&inv).unwrap();
         assert_eq!(v["state"], "tombstoned");

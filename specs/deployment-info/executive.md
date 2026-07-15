@@ -14,6 +14,7 @@ the machine is it using right now?"
 - A live managed-resource monitor with a focused resource endpoint, host and
   managed totals, per-category attribution, per-process rows, and bounded
   client-side recent history
+- Demand-driven request coalescing shared with Work Scope health and process inspectors, so overlapping consumers reuse one timestamped native-process observation generation
 - On-disk locations with sizes for small owned artifacts, paths-only for large
   caches, and a stable row for the attachment store
 - The active log sinks (stdout and/or a process-owned file path) — path only,

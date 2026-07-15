@@ -18,6 +18,7 @@ mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;
 mod process_sample;
+mod resource_monitor;
 mod spa_routes;
 mod sse;
 mod terminal_ws;
@@ -90,6 +91,8 @@ pub struct AppState {
     pub suggest_token: String,
     /// In-memory snapshot of loopback services that explicitly advertise an API catalog.
     pub discovery: Arc<DiscoveryRegistry>,
+    /// Demand-driven shared process observation generation.
+    pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
 }
 
 impl AppState {
@@ -163,6 +166,7 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
+        let resource_monitor = resource_monitor::ResourceMonitor::new();
         Self {
             runtime,
             llm_registry,
@@ -181,6 +185,7 @@ impl AppState {
             runtime_env,
             suggest_token,
             discovery,
+            resource_monitor,
         }
     }
 }

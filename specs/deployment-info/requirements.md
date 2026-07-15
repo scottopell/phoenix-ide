@@ -385,6 +385,23 @@ cadence.
 
 ---
 
+### REQ-DEPLOY-007a: Shared demand-driven resource observations
+
+WHEN one or more deployment, Work Scope, or process-inspector surfaces request live process metrics
+THE SYSTEM SHALL derive their overlapping metrics from one timestamped observation generation over a deduplicated set of Phoenix-managed process identities.
+
+WHEN concurrent consumers request metrics within the observation freshness lease
+THE SYSTEM SHALL coalesce them onto the same generation rather than repeat native process discovery and CPU measurement.
+
+WHILE no resource consumer requests observations
+THE SYSTEM SHALL perform no recurring process sampling.
+
+THE SYSTEM SHALL preserve unavailable metrics as unavailable rather than zero, and SHALL protect process attribution against PID reuse by validating native process identity across the sampling interval.
+
+**Rationale:** CPU measurement requires an interval and proportional-memory reads are operating-system work. One demand-driven generation amortizes that work and gives overlapping surfaces consistent values without creating a permanent monitor when nobody is looking.
+
+---
+
 ### REQ-DEPLOY-008: Safely clean up leftover managed worktrees
 
 THE SYSTEM SHALL expose a mutation endpoint for cleaning up a Phoenix-managed

@@ -58,6 +58,10 @@ duration_ms?: number,
  */
 output: BashRingWindow, 
 /**
+ * Timestamp of the shared observation generation supplying `resources`.
+ */
+resources_sampled_at?: string, 
+/**
  * Resource sample over the handle's process group. `None` when the
  * handle is terminal (there is no process group to sample). Skipped on
  * the wire when absent.

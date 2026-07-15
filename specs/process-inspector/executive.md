@@ -40,9 +40,11 @@ group membership are platform-specific custom reads — Linux `/proc`
 (`smaps_rollup` `Pss`, scan-by-pgrp for membership), macOS `proc_listallpids`
 filtered by each PID's `pbi_pgid` (`proc_pidinfo` `PROC_PIDTBSDINFO`) +
 `proc_pid_rusage` `ri_phys_footprint`. Memory is proportional (PSS /
-`phys_footprint`), not RSS, which double-counts shared pages. Sampling happens
-only at request time while an inspector polls; an unavailable metric is null
-(not zero) and logged at `debug`, per the codebase's capability-gap convention.
+`phys_footprint`), not RSS, which double-counts shared pages. Sampling is supplied by the demand-driven shared observation generation also
+used by `/about` and Work Scope health. Concurrent consumers reuse a fresh
+generation; when no consumer requests metrics there is no recurring sampler. An
+unavailable metric is null (not zero) and logged at `debug`, per the codebase's
+capability-gap convention.
 
 The handler nests under the existing `/api/work-scope/:scope_key/…` route family
 established by `GET /api/work-scope/:scope_key/inventory`. No SSE wire variant is

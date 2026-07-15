@@ -54,6 +54,15 @@ pub struct LiveHandleSummary {
     pub age_seconds: u64,
 }
 
+/// Identity needed to attribute one live handle's process group in shared
+/// resource-observation projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveHandleProcessGroup {
+    pub work_scope: WorkScope,
+    pub handle_id: HandleId,
+    pub pgid: i32,
+}
+
 /// Per-`WorkScope` handle table. Tracks live handles (for cap enforcement
 /// and lookup) and tombstones (so peek/wait/kill on an exited handle still
 /// resolves until the scope is hard-deleted with no inheritor or Phoenix
@@ -387,6 +396,26 @@ impl BashHandleRegistry {
             for h in scope_handles.all() {
                 if let Some(pgid) = h.live_pgid().await {
                     out.push(pgid);
+                }
+            }
+        }
+        out
+    }
+
+    /// Snapshot live process groups together with their authoritative scope and
+    /// handle identity. Read-only and non-creating.
+    pub async fn snapshot_live_process_groups(&self) -> Vec<LiveHandleProcessGroup> {
+        let mut out = Vec::new();
+        let map = self.inner.read().await;
+        for (work_scope, entry) in map.iter() {
+            let scope_handles = entry.read().await;
+            for handle in scope_handles.all() {
+                if let Some(pgid) = handle.live_pgid().await {
+                    out.push(LiveHandleProcessGroup {
+                        work_scope: work_scope.clone(),
+                        handle_id: handle.handle_id.clone(),
+                        pgid,
+                    });
                 }
             }
         }

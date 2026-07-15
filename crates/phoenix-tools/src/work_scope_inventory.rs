@@ -39,6 +39,8 @@ pub async fn assemble_inventory(
         bash: assemble_bash(work_scope, bash_handles).await,
         tmux: assemble_tmux(work_scope, tmux_registry).await,
         browser: assemble_browser(work_scope, browser_sessions).await,
+        health_sampled_at: None,
+        health: None,
     }
 }
 
@@ -85,6 +87,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
                 exit_code: None,
                 signal_number: None,
                 output_bytes,
+                health: None,
             }
         }
         HandleState::Tombstoned(tomb) => BashHandleInventory {
@@ -101,6 +104,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
             exit_code: tomb.exit_code,
             signal_number: tomb.signal_number,
             output_bytes: tomb.output_bytes,
+            health: None,
         },
     }
 }

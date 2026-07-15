@@ -847,9 +847,12 @@ mod tests {
                     exit_code: None,
                     signal_number: None,
                     output_bytes: 42,
+                    health: None,
                 }],
                 tmux: None,
                 browser: None,
+                health_sampled_at: None,
+                health: None,
             },
         };
         assert_parity(&event);

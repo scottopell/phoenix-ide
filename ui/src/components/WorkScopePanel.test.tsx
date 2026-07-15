@@ -54,7 +54,7 @@ function tombSuccess(over: Partial<BashHandleInventory> = {}): BashHandleInvento
 
 function inv(
   bashes: BashHandleInventory[],
-  over: Partial<Pick<WorkScopeInventory, 'scope_key' | 'tmux' | 'browser'>> = {},
+  over: Partial<Pick<WorkScopeInventory, 'scope_key' | 'tmux' | 'browser' | 'health' | 'health_sampled_at'>> = {},
 ): WorkScopeInventory {
   return { scope_key: 'ws-1', bash: bashes, tmux: null, browser: null, ...over };
 }
@@ -192,6 +192,42 @@ describe('bash glyph: liveness vs outcome', () => {
     expect(g.textContent).toBe('✗');
     expect(g.classList.contains('ws-glyph--err')).toBe(true);
     expect(g.getAttribute('title')).toBe('killed (signal 9)');
+  });
+});
+
+describe('WorkScopeSection resource health', () => {
+  it('shows nullable shared health compactly and flags high CPU', async () => {
+    getInv.mockResolvedValue(inv([
+      bash({ health: { cpu_percent: 245.4, memory_bytes: 128 * 1024 * 1024, process_count: 4 } }),
+    ], {
+      health: { cpu_percent: 245.4, memory_bytes: 128 * 1024 * 1024, process_count: 4 },
+      health_sampled_at: new Date().toISOString(),
+    }));
+
+    await renderExpanded();
+    expect(screen.getByText('245% · 128.0 MB · 4p')).toBeTruthy();
+    expect(screen.getByText('high CPU')).toBeTruthy();
+    openBashDetail();
+    expect(screen.getByText('health')).toBeTruthy();
+  });
+
+  it('suppresses stale health instead of presenting it as current', async () => {
+    getInv.mockResolvedValue(inv([
+      bash({ health: { cpu_percent: 245.4, memory_bytes: 1024, process_count: 2 } }),
+    ], {
+      health: { cpu_percent: 245.4, memory_bytes: 1024, process_count: 2 },
+      health_sampled_at: new Date(Date.now() - 10_000).toISOString(),
+    }));
+    await renderExpanded();
+    expect(screen.queryByText(/245%/)).toBeNull();
+    expect(screen.getByText('0s')).toBeTruthy();
+  });
+
+  it('keeps lifecycle elapsed text when health is unavailable', async () => {
+    getInv.mockResolvedValue(inv([bash({ started_at: new Date(Date.now() - 5000).toISOString() })]));
+    await renderExpanded();
+    expect(screen.getByText('5s')).toBeTruthy();
+    expect(screen.queryByText('0%')).toBeNull();
   });
 });
 

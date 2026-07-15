@@ -10,11 +10,7 @@
 //! yields current values.
 
 use super::AppState;
-use crate::api::process_sample::{
-    group_member_identities_for_sampling, process_identity_for_sampling,
-    sample_process_observations, session_member_identities_for_sampling, ProcessIdentity,
-    ProcessObservation,
-};
+use crate::api::process_sample::ProcessObservation;
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -149,9 +145,9 @@ pub struct AboutResourcesSnapshot {
     pub categories: Vec<ManagedResourceCategory>,
 }
 
-#[derive(Serialize, TS)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct HostResources {
+pub(crate) struct HostResources {
     pub logical_cpu_count: Option<u32>,
     pub cpu_busy_percent: Option<f32>,
     pub cpu_system_percent: Option<f32>,
@@ -932,203 +928,86 @@ pub fn absolutize(path: &Path) -> PathBuf {
 }
 
 async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
-    sample_about_resources_inner(Some(state)).await
-}
+    let generation = state.resource_monitor.observe(state).await;
+    let bash_pids = generation.all_bash_pids();
+    let mut all_pids = generation.api_pids.clone();
+    all_pids.extend(bash_pids.iter().copied());
+    if let Some(terminal_pids) = &generation.terminal_pids {
+        all_pids.extend(terminal_pids.iter().copied());
+    }
 
-async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
-    let api_identity = sysinfo::get_current_pid()
-        .ok()
-        .map(sysinfo::Pid::as_u32)
-        .and_then(|pid| process_identity_for_sampling(pid).map(|identity| (pid, identity)));
-    let api_identities = api_identity.into_iter().collect::<BTreeMap<_, _>>();
-    let api_snapshot = if api_identities.is_empty() {
-        BashPidSnapshot::Unavailable
+    let api = if generation.api_pids.is_empty() {
+        unavailable_category(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            "Phoenix API native process identity unavailable",
+        )
     } else {
-        BashPidSnapshot::Available(api_identities.clone())
-    };
-    let bash_pid_snapshot = match state {
-        Some(state) => snapshot_bash_pids(state).await,
-        None => BashPidSnapshot::Available(BTreeMap::new()),
-    };
-
-    let terminal_pid_snapshot = state.map(snapshot_terminal_pids);
-    let mut all_identities = api_identities;
-    if let BashPidSnapshot::Available(bash_identities) = &bash_pid_snapshot {
-        all_identities.extend(bash_identities);
-    }
-    if let Some(BashPidSnapshot::Available(terminal_identities)) = &terminal_pid_snapshot {
-        all_identities.extend(terminal_identities);
-    }
-    let all_pids = all_identities.keys().copied().collect::<BTreeSet<_>>();
-
-    let (host, observed_rows) = tokio::join!(
-        sample_host_resources(),
-        sample_process_observations(&all_identities)
-    );
-    let observed_rows_by_pid: BTreeMap<u32, ProcessObservation> = observed_rows
-        .into_iter()
-        .map(|row| (row.pid, row))
-        .collect();
-
-    let mut categories = Vec::new();
-    categories.push(build_api_category(&api_snapshot, &observed_rows_by_pid));
-
-    if let Some(state) = state {
-        categories.push(build_bash_category(
-            &bash_pid_snapshot,
-            &observed_rows_by_pid,
-        ));
-
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::Browser,
-            "Browser",
-            "browser sessions do not currently expose native process identity",
-        ));
-        categories.push(build_terminal_category(
-            terminal_pid_snapshot
-                .as_ref()
-                .expect("terminal snapshot exists with app state"),
-            &observed_rows_by_pid,
-        ));
-
-        let has_mcp = !state.mcp_manager.status().await.is_empty();
-        if has_mcp {
-            tracing::debug!(
-                "about resources: MCP servers present but native process identity unavailable"
-            );
-        }
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::Mcp,
-            "MCP",
-            if has_mcp {
-                "MCP servers are configured or connected, but Phoenix does not currently surface native process identity for attribution"
-            } else {
-                "no MCP server identities available"
-            },
-        ));
-    } else {
-        categories.push(build_bash_category(
-            &bash_pid_snapshot,
-            &observed_rows_by_pid,
-        ));
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::Browser,
-            "Browser",
-            "browser sessions were not sampled in this context",
-        ));
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::TmuxTerminal,
-            "tmux/terminal",
-            "tmux and terminal resources were not sampled in this context",
-        ));
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::Mcp,
-            "MCP",
-            "MCP resources were not sampled in this context",
-        ));
-    }
-
-    let managed_total = totals_from_observations(&all_pids, &observed_rows_by_pid);
-    AboutResourcesSnapshot {
-        sampled_at: Utc::now(),
-        host,
-        managed_total,
-        categories,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum BashPidSnapshot {
-    Available(BTreeMap<u32, ProcessIdentity>),
-    Unavailable,
-}
-
-async fn snapshot_bash_pids(state: &AppState) -> BashPidSnapshot {
-    let pgids = state
-        .runtime
-        .bash_handles()
-        .snapshot_live_pgids()
-        .await
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    match group_member_identities_for_sampling(&pgids) {
-        Some(member_identities) => BashPidSnapshot::Available(member_identities),
-        None => BashPidSnapshot::Unavailable,
-    }
-}
-
-fn snapshot_terminal_pids(state: &AppState) -> BashPidSnapshot {
-    let session_ids = state
-        .terminals
-        .snapshot_shell_session_ids()
-        .into_iter()
-        .collect();
-    match session_member_identities_for_sampling(&session_ids) {
-        Some(member_identities) => BashPidSnapshot::Available(member_identities),
-        None => BashPidSnapshot::Unavailable,
-    }
-}
-
-fn build_api_category(
-    snapshot: &BashPidSnapshot,
-    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
-) -> ManagedResourceCategory {
-    match snapshot {
-        BashPidSnapshot::Available(identities) => build_category_from_observations(
+        build_category_from_observations(
             ManagedResourceCategoryKind::Api,
             "API",
             ManagedResourceAttribution::Available,
             None,
-            &identities.keys().copied().collect(),
-            observed_rows_by_pid,
-        ),
-        BashPidSnapshot::Unavailable => unavailable_category(
-            ManagedResourceCategoryKind::Api,
-            "API",
-            "Phoenix API native process identity unavailable",
-        ),
-    }
-}
-
-fn build_terminal_category(
-    snapshot: &BashPidSnapshot,
-    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
-) -> ManagedResourceCategory {
-    match snapshot {
-        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            &generation.api_pids,
+            &generation.observations,
+        )
+    };
+    let bash = if generation.bash_attribution_available {
+        build_category_from_observations(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            ManagedResourceAttribution::Available,
+            None,
+            &bash_pids,
+            &generation.observations,
+        )
+    } else {
+        unavailable_category(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            "live bash process groups exist, but native process enumeration failed",
+        )
+    };
+    let terminal = match &generation.terminal_pids {
+        Some(pids) => build_category_from_observations(
             ManagedResourceCategoryKind::TmuxTerminal,
             "tmux/terminal",
             ManagedResourceAttribution::Available,
             Some("shell-mode terminals are attributed; tmux server identity remains unavailable".to_string()),
-            &identities.keys().copied().collect(),
-            observed_rows_by_pid,
+            pids,
+            &generation.observations,
         ),
-        BashPidSnapshot::Unavailable => unavailable_category(
+        None => unavailable_category(
             ManagedResourceCategoryKind::TmuxTerminal,
             "tmux/terminal",
             "shell terminals exist, but native process enumeration failed; tmux server identity remains unavailable",
         ),
-    }
-}
+    };
+    let has_mcp = !state.mcp_manager.status().await.is_empty();
 
-fn build_bash_category(
-    snapshot: &BashPidSnapshot,
-    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
-) -> ManagedResourceCategory {
-    match snapshot {
-        BashPidSnapshot::Available(identities) => build_category_from_observations(
-            ManagedResourceCategoryKind::Bash,
-            "Bash",
-            ManagedResourceAttribution::Available,
-            None,
-            &identities.keys().copied().collect(),
-            observed_rows_by_pid,
-        ),
-        BashPidSnapshot::Unavailable => unavailable_category(
-            ManagedResourceCategoryKind::Bash,
-            "Bash",
-            "live bash process groups exist, but native process enumeration failed",
-        ),
+    AboutResourcesSnapshot {
+        sampled_at: generation.sampled_at,
+        host: generation.host.clone(),
+        managed_total: totals_from_observations(&all_pids, &generation.observations),
+        categories: vec![
+            api,
+            bash,
+            unavailable_category(
+                ManagedResourceCategoryKind::Browser,
+                "Browser",
+                "browser sessions do not currently expose native process identity",
+            ),
+            terminal,
+            unavailable_category(
+                ManagedResourceCategoryKind::Mcp,
+                "MCP",
+                if has_mcp {
+                    "MCP servers are configured or connected, but Phoenix does not currently surface native process identity for attribution"
+                } else {
+                    "no MCP server identities available"
+                },
+            ),
+        ],
     }
 }
 
@@ -1252,7 +1131,7 @@ fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
     }
 }
 
-async fn sample_host_resources() -> HostResources {
+pub(crate) async fn sample_host_resources() -> HostResources {
     use sysinfo::System;
 
     let cpu = sample_host_cpu_breakdown().await;
@@ -1745,7 +1624,11 @@ mod tests {
 
     #[test]
     fn unavailable_api_snapshot_preserves_capability_failure() {
-        let category = build_api_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+        let category = unavailable_category(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            "native process identity unavailable",
+        );
 
         assert_eq!(
             category.attribution,
@@ -1757,7 +1640,11 @@ mod tests {
 
     #[test]
     fn unavailable_bash_snapshot_preserves_capability_failure() {
-        let category = build_bash_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+        let category = unavailable_category(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            "native process identity unavailable",
+        );
 
         assert_eq!(
             category.attribution,

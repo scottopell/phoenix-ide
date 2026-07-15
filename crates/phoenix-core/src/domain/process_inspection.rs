@@ -66,6 +66,10 @@ pub struct BashHandleInspection {
     /// Output delta — the existing ring-read window shape (REQ-BASH-004),
     /// reused verbatim from the bash tool's response.
     pub output: BashRingWindow,
+    /// Timestamp of the shared observation generation supplying `resources`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub resources_sampled_at: Option<DateTime<Utc>>,
     /// Resource sample over the handle's process group. `None` when the
     /// handle is terminal (there is no process group to sample). Skipped on
     /// the wire when absent.
@@ -74,8 +78,8 @@ pub struct BashHandleInspection {
     pub resources: Option<ResourceSample>,
 }
 
-/// The core resource trio over a bash handle's process group, sampled at
-/// request time.
+/// The core resource trio over a bash handle's process group, projected from a
+/// shared demand-driven observation generation.
 ///
 /// Each field is independently `Option` and serializes as an explicit `null`
 /// when unavailable: a `null` is a real capability gap (the metric could not be
@@ -125,6 +129,7 @@ mod tests {
             signal_number: None,
             duration_ms: None,
             output: empty_window(),
+            resources_sampled_at: Some(Utc::now()),
             resources: Some(ResourceSample {
                 cpu_pct: Some(12.5),
                 memory_bytes: Some(4096),
@@ -155,6 +160,7 @@ mod tests {
             signal_number: None,
             duration_ms: Some(42),
             output: empty_window(),
+            resources_sampled_at: None,
             resources: None,
         };
         let v = serde_json::to_value(&inspection).unwrap();
