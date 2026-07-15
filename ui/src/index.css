@@ -1037,6 +1037,7 @@ body.app-viewport-active #root {
   min-width: 100%;
   width: max-content;
   margin: 0;
+  background: var(--bg-secondary);
 }
 
 .agent-text-block th,

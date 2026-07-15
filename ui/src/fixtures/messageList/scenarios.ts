@@ -236,6 +236,7 @@ const wideMarkdownTableMessages: Message[] = [
         '| Shared platform | kernels, fuzzing, workload replay | Linux, eBPF, security | release and fleet teams | infrastructure product groups | performance and correctness |',
         '| Specialist program | device fixtures and adversarial testing | GPU and runtime integration | artifact owners | feature delivery teams | durable expertise transfer |',
         '| Temporary initiative | large-cluster chaos and rollout tests | Kubernetes controllers | onboarding teams | service owners | convergence and safe migration |',
+        '| Embedded partnership | production traces, shadow traffic, and replay | distributed systems and data integrity | platform and application owners | cross-functional migration groups | independently operated steady state |',
         '',
         'The paragraph after the table returns to the same readable prose width.',
       ].join('\n'),
@@ -322,9 +323,15 @@ export const messageListScenarios = [
   },
   {
     id: 'wide-markdown-table',
-    title: 'Wide Markdown table',
-    description: 'Wide assistant tables expand beyond prose while staying inside the conversation pane.',
+    title: 'Wide Markdown table / dark',
+    description: 'Wide assistant tables keep continuous row surfaces beyond the prose card in dark theme.',
     theme: 'dark',
+  },
+  {
+    id: 'wide-markdown-table-light',
+    title: 'Wide Markdown table / light',
+    description: 'Wide assistant tables keep continuous row surfaces beyond the prose card in light theme.',
+    theme: 'light',
   },
   {
     id: 'markdown-image-dark',
@@ -347,7 +354,7 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
     ? toolStripMessages
     : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'wide-markdown-table'
+      : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
         ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages

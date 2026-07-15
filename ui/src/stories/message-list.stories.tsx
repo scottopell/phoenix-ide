@@ -23,5 +23,8 @@ PrefixContinuityOffsetBug.storyName = 'prefix-continuity-offset-bug';
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 
+export const WideMarkdownTableLight = storyFor('wide-markdown-table-light');
+WideMarkdownTableLight.storyName = 'wide-markdown-table-light';
+
 export const MarkdownImageDark = storyFor('markdown-image-dark');
 MarkdownImageDark.storyName = 'markdown-image-dark';

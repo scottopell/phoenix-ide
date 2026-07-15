@@ -741,6 +741,7 @@ describe('MessageList', () => {
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
     const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
     const tableBreakoutTableRule = appCss.match(/\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll\s*>\s*table\s*{([^}]*)}/s)?.[1];
+    const markdownTableRule = appCss.match(/\.agent-text-block\s+\.markdown-table-scroll\s+table\s*{([^}]*)}/s)?.[1];
     const transcriptRule = appCss.match(/\.message-virtual-transcript\s*{[^}]*}/s)?.[0];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
@@ -752,6 +753,8 @@ describe('MessageList', () => {
     expect(tableBreakoutRule?.[2]).not.toMatch(/transform|position|left:/);
     expect(tableBreakoutTableRule).toMatch(/min-width:\s*min\(100%,\s*784px\)/);
     expect(tableBreakoutTableRule).toMatch(/margin-inline:\s*auto/);
+    expect(markdownTableRule).toMatch(/background:\s*var\(--bg-secondary\)/);
+    expect(tableFallbackRule).not.toMatch(/background/);
     expect(transcriptRule).not.toMatch(/container-type/);
     expect(transcriptRule).not.toMatch(/overflow-x/);
   });
