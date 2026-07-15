@@ -462,15 +462,18 @@ fn read_symlink_targets(
     let Some(mut stdin) = child.stdin.take() else {
         return HashMap::new();
     };
-    for (_, oid) in &links {
-        if writeln!(stdin, "{oid}").is_err() {
-            return HashMap::new();
-        }
-    }
-    drop(stdin);
+    let requests = links
+        .iter()
+        .map(|(_, oid)| *oid)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let writer = std::thread::spawn(move || writeln!(stdin, "{requests}").is_ok());
     let Ok(output) = child.wait_with_output() else {
         return HashMap::new();
     };
+    if !writer.join().unwrap_or(false) {
+        return HashMap::new();
+    }
     if !output.status.success() {
         return HashMap::new();
     }
@@ -526,8 +529,14 @@ fn safe_tree_destination(root: &Path, path: &str) -> Option<PathBuf> {
 }
 
 fn is_skill_directory_link(path: &str) -> bool {
-    let components: Vec<&str> = path.split('/').collect();
-    components.windows(3).enumerate().any(|(index, parts)| {
+    let Some(components) = validated_tree_components(path) else {
+        return false;
+    };
+    components.windows(2).enumerate().any(|(index, parts)| {
+        index + 2 == components.len()
+            && matches!(parts[0], ".claude" | ".agents")
+            && parts[1] == "skills"
+    }) || components.windows(3).enumerate().any(|(index, parts)| {
         index + 3 == components.len()
             && matches!(parts[0], ".claude" | ".agents")
             && parts[1] == "skills"
@@ -877,6 +886,41 @@ mod tests {
     }
 
     #[test]
+    fn git_tree_skills_view_matches_checkout_for_symlinked_catalog_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../skills", repo.path().join(".agents/skills")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir("../skills", repo.path().join(".agents/skills")).unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo.path())
+            .into_iter()
+            .filter(|skill| skill.name == "review")
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name == "review")
+            .map(|skill| skill.name)
+            .collect();
+
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(tree_names, ["review"]);
+    }
+
+    #[test]
     fn tree_link_resolution_rejects_paths_outside_committed_tree() {
         assert_eq!(
             resolve_tree_link(
@@ -923,6 +967,16 @@ mod tests {
             resolve_tree_link_chain(".agents/skills/a", &intermediate_cycle),
             None
         );
+    }
+
+    #[test]
+    fn skill_directory_links_include_catalog_roots_and_entries() {
+        assert!(is_skill_directory_link(".agents/skills"));
+        assert!(is_skill_directory_link("service/.claude/skills"));
+        assert!(is_skill_directory_link(".agents/skills/review"));
+        assert!(is_skill_directory_link("service/.claude/skills/review"));
+        assert!(!is_skill_directory_link("skills/review"));
+        assert!(!is_skill_directory_link(".agents/skills/review/nested"));
     }
 
     #[test]
