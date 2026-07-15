@@ -1735,14 +1735,6 @@ function formatReadFileRange(request: ReadFileRequest, parsed: ReadFileParseResu
   return 'from start of file';
 }
 
-function buildReadFileCopyText(parsed: ReadFileParseResult, rawText: string): string {
-  if (parsed.lines.length === 0) {
-    return rawText.slice(0, READ_FILE_PREVIEW_MAX_CHARS);
-  }
-  const preview = boundedReadFileLines(parsed.lines);
-  return preview.lines.map((line) => `${line.lineNumber}\t${line.content}`).join('\n');
-}
-
 function ReadFileResultView({
   input,
   rawText,
@@ -1760,7 +1752,7 @@ function ReadFileResultView({
   const [showAllReturnedLines, setShowAllReturnedLines] = useState(false);
   const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
   const hasMore = preview.truncated;
-  const canExpandReturnedOutput = !fullFileViewerAvailable && hasMore;
+  const canExpandReturnedOutput = hasMore;
   const visibleLines = showAllReturnedLines ? parsed.lines : preview.lines;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
@@ -1790,7 +1782,6 @@ function ReadFileResultView({
   }
 
   const rangeLabel = formatReadFileRange(request, parsed);
-  const copyText = fullFileViewerAvailable ? buildReadFileCopyText(parsed, rawText) : rawText;
 
   return (
     <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
@@ -1824,10 +1815,7 @@ function ReadFileResultView({
               {showAllReturnedLines ? 'Show preview' : 'Show all returned lines'}
             </button>
           )}
-          <CopyButton
-            text={copyText}
-            title={fullFileViewerAvailable ? 'Copy file excerpt' : 'Copy all returned lines'}
-          />
+          <CopyButton text={rawText} title="Copy all returned lines" />
         </div>
       </div>
       <div className="read-file-result-preview" role="table" aria-label="read_file preview">

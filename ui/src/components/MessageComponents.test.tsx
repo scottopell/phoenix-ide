@@ -1441,7 +1441,7 @@ describe('finalized code fence highlighting', () => {
 });
 
 describe('read_file structured result view', () => {
-  it('renders a ranged preview with metadata, copy, and open actions', async () => {
+  it('renders a ranged preview while preserving full returned output beside the live-file action', async () => {
     const onOpenFile = vi.fn();
     const lines = Array.from({ length: 25 }, (_, index) => `${index + 40}\tfixture line ${index + 40}`).join('\n');
 
@@ -1471,13 +1471,14 @@ describe('read_file structured result view', () => {
     fireEvent.click(screen.getByRole('button', { name: 'View full file' }));
     expect(onOpenFile).toHaveBeenCalledWith('src/lib.rs', new Set(), 40, 64);
 
-    fireEvent.click(screen.getByRole('button', { name: /Copy file excerpt/i }));
-    await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith(lines.split('\n').slice(0, 20).join('\n'));
-    });
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines));
 
     expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show all returned lines' }));
+    expect(screen.getByText('fixture line 64')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('keeps every returned line accessible when the full-file viewer is unavailable', async () => {
@@ -1511,7 +1512,7 @@ describe('read_file structured result view', () => {
     await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines));
   });
 
-  it('caps structured previews and copy payloads by characters', async () => {
+  it('caps structured previews by characters without truncating copied historical output', async () => {
     const longLine = 'x'.repeat(20_000);
     const copyMock = vi.mocked(copyToClipboard);
     copyMock.mockClear();
@@ -1532,9 +1533,8 @@ describe('read_file structured result view', () => {
     );
 
     expect(screen.getByText(/returned line truncated for preview/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /Copy file excerpt/i }));
-    await waitFor(() => expect(copyMock).toHaveBeenCalled());
-    expect(copyMock.mock.calls.at(-1)?.[0].length).toBeLessThanOrEqual(5_010);
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`));
   });
 
   it('preserves literal ellipses and distinguishes an empty range from an empty file', () => {
