@@ -513,13 +513,16 @@ function VirtualTranscriptInner<T>(
     onRangeChange?.(buildPhysicalSnapshot(store));
   }, [onRangeChange, store, store.range, store.revision]);
 
-  useLayoutEffect(() => {
-    onTotalExtentChange?.(totalPhysicalExtent(store));
-  }, [onTotalExtentChange, store, store.headerExtent, store.layout.totalExtent, store.revision]);
+  const totalExtent = totalPhysicalExtent(store);
+  const pinned = store.pinned;
 
   useLayoutEffect(() => {
-    onPinnedChange?.(store.pinned);
-  }, [onPinnedChange, store.pinned, store.revision]);
+    onTotalExtentChange?.(totalExtent);
+  }, [onTotalExtentChange, totalExtent]);
+
+  useLayoutEffect(() => {
+    onPinnedChange?.(pinned);
+  }, [onPinnedChange, pinned]);
 
   useImperativeHandle(ref, () => ({
     scrollToIndex(index, align, viewportStartOffset = 0) {
@@ -610,7 +613,7 @@ function VirtualTranscriptInner<T>(
       style={{ overflowAnchor: 'none' }}
       onScroll={handleScroll}
     >
-      <div className="virtual-transcript__inner" style={{ height: totalPhysicalExtent(store) }}>
+      <div className="virtual-transcript__inner" style={{ height: totalExtent }}>
         {header ? (
           <div ref={headerCallback} className="virtual-transcript__header" data-virtual-header="true">
             {header}

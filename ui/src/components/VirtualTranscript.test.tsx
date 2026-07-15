@@ -231,6 +231,33 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('does not republish unchanged height or pinned state when a callback scrolls to the tail', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const totals: number[] = [];
+    const pinnedStates: boolean[] = [];
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(20, 10)}
+        getKey={(item) => item.id}
+        estimatedExtent={10}
+        overscan={0}
+        initialTail
+        renderItem={renderRow}
+        onTotalExtentChange={(total) => {
+          totals.push(total);
+          ref.current?.scrollToTail();
+        }}
+        onPinnedChange={(pinned) => pinnedStates.push(pinned)}
+      />,
+    );
+
+    expect(totals).toEqual([200]);
+    expect(pinnedStates).toEqual([false, true]);
+    expect(rowIndexes()).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
   it('updates viewport geometry through ResizeObserver before publishing range', () => {
     const ranges: VirtualTranscriptPhysicalSnapshot[] = [];
 
