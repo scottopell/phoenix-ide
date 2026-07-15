@@ -725,7 +725,13 @@ function MessageListImpl({
         );
       };
       const onKeyDown = (e: KeyboardEvent) => {
-        if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') requestFromUpwardIntent();
+        const target = e.target;
+        const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
+        if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+        dispatchScrollEvent({ type: 'interactionStarted' });
+        dispatchScrollEvent({ type: 'upwardIntent' });
+        requestFromUpwardIntent();
       };
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -898,9 +904,9 @@ function MessageListImpl({
     return true;
   }, [findUnitIndexByMessageId, scrollToUnitIndex]);
 
-  const captureHistoryRestoreBasis = useCallback((): RestoreBasis => {
+  const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
-    if (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading')) {
+    if (!readerIntent && (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading'))) {
       return { kind: 'following_tail' };
     }
     const anchor = transcriptRef.current?.captureVisibleAnchor();
@@ -926,7 +932,7 @@ function MessageListImpl({
       || (source === 'range' && !readerOwnsViewport)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
-    const restoreBasis = captureHistoryRestoreBasis();
+    const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');
     queueMicrotask(() => onLoadOlderMessages(restoreBasis));
   }, [captureHistoryRestoreBasis, conversationId, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
   requestEarlierHistoryRef.current = requestEarlierHistory;
