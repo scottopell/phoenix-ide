@@ -118,7 +118,7 @@ retirement debt for any path that does not extend the target workflow profile.
 - ADR-014 separates workflow-version serialization from leased effect authority.
 - ADR-015 separates observation, receipt, and runtime acceptance and permits the
   normalized owed-acceptance capability only for profiles that need it.
-- ADR-014 makes externally retryable acceptance a typed profile capability,
+- ADR-016 makes externally retryable acceptance a typed profile capability,
   extends semantic projection parity across supported clients, isolates additional
   inbox consumers, and defines the engine adoption perimeter.
 - ADR-007 remains historical authority for creation's fenced reconciliation.

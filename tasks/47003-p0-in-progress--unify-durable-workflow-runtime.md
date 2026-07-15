@@ -295,6 +295,6 @@ Every milestone must run its focused tests and `./dev.py check`. Specification c
 
 ## Umbrella authority and dependency
 
-Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-013 through ADR-014.
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-013 through ADR-016.
 
-Milestone 1 normative artifacts are `specs/durable-workflows/requirements.md`, its executive summary, and ADR-013 through ADR-014. No Durable Workflows Allium artifact is part of this milestone.
+Milestone 1 normative artifacts are `specs/durable-workflows/requirements.md`, its executive summary, and ADR-013 through ADR-016. No Durable Workflows Allium artifact is part of this milestone.

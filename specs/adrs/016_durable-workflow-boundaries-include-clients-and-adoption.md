@@ -1,4 +1,4 @@
-# ADR-014: Durable-workflow boundaries include client acceptance and profile adoption
+# ADR-016: Durable-workflow boundaries include client acceptance and profile adoption
 
 - **Status:** Accepted
 - **Date:** 2026-07-12
