@@ -23,6 +23,10 @@ pub enum PlanError {
         family: &'static str,
     },
     UnknownEffectReference(EffectId),
+    RequiredDependsOnOptional {
+        effect_id: EffectId,
+        optional_dependency: EffectId,
+    },
     UnknownBarrierReference(BarrierId),
     UnknownInvalidationTarget(EffectId),
     InvalidatesReceiptedEffect(EffectId),
@@ -219,6 +223,22 @@ fn validate_dependencies<P: WorkflowProfile>(
             return Err(PlanError::UnknownEffectReference(
                 dependency.depends_on_effect_id,
             ));
+        }
+        let effect = plan
+            .effects
+            .iter()
+            .find(|effect| effect.effect_id == dependency.effect_id)
+            .expect("effect ids were validated");
+        let prerequisite = plan
+            .effects
+            .iter()
+            .find(|effect| effect.effect_id == dependency.depends_on_effect_id)
+            .expect("dependency ids were validated");
+        if effect.role == EffectRole::Required && prerequisite.role == EffectRole::Optional {
+            return Err(PlanError::RequiredDependsOnOptional {
+                effect_id: dependency.effect_id,
+                optional_dependency: dependency.depends_on_effect_id,
+            });
         }
     }
     Ok(())
