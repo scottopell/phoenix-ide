@@ -1,0 +1,11 @@
+id: tsx-no-real-timer-settle
+language: Tsx
+severity: error
+message: |
+  Do not settle React tests by awaiting a real `setTimeout`. Elapsed time is not
+  evidence that the asynchronous state transition completed and flakes under
+  scheduler load. Wait for the visible/API postcondition with Testing Library,
+  or use fake timers when timer behavior itself is the contract.
+note: "Anti-pattern: real elapsed-time sleep used to settle a TSX test"
+rule:
+  pattern: await new Promise(($RESOLVE) => setTimeout($RESOLVE, $DURATION))

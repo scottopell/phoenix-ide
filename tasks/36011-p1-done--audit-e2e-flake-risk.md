@@ -88,3 +88,40 @@ The audit must verify these findings and discover additional surfaces rather tha
 ## Expected outcome
 
 Phoenix has a traceable E2E quality baseline, the highest-risk timer bets are replaced by explicit contracts, new naked sleeps are difficult to introduce accidentally, and failures under load identify the missing witness or product defect instead of presenting as arbitrary elapsed-time flakes.
+
+## Audit findings
+
+Synchronization is classified as one of: readiness handshake, completion witness, behavior driver, polling transport, safety ceiling, or timing bet. A safety ceiling may remain around a durable witness; elapsed time must not create success.
+
+| Surface | Primitive and classification | Risk | Disposition |
+|---|---|---:|---|
+| Browser console capture | Two 100 ms sleeps around CDP log emission; timing bets | High | Replaced with event-count notification from the capture buffer. Listener subscription already completes before session publication. |
+| Browser screencast reattach | 100 ms sleep after last viewer drop; timing bet masking async stop/start overlap | High | Removed the ineffective sleep. Follow-up task 36012 makes broker lifecycle session-owned with an awaitable stop→restart transition; a shared task slot alone cannot close concurrent drop/attach ordering. |
+| New conversation workflow | 350 ms real timer used to settle directory validation; timing bet | High | Replaced with exact-path validation and dependent Git metadata request witnesses while preserving the no-status-flash initial UX. |
+| PR status hook tests | Four `setTimeout(0)` queue drains; timing bets | High | Replaced with Testing Library waits on visible stale-result/error postconditions. |
+| Workflow React state flushing | Passing tests emit asynchronous updates outside `act(...)`; incomplete settlement witness | Medium | Follow-up task 36015 identifies and drains each async producer, then makes unexpected warnings fail the suite. |
+| E2E mid-stream cancellation | Fixed-cadence snapshot polls around cancel; polling transport with negative readiness predicate | High | Follow-up task 36013 drives cancellation from a positive, identity-bound streaming/tool event. The current durable idle witness is retained until that seam exists. |
+| E2E snapshot scenarios | 100 ms GET polling with state plus transcript predicates; polling transport over durable completion witnesses | Medium | Accepted provisionally. Migrate scenario-by-scenario to exact message-id SSE barriers; do not replace with a generic wait framework. |
+| E2E create/stream attach | 404 retry with event-loop yield; polling transport around preallocated conversation/message identity | Medium | Accepted provisionally. Server-side pending-stream attachment would remove the remaining shell-visibility race. |
+| E2E startup | `/version` probe loop and 60 s outer bound; readiness handshake plus safety ceiling | Medium | Accepted. The probe exits on process death and does not use elapsed time as success. A bootstrap-ready field is preferable if startup gains deferred initialization. |
+| E2E port allocation | Free-port probe followed by process bind and bounded retry | Medium | Accepted mitigation. Passing an owned listener would require a server startup contract change. |
+| Browser selector/click waits | 100 ms DOM polling until explicit predicate or timeout | Medium | Accepted polling transport; a page-side MutationObserver is a possible optimization, not current evidence of flakes. |
+| Browser typing focus | 50 ms post-focus sleep in production tool path | Medium | Follow-up task 36014 verifies `document.activeElement`/selection before typing. This is product behavior, not only test synchronization. |
+| Ladle capture startup | 250 ms HTTP readiness polling with 30 s bound | Medium | Accepted polling transport at a process boundary; retain the fixture's durable settled marker for browser readiness. |
+| Screencast first frame | Channel receive with 5 s outer bound | Low | Accepted event-driven completion witness plus safety ceiling. |
+| Promise/selector delayed fixtures | Page timers intentionally create asynchronous behavior | Low | Accepted behavior drivers; they do not settle the assertion. |
+| Fake-timer polling/gesture tests | Virtual advancement of specified debounce, poll, retry, settle, and long-press behavior | Low | Accepted behavior drivers when using async timer advancement and visible/call-count witnesses. |
+
+### Recurring history
+
+Recent flake fixes repeat four bug classes: fixed-delay readiness, event drains that finish before state settlement, async completion matched without stable identity, and teardown/restart overlap. Structural fixes consistently use readiness markers, exact message/token identity, visible persisted postconditions, or awaited teardown. Timeout increases alone are mitigations and remain audit candidates.
+
+### Prevention
+
+`tsx-no-real-timer-settle` rejects real `setTimeout` sleeps inside TSX tests. Tests must wait for observable state or use fake timers when elapsed time is itself the behavior under test. Existing Rust fixture timers and Python process-boundary polling are classified above rather than globally banned.
+
+### Stress evidence
+
+- Browser console and screencast focused tests: 3 consecutive runs each (6 executions) passed without readiness/post-drop sleeps.
+- New-conversation workflow, directory picker, and PR status hook: 3 consecutive batches (96 assertions) passed without real-timer settling; workflow `act(...)` warnings are tracked in task 36015.
+- Full `./dev.py check` passed all 18 applicable checks in 87.5 seconds at load average 62.3/46.3/26.2; E2E passed in 41.7 seconds.

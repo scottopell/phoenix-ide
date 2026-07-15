@@ -86,9 +86,15 @@ function deferred<T>() {
 }
 
 async function settleValidation() {
-  await act(async () => {
-    await new Promise(resolve => setTimeout(resolve, 350));
-  });
+  const path = screen.getAllByPlaceholderText('/path/to/project')[0]?.getAttribute('value');
+  await waitFor(() => expect(api.validateCwd).toHaveBeenCalledWith(path));
+  const validation = await vi.mocked(api.validateCwd).mock.results.at(-1)?.value;
+  if (validation?.is_git) {
+    await waitFor(() => {
+      expect(api.listGitBranches).toHaveBeenCalledWith(path);
+      expect(api.getProjectTaskAvailability).toHaveBeenCalledWith(path);
+    });
+  }
 }
 
 interface DraftStorageFailureOverrides {

@@ -261,6 +261,9 @@ pub struct BrowserSession {
     pub trace_complete: Arc<tokio::sync::Notify>,
     /// Console logs captured from the page (separate lock to avoid contention)
     pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
+    /// Signals capture of a console event so consumers can await evidence rather
+    /// than sleeping for background delivery.
+    console_event: Arc<tokio::sync::Notify>,
     /// Last activity timestamp (for idle timeout)
     pub last_activity: Instant,
     /// Lazily-created live-view broker (REQ-BT-018). The slot holds a
@@ -487,6 +490,7 @@ impl BrowserSession {
             profiling: Arc::new(StdMutex::new(ProfilingState::default())),
             trace_complete: Arc::new(tokio::sync::Notify::new()),
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
+            console_event: Arc::new(tokio::sync::Notify::new()),
             last_activity: Instant::now(),
             screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
         })
@@ -606,11 +610,12 @@ impl BrowserSession {
     /// installed.
     pub async fn setup_console_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
         // Get the page event listener and console_logs handle
-        let (mut console_events, console_logs) = {
+        let (mut console_events, console_logs, console_event) = {
             let guard = session.read().await;
             let events = guard.page.event_listener::<EventConsoleApiCalled>().await?;
             let logs = guard.console_logs.clone();
-            (events, logs)
+            let event = guard.console_event.clone();
+            (events, logs, event)
         };
 
         // Spawn task to capture console events (uses separate lock, no contention)
@@ -638,6 +643,7 @@ impl BrowserSession {
                         text,
                         timestamp: Instant::now(),
                     });
+                    console_event.notify_one();
                 }
             }
         });
@@ -649,6 +655,21 @@ impl BrowserSession {
         }
 
         Ok(())
+    }
+
+    /// Wait until the capture buffer contains at least `count` console events.
+    pub async fn wait_for_console_log_count(&self, count: usize) {
+        loop {
+            let notified = self.console_event.notified();
+            if self
+                .console_logs
+                .lock()
+                .is_ok_and(|logs| logs.len() >= count)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Set up the profiling trace listener (REQ-BT-019.9 / .12).

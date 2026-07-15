@@ -82,9 +82,9 @@ describe('useConversationPrStatus', () => {
     });
 
     first.resolve(prStatus(1));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
+    await waitFor(() => {
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
+    });
   });
 
   it('seeds ready state from cached PR while the fresh status loads', async () => {
@@ -149,8 +149,9 @@ describe('useConversationPrStatus', () => {
     expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
 
     first.resolve(prStatus(1));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    await waitFor(() => {
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    });
 
     second.resolve(prStatus(2));
     await waitFor(() => {
@@ -266,12 +267,10 @@ describe('useConversationPrStatus', () => {
 
     await waitFor(() => {
       expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
+      expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
+      expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
-    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
-    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
   });
 
   it('keeps cached PR display-only after the fresh status request fails', async () => {
@@ -282,15 +281,13 @@ describe('useConversationPrStatus', () => {
 
     await waitFor(() => {
       expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
+      expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
+      expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
+      expect(screen.getByTestId('associated-count')).toHaveTextContent('0');
+      expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
+      expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
-    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
-    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
-    expect(screen.getByTestId('associated-count')).toHaveTextContent('0');
-    expect(screen.getByTestId('active-pr-number')).toHaveTextContent('none');
-    expect(screen.getByTestId('ambiguous')).toHaveTextContent('no');
   });
 
 });

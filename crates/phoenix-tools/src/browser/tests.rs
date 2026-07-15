@@ -678,9 +678,6 @@ async fn test_browser_console_logs_local() {
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
 
-    // Small delay to ensure console listener is set up
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Log some messages
     let eval_tool = BrowserEvalTool;
     eval_tool
@@ -702,8 +699,15 @@ async fn test_browser_console_logs_local() {
         )
         .await;
 
-    // Small delay to allow async event capture
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let session = manager
+            .get_existing(&phoenix_core::work_scope::WorkScope::Conversation(
+                "test-console-local".to_string(),
+            ))
+            .await
+            .expect("session should exist after navigate");
+        session.read().await.wait_for_console_log_count(3).await;
+    }
 
     // Get logs
     let logs_tool = BrowserRecentConsoleLogsTool;
@@ -2135,9 +2139,6 @@ async fn test_screencast_attach_emits_frames_and_url() {
     drop(broker_b);
     drop(rx_a);
     drop(rx_b);
-
-    // Tiny pause to let Drop run (it spawns a task to fire stopScreencast).
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Third attach: a fresh broker should be allocated since the previous
     // one died with the last viewer.
