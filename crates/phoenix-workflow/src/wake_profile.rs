@@ -590,6 +590,9 @@ pub fn cancellation_request(
     workflow: &WorkflowState<WakeProfile>,
     resolved_at: Timestamp,
 ) -> WakeCancellationOutcome {
+    if let Some(terminal) = &workflow.snapshot.terminal {
+        return WakeCancellationOutcome::AlreadyTerminal(Box::new(terminal.clone()));
+    }
     if let Some(receipt) = workflow
         .effects
         .values()

@@ -596,6 +596,8 @@ pub struct ObservationRecord<O> {
     pub attempt_id: AttemptId,
     pub observation_codec: CodecRef,
     pub observation: O,
+    pub observed_at: Timestamp,
+    pub recorded_at: Timestamp,
     pub authoritative: bool,
 }
 
@@ -605,6 +607,8 @@ pub struct StaleObservationRecord<O> {
     pub authority: ClaimAuthority,
     pub attempt_id: AttemptId,
     pub observation_codec: CodecRef,
+    pub observed_at: Timestamp,
+    pub recorded_at: Timestamp,
     pub observation: O,
 }
 
