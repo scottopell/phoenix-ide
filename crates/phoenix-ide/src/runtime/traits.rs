@@ -6,6 +6,9 @@ use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
+use phoenix_core::domain::project_instruction_bundle::{
+    NewProjectInstructionBundle, ProjectInstructionBundle,
+};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
@@ -196,6 +199,26 @@ pub trait StateStore: Send + Sync {
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
+
+    /// Persist an initial active project-instruction snapshot iff none exists,
+    /// returning the active snapshot chosen by the atomic operation.
+    async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conv_id: &str,
+        bundle: &NewProjectInstructionBundle,
+    ) -> Result<ProjectInstructionBundle, String>;
+
+    /// Load the immutable project-instruction snapshot active for this conversation.
+    async fn load_active_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String>;
+
+    /// Atomically promote the queued snapshot and bump transcript generation.
+    async fn activate_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<i64>, String>;
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
     /// of pending steering messages to the DB.
@@ -483,6 +506,34 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 usage,
                 first_byte_at,
             )
+            .await
+    }
+
+    async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conv_id: &str,
+        bundle: &NewProjectInstructionBundle,
+    ) -> Result<ProjectInstructionBundle, String> {
+        (**self)
+            .initialize_project_instruction_bundle_if_absent(conv_id, bundle)
+            .await
+    }
+
+    async fn load_active_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String> {
+        (**self)
+            .load_active_project_instruction_bundle(conv_id)
+            .await
+    }
+
+    async fn activate_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<i64>, String> {
+        (**self)
+            .activate_queued_project_instruction_bundle(conv_id)
             .await
     }
 
@@ -813,6 +864,37 @@ impl StateStore for DatabaseStorage {
                 usage,
                 first_byte_at,
             )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conv_id: &str,
+        bundle: &NewProjectInstructionBundle,
+    ) -> Result<ProjectInstructionBundle, String> {
+        self.db
+            .initialize_project_instruction_bundle_if_absent(conv_id, bundle)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn load_active_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String> {
+        self.db
+            .load_active_project_instruction_bundle(conv_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn activate_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<i64>, String> {
+        self.db
+            .activate_queued_project_instruction_bundle(conv_id)
             .await
             .map_err(|e| e.to_string())
     }

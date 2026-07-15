@@ -479,6 +479,13 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
 // In-Memory Storage
 // ============================================================================
 
+#[derive(Default)]
+struct TestProjectInstructionBundles {
+    active: Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+    queued: Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+    transcript_generation: i64,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
@@ -490,6 +497,7 @@ pub struct InMemoryStorage {
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    project_instruction_bundles: Mutex<HashMap<String, TestProjectInstructionBundles>>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -507,6 +515,7 @@ impl InMemoryStorage {
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
+            project_instruction_bundles: Mutex::new(HashMap::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -557,6 +566,31 @@ impl InMemoryStorage {
     /// Read back the stored `conv_mode` (test-only).
     pub fn get_mode(&self, conv_id: &str) -> Option<crate::db::ConvMode> {
         self.modes.lock().unwrap().get(conv_id).cloned()
+    }
+
+    pub fn queue_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+        bundle: phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle,
+    ) {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionBundle, ProjectInstructionBundleRole,
+        };
+        let queued = ProjectInstructionBundle {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conv_id.to_string(),
+            role: ProjectInstructionBundleRole::Queued,
+            estimated_tokens: bundle.estimated_tokens,
+            created_at: chrono::Utc::now(),
+            guidance: bundle.guidance,
+            skills: bundle.skills,
+        };
+        self.project_instruction_bundles
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .queued = Some(queued);
     }
 
     /// Get all messages for a conversation
@@ -898,6 +932,62 @@ impl StateStore for InMemoryStorage {
         _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conv_id: &str,
+        bundle: &phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle,
+    ) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, String>
+    {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionBundle, ProjectInstructionBundleRole,
+        };
+        let mut bundles = self.project_instruction_bundles.lock().unwrap();
+        let entry = bundles.entry(conv_id.to_string()).or_default();
+        Ok(entry
+            .active
+            .get_or_insert_with(|| ProjectInstructionBundle {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conv_id.to_string(),
+                role: ProjectInstructionBundleRole::Active,
+                estimated_tokens: bundle.estimated_tokens,
+                created_at: chrono::Utc::now(),
+                guidance: bundle.guidance.clone(),
+                skills: bundle.skills.clone(),
+            })
+            .clone())
+    }
+
+    async fn load_active_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+        String,
+    > {
+        Ok(self
+            .project_instruction_bundles
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .and_then(|entry| entry.active.clone()))
+    }
+
+    async fn activate_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<i64>, String> {
+        use phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole;
+        let mut bundles = self.project_instruction_bundles.lock().unwrap();
+        let entry = bundles.entry(conv_id.to_string()).or_default();
+        let Some(mut queued) = entry.queued.take() else {
+            return Ok(None);
+        };
+        queued.role = ProjectInstructionBundleRole::Active;
+        entry.active = Some(queued);
+        entry.transcript_generation += 1;
+        Ok(Some(entry.transcript_generation))
     }
 
     async fn update_steering_queue(

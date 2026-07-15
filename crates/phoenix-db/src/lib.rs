@@ -2319,6 +2319,10 @@ impl Database {
     }
 
     /// Persist the initial active bundle only when the conversation has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, bundle persistence, or reload fails.
     pub async fn initialize_project_instruction_bundle_if_absent(
         &self,
         conversation_id: &str,
@@ -2353,6 +2357,10 @@ impl Database {
     }
 
     /// Load the active bundle and its ordered normalized children.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bundle or its normalized children cannot be read.
     pub async fn load_active_project_instruction_bundle(
         &self,
         conversation_id: &str,
@@ -2365,6 +2373,10 @@ impl Database {
     }
 
     /// Replace only the unconfirmed candidate. Active and queued snapshots are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when candidate replacement or its subsequent reload fails.
     pub async fn persist_or_replace_project_instruction_candidate(
         &self,
         conversation_id: &str,
@@ -2400,6 +2412,10 @@ impl Database {
     }
 
     /// Atomically promote the reviewed candidate to queued, replacing an older queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the atomic candidate promotion transaction fails.
     pub async fn confirm_project_instruction_candidate(
         &self,
         conversation_id: &str,
@@ -2439,6 +2455,10 @@ impl Database {
 
     /// Atomically activate the exact queued snapshot and advance transcript generation.
     /// Returns the new generation, or `None` when no queued bundle exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when activation, generation bump, or transaction commit fails.
     pub async fn activate_queued_project_instruction_bundle(
         &self,
         conversation_id: &str,

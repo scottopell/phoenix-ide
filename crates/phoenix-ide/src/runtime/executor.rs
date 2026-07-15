@@ -29,7 +29,9 @@ use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
     Effect, Event, StepResult,
 };
-use crate::system_prompt::{build_system_prompt, ModeContext};
+use crate::system_prompt::{
+    build_system_prompt_with_project_instructions, discover_project_instruction_bundle, ModeContext,
+};
 use crate::tools::{BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_llm::{
@@ -2499,10 +2501,46 @@ where
         Ok(())
     }
 
+    async fn activate_queued_project_instructions(&self) -> Result<(), String> {
+        match self
+            .storage
+            .activate_queued_project_instruction_bundle(&self.context.conversation_id)
+            .await
+        {
+            Ok(Some(transcript_generation)) => {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    transcript_generation,
+                    "Activated queued project instructions at user-turn boundary"
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    conv_id = %self.context.conversation_id,
+                    %error,
+                    "Failed to activate queued project instructions"
+                );
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                    sequence_id: seq,
+                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                        "start the next turn",
+                    ),
+                });
+                Err(error)
+            }
+        }
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
+        // Activation belongs to the user-authored turn boundary, before the
+        // state transition can dispatch effects. Tool-loop requests therefore
+        // cannot observe a queued snapshot until the next user turn.
         if matches!(event, Event::UserMessage { .. }) {
+            self.activate_queued_project_instructions().await?;
+
+            // A fresh user turn always resets the parent tool-cycle counter.
             self.parent_tool_cycle_count = 0;
         }
 
@@ -4465,12 +4503,46 @@ where
                     phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
                 };
 
-            // Build system prompt with AGENTS.md content + mode context
-            // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = if is_coordinator {
                 crate::system_prompt::build_coordinator_system_prompt(llm_language)
             } else {
-                build_system_prompt(
+                // Legacy conversations acquire one immutable snapshot on their first
+                // request. A storage failure is terminal for this request: falling
+                // back to live discovery would silently change guidance mid-session.
+                let project_instructions = match storage
+                    .load_active_project_instruction_bundle(&conv_id)
+                    .await
+                {
+                    Ok(Some(bundle)) => bundle,
+                    Ok(None) => {
+                        let discovered = discover_project_instruction_bundle(&working_dir);
+                        match storage
+                            .initialize_project_instruction_bundle_if_absent(&conv_id, &discovered)
+                            .await
+                        {
+                            Ok(bundle) => bundle,
+                            Err(error) => {
+                                tracing::error!(
+                                    conv_id = %conv_id,
+                                    %error,
+                                    "Failed to initialize project instruction snapshot"
+                                );
+                                let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            conv_id = %conv_id,
+                            %error,
+                            "Failed to load active project instruction snapshot"
+                        );
+                        let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                        return;
+                    }
+                };
+                build_system_prompt_with_project_instructions(
                     &working_dir,
                     &tasks_dir_name,
                     is_sub_agent,
@@ -4478,6 +4550,7 @@ where
                     llm_language,
                     persona.as_deref(),
                     explore_bash_capability,
+                    &project_instructions,
                 )
             };
 
@@ -9096,6 +9169,9 @@ mod explore_prompt_cache_shape_tests {
 
     struct TaskCreatingPatchExecutor {
         task_path: PathBuf,
+        guidance_path: PathBuf,
+        storage: Arc<InMemoryStorage>,
+        conv_id: String,
     }
 
     #[async_trait]
@@ -9110,6 +9186,21 @@ mod explore_prompt_cache_shape_tests {
                 return None;
             }
             std::fs::write(&self.task_path, "# Draft\n").unwrap();
+            std::fs::write(&self.guidance_path, "live guidance changed\n").unwrap();
+            self.storage.queue_project_instruction_bundle(
+                &self.conv_id,
+                phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                    estimated_tokens: 4,
+                    guidance: vec![
+                        phoenix_core::domain::project_instruction_bundle::ProjectGuidanceSnapshot {
+                            relative_path: "AGENTS.md".to_string(),
+                            content: "exact queued guidance".to_string(),
+                            content_hash: "queued-hash".to_string(),
+                        },
+                    ],
+                    skills: vec![],
+                },
+            );
             Some(ToolOutput::success("created task draft"))
         }
 
@@ -9123,9 +9214,12 @@ mod explore_prompt_cache_shape_tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn explore_tool_loop_keeps_system_prompt_and_cache_key_stable_after_task_file_write() {
+    async fn project_instructions_stay_stable_until_next_user_turn_activates_exact_queue() {
         let temp = TempDir::new().unwrap();
+        let guidance_path = temp.path().join("AGENTS.md");
+        std::fs::write(&guidance_path, "original guidance\n").unwrap();
         let tasks_dir = temp.path().join("tasks");
         std::fs::create_dir(&tasks_dir).unwrap();
         std::fs::write(
@@ -9164,16 +9258,24 @@ mod explore_prompt_cache_shape_tests {
             end_turn: true,
             usage: Usage::default(),
         });
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("next turn complete")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
 
         let (event_tx, runtime_event_rx) = mpsc::channel(32);
         let broadcaster = SseBroadcaster::new(128, 0);
         let runtime = ConversationRuntime::new(
             context,
             ConvState::Idle,
-            storage,
+            storage.clone(),
             llm.clone(),
             Arc::new(TaskCreatingPatchExecutor {
                 task_path: tasks_dir.join(format!("{hinted_id}-p2-ready--draft.md")),
+                guidance_path,
+                storage: storage.clone(),
+                conv_id: conv_id.to_string(),
             }),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
@@ -9211,12 +9313,37 @@ mod explore_prompt_cache_shape_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
+        event_tx
+            .send(Event::UserMessage {
+                text: "start next turn".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "user-msg-2".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while llm.recorded_requests().len() < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for next-turn LLM request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
         let requests = llm.recorded_requests();
         assert!(tasks_dir
             .join(format!("{hinted_id}-p2-ready--draft.md"))
             .is_file());
         assert_eq!(requests[0].system.len(), requests[1].system.len());
         assert_eq!(requests[0].system[0].text, requests[1].system[0].text);
+        assert!(requests[0].system[0].text.contains("original guidance"));
+        assert!(!requests[1].system[0].text.contains("live guidance changed"));
+        assert!(requests[2].system[0].text.contains("exact queued guidance"));
+        assert!(!requests[2].system[0].text.contains("live guidance changed"));
         assert_eq!(
             requests[0].cache_key.as_str(),
             requests[1].cache_key.as_str()
