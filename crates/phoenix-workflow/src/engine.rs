@@ -7,19 +7,19 @@ use crate::{
     BarrierState, BarrierStatus, CancellationRequest, ClaimAuthority, ClaimOutcome, ClaimResult,
     CodecRef, CommitOutcome, CommitResult, DeliveryStatus, DivergenceAction,
     DivergenceResolutionAction, DivergenceSeverity, EffectDecl, EffectId, EffectInvalidationDecl,
-    EffectState, EffectStatus, EngineError, ExecutionMode, Generation, InboxDecisionBinding,
-    LeaseExpiry, ManualChoice, ManualChoiceKind, ManualEffectOutcome, ManualResolutionCommit,
-    ManualResolutionId, ManualResolutionOutcome, ManualResolutionRecord, ObservationId,
-    ObservationRecord, OwedAcceptanceDecisionBinding, OwedAcceptanceDisposition, OwedAcceptanceId,
-    OwedAcceptanceRecord, PlanError, ProfileRef, ProtocolSelection, ReceiptAcceptance,
-    ReceiptFamily, ReceiptId, ReceiptOrigin, ReceiptRecord, ReconciliationDecision,
-    ReconciliationOutcome, ReducerDecision, ReducerInboxEvent, ReducerInboxId, ReducerInboxKind,
-    ReducerInboxPayload, RenewalResult, ResolutionStatus, ResourceLockGrant,
-    RuntimeAcceptanceResult, SemanticAuthority, ShadowComparisonEvidence, ShadowDivergenceId,
-    ShadowDivergenceKind, ShadowDivergenceRecord, ShadowDivergenceResolution, ShadowWorkflow,
-    StaleObservationRecord, SuppressionReason, Timestamp, TransitionId, TransitionPlan, Version,
-    WorkflowBinding, WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
-    WorkflowTransition,
+    EffectRole, EffectState, EffectStatus, EngineError, ExecutionMode, Generation,
+    InboxDecisionBinding, LeaseExpiry, ManualChoice, ManualChoiceKind, ManualEffectOutcome,
+    ManualResolutionCommit, ManualResolutionId, ManualResolutionOutcome, ManualResolutionRecord,
+    ObservationId, ObservationRecord, OwedAcceptanceDecisionBinding, OwedAcceptanceDisposition,
+    OwedAcceptanceId, OwedAcceptanceRecord, PlanError, ProfileRef, ProtocolSelection,
+    ReceiptAcceptance, ReceiptFamily, ReceiptId, ReceiptOrigin, ReceiptRecord,
+    ReconciliationDecision, ReconciliationOutcome, ReducerDecision, ReducerInboxEvent,
+    ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, RenewalResult, ResolutionStatus,
+    ResourceLockGrant, RuntimeAcceptanceResult, SemanticAuthority, ShadowComparisonEvidence,
+    ShadowDivergenceId, ShadowDivergenceKind, ShadowDivergenceRecord, ShadowDivergenceResolution,
+    ShadowWorkflow, StaleObservationRecord, SuppressionReason, Timestamp, TransitionId,
+    TransitionPlan, Version, WorkflowBinding, WorkflowId, WorkflowProfile, WorkflowState,
+    WorkflowStatus, WorkflowTransition,
 };
 
 impl<P: WorkflowProfile> WorkflowState<P> {
@@ -94,7 +94,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if !accepted_protocol.accepting {
             return Err(EngineError::ProtocolNotAccepting);
         }
-        if *profile != accepted_protocol.profile {
+        if *profile != accepted_protocol.profile
+            || accepted_protocol.authority != SemanticAuthority::EngineProtocol
+        {
             return Err(EngineError::ProfileProtocolMismatch);
         }
         if snapshot_codec.family.is_empty() {
@@ -146,6 +148,25 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         decision: &ReducerDecision<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
     ) -> Result<CommitResult<P>, EngineError> {
+        if self.status == WorkflowStatus::Cancelling
+            && decision.plan.next_status == WorkflowStatus::Cancelled
+            && self.effects.values().any(|effect| {
+                effect.declaration.generation == self.generation
+                    && effect.declaration.role == EffectRole::Compensation
+                    && !matches!(
+                        effect.status,
+                        EffectStatus::Receipted | EffectStatus::Invalidated
+                    )
+            })
+        {
+            return Err(EngineError::InvalidPlan(
+                PlanError::InvalidStatusTransition {
+                    current: self.status,
+                    next: decision.plan.next_status,
+                },
+            ));
+        }
+
         self.ensure_executable()?;
         if decision.expected_workflow_version != self.version {
             return Ok(version_conflict_result());
@@ -389,6 +410,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 attempt_id,
                 observation_codec,
                 observation,
+                observed_at: now,
+                recorded_at: now,
                 authoritative: true,
             });
             if let Some(attempt) = effect
@@ -410,6 +433,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                     attempt_id,
                     observation_codec,
                     observation,
+                    observed_at: now,
+                    recorded_at: now,
                 });
             }
         }
