@@ -20,6 +20,7 @@ use super::{
 };
 
 pub const SELECTION_ID: &str = "conversation-creation-shadow-v1";
+const ANCHOR_SELECTION_ID: &str = "conversation-creation-authoritative-anchor-v1";
 const SELECTOR_IDENTITY: &str = "phoenix.conversation-creation.shadow";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,16 +134,17 @@ impl<'a> CreationShadowAdapter<'a> {
     }
 
     async fn ensure_protocol_selection(&self, now: DateTime<Utc>) -> WorkflowRepositoryResult<()> {
-        let existing: Option<(String, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT profile_id, protocol_version, accepting, runtime_acceptance_enabled, external_acceptance_enabled \
+        let existing: Option<(String, i64, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT profile_id, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled \
              FROM workflow_protocol_selections WHERE id = ?1",
         )
         .bind(SELECTION_ID)
         .fetch_optional(self.repository.pool())
         .await?;
-        if let Some((profile, version, accepting, runtime, external)) = existing {
+        if let Some((profile, version, authority, accepting, runtime, external)) = existing {
             if profile == creation_profile::PROFILE_ID
                 && version == i64::from(creation_profile::PROTOCOL_VERSION)
+                && authority == "engine_protocol"
                 && accepting == 0
                 && runtime == 0
                 && external == 0
@@ -165,7 +167,7 @@ impl<'a> CreationShadowAdapter<'a> {
                     .execute(self.repository.pool())
                     .await?;
                 }
-                return Ok(());
+                return self.ensure_anchor_selection(now).await;
             }
             return Err(WorkflowRepositoryError::CorruptState(
                 "creation shadow selection has incompatible capabilities".to_owned(),
@@ -179,7 +181,7 @@ impl<'a> CreationShadowAdapter<'a> {
                 selector_identity: SELECTOR_IDENTITY.to_owned(),
                 selector_version: 1,
                 protocol_version: creation_profile::PROTOCOL_VERSION,
-                authority: SemanticAuthority::LegacyProtocol,
+                authority: SemanticAuthority::EngineProtocol,
                 accepting: false,
                 runtime_acceptance_enabled: false,
                 external_acceptance_enabled: false,
@@ -203,7 +205,7 @@ impl<'a> CreationShadowAdapter<'a> {
             })
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => self.ensure_anchor_selection(now).await,
             Err(WorkflowRepositoryError::Sqlx(sqlx::Error::Database(error)))
                 if error.is_unique_violation() =>
             {
@@ -211,6 +213,21 @@ impl<'a> CreationShadowAdapter<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+    async fn ensure_anchor_selection(&self, now: DateTime<Utc>) -> WorkflowRepositoryResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO workflow_protocol_selections \
+             (id, profile_id, selector_identity, selector_version, protocol_version, authority, accepting, runtime_acceptance_enabled, external_acceptance_enabled, registered_at, drained_at) \
+             VALUES (?1, ?2, ?3, 1, ?4, 'legacy_protocol', 0, 0, 0, ?5, ?5)",
+        )
+        .bind(ANCHOR_SELECTION_ID)
+        .bind(creation_profile::PROFILE_ID)
+        .bind("phoenix.conversation-creation.authoritative-anchor")
+        .bind(i64::from(creation_profile::PROTOCOL_VERSION))
+        .bind(now.to_rfc3339())
+        .execute(self.repository.pool())
+        .await?;
+        Ok(())
     }
 }
 
@@ -275,7 +292,7 @@ async fn upsert_anchor(
     .bind(&config.authoritative_anchor_workflow_id)
     .bind(creation_profile::PROFILE_ID)
     .bind(i64::from(creation_profile::PROTOCOL_VERSION))
-    .bind(SELECTION_ID)
+    .bind(ANCHOR_SELECTION_ID)
     .bind(to_i64(oracle.generation)?)
     .bind(anchor_status_sql(&oracle.status))
     .bind(now.to_rfc3339())
@@ -295,7 +312,7 @@ async fn upsert_shadow_workflow(
         "INSERT INTO workflows (id, profile_id, protocol_version, authority, execution_mode, \
          authoritative_workflow_id, protocol_selection_id, version, generation, status, \
          snapshot_codec_family, snapshot_codec_version, snapshot_payload, accepted_at) \
-         VALUES (?1, ?2, ?3, 'legacy_protocol', 'shadow', ?4, ?5, 1, ?6, ?7, \
+         VALUES (?1, ?2, ?3, 'engine_protocol', 'shadow', ?4, ?5, 1, ?6, ?7, \
          'creation.diagnostic_sink', 1, '{}', ?8) \
          ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, status = excluded.status",
     )

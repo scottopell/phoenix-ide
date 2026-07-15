@@ -509,7 +509,7 @@ pub fn profile() -> ProfileRef {
 pub fn shadow_protocol() -> ProtocolSelection {
     ProtocolSelection {
         profile: profile(),
-        authority: SemanticAuthority::LegacyProtocol,
+        authority: SemanticAuthority::EngineProtocol,
         accepting: true,
         runtime_acceptance_enabled: false,
         external_acceptance_enabled: false,

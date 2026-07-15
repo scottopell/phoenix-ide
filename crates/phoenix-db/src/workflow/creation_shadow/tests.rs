@@ -141,7 +141,7 @@ async fn persists_real_bounded_shadow_graph_without_authority_or_semantic_byte_d
 
     let workflow = sqlx::query("SELECT authority, execution_mode, authoritative_workflow_id, snapshot_payload FROM workflows WHERE id = 'creation-shadow'")
         .fetch_one(&pool).await.unwrap();
-    assert_eq!(workflow.get::<String, _>("authority"), "legacy_protocol");
+    assert_eq!(workflow.get::<String, _>("authority"), "engine_protocol");
     assert_eq!(workflow.get::<String, _>("execution_mode"), "shadow");
     assert_eq!(
         workflow.get::<String, _>("authoritative_workflow_id"),
