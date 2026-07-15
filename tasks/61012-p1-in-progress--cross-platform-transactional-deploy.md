@@ -66,6 +66,27 @@ Extend the transactional production deployment foundation from native macOS laun
 - Test ENOSPC before disruption, concurrent rejection, claim/status durability, exact identity mismatch, config rollback, secret redaction, helper protocol mismatch, and both Linux architectures' release selection.
 - Never exercise live production labels, paths, units, database, or port without separate immediate approval.
 
+## Disposable QA plan
+
+### Lima/VZ systemd substrate
+
+- Use an Ubuntu 24.04 ARM64 Lima VM with `vmType: vz`, no host mounts, no containerd, real systemd PID 1, and cgroup v2.
+- Copy minimal test inputs with `limactl copy`; never execute helpers from a host-mounted worktree.
+- Randomize VM names, units, transaction paths, ports, and IDs. Structurally reject production unit names, port 8031, production installation roots, and paths not bound to the randomized VM.
+- Qualify passwordless sudo and root transient units with `sudo systemd-run`. Kill the initiating SSH process group after durable handoff and require the root-owned unit to finish with observable status.
+- Extend the harness with disposable service/socket installation, journal observation, VM reboot/readiness, and deletion reliability before using it for production-helper acceptance.
+- Systemd acceptance must cover success, candidate crash, wrong identity, health timeout, inactive or malformed units, bad environment, protocol/hash mismatch, destination ENOSPC, failures after each install/reload boundary, rollback failure, helper interruption, stale/newer claims, and committed reboot recovery.
+
+### Deterministic runtime fixture
+
+- Add a standard-library fixture runtime with `--build-identity`, `/api/version`, and `/version` plus controlled startup delay, crash, wrong identity, graceful termination, and direct-bind/socket-activation modes.
+- Use exact deterministic old, candidate, and wrong version/SHA pairs for injected failures; retain one real-Phoenix Linux smoke test after fixture-driven coverage.
+
+### Bare-Linux Docker substrate
+
+- Use an unprivileged non-root Linux container without systemd, with a minimal PID 1, Linux `/proc`, Unix sockets, and no host credentials, Docker socket, or production mounts.
+- Prove supervisor survival after initiator death, direct parent/child ownership, owner-only IPC and filesystem modes, `SO_PEERCRED` UID enforcement, stale/replayed handoff rejection, hash/path validation, secret redaction, exact PID/start-time/version/SHA binding, restart reconciliation, and child-only `prod stop`.
+
 ## Completion documentation
 
 Before marking this task done, append detailed legacy migration notes to task 61011 covering the old launchd, systemd, and detached-daemon artifacts and behavior; manual external-terminal/tmux migration; preservation of database/data paths; reconstruction from `.phoenix-ide.env`; post-migration exact verification; rollback/recovery; and implementation hints for future detection/automation. State explicitly that Phoenix does not detect or prevent unsafe legacy self-deploy and does not automatically migrate legacy artifacts.
