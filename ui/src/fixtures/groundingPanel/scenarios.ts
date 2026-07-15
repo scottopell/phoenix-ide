@@ -75,9 +75,11 @@ const tasks: TaskEntry[] = [
 
 const workScope: WorkScopeInventory = {
   scope_key: GROUNDING_PANEL_SCOPE_KEY,
+  health_sampled_at: '2099-01-01T00:00:00Z',
+  health: { cpu_percent: 249.1, memory_bytes: 1_489_780_736, process_count: 11 },
   bash: [
-    { handle_id: 'b-1', label: 'vite dev server', cmd: 'pnpm --dir ui dev', state: 'running', pid: 42100, pgid: 42100, started_at: new Date(Date.now() - 75_000).toISOString(), output_bytes: 1_200_000 },
-    { handle_id: 'b-2', label: 'stuck test cleanup', cmd: './dev.py check --lanes ui', state: 'kill_pending_kernel', pid: 42110, pgid: 42110, started_at: new Date(Date.now() - 185_000).toISOString(), output_bytes: 23_000 },
+    { handle_id: 'b-1', label: 'vite dev server', cmd: 'pnpm --dir ui dev', state: 'running', pid: 42100, pgid: 42100, started_at: new Date(Date.now() - 75_000).toISOString(), output_bytes: 1_200_000, health: { cpu_percent: 7.2, memory_bytes: 190_840_832, process_count: 3 } },
+    { handle_id: 'b-2', label: 'stress first-turn SSE coverage', cmd: 'for i in 1 2 3; do uv run tests/e2e/run.py || exit $?; done', state: 'kill_pending_kernel', pid: 42110, pgid: 42110, started_at: new Date(Date.now() - 185_000).toISOString(), output_bytes: 23_000, health: { cpu_percent: 241.9, memory_bytes: 1_298_939_904, process_count: 8 } },
     { handle_id: 'b-3', label: 'seed fixture', cmd: './dev.py seed', state: 'tombstoned', started_at: new Date(Date.now() - 480_000).toISOString(), duration_ms: 34_000, exit_code: 0, output_bytes: 82_000 },
     { handle_id: 'b-4', label: 'failing lint', cmd: 'pnpm lint', state: 'tombstoned', started_at: new Date(Date.now() - 360_000).toISOString(), duration_ms: 19_000, exit_code: 2, output_bytes: 18_000 },
   ],
