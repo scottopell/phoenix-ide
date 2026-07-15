@@ -543,7 +543,8 @@ function MessageListImpl({
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
   const earlierHistoryRequestScheduledRef = useRef(false);
-  const requestEarlierHistoryRef = useRef<(retry: boolean) => void>(() => {});
+  const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
+  const touchStartYRef = useRef<number | null>(null);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -667,20 +668,36 @@ function MessageListImpl({
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
       };
-      const onTouchStart = () => {
+      const requestFromUpwardIntent = () => {
+        const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
+        if (visibleRange && visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
+      };
+      const onTouchStart = (e: TouchEvent) => {
+        touchStartYRef.current = e.touches[0]?.clientY ?? null;
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
-      const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
-      const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
-      const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
+      const onTouchMove = (e: TouchEvent) => {
+        dispatchScrollEvent({ type: 'touchMoved' });
+        const currentY = e.touches[0]?.clientY;
+        if (currentY !== undefined && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
+          requestFromUpwardIntent();
+        }
+      };
+      const onTouchEnd = (e: TouchEvent) => {
+        touchStartYRef.current = null;
+        dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
+      };
+      const onTouchCancel = (e: TouchEvent) => {
+        touchStartYRef.current = null;
+        dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
+      };
       const onWheel = (e: WheelEvent) => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) {
           dispatchScrollEvent({ type: 'upwardIntent' });
-          const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
-          if (visibleRange && visibleRange.startIndex <= 2) requestEarlierHistoryRef.current(false);
+          requestFromUpwardIntent();
         }
       };
       const onScroll = () => {
@@ -707,6 +724,9 @@ function MessageListImpl({
             : { type: 'downwardMovement', snapshot },
         );
       };
+      const onKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') requestFromUpwardIntent();
+      };
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
       ref.addEventListener('touchmove', onTouchMove, { passive: true });
@@ -714,6 +734,7 @@ function MessageListImpl({
       ref.addEventListener('touchcancel', onTouchCancel, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('keydown', onKeyDown);
       detachGestureListenersRef.current = () => {
         ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
@@ -722,6 +743,7 @@ function MessageListImpl({
         ref.removeEventListener('touchcancel', onTouchCancel);
         ref.removeEventListener('wheel', onWheel);
         ref.removeEventListener('scroll', onScroll);
+        window.removeEventListener('keydown', onKeyDown);
       };
     }
   }, [dispatchScrollEvent]);
@@ -890,17 +912,18 @@ function MessageListImpl({
     return { kind: 'reader_anchor', messageId, viewportStartOffset: anchor.offset };
   }, [historicalUnits, messageIdForHistoricalUnit]);
 
-  const requestEarlierHistory = useCallback((retry: boolean) => {
+  const requestEarlierHistory = useCallback((source: 'range' | 'upward-intent' | 'retry') => {
     const machine = scrollMachineRef.current;
-    const readerOwnsViewport = machine.kind === 'live'
-      && machine.conversationId === conversationId
-      && machine.follow.kind === 'reading';
+    const ownsCurrentView = machine.kind === 'live' && machine.conversationId === conversationId;
+    const readerOwnsViewport = ownsCurrentView && machine.follow.kind === 'reading';
     if (
       earlierHistoryRequestScheduledRef.current
       || !hasOlderMessages
       || loadingOlderMessages
       || !onLoadOlderMessages
-      || (!retry && (olderHistoryError || !readerOwnsViewport))
+      || (!ownsCurrentView && source !== 'retry')
+      || (olderHistoryError && source !== 'retry')
+      || (source === 'range' && !readerOwnsViewport)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis();
@@ -1076,7 +1099,7 @@ function MessageListImpl({
     }
     if (visibleRange) {
       onVisibleRangeChange?.(visibleRange);
-      if (visibleRange.startIndex <= 2) requestEarlierHistory(false);
+      if (visibleRange.startIndex <= 2) requestEarlierHistory('range');
     }
   }, [onVisibleRangeChange, requestEarlierHistory]);
 
@@ -1124,7 +1147,7 @@ function MessageListImpl({
         {olderHistoryError && hasOlderMessages && onLoadOlderMessages && (
           <div role="alert">
             <span>Could not load earlier history.</span>
-            <button type="button" onClick={() => requestEarlierHistory(true)}>
+            <button type="button" onClick={() => requestEarlierHistory('retry')}>
               Retry
             </button>
           </div>
