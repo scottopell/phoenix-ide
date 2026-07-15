@@ -50,6 +50,7 @@ Adding a new scenario
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -390,6 +391,84 @@ async def _snapshot_has_agent_after_message(
     )
 
 
+async def _new_conv_and_stream_async(
+    base_url: str,
+    text: str,
+    timeout: float,
+) -> str:
+    conv_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+    payload = {
+        "conversation_id": conv_id,
+        "cwd": str(ROOT),
+        "text": text,
+        "images": [],
+        "message_id": message_id,
+    }
+    stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
+    create_url = f"{base_url}/api/conversations/new"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            create_task = asyncio.create_task(client.post(create_url, json=payload))
+            try:
+                while True:
+                    try:
+                        async with aconnect_sse(client, "GET", stream_url) as source:
+                            source.response.raise_for_status()
+                            events = source.aiter_sse()
+                            init = await anext(events)
+                            if init.event != "init":
+                                raise RuntimeError(
+                                    f"expected initial SSE event, got {init.event!r}"
+                                )
+                            if _terminal_event(
+                                init.event, init.data
+                            ) and await _snapshot_has_agent_after_message(
+                                client, base_url, conv_id, message_id
+                            ):
+                                break
+
+                            async for event in events:
+                                if _terminal_event(
+                                    event.event, event.data
+                                ) and await _snapshot_has_agent_after_message(
+                                    client, base_url, conv_id, message_id
+                                ):
+                                    break
+                            else:
+                                raise RuntimeError(
+                                    "SSE stream closed before the first turn completed"
+                                )
+                            break
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code != 404:
+                            raise
+                        if create_task.done():
+                            response = await create_task
+                            response.raise_for_status()
+                        await asyncio.sleep(0)
+
+                response = await create_task
+                response.raise_for_status()
+                return conv_id
+            finally:
+                if not create_task.done():
+                    create_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await create_task
+
+
+def _new_conv_and_stream(base_url: str, text: str, timeout: float) -> str:
+    try:
+        return asyncio.run(_new_conv_and_stream_async(base_url, text, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        raise TimeoutError(
+            f"first-turn SSE did not reach terminal in {timeout:g}s"
+        ) from error
+
+
 async def _send_chat_and_stream_async(
     base_url: str,
     conv_id: str,
@@ -526,23 +605,13 @@ def _user_message_images(message: dict) -> list[dict]:
 
 
 def scenario_text_streaming(base_url: str) -> None:
-    conv = _new_conv(base_url, "[[perf:1]] establish conversation")
-    _poll_to_idle_with_messages(
-        base_url,
-        conv["id"],
-        lambda messages: len(_agent_text(messages).split()) == 1,
-        "setup turn response",
-        timeout=SCENARIO_TIMEOUT_SECONDS,
-    )
-
     word_count = 8
-    _send_chat_and_stream(
+    conv_id = _new_conv_and_stream(
         base_url,
-        conv["id"],
         f"[[perf:{word_count}]] stream this turn",
         SCENARIO_TIMEOUT_SECONDS,
     )
-    final = _get_conv(base_url, conv["id"])
+    final = _get_conv(base_url, conv_id)
     agent_messages = [
         message
         for message in final["messages"]
