@@ -13,6 +13,7 @@ use phoenix_core::domain::llm_types::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -28,6 +29,14 @@ const BROAD_TERM_MATCH_LIMIT: usize = 400;
 /// Always-on ceiling on the combined context output. The scan is killed once
 /// stdout crosses this, even inside a legitimate single repo.
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
+/// Files larger than this are skipped entirely (`rg --max-filesize`). This is
+/// the per-file work bound: `--max-count` limits matching *lines*, so it cannot
+/// bound a term that appears thousands of times on one enormous line (a
+/// minified bundle / single-line log). Conceptual code search over such a file
+/// is not useful anyway, so skipping it bounds scan time without meaningful
+/// loss. Applied to every `rg` invocation (probe and combined) so the two agree
+/// on which files exist.
+const MAX_FILE_SIZE: &str = "16M";
 
 use phoenix_core::llm_language::KEYWORD_SEARCH_FILTER_SYSTEM as FILTER_SYSTEM_PROMPT;
 
@@ -70,7 +79,9 @@ impl KeywordSearchTool {
         stderr: Stdio,
     ) -> Result<tokio::process::Child, String> {
         let mut cmd = Command::new("rg");
-        cmd.args(extra_args).arg("-i"); // case insensitive
+        cmd.args(extra_args)
+            .arg("-i") // case insensitive
+            .args(["--max-filesize", MAX_FILE_SIZE]); // bound per-file scan work
         for term in terms {
             cmd.args(["-e", term]);
         }
@@ -92,10 +103,11 @@ impl KeywordSearchTool {
     /// matches rather than after walking the entire tree — an intentionally
     /// broad search root (a multi-repo container) stays cheap. `--count-matches`
     /// (not `--count`) counts individual matches, so a term repeated many times
-    /// on one long line still reads as broad. A file's total is emitted only
-    /// after that file is scanned, so `--max-count = limit + 1` both bounds each
-    /// file's scan and ensures a term dense in one giant file (a generated
-    /// bundle, a huge log) alone trips the limit rather than being accepted.
+    /// on one long line still reads as broad. `--max-count = limit + 1` makes a
+    /// single file that alone exceeds the limit trip the early exit and bounds
+    /// scanning of a many-line file (rg stops after limit+1 matching lines);
+    /// `--max-filesize` (set in `spawn_rg`) bounds the remaining case — a term
+    /// dense on one enormous single line — by skipping oversized files.
     ///
     /// Returns the accumulated match count (just past the limit when the early
     /// exit fires). A non-`{matches, no-matches}` exit status — e.g. an invalid
@@ -262,6 +274,31 @@ impl KeywordSearchTool {
         Ok((String::from_utf8_lossy(&buf).to_string(), truncated))
     }
 
+    /// Combined context scan over `usable_terms`, capped at `MAX_COMBINED_RESULTS`.
+    /// If the output overruns the cap, drop the lowest-priority term and retry:
+    /// `search_terms` is ordered by importance (REQ-KWS-004), so peeling from the
+    /// tail preserves the most important terms rather than letting a low-priority
+    /// term crowd them out of the byte budget in filesystem-traversal order. Each
+    /// retry is byte-bounded by `ripgrep_capped`, so this cannot regress to an
+    /// unbounded rescan. Returns `(results, capped, dropped_term_count)`.
+    async fn combined_scan(
+        &self,
+        search_root: &Path,
+        mut usable_terms: Vec<String>,
+        cancel: &CancellationToken,
+    ) -> Result<(String, bool, usize), String> {
+        let full_term_count = usable_terms.len();
+        loop {
+            let (out, capped) = self
+                .ripgrep_capped(search_root, &usable_terms, cancel, MAX_COMBINED_RESULTS)
+                .await?;
+            if !capped || usable_terms.len() == 1 {
+                return Ok((out, capped, full_term_count - usable_terms.len()));
+            }
+            usable_terms.pop(); // drop lowest-priority term, retry
+        }
+    }
+
     /// Select an LLM for filtering: the shared cheap/fast model (spans the
     /// supported providers, falls back to the default service), so the tool
     /// has no model list of its own to drift from the registry's.
@@ -375,12 +412,19 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
         tracing::info!(root = %search_root.display(), terms = input.search_terms.len(), "keyword_search scope resolved");
 
-        // Filter out overly broad terms via the early-exit match-count probe.
+        // Classify each term with the early-exit match-count probe. Zero-count
+        // terms are excluded, not kept: they contribute nothing to the combined
+        // OR-scan, so keeping them would force a second full-tree scan only to
+        // rediscover they match nothing (doubling worst-case no-match latency on
+        // a broad root). Broad terms are dropped as too noisy.
         let mut usable_terms = Vec::new();
+        let mut any_broad = false;
         for term in &input.search_terms {
             match self.count_matches(&search_root, term, &ctx.cancel).await {
+                Ok(0) => tracing::debug!(term = %term, "No matches for term"),
                 Ok(count) if count <= BROAD_TERM_MATCH_LIMIT => usable_terms.push(term.clone()),
                 Ok(count) => {
+                    any_broad = true;
                     tracing::debug!(term = %term, matches = count, "Skipping broad term");
                 }
                 Err(e) => {
@@ -396,44 +440,29 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         }
 
         if usable_terms.is_empty() {
-            return ToolOutput::error(
-                "Each of those search terms yielded too many results. Try more specific terms.",
-            );
+            // No usable term. If any term was over-broad, tell the agent to be
+            // more specific; otherwise nothing matched (all zero / errored), so
+            // report no matches without a redundant combined scan.
+            if any_broad {
+                return ToolOutput::error(
+                    "Each of those search terms yielded too many results. Try more specific terms.",
+                );
+            }
+            return ToolOutput::success("No matches found for the given search terms.");
         }
 
-        // Combined scan, capped mid-stream at MAX_COMBINED_RESULTS. If the
-        // combined output would exceed the ceiling, drop the lowest-priority
-        // term and retry: `search_terms` is ordered by importance (REQ-KWS-004),
-        // so peeling from the tail preserves the most important terms rather
-        // than letting a low-priority term crowd them out of the byte budget in
-        // filesystem-traversal order. Each retry is byte-bounded by
-        // `ripgrep_capped`, so this cannot regress to an unbounded rescan.
-        let full_term_count = usable_terms.len();
-        let (results, capped) = loop {
-            match self
-                .ripgrep_capped(
-                    &search_root,
-                    &usable_terms,
-                    &ctx.cancel,
-                    MAX_COMBINED_RESULTS,
-                )
-                .await
-            {
-                Ok((out, was_capped)) => {
-                    if !was_capped || usable_terms.len() == 1 {
-                        break (out, was_capped);
-                    }
-                    usable_terms.pop(); // drop lowest-priority term, retry
+        let (results, capped, dropped) = match self
+            .combined_scan(&search_root, usable_terms, &ctx.cancel)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                if ctx.cancel.is_cancelled() {
+                    return ToolOutput::error("keyword_search cancelled");
                 }
-                Err(e) => {
-                    if ctx.cancel.is_cancelled() {
-                        return ToolOutput::error("keyword_search cancelled");
-                    }
-                    return ToolOutput::error(e);
-                }
+                return ToolOutput::error(e);
             }
         };
-        let dropped = full_term_count - usable_terms.len();
 
         if results.is_empty() || results == "No matches found" {
             // The retained terms matched nothing — but if peeling dropped a
@@ -470,20 +499,22 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
             }
         };
 
-        // Signal incompleteness on the FINAL output. Two distinct cases: the
-        // remaining terms' output still overran the ceiling (capped), or lower-
-        // priority terms were dropped to make it fit (dropped).
-        let output = if capped {
-            format!(
-                "{filtered}\n\n[results truncated: search scope is large — use more specific search terms for complete results]"
-            )
-        } else if dropped > 0 {
-            format!(
-                "{filtered}\n\n[note: {dropped} lower-priority term(s) were dropped to fit the result budget — narrow your terms for full coverage]"
-            )
-        } else {
-            filtered
-        };
+        // Signal incompleteness on the FINAL output. The two causes are
+        // independent and can co-occur: the retained terms' output still overran
+        // the ceiling (capped), and/or lower-priority terms were dropped to make
+        // it fit (dropped). Emit a marker for each that applies.
+        let mut output = filtered;
+        if dropped > 0 {
+            let _ = write!(
+                output,
+                "\n\n[note: {dropped} lower-priority term(s) were dropped to fit the result budget — narrow your terms for full coverage]"
+            );
+        }
+        if capped {
+            output.push_str(
+                "\n\n[results truncated: search scope is large — use more specific search terms for complete results]",
+            );
+        }
         ToolOutput::success(output)
     }
 }
@@ -682,6 +713,23 @@ mod tests {
             count > BROAD_TERM_MATCH_LIMIT,
             "a single file exceeding the limit must be flagged broad, got {count}"
         );
+    }
+
+    /// An absent term counts to zero — the caller uses this to exclude it from
+    /// the combined scan rather than re-walking the tree to rediscover no hits.
+    #[tokio::test]
+    async fn count_matches_returns_zero_for_absent_term() {
+        if !rg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("a.rs"), "hello world\n").unwrap();
+        let tool = KeywordSearchTool;
+        let count = tool
+            .count_matches(dir.path(), "absent_needle_xyz", &CancellationToken::new())
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "absent term must count to zero");
     }
 
     /// Many matches on a *single line* (a minified bundle) must read as broad —
