@@ -43,10 +43,21 @@ until their direct orchestration paths are retired.
 
 | Subsystem | Current authority | Target profile | Migration state | Retirement debt |
 | --- | --- | --- | --- | --- |
-| Wake | Mixed legacy and engine paths | Wake workflow | Engine integration and parity hardening | Legacy registration, scheduling, and delivery paths |
+| Wake | Mixed legacy and engine paths | Wake workflow | Engine integration plus user-facing delivery adoption | Legacy registration/scheduling; automatic resume; REST/SSE status; web, iOS, and CLI presentation; cancellation UI |
 | Creation | Legacy creation worker | Creation workflow | Non-authoritative shadow comparison | Legacy worker and cleanup orchestration |
 | Sub-agents | Conversation runtime/state machine | Sub-agent workflow | Tracked for profile specification and shadow adoption | Direct spawn, timeout, cancellation, continuation, and terminal delivery |
 | Tool execution | Conversation runtime | Typed effect execution | Profile inventory required | Ad hoc retry and recovery paths |
+
+### Wake user-value completion gate
+
+Wake does not complete at durable reducer-inbox delivery. Its cutover evidence must
+show a real conversation parking on a long-running Bash or Tmux operation without
+burning a turn, exposing the pending wait and cancellation from every supported
+client, and resuming exactly once after terminal evidence. The shipped surface
+must include REST/SSE status, web and iOS capability/presentation parity,
+`phoenix-client.py wake-status`, restart-safe automatic resume, and pending/history
+visibility. This delivery slice is tracked by task 25002 and is part of the Wake
+migration's definition of done, not an optional adoption candidate.
 
 ### Adoption candidates
 
