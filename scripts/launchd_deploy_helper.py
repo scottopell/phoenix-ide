@@ -238,6 +238,16 @@ class Launchctl:
         return pid
 
 
+def parse_legacy_version_body(body: str) -> str:
+    value = body.strip()
+    prefix = "phoenix-ide "
+    if value.startswith(prefix):
+        value = value[len(prefix):].strip()
+    if not value:
+        raise ActivationError("legacy health response has no version")
+    return value
+
+
 def fetch_identity(
     url: str,
     timeout: float = 2.0,
@@ -247,7 +257,8 @@ def fetch_identity(
     context = ssl._create_unverified_context() if insecure_tls else None
     with urllib.request.urlopen(url, timeout=timeout, context=context) as response:
         if expected_git_sha is not None:
-            return Identity(version=response.read().decode().strip(), git_sha=expected_git_sha)
+            version = parse_legacy_version_body(response.read().decode())
+            return Identity(version=version, git_sha=expected_git_sha)
         body = json.load(response)
     try:
         return Identity(version=str(body["version"]), git_sha=str(body["git_sha"]))

@@ -437,7 +437,7 @@ class PreparationTests(unittest.TestCase):
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_args): return None
-            def read(self): return b"0.9.0"
+            def read(self): return b"phoenix-ide 0.9.0\n"
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "PROD_SHA_PATH", Path(td) / "deployed.sha"), \
              mock.patch("urllib.request.urlopen", return_value=Response()):
@@ -446,6 +446,18 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual({"version": "0.9.0", "git_sha": "abc123"}, identity)
         self.assertEqual("http://localhost:9123/version", url)
         self.assertFalse(insecure)
+
+    def test_helper_normalizes_legacy_version_before_exact_rollback_comparison(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return b"phoenix-ide 0.9.0\n"
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=Response()):
+            identity = helper.fetch_identity(
+                "http://localhost:8031/version",
+                expected_git_sha="abc123def456",
+            )
+        self.assertEqual(helper.Identity("0.9.0", "abc123def456"), identity)
 
     def test_legacy_rollback_verification_uses_plain_version_body(self):
         with tempfile.TemporaryDirectory() as td:
@@ -614,6 +626,32 @@ class PreparationTests(unittest.TestCase):
             self.dev.launchd_prod_status()
         identity.assert_called_once_with({"PHOENIX_PORT": "9555"})
         self.assertTrue(any("Port: 9555" in str(call) for call in output.call_args_list))
+
+    def test_prod_status_falls_back_to_legacy_public_version(self):
+        legacy_identity = {"version": "0.9.0", "git_sha": "abc123def456"}
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+             mock.patch.object(
+                 self.dev,
+                 "_legacy_prod_identity",
+                 return_value=(legacy_identity, "http://localhost:8031/version", False),
+             ) as legacy, \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "state = running\n", ""),
+             ), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {"PHOENIX_PASSWORD": "secret"},
+                "Sockets": {"Listeners": {"SockServiceName": "8031"}},
+            }))
+            self.dev.launchd_prod_status()
+        legacy.assert_called_once_with({"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "8031"})
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("Version: 0.9.0 (abc123def456)", rendered)
+        self.assertNotIn("Health: not responding", rendered)
 
     def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

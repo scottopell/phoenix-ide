@@ -7209,6 +7209,14 @@ def _rollback_identity_matches(
     )
 
 
+def _parse_legacy_version_body(body: str) -> str | None:
+    value = body.strip()
+    prefix = "phoenix-ide "
+    if value.startswith(prefix):
+        value = value[len(prefix):].strip()
+    return value or None
+
+
 def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, bool] | None:
     import ssl
     import urllib.request
@@ -7220,8 +7228,8 @@ def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, boo
     context = ssl._create_unverified_context() if tls_enabled_from_env(env) else None
     try:
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
-            version = response.read().decode().strip()
-        if not version:
+            version = _parse_legacy_version_body(response.read().decode())
+        if version is None:
             return None
         return {"version": version, "git_sha": source_sha}, url, tls_enabled_from_env(env)
     except Exception:
@@ -7728,6 +7736,9 @@ def launchd_prod_status():
 
     status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
     identity = _current_prod_identity(status_env)
+    if identity is None:
+        legacy = _legacy_prod_identity(status_env)
+        identity = legacy[0] if legacy is not None else None
     if identity:
         print(f"  Version: {identity['version']} ({identity['git_sha']})")
     else:
