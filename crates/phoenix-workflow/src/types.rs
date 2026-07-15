@@ -60,6 +60,17 @@ pub struct Timestamp(pub u64);
 pub struct LeaseExpiry(pub u64);
 
 impl LeaseExpiry {
+    pub const MAX_FINITE: Self = Self(u64::MAX - 1);
+
+    #[must_use]
+    pub const fn finite(value: u64) -> Option<Self> {
+        if value < u64::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn is_live_at(self, now: Timestamp) -> bool {
         now.0 < self.0
