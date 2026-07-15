@@ -1,10 +1,15 @@
 import { useEffect, useMemo } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from '../../components/StateBar';
+import { WorkControlBar } from '../../components/WorkActions';
+import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import type { ConversationPrStatusHandle } from '../../hooks/useConversationPrStatus';
 import '../../index.css';
 import './renderFixture.css';
 import {
+  mobileMultiPrActiveSelection,
+  mobileMultiPrActiveStatus,
+  mobileMultiPrAssociatedPrs,
   mobileMultiPrConversation,
   mobileMultiPrSelection,
   mobileMultiPrStatus,
@@ -52,15 +57,19 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
 }
 
 export function MobileMultiPrConversationFixture({ scenario }: Props) {
-  const prStatusHandle = useMemo<ConversationPrStatusHandle>(() => ({
-    state: { status: 'ready', prStatus: mobileMultiPrStatus },
-    refresh: async () => mobileMultiPrStatus,
-    activeSelection: mobileMultiPrSelection,
-    activePrSummary: null,
-    ambiguous: true,
-    pinActivePr: async () => undefined,
-    resumeInference: async () => undefined,
-  }), []);
+  const prStatusHandle = useMemo<ConversationPrStatusHandle>(() => {
+    const hasActivePr = scenario.id === 'active-pr-actions';
+    const status = hasActivePr ? mobileMultiPrActiveStatus : mobileMultiPrStatus;
+    return {
+      state: { status: 'ready', prStatus: status },
+      refresh: async () => status,
+      activeSelection: hasActivePr ? mobileMultiPrActiveSelection : mobileMultiPrSelection,
+      activePrSummary: hasActivePr ? mobileMultiPrAssociatedPrs[1]! : null,
+      ambiguous: !hasActivePr,
+      pinActivePr: async () => undefined,
+      resumeInference: async () => undefined,
+    };
+  }, [scenario.id]);
 
   useEffect(() => {
     const previousTheme = document.documentElement.dataset['theme'];
@@ -88,21 +97,31 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
             <p>The multi-PR association is implemented. I’m ready to review the mobile experience.</p>
           </div>
         </section>
-        <section className="mobile-multi-pr-conversation-fixture-input" aria-label="Message input preview">
-          <span>Message Phoenix…</span>
-          <button type="button">Send</button>
-        </section>
-        <StateBar
-          conversation={mobileMultiPrConversation}
-          convState={{ type: 'idle' }}
-          connectionState="connected"
-          connectionAttempt={0}
-          nextRetryIn={null}
-          contextWindowUsed={48_000}
-          modelContextWindow={200_000}
-          onOpenFiles={() => undefined}
-          prStatusHandle={prStatusHandle}
-        />
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId={mobileMultiPrConversation.id}
+            convModeLabel="Work"
+            phaseType="idle"
+            continuedInConvId={null}
+            onSendMessage={async () => undefined}
+            prStatusHandle={prStatusHandle}
+          />
+          <section className="mobile-multi-pr-conversation-fixture-input" aria-label="Message input preview">
+            <span>Message Phoenix…</span>
+            <button type="button">Send</button>
+          </section>
+          <StateBar
+            conversation={mobileMultiPrConversation}
+            convState={{ type: 'idle' }}
+            connectionState="connected"
+            connectionAttempt={0}
+            nextRetryIn={null}
+            contextWindowUsed={48_000}
+            modelContextWindow={200_000}
+            onOpenFiles={() => undefined}
+            prStatusHandle={prStatusHandle}
+          />
+        </ViewerSlotProvider>
       </main>
     </MemoryRouter>
   );

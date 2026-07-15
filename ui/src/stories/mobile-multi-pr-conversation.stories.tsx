@@ -19,3 +19,6 @@ Expanded.storyName = 'expanded';
 
 export const ChooserOpen = storyFor('chooser-open');
 ChooserOpen.storyName = 'chooser-open';
+
+export const ActivePrActions = storyFor('active-pr-actions');
+ActivePrActions.storyName = 'active-pr-actions';

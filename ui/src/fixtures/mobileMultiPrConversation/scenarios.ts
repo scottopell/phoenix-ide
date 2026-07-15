@@ -97,3 +97,34 @@ export const mobileMultiPrStatus: PrStatusResponse = {
   work_change: { kind: 'clean' },
   selection: mobileMultiPrSelection,
 };
+
+export const mobileMultiPrActiveSelection: AssociatedPrStatusEnvelope = {
+  ...mobileMultiPrSelection,
+  active_pr: {
+    pr: { repo_owner: 'phoenix-ide', repo_name: 'phoenix-ide', pr_number: 423 },
+    provenance: 'pinned',
+  },
+};
+
+export const mobileMultiPrActiveStatus: PrStatusResponse = {
+  found: true,
+  number: 423,
+  title: mobileMultiPrAssociatedPrs[1]!.title,
+  url: mobileMultiPrAssociatedPrs[1]!.url,
+  state: 'OPEN',
+  draft: false,
+  base: mobileMultiPrAssociatedPrs[1]!.base,
+  head: mobileMultiPrAssociatedPrs[1]!.head,
+  display_state: 'open',
+  check_state: 'failing',
+  feedback_freshness: { state: 'new', count: 2 },
+  feedback_status: 'open',
+  refresh: {
+    state: 'fresh',
+    last_attempted_at: '2026-07-15T14:30:00Z',
+    last_refreshed_at: '2026-07-15T14:30:00Z',
+    stale: false,
+  },
+  work_change: { kind: 'clean' },
+  selection: mobileMultiPrActiveSelection,
+};
