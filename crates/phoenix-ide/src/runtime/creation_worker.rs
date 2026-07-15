@@ -832,6 +832,17 @@ struct RepositoryMutationLock {
 
 impl RepositoryMutationLock {
     fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
+        let (file, lock_path) = Self::open_file(repo_root)?;
+        file.lock_exclusive().map_err(|error| {
+            (
+                format!("could not lock repository {}: {error}", lock_path.display()),
+                ErrorKind::ServerError,
+            )
+        })?;
+        Ok(Self { file })
+    }
+
+    fn open_file(repo_root: &str) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
         let common_dir = crate::git_ops::run_git(
             Path::new(repo_root),
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -853,13 +864,7 @@ impl RepositoryMutationLock {
                     ErrorKind::ServerError,
                 )
             })?;
-        file.lock_exclusive().map_err(|error| {
-            (
-                format!("could not lock repository {}: {error}", lock_path.display()),
-                ErrorKind::ServerError,
-            )
-        })?;
-        Ok(Self { file })
+        Ok((file, lock_path))
     }
 }
 
@@ -1225,8 +1230,7 @@ mod existing_message_recovery_tests {
 #[allow(clippy::items_after_test_module)]
 mod repository_lock_tests {
     use super::RepositoryMutationLock;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use fs2::FileExt;
 
     #[test]
     fn repository_mutation_lock_serializes_live_holders() {
@@ -1239,20 +1243,12 @@ mod repository_lock_tests {
         assert!(status.success());
         let repo_path = repo.path().to_string_lossy().to_string();
         let first = RepositoryMutationLock::acquire(&repo_path).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let _second = RepositoryMutationLock::acquire(&repo_path).unwrap();
-            acquired_tx.send(()).unwrap();
-        });
-        started_rx.recv().unwrap();
-        assert!(acquired_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
+        let (second, _) = RepositoryMutationLock::open_file(&repo_path).unwrap();
+
+        assert!(second.try_lock_exclusive().is_err());
         drop(first);
-        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        thread.join().unwrap();
+        second.try_lock_exclusive().unwrap();
+        second.unlock().unwrap();
     }
 }
 
