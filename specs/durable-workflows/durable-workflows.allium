@@ -892,6 +892,14 @@ rule RecordAuthoritativeObservation {
     ensures: attempt.status = observation_recorded
 }
 
+rule RejectObservationFromWrongWorker {
+    when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
+    requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id != worker
+    ensures: ObservationOutcome(stale_authority)
+    ensures: not Observation.created(effect: effect, attempt: attempt, codec: codec)
+}
+
 rule RetainStaleObservationAsDiagnostic {
     when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
     requires: not live_matching_authority(effect, authority)
@@ -1044,6 +1052,12 @@ rule CancelWorkflow {
     ensures: compensation_effects_follow_core_contracts(workflow)
 }
 
+rule CancellationVersionConflict {
+    when: WorkflowCancellationRequested(client, workflow, decision)
+    requires: decision.expected_workflow_version != workflow.version
+    ensures: WorkflowLifecycleOutcome(version_conflict)
+}
+
 rule DeleteWorkflow {
     when: WorkflowDeletionRequested(client, workflow, decision)
     requires: workflow.status in {active, cancelling, cancelled, failed}
@@ -1056,6 +1070,12 @@ rule DeleteWorkflow {
     ensures: incompatible_effects_invalidated(workflow)
     ensures: DeletionReducerPlanCommittedAtomically(workflow, decision)
     ensures: compensation_effects_follow_core_contracts(workflow)
+}
+
+rule DeletionVersionConflict {
+    when: WorkflowDeletionRequested(client, workflow, decision)
+    requires: decision.expected_workflow_version != workflow.version
+    ensures: WorkflowLifecycleOutcome(version_conflict)
 }
 
 rule CompleteWorkflowCancellation {
@@ -1269,6 +1289,8 @@ rule RuntimeAcceptsOwedAcceptance {
     ensures: runtime_acceptance_state_persisted(owed.workflow, owed.reducer_inbox)
     ensures: owed.status = accepted
     ensures: owed.accepting_transition = committed_transition_for_decision(owed.workflow, decision)
+    ensures: owed.reducer_inbox.delivery_status = consumed
+    ensures: owed.reducer_inbox.consumed_by = committed_transition_for_decision(owed.workflow, decision)
 }
 
 rule RuntimeAcceptanceVersionConflict {

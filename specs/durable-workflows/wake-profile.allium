@@ -352,14 +352,16 @@ rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
 
 rule RegistrationScheduleUsesDefaultBound {
     when: WakeRegistrationRequested(agent, conversation, resource, omitted, tool_use_id)
-    requires: resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource.kind in {bash, tmux_window} implies resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource.kind = subagent implies subagent_resource_matches_child_conversation(resource)
     ensures: WakeRegistrationRequested(agent, conversation, resource,
         config.default_max_wait_seconds, tool_use_id)
 }
 
 rule RegistrationRejectsForeignOrUnstableResource {
     when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
-    requires: not resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+    requires: resource.kind in {bash, tmux_window} and not resource_is_owned_in_scope(resource, resolve_work_scope(conversation))
+        or resource.kind = subagent and not subagent_resource_matches_child_conversation(resource)
         or not resource_identity_is_stable(resource)
     ensures: WakeRegistrationRejected("wake_unauthorized_handle")
     ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
@@ -633,6 +635,8 @@ rule LifecycleScheduleRejectsWhileWakePending {
     when: DestructiveLifecycleRequested(manager, conversation, action)
     requires: lifecycle_action_is_destructive(action)
     requires: pending_wake_count(conversation) > 0
+        or unconsumed_wake_delivery_count(conversation) > 0
+        or owed_wake_acceptance_count(conversation) > 0
     ensures: DestructiveLifecycleRejected("wake_contract_pending")
     ensures: not DestructiveLifecycleMayProceed(conversation, action)
 }
