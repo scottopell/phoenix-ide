@@ -1078,9 +1078,15 @@ function MessageListImpl({
     dispatchTranscriptPositioning({ type: 'input_changed', input: transcriptPositioning });
   }, [dispatchTranscriptPositioning, transcriptPositioning]);
 
-  useEffect(() => {
-    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+  const clearFindRowMatches = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scroller.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
       .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+  }, []);
+
+  useEffect(() => {
+    clearFindRowMatches();
     const match = activeFindMatchRef.current;
     if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
@@ -1088,8 +1094,7 @@ function MessageListImpl({
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
         const header = systemPromptRef.current;
         if (!header) return;
-        scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
-          .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+        clearFindRowMatches();
         header.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
         header.scrollIntoView({ block: 'center' });
       }, delay));
@@ -1100,19 +1105,17 @@ function MessageListImpl({
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;
-      scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
-        .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+      clearFindRowMatches();
       row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
       row.scrollIntoView({ block: 'center' });
     }, delay));
     return () => timers.forEach(clearTimeout);
-  }, [activeFindMatchKey, dispatchScrollEvent, findRowByKey]);
+  }, [activeFindMatchKey, clearFindRowMatches, dispatchScrollEvent, findRowByKey]);
 
   useEffect(() => {
     if (findOpen || activeScope !== findScopeId) return;
-    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
-      .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
-  }, [activeScope, findOpen, findScopeId]);
+    clearFindRowMatches();
+  }, [activeScope, clearFindRowMatches, findOpen, findScopeId]);
 
   const handleRangeChanged = useCallback((snapshot: VirtualTranscriptRangeChange) => {
     const visibleRange = snapshot.visibleRange;

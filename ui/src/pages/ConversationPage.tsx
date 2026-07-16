@@ -650,22 +650,33 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   }, [atom.messages, reconcileAuthoritative]);
 
   const idleReconciliationKeyRef = useRef<string | null>(null);
+  const optimisticPhaseOwnerRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (atom.phase.type !== 'awaiting_llm') {
+      optimisticPhaseOwnerRef.current = null;
+    }
+  }, [atom.phase.type, atom.phaseLastAppliedEventSeq]);
   useEffect(() => {
     if (!conversationId || !isConnected || atom.phase.type !== 'idle') return;
-    const accepted = queuedMessages.filter(
-      (message) => (
-        message.status === 'accepted' || message.status === 'steering_queued'
-      ) && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0),
-    );
+    const accepted = queuedMessages.filter((message) => {
+      if (message.status === 'accepted') return true;
+      return message.status === 'steering_queued'
+        && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0);
+    });
     if (accepted.length === 0) return;
 
-    const key = `${conversationId}:${accepted.map((message) => message.localId).join(',')}`;
+    const key = [
+      conversationId,
+      atom.phaseLastAppliedEventSeq,
+      accepted.map((message) => message.localId).join(','),
+    ].join(':');
     if (idleReconciliationKeyRef.current === key) return;
     idleReconciliationKeyRef.current = key;
 
     let cancelled = false;
     void (async () => {
       try {
+        const snapshotStartedAtEventSeq = eventCursorRef.current;
         const settledResults = await Promise.allSettled(
           Array.from({ length: Math.ceil(accepted.length / 100) }, (_, index) => {
             const chunk = accepted.slice(index * 100, (index + 1) * 100);
@@ -709,7 +720,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
               transcriptGeneration: current.transcriptGeneration,
             }),
             transcriptCoverage: current.transcriptCoverage,
-            snapshotStartedAtEventSeq: eventCursorRef.current,
+            snapshotStartedAtEventSeq,
           });
           reconcileAuthoritative(persisted.map((entry) => entry.message_id));
         }
@@ -720,6 +731,8 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
               markRecoverableInconsistency(entry.message_id);
             }
           }
+        } else {
+          idleReconciliationKeyRef.current = null;
         }
       } catch (error) {
         idleReconciliationKeyRef.current = null;
@@ -1347,11 +1360,16 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
       const phaseBeforePost = atomRef.current.phase;
       const optimisticPhaseOwner = (
-        phaseBeforePost.type === 'idle' || phaseBeforePost.type === 'error'
+        (phaseBeforePost.type === 'idle' || phaseBeforePost.type === 'error')
+        && optimisticPhaseOwnerRef.current === null
       ) ? localId : null;
+      if (optimisticPhaseOwner) {
+        optimisticPhaseOwnerRef.current = optimisticPhaseOwner;
+      }
       const rollbackOptimisticPhase = () => {
         if (
           optimisticPhaseOwner
+          && optimisticPhaseOwnerRef.current === optimisticPhaseOwner
           && atomRef.current.phase.type === 'awaiting_llm'
           && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
         ) {
@@ -1360,6 +1378,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             phase: phaseBeforePost,
             expectedConversationId: conversationId,
           });
+          optimisticPhaseOwnerRef.current = null;
         }
       };
 
@@ -1418,6 +1437,13 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         markFailedRef.current(localId);
         rollbackOptimisticPhase();
       } finally {
+        if (
+          optimisticPhaseOwner
+          && optimisticPhaseOwnerRef.current === optimisticPhaseOwner
+          && atomRef.current.phase.type !== 'awaiting_llm'
+        ) {
+          optimisticPhaseOwnerRef.current = null;
+        }
         sendingMessagesRef.current.delete(localId);
       }
     },
