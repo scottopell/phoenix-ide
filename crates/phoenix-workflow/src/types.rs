@@ -161,6 +161,7 @@ pub enum BarrierStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed,
+    AlreadyCommitted,
     VersionConflict,
     InvalidPlan,
 }
@@ -736,6 +737,8 @@ pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_event: P::Event,
     pub next_status: WorkflowStatus,
     pub retry_at: Option<Timestamp>,
+    pub compensation_effects: Vec<EffectDecl<P::Intent>>,
+    pub compensation_dependencies: Vec<DependencyDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

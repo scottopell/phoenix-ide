@@ -737,6 +737,8 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(stale.outcome, CommitOutcome::VersionConflict);
@@ -758,6 +760,8 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(invalid.outcome, CommitOutcome::InvalidPlan);
@@ -780,6 +784,8 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(committed.outcome, CommitOutcome::Committed);
@@ -855,6 +861,8 @@ fn manual_resolution_version_has_matching_transition_history() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::Committed);
@@ -1248,6 +1256,8 @@ fn invalid_manual_resolution_does_not_mutate_state() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -1350,6 +1360,8 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(
@@ -2168,6 +2180,8 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(
@@ -2210,6 +2224,8 @@ fn shadow_mutation_apis_reject_manual_resolution() {
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
@@ -3118,6 +3134,8 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(empty_codec.outcome, CommitOutcome::InvalidPlan);
@@ -3142,6 +3160,8 @@ fn empty_manual_commit_codecs_and_invalid_manual_status_are_rejected_atomically(
             transition_event: "manual-transition",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(invalid_status.outcome, CommitOutcome::InvalidPlan);
@@ -3680,6 +3700,8 @@ fn review_regressions_manual_resolution_survives_versions_and_holds_lock() {
             transition_event: "manual",
             next_status: WorkflowStatus::Active,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     assert_eq!(resolved.outcome, CommitOutcome::Committed);
@@ -4257,6 +4279,8 @@ fn retry_and_compensate_manual_choices_do_not_receipt_or_satisfy_barriers() {
                 transition_event: "manual-more-work",
                 next_status: WorkflowStatus::Active,
                 retry_at: matches!(kind, ManualChoiceKind::Retry).then_some(Timestamp(5)),
+                compensation_effects: vec![],
+                compensation_dependencies: vec![],
             },
         );
 
@@ -4409,6 +4433,8 @@ fn terminal_manual_receipt_and_post_terminal_barrier_are_suppressed() {
             transition_event: "manual-terminal",
             next_status: WorkflowStatus::Completed,
             retry_at: None,
+            compensation_effects: vec![],
+            compensation_dependencies: vec![],
         },
     );
     let ManualEffectOutcome::Receipt { reducer_event, .. } =

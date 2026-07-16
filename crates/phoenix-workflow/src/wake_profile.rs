@@ -49,17 +49,24 @@ pub struct TmuxResourceIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubagentResourceIdentity {
+    pub child_conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WakeResourceIdentity {
     Bash(BashResourceIdentity),
     TmuxWindow(TmuxResourceIdentity),
+    Subagent(SubagentResourceIdentity),
 }
 
 impl WakeResourceIdentity {
     #[must_use]
-    pub const fn work_scope(&self) -> &WorkScopeIdentity {
+    pub const fn work_scope(&self) -> Option<&WorkScopeIdentity> {
         match self {
-            Self::Bash(identity) => &identity.work_scope,
-            Self::TmuxWindow(identity) => &identity.work_scope,
+            Self::Bash(identity) => Some(&identity.work_scope),
+            Self::TmuxWindow(identity) => Some(&identity.work_scope),
+            Self::Subagent(_) => None,
         }
     }
 }
@@ -103,6 +110,18 @@ pub enum TmuxTerminalStatus {
     WindowKilled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentTerminalStatus {
+    SubmitResult,
+    SubmitError,
+    WallClockTimeout,
+    IndependentlyObservedCancellation,
+    TurnLimitHardStop,
+    ImplicitTextCompletion,
+    RuntimeFailure,
+    ContextExhausted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashTerminalEvidence {
     pub identity: BashResourceIdentity,
@@ -126,9 +145,18 @@ pub struct TmuxTerminalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentTerminalEvidence {
+    pub identity: SubagentResourceIdentity,
+    pub status: SubagentTerminalStatus,
+    pub occurred_at: Timestamp,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeTerminalEvidence {
     Bash(BashTerminalEvidence),
     TmuxWindow(TmuxTerminalEvidence),
+    Subagent(SubagentTerminalEvidence),
 }
 
 impl WakeTerminalEvidence {
@@ -137,6 +165,7 @@ impl WakeTerminalEvidence {
         match self {
             Self::Bash(evidence) => evidence.occurred_at,
             Self::TmuxWindow(evidence) => evidence.occurred_at,
+            Self::Subagent(evidence) => evidence.occurred_at,
         }
     }
 
@@ -147,6 +176,7 @@ impl WakeTerminalEvidence {
             Self::TmuxWindow(evidence) => {
                 WakeResourceIdentity::TmuxWindow(evidence.identity.clone())
             }
+            Self::Subagent(evidence) => WakeResourceIdentity::Subagent(evidence.identity.clone()),
         }
     }
 }
@@ -531,7 +561,11 @@ pub fn registration_decision(
     ),
     WakeRegistrationError,
 > {
-    if intent.registration_scope != *intent.resource.work_scope() {
+    if intent
+        .resource
+        .work_scope()
+        .is_some_and(|scope| intent.registration_scope != *scope)
+    {
         return Err(WakeRegistrationError::ResourceScopeMismatch);
     }
     let receipt = registration_receipt(intent);

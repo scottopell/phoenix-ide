@@ -148,17 +148,21 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         decision: &ReducerDecision<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
     ) -> Result<CommitResult<P>, EngineError> {
-        if self.status == WorkflowStatus::Cancelling
-            && decision.plan.next_status == WorkflowStatus::Cancelled
-            && self.effects.values().any(|effect| {
-                effect.declaration.generation == self.generation
-                    && effect.declaration.role == EffectRole::Compensation
-                    && !matches!(
-                        effect.status,
-                        EffectStatus::Receipted | EffectStatus::Invalidated
-                    )
-            })
-        {
+        if decision.expected_workflow_version != self.version {
+            return Ok(version_conflict_result());
+        }
+        if matches!(
+            (self.status, decision.plan.next_status),
+            (WorkflowStatus::Cancelling, WorkflowStatus::Cancelled)
+                | (WorkflowStatus::DeletionPending, WorkflowStatus::Deleted)
+        ) && self.effects.values().any(|effect| {
+            effect.declaration.generation == self.generation
+                && effect.declaration.role == EffectRole::Compensation
+                && !matches!(
+                    effect.status,
+                    EffectStatus::Receipted | EffectStatus::Invalidated
+                )
+        }) {
             return Err(EngineError::InvalidPlan(
                 PlanError::InvalidStatusTransition {
                     current: self.status,
@@ -168,9 +172,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
 
         self.ensure_executable()?;
-        if decision.expected_workflow_version != self.version {
-            return Ok(version_conflict_result());
-        }
         self.validate_plan_against_state(&decision.plan, barrier_events)?;
 
         let mut replacement = self.clone();
@@ -294,7 +295,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         new_lease_until: LeaseExpiry,
     ) -> RenewalResult {
-        if authority.worker_id != requesting_worker_id || !new_lease_until.is_live_at(now) {
+        if authority.worker_id != requesting_worker_id
+            || !new_lease_until.is_live_at(now)
+            || new_lease_until == LeaseExpiry(u64::MAX)
+        {
             return stale_renewal();
         }
         match self.effect_authorized_mut(authority, now) {
@@ -342,7 +346,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if workflow_status_is_terminal(self.status) {
             return ineligible_claim();
         }
-        if !lease_until.is_live_at(now) || self.crashed_workers.contains(&worker_id) {
+        if !lease_until.is_live_at(now)
+            || lease_until == LeaseExpiry(u64::MAX)
+            || self.crashed_workers.contains(&worker_id)
+        {
             return denied_claim();
         }
         let Some(effect) = self.effects.get(&effect_id) else {
@@ -695,6 +702,19 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         else {
             return invalid_manual_resolution(None);
         };
+        if existing.status == ResolutionStatus::Resolved
+            && existing.accepted_choice.as_ref().is_some_and(|accepted| {
+                accepted.kind == choice.kind
+                    && accepted.codec == choice.codec
+                    && accepted.payload == choice.payload
+            })
+        {
+            return ManualResolutionOutcome {
+                outcome: CommitOutcome::AlreadyCommitted,
+                resolution: Some(existing),
+                effect_outcome: None,
+            };
+        }
         if existing.status != ResolutionStatus::Required
             || self.version != expected_workflow_version
         {
@@ -1334,6 +1354,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             transition_event,
             next_status,
             retry_at,
+            compensation_effects,
+            compensation_dependencies,
         } = commit;
         debug_assert!(
             choice.kind != ManualChoiceKind::Fail || next_status == WorkflowStatus::Failed,
@@ -1434,6 +1456,33 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 }
             }
         };
+
+        if choice.kind == ManualChoiceKind::Compensate {
+            for declaration in compensation_effects {
+                self.effects.insert(
+                    declaration.effect_id,
+                    EffectState {
+                        declaration,
+                        declared_workflow_version: self.version,
+                        status: EffectStatus::Blocked,
+                        dependencies: BTreeSet::new(),
+                        attempts: vec![],
+                        observations: vec![],
+                        stale_observations: vec![],
+                        claim: None,
+                        destructive_lock: None,
+                        pending_reconciliation: false,
+                        receipt: None,
+                    },
+                );
+            }
+            for dependency in compensation_dependencies {
+                if let Some(effect) = self.effects.get_mut(&dependency.effect_id) {
+                    effect.dependencies.insert(dependency.depends_on_effect_id);
+                }
+            }
+            self.refresh_eligibility(Timestamp(0));
+        }
 
         let mut updated = clone_manual_resolution(existing);
         updated.status = ResolutionStatus::Resolved;
