@@ -8725,6 +8725,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_project_instruction_initializers_return_one_active_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "bundle-init-race",
+            "bundle-init-race",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first, second) = tokio::join!(
+            async move {
+                first_db
+                    .initialize_project_instruction_bundle_if_absent(
+                        "bundle-init-race",
+                        &instruction_bundle("first"),
+                    )
+                    .await
+            },
+            async move {
+                second_db
+                    .initialize_project_instruction_bundle_if_absent(
+                        "bundle-init-race",
+                        &instruction_bundle("second"),
+                    )
+                    .await
+            }
+        );
+
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            db.load_active_project_instruction_bundle("bundle-init-race")
+                .await
+                .unwrap(),
+            Some(first)
+        );
+    }
+
+    #[tokio::test]
     async fn project_instruction_confirmed_queue_survives_newer_candidate_and_activates_exactly() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("bundle-queue", "bundle-queue", "/tmp", true, None, None)
