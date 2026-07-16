@@ -296,11 +296,15 @@ export function WorkControlBar({
           <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
             <div className="mobile-pr-actions-hero">{mobileHero}</div>
             <div className="mobile-pr-actions-secondary">
-              <button type="button" className="mobile-pr-action" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>PR diff</button>
-              <button type="button" className="mobile-pr-action" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>Workspace</button>
+              <button type="button" className="mobile-pr-action mobile-pr-action--review" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>
+                <span aria-hidden="true">Δ</span><span>PR diff</span>
+              </button>
+              <button type="button" className="mobile-pr-action mobile-pr-action--workspace" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>
+                <span aria-hidden="true">◫</span><span>Changes</span>
+              </button>
               {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
                 <a
-                  className="mobile-pr-action"
+                  className="mobile-pr-action mobile-pr-action--external"
                   href={disposition.secondaryResolve.url}
                   target="_blank"
                   rel="noopener noreferrer"
@@ -310,19 +314,23 @@ export function WorkControlBar({
                       ? `Open PR #${disposition.secondaryResolve.number}`
                       : 'Create PR on GitHub'}
                 >
-                  GitHub ↗
+                  <span aria-hidden="true">↗</span><span>GitHub</span>
                 </a>
               )}
               {!cleanupBlockedByAmbiguity && associatedPrs.length > 1 && (
-                <button type="button" className="mobile-pr-action mobile-pr-action--quiet" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
+                <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>
+                  <span aria-hidden="true">✓</span><span>Cleanup</span>
+                </button>
               )}
               {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
-                <button type="button" className="mobile-pr-action mobile-pr-action--quiet" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
+                <button type="button" className="mobile-pr-action mobile-pr-action--danger" disabled={isLoading} onClick={handleAbandon}>
+                  <span aria-hidden="true">×</span><span>Abandon</span>
+                </button>
               )}
             </div>
             <div className="mobile-pr-actions-context">
               <strong>{activePrLabel}</strong>
-              <span>{activePr?.head} → {activePr?.base}</span>
+              <span className="mobile-pr-actions-branch">{activePr?.head} → {activePr?.base}</span>
             </div>
           </div>
         )}
