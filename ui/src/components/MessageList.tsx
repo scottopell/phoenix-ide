@@ -676,7 +676,7 @@ function MessageListImpl({
       };
       const requestFromUpwardIntent = () => {
         const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
-        if (visibleRange && visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
+        if (!visibleRange || visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
       const onTouchStart = (e: TouchEvent) => {
         touchStartYRef.current = e.touches[0]?.clientY ?? null;
