@@ -100,7 +100,7 @@ fn persistence_domain_accepts_runtime_owned_strings() {
     assert_eq!(receipt.registering_tool_use_id, "tool-runtime");
     assert_eq!(continuation.pending_contract, "contract-runtime");
     assert_eq!(
-        snapshot.resource.work_scope().stable_key,
+        snapshot.resource.work_scope().unwrap().stable_key,
         "worktree-runtime"
     );
 }
@@ -176,7 +176,9 @@ fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
     let bash_evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match &bash {
             WakeResourceIdentity::Bash(identity) => identity.clone(),
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Killed,
         occurred_at: Timestamp(10),
@@ -192,7 +194,7 @@ fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
     let tmux_evidence = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
         identity: match &tmux {
             WakeResourceIdentity::TmuxWindow(identity) => identity.clone(),
-            WakeResourceIdentity::Bash(_) => unreachable!(),
+            WakeResourceIdentity::Bash(_) | WakeResourceIdentity::Subagent(_) => unreachable!(),
         },
         status: TmuxTerminalStatus::ExitMarkerObserved,
         occurred_at: Timestamp(11),
@@ -210,7 +212,9 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
     let fired_evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match &resource {
             WakeResourceIdentity::Bash(identity) => identity.clone(),
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(19),
@@ -243,7 +247,9 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
         WakeTerminalEvidence::Bash(BashTerminalEvidence {
             identity: match &resource {
                 WakeResourceIdentity::Bash(identity) => identity.clone(),
-                WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+                WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                    unreachable!()
+                }
             },
             status: BashTerminalStatus::Exited,
             occurred_at: Timestamp(21),
@@ -398,7 +404,9 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
         WakeTerminalEvidence::Bash(BashTerminalEvidence {
             identity: match &intent.resource {
                 WakeResourceIdentity::Bash(identity) => identity.clone(),
-                WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+                WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                    unreachable!()
+                }
             },
             status: BashTerminalStatus::Exited,
             occurred_at: Timestamp(5),
