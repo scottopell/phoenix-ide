@@ -343,7 +343,7 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
     catalog_roots.sort();
     catalog_roots.dedup();
 
-    let mut visited = HashSet::new();
+    let mut materialized_metadata = HashSet::new();
     for logical_root in catalog_roots {
         let Some(physical_root) = resolve_tree_link_chain(&logical_root, &symlinks) else {
             continue;
@@ -356,7 +356,7 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
             temp.path(),
             &logical_root,
             &physical_root,
-            &mut visited,
+            &mut materialized_metadata,
         );
     }
 
@@ -375,11 +375,8 @@ fn materialize_skill_catalog(
     destination_root: &Path,
     logical_root: &str,
     physical_root: &str,
-    visited: &mut HashSet<(String, String)>,
+    materialized_metadata: &mut HashSet<String>,
 ) {
-    if !visited.insert((logical_root.to_string(), physical_root.to_string())) {
-        return;
-    }
     for child in tree_children(tree, physical_root) {
         let logical_skill = tree_path_join(logical_root, &child);
         let physical_skill = tree_path_join(physical_root, &child);
@@ -390,7 +387,9 @@ fn materialize_skill_catalog(
         let Some(metadata) = resolve_tree_link_chain(&metadata, symlinks) else {
             continue;
         };
-        if tree.get(&metadata).is_some_and(|entry| !entry.symlink) {
+        if tree.get(&metadata).is_some_and(|entry| !entry.symlink)
+            && materialized_metadata.insert(metadata.clone())
+        {
             copy_tree_blob(
                 repo_root,
                 reference,
@@ -409,7 +408,7 @@ fn materialize_skill_catalog(
                     destination_root,
                     &logical_children,
                     &physical_children,
-                    visited,
+                    materialized_metadata,
                 );
             }
         }
@@ -1064,6 +1063,27 @@ mod tests {
         git(repo.path(), &["commit", "-qm", "init"]);
 
         assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_breaks_nested_catalog_symlink_cycles() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills/a")).unwrap();
+        std::fs::write(
+            repo.path().join(".agents/skills/a/SKILL.md"),
+            "---\nname: a\ndescription: A\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("..", &repo.path().join(".agents/skills/a/skills"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "a");
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        assert!(view.dir.join(".agents/skills/a/SKILL.md").is_file());
+        assert!(!view.dir.join(".agents/skills/a/skills/a/SKILL.md").exists());
     }
 
     #[test]
