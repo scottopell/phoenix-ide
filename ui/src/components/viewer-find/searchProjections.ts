@@ -82,6 +82,7 @@ export interface ConversationUnitSearchMatchTarget {
 export interface ConversationTextFragmentDisplay {
   mode: 'full' | 'compact-collapsed';
   summaryText: string;
+  sourceText: string;
 }
 
 export interface SearchResultRevealTarget {
@@ -1215,7 +1216,7 @@ export function buildSearchOutputProjection(
       const duplicateIndex = duplicateCounts.get(identityText) ?? 0;
       duplicateCounts.set(identityText, duplicateIndex + 1);
       const fragment: SearchResultFragment = {
-        fragmentId: `search-hit:${encodeURIComponent(identityText)}:${duplicateIndex}`,
+        fragmentId: `search-hit:${encodeURIComponent(path)}:${lineNumber}:${boundedFragmentHash(identityText)}:${duplicateIndex}`,
         semanticText,
         display: { path: '', lineNumber, content },
         revealTarget: { ...revealBase, path, lineNumber },
@@ -1407,16 +1408,20 @@ export function buildAgentTextFragments(
   const out: ConversationTextFragment[] = [];
   blocks.forEach((block, index) => {
     if (block.type !== 'text') return;
-    const semanticText = block.text ?? '';
+    const sourceText = block.text ?? '';
+    const markdownBlocks = buildMarkdownDisplayBlocks(sourceText);
+    const semanticText = markdownBlocks.length > 0
+      ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')
+      : sourceText;
     const fragmentId = `agent-text-${index}`;
-    const collapsed = !options.forceExpandedText && density === 'compact' && shouldCollapseCompactText(semanticText);
+    const collapsed = !options.forceExpandedText && density === 'compact' && shouldCollapseCompactText(sourceText);
     out.push({
       fragmentId,
       semanticText,
       revealTarget: { kind: 'agent-text', key: fragmentId },
       display: collapsed
-        ? { mode: 'compact-collapsed', summaryText: firstLineSummary(semanticText) }
-        : { mode: 'full', summaryText: semanticText },
+        ? { mode: 'compact-collapsed', summaryText: firstLineSummary(semanticText), sourceText }
+        : { mode: 'full', summaryText: semanticText, sourceText },
     });
   });
   return out;

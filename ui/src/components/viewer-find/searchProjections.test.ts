@@ -6,6 +6,7 @@ import {
   buildAgentTextFragments,
   buildPatchOutputProjection,
   buildReadFileOutputProjection,
+  buildSearchOutputProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
@@ -307,6 +308,16 @@ describe('typed semantic display projections', () => {
     expect(line?.fragmentId.length).toBeLessThan(64);
   });
 
+  it('projects agent prose from rendered Markdown text, not source-only syntax', () => {
+    const fragments = buildAgentTextFragments([
+      { type: 'text', text: 'Read **bold docs** at [the guide](https://example.test/secret-url).' },
+    ], 'full');
+
+    expect(fragments[0]?.semanticText).toBe('Read bold docs at the guide.');
+    expect(fragments[0]?.semanticText).not.toContain('https://');
+    expect(fragments[0]?.display.sourceText).toContain('[the guide]');
+  });
+
   it('keeps complete sub-agent outcomes searchable behind compact previews', () => {
     const longOutcome = `prefix ${'hidden '.repeat(40)}exact outcome token`;
     const fragments = buildSubAgentCardFragments({
@@ -379,6 +390,18 @@ describe('browser tool semantic projection parity', () => {
     );
     expect(logs.fullText).toBe('2 entries\n1 error\n1 log\nerror\nboom\nlog\nready');
     expect(buildTerminalToolResultProjection('console-logs', '[]', undefined).fullText).toBe('(no console entries)');
+  });
+});
+
+describe('bounded search fragment identities', () => {
+  it('does not embed arbitrarily long matched lines in fragment ids', () => {
+    const content = `token ${'x'.repeat(20_000)}`;
+    const projection = buildSearchOutputProjection(`src/min.js:1:${content}`, { toolUseId: 'search-long' });
+    const hit = projection.hits[0]?.fragment;
+
+    expect(hit?.semanticText).toContain(content);
+    expect(hit?.fragmentId).not.toContain(content);
+    expect(hit?.fragmentId.length).toBeLessThan(128);
   });
 });
 

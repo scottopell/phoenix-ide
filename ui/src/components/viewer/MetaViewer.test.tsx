@@ -1,7 +1,7 @@
 import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { MetaViewer } from './MetaViewer';
+import { __metaViewerFindTestables, MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
 import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -90,6 +90,29 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 }
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
+describe('MetaViewer find identities', () => {
+  it('bounds match ids for arbitrarily long file lines', () => {
+    const text = `prefix ${'x'.repeat(20_000)} token`;
+    const source = {
+      id: 'line:1',
+      kind: 'line' as const,
+      lineNumber: 1,
+      text,
+      target: { kind: 'file-line' as const, lineNumber: 1, startColumn: 0, endColumn: 0 },
+    };
+    const id = __metaViewerFindTestables.stableFileMatchId([source])({
+      sourceId: source.id,
+      sourceText: text,
+      start: text.length - 5,
+      end: text.length,
+      target: { kind: 'file-line', lineNumber: 1, startColumn: text.length - 5, endColumn: text.length },
+    });
+
+    expect(id).not.toContain('prefix');
+    expect(id.length).toBeLessThan(128);
+  });
+});
+
 describe('MetaViewer payload routing', () => {
   it('drives file counts from the typed line projection', async () => {
     renderViewer({

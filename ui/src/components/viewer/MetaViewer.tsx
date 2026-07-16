@@ -588,6 +588,15 @@ function renderBody(
   }
 }
 
+function boundedFileMatchHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function stableFileMatchId(
   sources: readonly FileSearchProjection['sources'][number][],
 ): (match: SearchableSourceMatch<FileSearchMatchTarget>) => string {
@@ -600,15 +609,19 @@ function stableFileMatchId(
     const leftContext = match.sourceText.slice(Math.max(0, match.start - 32), match.start);
     const rightContext = match.sourceText.slice(match.end, Math.min(match.sourceText.length, match.end + 32));
     const semanticSignature = [
-      match.sourceText,
+      match.target.lineNumber,
       `${match.start}:${match.end}`,
-      previous,
-      leftContext,
-      rightContext,
-      next,
-    ].join('\u0001');
+      boundedFileMatchHash(match.sourceText),
+      boundedFileMatchHash(previous),
+      boundedFileMatchHash(leftContext),
+      boundedFileMatchHash(rightContext),
+      boundedFileMatchHash(next),
+    ].join(':');
     const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
     duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
-    return `${semanticSignature}\u0001${duplicateOccurrence}`;
+    return `${semanticSignature}:${duplicateOccurrence}`;
   };
 }
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const __metaViewerFindTestables = { stableFileMatchId };

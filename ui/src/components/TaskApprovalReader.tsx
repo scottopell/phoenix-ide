@@ -507,7 +507,7 @@ export function TaskApprovalReader({
       return match?.id ?? `markdown:line:${lineNumber}`;
     };
 
-    const annotatable = (Tag: React.ElementType, kind?: string) =>
+    const annotatable = (Tag: React.ElementType, kind?: string, decorateChildren = true) =>
       ({
         children,
         node,
@@ -534,7 +534,7 @@ export function TaskApprovalReader({
         const displayBlock = markdownDisplayBlocks.find((block) => block.id === blockId);
         const blockText = displayBlock?.searchableText ?? lineText;
         const blockMatches = matchesByBlockId.get(blockId) ?? [];
-        const shouldDecorateChildren = blockMatches.length > 0;
+        const shouldDecorateChildren = decorateChildren && blockMatches.length > 0;
         return (
           <AnnotatableBlock
             as={Tag}
@@ -576,8 +576,8 @@ export function TaskApprovalReader({
             h6: annotatable('h6', 'heading'),
             td: annotatable('td', 'tableCell'),
             th: annotatable('th', 'tableCell'),
-            li: annotatable('li'),
-            blockquote: annotatable('blockquote'),
+            li: annotatable('li', undefined, false),
+            blockquote: annotatable('blockquote', undefined, false),
             code: ({
               className,
               children,

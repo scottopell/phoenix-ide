@@ -322,6 +322,27 @@ describe('TaskApprovalReader shared find integration', () => {
     }
   });
 
+  it('preserves nested list and blockquote children while find is active', async () => {
+    renderTaskApprovalReader([
+      '- first alpha paragraph',
+      '',
+      '  nested paragraph',
+      '  - nested item',
+      '',
+      '> quoted alpha paragraph',
+      '>',
+      '> second quoted paragraph',
+    ].join('\n'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    expect(screen.getByText('nested paragraph')).toBeInTheDocument();
+    expect(screen.getByText('nested item')).toBeInTheDocument();
+    expect(screen.getByText('second quoted paragraph')).toBeInTheDocument();
+  });
+
   it('marks the exact active occurrence inside fenced code', async () => {
     renderTaskApprovalReader('```ts\nconst fencedToken = true;\n```');
     fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));

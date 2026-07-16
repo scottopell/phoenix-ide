@@ -1042,7 +1042,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }, []);
 
   const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
-    const remarkPlugins = usesGfmSyntax(fragment.semanticText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
+    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
     const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
@@ -1051,7 +1051,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       return (
         <CollapsibleText
           key={fragment.fragmentId}
-          text={fragment.semanticText}
+          text={fragment.display.sourceText}
           summary={fragment.display.summaryText}
           expanded={false}
           onExpand={() => expandFragment(fragment.fragmentId)}
@@ -1067,7 +1067,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
             </div>
           ) : (
             <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-              {fragment.semanticText}
+              {fragment.display.sourceText}
             </ReactMarkdown>
           )}
         </div>
