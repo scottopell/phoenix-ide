@@ -122,6 +122,25 @@ describe('history expansion reducer', () => {
     });
   });
 
+  it('allows an active reader expansion to return to tail ownership', () => {
+    const currentView = view('a', 1);
+    let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: manualRequest(currentView),
+    });
+    state = reduceHistoryExpansion(state, {
+      type: 'reader_restore_updated',
+      requestToken: 1,
+      view: currentView,
+      restore: { kind: 'following_tail' },
+    });
+    state = reduceHistoryExpansion(state, {
+      type: 'history_loaded', requestToken: 1, view: currentView, targetPresent: true, commandToken: 101,
+    });
+
+    expect(state.coverage).toBe('complete');
+    expect(state.pendingCommand).toBeNull();
+  });
+
   it('ignores reader restore updates from a stale view or request token', () => {
     const currentView = view('a', 1);
     const state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {

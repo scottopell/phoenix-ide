@@ -306,8 +306,8 @@ rule ActiveReaderExpansionTracksLatestRestoreBasis {
     requires: view.active_request != null
     requires: view.active_request.token = request_token
     requires: view.active_request.intent = reader_expand
-    requires: restore_basis in { reader_anchor, reader_viewport }
-    requires: restore_basis = reader_viewport
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request.restore_basis = restore_basis
     ensures: view.active_request.anchor_message_id = anchor_message_id
