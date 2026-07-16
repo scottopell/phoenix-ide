@@ -3479,23 +3479,6 @@ async fn send_chat(
             .await
             .unwrap_or_else(|| conversation.state.clone())
     };
-    if matches!(
-        effective_state,
-        ConvState::Idle
-            | ConvState::Error { .. }
-            | ConvState::ContextExhausted { .. }
-            | ConvState::AwaitingSubAgents { .. }
-    ) {
-        let repository =
-            phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
-        let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
-            .cancel_pending_for_conversation(&id, chrono::Utc::now())
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        if cancelled > 0 {
-            state.runtime.kick_wake_worker();
-        }
-    }
     if let Err(err) = check_user_message_acceptable(&effective_state) {
         // `AgentBusy` and `CancellationInProgress` states are transient — the
         // conversation will reach `Idle` once the current operation completes.

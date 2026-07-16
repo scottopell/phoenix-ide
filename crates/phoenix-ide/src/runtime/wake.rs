@@ -513,22 +513,24 @@ async fn deliver_owed(
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
-            .map(
-                |(inbox_id, registering_tool_use_id, output)| {
-                    let resume_llm = serde_json::from_str::<serde_json::Value>(&output)
-                        .ok()
-                        .and_then(|value| value.get("status").and_then(|status| status.as_str()).map(str::to_owned))
-                        .is_none_or(|status| status != "cancelled");
-                    WakeObservationResult {
-                        message_id: format!("wake-result-{inbox_id}"),
-                        content: format!(
-                            "Durable wait observation for registration {registering_tool_use_id}: {output}"
-                        ),
-                        inbox_id,
-                        resume_llm,
-                    }
-                },
-            )
+            .map(|(inbox_id, registering_tool_use_id, output)| {
+                let resume_llm = serde_json::from_str::<serde_json::Value>(&output)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("status")
+                            .and_then(|status| status.as_str())
+                            .map(str::to_owned)
+                    })
+                    .is_none_or(|status| status != "cancelled");
+                WakeObservationResult {
+                    message_id: format!("wake-result-{inbox_id}"),
+                    registering_tool_use_id,
+                    content: format!("Durable wait observation: {output}"),
+                    inbox_id,
+                    resume_llm,
+                }
+            })
             .collect();
         if results.is_empty() {
             continue;
@@ -705,7 +707,7 @@ async fn inspect_binding(
                     )
                 }
                 BashTerminalInspection::Unknown => {
-                    forgotten(binding, WakeForgottenReason::CascadeDestroyedHandle, now)
+                    forgotten(binding, WakeForgottenReason::PhoenixRestart, now)
                 }
                 BashTerminalInspection::Live
                 | BashTerminalInspection::KillPendingKernel { .. }
@@ -1100,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_missing_is_forgotten_immediately_before_deadline() {
+    async fn bash_missing_after_restart_is_forgotten_immediately_before_deadline() {
         let manager = manager_with_due_wakes(0).await;
         let binding = binding(WakeResourceIdentity::Bash(BashResourceIdentity {
             work_scope: scope(),
@@ -1110,7 +1112,7 @@ mod tests {
         assert!(matches!(
             inspect_binding(&manager, &binding, at(50)).await.unwrap(),
             InspectionDecision::DeadlineTerminal(WakeTerminalPayload::Forgotten {
-                reason: WakeForgottenReason::CascadeDestroyedHandle,
+                reason: WakeForgottenReason::PhoenixRestart,
                 resolved_at: Timestamp(50),
                 ..
             })

@@ -3249,17 +3249,6 @@ impl RuntimeManager {
             _ => {}
         }
 
-        if matches!(conv.state, ConvState::Idle) {
-            let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-            if phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
-                .has_pending_for_conversation(conversation_id)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Ok((ConvState::Idle, row_state_updated_at, false));
-            }
-        }
-
         let messages = self
             .db
             .get_messages(conversation_id)

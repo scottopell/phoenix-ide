@@ -245,6 +245,18 @@ impl<'a> WakeWorkflowAdapter<'a> {
             tx.rollback().await?;
             return Ok(0);
         }
+        let core_consumed = sqlx::query(
+            "UPDATE workflow_reducer_inbox SET delivery_status = 'consumed' \
+             WHERE delivery_status = 'pending' \
+             AND id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(&encoded_ids)
+        .execute(&mut *tx)
+        .await?;
+        if core_consumed.rows_affected() != inbox_ids.len() as u64 {
+            tx.rollback().await?;
+            return Ok(0);
+        }
         let result = sqlx::query(
             "UPDATE wake_runtime_obligations SET status = 'accepted', resolved_at = ?1, terminal_reason = 'accepted' \
              WHERE conversation_id = ?2 AND status = 'owed' \
@@ -376,19 +388,6 @@ impl<'a> WakeWorkflowAdapter<'a> {
             };
             cancelled += u64::from(self.cancel(&request).await?);
         }
-        let owed_inbox_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT oi.inbox_item_id FROM wake_runtime_obligations o \
-             JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
-             WHERE o.conversation_id = ?1 AND o.status = 'owed'",
-        )
-        .bind(conversation_id)
-        .fetch_all(self.repository.pool())
-        .await?;
-        if !owed_inbox_ids.is_empty() {
-            self.accept_owed_items(conversation_id, &owed_inbox_ids, now)
-                .await?;
-            cancelled += 1;
-        }
         Ok(cancelled)
     }
 
@@ -408,6 +407,13 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .await?;
         let result = sqlx::query(
             "UPDATE wake_workflow_bindings SET conversation_id = ?1 WHERE conversation_id = ?2",
+        )
+        .bind(successor_id)
+        .bind(predecessor_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_observation_inbox SET conversation_id = ?1 WHERE conversation_id = ?2",
         )
         .bind(successor_id)
         .bind(predecessor_id)
@@ -1178,6 +1184,32 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(&request.workflow_id)
         .execute(&mut *tx)
         .await?;
+            let conversation_id: String = sqlx::query_scalar(
+                "SELECT conversation_id FROM wake_workflow_bindings WHERE workflow_id = ?1",
+            )
+            .bind(&request.workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let obligation_id = format!("wake-cancel-obligation:{}", request.workflow_id);
+            sqlx::query(
+                "INSERT INTO wake_runtime_obligations \
+                 (id, conversation_id, snapshot_upper_bound, status, created_at, resolved_at, terminal_reason) \
+                 VALUES (?1, ?2, ?3, 'owed', ?4, NULL, NULL)",
+            )
+            .bind(&obligation_id)
+            .bind(&conversation_id)
+            .bind(sequence)
+            .bind(request.committed_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO wake_runtime_obligation_items (obligation_id, ordinal, inbox_item_id) \
+                 VALUES (?1, 0, ?2)",
+            )
+            .bind(&obligation_id)
+            .bind(&request.reducer_inbox_id)
+            .execute(&mut *tx)
+            .await?;
         }
         if effect_already_receipted {
             sqlx::query(

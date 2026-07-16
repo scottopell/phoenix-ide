@@ -995,7 +995,7 @@ async fn retry_promotes_only_the_exact_due_deadline() {
 }
 
 #[tokio::test]
-async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance() {
+async fn cancellation_creates_delivery_obligation_without_llm_resume() {
     let (pool, repo) = registered(bash()).await;
     let adapter = WakeWorkflowAdapter::new(&repo);
     assert!(adapter
@@ -1070,7 +1070,11 @@ async fn cancellation_is_direct_reducer_only_and_never_creates_owed_acceptance()
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(runtime_obligations, 0, "cancellation must not auto-resume");
+    assert_eq!(runtime_obligations, 1, "cancellation must be delivered");
+    let output = adapter.owed_tool_results("conv-wake").await.unwrap();
+    assert_eq!(output.len(), 1);
+    let payload: Value = serde_json::from_str(&output[0].2).unwrap();
+    assert_eq!(payload["status"], "cancelled");
 
     let owed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_owed_acceptance")
         .fetch_one(&pool)

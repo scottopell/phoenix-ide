@@ -28,6 +28,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WakeObservationResult {
     pub inbox_id: String,
+    pub registering_tool_use_id: String,
     pub message_id: String,
     pub content: String,
     pub resume_llm: bool,

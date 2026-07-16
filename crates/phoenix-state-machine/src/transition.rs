@@ -773,7 +773,11 @@ pub fn transition_core(
             };
             for wake_result in results {
                 transition = transition.with_effect(Effect::PersistMessage {
-                    content: MessageContent::user(&wake_result.content),
+                    content: MessageContent::tool(
+                        &wake_result.registering_tool_use_id,
+                        &wake_result.content,
+                        false,
+                    ),
                     display_data: None,
                     usage_data: None,
                     message_id: wake_result.message_id.clone(),
@@ -784,7 +788,9 @@ pub fn transition_core(
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::AcceptWakeObservations { inbox_ids });
             if resume_llm {
-                transition = transition.with_effect(Effect::RequestLlm);
+                transition = transition
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm);
             }
             Ok(transition)
         }
@@ -991,15 +997,20 @@ fn handle_core_tool_complete(
             && matches!(current_tool.input, ToolInput::WaitUntil(_))
             && matches!(result.outcome, ToolOutcome::Success { .. }) =>
         {
-            let mut all_results = completed_results.clone();
-            all_results.push(result);
-            for remaining in remaining_tools {
-                all_results.push(ToolResult::error(
-                    remaining.id.clone(),
-                    "tool skipped because wait_until suspended the tool round".to_owned(),
-                ));
+            let mut new_results = completed_results.clone();
+            new_results.push(result);
+            if let Some((next_tool, rest)) = remaining_tools.split_first() {
+                return Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
+                    current_tool: next_tool.clone(),
+                    remaining_tools: rest.to_vec(),
+                    completed_results: new_results,
+                    pending_sub_agents: pending_sub_agents.clone(),
+                    assistant_message: assistant_message.clone(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::execute_tool(next_tool.clone())));
             }
-            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), new_results)
                 .expect("tool_use/tool_result count mismatch in wait-until transition");
             let next = if pending_sub_agents.is_empty() {
                 CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
