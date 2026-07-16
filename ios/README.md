@@ -115,6 +115,10 @@ PhoenixMobile/Sources/
                             versioning rule in its header before changing
                             any persisted struct
     ImageProcessing.swift   Picked photos -> bounded JPEG ImagePayload
+    AttentionMonitor.swift  STOPGAP nudge tier: BGAppRefresh list diff ->
+                            local notifications. Deleted (not extended)
+                            when server-side APNs lands (tasks/58046)
+    BackgroundRefresh.swift BGTaskScheduler plumbing for the stopgap tier
   API/
     Models.swift            Wire types (Conversation, Message, envelopes)
     PhoenixAPI.swift        REST client, Bearer auth, self-signed trust delegate

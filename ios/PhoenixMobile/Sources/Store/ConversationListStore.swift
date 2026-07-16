@@ -85,6 +85,15 @@ final class ConversationListStore {
         persistCache()
     }
 
+    /// Apply an externally fetched list (background attention check) so a
+    /// cold open renders fresher data. Skipped while a foreground refresh
+    /// is in flight; the generation guard semantics match refresh().
+    func applyExternal(_ fresh: [Conversation]) {
+        guard !isRefreshing else { return }
+        apply(fresh)
+        lastError = nil
+    }
+
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {

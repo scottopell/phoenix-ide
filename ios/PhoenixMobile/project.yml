@@ -36,6 +36,13 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Phoenix connects to your Phoenix server on the local network."
+        # Stopgap nudge tier (AttentionMonitor): opportunistic background
+        # list fetches for local notifications. Replaced by APNs when
+        # server-side notification support lands.
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.phoenix.mobile.refresh
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

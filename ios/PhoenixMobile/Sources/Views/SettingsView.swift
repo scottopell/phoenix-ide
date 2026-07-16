@@ -55,6 +55,29 @@ struct SettingsView: View {
                 }
                 .id(pinRefresh)
 
+                Section {
+                    Toggle(
+                        "Needs-attention nudges",
+                        isOn: Binding(
+                            get: { model.backgroundNudgesEnabled },
+                            set: { newValue in
+                                Task { await model.setBackgroundNudges(newValue) }
+                            }))
+                    if let hint = model.nudgeAuthorizationHint {
+                        Text(hint)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Notifications")
+                } footer: {
+                    Text(
+                        "Best-effort local nudges when an agent needs you, errors, or "
+                        + "finishes — checked on iOS-scheduled background refreshes "
+                        + "(15+ min, not guaranteed). This is a stopgap: real-time "
+                        + "push arrives with server-side notification support.")
+                }
+
                 Section("Connection") {
                     LabeledContent("Network") {
                         Label(

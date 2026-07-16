@@ -84,7 +84,11 @@ struct ConversationListView: View {
                 Text(model.lastActionError ?? "")
             }
             .task {
+                consumePendingNavigation()
                 await model.refreshList()
+            }
+            .onChange(of: model.pendingOpenConversationId) {
+                consumePendingNavigation()
             }
         }
     }
@@ -145,6 +149,15 @@ struct ConversationListView: View {
                 await model.refreshList()
             }
         }
+    }
+
+    /// Notification tap → navigate to the conversation (set by
+    /// NotificationRouter; works from cold launch via .task and warm via
+    /// onChange).
+    private func consumePendingNavigation() {
+        guard let id = model.pendingOpenConversationId else { return }
+        model.pendingOpenConversationId = nil
+        navPath = [id]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.
