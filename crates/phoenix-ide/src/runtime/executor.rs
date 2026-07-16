@@ -2502,6 +2502,19 @@ where
     }
 
     async fn activate_queued_project_instructions(&self) -> Result<(), String> {
+        // Avoid consuming a persisted sequence when the common case has no queue.
+        // Activation remains authoritative and atomic below: if the queue changes
+        // after this preflight, activation may still return None (queue removed),
+        // or a later boundary will activate a queue inserted after this read.
+        if self
+            .storage
+            .load_queued_project_instruction_bundle(&self.context.conversation_id)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+
         let (reserved_broadcast_range, reserved_seqs) =
             self.broadcast_tx.reserve_next_persisted_message_range(1);
         let _reserved_broadcast_range = reserved_broadcast_range;
@@ -2542,16 +2555,6 @@ where
     }
 
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // Activation belongs to the user-authored turn boundary, before the
-        // state transition can dispatch effects. Tool-loop requests therefore
-        // cannot observe a queued snapshot until the next user turn.
-        if matches!(event, Event::UserMessage { .. }) {
-            self.activate_queued_project_instructions().await?;
-
-            // A fresh user turn always resets the parent tool-cycle counter.
-            self.parent_tool_cycle_count = 0;
-        }
-
         // Steering messages are buffered rather than fed to the state machine.
         // They are delivered as `UserMessage` when the conversation next enters `Idle`.
         if let Event::SteerMessage {
@@ -2635,7 +2638,9 @@ where
                 }
             }
 
-            // Pure state transition
+            // Compute the pure transition before performing boundary side effects.
+            // A rejected UserMessage must not activate a queued snapshot.
+            let starts_user_turn = matches!(current_event, Event::UserMessage { .. });
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2655,6 +2660,14 @@ where
                     return Err(e.to_string());
                 }
             };
+
+            if starts_user_turn {
+                // Activation must precede transition effects so the first model
+                // request observes the new snapshot, but follows validation so
+                // rejected messages leave the queue and timeline untouched.
+                self.activate_queued_project_instructions().await?;
+                self.parent_tool_cycle_count = 0;
+            }
 
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
@@ -2919,6 +2932,9 @@ where
         drain_event: Event,
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
+        let Event::SteerDrainedUserMessages { mut entries } = drain_event else {
+            unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
+        };
         let mut deferred_request_llm: Option<Effect> = None;
         // Cosmetic (task 60004): when the inline drain enters from Idle, the
         // original transition's Idle state-change SSE would briefly render the
@@ -2933,6 +2949,33 @@ where
         // deliberately skips this boundary action.
         if suppress_intermediate_state_change {
             self.activate_queued_project_instructions().await?;
+            // These steers are becoming a new user turn. Expansion happened at
+            // enqueue time while the prior turn was active, so rerender slash
+            // invocations from the now-active snapshot selected at this boundary.
+            let project_instructions = self
+                .storage
+                .load_active_project_instruction_bundle(&self.context.conversation_id)
+                .await?;
+            if let Some(project_instructions) = project_instructions {
+                let resolution_root =
+                    crate::resolution_root::ResolutionRoot::working_dir(&self.context.working_dir);
+                for entry in &mut entries {
+                    if entry.skill_invocation.is_none() {
+                        continue;
+                    }
+                    let expanded = crate::message_expander::expand_with_project_skills(
+                        &entry.text,
+                        &resolution_root,
+                        &project_instructions.skills,
+                    )
+                    .map_err(|error| {
+                        format!("failed to expand drained steering message: {error}")
+                    })?;
+                    entry.llm_text =
+                        (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+                    entry.skill_invocation = expanded.skill_invocation;
+                }
+            }
         }
         for effect in original_effects {
             if matches!(effect, Effect::RequestLlm) {
@@ -2956,9 +2999,6 @@ where
             }
         }
 
-        let Event::SteerDrainedUserMessages { entries } = drain_event else {
-            unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
-        };
         let drain_result = transition(
             &self.state,
             &self.context,
@@ -9678,6 +9718,71 @@ mod steer_drain_detector_tests {
         (rt, storage)
     }
 
+    fn user_message(id: &str) -> Event {
+        Event::UserMessage {
+            text: "hello".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: id.to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn user_turn_without_queued_instructions_does_not_consume_sequence() {
+        let (mut rt, _) =
+            build_runtime_with_state_and_queue("conv-no-queue", ConvState::Idle, vec![]);
+        let mut events = rt.broadcast_tx.subscribe();
+
+        rt.process_event(user_message("m1")).await.unwrap();
+
+        let emitted_count = std::iter::from_fn(|| events.try_recv().ok()).count();
+        assert_eq!(emitted_count, 3);
+        assert_eq!(rt.broadcast_tx.current_seq(), 3);
+        assert_eq!(
+            rt.broadcast_tx.next_seq(),
+            4,
+            "activation preflight must not leave an unused sequence between user-message effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_user_message_does_not_activate_queued_instructions() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-rejected-boundary",
+            ConvState::ContextExhausted {
+                summary: "full".to_string(),
+            },
+            vec![],
+        );
+        storage.queue_project_instruction_bundle(
+            "conv-rejected-boundary",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+
+        assert!(rt.process_event(user_message("rejected")).await.is_err());
+
+        assert!(storage
+            .load_queued_project_instruction_bundle("conv-rejected-boundary")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .load_active_project_instruction_bundle("conv-rejected-boundary")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_all_messages("conv-rejected-boundary")
+            .is_empty());
+    }
+
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
     fn extract_steer_drain_entries(events: &[Event]) -> Vec<Vec<SteerEntry>> {
         events
@@ -9743,6 +9848,64 @@ mod steer_drain_detector_tests {
         // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
         // SteerDrainedUserMessages arm).
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn idle_drain_rerenders_slash_skill_from_activated_queue() {
+        use phoenix_core::domain::project_instruction_bundle::{
+            NewProjectInstructionBundle, ProjectSkillSnapshot,
+        };
+        use phoenix_core::domain::skill_invocation::SkillInvocation;
+
+        let skill_bundle = |body: &str| NewProjectInstructionBundle {
+            estimated_tokens: 1,
+            guidance: vec![],
+            skills: vec![ProjectSkillSnapshot {
+                name: "alpha".to_string(),
+                description: "test".to_string(),
+                source_label: ".agents/skills".to_string(),
+                body: body.to_string(),
+                base_dir: "/tmp/.agents/skills/alpha".to_string(),
+                source_path: "/tmp/.agents/skills/alpha/SKILL.md".to_string(),
+                content_hash: body.to_string(),
+            }],
+        };
+        let mut entry = mk_entry("slash-steer", "/alpha");
+        entry.llm_text = Some("active body".to_string());
+        entry.skill_invocation = Some(SkillInvocation {
+            name: "alpha".to_string(),
+            body: "active body".to_string(),
+            skill_dir: "/tmp/.agents/skills/alpha".to_string(),
+        });
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-slash-idle-drain",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![entry],
+        );
+        storage
+            .initialize_project_instruction_bundle_if_absent(
+                "conv-slash-idle-drain",
+                &skill_bundle("active body"),
+            )
+            .await
+            .unwrap();
+        storage
+            .queue_project_instruction_bundle("conv-slash-idle-drain", skill_bundle("queued body"));
+
+        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
+            .await
+            .unwrap();
+
+        let skill = storage
+            .get_all_messages("conv-slash-idle-drain")
+            .into_iter()
+            .find_map(|message| match message.content {
+                MessageContent::Skill(skill) => Some(skill),
+                _ => None,
+            })
+            .expect("drained skill message");
+        assert!(skill.body.contains("queued body"));
+        assert!(!skill.body.contains("active body"));
     }
 
     /// Task 60004: entering Idle with a non-empty steering queue must NOT

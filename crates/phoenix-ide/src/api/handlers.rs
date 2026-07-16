@@ -3079,6 +3079,29 @@ async fn ensure_active_project_instructions(
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
+async fn project_instructions_for_next_turn(
+    state: &AppState,
+    conversation_id: &str,
+    cwd: &FsPath,
+) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, AppError> {
+    if let Some(queued) = state
+        .db
+        .load_queued_project_instruction_bundle(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Ok(queued);
+    }
+    ensure_active_project_instructions(state, conversation_id, cwd).await
+}
+
+fn steering_starts_later_turn(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. }
+    )
+}
+
 async fn project_instruction_status(
     state: &AppState,
     id: &str,
@@ -3665,13 +3688,17 @@ async fn send_chat(
                     skill_invocation: None,
                 }
             } else {
-                let active_project =
+                let project_instructions = if steering_starts_later_turn(&effective_state) {
+                    project_instructions_for_next_turn(&state, &id, FsPath::new(&conversation.cwd))
+                        .await?
+                } else {
                     ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd))
-                        .await?;
+                        .await?
+                };
                 crate::message_expander::expand_with_project_skills(
                     &req.text,
                     &resolution_root,
-                    &active_project.skills,
+                    &project_instructions.skills,
                 )
                 .map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
@@ -3753,12 +3780,12 @@ async fn send_chat(
             skill_invocation: None,
         }
     } else {
-        let active_project =
-            ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
+        let project_instructions =
+            project_instructions_for_next_turn(&state, &id, FsPath::new(&conversation.cwd)).await?;
         crate::message_expander::expand_with_project_skills(
             &req.text,
             &resolution_root,
-            &active_project.skills,
+            &project_instructions.skills,
         )
         .map_err(|e| {
             AppError::UnprocessableEntity(ExpansionErrorResponse {
@@ -13284,6 +13311,99 @@ mod chat_authority_tests {
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
+    }
+
+    fn skill_bundle(
+        body: &str,
+    ) -> phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+        use phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot;
+        phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+            estimated_tokens: 1,
+            guidance: vec![],
+            skills: vec![ProjectSkillSnapshot {
+                name: "alpha".to_string(),
+                description: "test".to_string(),
+                source_label: ".agents/skills".to_string(),
+                body: body.to_string(),
+                base_dir: "/tmp/.agents/skills/alpha".to_string(),
+                source_path: "/tmp/.agents/skills/alpha/SKILL.md".to_string(),
+                content_hash: body.to_string(),
+            }],
+        }
+    }
+
+    async fn seed_active_and_queue_changed_skill(state: &AppState, id: &str) {
+        state
+            .db
+            .initialize_project_instruction_bundle_if_absent(id, &skill_bundle("active body"))
+            .await
+            .unwrap();
+        let candidate = state
+            .db
+            .persist_or_replace_project_instruction_candidate(id, &skill_bundle("queued body"))
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .confirm_project_instruction_candidate(id, &candidate.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn direct_slash_message_expands_from_queued_next_turn_bundle() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-queued-skill", "skill", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        seed_active_and_queue_changed_skill(&state, "c-queued-skill").await;
+
+        let _ = send_chat(
+            State(state.clone()),
+            Path("c-queued-skill".to_string()),
+            Json(ChatRequest {
+                text: "/alpha".to_string(),
+                message_id: "queued-skill-message".to_string(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let messages = state.db.get_messages("c-queued-skill").await.unwrap();
+                if let Some(skill) = messages.iter().find_map(|message| match &message.content {
+                    crate::db::MessageContent::Skill(skill) => Some(skill),
+                    _ => None,
+                }) {
+                    assert!(skill.body.contains("queued body"));
+                    assert!(!skill.body.contains("active body"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user message persisted");
+    }
+
+    #[test]
+    fn cancelling_steering_is_classified_as_a_later_turn() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![],
+            completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: None,
+        };
+        assert!(steering_starts_later_turn(&state));
+        assert!(!steering_starts_later_turn(&ConvState::LlmRequesting {
+            attempt: 1
+        }));
     }
 
     /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.

@@ -214,6 +214,12 @@ pub trait StateStore: Send + Sync {
         conv_id: &str,
     ) -> Result<Option<ProjectInstructionBundle>, String>;
 
+    /// Load the project-instruction snapshot queued for the next user turn.
+    async fn load_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String>;
+
     /// Atomically promote the queue, bump generation, and persist its timeline marker.
     async fn activate_queued_project_instruction_bundle(
         &self,
@@ -526,6 +532,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     ) -> Result<Option<ProjectInstructionBundle>, String> {
         (**self)
             .load_active_project_instruction_bundle(conv_id)
+            .await
+    }
+
+    async fn load_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String> {
+        (**self)
+            .load_queued_project_instruction_bundle(conv_id)
             .await
     }
 
@@ -887,6 +902,16 @@ impl StateStore for DatabaseStorage {
     ) -> Result<Option<ProjectInstructionBundle>, String> {
         self.db
             .load_active_project_instruction_bundle(conv_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn load_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<ProjectInstructionBundle>, String> {
+        self.db
+            .load_queued_project_instruction_bundle(conv_id)
             .await
             .map_err(|e| e.to_string())
     }

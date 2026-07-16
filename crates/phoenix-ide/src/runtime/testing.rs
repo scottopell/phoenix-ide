@@ -974,6 +974,21 @@ impl StateStore for InMemoryStorage {
             .and_then(|entry| entry.active.clone()))
     }
 
+    async fn load_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+        String,
+    > {
+        Ok(self
+            .project_instruction_bundles
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .and_then(|entry| entry.queued.clone()))
+    }
+
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,

@@ -2436,23 +2436,28 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let id = uuid::Uuid::new_v4().to_string();
+        let created_at = Utc::now();
         insert_project_instruction_bundle_tx(
             &mut tx,
             &id,
             conversation_id,
             ProjectInstructionBundleRole::Candidate,
             bundle,
-            &Utc::now().to_rfc3339(),
+            &created_at.to_rfc3339(),
         )
         .await?;
         tx.commit().await?;
-        self.load_project_instruction_bundle_by_role(
-            conversation_id,
-            ProjectInstructionBundleRole::Candidate,
-        )
-        .await?
-        .ok_or_else(|| {
-            DbError::Serialization("candidate disappeared after persistence".to_string())
+        // Return the exact row this transaction inserted. Reloading "the candidate"
+        // by role here can observe a concurrent replacement and attribute its ID to
+        // this caller's preview contents.
+        Ok(ProjectInstructionBundle {
+            id,
+            conversation_id: conversation_id.to_string(),
+            role: ProjectInstructionBundleRole::Candidate,
+            estimated_tokens: bundle.estimated_tokens,
+            created_at,
+            guidance: bundle.guidance.clone(),
+            skills: bundle.skills.clone(),
         })
     }
 
@@ -8768,6 +8773,33 @@ mod tests {
                 .unwrap(),
             Some(first)
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_persist_returns_the_exact_bundle_inserted_by_that_call() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "bundle-return-exact",
+            "bundle-return-exact",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let requested = instruction_bundle("requested");
+
+        let returned = db
+            .persist_or_replace_project_instruction_candidate("bundle-return-exact", &requested)
+            .await
+            .unwrap();
+
+        assert_eq!(returned.conversation_id, "bundle-return-exact");
+        assert_eq!(returned.role, ProjectInstructionBundleRole::Candidate);
+        assert_eq!(returned.estimated_tokens, requested.estimated_tokens);
+        assert_eq!(returned.guidance, requested.guidance);
+        assert_eq!(returned.skills, requested.skills);
     }
 
     #[tokio::test]

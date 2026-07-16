@@ -15,7 +15,9 @@ THE SYSTEM SHALL use one immutable project-instruction bundle containing the app
 AND SHALL keep that bundle unchanged throughout a user turn and its tool loop.
 
 WHEN either the user invokes a slash skill or the model invokes the Skill tool in an existing conversation
-THE SYSTEM SHALL render the invocation from the active bundle's captured skill name, body, and base directory without rediscovering or rereading `SKILL.md`.
+THE SYSTEM SHALL render the invocation from the bundle governing that invocation's turn, using its captured skill name, body, and base directory without rediscovering or rereading `SKILL.md`.
+
+A direct user message that starts the next turn, and steering known to start a later turn, SHALL expand slash skills from the queued bundle when one is waiting; invocation within the active turn SHALL expand from the active bundle.
 
 Skill companion files remain live resources outside the snapshot and MAY be read through ordinary file tools after invocation.
 
@@ -72,6 +74,8 @@ AND SHALL activate the confirmed bundle before processing the next user-authored
 A direct user message and a steering message drained while entering idle SHALL each start such a boundary. A steering drain during an existing tool loop SHALL NOT activate the bundle.
 
 Activation SHALL atomically preserve conversation history, persist a visible content-free System instruction-refresh timeline event, advance the transcript generation, and invalidate incompatible provider continuation state. The system SHALL emit the durable event after commit, and System timeline events SHALL remain excluded from model context.
+
+A rejected user message SHALL NOT activate the queued bundle, advance transcript generation, or add an activation timeline event.
 
 ### REQ-PI-007 — Durable Recovery
 
