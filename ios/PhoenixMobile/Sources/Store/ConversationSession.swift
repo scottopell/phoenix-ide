@@ -259,6 +259,11 @@ final class ConversationSession {
                 case .provideTaskFeedback(let annotations):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: annotations)
+                case .respondToQuestions(let answers):
+                    try await api.respondToQuestion(
+                        conversationId: conversationId, answers: answers)
+                case .dismissQuestion:
+                    try await api.dismissQuestion(conversationId: conversationId)
                 }
                 // Success needs no local state change: the server emits the
                 // resulting state_change over SSE and the reducer applies it.

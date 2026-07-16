@@ -40,14 +40,18 @@ struct StateDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .awaitingUserResponse(let count, let firstQuestion):
-            needsActionCard(
-                icon: "questionmark.bubble",
-                title: count == 1
-                    ? "The agent asked a question"
-                    : "The agent asked \(count) questions",
-                detail: firstQuestion,
-                footnote: "Answer from the web UI — responding here isn't supported yet.")
+        case .awaitingUserResponse(let questions):
+            if questions.isEmpty {
+                // Degenerate payload: still show the condition rather than
+                // nothing; dismiss is the only meaningful resolution.
+                needsActionCard(
+                    icon: "questionmark.bubble",
+                    title: "The agent is waiting for a response",
+                    detail: nil,
+                    footnote: "No question payload — respond from the web UI.")
+            } else {
+                QuestionCard(session: session, questions: questions)
+            }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
             TaskApprovalCard(

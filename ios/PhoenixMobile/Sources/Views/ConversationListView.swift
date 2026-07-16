@@ -7,9 +7,11 @@ struct ConversationListView: View {
     @Environment(AppModel.self) private var model
     @State private var showNewConversation = false
     @State private var showSettings = false
+    @State private var navPath: [String] = []
+    @State private var openingCoordinator = false
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navPath) {
             VStack(spacing: 0) {
                 OfflineBanner()
                 list
@@ -31,6 +33,32 @@ struct ConversationListView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    // The fleet Coordinator: one conversation that answers
+                    // questions about all the others. Ordinary conversation
+                    // underneath, so it inherits offline caching and the
+                    // outbox for free. Enabled offline once its id is known.
+                    Button {
+                        guard !openingCoordinator else { return }
+                        openingCoordinator = true
+                        Task {
+                            defer { openingCoordinator = false }
+                            if let id = await model.openCoordinator() {
+                                navPath.append(id)
+                            }
+                        }
+                    } label: {
+                        if openingCoordinator {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "globe")
+                        }
+                    }
+                    .disabled(
+                        openingCoordinator
+                            || (!model.connectivity.isOnline
+                                && model.coordinatorConversationId == nil))
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showNewConversation = true
                     } label: {
@@ -46,7 +74,7 @@ struct ConversationListView: View {
                 SettingsView()
             }
             .alert(
-                "Couldn't archive",
+                "Action failed",
                 isPresented: Binding(
                     get: { model.lastActionError != nil },
                     set: { if !$0 { model.lastActionError = nil } })
@@ -82,7 +110,9 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations) { conversation in
                     NavigationLink(value: conversation.id) {
-                        ConversationRow(conversation: conversation)
+                        ConversationRow(
+                            conversation: conversation,
+                            isCoordinator: conversation.id == model.coordinatorConversationId)
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button {
@@ -116,6 +146,7 @@ struct ConversationListView: View {
 
 struct ConversationRow: View {
     let conversation: Conversation
+    var isCoordinator = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -124,7 +155,12 @@ struct ConversationRow: View {
                     presentationMode: conversation.presentation_mode,
                     requiresAction: conversation.requires_action ?? false,
                     stateType: conversation.stateType)
-                Text(conversation.displayTitle)
+                if isCoordinator {
+                    Image(systemName: "globe")
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                }
+                Text(isCoordinator ? "Coordinator" : conversation.displayTitle)
                     .font(.body)
                     .lineLimit(1)
                 Spacer()

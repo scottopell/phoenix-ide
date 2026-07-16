@@ -36,6 +36,11 @@ enum ConversationAction: Equatable {
     /// Send the plan back with free-text change requests; the agent
     /// revises and re-proposes.
     case provideTaskFeedback(annotations: String)
+    /// Answer the agent's questions (awaiting_user_response). Answers are
+    /// keyed by question text, encoded per QuestionAnswers.
+    case respondToQuestions(answers: [String: String])
+    /// Dismiss the questions without answering; the agent proceeds.
+    case dismissQuestion
 
     enum DeliveryPolicy {
         case onlineOnly
@@ -46,8 +51,9 @@ enum ConversationAction: Equatable {
         switch self {
         case .cancel, .dismissError:
             return .onlineOnly
-        case .approveTask, .rejectTask, .provideTaskFeedback:
-            // Approval decides live server state; a queued stale decision
+        case .approveTask, .rejectTask, .provideTaskFeedback,
+             .respondToQuestions, .dismissQuestion:
+            // These decide live server state; a queued stale decision
             // replayed later (possibly after someone decided differently
             // from the web UI) must never fire.
             return .onlineOnly

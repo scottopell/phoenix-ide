@@ -15,6 +15,7 @@ final class AppModel {
     /// the value is a server-local filesystem path and must not leak (or be
     /// sent) to a different server configured later.
     static let lastCwdKey = "phoenix.lastCwd"
+    private static let coordinatorIdKey = "phoenix.coordinatorConversationId"
 
     var serverURLString: String {
         didSet {
@@ -91,6 +92,38 @@ final class AppModel {
         await listStore.refresh(api: api)
     }
 
+    // MARK: - Coordinator
+
+    /// The fleet Coordinator's conversation id, remembered across launches
+    /// so its cached transcript opens offline and its list row is badged.
+    /// Per-server state — cleared on sign-out.
+    private(set) var coordinatorConversationId: String? =
+        UserDefaults.standard.string(forKey: AppModel.coordinatorIdKey)
+
+    /// Resolve the Coordinator conversation to open. Online: get-or-create
+    /// on the server (it's an ordinary conversation; everything downstream
+    /// is the normal conversation surface). Offline: fall back to the
+    /// remembered id so the cached transcript still opens — asking new
+    /// questions then queues through the outbox like any conversation.
+    func openCoordinator() async -> String? {
+        if let api, connectivity.isOnline {
+            do {
+                let conversation = try await api.ensureCoordinator()
+                coordinatorConversationId = conversation.id
+                UserDefaults.standard.set(conversation.id, forKey: Self.coordinatorIdKey)
+                listStore.upsert(conversation)
+                return conversation.id
+            } catch {
+                lastActionError = (error as? APIError)?.errorDescription
+                    ?? error.localizedDescription
+                return nil
+            }
+        }
+        if let cached = coordinatorConversationId { return cached }
+        lastActionError = "Opening the Coordinator for the first time needs a connection."
+        return nil
+    }
+
     /// List-scoped conversation action (see ConversationAction's policy
     /// doc — archive is online-only: it transitions live server state and
     /// frees resources, so a queued stale archive must not replay later).
@@ -165,6 +198,8 @@ final class AppModel {
     func signOut() {
         clearCache()
         UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
+        UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
+        coordinatorConversationId = nil
         CertPinStore.forget()
         password = ""
         Keychain.deletePassword(account: Self.passwordAccount)

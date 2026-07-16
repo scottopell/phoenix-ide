@@ -54,15 +54,29 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(parse(raw), .awaitingSubAgents(pendingCount: 3, completedCount: 1))
     }
 
-    func testAwaitingUserResponseCarriesQuestions() {
+    func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
         {"type":"awaiting_user_response",
-         "questions":[{"question":"Which db?","header":"DB","options":[],"multiSelect":false},
-                      {"question":"Which port?","header":"Port","options":[],"multiSelect":false}]}
+         "questions":[{"question":"Which db?","header":"DB",
+                       "options":[{"label":"sqlite","description":"file-backed"},
+                                  {"label":"postgres","description":""}],
+                       "multiSelect":false},
+                      {"question":"Which features?","header":"Feat","options":[],"multiSelect":true}]}
         """
         XCTAssertEqual(
             parse(raw),
-            .awaitingUserResponse(questionCount: 2, firstQuestion: "Which db?"))
+            .awaitingUserResponse(questions: [
+                UserQuestion(
+                    question: "Which db?", header: "DB",
+                    options: [
+                        .init(label: "sqlite", description: "file-backed"),
+                        .init(label: "postgres", description: ""),
+                    ],
+                    multiSelect: false),
+                UserQuestion(
+                    question: "Which features?", header: "Feat",
+                    options: [], multiSelect: true),
+            ]))
     }
 
     func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {
