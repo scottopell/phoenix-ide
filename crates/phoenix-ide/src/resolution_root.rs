@@ -381,12 +381,12 @@ fn materialize_skill_catalog(
         return;
     }
     for child in tree_children(tree, physical_root) {
-        let logical_skill = format!("{logical_root}/{child}");
-        let physical_skill = format!("{physical_root}/{child}");
+        let logical_skill = tree_path_join(logical_root, &child);
+        let physical_skill = tree_path_join(physical_root, &child);
         let Some(physical_skill) = resolve_tree_link_chain(&physical_skill, symlinks) else {
             continue;
         };
-        let metadata = format!("{physical_skill}/SKILL.md");
+        let metadata = tree_path_join(&physical_skill, "SKILL.md");
         let Some(metadata) = resolve_tree_link_chain(&metadata, symlinks) else {
             continue;
         };
@@ -396,10 +396,10 @@ fn materialize_skill_catalog(
                 reference,
                 &metadata,
                 destination_root,
-                &format!("{logical_skill}/SKILL.md"),
+                &tree_path_join(&logical_skill, "SKILL.md"),
             );
-            let logical_children = format!("{logical_skill}/skills");
-            let physical_children = format!("{physical_skill}/skills");
+            let logical_children = tree_path_join(&logical_skill, "skills");
+            let physical_children = tree_path_join(&physical_skill, "skills");
             if let Some(physical_children) = resolve_tree_link_chain(&physical_children, symlinks) {
                 materialize_skill_catalog(
                     repo_root,
@@ -417,7 +417,11 @@ fn materialize_skill_catalog(
 }
 
 fn tree_children(tree: &HashMap<String, TreeEntry>, directory: &str) -> Vec<String> {
-    let prefix = format!("{directory}/");
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
     let mut children: Vec<String> = tree
         .keys()
         .filter_map(|path| path.strip_prefix(&prefix)?.split('/').next())
@@ -427,6 +431,14 @@ fn tree_children(tree: &HashMap<String, TreeEntry>, directory: &str) -> Vec<Stri
     children.sort();
     children.dedup();
     children
+}
+
+fn tree_path_join(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
 }
 
 fn copy_tree_blob(
@@ -583,6 +595,9 @@ fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) 
     let mut path = link_path.to_string();
     let mut visited = HashSet::new();
     loop {
+        if path.is_empty() {
+            return Some(path);
+        }
         let components = validated_tree_components(&path)?;
         let Some((prefix_len, link, target)) = (1..=components.len()).find_map(|len| {
             let prefix = components[..len].join("/");
@@ -596,10 +611,9 @@ fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) 
             return None;
         }
         let resolved = resolve_tree_link(&link, target)?;
-        path = std::iter::once(resolved.as_str())
-            .chain(components[prefix_len..].iter().copied())
-            .collect::<Vec<_>>()
-            .join("/");
+        path = components[prefix_len..]
+            .iter()
+            .fold(resolved, |path, component| tree_path_join(&path, component));
     }
 }
 
@@ -616,7 +630,7 @@ fn resolve_tree_link(link_path: &str, target: &str) -> Option<String> {
             std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
         }
     }
-    (!resolved.is_empty()).then(|| resolved.join("/"))
+    Some(resolved.join("/"))
 }
 
 #[cfg(test)]
@@ -1018,6 +1032,41 @@ mod tests {
     }
 
     #[test]
+    fn git_tree_skills_view_preserves_catalog_parent_link_to_repo_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir(".", &repo.path().join(".agents"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_preserves_catalog_root_link_to_repo_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("review")).unwrap();
+        std::fs::write(
+            repo.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("..", &repo.path().join(".agents/skills"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
     fn tree_link_resolution_rejects_paths_outside_committed_tree() {
         assert_eq!(
             resolve_tree_link(
@@ -1031,6 +1080,14 @@ mod tests {
             None
         );
         assert_eq!(resolve_tree_link(".agents/skills/escape", "/outside"), None);
+        assert_eq!(resolve_tree_link(".agents", "."), Some(String::new()));
+        assert_eq!(
+            resolve_tree_link_chain(
+                ".agents/skills",
+                &HashMap::from([(".agents".to_string(), ".".to_string())])
+            ),
+            Some("skills".to_string())
+        );
 
         let chained = HashMap::from([
             (
