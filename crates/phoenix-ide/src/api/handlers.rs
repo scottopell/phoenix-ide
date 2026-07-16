@@ -3058,11 +3058,36 @@ async fn inspect_bash_handle(
 const REWARM_ESTIMATE_NOTICE: &str =
     "Estimated one-time input-token rewarm; actual provider cache behavior may differ.";
 
+async fn require_project_instruction_snapshot_ready(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<bool, AppError> {
+    let creation_job = state
+        .db
+        .get_conversation_creation_job_for_conversation(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if creation_job.as_ref().is_some_and(|job| {
+        !matches!(
+            job.protocol.status,
+            phoenix_core::domain::creation_protocol::CreationStatus::Ready
+        )
+    }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Project instructions are unavailable until conversation provisioning finishes",
+            "conversation_provisioning",
+        ))));
+    }
+    Ok(creation_job.is_some())
+}
+
 async fn ensure_active_project_instructions(
     state: &AppState,
     conversation_id: &str,
     cwd: &FsPath,
 ) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, AppError> {
+    let has_creation_job =
+        require_project_instruction_snapshot_ready(state, conversation_id).await?;
     if let Some(active) = state
         .db
         .load_active_project_instruction_bundle(conversation_id)
@@ -3070,6 +3095,13 @@ async fn ensure_active_project_instructions(
         .map_err(|error| AppError::Internal(error.to_string()))?
     {
         return Ok(active);
+    }
+    if has_creation_job {
+        return Err(AppError::TypedInternal {
+            message: "Conversation provisioning completed without a project-instruction snapshot"
+                .to_string(),
+            error_type: "project_instruction_snapshot_unavailable".to_string(),
+        });
     }
     let discovered = discover_project_instruction_bundle(cwd);
     state
@@ -6047,10 +6079,7 @@ fn find_literal_match(line: &str, query: &str, case_sensitive: bool) -> Option<(
     None
 }
 
-/// Discover skills available for the conversation's working directory (REQ-IR-005).
-///
-/// Calls `discover_skills()` from `system_prompt.rs` and returns each skill's
-/// name, description, and optional `argument_hint` for frontend autocomplete.
+/// Return the immutable skill catalog active for a conversation (REQ-IR-005, REQ-PI-007).
 async fn list_conversation_skills(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6061,10 +6090,22 @@ async fn list_conversation_skills(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let active =
+        ensure_active_project_instructions(&state, &id, std::path::Path::new(&conversation.cwd))
+            .await?;
 
-    let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(SkillsResponse {
-        skills: skill_entries_from_dir(&cwd, None),
+        skills: active
+            .skills
+            .into_iter()
+            .map(|skill| SkillEntry {
+                name: skill.name,
+                description: skill.description,
+                argument_hint: None,
+                source: skill.source_label,
+                path: skill.source_path,
+            })
+            .collect(),
     }))
 }
 
@@ -6105,8 +6146,7 @@ async fn list_project_skills(
 /// frontend. When `strip_prefix` is set (a `GitTree` materialization root),
 /// filesystem skill paths are rewritten relative to it so the frontend sees the
 /// ref-relative `SKILL.md` location instead of an ephemeral temp path; built-in
-/// skill paths (outside the prefix) are left absolute. Shared by the
-/// conversation-scoped and directory-scoped handlers.
+/// skill paths (outside the prefix) are left absolute.
 fn skill_entries_from_dir(
     dir: &std::path::Path,
     strip_prefix: Option<&std::path::Path>,
@@ -7466,6 +7506,205 @@ mod project_instruction_refresh_tests {
             .await
             .unwrap();
         (state, root)
+    }
+
+    fn creation_job(
+        conversation_id: &str,
+        cwd: &std::path::Path,
+    ) -> crate::db::InsertConversationCreationJob {
+        crate::db::InsertConversationCreationJob {
+            id: format!("job-{conversation_id}"),
+            conversation_id: conversation_id.to_string(),
+            message_id: Some(format!("message-{conversation_id}")),
+            intent: crate::db::ConversationCreationIntent {
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: None,
+                text: "hello".to_string(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: format!("message-{conversation_id}"),
+                images: vec![],
+                files: vec![],
+                mode: Some("direct".to_string()),
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_skills_use_active_snapshot_while_project_skills_remain_live() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root.path().join("project/.agents/skills/alpha")).unwrap();
+        let beta = root.path().join("project/.agents/skills/beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(
+            beta.join("SKILL.md"),
+            "---\nname: beta\ndescription: live beta\n---\nbody",
+        )
+        .unwrap();
+
+        let Json(conversation_skills) =
+            list_conversation_skills(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let Json(project_skills) = list_project_skills(Query(ProjectSkillsQuery {
+            cwd: root.path().join("project").to_string_lossy().into_owned(),
+            mode: None,
+            base_branch: None,
+        }))
+        .await
+        .unwrap();
+
+        assert!(conversation_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "alpha"));
+        assert!(!conversation_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "beta"));
+        assert!(project_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "beta"));
+        assert!(!project_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "alpha"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provisioning_endpoints_do_not_initialize_from_placeholder_cwd() {
+        let state = super::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let placeholder = root.path().join("placeholder");
+        let final_cwd = root.path().join("final");
+        std::fs::create_dir_all(&placeholder).unwrap();
+        std::fs::create_dir_all(final_cwd.join(".agents/skills/final-skill")).unwrap();
+        std::fs::write(
+            final_cwd.join(".agents/skills/final-skill/SKILL.md"),
+            "---\nname: final-skill\ndescription: final cwd skill\n---\nbody",
+        )
+        .unwrap();
+        state
+            .db
+            .create_conversation(
+                "provisioning-snapshot",
+                "provisioning-snapshot",
+                placeholder.to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let job = creation_job("provisioning-snapshot", &placeholder);
+        state
+            .db
+            .insert_conversation_creation_job(&job)
+            .await
+            .unwrap();
+
+        for result in [
+            get_project_instructions(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+            list_conversation_skills(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+            get_system_prompt(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+        ] {
+            match result {
+                Err(AppError::Conflict(detail)) => {
+                    assert_eq!(detail.error_type, "conversation_provisioning");
+                }
+                other => panic!("expected provisioning conflict, got {other:?}"),
+            }
+        }
+        assert!(state
+            .db
+            .load_active_project_instruction_bundle("provisioning-snapshot")
+            .await
+            .unwrap()
+            .is_none());
+
+        state
+            .db
+            .update_conversation_cwd_recovery_only(
+                "provisioning-snapshot",
+                final_cwd.to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        let claimed = state
+            .db
+            .claim_next_conversation_creation_job(
+                &phoenix_core::domain::creation_protocol::CreationWorkerId("test-worker".into()),
+                &phoenix_core::domain::creation_protocol::CreationClaimToken("test-token".into()),
+                chrono::Utc::now(),
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let crate::db::CreationClaimOutcome::Claimed(claimed) = claimed else {
+            panic!("expected claimed job");
+        };
+        let phoenix_core::domain::creation_protocol::CreationStatus::Claimed(claim) =
+            claimed.protocol.status
+        else {
+            panic!("expected claim authority");
+        };
+        let discovered = discover_project_instruction_bundle(&final_cwd);
+        state
+            .db
+            .initialize_project_instruction_bundle_if_absent("provisioning-snapshot", &discovered)
+            .await
+            .unwrap();
+        state
+            .db
+            .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let Json(skills) = list_conversation_skills(
+            State(state.clone()),
+            Path("provisioning-snapshot".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "final-skill"));
+        let active = state
+            .db
+            .load_active_project_instruction_bundle("provisioning-snapshot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(active
+            .skills
+            .iter()
+            .any(|skill| skill.name == "final-skill"));
     }
 
     #[tokio::test]

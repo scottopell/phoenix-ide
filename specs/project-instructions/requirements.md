@@ -33,6 +33,8 @@ AND SHALL NOT apply them until the user confirms **Refresh project instructions*
 
 New conversations SHALL resolve the latest applicable sources for their initial bundle.
 
+For asynchronously provisioned conversations, only the creation worker SHALL initialize the initial bundle, after it has finalized the conversation's effective working directory. While the creation job is not `Ready` — including failed, cancelled, and deletion-pending states — conversation-scoped project-instruction, system-prompt inspection, and skill-catalog endpoints SHALL return a typed unavailable/conflict response and SHALL NOT discover or persist instructions from the provisional working directory.
+
 ### REQ-PI-003 — Source Manifest
 
 WHEN the system presents a refresh candidate
@@ -84,6 +86,8 @@ THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles, 
 AND SHALL preserve the same activation boundary and source manifest.
 
 The system-prompt inspection surface SHALL render the persisted active bundle rather than rediscovering mutable filesystem sources.
+
+The conversation-scoped skill-catalog endpoint SHALL return skill metadata from the persisted active bundle rather than rediscovering mutable filesystem sources. The directory-scoped project skill endpoint used before conversation creation SHALL remain live discovery of the requested project directory.
 
 WHEN a conversation predates project-instruction snapshots
 THE SYSTEM SHALL resolve and persist its initial bundle before its next model request without dropping or rewriting conversation history.

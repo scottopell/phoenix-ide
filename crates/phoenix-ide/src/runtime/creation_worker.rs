@@ -619,6 +619,14 @@ async fn provision_conversation(
         && intent.text.trim().is_empty()
         && images.is_empty()
         && files.is_empty();
+    let discovered = crate::system_prompt::discover_project_instruction_bundle(
+        std::path::Path::new(&effective_cwd),
+    );
+    let active = manager
+        .db()
+        .initialize_project_instruction_bundle_if_absent(&job.conversation_id, &discovered)
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
     let expanded_initial_message = if seeded_empty {
         None
     } else {
@@ -631,14 +639,6 @@ async fn provision_conversation(
         } else {
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-            let discovered = crate::system_prompt::discover_project_instruction_bundle(
-                std::path::Path::new(&effective_cwd),
-            );
-            let active = manager
-                .db()
-                .initialize_project_instruction_bundle_if_absent(&job.conversation_id, &discovered)
-                .await
-                .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
             let expanded = crate::message_expander::expand_with_project_skills(
                 &intent.text,
                 &resolution_root,
