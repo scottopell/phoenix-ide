@@ -1347,31 +1347,56 @@ fn translate_to_responses_request(
             }
         }
 
-        // Emit single Message item for text + image content
-        if !text_blocks.is_empty() || !image_blocks.is_empty() {
-            let content = if image_blocks.is_empty() {
-                ResponsesApiMessageContent::Text(text_blocks.join("\n"))
-            } else {
-                let mut parts: Vec<ResponsesApiMessagePart> = text_blocks
-                    .iter()
-                    .map(|t| ResponsesApiMessagePart::InputText {
-                        text: (*t).to_string(),
-                        prompt_cache_breakpoint: None,
-                    })
-                    .collect();
-                for source in &image_blocks {
-                    let ImageSource::Base64 { media_type, data } = source;
-                    parts.push(ResponsesApiMessagePart::InputImage {
-                        image_url: format!("data:{media_type};base64,{data}"),
-                        prompt_cache_breakpoint: None,
+        // Emit a message item for text + image content. User turns are model
+        // input (input_text/input_image parts, cache-markable); assistant turns
+        // are model output and serialize as a plain string, which structurally
+        // cannot carry an input_text part.
+        match msg.role {
+            MessageRole::User => {
+                if !text_blocks.is_empty() || !image_blocks.is_empty() {
+                    let content = if image_blocks.is_empty() {
+                        InputMessageContent::Text(text_blocks.join("\n"))
+                    } else {
+                        let mut parts: Vec<InputMessagePart> = text_blocks
+                            .iter()
+                            .map(|t| InputMessagePart::InputText {
+                                text: (*t).to_string(),
+                                prompt_cache_breakpoint: None,
+                            })
+                            .collect();
+                        for source in &image_blocks {
+                            let ImageSource::Base64 { media_type, data } = source;
+                            parts.push(InputMessagePart::InputImage {
+                                image_url: format!("data:{media_type};base64,{data}"),
+                                prompt_cache_breakpoint: None,
+                            });
+                        }
+                        InputMessageContent::Parts(parts)
+                    };
+                    input_items.push(ResponsesApiInputItem::InputMessage {
+                        role: InputMessageRole::User,
+                        content,
                     });
                 }
-                ResponsesApiMessageContent::Parts(parts)
-            };
-            input_items.push(ResponsesApiInputItem::Message {
-                role: role.to_string(),
-                content,
-            });
+            }
+            MessageRole::Assistant => {
+                // Assistant content is text-only. An image on an assistant turn
+                // is not representable in the OpenAI assistant wire form —
+                // log-drop it so the capability gap is visible, not silent.
+                if !image_blocks.is_empty() {
+                    tracing::debug!(
+                        n = image_blocks.len(),
+                        "dropping images on assistant message — OpenAI assistant \
+                         content cannot carry images"
+                    );
+                }
+                if !text_blocks.is_empty() {
+                    input_items.push(ResponsesApiInputItem::AssistantMessage {
+                        role: AssistantMessageRole::Assistant,
+                        content: text_blocks.join("\n"),
+                    });
+                }
+            }
         }
 
         // Emit FunctionCall items
@@ -1512,28 +1537,36 @@ fn supports_explicit_prompt_cache(api_name: &str) -> bool {
 fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
     const READ_BREAKPOINT_LIMIT: usize = 50;
 
-    let mut messages = items.iter_mut().filter_map(|item| match item {
-        ResponsesApiInputItem::Message { role, content } => Some((role, content)),
-        ResponsesApiInputItem::AdditionalTools { .. }
-        | ResponsesApiInputItem::FunctionCall { .. }
-        | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
-    });
-    let Some(_implicit_latest_message) = messages.next_back() else {
+    // The final message of the request stays in implicit-cache mode, so it is
+    // never marked. Assistant messages are model output and cannot carry an
+    // explicit marker (their content type has no marker field), but they still
+    // count when locating that trailing implicit boundary.
+    let Some(last_message_idx) = items.iter().rposition(|item| {
+        matches!(
+            item,
+            ResponsesApiInputItem::InputMessage { .. }
+                | ResponsesApiInputItem::AssistantMessage { .. }
+        )
+    }) else {
         return;
     };
-    // An explicit cache marker turns text content into an `input_text` part, a
-    // discriminant valid only on input-role messages; the Responses API rejects
-    // it on an assistant message, whose parts must be `output_text`/`refusal`.
-    // Assistant turns are model output — filter them out *before* the limit so
-    // they don't consume read-marker budget, leaving the full limit for
-    // markable input-role history in a long alternating conversation.
-    for (_role, content) in messages
+
+    // Mark input-role messages newest-first, up to the read limit. Assistant
+    // messages are structurally excluded here, so they never consume read-marker
+    // budget — the full limit stays available for markable input-role history in
+    // a long alternating conversation.
+    items[..last_message_idx]
+        .iter_mut()
         .rev()
-        .filter(|(role, _)| role.as_str() != "assistant")
+        .filter_map(|item| match item {
+            ResponsesApiInputItem::InputMessage { content, .. } => Some(content),
+            ResponsesApiInputItem::AssistantMessage { .. }
+            | ResponsesApiInputItem::AdditionalTools { .. }
+            | ResponsesApiInputItem::FunctionCall { .. }
+            | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
+        })
         .take(READ_BREAKPOINT_LIMIT)
-    {
-        content.mark_last_block();
-    }
+        .for_each(InputMessageContent::mark_last_block);
 }
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
@@ -1812,9 +1845,9 @@ impl CodexResponsesLiteRequest {
             role: "developer".to_string(),
             tools,
         });
-        input.push(ResponsesApiInputItem::Message {
-            role: "developer".to_string(),
-            content: ResponsesApiMessageContent::Parts(vec![ResponsesApiMessagePart::InputText {
+        input.push(ResponsesApiInputItem::InputMessage {
+            role: InputMessageRole::Developer,
+            content: InputMessageContent::Parts(vec![InputMessagePart::InputText {
                 text: instructions,
                 prompt_cache_breakpoint: None,
             }]),
@@ -1932,10 +1965,27 @@ pub(crate) enum ResponsesApiInputItem {
         role: String,
         tools: Vec<ResponsesApiTool>,
     },
+    /// A model-*input* message (user or developer). Its content parts use the
+    /// `input_text`/`input_image` discriminants and are the only messages that
+    /// may carry an explicit prompt-cache breakpoint.
     #[serde(rename = "message")]
-    Message {
-        role: String,
-        content: ResponsesApiMessageContent,
+    InputMessage {
+        role: InputMessageRole,
+        content: InputMessageContent,
+    },
+    /// A replayed assistant turn — model *output* fed back as input. The
+    /// Responses API requires assistant content parts to be
+    /// `output_text`/`refusal` and rejects an `input_text` part; a plain string
+    /// is the always-valid form and the only shape this translator produces
+    /// (assistant turns are text-only — tool calls become `FunctionCall` items
+    /// and images never occur on model output). Modeling the content as a bare
+    /// `String` makes an assistant `input_text` part unrepresentable, and the
+    /// absence of a cache-marker field makes marking one structurally
+    /// impossible.
+    #[serde(rename = "message")]
+    AssistantMessage {
+        role: AssistantMessageRole,
+        content: String,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -1950,19 +2000,37 @@ pub(crate) enum ResponsesApiInputItem {
     },
 }
 
-/// Message content: plain string when text-only, array of parts when images present
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub(crate) enum ResponsesApiMessageContent {
-    Text(String),
-    Parts(Vec<ResponsesApiMessagePart>),
+/// Roles whose message content is model input. `input_text`/`input_image` parts
+/// and explicit cache breakpoints are valid only for these roles.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputMessageRole {
+    User,
+    Developer,
 }
 
-impl ResponsesApiMessageContent {
+/// The assistant role as a single-variant enum: an assistant message's role is
+/// fixed by construction and cannot be set to an input role.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssistantMessageRole {
+    Assistant,
+}
+
+/// Input-role message content: a plain string when text-only, or an array of
+/// parts when images are present or an explicit cache breakpoint is placed.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum InputMessageContent {
+    Text(String),
+    Parts(Vec<InputMessagePart>),
+}
+
+impl InputMessageContent {
     fn mark_last_block(&mut self) {
         match self {
             Self::Text(text) => {
-                *self = Self::Parts(vec![ResponsesApiMessagePart::InputText {
+                *self = Self::Parts(vec![InputMessagePart::InputText {
                     text: std::mem::take(text),
                     prompt_cache_breakpoint: Some(PromptCacheBreakpoint::explicit()),
                 }]);
@@ -1978,7 +2046,7 @@ impl ResponsesApiMessageContent {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponsesApiMessagePart {
+pub(crate) enum InputMessagePart {
     InputText {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1991,7 +2059,7 @@ pub(crate) enum ResponsesApiMessagePart {
     }, // "data:{media_type};base64,{data}"
 }
 
-impl ResponsesApiMessagePart {
+impl InputMessagePart {
     fn set_breakpoint(&mut self) {
         match self {
             Self::InputText {
@@ -2942,6 +3010,16 @@ mod tests {
             earlier_user_marked,
             "explicit cache pass should still mark the earlier user message"
         );
+
+        // Positively assert the replayed assistant turn's wire shape so the
+        // assistant checks above cannot pass vacuously: it must be a message
+        // item with role "assistant" and plain-string content.
+        let assistant = input
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .expect("replayed assistant turn present in input");
+        assert_eq!(assistant["type"], "message");
+        assert_eq!(assistant["content"], "prior answer");
     }
 
     #[tokio::test]

@@ -10,8 +10,8 @@
 
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
-    self, ResponsesApiFunctionOutput, ResponsesApiFunctionOutputPart, ResponsesApiInputItem,
-    ResponsesApiMessageContent, ResponsesApiMessagePart,
+    self, InputMessageContent, InputMessagePart, ResponsesApiFunctionOutput,
+    ResponsesApiFunctionOutputPart, ResponsesApiInputItem,
 };
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole, ToolReference,
@@ -327,7 +327,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
 
 proptest! {
 
-    /// H1 — Text-only user message → ResponsesApiMessageContent::Text
+    /// H1 — Text-only user message → InputMessageContent::Text
     #[test]
     fn prop_responses_text_only_message_is_string(
         text in "[a-zA-Z0-9 _.!?,]{1,100}",
@@ -340,13 +340,13 @@ proptest! {
         let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
-        if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
+        if let ResponsesApiInputItem::InputMessage { content, .. } = &responses_req.input[0] {
             prop_assert!(
-                matches!(content, ResponsesApiMessageContent::Text(_)),
+                matches!(content, InputMessageContent::Text(_)),
                 "Expected Text content for text-only message"
             );
         } else {
-            prop_assert!(false, "Expected Message item");
+            prop_assert!(false, "Expected InputMessage item");
         }
     }
 
@@ -373,11 +373,11 @@ proptest! {
         let responses_req = openai::test_helpers::translate_to_responses_request("gpt-5.5", &req);
 
         prop_assert_eq!(responses_req.input.len(), 1);
-        if let ResponsesApiInputItem::Message { content, .. } = &responses_req.input[0] {
-            if let ResponsesApiMessageContent::Parts(parts) = content {
+        if let ResponsesApiInputItem::InputMessage { content, .. } = &responses_req.input[0] {
+            if let InputMessageContent::Parts(parts) = content {
                 let expected_url = format!("data:{media_type};base64,{data}");
                 let has_image = parts.iter().any(|p| {
-                    matches!(p, ResponsesApiMessagePart::InputImage { image_url, .. }
+                    matches!(p, InputMessagePart::InputImage { image_url, .. }
                         if image_url == &expected_url)
                 });
                 prop_assert!(has_image, "Parts must contain InputImage with correct data URL");
@@ -385,7 +385,7 @@ proptest! {
                 prop_assert!(false, "Expected Parts content for message with image");
             }
         } else {
-            prop_assert!(false, "Expected Message item");
+            prop_assert!(false, "Expected InputMessage item");
         }
     }
 
