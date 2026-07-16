@@ -2256,10 +2256,17 @@ CREATE TABLE creation_shadow_creation_evidence (
 );
 
 INSERT INTO creation_shadow_creation_evidence (creation_job_id, cwd, attachment_count, creation_kind, accepted_at)
-SELECT j.id, c.cwd,
-       (SELECT COUNT(*) FROM conversation_creation_job_files f WHERE f.job_id = j.id)
-       + (SELECT COUNT(*) FROM conversation_creation_job_images i WHERE i.job_id = j.id),
-       CASE WHEN j.message_id IS NULL THEN 'seeded_empty' ELSE 'initial_turn' END,
+SELECT j.id, COALESCE(NULLIF(json_extract(j.intent_json, '$.cwd'), ''), c.cwd),
+       COALESCE(json_array_length(json_extract(j.intent_json, '$.files')),
+                (SELECT COUNT(*) FROM conversation_creation_job_files f WHERE f.job_id = j.id), 0)
+       + COALESCE(json_array_length(json_extract(j.intent_json, '$.images')),
+                  (SELECT COUNT(*) FROM conversation_creation_job_images i WHERE i.job_id = j.id), 0),
+       CASE WHEN (json_extract(j.intent_json, '$.seed_parent_id') IS NOT NULL
+                       OR json_extract(j.intent_json, '$.seed_label') IS NOT NULL)
+                      AND trim(COALESCE(json_extract(j.intent_json, '$.text'), '')) = ''
+                      AND COALESCE(json_array_length(json_extract(j.intent_json, '$.files')), 0) = 0
+                      AND COALESCE(json_array_length(json_extract(j.intent_json, '$.images')), 0) = 0
+            THEN 'seeded_empty' ELSE 'initial_turn' END,
        j.accepted_at
 FROM conversation_creation_jobs j
 JOIN conversations c ON c.id = j.conversation_id;
