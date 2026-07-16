@@ -330,32 +330,34 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
     };
 
     let tree = tree_index(repo_root, reference);
-    for rel_path in tree.keys().filter(|path| is_skill_metadata_path(path)) {
-        copy_tree_blob(repo_root, reference, rel_path, temp.path(), rel_path);
-    }
-
     let symlinks = read_symlink_targets(repo_root, &tree);
-    for link_path in symlinks.keys().filter(|path| is_skill_directory_link(path)) {
-        let Some(target_root) = resolve_tree_link_chain(link_path, &symlinks) else {
+    let mut catalog_roots = vec![".claude/skills".to_string(), ".agents/skills".to_string()];
+    catalog_roots.extend(tree.keys().filter_map(|path| {
+        let top = validated_tree_components(path)?.first()?.to_string();
+        Some(format!("{top}/.claude/skills"))
+    }));
+    catalog_roots.extend(tree.keys().filter_map(|path| {
+        let top = validated_tree_components(path)?.first()?.to_string();
+        Some(format!("{top}/.agents/skills"))
+    }));
+    catalog_roots.sort();
+    catalog_roots.dedup();
+
+    let mut visited = HashSet::new();
+    for logical_root in catalog_roots {
+        let Some(physical_root) = resolve_tree_link_chain(&logical_root, &symlinks) else {
             continue;
         };
-        let target_prefix = format!("{target_root}/");
-        for target_path in tree.keys().filter(|path| {
-            path.strip_prefix(&target_prefix)
-                .is_some_and(is_relative_skill_metadata_path)
-        }) {
-            let Some(suffix) = target_path.strip_prefix(&target_prefix) else {
-                continue;
-            };
-            let logical_path = format!("{link_path}/{suffix}");
-            copy_tree_blob(
-                repo_root,
-                reference,
-                target_path,
-                temp.path(),
-                &logical_path,
-            );
-        }
+        materialize_skill_catalog(
+            repo_root,
+            reference,
+            &tree,
+            &symlinks,
+            temp.path(),
+            &logical_root,
+            &physical_root,
+            &mut visited,
+        );
     }
 
     SkillsView {
@@ -364,18 +366,67 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
     }
 }
 
-fn is_skill_metadata_path(path: &str) -> bool {
-    let Some(components) = validated_tree_components(path) else {
-        return false;
-    };
-    components.last() == Some(&"SKILL.md")
-        && components
-            .windows(2)
-            .any(|parts| matches!(parts[0], ".claude" | ".agents") && parts[1] == "skills")
+#[allow(clippy::too_many_arguments)]
+fn materialize_skill_catalog(
+    repo_root: &Path,
+    reference: &str,
+    tree: &HashMap<String, TreeEntry>,
+    symlinks: &HashMap<String, String>,
+    destination_root: &Path,
+    logical_root: &str,
+    physical_root: &str,
+    visited: &mut HashSet<(String, String)>,
+) {
+    if !visited.insert((logical_root.to_string(), physical_root.to_string())) {
+        return;
+    }
+    for child in tree_children(tree, physical_root) {
+        let logical_skill = format!("{logical_root}/{child}");
+        let physical_skill = format!("{physical_root}/{child}");
+        let Some(physical_skill) = resolve_tree_link_chain(&physical_skill, symlinks) else {
+            continue;
+        };
+        let metadata = format!("{physical_skill}/SKILL.md");
+        let Some(metadata) = resolve_tree_link_chain(&metadata, symlinks) else {
+            continue;
+        };
+        if tree.get(&metadata).is_some_and(|entry| !entry.symlink) {
+            copy_tree_blob(
+                repo_root,
+                reference,
+                &metadata,
+                destination_root,
+                &format!("{logical_skill}/SKILL.md"),
+            );
+            let logical_children = format!("{logical_skill}/skills");
+            let physical_children = format!("{physical_skill}/skills");
+            if let Some(physical_children) = resolve_tree_link_chain(&physical_children, symlinks) {
+                materialize_skill_catalog(
+                    repo_root,
+                    reference,
+                    tree,
+                    symlinks,
+                    destination_root,
+                    &logical_children,
+                    &physical_children,
+                    visited,
+                );
+            }
+        }
+    }
 }
 
-fn is_relative_skill_metadata_path(path: &str) -> bool {
-    path == "SKILL.md" || path.ends_with("/SKILL.md")
+fn tree_children(tree: &HashMap<String, TreeEntry>, directory: &str) -> Vec<String> {
+    let prefix = format!("{directory}/");
+    let mut children: Vec<String> = tree
+        .keys()
+        .filter_map(|path| path.strip_prefix(&prefix)?.split('/').next())
+        .filter(|child| !child.is_empty())
+        .map(str::to_string)
+        .collect();
+    children.sort();
+    children.dedup();
+    children
 }
 
 fn copy_tree_blob(
@@ -526,21 +577,6 @@ fn safe_tree_destination(root: &Path, path: &str) -> Option<PathBuf> {
         destination.push(component);
     }
     Some(destination)
-}
-
-fn is_skill_directory_link(path: &str) -> bool {
-    let Some(components) = validated_tree_components(path) else {
-        return false;
-    };
-    components.windows(2).enumerate().any(|(index, parts)| {
-        index + 2 == components.len()
-            && matches!(parts[0], ".claude" | ".agents")
-            && parts[1] == "skills"
-    }) || components.windows(3).enumerate().any(|(index, parts)| {
-        index + 3 == components.len()
-            && matches!(parts[0], ".claude" | ".agents")
-            && parts[1] == "skills"
-    })
 }
 
 fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) -> Option<String> {
@@ -831,6 +867,30 @@ mod tests {
         );
     }
 
+    fn symlink_dir(target: &str, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    fn assert_tree_skills_match_checkout(repo: &Path, expected: &str) {
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo)
+            .into_iter()
+            .filter(|skill| skill.name == expected)
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo, "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name == expected)
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(tree_names, [expected]);
+    }
+
     #[test]
     fn git_tree_skills_view_matches_checkout_for_repo_relative_symlinked_skill() {
         let repo = TempDir::new().unwrap();
@@ -921,6 +981,43 @@ mod tests {
     }
 
     #[test]
+    fn git_tree_skills_view_follows_symlinked_entries_under_catalog_link() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("catalog")).unwrap();
+        std::fs::create_dir_all(repo.path().join("real/review")).unwrap();
+        std::fs::write(
+            repo.path().join("real/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("../catalog", &repo.path().join(".agents/skills"));
+        symlink_dir("../real/review", &repo.path().join("catalog/review"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_follows_symlinked_catalog_parent() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("agent-config/skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("agent-config/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("agent-config", &repo.path().join(".agents"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
     fn tree_link_resolution_rejects_paths_outside_committed_tree() {
         assert_eq!(
             resolve_tree_link(
@@ -967,16 +1064,6 @@ mod tests {
             resolve_tree_link_chain(".agents/skills/a", &intermediate_cycle),
             None
         );
-    }
-
-    #[test]
-    fn skill_directory_links_include_catalog_roots_and_entries() {
-        assert!(is_skill_directory_link(".agents/skills"));
-        assert!(is_skill_directory_link("service/.claude/skills"));
-        assert!(is_skill_directory_link(".agents/skills/review"));
-        assert!(is_skill_directory_link("service/.claude/skills/review"));
-        assert!(!is_skill_directory_link("skills/review"));
-        assert!(!is_skill_directory_link(".agents/skills/review/nested"));
     }
 
     #[test]
