@@ -55,7 +55,7 @@ Extend the transactional production deployment foundation from native macOS laun
 
 - Support `prod deploy`, `prod deploy --release TAG`, and `prod deploy --release latest` on all three backends.
 - Make status report backend runtime identity plus the shared durable transaction result.
-- Make `prod set`/`prod unset` edit `.phoenix-ide.env` atomically or remove those commands with direct migration guidance; do not retain separate launchd/systemd override stores as modern sources of truth.
+- Remove configuration mutation from `prod set`/`prod unset`; keep them only as rejection paths with direct guidance to edit `.phoenix-ide.env`. Do not retain separate launchd/systemd override stores as modern sources of truth.
 - Keep stop backend-owned and transaction-aware.
 
 ### 6. Prove each ownership boundary with disposable tests
