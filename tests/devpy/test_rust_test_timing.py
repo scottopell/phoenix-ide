@@ -1,4 +1,6 @@
 import importlib.util
+import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,11 +13,13 @@ def load_checker():
         "rust_test_timing_under_test", ROOT / "scripts" / "check_rust_test_timing.py"
     )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
+@unittest.skipUnless(shutil.which("ast-grep"), "ast-grep is not installed")
 class RustTestTimingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -90,42 +94,61 @@ class RustTestTimingTests(unittest.TestCase):
         )
         self.assertEqual(1, len(diagnostics))
 
-    def test_changed_line_filter_blocks_only_new_debt(self):
-        source = """
+    def test_semantic_diff_detects_context_only_changes(self):
+        finding = self.checker.Finding(
+            key=("fixture.rs", "rx.recv().await"),
+            diagnostic="current",
+        )
+        self.assertEqual([finding], self.checker._introduced([finding], []))
+        self.assertEqual([], self.checker._introduced([finding], [finding]))
+
+    def test_semantic_diff_detects_removed_timeout_wrapper(self):
+        unbounded = self.checker.Finding(
+            key=("fixture.rs", "rx.recv().await"),
+            diagnostic="timeout removed",
+        )
+        self.assertEqual([unbounded], self.checker._introduced([unbounded], []))
+
+    def test_semantic_diff_does_not_reflag_unchanged_legacy_finding(self):
+        finding = self.checker.Finding(
+            key=("fixture.rs", "rx.recv().await"),
+            diagnostic="line number may differ",
+        )
+        baseline = self.checker.Finding(key=finding.key, diagnostic="old location")
+        self.assertEqual([], self.checker._introduced([finding], [baseline]))
+
+    def test_imported_sleep_and_test_only_helpers_are_flagged(self):
+        diagnostics = self.check(
+            """
+            use tokio::time::{sleep, Duration};
+            #[cfg(test)]
+            async fn helper() { sleep(Duration::from_millis(10)).await; }
+            """
+        )
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("sleep", diagnostics[0].diagnostic)
+
+    def test_cfg_any_test_scope_is_flagged(self):
+        diagnostics = self.check(
+            """
+            #[cfg(any(test, feature = "test-support"))]
+            async fn helper() { done.notified().await; }
+            """
+        )
+        self.assertEqual(1, len(diagnostics))
+
+    def test_exemption_does_not_suppress_unbounded_event_wait(self):
+        diagnostics = self.check(
+            """
             #[tokio::test]
-            async fn two_smells() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            async fn event_wait() {
+                // test-timing-allow: event delivery is intentionally delayed
                 rx.recv().await;
             }
-        """
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            path = Path(directory) / "fixture.rs"
-            path.write_text(source)
-            relative = str(path.relative_to(ROOT))
-            diagnostics = self.checker.findings(
-                [str(path)], changed_lines={relative: {5}}
-            )
+            """
+        )
         self.assertEqual(1, len(diagnostics))
-        self.assertIn("recv", diagnostics[0])
-
-    def test_changed_continuation_line_flags_multiline_smell(self):
-        source = """
-            #[tokio::test]
-            async fn multiline_smell() {
-                tokio::time::sleep(
-                    Duration::from_millis(10),
-                ).await;
-            }
-        """
-        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            path = Path(directory) / "fixture.rs"
-            path.write_text(source)
-            relative = str(path.relative_to(ROOT))
-            diagnostics = self.checker.findings(
-                [str(path)], changed_lines={relative: {5}}
-            )
-        self.assertEqual(1, len(diagnostics))
-        self.assertIn("sleep", diagnostics[0])
+        self.assertIn("tokio::time::timeout", diagnostics[0].diagnostic)
 
 
 if __name__ == "__main__":

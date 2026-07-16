@@ -117,6 +117,19 @@ class CheckPlanTests(unittest.TestCase):
             run.call_args_list[0].args[0],
         )
 
+    def test_rust_timing_checker_change_runs_structural_and_self_tests(self):
+        cats = self.dev._categorize_changed_paths({"scripts/check_rust_test_timing.py"})
+        self.assertIn("ASTGREP", cats)
+        self.assertIn("SPECS", cats)
+        active, _ = self.dev._gate_lanes()
+        with mock.patch.object(
+            self.dev, "_changed_paths_vs_base",
+            return_value={"scripts/check_rust_test_timing.py"},
+        ):
+            active, _ = self.dev._gate_lanes()
+        self.assertIn("ast-grep", active)
+        self.assertIn("spec-shape", active)
+
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
         with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \

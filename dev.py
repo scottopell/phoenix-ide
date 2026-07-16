@@ -3102,6 +3102,8 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p.startswith("tests/devpy/"):
             cats.add("SPECS")
+        if p == "scripts/check_rust_test_timing.py":
+            cats.update({"ASTGREP", "SPECS"})
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -4115,15 +4117,17 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             "ast-grep", "scan", "--inline-rules", inline_rules,
             "crates/", "ui/src/",
         ])
-        comparison_commit = _resolve_check_merge_base()
-        if os.environ.get("PHOENIX_CHECK_ALL") == "1" and _on_integration_base():
-            comparison_commit = "HEAD^"
+        comparison_commit = "HEAD^" if _on_integration_base() else _resolve_check_merge_base()
         if comparison_commit is None:
-            raise RuntimeError("cannot resolve comparison commit for Rust test timing lint")
-        timing_command = [
-            "uv", "run", "scripts/check_rust_test_timing.py",
-            "--base-sha", comparison_commit, "crates/",
-        ]
+            timing_command = [
+                sys.executable, "-c",
+                "import sys; print('cannot resolve comparison commit for Rust test timing lint', file=sys.stderr); sys.exit(1)",
+            ]
+        else:
+            timing_command = [
+                "uv", "run", "scripts/check_rust_test_timing.py",
+                "--base-sha", comparison_commit, "crates/",
+            ]
         run_step("rust-test-timing", timing_command)
 
     def check_allium():
