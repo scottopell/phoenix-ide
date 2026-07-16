@@ -545,6 +545,7 @@ pub fn create_router(state: AppState) -> Router {
                             )
                         } else {
                             tracing::info_span!(
+                                target: "phoenix_ide::otel",
                                 "http",
                                 otel.kind = "server",
                                 method = %request.method(),

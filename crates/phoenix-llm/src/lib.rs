@@ -224,7 +224,12 @@ impl LoggingService {
     /// resolves.
     fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
         let telemetry = request.telemetry.as_ref();
+        let generated_request_id = format!("llm-{}", rand::random::<u64>());
+        let request_id = telemetry.map_or(generated_request_id.as_str(), |value| {
+            value.request_id.as_str()
+        });
         tracing::info_span!(
+            target: "phoenix_llm::otel",
             "llm.request",
             otel.kind = "client",
             otel.name = %self.model_id,
@@ -233,9 +238,9 @@ impl LoggingService {
             provider = self.provider,
             transport = self.transport,
             streaming,
-            conv_id = telemetry.map_or("", |value| value.conversation_id.as_str()),
-            root_conv_id = telemetry.map_or("", |value| value.root_conversation_id.as_str()),
-            request_id = telemetry.map_or("", |value| value.request_id.as_str()),
+            conv_id = telemetry.map(|value| value.conversation_id.as_str()),
+            root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
+            request_id,
             retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,

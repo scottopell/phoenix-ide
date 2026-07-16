@@ -832,6 +832,7 @@ where
     // (`success = false`) is an application result, not a span error — only
     // unknown-tool dispatch marks the span as an error.
     let span = tracing::info_span!(
+        target: "phoenix_ide::otel",
         "tool.execute",
         otel.name = %tool_name,
         otel.status_code = tracing::field::Empty,
@@ -4183,6 +4184,7 @@ where
             return span.clone();
         }
         let span = tracing::info_span!(
+            target: "phoenix_ide::otel",
             "conversation.turn",
             conv_id = %self.context.conversation_id,
             root_conv_id = %self.context.root_conversation_id,

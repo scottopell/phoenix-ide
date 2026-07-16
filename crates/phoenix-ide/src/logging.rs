@@ -152,10 +152,15 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
     })
 }
 
-const OTEL_SPAN_NAMES: &[&str] = &["http", "conversation.turn", "llm.request", "tool.execute"];
+const OTEL_SPANS: &[(&str, &str)] = &[
+    ("phoenix_ide::otel", "http"),
+    ("phoenix_ide::otel", "conversation.turn"),
+    ("phoenix_ide::otel", "tool.execute"),
+    ("phoenix_llm::otel", "llm.request"),
+];
 
 fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
-    meta.is_span() && OTEL_SPAN_NAMES.contains(&meta.name())
+    meta.is_span() && OTEL_SPANS.contains(&(meta.target(), meta.name()))
 }
 
 fn phoenix_span_limits() -> SpanLimits {
@@ -415,13 +420,48 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
-            let llm = tracing::info_span!("llm.request", model = "gpt-test");
+            let llm = tracing::info_span!(
+                target: "phoenix_llm::otel",
+                "llm.request",
+                model = "gpt-test",
+                provider = "openai",
+                transport = "http_sse",
+                request_id = "request-123",
+                conv_id = "conversation-123",
+                retry_attempt = 2_u64,
+            );
             let _guard = llm.enter();
             tracing::debug!(target: "tokio_tungstenite", frame = "PAYLOAD_SENTINEL", "frame");
             tracing::info!(delta = "DELTA_SENTINEL", "response delta");
             let dependency =
                 tracing::debug_span!(target: "sqlx::query", "query", sql = "SELECT secret");
             drop(dependency);
+            let http_collision = tracing::info_span!(
+                target: "reqwest::otel",
+                "http",
+                authorization = "Bearer HTTP_COLLISION_SENTINEL"
+            );
+            let turn_collision = tracing::info_span!(
+                target: "foreign_runtime",
+                "conversation.turn",
+                payload = "TURN_COLLISION_SENTINEL"
+            );
+            let llm_collision = tracing::info_span!(
+                target: "foreign_llm",
+                "llm.request",
+                payload = "LLM_COLLISION_SENTINEL"
+            );
+            let tool_collision = tracing::info_span!(
+                target: "foreign_tools",
+                "tool.execute",
+                payload = "TOOL_COLLISION_SENTINEL"
+            );
+            drop((
+                http_collision,
+                turn_collision,
+                llm_collision,
+                tool_collision,
+            ));
         });
         provider.force_flush().expect("flush spans");
 
@@ -429,12 +469,29 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "llm.request");
         assert!(spans[0].events.is_empty());
+        let attributes = format!("{:?}", spans[0].attributes);
+        for required in [
+            "gpt-test",
+            "openai",
+            "http_sse",
+            "request-123",
+            "conversation-123",
+        ] {
+            assert!(
+                attributes.contains(required),
+                "missing attribute {required}"
+            );
+        }
         let encoded = format!("{spans:?}");
         for forbidden in [
             "PAYLOAD_SENTINEL",
             "DELTA_SENTINEL",
             "SELECT secret",
             "authorization",
+            "HTTP_COLLISION_SENTINEL",
+            "TURN_COLLISION_SENTINEL",
+            "LLM_COLLISION_SENTINEL",
+            "TOOL_COLLISION_SENTINEL",
         ] {
             assert!(!encoded.contains(forbidden), "export contained {forbidden}");
         }

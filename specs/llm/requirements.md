@@ -170,7 +170,7 @@ THE SYSTEM SHALL compute total as input + output + cache tokens
 ### REQ-LLM-008: Request Observability
 
 WHEN an LLM request executes
-THE SYSTEM SHALL emit bounded structured telemetry containing model, provider, transport, duration, token counts, retry attempt, request identifier, conversation identifier, and classified failure reason when applicable
+THE SYSTEM SHALL emit bounded structured telemetry containing model, provider, transport, duration, token counts, retry attempt, a request identifier, conversation identifiers when conversation context exists, and classified failure reason when applicable
 AND SHALL keep human-readable log filtering independent from exported trace filtering
 
 WHEN traces are exported
