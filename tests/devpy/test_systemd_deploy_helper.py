@@ -6,6 +6,7 @@ import pwd
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +55,7 @@ class SystemdManifestValidationTests(unittest.TestCase):
             status_path=self.base / "status.json",
             active_path=self.base / "active",
             activation_lock_path=self.base / "activation.lock",
+            claim_lock_path=self.base / "claim.lock",
         )
         self.manifest_path = self.transaction / "manifest.json"
         self.raw = self.make_manifest()
@@ -97,6 +99,7 @@ class SystemdManifestValidationTests(unittest.TestCase):
             "status_path": str(self.base / "status.json"),
             "active_path": str(self.base / "active"),
             "activation_lock_path": str(self.base / "activation.lock"),
+            "claim_lock_path": str(self.base / "claim.lock"),
             "previous_deployed_sha": None,
             "created_at": "2026-07-15T00:00:00+00:00",
         }
@@ -172,6 +175,164 @@ class SystemdManifestValidationTests(unittest.TestCase):
         self.write_manifest()
         with self.assertRaisesRegex(helper.ValidationError, "must not be root"):
             self.validate()
+
+
+class FakeSystemctl:
+    def __init__(self, manifest, previous_state, *, start_failure=None):
+        self.manifest = manifest
+        self.previous_state = previous_state
+        self.disruption_started = False
+        self.start_failure = start_failure
+        self.events = []
+
+    def verify_units(self, service, socket):
+        self.events.append("verify")
+
+    def inspect(self):
+        self.events.append("inspect")
+        return self.previous_state
+
+    def stop(self):
+        self.events.append("stop")
+        self.disruption_started = True
+
+    def daemon_reload(self):
+        self.events.append("reload")
+
+    def start_candidate(self, old_pid):
+        self.events.append(("start_candidate", old_pid))
+        if self.start_failure:
+            raise helper.ActivationError(self.start_failure)
+        return old_pid + 1
+
+    def restore_state(self, previous):
+        self.events.append(("restore_state", previous))
+        return 99
+
+
+class SystemdActivationTests(SystemdManifestValidationTests):
+    def install_previous(self):
+        for target, content in (
+            (self.targets.binary, "old binary"),
+            (self.targets.service, "old service"),
+            (self.targets.socket, "old socket"),
+            (self.targets.environment, "OLD=value"),
+        ):
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        Path(self.targets.deployed_sha).write_text("a" * 40 + "\n")
+        self.raw["previous"] = {"version": "1.0.0", "git_sha": "a" * 12}
+        self.raw["previous_health_url"] = "http://127.0.0.1:49151/api/version"
+        self.raw["previous_deployed_sha"] = "a" * 40
+        for name, target in (
+            ("binary", self.targets.binary),
+            ("service", self.targets.service),
+            ("socket", self.targets.socket),
+            ("environment", self.targets.environment),
+        ):
+            self.raw["rollback"][name] = self.artifact(f"rollback-{name}", Path(target).read_text())
+        self.write_manifest()
+
+    def manifest(self):
+        return helper.Manifest.load(self.manifest_path)
+
+    def test_success_atomically_installs_candidate_and_commits(self):
+        self.install_previous()
+        manifest = self.manifest()
+        previous_state = helper.UnitState(True, True, True, True, 41)
+        controller = FakeSystemctl(manifest, previous_state)
+        with mock.patch.object(helper, "wait_for_identity") as verify:
+            state = helper.activate(manifest, controller)
+        self.assertEqual("committed", state)
+        self.assertEqual("binary", Path(self.targets.binary).read_text())
+        self.assertEqual("service", Path(self.targets.service).read_text())
+        self.assertEqual("socket", Path(self.targets.socket).read_text())
+        self.assertEqual("SECRET=value", Path(self.targets.environment).read_text())
+        self.assertEqual(pwd.getpwnam(manifest.service_user).pw_gid, Path(self.targets.environment).stat().st_gid)
+        self.assertEqual(0o640, Path(self.targets.environment).stat().st_mode & 0o777)
+        self.assertEqual("b" * 40, Path(self.targets.deployed_sha).read_text().strip())
+        self.assertEqual("committed", json.loads(self.policy.status_path.read_text())["state"])
+        verify.assert_called_once_with(manifest, manifest.expected, manifest.expected_health_url)
+        self.assertEqual(["verify", "inspect", "stop", "reload", ("start_candidate", 41)], controller.events)
+
+    def test_identity_failure_restores_previous_artifacts_and_state(self):
+        self.install_previous()
+        manifest = self.manifest()
+        previous_state = helper.UnitState(True, False, True, True, 41)
+        controller = FakeSystemctl(manifest, previous_state)
+        calls = iter([helper.ActivationError("wrong identity"), None])
+
+        def verify(*_args):
+            outcome = next(calls)
+            if outcome:
+                raise outcome
+
+        with mock.patch.object(helper, "wait_for_identity", side_effect=verify):
+            state = helper.activate(manifest, controller)
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertEqual("old binary", Path(self.targets.binary).read_text())
+        self.assertEqual("old service", Path(self.targets.service).read_text())
+        self.assertEqual("old socket", Path(self.targets.socket).read_text())
+        self.assertEqual("OLD=value", Path(self.targets.environment).read_text())
+        self.assertEqual("a" * 40, Path(self.targets.deployed_sha).read_text().strip())
+        status = json.loads(self.policy.status_path.read_text())
+        self.assertEqual("activation_failed_rolled_back", status["state"])
+        self.assertEqual("wrong identity", status["failure"])
+        self.assertIn(("restore_state", previous_state), controller.events)
+
+    def test_preparation_failure_does_not_stop_service(self):
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        controller.verify_units = mock.Mock(side_effect=helper.ActivationError("bad unit"))
+        with self.assertRaisesRegex(helper.ActivationError, "bad unit"):
+            helper.activate(manifest, controller)
+        self.assertNotIn("stop", controller.events)
+        self.assertEqual("precondition_failed", json.loads(self.policy.status_path.read_text())["state"])
+
+    def test_partial_reservation_failure_cleans_temporary_files_before_disruption(self):
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        original = helper.prepare_atomic_install
+        calls = 0
+
+        def fail_after_first(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("ENOSPC")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(helper, "prepare_atomic_install", side_effect=fail_after_first):
+            with self.assertRaisesRegex(OSError, "ENOSPC"):
+                helper.activate(manifest, controller)
+        self.assertNotIn("stop", controller.events)
+        self.assertEqual([], list(Path(self.targets.binary).parent.glob(".*.install-*")))
+        self.assertEqual("precondition_failed", json.loads(self.policy.status_path.read_text())["state"])
+
+    def test_concurrent_activation_does_not_replace_active_status_or_claim(self):
+        manifest = self.manifest()
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
+        helper.write_status(manifest, "activating")
+        before = self.policy.status_path.read_bytes()
+        with self.policy.activation_lock_path.open("a+") as lock:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(helper.ConcurrentDeploy):
+                helper.activate(manifest, FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41)))
+        self.assertEqual(before, self.policy.status_path.read_bytes())
+        self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
+
+    def test_claim_release_requires_matching_terminal_status(self):
+        manifest = self.manifest()
+        self.policy.active_path.write_text("newer-transaction\n")
+        helper.write_status(manifest, "committed")
+        self.assertFalse(helper.release_claim(manifest))
+        self.assertTrue(self.policy.active_path.exists())
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
+        self.assertTrue(helper.release_claim(manifest))
+        self.assertFalse(self.policy.active_path.exists())
 
 
 if __name__ == "__main__":

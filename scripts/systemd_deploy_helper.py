@@ -5,13 +5,22 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
 import pwd
 import re
+import shutil
+import ssl
+import subprocess
+import tempfile
+import time
 import stat
+import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -100,8 +109,11 @@ class Manifest:
     status_path: str
     active_path: str
     activation_lock_path: str
+    claim_lock_path: str
     previous_deployed_sha: Optional[str]
     created_at: str
+    transition_timeout_secs: float = 30.0
+    health_timeout_secs: float = 30.0
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -133,6 +145,7 @@ class ValidationPolicy:
     status_path: Path
     active_path: Path
     activation_lock_path: Path
+    claim_lock_path: Path
     owner_uid: int = 0
     maximum_mode: int = 0o700
 
@@ -151,6 +164,7 @@ class ValidationPolicy:
             status_path=PRODUCTION_TRANSACTION_ROOT.parent / "status.json",
             active_path=PRODUCTION_TRANSACTION_ROOT.parent / "active",
             activation_lock_path=PRODUCTION_TRANSACTION_ROOT.parent / "activation.lock",
+            claim_lock_path=PRODUCTION_TRANSACTION_ROOT.parent / "claim.lock",
         )
 
 
@@ -319,6 +333,7 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
         ("status", manifest.status_path, policy.status_path),
         ("active claim", manifest.active_path, policy.active_path),
         ("activation lock", manifest.activation_lock_path, policy.activation_lock_path),
+        ("claim lock", manifest.claim_lock_path, policy.claim_lock_path),
     ):
         path = Path(value)
         if path != allowed:
@@ -326,6 +341,418 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
         validate_root_owned_tree(path.parent, policy.transaction_root.parent, policy)
         if path.is_symlink():
             raise ValidationError(f"{description} path must not be a symlink")
+
+
+TERMINAL_STATES = {
+    "committed",
+    "precondition_failed",
+    "activation_failed_rolled_back",
+    "activation_failed_rollback_failed",
+    "rejected_concurrent",
+}
+
+
+class ActivationError(RuntimeError):
+    pass
+
+
+class ConcurrentDeploy(ActivationError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitState:
+    service_active: bool
+    service_enabled: bool
+    socket_active: bool
+    socket_enabled: bool
+    main_pid: int
+
+
+@dataclasses.dataclass
+class PreparedInstalls:
+    candidate_binary: Path
+    candidate_service: Path
+    candidate_socket: Path
+    candidate_environment: Optional[Path]
+    rollback_binary: Optional[Path]
+    rollback_service: Optional[Path]
+    rollback_socket: Optional[Path]
+    rollback_environment: Optional[Path]
+
+    def paths(self):
+        return [value for value in dataclasses.astuple(self) if value is not None]
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fsync_dir(path.parent)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def prepare_atomic_install(
+    staged: Path,
+    target: Path,
+    mode: int,
+    *,
+    owner_uid: Optional[int] = None,
+    owner_gid: Optional[int] = None,
+) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.install-", dir=target.parent)
+    try:
+        os.fchmod(fd, mode)
+        if owner_uid is not None or owner_gid is not None:
+            os.fchown(fd, -1 if owner_uid is None else owner_uid, -1 if owner_gid is None else owner_gid)
+        with os.fdopen(fd, "wb") as destination:
+            fd = -1
+            with staged.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        return Path(temporary)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def commit_atomic_install(prepared: Path, target: Path) -> None:
+    os.replace(prepared, target)
+    fsync_dir(target.parent)
+
+
+def remove_target(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    if path.parent.exists():
+        fsync_dir(path.parent)
+
+
+def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = None, rollback_failure: Optional[str] = None) -> None:
+    status = {
+        "transaction_id": manifest.transaction_id,
+        "state": state,
+        "source_kind": manifest.source_kind,
+        "source_commit": manifest.source_commit,
+        "release_tag": manifest.release_tag,
+        "release_commit": manifest.release_commit,
+        "expected_version": manifest.expected.version,
+        "expected_git_sha": manifest.expected.git_sha,
+        "created_at": manifest.created_at,
+        "updated_at": utc_now(),
+        "failure": failure,
+        "rollback_failure": rollback_failure,
+    }
+    lock_path = Path(manifest.claim_lock_path)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
+def status_is_durable_terminal(manifest: Manifest) -> bool:
+    try:
+        status = json.loads(Path(manifest.status_path).read_text())
+        return status.get("transaction_id") == manifest.transaction_id and status.get("state") in TERMINAL_STATES
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def release_claim(manifest: Manifest) -> bool:
+    claim = Path(manifest.active_path)
+    lock_path = Path(manifest.claim_lock_path)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if claim.read_text().strip() != manifest.transaction_id:
+                return False
+            if not status_is_durable_terminal(manifest):
+                return False
+            claim.unlink()
+            fsync_dir(claim.parent)
+            return True
+        except FileNotFoundError:
+            return False
+
+
+class Systemctl:
+    def __init__(self, manifest: Manifest, run=subprocess.run):
+        self.manifest = manifest
+        self.run = run
+        self.service = f"{manifest.unit_name}.service"
+        self.socket = f"{manifest.unit_name}.socket"
+        self.disruption_started = False
+
+    def command(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = self.run(["systemctl", *args], capture_output=True, text=True)
+        if check and result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise ActivationError(f"systemctl {' '.join(args)} failed: {detail or result.returncode}")
+        return result
+
+    def property(self, unit: str, name: str) -> str:
+        return self.command("show", unit, f"--property={name}", "--value").stdout.strip()
+
+    def is_active(self, unit: str) -> bool:
+        return self.command("is-active", unit, check=False).stdout.strip() == "active"
+
+    def is_enabled(self, unit: str) -> bool:
+        return self.command("is-enabled", unit, check=False).stdout.strip() in {"enabled", "static", "indirect"}
+
+    def main_pid(self) -> int:
+        value = self.property(self.service, "MainPID")
+        return int(value) if value.isdigit() else 0
+
+    def inspect(self) -> UnitState:
+        return UnitState(
+            service_active=self.is_active(self.service),
+            service_enabled=self.is_enabled(self.service),
+            socket_active=self.is_active(self.socket),
+            socket_enabled=self.is_enabled(self.socket),
+            main_pid=self.main_pid(),
+        )
+
+    def verify_units(self, service: Path, socket: Path) -> None:
+        result = self.run(["systemd-analyze", "verify", str(socket), str(service)], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ActivationError(f"systemd unit validation failed: {(result.stderr or result.stdout).strip()}")
+
+    def stop(self) -> None:
+        self.command("stop", self.service, self.socket, check=False)
+        self.disruption_started = True
+        deadline = time.monotonic() + self.manifest.transition_timeout_secs
+        while time.monotonic() < deadline:
+            if not self.is_active(self.service) and not self.is_active(self.socket):
+                return
+            time.sleep(0.1)
+        raise ActivationError("timed out stopping previous systemd units")
+
+    def daemon_reload(self) -> None:
+        self.command("daemon-reload")
+
+    def start_candidate(self, old_pid: int) -> int:
+        self.command("enable", self.socket, self.service)
+        self.command("start", self.socket, self.service)
+        deadline = time.monotonic() + self.manifest.transition_timeout_secs
+        while time.monotonic() < deadline:
+            pid = self.main_pid()
+            if self.is_active(self.service) and self.is_active(self.socket) and pid not in {0, old_pid}:
+                return pid
+            time.sleep(0.1)
+        raise ActivationError("systemd candidate did not become active with a new MainPID")
+
+    def restore_state(self, previous: UnitState) -> int:
+        for enabled, unit in ((previous.socket_enabled, self.socket), (previous.service_enabled, self.service)):
+            self.command("enable" if enabled else "disable", unit, check=False)
+        if previous.socket_active:
+            self.command("start", self.socket)
+        if previous.service_active:
+            self.command("start", self.service)
+        if not previous.service_active:
+            return 0
+        deadline = time.monotonic() + self.manifest.transition_timeout_secs
+        while time.monotonic() < deadline:
+            pid = self.main_pid()
+            if self.is_active(self.service) and pid != 0:
+                return pid
+            time.sleep(0.1)
+        raise ActivationError("restored systemd service did not become active")
+
+
+def fetch_identity(url: str) -> Identity:
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    with urllib.request.urlopen(url, timeout=2, context=context) as response:
+        value = json.load(response)
+    try:
+        return Identity(version=str(value["version"]), git_sha=str(value["git_sha"]))
+    except (KeyError, TypeError) as exc:
+        raise ActivationError("health response has no exact runtime identity") from exc
+
+
+def wait_for_identity(manifest: Manifest, expected: Identity, url: str) -> None:
+    deadline = time.monotonic() + manifest.health_timeout_secs
+    last = "not responding"
+    while time.monotonic() < deadline:
+        try:
+            actual = fetch_identity(url)
+            last = f"version={actual.version} git_sha={actual.git_sha}"
+            if actual == expected:
+                return
+        except Exception as exc:
+            last = type(exc).__name__
+        time.sleep(0.2)
+    raise ActivationError(
+        f"exact health verification failed: expected version={expected.version} git_sha={expected.git_sha}; observed {last}"
+    )
+
+
+def artifact_path(artifact: OptionalArtifact) -> Optional[Path]:
+    return Path(artifact.path) if artifact.path is not None else None
+
+
+def service_group_id(service_user: str) -> int:
+    return pwd.getpwnam(service_user).pw_gid
+
+
+def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstalls:
+    candidate_service = Path(manifest.candidate.service.path)
+    candidate_socket = Path(manifest.candidate.socket.path)
+    systemctl.verify_units(candidate_service, candidate_socket)
+    service_gid = service_group_id(manifest.service_user)
+    reserved: list[Path] = []
+
+    def reserve(staged: Path, target: Path, mode: int, *, owner_gid: Optional[int] = None) -> Path:
+        path = prepare_atomic_install(staged, target, mode, owner_gid=owner_gid)
+        reserved.append(path)
+        return path
+
+    try:
+        prepared = PreparedInstalls(
+            candidate_binary=reserve(Path(manifest.candidate.binary.path), Path(manifest.targets.binary), 0o755),
+            candidate_service=reserve(candidate_service, Path(manifest.targets.service), 0o644),
+            candidate_socket=reserve(candidate_socket, Path(manifest.targets.socket), 0o644),
+            candidate_environment=(
+                reserve(
+                    Path(manifest.candidate.environment.path),
+                    Path(manifest.targets.environment),
+                    0o640,
+                    owner_gid=service_gid,
+                )
+                if manifest.candidate.environment.path is not None else None
+            ),
+            rollback_binary=None,
+            rollback_service=None,
+            rollback_socket=None,
+            rollback_environment=None,
+        )
+        if manifest.previous is not None:
+            prepared.rollback_binary = reserve(Path(manifest.rollback.binary.path), Path(manifest.targets.binary), 0o755)
+            prepared.rollback_service = reserve(Path(manifest.rollback.service.path), Path(manifest.targets.service), 0o644)
+            prepared.rollback_socket = reserve(Path(manifest.rollback.socket.path), Path(manifest.targets.socket), 0o644)
+            if manifest.rollback.environment.path is not None:
+                prepared.rollback_environment = reserve(
+                    Path(manifest.rollback.environment.path),
+                    Path(manifest.targets.environment),
+                    0o640,
+                    owner_gid=service_gid,
+                )
+        return prepared
+    except BaseException:
+        for path in reserved:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def install_candidate(manifest: Manifest, prepared: PreparedInstalls) -> None:
+    commit_atomic_install(prepared.candidate_binary, Path(manifest.targets.binary))
+    commit_atomic_install(prepared.candidate_service, Path(manifest.targets.service))
+    commit_atomic_install(prepared.candidate_socket, Path(manifest.targets.socket))
+    if prepared.candidate_environment is None:
+        remove_target(Path(manifest.targets.environment))
+    else:
+        commit_atomic_install(prepared.candidate_environment, Path(manifest.targets.environment))
+
+
+def restore_deployed_sha(manifest: Manifest) -> None:
+    target = Path(manifest.targets.deployed_sha)
+    if manifest.previous_deployed_sha is None:
+        remove_target(target)
+    else:
+        atomic_write(target, (manifest.previous_deployed_sha + "\n").encode())
+
+
+def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState, prepared: PreparedInstalls) -> None:
+    systemctl.stop()
+    if manifest.previous is None:
+        for target in dataclasses.astuple(manifest.targets)[:4]:
+            remove_target(Path(target))
+        systemctl.daemon_reload()
+        restore_deployed_sha(manifest)
+        return
+    assert prepared.rollback_binary and prepared.rollback_service and prepared.rollback_socket
+    commit_atomic_install(prepared.rollback_binary, Path(manifest.targets.binary))
+    commit_atomic_install(prepared.rollback_service, Path(manifest.targets.service))
+    commit_atomic_install(prepared.rollback_socket, Path(manifest.targets.socket))
+    if prepared.rollback_environment is None:
+        remove_target(Path(manifest.targets.environment))
+    else:
+        commit_atomic_install(prepared.rollback_environment, Path(manifest.targets.environment))
+    systemctl.daemon_reload()
+    systemctl.restore_state(previous_state)
+    if manifest.previous_health_url is None:
+        raise ActivationError("previous health endpoint is unavailable")
+    wait_for_identity(manifest, manifest.previous, manifest.previous_health_url)
+    restore_deployed_sha(manifest)
+
+
+def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
+    lock_path = Path(manifest.activation_lock_path)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentDeploy("another deployment is already activating") from exc
+        controller = systemctl or Systemctl(manifest)
+        prepared = None
+        try:
+            prepared = prepare_installs(manifest, controller)
+        except Exception as exc:
+            write_status(manifest, "precondition_failed", failure=str(exc))
+            raise
+        previous_state = controller.inspect()
+        write_status(manifest, "activating")
+        try:
+            controller.stop()
+            install_candidate(manifest, prepared)
+            controller.daemon_reload()
+            controller.start_candidate(previous_state.main_pid)
+            wait_for_identity(manifest, manifest.expected, manifest.expected_health_url)
+            atomic_write(Path(manifest.targets.deployed_sha), (manifest.source_commit + "\n").encode())
+            write_status(manifest, "committed")
+            return "committed"
+        except Exception as activation_exc:
+            failure = str(activation_exc)
+            if not controller.disruption_started:
+                write_status(manifest, "precondition_failed", failure=failure)
+                raise
+            try:
+                restore(manifest, controller, previous_state, prepared)
+                write_status(manifest, "activation_failed_rolled_back", failure=failure)
+                return "activation_failed_rolled_back"
+            except Exception as rollback_exc:
+                write_status(
+                    manifest,
+                    "activation_failed_rollback_failed",
+                    failure=failure,
+                    rollback_failure=str(rollback_exc),
+                )
+                return "activation_failed_rollback_failed"
+        finally:
+            if prepared is not None:
+                for path in prepared.paths():
+                    path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -341,9 +768,23 @@ def main() -> int:
         parser.error("activation requires activate --manifest PATH")
     if os.geteuid() != 0:
         raise SystemExit("systemd activation helper must run as root")
-    manifest = Manifest.load(args.manifest)
-    validate_manifest(args.manifest, manifest, ValidationPolicy.production())
-    raise SystemExit("systemd activation is not implemented")
+    manifest = None
+    try:
+        manifest = Manifest.load(args.manifest)
+        validate_manifest(args.manifest, manifest, ValidationPolicy.production())
+        state = activate(manifest)
+        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
+            release_claim(manifest)
+        print(state, flush=True)
+        return 0 if state == "committed" else 1
+    except ConcurrentDeploy as exc:
+        print(f"systemd activation helper failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        if manifest is not None and status_is_durable_terminal(manifest):
+            release_claim(manifest)
+        print(f"systemd activation helper failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

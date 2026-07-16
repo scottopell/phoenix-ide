@@ -67,7 +67,13 @@ def inherited_systemd_socket():
         raise RuntimeError("LISTEN_PID does not name this process")
     if os.environ.get("LISTEN_FDS") != "1":
         raise RuntimeError("fixture requires exactly one systemd socket")
-    inherited = socket.fromfd(3, socket.AF_INET6, socket.SOCK_STREAM)
+    inherited = socket.socket(fileno=os.dup(3))
+    if inherited.type & socket.SOCK_STREAM != socket.SOCK_STREAM:
+        inherited.close()
+        raise RuntimeError("fixture requires a stream socket")
+    if inherited.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1:
+        inherited.close()
+        raise RuntimeError("fixture requires a listening socket")
     os.set_inheritable(inherited.fileno(), False)
     return inherited
 
