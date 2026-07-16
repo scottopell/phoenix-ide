@@ -4,7 +4,10 @@ import { ConversationContext } from '../../conversation/ConversationContext';
 import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
 import { useMediaQuery } from '../../hooks';
+import { InputArea } from '../../components/InputArea';
 import { MessageList } from '../../components/MessageList';
+import { StateBar } from '../../components/StateBar';
+import type { Conversation, ImageData } from '../../api';
 import { getMessageListScenario, messageListFixtureData } from '../messageList';
 import '../../index.css';
 import '../../pages/CoordinatorPage.css';
@@ -17,11 +20,32 @@ interface Props {
 export function CoordinatorFixture({ scenario }: Props) {
   const [view, setView] = useState<'conversation' | 'fleet'>(scenario.initialView);
   const compactLayout = useMediaQuery('(max-width: 1024px)');
+  const [draft, setDraft] = useState('');
+  const [images, setImages] = useState<ImageData[]>([]);
   const store = useMemo(() => new ConversationStore(), []);
   const transcript = useMemo(
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
     [],
   );
+  const convState = scenario.working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  const conversation: Conversation = {
+    id: transcript.conversationId,
+    slug: transcript.slug,
+    model: 'claude-sonnet-5',
+    cwd: '/work/phoenix',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    message_count: transcript.messages.length,
+    state: convState,
+    branch_name: null,
+    base_branch: null,
+    worktree_path: null,
+    task_title: null,
+    conv_mode_label: 'Explore',
+    browser_session_active: false,
+    terminal_uses_tmux: false,
+    work_scope_key: null,
+  };
 
   useEffect(() => {
     document.documentElement.dataset['theme'] = 'dark';
@@ -51,16 +75,38 @@ export function CoordinatorFixture({ scenario }: Props) {
                   <MessageList
                     messages={transcript.messages}
                     pendingMessages={[]}
-                    convState={scenario.working ? { type: 'llm_requesting', attempt: 1 } : { type: 'idle' }}
+                    convState={convState}
                     onRetry={() => {}}
                     onOpenFile={() => {}}
                     conversationId={transcript.conversationId}
                     slug={transcript.slug}
                     transcriptPositioning={{ kind: 'idle', view: { conversationId: transcript.conversationId, generation: 1, transcriptGeneration: 1 } }}
                   />
-                  {scenario.working && <div className="continuation-progress"><div className="continuation-progress-header">Agent working…</div><div className="continuation-progress-text">You can queue a follow-up.</div></div>}
-                  <div id="input-area"><textarea aria-label="Message Coordinator" defaultValue="" placeholder="Ask about work across Phoenix…" /></div>
-                  <div id="state-bar" className="statebar-mobile"><span>coordinator</span><span>{scenario.working ? 'awaiting LLM response' : 'ready'}</span></div>
+                  <InputArea
+                    cwd={undefined}
+                    scopeKey={transcript.conversationId}
+                    convState={convState}
+                    images={images}
+                    setImages={setImages}
+                    isOffline={false}
+                    failedMessages={[]}
+                    convModeLabel="Explore"
+                    draft={draft}
+                    onDraftChange={setDraft}
+                    onSend={() => {}}
+                    onCancel={() => {}}
+                    onRetry={() => {}}
+                  />
+                  <StateBar
+                    conversation={conversation}
+                    convState={convState}
+                    connectionState="connected"
+                    connectionAttempt={0}
+                    nextRetryIn={null}
+                    contextWindowUsed={16_000}
+                    modelContextWindow={200_000}
+                    phaseStateUpdatedAt={null}
+                  />
                 </div>
               </div>
             </section>
