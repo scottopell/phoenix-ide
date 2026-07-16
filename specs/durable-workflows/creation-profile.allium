@@ -284,7 +284,10 @@ rule ShellFirstDurableAcceptance {
         intent_fingerprint: creation_request_fingerprint(raw_intent),
         workflow: binding.workflow,
         selected_protocol: creation_protocol_selection(),
-        receipt: acceptance,
+        receipt: dwf/ExternalAcceptanceReceipt{
+            idempotency_key: creation_acceptance_key(raw_intent),
+            workflow: binding.workflow
+        },
         accepted_at: now()
     )
     ensures: CreationAcceptanceProjection.created(
@@ -313,9 +316,9 @@ rule ReplayCreationAcceptanceFromStableBinding {
         creation_acceptance_scope(raw_intent), creation_acceptance_key(raw_intent)
     )
     requires: acceptance_binding != null
-    requires: acceptance_binding.request_fingerprint = creation_request_fingerprint(raw_intent)
-    ensures: CreationProfileAcceptanceReplay(acceptance_binding.acceptance)
-    ensures: not CreationWorkflowBinding.created(conversation_id: acceptance_binding.acceptance.conversation_id)
+    requires: acceptance_binding.intent_fingerprint = creation_request_fingerprint(raw_intent)
+    ensures: CreationProfileAcceptanceReplay(acceptance_binding.receipt)
+    ensures: not CreationWorkflowBinding.created(workflow: acceptance_binding.workflow)
 }
 
 rule RejectConflictingCreationAcceptanceKey {
@@ -324,7 +327,7 @@ rule RejectConflictingCreationAcceptanceKey {
         creation_acceptance_scope(raw_intent), creation_acceptance_key(raw_intent)
     )
     requires: acceptance_binding != null
-    requires: acceptance_binding.request_fingerprint != creation_request_fingerprint(raw_intent)
+    requires: acceptance_binding.intent_fingerprint != creation_request_fingerprint(raw_intent)
     ensures: CreationProfileAcceptanceConflict(creation_acceptance_key(raw_intent))
 }
 

@@ -1,3 +1,4 @@
+-- DurableEngineAuthoritySelected(contract)
 -- WakeTerminalDeliveryPersistedThroughReducerAcceptance(conversation)
 -- allium: 3
 -- wake-contracts.allium
@@ -401,6 +402,7 @@ rule WaitUntilRejectedByRange {
 -- be evaluated and may fire later.
 rule WakeRouterFiresOnConditionHold {
     when: WakeRouterTick(contract)
+    requires: not DurableEngineAuthoritySelected(contract)
 
     requires: contract.status = pending
     requires: evaluator_reports_fired(contract.condition)
@@ -443,6 +445,7 @@ rule WakeRouterFiresOnConditionHold {
 -- distinguishes missing handles from completed child failures.
 rule WakeRouterForgetsMissingSubAgentHandle {
     when: WakeRouterTick(contract)
+    requires: not DurableEngineAuthoritySelected(contract)
 
     requires: contract.status = pending
     requires: contract.condition.handle?.kind = subagent
@@ -465,6 +468,7 @@ rule WakeRouterForgetsMissingSubAgentHandle {
 -- tmux_run exit marker fires through evaluator_reports_fired instead.
 rule WakeRouterForgetsMissingTmuxHandle {
     when: WakeRouterTick(contract)
+    requires: not DurableEngineAuthoritySelected(contract)
 
     requires: contract.status = pending
     requires: contract.condition.handle?.kind = tmux_pane
@@ -487,6 +491,7 @@ rule WakeRouterForgetsMissingTmuxHandle {
 -- the condition holding and without in-deadline durable terminal evidence.
 rule WakeRouterFiresOnExpiry {
     when: WakeRouterTick(contract)
+    requires: not DurableEngineAuthoritySelected(contract)
 
     requires: contract.status = pending
     requires: contract.expires_at <= now()
@@ -513,6 +518,7 @@ rule WakeRouterFiresOnExpiry {
 -- REQ-WAKE-008: explicit user cancel (UI button click).
 rule UserCancelsContract {
     when: UserClicksCancel(contract_id)
+    requires: not DurableEngineAuthoritySelected(Contract{id: contract_id})
 
     requires: Contract{id: contract_id}.status = pending
 

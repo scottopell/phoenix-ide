@@ -245,9 +245,9 @@ entity InboxConsumerDisposition {
 entity Workflow {
     id: String
     profile: ProfileRef
-    authority: SemanticAuthority? when execution_mode = authoritative
+    authority: SemanticAuthority when execution_mode = authoritative
     execution_mode: ExecutionMode
-    authoritative_workflow: Workflow? when execution_mode = shadow
+    authoritative_workflow: Workflow when execution_mode = shadow
     protocol_selection: ProfileProtocolSelection
     version: Integer
     generation: Integer
@@ -308,6 +308,7 @@ entity Effect {
         eligible -> claimed
         eligible -> invalidated
         claimed -> retry_wait
+        claimed -> eligible
         claimed -> ambiguity_wait
         claimed -> receipted
         claimed -> invalidated
@@ -315,6 +316,7 @@ entity Effect {
         retry_wait -> invalidated
         ambiguity_wait -> receipted
         ambiguity_wait -> invalidated
+        ambiguity_wait -> retry_wait
         terminal: receipted, invalidated
     }
 }

@@ -1,6 +1,6 @@
 # ADR-006: Wake contracts are persisted conversation-scoped terminal waits
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-011
 - **Date:** 2026-07-01
 - **Affects:** REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-006, REQ-WAKE-009, REQ-WAKE-010, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018
 
