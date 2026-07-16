@@ -121,7 +121,6 @@ class CheckPlanTests(unittest.TestCase):
         cats = self.dev._categorize_changed_paths({"scripts/check_rust_test_timing.py"})
         self.assertIn("ASTGREP", cats)
         self.assertIn("SPECS", cats)
-        active, _ = self.dev._gate_lanes()
         with mock.patch.object(
             self.dev, "_changed_paths_vs_base",
             return_value={"scripts/check_rust_test_timing.py"},

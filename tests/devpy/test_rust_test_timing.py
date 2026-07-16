@@ -159,6 +159,26 @@ class RustTestTimingTests(unittest.TestCase):
         )
         self.assertEqual([], diagnostics)
 
+    def test_feature_string_containing_test_does_not_create_test_scope(self):
+        diagnostics = self.check(
+            """
+            #[cfg(any(feature = "test-support", unix))]
+            async fn production() { done.notified().await; }
+            """
+        )
+        self.assertEqual([], diagnostics)
+
+    def test_long_stacked_attribute_with_semicolon_preserves_test_scope(self):
+        reason = "x" * 700
+        diagnostics = self.check(
+            f'''
+            #[tokio::test]
+            #[ignore = "flaky; {{reason}}"]
+            async fn ignored_test() {{ done.notified().await; }}
+            '''
+        )
+        self.assertEqual(1, len(diagnostics))
+
     def test_not_test_cfg_does_not_create_test_scope(self):
         diagnostics = self.check(
             """

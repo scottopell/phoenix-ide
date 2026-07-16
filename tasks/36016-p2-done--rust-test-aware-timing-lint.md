@@ -6,7 +6,7 @@ After PR #501 ships, evaluate: newer ast-grep relational capabilities, path-scop
 
 ## Implementation
 
-The structural guard uses ast-grep's Rust parser and typed rule IDs for sleeps, event waits, and timeout wrappers, then correlates their JSON byte ranges with enclosing annotated test functions, positive `cfg(...test...)` scopes, and dedicated test files. Byte offsets are compared against UTF-8 source bytes so non-ASCII text before a test cannot shift scope detection.
+The structural guard uses ast-grep's Rust parser and typed rule IDs for sleeps, event waits, timeout wrappers, items, and attributes. Parser-provided attribute byte ranges are associated with their adjacent function/module through whitespace/comment trivia, avoiding fixed lookback windows and punctuation inside attribute strings. Positive `cfg(...test...)` scopes are parsed after quoted values are removed, so feature names containing “test” and `cfg(not(test))` do not create test scope. Byte offsets are compared against UTF-8 source bytes so non-ASCII text before a test cannot shift scope detection.
 
 It rejects new or changed test lines containing:
 

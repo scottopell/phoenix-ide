@@ -29,6 +29,7 @@ rule:
   any:
     - kind: function_item
     - kind: mod_item
+    - kind: attribute_item
 ---
 id: phoenix-rust-test-sleep
 language: Rust
@@ -92,16 +93,32 @@ def _bounds(finding: dict) -> tuple[int, int]:
     return offsets["start"], offsets["end"]
 
 
-def _attribute_prefix(source: bytes, start: int) -> str:
-    return source[max(0, start - 500) : start].decode("utf-8", errors="ignore")
+def _is_trivia(source: bytes) -> bool:
+    text = source.decode("utf-8", errors="ignore")
+    text = re.sub(r"//[^\n]*(?:\n|$)", "", text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return not text.strip()
 
 
-def _attached_attributes(prefix: str) -> str:
-    boundary = max(prefix.rfind("}"), prefix.rfind(";"))
-    return prefix[boundary + 1 :]
+def _attached_attributes(source: bytes, start: int, attributes: list[dict]) -> str:
+    cursor = start
+    attached = []
+    for attribute in sorted(attributes, key=lambda item: _bounds(item)[1], reverse=True):
+        attr_start, attr_end = _bounds(attribute)
+        if attr_end > cursor:
+            continue
+        if not _is_trivia(source[attr_end:cursor]):
+            break
+        attached.append(attribute["text"])
+        cursor = attr_start
+    return "\n".join(reversed(attached))
 
 
 def _cfg_has_positive_test(expression: str) -> bool:
+    expression = re.sub(r'r#*".*?"#*|"(?:\\.|[^"\\])*"', '""', expression)
     tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[(),]", expression)
 
     def parse(index: int, negated: bool = False) -> tuple[bool, int]:
@@ -129,7 +146,13 @@ def _attributes_enable_test(prefix: str) -> bool:
     return any(_cfg_has_positive_test(match.group(1)) for match in CFG_ATTR.finditer(prefix))
 
 
-def _is_test_scope(filename: str, source: bytes, smell: dict, items: list[dict]) -> bool:
+def _is_test_scope(
+    filename: str,
+    source: bytes,
+    smell: dict,
+    items: list[dict],
+    attributes: list[dict],
+) -> bool:
     path = Path(filename)
     if "tests" in path.parts or path.name in {"tests.rs", "testing.rs"}:
         return True
@@ -138,7 +161,7 @@ def _is_test_scope(filename: str, source: bytes, smell: dict, items: list[dict])
         start, end = _bounds(item)
         if not start <= point < end:
             continue
-        prefix = _attached_attributes(_attribute_prefix(source, start))
+        prefix = _attached_attributes(source, start, attributes)
         if item["text"].lstrip().startswith("mod "):
             if _attributes_enable_test(prefix):
                 return True
@@ -200,7 +223,9 @@ def findings(
     for filename, kinds in grouped.items():
         source_text = Path(filename).read_text()
         source = source_text.encode()
-        items = kinds["phoenix-rust-test-item"]
+        all_items = kinds["phoenix-rust-test-item"]
+        attributes = [item for item in all_items if item["text"].lstrip().startswith("#")]
+        items = [item for item in all_items if item not in attributes]
         timeouts = [
             timeout for timeout in kinds["phoenix-rust-test-timeout"]
             if not timeout["text"].lstrip().startswith("timeout(")
@@ -221,7 +246,7 @@ def findings(
                 relative = str(Path(filename).resolve().relative_to(source_root))
             except ValueError:
                 relative = _relative_path(filename)
-            if not _is_test_scope(relative, source, smell, items):
+            if not _is_test_scope(relative, source, smell, items, attributes):
                 continue
             is_event_wait = kind == "event"
             if is_event_wait and _is_bounded(smell, timeouts):
