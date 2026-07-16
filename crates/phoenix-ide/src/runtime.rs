@@ -2869,6 +2869,31 @@ impl RuntimeManager {
         }
     }
 
+    pub async fn persist_direct_user_message(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        message_id: &str,
+        content: &crate::db::MessageContent,
+        display_data: Option<&serde_json::Value>,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        let seq = handle.broadcast_tx.next_seq();
+        let message = self
+            .db
+            .add_message_with_seq(
+                message_id,
+                conversation_id,
+                seq,
+                content,
+                display_data,
+                None,
+            )
+            .await
+            .map_err(|error| format!("Failed to persist direct user message: {error}"))?;
+        let _ = handle.broadcast_tx.send_message(message);
+        Ok(())
+    }
+
     pub async fn send_event(
         self: &Arc<Self>,
         conversation_id: &str,

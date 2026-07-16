@@ -43,7 +43,9 @@ use crate::git_ops::{
     GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::SseEvent;
-use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use crate::state_machine::{
+    check_user_message_acceptable, ConvState, Effect, Event, TransitionError,
+};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -3695,6 +3697,30 @@ async fn send_chat(
     // `text` carries the `display_text` (stored in DB, shown in history — REQ-IR-006).
     // `llm_text` is the expanded form delivered to the model when present (REQ-IR-001).
     let display_text = expanded.display_text;
+    let persist_effect = Effect::persist_user_message(
+        display_text.clone(),
+        chat_llm_text.clone(),
+        images.clone(),
+        files.clone(),
+        req.message_id.clone(),
+        req.user_agent.clone(),
+        expanded.skill_invocation.clone(),
+        true,
+    );
+    let Effect::PersistMessage {
+        content,
+        display_data,
+        ..
+    } = persist_effect
+    else {
+        unreachable!("persist_user_message always returns PersistMessage")
+    };
+    state
+        .runtime
+        .persist_direct_user_message(&id, &req.message_id, &content, display_data.as_ref())
+        .await
+        .map_err(AppError::Internal)?;
+
     let event = Event::UserMessage {
         text: display_text.clone(),
         llm_text: chat_llm_text,
@@ -13130,6 +13156,35 @@ mod chat_authority_tests {
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn direct_chat_is_persisted_before_success_response() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-durable", "durable", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let message_id = uuid::Uuid::new_v4().to_string();
+
+        let response = send_chat(
+            State(state.clone()),
+            Path("c-durable".to_string()),
+            Json(ChatRequest {
+                text: "durable before response".to_string(),
+                message_id: message_id.clone(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+            }),
+        )
+        .await
+        .expect("chat accepted");
+
+        assert!(!response.0.steering);
+        assert!(!response.0.already_persisted);
+        assert!(state.db.message_exists(&message_id).await.expect("query"));
     }
 
     /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.
