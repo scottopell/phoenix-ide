@@ -3665,12 +3665,9 @@ async fn send_chat(
                     skill_invocation: None,
                 }
             } else {
-                let active_project = ensure_active_project_instructions(
-                    &state,
-                    &id,
-                    FsPath::new(&conversation.cwd),
-                )
-                .await?;
+                let active_project =
+                    ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd))
+                        .await?;
                 crate::message_expander::expand_with_project_skills(
                     &req.text,
                     &resolution_root,
