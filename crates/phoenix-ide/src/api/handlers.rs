@@ -3160,15 +3160,13 @@ async fn confirm_project_instructions(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let active =
-        ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
+    ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
     let candidate = state
         .db
         .load_project_instruction_candidate(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    let Some(candidate) = candidate.filter(|bundle| bundle.id == request.candidate_bundle_id)
-    else {
+    let Some(_) = candidate.filter(|bundle| bundle.id == request.candidate_bundle_id) else {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "The project-instruction preview is missing or has been replaced; preview again before confirming",
             "stale_project_instruction_candidate",
