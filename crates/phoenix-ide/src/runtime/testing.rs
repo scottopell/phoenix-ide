@@ -1148,6 +1148,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: Some(100),
+            telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
 

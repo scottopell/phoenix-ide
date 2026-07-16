@@ -196,12 +196,23 @@ pub trait LlmService: Send + Sync {
 pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     model_id: String,
+    provider: &'static str,
+    transport: &'static str,
 }
 
 impl LoggingService {
-    pub fn new(inner: Arc<dyn LlmService>) -> Self {
+    pub fn new(
+        inner: Arc<dyn LlmService>,
+        provider: &'static str,
+        transport: &'static str,
+    ) -> Self {
         let model_id = inner.model_id().to_string();
-        Self { inner, model_id }
+        Self {
+            inner,
+            model_id,
+            provider,
+            transport,
+        }
     }
 }
 
@@ -211,20 +222,26 @@ impl LoggingService {
     /// and error aggregation); the tracing-side name stays `llm.request` for
     /// local log filtering. Usage/error fields are `Empty` until the call
     /// resolves.
-    fn request_span(&self, streaming: bool) -> tracing::Span {
+    fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
+        let telemetry = request.telemetry.as_ref();
         tracing::info_span!(
             "llm.request",
             otel.kind = "client",
             otel.name = %self.model_id,
             otel.status_code = tracing::field::Empty,
             model = %self.model_id,
+            provider = self.provider,
+            transport = self.transport,
             streaming,
+            conv_id = telemetry.map_or("", |value| value.conversation_id.as_str()),
+            root_conv_id = telemetry.map_or("", |value| value.root_conversation_id.as_str()),
+            request_id = telemetry.map_or("", |value| value.request_id.as_str()),
+            retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
-            time_to_first_token_ms = tracing::field::Empty,
-            error.message = tracing::field::Empty,
+            error.kind = tracing::field::Empty,
         )
     }
 
@@ -241,7 +258,7 @@ impl LoggingService {
             }
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
-                span.record("error.message", e.message.as_str());
+                span.record("error.kind", format!("{:?}", e.kind));
             }
         }
     }
@@ -250,7 +267,7 @@ impl LoggingService {
 #[async_trait]
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let span = self.request_span(false);
+        let span = self.request_span(request, false);
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
@@ -272,7 +289,7 @@ impl LlmService for LoggingService {
                     parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    error = %e.message,
+                    error_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM request failed"
@@ -288,7 +305,7 @@ impl LlmService for LoggingService {
         request: &LlmRequest,
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let span = self.request_span(true);
+        let span = self.request_span(request, true);
         let start = std::time::Instant::now();
 
         let result = self
@@ -315,7 +332,7 @@ impl LlmService for LoggingService {
                     parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    error = %e.message,
+                    error_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM streaming request failed"

@@ -167,12 +167,21 @@ THE SYSTEM SHALL compute total as input + output + cache tokens
 
 ---
 
-### REQ-LLM-008: Request Logging
+### REQ-LLM-008: Request Observability
 
-WHEN LLM request completes
-THE SYSTEM SHALL log model, duration, token counts, and any errors
+WHEN an LLM request executes
+THE SYSTEM SHALL emit bounded structured telemetry containing model, provider, transport, duration, token counts, retry attempt, request identifier, conversation identifier, and classified failure reason when applicable
+AND SHALL keep human-readable log filtering independent from exported trace filtering
 
-**Rationale:** Operational visibility into LLM requests for monitoring and troubleshooting.
+WHEN traces are exported
+THE SYSTEM SHALL export only explicitly designated Phoenix spans
+AND SHALL NOT export tracing events, dependency diagnostics, prompts, conversation content, tool schemas or arguments, authorization credentials or headers, raw provider payloads, WebSocket frames, SSE deltas, or parser buffers
+AND SHALL enforce finite span attribute, event, and link limits before export
+
+WHEN provider streaming diagnostics are logged locally
+THE SYSTEM SHALL log only content-free structural metadata such as event type, byte count, parser counters, transport transition, and classified error code
+
+**Rationale:** Operators need request latency, usage, correlation, retry, failure, and transport visibility without turning long-lived LLM spans into unbounded payload stores or exposing user content and credentials.
 
 ---
 

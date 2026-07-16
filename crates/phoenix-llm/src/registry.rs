@@ -762,7 +762,7 @@ impl ModelRegistry {
                 return None;
             }
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
-            return Some(Arc::new(LoggingService::new(service)));
+            return Some(Arc::new(LoggingService::new(service, "mock", "in_process")));
         }
 
         // ChatGPT bridge: when the user has signalled intent to use the
@@ -788,7 +788,11 @@ impl ModelRegistry {
                 config.custom_headers.clone(),
                 Arc::clone(cred),
             ));
-            return Some(Arc::new(LoggingService::new(service)));
+            return Some(Arc::new(LoggingService::new(
+                service,
+                "openai",
+                "websocket_or_http_sse",
+            )));
         }
 
         Self::try_create_model_with_standard_auth(spec, config)
@@ -835,7 +839,12 @@ impl ModelRegistry {
             config.custom_headers.clone(),
             config.request_tags.clone(),
         ));
-        Some(Arc::new(LoggingService::new(service)))
+        let provider = spec.backend.header_value();
+        let transport = match spec.backend {
+            ModelBackend::Anthropic | ModelBackend::OpenAIResponses => "http_sse",
+            ModelBackend::Mock => "in_process",
+        };
+        Some(Arc::new(LoggingService::new(service, provider, transport)))
     }
 
     /// Get a model by ID
@@ -1135,7 +1144,11 @@ impl ModelRegistry {
                 ));
                 new_codex_services.insert(
                     spec.id.clone(),
-                    Arc::new(LoggingService::new(service)) as Arc<dyn LlmService>,
+                    Arc::new(LoggingService::new(
+                        service,
+                        "openai",
+                        "websocket_or_http_sse",
+                    )) as Arc<dyn LlmService>,
                 );
                 new_codex_specs.insert(spec.id.clone(), spec);
             }

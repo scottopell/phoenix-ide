@@ -251,8 +251,6 @@ impl ResponsesStreamAccumulator {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(event_type);
 
-        tracing::debug!(dispatch_type, "responses_api SSE event");
-
         match dispatch_type {
             "response.output_text.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
@@ -274,7 +272,8 @@ impl ResponsesStreamAccumulator {
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                item = %item,
+                                item_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                                item_bytes = item.to_string().len(),
                                 "responses_api failed to deserialize output item"
                             );
                         }
@@ -288,8 +287,8 @@ impl ResponsesStreamAccumulator {
             "error" => {
                 tracing::warn!(
                     event = "error",
-                    data = %data,
-                    "responses_api SSE error event — full payload"
+                    data_len = data.len(),
+                    "responses_api SSE error event"
                 );
                 let nested = v.get("error");
                 let code = nested
@@ -308,8 +307,8 @@ impl ResponsesStreamAccumulator {
             "response.failed" => {
                 tracing::warn!(
                     event = "response.failed",
-                    data = %data,
-                    "responses_api SSE response.failed event — full payload"
+                    data_len = data.len(),
+                    "responses_api SSE failure event"
                 );
                 let err = v.pointer("/response/error");
                 let code = err
@@ -326,8 +325,8 @@ impl ResponsesStreamAccumulator {
             "response.incomplete" => {
                 tracing::warn!(
                     event = "response.incomplete",
-                    data = %data,
-                    "responses_api SSE response.incomplete event — full payload"
+                    data_len = data.len(),
+                    "responses_api SSE incomplete event"
                 );
                 let reason = v
                     .pointer("/response/incomplete_details/reason")
@@ -376,7 +375,10 @@ impl ResponsesStreamAccumulator {
                     )
                     .unwrap_or(0);
                 } else {
-                    tracing::warn!(data, "responses_api terminal event had no /response/usage");
+                    tracing::warn!(
+                        data_len = data.len(),
+                        "responses_api terminal event had no /response/usage"
+                    );
                 }
                 // Fallback: recover the assembled output from the terminal
                 // event's `/response/output` array when no per-item.done
@@ -400,7 +402,8 @@ impl ResponsesStreamAccumulator {
                                 Ok(output) => self.output_items.push(output),
                                 Err(e) => tracing::warn!(
                                     error = %e,
-                                    item = %item,
+                                    item_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+                                    item_bytes = item.to_string().len(),
                                     "responses_api response.completed fallback: output item deserialize failed"
                                 ),
                             }
@@ -422,15 +425,9 @@ impl ResponsesStreamAccumulator {
                     self.logged_empty_dispatch = true;
                     // Char-aware truncation — slicing by byte index would
                     // panic on a non-UTF8 boundary.
-                    let truncated: String = data.chars().take(500).collect();
-                    let suffix = if data.len() > truncated.len() {
-                        format!("…[truncated from {} bytes]", data.len())
-                    } else {
-                        String::new()
-                    };
                     tracing::debug!(
                         event_type = %event_type,
-                        data = %format!("{truncated}{suffix}"),
+                        data_len = data.len(),
                         "responses_api empty-dispatch event — first occurrence in this stream"
                     );
                 }
@@ -1131,16 +1128,18 @@ pub async fn complete_streaming(
             )
             .await
             {
-                Ok(response) => return Ok(response),
-                Err(CodexWsError::Cooldown) => tracing::debug!(
-                    cache_key = request.cache_key.as_str(),
-                    "Codex WebSocket transport cooldown active; using HTTP/SSE"
-                ),
+                Ok(response) => {
+                    tracing::Span::current().record("transport", "websocket");
+                    return Ok(response);
+                }
+                Err(CodexWsError::Cooldown) => {
+                    tracing::debug!("Codex WebSocket transport cooldown active; using HTTP/SSE");
+                }
                 Err(CodexWsError::Backend(error) | CodexWsError::Interrupted(error)) => {
                     return Err(error);
                 }
                 Err(CodexWsError::Reconnect(error)) => {
-                    tracing::debug!(error = %error.message,
+                    tracing::debug!(error_kind = ?error.kind,
                         "Codex WebSocket lifetime exhausted; retrying once on a fresh socket");
                     match complete_codex_websocket(
                         &url,
@@ -1153,7 +1152,10 @@ pub async fn complete_streaming(
                     )
                     .await
                     {
-                        Ok(response) => return Ok(response),
+                        Ok(response) => {
+                            tracing::Span::current().record("transport", "websocket");
+                            return Ok(response);
+                        }
                         Err(
                             CodexWsError::Backend(error)
                             | CodexWsError::Interrupted(error)
@@ -1163,16 +1165,18 @@ pub async fn complete_streaming(
                             "Codex WebSocket cooldown became active; using HTTP/SSE"
                         ),
                         Err(CodexWsError::Fallback(error)) => {
-                            tracing::warn!(error = %error.message,
+                            tracing::warn!(error_kind = ?error.kind,
                                 "fresh Codex WebSocket failed; falling back once to full HTTP/SSE");
                         }
                     }
                 }
-                Err(CodexWsError::Fallback(error)) => tracing::warn!(error = %error.message,
+                Err(CodexWsError::Fallback(error)) => tracing::warn!(error_kind = ?error.kind,
                     "Codex WebSocket transport/protocol failed; falling back once to full HTTP/SSE"),
             }
         }
     }
+
+    tracing::Span::current().record("transport", "http_sse");
 
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
@@ -1246,7 +1250,8 @@ pub async fn complete_streaming(
                     data_len = event.data.len(),
                     "SSE event processing failed; dumping parser diagnostics"
                 );
-                tracing::error!("{}", sse.diagnostic_dump());
+                let diagnostics = sse.diagnostics();
+                tracing::error!(?diagnostics, "SSE parser diagnostics");
                 return Err(e);
             }
             if acc.done {
@@ -1564,7 +1569,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
                     (output.name, output.arguments, output.call_id)
                 {
                     let input = serde_json::from_str(&arguments).unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, arguments = %arguments, "Failed to parse function call arguments");
+                        tracing::warn!(error = %e, arguments_len = arguments.len(), "Failed to parse function call arguments");
                         serde_json::Value::Object(serde_json::Map::new())
                     });
                     content.push(ContentBlock::ToolUse {
@@ -2267,6 +2272,7 @@ mod tests {
                 .collect(),
             tools: vec![],
             max_tokens: None,
+            telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
     }
@@ -2816,6 +2822,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }
     }

@@ -16,7 +16,7 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::resource::Resource;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -99,18 +99,13 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         TraceExporter::Otlp => Some(init_otlp_provider()?),
     };
 
-    // The OTel layer is intentionally NOT gated by RUST_LOG/EnvFilter: quiet
-    // logging configurations (e.g. RUST_LOG=warn) must not silently disable
-    // tracing. The only exclusion is "http.stream" spans — long-lived SSE/
-    // WebSocket connection spans (see the TraceLayer in api/handlers.rs) whose
-    // durations are connection lifetimes, not request latencies. They stay
-    // visible to the stdout/file access log but are never exported.
+    // OTel has its own allowlist instead of inheriting RUST_LOG. Local sinks may
+    // opt into verbose dependency diagnostics, but exported traces contain only
+    // Phoenix's intentional, bounded spans and never tracing events.
     let otel_layer = tracer_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer()
             .with_tracer(provider.tracer("phoenix-ide"))
-            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-                !(meta.is_span() && meta.name() == "http.stream")
-            }))
+            .with_filter(tracing_subscriber::filter::filter_fn(otel_metadata_enabled))
     });
 
     // EnvFilter is applied per-layer to the stdout/file sinks only, not to the
@@ -155,6 +150,22 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         _log_guard: guard,
         tracer_provider,
     })
+}
+
+const OTEL_SPAN_NAMES: &[&str] = &["http", "conversation.turn", "llm.request", "tool.execute"];
+
+fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
+    meta.is_span() && OTEL_SPAN_NAMES.contains(&meta.name())
+}
+
+fn phoenix_span_limits() -> SpanLimits {
+    SpanLimits {
+        max_events_per_span: 0,
+        max_attributes_per_span: 32,
+        max_links_per_span: 4,
+        max_attributes_per_event: 0,
+        max_attributes_per_link: 4,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -216,6 +227,7 @@ fn init_datadog_provider() -> SdkTracerProvider {
 
     datadog_opentelemetry::tracing()
         .with_config(dd_config_builder.build())
+        .with_span_limits(phoenix_span_limits())
         .init()
 }
 
@@ -230,6 +242,7 @@ fn init_otlp_provider() -> std::io::Result<SdkTracerProvider> {
     Ok(SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(otlp_resource())
+        .with_span_limits(phoenix_span_limits())
         .build())
 }
 
@@ -384,6 +397,57 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn otel_filter_is_a_spans_only_allowlist() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .with_span_limits(phoenix_span_limits())
+            .build();
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(tracing_subscriber::filter::filter_fn(otel_metadata_enabled));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let llm = tracing::info_span!("llm.request", model = "gpt-test");
+            let _guard = llm.enter();
+            tracing::debug!(target: "tokio_tungstenite", frame = "PAYLOAD_SENTINEL", "frame");
+            tracing::info!(delta = "DELTA_SENTINEL", "response delta");
+            let dependency =
+                tracing::debug_span!(target: "sqlx::query", "query", sql = "SELECT secret");
+            drop(dependency);
+        });
+        provider.force_flush().expect("flush spans");
+
+        let spans = exporter.get_finished_spans().expect("exported spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "llm.request");
+        assert!(spans[0].events.is_empty());
+        let encoded = format!("{spans:?}");
+        for forbidden in [
+            "PAYLOAD_SENTINEL",
+            "DELTA_SENTINEL",
+            "SELECT secret",
+            "authorization",
+        ] {
+            assert!(!encoded.contains(forbidden), "export contained {forbidden}");
+        }
+    }
+
+    #[test]
+    fn otel_limits_are_conservative_and_event_free() {
+        let limits = phoenix_span_limits();
+        assert_eq!(limits.max_events_per_span, 0);
+        assert_eq!(limits.max_attributes_per_event, 0);
+        assert!(limits.max_attributes_per_span <= 32);
+        assert!(limits.max_links_per_span <= 4);
+    }
 
     #[test]
     fn stdout_defaults_on_when_unset() {

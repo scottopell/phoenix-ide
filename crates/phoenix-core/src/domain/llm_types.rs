@@ -55,6 +55,15 @@ impl PromptCacheKey {
     }
 }
 
+/// Content-free correlation fields attached to one provider attempt.
+#[derive(Debug, Clone)]
+pub struct LlmRequestTelemetry {
+    pub conversation_id: String,
+    pub root_conversation_id: String,
+    pub request_id: String,
+    pub retry_attempt: u32,
+}
+
 /// LLM request
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -62,6 +71,7 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
     /// cohort. Used as `prompt_cache_key` on the `OpenAI` Responses path,

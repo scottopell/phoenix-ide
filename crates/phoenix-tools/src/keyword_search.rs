@@ -448,6 +448,7 @@ impl KeywordSearchTool {
             }],
             tools: vec![],
             max_tokens: Some(4096),
+            telemetry: None,
             // Shared by every keyword-search filter call so FILTER_SYSTEM_PROMPT caches.
             cache_key: PromptCacheKey::stable("keyword-search-filter"),
         };

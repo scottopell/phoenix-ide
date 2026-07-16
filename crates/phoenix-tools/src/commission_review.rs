@@ -450,6 +450,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             }],
             tools: vec![],
             max_tokens: Some(4096),
+            telemetry: None,
             cache_key: PromptCacheKey::stable(format!(
                 "commission-review:{}:{index}",
                 ctx.conversation_id

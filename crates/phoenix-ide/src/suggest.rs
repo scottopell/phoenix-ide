@@ -40,6 +40,7 @@ pub async fn suggest_commands(
         }],
         tools: vec![],
         max_tokens: Some(MAX_SUGGEST_TOKENS),
+        telemetry: None,
         // Shared by every suggestion call so SUGGEST_SYSTEM caches.
         cache_key: PromptCacheKey::stable("command-suggester"),
     };

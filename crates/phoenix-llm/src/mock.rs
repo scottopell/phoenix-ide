@@ -847,6 +847,7 @@ mod tests {
             }],
             tools: vec![],
             max_tokens: None,
+            telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
     }

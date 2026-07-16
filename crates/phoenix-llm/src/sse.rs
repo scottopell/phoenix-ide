@@ -32,6 +32,15 @@ pub struct SseEvent {
     pub data: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SseDiagnostics {
+    pub chunk_count: usize,
+    pub bytes_received: usize,
+    pub buffered_bytes: usize,
+    pub pending_event_type_len: usize,
+    pub pending_data_len: usize,
+}
+
 /// Incremental SSE parser.
 ///
 /// Feed it arbitrary byte slices via [`push`]; it buffers incomplete lines
@@ -43,24 +52,18 @@ pub struct SseParser {
     current_event: String,
     /// Accumulated `data:` lines for the current event (joined with `\n`).
     current_data: String,
-    /// Rolling log of raw byte chunks received (kept for diagnostics on parse errors).
-    /// Capped to avoid unbounded growth.
-    raw_chunks_log: Vec<Vec<u8>>,
-    /// Total bytes logged so far (to enforce cap).
-    raw_bytes_logged: usize,
+    chunk_count: usize,
+    bytes_received: usize,
 }
 
 impl SseParser {
-    /// Max bytes to keep in the raw chunk log (64 KB).
-    const RAW_LOG_CAP: usize = 64 * 1024;
-
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
             current_event: String::new(),
             current_data: String::new(),
-            raw_chunks_log: Vec::new(),
-            raw_bytes_logged: 0,
+            chunk_count: 0,
+            bytes_received: 0,
         }
     }
 
@@ -68,11 +71,8 @@ impl SseParser {
     ///
     /// Returns zero or more complete events extracted from the buffered data.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        // Log raw chunks for diagnostics (capped to avoid unbounded growth)
-        if self.raw_bytes_logged < Self::RAW_LOG_CAP {
-            self.raw_chunks_log.push(bytes.to_vec());
-            self.raw_bytes_logged += bytes.len();
-        }
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.bytes_received = self.bytes_received.saturating_add(bytes.len());
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
 
@@ -136,49 +136,15 @@ impl SseParser {
         events
     }
 
-    /// Return diagnostic info about the raw chunks received.
-    /// Useful when a downstream JSON parse fails — helps distinguish
-    /// "our parser lost bytes" from "the upstream sent garbage".
-    pub fn diagnostic_dump(&self) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "SseParser diagnostics: {} chunks, {} bytes logged",
-            self.raw_chunks_log.len(),
-            self.raw_bytes_logged,
-        );
-        // Show the last few chunks (most relevant to the error)
-        let start = self.raw_chunks_log.len().saturating_sub(5);
-        for (i, chunk) in self.raw_chunks_log[start..].iter().enumerate() {
-            let display = String::from_utf8_lossy(chunk);
-            let truncated = if display.len() > 500 {
-                format!(
-                    "{}...[truncated, {} bytes total]",
-                    display.get(..500).unwrap_or(&display),
-                    chunk.len()
-                )
-            } else {
-                display.into_owned()
-            };
-            let _ = writeln!(
-                out,
-                "  chunk[{}]: ({} bytes) {:?}",
-                start + i,
-                chunk.len(),
-                truncated,
-            );
+    /// Content-free parser counters safe for operational logging.
+    pub fn diagnostics(&self) -> SseDiagnostics {
+        SseDiagnostics {
+            chunk_count: self.chunk_count,
+            bytes_received: self.bytes_received,
+            buffered_bytes: self.buf.len(),
+            pending_event_type_len: self.current_event.len(),
+            pending_data_len: self.current_data.len(),
         }
-        if !self.buf.is_empty() {
-            let remaining = String::from_utf8_lossy(&self.buf);
-            let _ = writeln!(
-                out,
-                "  remaining buf: ({} bytes) {:?}",
-                self.buf.len(),
-                remaining
-            );
-        }
-        out
     }
 
     /// Signal end-of-stream. Flushes any pending event even without a trailing
@@ -575,6 +541,19 @@ mod proptests {
             );
             prop_assert_eq!(&lf_events, &expected);
         }
+    }
+
+    #[test]
+    fn diagnostics_never_retain_payload_content() {
+        let secret = "Bearer SECRET_SENTINEL prompt and tool schema";
+        let wire = format!("event: error\ndata: {secret}");
+        let mut parser = SseParser::new();
+        parser.push(wire.as_bytes());
+
+        let diagnostics = parser.diagnostics();
+        assert_eq!(diagnostics.chunk_count, 1);
+        assert_eq!(diagnostics.bytes_received, wire.len());
+        assert!(!format!("{diagnostics:?}").contains("SECRET_SENTINEL"));
     }
 
     // ========================================================================

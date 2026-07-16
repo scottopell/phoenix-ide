@@ -276,7 +276,7 @@ impl StreamAccumulator {
 
     fn into_response_with_diagnostics(
         mut self,
-        diagnostics: &str,
+        diagnostics: Option<super::sse::SseDiagnostics>,
     ) -> Result<LlmResponse, LlmError> {
         // Flush any in-progress block that never received content_block_stop.
         // This happens when the stream is truncated (e.g. stop_reason=max_tokens):
@@ -410,7 +410,8 @@ pub async fn complete_streaming(
                     data_len = event.data.len(),
                     "SSE event processing failed; dumping parser diagnostics"
                 );
-                tracing::error!("{}", sse.diagnostic_dump());
+                let diagnostics = sse.diagnostics();
+                tracing::error!(?diagnostics, "SSE parser diagnostics");
                 return Err(e);
             }
             if acc.done {
@@ -420,7 +421,7 @@ pub async fn complete_streaming(
     }
 
     // Capture diagnostics before finish() consumes the parser.
-    let diagnostics = sse.diagnostic_dump();
+    let diagnostics = sse.diagnostics();
 
     // Flush any trailing event (lenient: some gateways omit final blank line)
     for event in sse.finish() {
@@ -428,7 +429,7 @@ pub async fn complete_streaming(
             .await?;
     }
 
-    acc.into_response_with_diagnostics(&diagnostics)
+    acc.into_response_with_diagnostics(Some(diagnostics))
 }
 
 /// Complete using Anthropic Messages API
@@ -721,13 +722,13 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
 
 #[allow(clippy::too_many_lines)] // single-pass per-variant mapping; splitting would add indirection without clarity
 pub(crate) fn normalize_response(resp: AnthropicResponse) -> Result<LlmResponse, LlmError> {
-    normalize_response_with_diagnostics(resp, "")
+    normalize_response_with_diagnostics(resp, None)
 }
 
 #[allow(clippy::too_many_lines)]
 fn normalize_response_with_diagnostics(
     resp: AnthropicResponse,
-    sse_diagnostics: &str,
+    sse_diagnostics: Option<super::sse::SseDiagnostics>,
 ) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
 
@@ -875,7 +876,7 @@ fn normalize_response_with_diagnostics(
     // header and returning an empty stream). Treat as a retryable server error
     // and emit SSE diagnostics to distinguish gateway bugs from client bugs.
     if !has_client_content && !end_turn {
-        if sse_diagnostics.is_empty() {
+        if sse_diagnostics.is_none() {
             tracing::warn!(
                 stop_reason = ?resp.stop_reason,
                 output_tokens = resp.usage.output_tokens,
@@ -887,7 +888,7 @@ fn normalize_response_with_diagnostics(
                 output_tokens = resp.usage.output_tokens,
                 "Anthropic returned empty content without end_turn; SSE diagnostics follow"
             );
-            tracing::error!("{}", sse_diagnostics);
+            tracing::error!(?sse_diagnostics, "Anthropic SSE ended without content");
         }
         return Err(LlmError::server_error(format!(
             "Anthropic returned empty response (no content or tool calls, stop_reason={:?}, output_tokens={})",
@@ -1121,6 +1122,7 @@ mod tests {
                 },
             ],
             max_tokens: None,
+            telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
     }
@@ -1226,6 +1228,7 @@ mod tests {
             }],
             tools: vec![],
             max_tokens: None,
+            telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };
         let req = translate_request(&spec, &request);
@@ -1306,7 +1309,7 @@ mod tests {
         .unwrap();
         acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
-        let resp = acc.into_response_with_diagnostics("").unwrap();
+        let resp = acc.into_response_with_diagnostics(None).unwrap();
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
         assert!(resp.end_turn);
@@ -1353,7 +1356,7 @@ mod tests {
         .unwrap();
         acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
-        let resp = acc.into_response_with_diagnostics("").unwrap();
+        let resp = acc.into_response_with_diagnostics(None).unwrap();
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(
             &resp.content[0],
@@ -1411,7 +1414,7 @@ mod tests {
         .unwrap();
         acc.process_event("message_stop", "{}", &tx).await.unwrap();
 
-        let resp = acc.into_response_with_diagnostics("").unwrap();
+        let resp = acc.into_response_with_diagnostics(None).unwrap();
         assert!(
             resp.content.is_empty(),
             "an orphan delta must not fabricate a content block: {:?}",

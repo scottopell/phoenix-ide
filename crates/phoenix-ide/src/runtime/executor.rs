@@ -841,6 +841,7 @@ where
         tool_use_id = %tool_use_id,
         outcome = tracing::field::Empty,
         success = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
     );
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
@@ -867,6 +868,7 @@ where
                 });
         }
         let duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        span.record("duration_ms", duration_ms);
         span.record("outcome", "completed");
         span.record("success", out.is_success());
         tracing::info!(
@@ -4306,6 +4308,12 @@ where
             }
         }
 
+        let retry_attempt = match self.state {
+            ConvState::LlmRequesting { attempt }
+            | ConvState::SeededLlmRequesting { attempt, .. } => attempt,
+            _ => 1,
+        };
+
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
@@ -4491,6 +4499,12 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
+                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                    conversation_id: conv_id.clone(),
+                    root_conversation_id: root_conv_id.clone(),
+                    request_id: request_id.clone(),
+                    retry_attempt,
+                }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
@@ -5228,6 +5242,7 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
+                telemetry: None,
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.

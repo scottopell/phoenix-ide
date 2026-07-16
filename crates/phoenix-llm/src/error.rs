@@ -91,14 +91,13 @@ impl LlmError {
     }
 
     #[must_use]
-    pub fn from_http_status(status: u16, body: &str) -> Self {
+    pub fn from_http_status(status: u16, _body: &str) -> Self {
         match status {
-            401 | 403 => Self::auth(format!("Authentication failed: {body}")),
-            429 => Self::rate_limit(format!("Rate limited: {body}")),
-            400..=499 => Self::invalid_request(format!("Bad request ({status}): {body}")),
-            500..=599 => Self::server_error(format!("Server error ({status}): {body}")),
-            // Unexpected status (1xx, 3xx, etc.) — treat as retryable server error
-            _ => Self::server_error(format!("Unexpected HTTP {status}: {body}")),
+            401 | 403 => Self::auth(format!("Authentication failed (HTTP {status})")),
+            429 => Self::rate_limit("Rate limited (HTTP 429)"),
+            400..=499 => Self::invalid_request(format!("Bad request (HTTP {status})")),
+            500..=599 => Self::server_error(format!("Server error (HTTP {status})")),
+            _ => Self::server_error(format!("Unexpected HTTP {status}")),
         }
     }
 }

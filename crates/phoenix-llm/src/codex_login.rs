@@ -286,10 +286,7 @@ pub async fn exchange_pkce_code(
         .map_err(|e| LoginError::Network(format!("read body failed: {e}")))?;
 
     if !status.is_success() {
-        // The error body may contain user-correlatable identifiers; we strip
-        // it from the surfaced message and put just the status code in the
-        // error chain. Full body is logged at debug level for operators.
-        tracing::debug!(%status, body = %body, "codex_login: token endpoint error");
+        tracing::debug!(%status, body_len = body.len(), "codex_login: token endpoint error");
         return Err(LoginError::OAuth(format!("HTTP {status}")));
     }
 
