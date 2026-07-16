@@ -325,14 +325,17 @@ describe('ConversationPage archived read-only rendering', () => {
   it('keeps commission review actions available for non-terminal narrow layouts', async () => {
     viewportFlags.isWideDesktop = false;
     renderPage(makeConversation());
-    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
-    expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
+    await waitFor(() => {
+      expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
+    });
   });
 
   it('hides commission review actions when the conversation cannot open sidepanels', async () => {
+    navStackProps.onOpenCommissionReview = vi.fn();
     renderPage(makeConversation({ archived: true }));
-    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
-    expect(navStackProps.onOpenCommissionReview).toBeUndefined();
+    await waitFor(() => {
+      expect(navStackProps.onOpenCommissionReview).toBeUndefined();
+    });
   });
 
   it('uses authoritative metadata when the cached slug owner changed', async () => {
