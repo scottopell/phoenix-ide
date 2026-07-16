@@ -278,6 +278,14 @@ THE SYSTEM SHALL include the MCP server's canonical URI as the `resource`
 parameter (RFC 8707 Resource Indicators) on both the authorization request and
 the token request, so the issued token is audience-bound to that server.
 
+WHERE an OAuth server config supplies a whitespace-delimited `scopes` string
+THE SYSTEM SHALL normalize and deduplicate that configured set and request it
+on the initial authorization. Challenge-required scopes SHALL be unioned with
+configured scopes. WHERE neither configured nor challenge-required scopes are
+present, THE SYSTEM SHALL request the protected resource metadata's advertised
+scope set as the fallback. Any prior grants carried into re-authorization SHALL
+always be unioned with that resulting set.
+
 THE SYSTEM SHALL perform this flow natively, without delegating to an external
 process such as `mcp-remote`.
 
@@ -291,8 +299,14 @@ authorization-server mix-up: a `state`-valid callback delivered from a
 different authorization server is rejected before the code reaches the token
 endpoint. Resource Indicators bind the token's
 audience to the MCP server, which compliant authorization and resource servers
-require. Performing the flow natively removes the npm/subprocess dependency and
-the browser-popup-on-every-reload behavior of the external bridge.
+require. An explicit scope set is necessary for providers whose application
+registration and authorization endpoint require the client to name its initial
+permissions; challenge and prior-grant unions prevent that configured baseline
+from suppressing resource-required permissions or losing access during step-up.
+Metadata remains the fallback so discovery-driven servers need no redundant
+configuration. Performing the flow natively removes the npm/subprocess
+dependency and the browser-popup-on-every-reload behavior of the external
+bridge.
 
 ---
 

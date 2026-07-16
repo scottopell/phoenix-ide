@@ -169,11 +169,14 @@ rule ServerDiscovered {
         -- ride every request under any scheme. OAuth is selected by the
         -- top-level oauth field (Claude Code's shape), not under auth. A config
         -- OAuth entry is NOT pre-authorized: it materializes auth_scheme =
-        -- none, so the first 401 drives the OAuth flow. A pre-configured client
-        -- (oauth.clientId) is not seeded here: the authorization server is not
-        -- named in config, so seeding waits until discovery resolves the issuer
-        -- (OAuthClientPreconfigured). start_background_discovery / connect_one
-        -- then spawns or connects (REQ-MCP-001).
+        -- none, so the first 401 drives the OAuth flow. Its optional
+        -- whitespace-delimited oauth.scopes string is normalized and retained
+        -- as configured_scopes(srv), including when no clientId is present. A
+        -- pre-configured client (oauth.clientId) is not seeded here: the
+        -- authorization server is not named in config, so seeding waits until
+        -- discovery resolves the issuer (OAuthClientPreconfigured).
+        -- start_background_discovery / connect_one then spawns or connects
+        -- (REQ-MCP-001, REQ-MCP-011).
 }
 
 -- Discovery of an HTTP server that has no config credential but DOES have a
@@ -443,9 +446,9 @@ rule OAuthClientRegistered {
         -- -> Client ID Metadata Document -> RFC 7591 dynamic client registration
         -- as the fallback. Reused across MCP servers sharing the authorization
         -- server (REQ-MCP-010). The authorization URL carries the PKCE challenge
-        -- (the client first verifies code_challenge_methods_supported) and the
-        -- RFC 8707 resource indicator; the verifier is held for the token
-        -- exchange (REQ-MCP-011).
+        -- (the client first verifies code_challenge_methods_supported), the RFC
+        -- 8707 resource indicator, and requested_scopes(srv); the verifier is
+        -- held for the token exchange (REQ-MCP-011).
 }
 
 -- The operator completed the browser authorization; exchange the code for
@@ -648,8 +651,9 @@ rule ReloadClearsHttpSession {
     ensures: srv.session_id = null
 }
 
--- Reload invalidated an OAuth server's credential: either it was repointed
--- (resource/authorization-server changed) or its config moved away from OAuth
+-- Reload invalidated an OAuth server's credential: it was repointed
+-- (resource/authorization-server changed), its configured OAuth scopes changed,
+-- or its config moved away from OAuth
 -- (to static/none) without changing the URL. Either way the stored token must
 -- not survive -- discard it and cancel any pending flow so
 -- TokenImpliesOAuthServer is not violated (REQ-MCP-011, REQ-MCP-012). The new
@@ -666,8 +670,9 @@ rule ReloadInvalidatesOAuth {
     ensures: PendingAuthorizationCancelled(srv)
 
     @guidance
-        -- oauth_invalidated_by_reload = resource_changed OR the new config no
-        -- longer selects OAuth. ReloadRestartsServer sets auth_scheme to
+        -- oauth_invalidated_by_reload = resource_changed OR configured OAuth
+        -- scopes changed OR the new config no longer selects OAuth.
+        -- ReloadRestartsServer sets auth_scheme to
         -- new_auth_scheme (none for a repointed OAuth server -> the next 401
         -- re-enters OAuthRequired; static when reconfigured to a credential).
         -- Deleting the token before that scheme change keeps AuthorizedImplies
@@ -843,7 +848,7 @@ invariant OneTokenPerServer {
 --
 -- has_preconfigured_client(srv): Bool
 --   True iff srv's config is OAuth carrying a pre-configured public client
---   (HttpAuth::OAuth(Some(PreconfiguredClient)) -- the oauth.clientId shape).
+--   (an OAuthConfig carrying a PreconfiguredClient -- the oauth.clientId shape).
 --
 -- preconfigured_client_id(srv): String
 --   The clientId from srv's config. Seeded into the OAuthRegistration (with no
@@ -869,7 +874,8 @@ invariant OneTokenPerServer {
 --
 -- oauth_invalidated_by_reload(srv): Bool
 --   True iff a reload makes srv's stored OAuth token unusable: resource_changed
---   (repoint) OR the new config no longer selects OAuth (auth mode left OAuth).
+--   (repoint), the configured OAuth scope set changed, OR the new config no
+--   longer selects OAuth (auth mode left OAuth).
 --
 -- callback_state_matches(srv, code): Bool
 --   True iff the OAuth redirect that carried `code` presented the `state`
@@ -912,12 +918,22 @@ invariant OneTokenPerServer {
 --   The secret is null for a public client; the auth method records how the
 --   client authenticates at the token endpoint (e.g. none, client_secret_post).
 --
+-- configured_scopes(srv): List<String>
+--   The normalized, deduplicated scopes from the config's optional
+--   whitespace-delimited oauth.scopes string. Empty when omitted.
+--
+-- requested_scopes(srv): List<String>
+--   The union of configured_scopes(srv) and scopes required by the current
+--   Bearer challenge. When that union is empty, the protected resource
+--   metadata's advertised scopes are used as the fallback. Prior grants carried
+--   into re-authorization are always unioned with the result.
+--
 -- authorization_url(srv): String
 --   The OAuth 2.1 authorization-code URL the operator opens in a browser,
 --   carrying the PKCE challenge (built only after confirming the authorization
 --   server advertises code_challenge_methods_supported), the RFC 8707 resource
---   indicator, and the `state` nonce. For a step-up (InsufficientScopeStepUp)
---   it requests the union of previously granted and newly challenged scopes.
+--   indicator, the `state` nonce, and requested_scopes(srv). A step-up therefore
+--   requests configured, previously granted, and newly challenged scopes.
 --
 -- exchanged_access_token(srv, code): String
 -- exchanged_refresh_token(srv, code): String?

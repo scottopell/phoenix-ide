@@ -933,11 +933,30 @@ impl McpServer {
 fn preconfigured_client_id(config: &McpServerConfig) -> Option<&str> {
     match config {
         McpServerConfig::Http {
-            auth: HttpAuth::OAuth(Some(preconfigured)),
+            auth: HttpAuth::OAuth(oauth),
             ..
-        } => Some(&preconfigured.client_id),
+        } => oauth
+            .client
+            .as_ref()
+            .map(|client| client.client_id.as_str()),
         McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
     }
+}
+
+fn oauth_config(config: &McpServerConfig) -> Option<&OAuthConfig> {
+    match config {
+        McpServerConfig::Http {
+            auth: HttpAuth::OAuth(oauth),
+            ..
+        } => Some(oauth),
+        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
+    }
+}
+
+fn configured_oauth_scopes(config: &McpServerConfig) -> &[String] {
+    oauth_config(config)
+        .map(|oauth| oauth.scopes.as_slice())
+        .unwrap_or_default()
 }
 
 /// The URL of an HTTP server whose 401s drive the OAuth flow: an explicit
@@ -1430,13 +1449,8 @@ async fn begin_oauth_flow(
     let Some(url) = oauth_resource_url(entry) else {
         return Err("server is not OAuth-eligible".to_string());
     };
-    let preconfigured = match entry {
-        McpServerConfig::Http {
-            auth: HttpAuth::OAuth(Some(pre)),
-            ..
-        } => Some(pre),
-        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
-    };
+    let configured_oauth = oauth_config(entry);
+    let preconfigured = configured_oauth.and_then(|oauth| oauth.client.as_ref());
     // A pre-registered app whose allowlist pins a fixed loopback port redirects
     // there; Phoenix bounces that callback to its own route (REQ-MCP-020).
     // Otherwise the redirect is Phoenix's own server-route callback.
@@ -1467,19 +1481,22 @@ async fn begin_oauth_flow(
     )
     .await?;
 
-    // Requested scopes: the challenge's `scope` when present, else the
-    // resource's advertised set; unioned with any prior grants (step-up,
-    // REQ-MCP-012).
-    let mut scopes: Vec<String> = challenge
+    // Configured and challenge-required scopes form the explicit request. The
+    // resource's advertised set is the fallback only when neither is present;
+    // prior grants are always unioned for step-up (REQ-MCP-011..012).
+    let mut scopes = configured_oauth
+        .map(|oauth| oauth.scopes.clone())
+        .unwrap_or_default();
+    let challenge_scopes = challenge
         .get("scope")
-        .map(|s| s.split_whitespace().map(str::to_string).collect())
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(|| prm.scopes_supported.clone());
-    for scope in extra_scopes {
-        if !scopes.contains(&scope) {
-            scopes.push(scope);
-        }
+        .map(|scope| scope.split_whitespace())
+        .into_iter()
+        .flatten();
+    extend_unique(&mut scopes, challenge_scopes);
+    if scopes.is_empty() {
+        scopes = prm.scopes_supported.clone();
     }
+    extend_unique(&mut scopes, extra_scopes.iter().map(String::as_str));
 
     let pkce = oauth::generate_pkce();
     let state_nonce = oauth::generate_state_nonce();
@@ -1756,10 +1773,12 @@ impl McpClientManager {
         // failure path discards the token and re-prompts.
         let client_id_changed =
             preconfigured_client_id(old_config) != preconfigured_client_id(new_config);
-        if !resource_matches || client_id_changed {
+        let configured_scopes_changed =
+            configured_oauth_scopes(old_config) != configured_oauth_scopes(new_config);
+        if !resource_matches || client_id_changed || configured_scopes_changed {
             tracing::info!(
                 server = %name,
-                "Reload repointed, de-OAuthed, or re-keyed this server's client; discarding its stored token"
+                "Reload repointed, de-OAuthed, re-keyed, or changed configured scopes; discarding its stored token"
             );
             if let Err(e) = self.oauth.store().delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
@@ -3088,43 +3107,70 @@ impl McpClientManager {
     /// an object without a `clientId` selects OAuth with a dynamically
     /// registered client; an object carrying `clientId` pre-configures the
     /// (public) client identity for an authorization server that disables DCR
-    /// (REQ-MCP-010). The authorization server is *not* named in config — it
-    /// is discovered from the resource's metadata. `callbackPort` is read but
-    /// ignored: Phoenix receives the redirect on its own server route, not a
-    /// throwaway localhost port. No client secret is read: the flow is
-    /// authorization-code + PKCE, a public client.
+    /// (REQ-MCP-010). A whitespace-delimited `scopes` string supplies the
+    /// initial authorization scope set (REQ-MCP-011). No client secret is read:
+    /// the flow is authorization-code + PKCE, a public client.
     fn classify_oauth_auth(name: &str, oauth_value: &Value) -> Option<HttpAuth> {
         match oauth_value {
-            Value::Bool(true) => Some(HttpAuth::OAuth(None)),
-            Value::Object(fields) => match fields.get("clientId").and_then(Value::as_str) {
-                Some(client_id) => {
-                    // A present-but-malformed callbackPort (non-integer, 0, or
-                    // out of range) would silently fall back to the server-route
-                    // redirect, which a fixed-allowlist app rejects — a confusing
-                    // failure. Treat it as an unusable config and skip the server.
-                    let callback_port = match fields.get("callbackPort") {
-                        None => None,
-                        Some(value) => match value.as_u64().and_then(|p| u16::try_from(p).ok()) {
-                            Some(port) if port != 0 => Some(port),
-                            _ => {
-                                tracing::debug!(
-                                    server = %name,
-                                    "'oauth.callbackPort' must be an integer 1-65535; skipping server"
-                                );
-                                return None;
+            Value::Bool(true) => Some(HttpAuth::OAuth(OAuthConfig::default())),
+            Value::Object(fields) => {
+                let scopes = match fields.get("scopes") {
+                    None => Vec::new(),
+                    Some(Value::String(scopes)) => {
+                        let mut parsed = Vec::new();
+                        extend_unique(&mut parsed, scopes.split_whitespace());
+                        if parsed.is_empty() {
+                            tracing::debug!(
+                                server = %name,
+                                "'oauth.scopes' must contain at least one scope; skipping server"
+                            );
+                            return None;
+                        }
+                        parsed
+                    }
+                    Some(_) => {
+                        tracing::debug!(
+                            server = %name,
+                            "'oauth.scopes' must be a whitespace-delimited string; skipping server"
+                        );
+                        return None;
+                    }
+                };
+
+                let client = match fields.get("clientId") {
+                    Some(Value::String(client_id)) if !client_id.is_empty() => {
+                        let callback_port = match fields.get("callbackPort") {
+                            None => None,
+                            Some(value) => {
+                                match value.as_u64().and_then(|p| u16::try_from(p).ok()) {
+                                    Some(port) if port != 0 => Some(port),
+                                    _ => {
+                                        tracing::debug!(
+                                            server = %name,
+                                            "'oauth.callbackPort' must be an integer 1-65535; skipping server"
+                                        );
+                                        return None;
+                                    }
+                                }
                             }
-                        },
-                    };
-                    Some(HttpAuth::OAuth(Some(PreconfiguredClient {
-                        client_id: client_id.to_string(),
-                        callback_port,
-                    })))
-                }
-                // An object with no clientId (e.g. only callbackPort/scopes):
-                // OAuth via dynamic client registration, where DCR registers
-                // Phoenix's own callback, so a fixed loopback port is moot.
-                None => Some(HttpAuth::OAuth(None)),
-            },
+                        };
+                        Some(PreconfiguredClient {
+                            client_id: client_id.clone(),
+                            callback_port,
+                        })
+                    }
+                    Some(_) => {
+                        tracing::debug!(
+                            server = %name,
+                            "'oauth.clientId' must be a non-empty string; skipping server"
+                        );
+                        return None;
+                    }
+                    None => None,
+                };
+
+                Some(HttpAuth::OAuth(OAuthConfig { client, scopes }))
+            }
             Value::Null
             | Value::Bool(false)
             | Value::Number(_)
@@ -3736,6 +3782,14 @@ impl McpServerConfig {
     }
 }
 
+fn extend_unique<'a>(target: &mut Vec<String>, scopes: impl IntoIterator<Item = &'a str>) {
+    for scope in scopes {
+        if !target.iter().any(|existing| existing == scope) {
+            target.push(scope.to_string());
+        }
+    }
+}
+
 /// Auth credential for an HTTP server, distinct from the generic `headers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpAuth {
@@ -3744,9 +3798,9 @@ pub enum HttpAuth {
     /// An explicit config credential; a 401 against it is a hard failure,
     /// never an OAuth flow (REQ-MCP-008).
     Static(StaticCred),
-    /// OAuth 2.1; the client identity may be pre-configured for an
-    /// authorization server that disables dynamic client registration.
-    OAuth(Option<PreconfiguredClient>),
+    /// OAuth 2.1 configuration, including an optional pre-configured client
+    /// identity and the initial scopes requested from the operator.
+    OAuth(OAuthConfig),
 }
 
 /// An explicit, config-supplied auth credential (REQ-MCP-008).
@@ -3756,6 +3810,15 @@ pub enum StaticCred {
     /// Designated auth headers (e.g. an API-key header), NOT the generic
     /// per-request `headers`.
     Headers(HashMap<String, String>),
+}
+
+/// Operator-supplied OAuth behavior from the top-level `oauth` config object.
+/// Keeping client identity and initial scopes in one typed value makes dropping
+/// either field during config discovery impossible.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub client: Option<PreconfiguredClient>,
+    pub scopes: Vec<String>,
 }
 
 /// A pre-configured public OAuth client for an authorization server that
@@ -3888,15 +3951,15 @@ mod tests {
                 Some(McpServerConfig::Http {
                     url: "https://example.com/mcp".to_string(),
                     headers: HashMap::new(),
-                    auth: HttpAuth::OAuth(None),
+                    auth: HttpAuth::OAuth(OAuthConfig::default()),
                 }),
                 "oauth = {oauth_value} must select dynamic-client OAuth"
             );
         }
 
         // Pre-configured client for a DCR-less authorization server: `clientId`
-        // names the pre-registered app; the authorization server and the
-        // client secret are not in config (discovered / from the environment).
+        // names the pre-registered public app; the authorization server is
+        // discovered and no client secret is accepted.
         let preconfigured = serde_json::json!({
             "type": "http",
             "url": "https://example.com/mcp",
@@ -3907,10 +3970,58 @@ mod tests {
             Some(McpServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
-                auth: HttpAuth::OAuth(Some(PreconfiguredClient {
-                    client_id: "cid-1".to_string(),
-                    callback_port: Some(3118),
-                })),
+                auth: HttpAuth::OAuth(OAuthConfig {
+                    client: Some(PreconfiguredClient {
+                        client_id: "cid-1".to_string(),
+                        callback_port: Some(3118),
+                    }),
+                    scopes: Vec::new(),
+                }),
+            })
+        );
+
+        let configured_scopes = serde_json::json!({
+            "type": "http",
+            "url": "https://mcp.slack.com/mcp",
+            "oauth": {
+                "clientId": "1601185624273.8899143856786",
+                "callbackPort": 3118,
+                "scopes": "channels:history  groups:history channels:history chat:write"
+            },
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("slack", &configured_scopes),
+            Some(McpServerConfig::Http {
+                url: "https://mcp.slack.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::OAuth(OAuthConfig {
+                    client: Some(PreconfiguredClient {
+                        client_id: "1601185624273.8899143856786".to_string(),
+                        callback_port: Some(3118),
+                    }),
+                    scopes: vec![
+                        "channels:history".to_string(),
+                        "groups:history".to_string(),
+                        "chat:write".to_string(),
+                    ],
+                }),
+            })
+        );
+
+        let dynamic_with_scopes = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "oauth": {"scopes": "read write"},
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("dynamic", &dynamic_with_scopes),
+            Some(McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::OAuth(OAuthConfig {
+                    client: None,
+                    scopes: vec!["read".to_string(), "write".to_string()],
+                }),
             })
         );
 
@@ -3929,6 +4040,26 @@ mod tests {
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
             })
         );
+    }
+
+    #[test]
+    fn classify_oauth_rejects_malformed_scopes() {
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!([]),
+            serde_json::json!(42),
+        ] {
+            let cfg = serde_json::json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "oauth": {"scopes": bad},
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &cfg),
+                None,
+                "scopes {bad} must skip the server"
+            );
+        }
     }
 
     #[test]

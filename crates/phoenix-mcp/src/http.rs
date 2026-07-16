@@ -1836,9 +1836,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let _mcp = connect_http_managed(&manager, &server, HttpAuth::OAuth(None))
-            .await
-            .expect("connect");
+        let _mcp = connect_http_managed(
+            &manager,
+            &server,
+            HttpAuth::OAuth(crate::OAuthConfig::default()),
+        )
+        .await
+        .expect("connect");
 
         wait_for("a GET stream request", || {
             !server.get_requests.lock().unwrap().is_empty()
@@ -3421,6 +3425,9 @@ mod tests {
         assert!(manager.servers.read().await.is_empty());
     }
 
+    // One end-to-end lifecycle: trigger step-up, inspect the union, complete
+    // authorization, and prove the held call replays with the upgraded token.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn insufficient_scope_steps_up_with_union_and_replays_the_call() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
@@ -3444,9 +3451,16 @@ mod tests {
             ))
             .await
             .unwrap();
-        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
-            .await
-            .expect("connect");
+        let mcp = connect_http_managed(
+            &manager,
+            &server,
+            HttpAuth::OAuth(crate::OAuthConfig {
+                client: None,
+                scopes: vec!["configured".to_string()],
+            }),
+        )
+        .await
+        .expect("connect");
         manager
             .servers
             .write()
@@ -3490,8 +3504,8 @@ mod tests {
             .map(|s| s.split(' ').collect())
             .unwrap_or_default();
         assert!(
-            scopes.contains(&"read") && scopes.contains(&"write"),
-            "step-up must request the union of prior and challenged scopes, got: {scopes:?}"
+            scopes.contains(&"configured") && scopes.contains(&"read") && scopes.contains(&"write"),
+            "step-up must request configured, prior, and challenged scopes, got: {scopes:?}"
         );
         // The narrow token is gone before re-authorization (OneTokenPerServer).
         assert!(manager
@@ -3634,10 +3648,16 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         // The authorization server is discovered from the resource metadata;
         // the pre-configured client is seeded under that issuer post-discovery.
-        let auth = HttpAuth::OAuth(Some(crate::PreconfiguredClient {
-            client_id: "pre-1".to_string(),
-            callback_port: None,
-        }));
+        let auth = HttpAuth::OAuth(crate::OAuthConfig {
+            client: Some(crate::PreconfiguredClient {
+                client_id: "pre-1".to_string(),
+                callback_port: None,
+            }),
+            scopes: vec![
+                "configured.read".to_string(),
+                "configured.write".to_string(),
+            ],
+        });
         connect_http_managed(&manager, &server, auth)
             .await
             .err()
@@ -3651,6 +3671,11 @@ mod tests {
             "the pre-configured client must be reused (OAuthClientReused)"
         );
         assert!(server.recorded_for_path("/register").is_empty());
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some("configured.read configured.write"),
+            "configured scopes must override the protected-resource fallback"
+        );
     }
 
     #[tokio::test]
@@ -3838,10 +3863,13 @@ mod tests {
         let preconfigured = |client_id: &str| McpServerConfig::Http {
             url: server.url.clone(),
             headers: HashMap::new(),
-            auth: HttpAuth::OAuth(Some(crate::PreconfiguredClient {
-                client_id: client_id.to_string(),
-                callback_port: None,
-            })),
+            auth: HttpAuth::OAuth(crate::OAuthConfig {
+                client: Some(crate::PreconfiguredClient {
+                    client_id: client_id.to_string(),
+                    callback_port: None,
+                }),
+                scopes: Vec::new(),
+            }),
         };
         let mcp = McpClientManager::connect_one(
             "remote",
@@ -3882,6 +3910,69 @@ mod tests {
         let last_init = requests
             .iter()
             .rfind(|r| r.rpc_method() == "initialize")
+            .expect("restart initialize");
+        assert_eq!(last_init.header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn reload_configured_scope_change_discards_the_stored_token() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let configured = |scope: &str| McpServerConfig::Http {
+            url: server.url.clone(),
+            headers: HashMap::new(),
+            auth: HttpAuth::OAuth(crate::OAuthConfig {
+                client: None,
+                scopes: vec![scope.to_string()],
+            }),
+        };
+        let mcp = McpClientManager::connect_one(
+            "remote",
+            &configured("read"),
+            Arc::clone(&manager.pending_oauth_urls),
+            Arc::clone(&manager.oauth),
+        )
+        .await
+        .expect("connect with restored token");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), configured("write"))])
+            .await;
+
+        assert_eq!(result.restarted, vec!["remote"]);
+        assert!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "changed configured scopes must discard the stored token"
+        );
+        let requests = server.requests.lock().unwrap();
+        let last_init = requests
+            .iter()
+            .rfind(|request| request.rpc_method() == "initialize")
             .expect("restart initialize");
         assert_eq!(last_init.header("authorization"), None);
     }
