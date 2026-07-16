@@ -481,8 +481,10 @@ struct TreeEntry {
 }
 
 fn tree_index(repo_root: &Path, reference: &str) -> HashMap<String, TreeEntry> {
-    let Ok(listing) = run_git_bytes(repo_root, &["ls-tree", "-rz", "--full-tree", reference])
-    else {
+    let Ok(listing) = run_git_bytes(
+        repo_root,
+        &["ls-tree", "-r", "-z", "--full-tree", reference],
+    ) else {
         return HashMap::new();
     };
     listing
@@ -730,6 +732,23 @@ mod tests {
                 panic!("working dir should see untracked file")
             }
         }
+    }
+
+    #[test]
+    fn tree_index_recurses_to_nested_skill_metadata() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let tree = tree_index(repo.path(), "main");
+        assert!(tree.contains_key(".agents/skills/review/SKILL.md"));
     }
 
     #[test]
