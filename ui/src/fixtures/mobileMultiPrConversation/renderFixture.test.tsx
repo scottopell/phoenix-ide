@@ -43,10 +43,9 @@ describe('MobileMultiPrConversationFixture', () => {
       expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
     });
 
-    expect(screen.getByTestId('view-active-pr-diff-button')).toHaveTextContent('PR #423 Diff');
-    expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #423 feedback');
-    expect(screen.getByTestId('open-pr-link')).toHaveTextContent('Open PR #423');
-    expect(screen.queryByTestId('active-pr-ambiguity-note')).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address 2 new feedback on PR #423');
+    expect(screen.getByRole('button', { name: 'Work details' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Workspace diff')).not.toBeInTheDocument();
   });
 
   it('shows new comments on an open branch alongside a closed-unmerged sibling branch', async () => {
@@ -62,10 +61,25 @@ describe('MobileMultiPrConversationFixture', () => {
       expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
     });
 
-    expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #423 feedback3 new');
-    expect(screen.getByTestId('merge-pr-link')).toHaveTextContent('Merge on GitHub #423');
-    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 1 open/draft · 1 closed');
-    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address 3 new feedback on PR #423');
+    expect(screen.getByRole('button', { name: 'Work details' })).toBeInTheDocument();
+    expect(screen.queryByText('Associated PRs: 1 open/draft · 1 closed')).not.toBeInTheDocument();
+  });
+
+  it('renders closed branch history as structured non-interactive sheet content', async () => {
+    setMobileViewport();
+    const scenario = getMobileMultiPrConversationScenario('mixed-branch-work-sheet');
+    render(<MobileMultiPrConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
+    });
+
+    const closedHistory = screen.getByText('closed').closest('.mobile-work-pr');
+    expect(closedHistory).toHaveTextContent('#417 Add durable multi-PR conversation association');
+    expect(closedHistory).toHaveTextContent('feature/multi-pr-association → main');
+    expect(closedHistory?.tagName).toBe('DIV');
+    expect(screen.getByRole('button', { name: /#423 Follow up with mobile active-PR selection/ })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('renders the production mobile StateBar with the two-PR chooser open', async () => {
@@ -78,15 +92,10 @@ describe('MobileMultiPrConversationFixture', () => {
     });
 
     expect(screen.getByLabelText('Collapse status bar')).toBeInTheDocument();
-    expect(screen.getByTestId('view-diff-button')).toHaveTextContent('Workspace Diff');
-    expect(screen.getByTestId('active-pr-ambiguity-note')).toHaveTextContent('Multiple actionable PRs');
-    expect(screen.queryByTestId('view-active-pr-diff-button')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.getByTestId('active-pr-ambiguity-label')).toHaveTextContent('Multiple actionable PRs');
-    expect(screen.getByTestId('active-pr-choice-417')).toHaveTextContent('Add durable multi-PR conversation association');
-    expect(screen.getByTestId('active-pr-choice-423')).toHaveTextContent('Follow up with mobile active-PR selection');
-    expect(screen.getAllByRole('menuitemradio')).toHaveLength(2);
-    expect(screen.queryByText('Active')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#417 Add durable multi-PR conversation association/ })).toHaveTextContent('feature/multi-pr-association → main');
+    expect(screen.getByRole('button', { name: /#423 Follow up with mobile active-PR selection/ })).toHaveTextContent('feature/mobile-pr-selector → feature/multi-pr-association');
+    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
   });
 });

@@ -37,13 +37,13 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
       return;
     }
 
-    const chooser = stateBar.querySelector<HTMLButtonElement>('[data-testid="active-pr-selector-trigger"]');
-    if (scenario.chooserOpen && chooser?.getAttribute('aria-expanded') !== 'true') {
-      chooser?.click();
+    const workDetails = document.querySelector<HTMLButtonElement>('.mobile-work-sheet-trigger');
+    if (scenario.chooserOpen && workDetails?.getAttribute('aria-expanded') !== 'true') {
+      workDetails?.click();
       return;
     }
 
-    if (scenario.chooserOpen && !stateBar.querySelector('[aria-label="Active pull request choices"]')) return;
+    if (scenario.chooserOpen && !document.querySelector('[role="dialog"][aria-modal="true"]')) return;
 
     document.documentElement.dataset['mobileMultiPrConversationFixtureReady'] = scenario.id;
     observer?.disconnect();
@@ -61,7 +61,7 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
 
 export function MobileMultiPrConversationFixture({ scenario }: Props) {
   const prStatusHandle = useMemo<ConversationPrStatusHandle>(() => {
-    if (scenario.id === 'mixed-branch-history') {
+    if (scenario.id === 'mixed-branch-history' || scenario.id === 'mixed-branch-work-sheet') {
       return {
         state: { status: 'ready', prStatus: mobileMixedBranchStatus },
         refresh: async () => mobileMixedBranchStatus,

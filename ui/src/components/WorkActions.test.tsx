@@ -1135,3 +1135,130 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     });
   });
 });
+
+describe('WorkControlBar — mobile work dialog (REQ-WAB-011)', () => {
+  const enableMobile = () => {
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: query === '(max-width: 768px)',
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+  };
+
+  it('renders only one contextual work verb persistently and discloses secondary actions', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_freshness: { state: 'new', count: 3 },
+      feedback_status: 'open',
+      selection: selection(),
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address 3 new feedback on PR #12');
+    expect(screen.queryByText('Workspace diff')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Work details' }));
+    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toBeInTheDocument();
+  });
+
+  it('requires explicit selection for ambiguous PRs and pins through the shared handle', async () => {
+    enableMobile();
+    const ambiguousSelection: AssociatedPrStatusEnvelope = {
+      associated_prs: [
+        ...selection().associated_prs,
+        {
+          ...selection().associated_prs[0]!,
+          pr_number: 13,
+          title: 'Second PR',
+          url: 'https://github.com/o/r/pull/13',
+          head: 'task-124',
+        },
+      ],
+    };
+    const pinActivePr = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({ found: false, selection: ambiguousSelection }, { pinActivePr });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-ambiguous"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Choose active PR · 2 open' })).toBeInTheDocument();
+    expect(pinActivePr).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Choose active PR · 2 open' }));
+    fireEvent.click(screen.getByRole('button', { name: /#13 Second PR/ }));
+    await waitFor(() => expect(pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 13 }));
+  });
+
+  it('keeps the chooser open and reports a failed active-PR mutation', async () => {
+    enableMobile();
+    const ambiguousSelection: AssociatedPrStatusEnvelope = {
+      associated_prs: [
+        ...selection().associated_prs,
+        { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+      ],
+    };
+    const pinActivePr = vi.fn().mockRejectedValue(new Error('Could not save selection'));
+    const handle = prStatusHandle({ found: false, selection: ambiguousSelection }, { pinActivePr });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-pin-error"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Choose active PR · 2 open' }));
+    fireEvent.click(screen.getByRole('button', { name: /#13 Second PR/ }));
+    expect(await screen.findByText('Could not save selection')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
+  });
+
+  it('closes on Escape and restores focus to the disclosure trigger', async () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-focus"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+    const trigger = screen.getByRole('button', { name: 'Work details' });
+    fireEvent.click(trigger);
+    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Work details' })).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+  });
+});

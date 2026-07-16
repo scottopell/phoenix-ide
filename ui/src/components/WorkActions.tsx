@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
+import { useIsMobile } from '../hooks';
+import './WorkActions.css';
 
 interface WorkControlBarProps {
   conversationId: string;
@@ -115,6 +117,12 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
+  const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
+  const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
+  const isMobile = useIsMobile();
+  const mobileSheetTitleId = useId();
+  const mobileSheetRef = useRef<HTMLDivElement>(null);
+  const mobileSheetTriggerRef = useRef<HTMLButtonElement>(null);
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
@@ -187,6 +195,95 @@ export function WorkControlBar({
     return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
   }, [actionablePrs, associatedPrs]);
 
+  useEffect(() => {
+    if (!mobileSheetOpen) return;
+    const dialog = mobileSheetRef.current;
+    const trigger = mobileSheetTriggerRef.current;
+    const focusable = dialog?.querySelector<HTMLElement>('button:not([disabled]), a[href]');
+    (focusable ?? dialog)?.focus();
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileSheetOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+      const items = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), a[href]')];
+      if (items.length === 0) return;
+      const first = items[0]!;
+      const last = items[items.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    const onFocusIn = (event: FocusEvent) => {
+      if (dialog && event.target instanceof Node && !dialog.contains(event.target)) {
+        (dialog.querySelector<HTMLElement>('button:not([disabled]), a[href]') ?? dialog).focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('focusin', onFocusIn);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('focusin', onFocusIn);
+      document.body.style.overflow = previousOverflow;
+      trigger?.focus();
+    };
+  }, [mobileSheetOpen]);
+
+  const handleCleanUp = async () => {
+    setError(null);
+    setMarkingMerged(true);
+    try {
+      if (!(await terminalActionStillSafe())) return;
+      await api.markMerged(conversationId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to mark as merged');
+    } finally {
+      setMarkingMerged(false);
+    }
+  };
+
+  const handleAbandon = async () => {
+    const confirmText = isBranch
+      ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
+      : 'Abandon this task? The worktree and task branch will be deleted.';
+    if (!window.confirm(confirmText)) return;
+    setError(null);
+    setAbandoning(true);
+    try {
+      if (!(await terminalActionStillSafe())) return;
+      await api.abandonTask(conversationId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to abandon task');
+    } finally {
+      setAbandoning(false);
+    }
+  };
+
+  const selectMobilePr = async (pr: (typeof associatedPrs)[number]) => {
+    if (!prStatusHandle.pinActivePr) return;
+    const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+    setSavingPrIdentity(identity);
+    setError(null);
+    try {
+      await prStatusHandle.pinActivePr({
+        repo_owner: pr.repo_owner,
+        repo_name: pr.repo_name,
+        pr_number: pr.pr_number,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to select active PR');
+    } finally {
+      setSavingPrIdentity(null);
+    }
+  };
+
   if (!disposition.visible) return null;
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
@@ -208,6 +305,157 @@ export function WorkControlBar({
   const addressFeedbackAriaLabel = canShowPrDiff
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
+
+  if (isMobile) {
+    const openSheet = () => setMobileSheetOpen(true);
+    const mobilePrimary = prStatusHandle.ambiguous && actionablePrs.length > 1 ? (
+      <button type="button" className="mobile-work-primary work-actions-btn--primary" onClick={openSheet}>
+        Choose active PR · {actionablePrs.length} open
+      </button>
+    ) : disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
+      <button
+        type="button"
+        className="mobile-work-primary work-actions-btn--primary"
+        data-testid="mobile-primary-address-feedback"
+        disabled={capturing}
+        onClick={handleAddressFeedback}
+      >
+        {capturing ? `Capturing ${activePrLabel}…` : `Address ${freshnessLabel ?? ''} feedback on ${activePrLabel}`.replace('  ', ' ')}
+      </button>
+    ) : disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' ? (
+      <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+    ) : disposition.primary === 'review' ? (
+      <button type="button" className="mobile-work-primary work-actions-btn--primary" onClick={() => openDiffFullscreen('workspace')}>
+        Review workspace changes
+      </button>
+    ) : disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
+      <button type="button" className="mobile-work-primary work-actions-btn--primary" disabled={isLoading} onClick={handleCleanUp}>
+        {markingMerged ? 'Cleaning…' : 'Clean up'}
+      </button>
+    ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
+      <button type="button" className="mobile-work-primary work-actions-btn--primary" disabled={isLoading} onClick={handleAbandon}>
+        {abandoning ? 'Abandoning…' : 'Abandon'}
+      </button>
+    ) : null;
+
+    return (
+      <div className="mobile-work-controls" data-testid="mobile-work-controls">
+        <div className="mobile-work-rail">
+          {mobilePrimary}
+          <button
+            ref={mobileSheetTriggerRef}
+            type="button"
+            className="mobile-work-sheet-trigger"
+            aria-haspopup="dialog"
+            aria-expanded={mobileSheetOpen}
+            onClick={openSheet}
+          >
+            Work details
+          </button>
+        </div>
+        {error && <div className="work-actions-error">{error}</div>}
+        {mobileSheetOpen && (
+          <div className="mobile-work-sheet-backdrop" onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setMobileSheetOpen(false);
+          }}>
+            <div
+              ref={mobileSheetRef}
+              className="mobile-work-sheet"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby={mobileSheetTitleId}
+              tabIndex={-1}
+            >
+              <header className="mobile-work-sheet-header">
+                <div>
+                  <h2 id={mobileSheetTitleId}>Work details</h2>
+                  <p>{activePr ? `${activePrLabel} · ${activePr.head}` : `${associatedPrs.length} associated PRs`}</p>
+                </div>
+                <button type="button" className="mobile-work-sheet-close" aria-label="Close work details" onClick={() => setMobileSheetOpen(false)}>×</button>
+              </header>
+
+              {associatedPrs.length > 0 && (
+                <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-prs`}>
+                  <h3 id={`${mobileSheetTitleId}-prs`}>Pull requests</h3>
+                  {prStatusHandle.ambiguous && <p className="mobile-work-sheet-guidance">Choose one open PR to enable PR-specific actions.</p>}
+                  <div className="mobile-work-pr-list">
+                    {associatedPrs.map((pr) => {
+                      const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+                      const selected = activePr?.pr_number === pr.pr_number && activePr.repo_owner === pr.repo_owner && activePr.repo_name === pr.repo_name;
+                      const actionable = pr.display_state === 'open' || pr.display_state === 'draft';
+                      const content = (
+                        <>
+                          <span className="mobile-work-pr-title">#{pr.pr_number} {pr.title}</span>
+                          <span className="mobile-work-pr-meta">{pr.head} → {pr.base}</span>
+                          <span className="mobile-work-pr-state">{pr.display_state}{selected ? ' · active' : ''}{savingPrIdentity === identity ? ' · saving…' : ''}</span>
+                        </>
+                      );
+                      return actionable ? (
+                        <button
+                          key={identity}
+                          type="button"
+                          className={`mobile-work-pr${selected ? ' mobile-work-pr--active' : ''}`}
+                          aria-pressed={selected}
+                          disabled={savingPrIdentity !== null}
+                          onClick={() => selectMobilePr(pr)}
+                        >
+                          {content}
+                        </button>
+                      ) : (
+                        <div key={identity} className="mobile-work-pr mobile-work-pr--history">
+                          {content}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-review`}>
+                <h3 id={`${mobileSheetTitleId}-review`}>Review</h3>
+                <button type="button" className="mobile-work-sheet-action" onClick={() => openDiffFullscreen('workspace')}>Workspace diff</button>
+                {canShowPrDiff && <button type="button" className="mobile-work-sheet-action" onClick={() => openDiffFullscreen('active_pr')}>{activePrLabel} diff</button>}
+              </section>
+
+              {disposition.resolve && !prStatusHandle.ambiguous && (
+                <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-resolve`}>
+                  <h3 id={`${mobileSheetTitleId}-resolve`}>Pull request</h3>
+                  {disposition.resolve.kind === 'address_feedback' && prSpecificActionsEnabled ? (
+                    <button type="button" className="mobile-work-sheet-action mobile-work-sheet-action--primary" disabled={capturing} onClick={handleAddressFeedback}>
+                      {addressFeedbackLabel}{freshnessLabel ? ` · ${freshnessLabel}` : ''}
+                    </button>
+                  ) : disposition.resolve.kind !== 'address_feedback' ? (
+                    <ResolveLink verb={disposition.resolve} primary={false} coverageMarker={coverageMarker} />
+                  ) : null}
+                  {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+                    <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
+                  )}
+                </section>
+              )}
+
+              {(disposition.showCleanUp || disposition.showAbandon) && !cleanupBlockedByAmbiguity && (
+                <section className="mobile-work-sheet-section mobile-work-sheet-section--finish" aria-labelledby={`${mobileSheetTitleId}-finish`}>
+                  <h3 id={`${mobileSheetTitleId}-finish`}>Finish</h3>
+                  {disposition.showCleanUp && (
+                    <div className="mobile-work-finish-action">
+                      <button type="button" className="mobile-work-sheet-action" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
+                      <p>{cleanUpHintText(isBranch)}</p>
+                    </div>
+                  )}
+                  {disposition.showAbandon && (
+                    <div className="mobile-work-finish-action">
+                      <button type="button" className="mobile-work-sheet-action mobile-work-sheet-action--danger" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
+                      <p>{abandonHintText(isBranch)}</p>
+                    </div>
+                  )}
+                </section>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="work-actions-bar">
@@ -280,18 +528,7 @@ export function WorkControlBar({
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
               data-testid="clean-up-button"
               disabled={isLoading}
-              onClick={async () => {
-                setError(null);
-                setMarkingMerged(true);
-                try {
-                  if (!(await terminalActionStillSafe())) return;
-                  await api.markMerged(conversationId);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to mark as merged');
-                } finally {
-                  setMarkingMerged(false);
-                }
-              }}
+              onClick={handleCleanUp}
             >
               {markingMerged ? 'Cleaning...' : 'Clean up'}
             </button>
@@ -304,22 +541,7 @@ export function WorkControlBar({
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
               data-testid="abandon-button"
               disabled={isLoading}
-              onClick={async () => {
-                const confirmText = isBranch
-                  ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-                  : 'Abandon this task? The worktree and task branch will be deleted.';
-                if (!window.confirm(confirmText)) return;
-                setError(null);
-                setAbandoning(true);
-                try {
-                  if (!(await terminalActionStillSafe())) return;
-                  await api.abandonTask(conversationId);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to abandon task');
-                } finally {
-                  setAbandoning(false);
-                }
-              }}
+              onClick={handleAbandon}
             >
               {abandoning ? 'Abandoning...' : 'Abandon'}
             </button>

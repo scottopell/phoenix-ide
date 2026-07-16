@@ -4,6 +4,7 @@ export const mobileMultiPrConversationScenarioDefinitions = [
   { id: 'chooser-open', title: 'Two open PR choices', expanded: true, chooserOpen: true },
   { id: 'active-pr-actions', title: 'Work Actions for one active PR', expanded: false, chooserOpen: false },
   { id: 'mixed-branch-history', title: 'Open PR with new comments and closed sibling branch', expanded: false, chooserOpen: false },
+  { id: 'mixed-branch-work-sheet', title: 'Work sheet with open and closed branch history', expanded: false, chooserOpen: true },
 ] as const;
 
 export type MobileMultiPrConversationScenarioId =

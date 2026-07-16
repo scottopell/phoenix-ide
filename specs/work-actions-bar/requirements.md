@@ -50,9 +50,9 @@ is live, and the bar's verbs have no meaning outside Work and Branch.
 
 ---
 
-### REQ-WAB-002: Three-Zone Layout
+### REQ-WAB-002: Responsive Three-Zone Presentation
 
-THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
+THE SYSTEM SHALL organize available work actions into three logical zones:
 
 **REVIEW zone** — always present when the bar is visible:
 - `View Diff` — opens the diff viewer through the viewer slot (REQ-VS-003, fullscreen
@@ -74,6 +74,17 @@ THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
 - One of the two terminal verbs may be suppressed in specific `WorkDisposition` cases
   (REQ-WAB-004).
 
+WHEN the conversation is presented in a narrow mobile viewport
+THE SYSTEM SHALL preserve the same zone membership and `WorkDisposition` semantics while
+rendering at most the single primary verb in persistent conversation chrome.
+THE SYSTEM SHALL make the other present verbs available through one viewport-bound work-actions
+dialog, and SHALL NOT require the transcript to surrender its primary viewport area to a wrapped
+multi-row action bar.
+
+The mobile dialog SHALL use the same explicit active PR and the same derived disposition as the
+persistent primary. Moving a verb into the dialog changes only its presentation: it does not
+change whether the verb is present, primary, legal, or which PR it targets.
+
 ---
 
 ### REQ-WAB-003: Single Primary Across the Entire Bar
@@ -94,6 +105,10 @@ A RESOLVE disposition may additionally carry a single **secondary** link-out (th
 `Merge on GitHub #N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
 the primary and never glows; it exists only alongside an `address_feedback` primary. This does
 not violate the single-primary rule: there is still exactly one glowing button.
+
+On mobile, the primary verb remains the sole emphasized work verb even when it is rendered in
+persistent chrome and repeated inside the work-actions dialog for complete grouped access. The
+dialog trigger is disclosure, not a second work verb or primary.
 
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
 presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
@@ -265,6 +280,26 @@ AND SHALL show a muted inline note: "Continued — actions belong on the continu
 The continuation is the live conversation; any terminal decision belongs there. bedrock
 REQ-BED-031 also forbids terminal actions on a context-exhausted parent that has a
 continuation, so the suppressed bar matches the server-side legality gate.
+
+---
+
+### REQ-WAB-011: Mobile Work-Actions Dialog
+
+WHEN secondary work actions are disclosed on mobile
+THE SYSTEM SHALL render one modal work-actions dialog that:
+
+- is bounded to the viewport and scrolls internally without horizontal overflow;
+- moves focus into the dialog on open and restores focus to its trigger on close;
+- can be dismissed with an explicit close control, Escape, or the backdrop;
+- presents active-PR selection, REVIEW, RESOLVE, and FINISH controls as distinct semantic groups;
+- uses touch targets of at least 44 CSS pixels for interactive controls;
+- represents associated PR history as structured PR identity, branch, and state rather than as
+  the authority for active selection; and
+- keeps ambiguous PR-specific verbs unavailable until the user explicitly selects an actionable
+  PR through `pr-association`.
+
+The dialog SHALL NOT store a parallel active PR, infer by recency, or reinterpret a compatibility
+primary-PR projection as authoritative.
 
 ---
 

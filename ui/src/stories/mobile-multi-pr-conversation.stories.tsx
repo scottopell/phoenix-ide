@@ -25,3 +25,6 @@ ActivePrActions.storyName = 'active-pr-actions';
 
 export const MixedBranchHistory = storyFor('mixed-branch-history');
 MixedBranchHistory.storyName = 'mixed-branch-history';
+
+export const MixedBranchWorkSheet = storyFor('mixed-branch-work-sheet');
+MixedBranchWorkSheet.storyName = 'mixed-branch-work-sheet';
