@@ -331,17 +331,7 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
 
     let tree = tree_index(repo_root, reference);
     let symlinks = read_symlink_targets(repo_root, &tree);
-    let mut catalog_roots = vec![".claude/skills".to_string(), ".agents/skills".to_string()];
-    catalog_roots.extend(tree.keys().filter_map(|path| {
-        let top = validated_tree_components(path)?.first()?.to_string();
-        Some(format!("{top}/.claude/skills"))
-    }));
-    catalog_roots.extend(tree.keys().filter_map(|path| {
-        let top = validated_tree_components(path)?.first()?.to_string();
-        Some(format!("{top}/.agents/skills"))
-    }));
-    catalog_roots.sort();
-    catalog_roots.dedup();
+    let catalog_roots = skill_catalog_roots(tree.keys().map(String::as_str));
 
     let mut materialized_metadata = HashSet::new();
     for logical_root in catalog_roots {
@@ -364,6 +354,25 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         dir: temp.path().to_path_buf(),
         _temp: Some(temp),
     }
+}
+
+fn skill_catalog_roots<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let top_level_projects: HashSet<&str> = paths
+        .filter_map(|path| {
+            let components = validated_tree_components(path)?;
+            let project = *components.first()?;
+            (components.len() > 1 && !matches!(project, ".claude" | ".agents")).then_some(project)
+        })
+        .collect();
+    let mut roots = vec![".claude/skills".to_string(), ".agents/skills".to_string()];
+    roots.extend(top_level_projects.into_iter().flat_map(|project| {
+        [
+            format!("{project}/.claude/skills"),
+            format!("{project}/.agents/skills"),
+        ]
+    }));
+    roots.sort();
+    roots
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -721,6 +730,29 @@ mod tests {
                 panic!("working dir should see untracked file")
             }
         }
+    }
+
+    #[test]
+    fn skill_catalog_roots_are_bounded_by_unique_top_level_projects() {
+        let paths = [
+            "service-a/src/one.rs",
+            "service-a/src/two.rs",
+            "service-a/tests/three.rs",
+            "service-b/src/one.rs",
+            ".agents/skills/review/SKILL.md",
+            "README.md",
+        ];
+        assert_eq!(
+            skill_catalog_roots(paths.into_iter()),
+            [
+                ".agents/skills",
+                ".claude/skills",
+                "service-a/.agents/skills",
+                "service-a/.claude/skills",
+                "service-b/.agents/skills",
+                "service-b/.claude/skills",
+            ]
+        );
     }
 
     #[test]
