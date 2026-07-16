@@ -1,0 +1,158 @@
+From 7acdec72170bc30b4924d1971fd171085e5a13f4 Mon Sep 17 00:00:00 2001
+From: Scott Opell <me@scottopell.com>
+Date: Thu, 16 Jul 2026 16:36:11 -0400
+Subject: [PATCH] perf: coalesce concurrent file hashing
+
+---
+ src/daemon.rs | 114 ++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 91 insertions(+), 23 deletions(-)
+
+diff --git a/src/daemon.rs b/src/daemon.rs
+index b4e12ba..10cd261 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -1057,6 +1057,15 @@ pub(crate) struct Daemon {
+     transfer_counters: TransferCounters,
+     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
+     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
++    file_hash_flights: Arc<Mutex<HashMap<FileHashCacheKey, Arc<FileHashFlight>>>>,
++}
++
++type SharedFileHashResult = Result<(String, bool, u64), String>;
++
++#[derive(Default)]
++struct FileHashFlight {
++    result: std::sync::Mutex<Option<SharedFileHashResult>>,
++    ready: std::sync::Condvar,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+@@ -1098,6 +1107,7 @@ impl Daemon {
+             transfer_counters: TransferCounters::new(),
+             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
+             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
++            file_hash_flights: Arc::new(Mutex::new(HashMap::new())),
+             config,
+         }
+     }
+@@ -1340,6 +1350,86 @@ impl Daemon {
+         })
+     }
+ 
++    fn hash_file_singleflight(
++        &self,
++        key: &FileHashCacheKey,
++        path: &Path,
++        size: i64,
++    ) -> anyhow::Result<(String, bool, u64)> {
++        let (flight, leader) = {
++            let mut flights = self
++                .file_hash_flights
++                .lock()
++                .map_err(|_| anyhow::anyhow!("file hash flight lock poisoned"))?;
++            match flights.get(key) {
++                Some(flight) => (Arc::clone(flight), false),
++                None => {
++                    let flight = Arc::new(FileHashFlight::default());
++                    flights.insert(key.clone(), Arc::clone(&flight));
++                    (flight, true)
++                }
++            }
++        };
++
++        if !leader {
++            let mut result = flight
++                .result
++                .lock()
++                .map_err(|_| anyhow::anyhow!("file hash result lock poisoned"))?;
++            while result.is_none() {
++                result = flight
++                    .ready
++                    .wait(result)
++                    .map_err(|_| anyhow::anyhow!("file hash result lock poisoned"))?;
++            }
++            return match result.as_ref().expect("result checked above") {
++                Ok((hash, _, _)) => Ok((hash.clone(), true, 0)),
++                Err(error) => Err(anyhow::anyhow!(error.clone())),
++            };
++        }
++
++        let computed = match self.with_store(|store| Ok(store.file_hash_lookup(path))) {
++            Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
++            Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
++                crate::cache_key::hash_file(path).map(|hash| {
++                    let _ = self.with_store(|store| {
++                        store.file_hash_record(&fp, &hash);
++                        Ok(())
++                    });
++                    (hash, false, size.max(0) as u64)
++                })
++            }
++            Ok(crate::cache_key::FileHashLookup::Uncacheable) => {
++                crate::cache_key::hash_file(path).map(|hash| (hash, false, size.max(0) as u64))
++            }
++            Err(error) => Err(error),
++        };
++        if let Ok((hash, _, _)) = &computed
++            && let Ok(mut cache) = self.file_hash_cache.lock()
++        {
++            if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
++                cache.clear();
++            }
++            cache.insert(key.clone(), hash.clone());
++        }
++        let shared = computed
++            .as_ref()
++            .map(|value| value.clone())
++            .map_err(|error| format!("{error:#}"));
++        if let Ok(mut result) = flight.result.lock() {
++            *result = Some(shared);
++            flight.ready.notify_all();
++        }
++        if let Ok(mut flights) = self.file_hash_flights.lock()
++            && flights
++                .get(key)
++                .is_some_and(|active| Arc::ptr_eq(active, &flight))
++        {
++            flights.remove(key);
++        }
++        computed
++    }
++
+     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
+         let mut results = Vec::with_capacity(req.files.len());
+ 
+@@ -1405,29 +1495,7 @@ impl Daemon {
+                 }
+             }
+ 
+-            // #281: hold the store mutex only for the cheap cache lookup and
+-            // record; run the blake3 read of the whole file OUTSIDE the lock so
+-            // it can't stall a concurrent RemoteCheck's `import_restored_entry`.
+-            let path = Path::new(&file.path);
+-            let computed: anyhow::Result<(String, bool, u64)> =
+-                match self.with_store(|store| Ok(store.file_hash_lookup(path))) {
+-                    Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
+-                    Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
+-                        crate::cache_key::hash_file(path).map(|hash| {
+-                            // Brief re-lock just to persist the result.
+-                            let _ = self.with_store(|store| {
+-                                store.file_hash_record(&fp, &hash);
+-                                Ok(())
+-                            });
+-                            (hash, false, file.size.max(0) as u64)
+-                        })
+-                    }
+-                    Ok(crate::cache_key::FileHashLookup::Uncacheable) => {
+-                        crate::cache_key::hash_file(path)
+-                            .map(|hash| (hash, false, file.size.max(0) as u64))
+-                    }
+-                    Err(e) => Err(e),
+-                };
++            let computed = self.hash_file_singleflight(&key, Path::new(&file.path), file.size);
+ 
+             match computed {
+                 Ok((hash, cache_hit, bytes_hashed)) => {
+-- 
+2.50.0
+

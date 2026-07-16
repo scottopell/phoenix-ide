@@ -1,0 +1,24 @@
+From 8b49c1b24ecfca0217620cb1166d706dec4564fc Mon Sep 17 00:00:00 2001
+From: Scott Opell <me@scottopell.com>
+Date: Thu, 16 Jul 2026 16:32:50 -0400
+Subject: [PATCH] perf: reuse output hashes during cold builds
+
+---
+ src/store.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/store.rs b/src/store.rs
+index 9bd3e6f..1c63008 100644
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -1065,6 +1065,7 @@ impl Store {
+         for (source_path, store_name) in output_files {
+             let hash = crate::cache_key::hash_file(source_path)?;
+             let metadata = fs::metadata(source_path)?;
++            self.record_known_file_hash(source_path, &hash);
+             let size = metadata.len();
+             let executable = is_executable(&metadata);
+             if size == 0 {
+-- 
+2.50.0
+
