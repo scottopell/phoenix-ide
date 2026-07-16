@@ -250,7 +250,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // rather than being stranded on the raw <pre>.
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
-  const findEligible = (textLike && !htmlPreview) || largeFallback;
+  const findEligible = payload.kind !== 'markdown' && ((textLike && !htmlPreview) || largeFallback);
   const findSourceText = findEligible ? content : '';
   const restoreFindFocus = useCallback((focusOrigin: HTMLElement | null) => {
     queueMicrotask(() => (focusOrigin ?? findButtonRef.current)?.focus());

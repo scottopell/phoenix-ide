@@ -454,7 +454,7 @@ describe('buildConversationSearchProjection', () => {
     expect(matchSource?.revealTarget).toMatchObject({ kind: 'tool-result-search', key: 'search:search-1', path: 'src/hidden.ts', lineNumber: 42 });
   });
 
-  it('indexes full-density non-think tool details while compact still excludes them', () => {
+  it('indexes tool results but excludes unowned tool header and input metadata', () => {
     const units: RenderUnit[] = [
       {
         kind: 'agent_turn',
@@ -470,8 +470,8 @@ describe('buildConversationSearchProjection', () => {
     ];
 
     const fullInputProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'full' });
-    expect(fullInputProjection.matches).toHaveLength(1);
-    expect(fullInputProjection.matches[0]?.target.sourceId).toContain('tool-use-input-0');
+    expect(fullInputProjection.matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'bash ls', { density: 'full' }).matches).toHaveLength(0);
 
     const fullResultProjection = buildConversationSearchProjection(units, 'hidden alpha result', { density: 'full' });
     expect(fullResultProjection.matches).toHaveLength(1);
@@ -509,7 +509,7 @@ describe('buildConversationSearchProjection', () => {
     }];
 
     const compactProjection = buildConversationSearchProjection(units, 'alpha', { density: 'compact' });
-    expect(compactProjection.matches).toHaveLength(3);
+    expect(compactProjection.matches).toHaveLength(2);
     const lineMatch = compactProjection.matches.find((match) => match.target.kind === 'unit-text'
       && match.target.fragmentId === 'read-file-line:second%20alpha%20line:0');
     expect(lineMatch).toBeTruthy();
@@ -540,7 +540,6 @@ describe('buildConversationSearchProjection', () => {
       projection.sources.find((source) => source.id === match.target.sourceId)?.role);
     expect(matchingSources).toEqual([
       'agent-text-0',
-      'tool-use-display-1',
       'tool-use-result-1:terminal-result:bash',
       'agent-text-2',
     ]);
@@ -715,9 +714,6 @@ describe('buildConversationSearchProjection', () => {
       ['skill', 'skill-message', '/dogfood alpha --trace\nalpha.txt'],
       ['system', 'system-message', 'System alpha'],
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
-      ['agent_turn', 'tool-use-name-1', 'search'],
-      ['agent_turn', 'tool-use-display-1', 'search alpha'],
-      ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
       ['agent_turn', 'tool-use-result-1:search-note:Tool%20alpha%20result:0', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'completed summarize beta path done\npending inspect alpha path'],
     ]);
@@ -732,8 +728,6 @@ describe('buildConversationSearchProjection', () => {
       'skill',
       'skill',
       'system',
-      'agent_turn',
-      'agent_turn',
       'agent_turn',
       'agent_turn',
       'sub_agent_status',

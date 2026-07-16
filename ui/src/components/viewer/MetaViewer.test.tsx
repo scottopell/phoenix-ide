@@ -432,7 +432,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps HTML preview ineligible but allows source-like markdown and HTML source find', () => {
+  it('keeps rendered Markdown and HTML preview ineligible while allowing HTML source find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -461,7 +461,7 @@ describe('MetaViewer payload routing', () => {
         <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
       </ReviewNotesProvider>,
     );
-    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
   });
 
   it('closes file find when switching HTML source to preview', async () => {
@@ -480,22 +480,6 @@ describe('MetaViewer payload routing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
 
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
-  });
-
-  it('falls back to line reveal for markdown source matches without explicit marks', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'markdown',
-      content: '# alpha heading\n\nBody text',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha heading' } });
-
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
   });
 
   it('falls back to line reveal for HTML source matches without explicit marks', async () => {
@@ -570,7 +554,8 @@ describe('MetaViewer payload routing', () => {
     await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
       type: 'line', id: 'file:/tmp/project/thing', lineNumber: 2, align: 'center', behavior: 'smooth',
     }));
-    const scrollCount = codeViewMockState.scrollToCalls.length;
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    codeViewMockState.scrollToCalls.length = 0;
 
     rerender(
       <ReviewNotesProvider>
@@ -579,7 +564,8 @@ describe('MetaViewer payload routing', () => {
     );
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    expect(codeViewMockState.scrollToCalls).toHaveLength(scrollCount);
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    expect(codeViewMockState.scrollToCalls).toHaveLength(0);
   });
 
   it('keeps repeated identical file matches distinct', async () => {

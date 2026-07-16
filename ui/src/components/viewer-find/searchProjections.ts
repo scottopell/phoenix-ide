@@ -1284,14 +1284,22 @@ export function buildKeywordSearchOutputProjection(
   }
 
   if (hits.length === 0 || hits.length * 3 < lines.length) {
-    const fragment: KeywordSearchFragment = {
-      fragmentId: 'keyword-search-fallback',
-      semanticText: text,
-      display: { title: 'Raw ripgrep results — LLM filter unavailable', body: text },
+    const title = 'Raw ripgrep results — LLM filter unavailable';
+    const titleFragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback-title',
+      semanticText: title,
+      display: { title },
       revealTarget,
       kind: 'fallback',
     };
-    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [fragment] };
+    const bodyFragment: KeywordSearchFragment = {
+      fragmentId: 'keyword-search-fallback-body',
+      semanticText: text,
+      display: { title, body: text },
+      revealTarget,
+      kind: 'fallback',
+    };
+    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [titleFragment, bodyFragment] };
   }
   return { hits, rawFallback: false, empty: false, fallbackText: null, fragments: hits.map((hit) => hit.fragment) };
 }
@@ -1351,10 +1359,6 @@ function agentTurnSources(
       return;
     }
     if (block.type === 'tool_use') {
-      out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
-      out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
-      const detailsVisible = densityToolDetailsVisible(block.name, density);
-      if (detailsVisible) out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
       const toolResult = toolResultsByUseId.get(block.id ?? '');
       if (!toolResult) return;
       const resultText = toolResultText(toolResult);
@@ -1417,30 +1421,8 @@ function agentTurnSources(
   return out;
 }
 
-function densityToolDetailsVisible(toolName: string | undefined, density: 'full' | 'compact'): boolean {
-  if (toolName === 'think') return true;
-  return density === 'full';
-}
-
 function containsMermaidFence(text: string): boolean {
   return /```\s*mermaid\b/i.test(text);
-}
-
-function stableJson(value: unknown): string {
-  if (value === undefined) return '';
-  return JSON.stringify(sortJsonValue(value), null, 2) ?? '';
-}
-
-function sortJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJsonValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, child]) => [key, sortJsonValue(child)]),
-    );
-  }
-  return value;
 }
 
 function projectMatches<TTarget, TSource extends SearchableSource<TTarget>>(
