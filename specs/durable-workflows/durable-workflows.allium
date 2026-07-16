@@ -713,6 +713,14 @@ rule RejectUnavailableExternalAcceptance {
     ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
 }
 
+rule RejectUnavailableWorkflowAcceptance {
+    when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
+    requires: accepting_selection_for(profile) = null
+        or not profile_executor_available(profile)
+    ensures: AcceptanceOutcome(closed_or_unavailable)
+    ensures: not Workflow.created(profile: profile, snapshot_codec: snapshot_codec)
+}
+
 rule RejectUnsupportedWorkflowCodec {
     when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
     requires: not profile_has_lossless_decoder(profile, snapshot_codec)
@@ -1561,7 +1569,7 @@ invariant AcceptedProtocolRemainsExecutable {
 }
 
 invariant OneSemanticAuthorityPerWorkflow {
-    every_workflow_has_exactly_one_semantic_authority
+    every_authoritative_workflow_has_exactly_one_semantic_authority_and_every_shadow_derives_authority_only_from_its_authoritative_workflow
 }
 
 invariant ShadowCannotActAuthoritatively {

@@ -291,6 +291,7 @@ config {
 -- wake_protocol_selection(), authority_is_immutable(binding)
 -- observation_inbox_row_persisted(item), wake_batches_partition_by_workflow_authority(conversation)
 -- conversation_is_terminal_or_archived(conversation)
+-- cancelled_wake_inbox_consumed_atomically(binding, receipt)
 
 -- legacy_projection(contract_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding)
@@ -362,9 +363,9 @@ rule RegistrationScheduleUsesDefaultBound {
 rule RegistrationRejectsUnavailableSubagentResource {
     when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
     requires: resource.kind = subagent
-    requires: not registering_conversation_owns_child(conversation, resource)
-        or not subagent_resource_matches_child_conversation(resource)
-        or conversation_is_terminal_or_archived(conversation)
+    requires: registering_conversation_owns_child(conversation, resource)
+    requires: subagent_resource_matches_child_conversation(resource)
+    requires: conversation_is_terminal_or_archived(conversation)
         or wake_protocol_selection().accepting != true
     ensures: WakeRegistrationRejected("wake_unavailable_subagent")
     ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
@@ -527,6 +528,7 @@ rule CancelledReceiptMaterializesWithoutAutoResume {
         terminal: terminal, sequence: committed_sequence(receipt), committed_at: now()
     )
     ensures: observation_inbox_row_persisted(WakeObservationInboxItem{terminal_receipt: receipt})
+    ensures: cancelled_wake_inbox_consumed_atomically(binding, receipt)
     ensures: no_resume_scheduled_only_for_cancel(binding)
 }
 

@@ -603,7 +603,7 @@ bash waits as `Forgotten { reason: "phoenix_restart" }`.
 
 A `TmuxPane` wake handle SHALL be addressed by the tmux registry's stable
 `window_id`. It is WorkScope-keyed for continuation inheritance and lifecycle
-teardown. A hard-delete or WorkScope teardown with no inheriting successor fires
+teardown. After lifecycle admission confirms no pending wake contract, unconsumed observation, or owed acceptance, a hard-delete or WorkScope teardown with no inheriting successor fires
 pending tmux waits as forgotten unless the registry already recorded a terminal
 exit-marker or killed-window state; a surviving tmux handle is re-registered on
 router startup.
@@ -616,8 +616,7 @@ its durable terminal cause: children whose terminal cause occurred before the
 contract deadline deliver the corresponding tagged terminal payload;
 non-terminal children fire `Forgotten { reason: "phoenix_restart" }`. Child
 cancellation observed independently of parent wake cancellation produces a fired
-sub-agent `cancelled` payload. Parent hard-delete SHALL
-cancel pending wake contracts before deleting the child; hard-delete MUST NOT
+sub-agent `cancelled` payload. Parent hard-delete SHALL reject while pending wake contracts or undelivered wake obligations remain; after those obligations resolve, hard-delete MUST NOT
 report lifecycle cancellation as a missing child handle.
 
 **Rationale:** The three v1 handle kinds deliberately use their existing stable

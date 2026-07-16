@@ -2,7 +2,7 @@
 
 Build one shared durable workflow engine from the best proven ideas in the conversation-creation protocol and wake-plane prototype. Hold PR #471 until wake runs on the shared engine; wake is the first production adopter, and conversation creation follows through shadow parity and versioned cutover.
 
-This umbrella task is the sole authority for program sequencing, architecture ownership, migration gates, and release criteria. It supersedes conflicting sequencing or ownership in tasks 40006–40011 and 47002. Those tasks remain normative inputs and narrower acceptance references until transitioned below.
+This umbrella task is the sole authority for program sequencing, architecture ownership, migration gates, and release criteria. It supersedes conflicting sequencing or ownership in tasks 40006–40011 and delegates wake adoption to task 25002. Those tasks remain normative inputs and narrower acceptance references until transitioned below.
 
 ## Product outcome
 
@@ -257,7 +257,7 @@ On approval of this umbrella task:
 1. Mark this task `in-progress`.
 2. Mark task 40006 `wont-do` as superseded by Milestone 1 while retaining its body as design input.
 3. Mark tasks 40007 and 40008 `blocked` on Milestone 1, then revise them into child implementation tasks for Milestones 2 and 3.
-4. Mark task 47002 `in-progress` or `blocked` as the held wake adopter, with completion redefined by Milestone 4 rather than the current bespoke implementation.
+4. Keep task 25002 as the held wake adopter, with completion defined by Milestone 4 rather than the current bespoke implementation.
 5. Mark tasks 40009 and 40010 `blocked` on the wake adoption gate and revise them into Milestones 5 and 6.
 6. Keep task 40011 `blocked` on Milestone 6.
 7. Preserve task 54007 as the later sub-agent wake-handle follow-up; do not add sub-agents to the first shared-engine slice.
