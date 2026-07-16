@@ -429,6 +429,10 @@ pub fn discover_skills_with_options(
 /// Invoke a skill by name: look up in pre-discovered skills, read SKILL.md,
 /// strip frontmatter, prepend base directory, substitute arguments.
 ///
+/// This is the live-filesystem entry point used during discovery and by callers
+/// that do not yet have a conversation snapshot. Established conversations use
+/// [`invoke_captured_skill`] instead.
+///
 /// # Errors
 ///
 /// Returns `Err` if the skill is not found or cannot be read from disk.
@@ -460,26 +464,39 @@ pub fn invoke_skill(
     let raw_content = std::fs::read_to_string(skill.skill_md_path())
         .map_err(|e| format!("Failed to read skill '{skill_name}': {e}"))?;
 
-    // REQ-SK-001: Strip YAML frontmatter
-    let body = strip_frontmatter(&raw_content);
+    let body = strip_skill_frontmatter(&raw_content);
+    Ok(invoke_captured_skill(
+        skill_name,
+        arguments,
+        &body,
+        &skill.skill_dir(),
+    ))
+}
 
-    // REQ-SK-003: Prepend base directory so the LLM can read companion files.
-    let skill_dir = skill.skill_dir();
-    let body_with_dir = format!("Base directory for this skill: {skill_dir}\n\n{body}");
-
-    // REQ-SK-004: Argument substitution
-    let final_body = substitute_arguments(&body_with_dir, arguments);
-
-    Ok(SkillInvocation {
+/// Render an invocation exclusively from captured snapshot values.
+///
+/// This deliberately performs no filesystem access. Companion files beneath
+/// `base_dir` remain live and may be read later by ordinary file tools, while
+/// the primary `SKILL.md` instruction body is exact for the active snapshot.
+#[must_use]
+pub fn invoke_captured_skill(
+    skill_name: &str,
+    arguments: &str,
+    body: &str,
+    base_dir: &str,
+) -> SkillInvocation {
+    let body_with_dir = format!("Base directory for this skill: {base_dir}\n\n{body}");
+    SkillInvocation {
         name: skill_name.to_string(),
-        body: final_body,
-        skill_dir,
-    })
+        body: substitute_arguments(&body_with_dir, arguments),
+        skill_dir: base_dir.to_string(),
+    }
 }
 
 /// Strip YAML frontmatter (--- delimited block at the top of the file).
 /// Returns the body content after the closing ---.
-fn strip_frontmatter(content: &str) -> String {
+#[must_use]
+pub fn strip_skill_frontmatter(content: &str) -> String {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return content.to_string();
@@ -543,14 +560,14 @@ mod tests {
     #[test]
     fn test_strip_frontmatter_valid() {
         let content = "---\nname: build\ndescription: Build it\n---\n\n# Build\nRun cargo build.";
-        let result = strip_frontmatter(content);
+        let result = strip_skill_frontmatter(content);
         assert_eq!(result, "# Build\nRun cargo build.");
     }
 
     #[test]
     fn test_strip_frontmatter_no_frontmatter() {
         let content = "# Just markdown\nNo frontmatter here.";
-        let result = strip_frontmatter(content);
+        let result = strip_skill_frontmatter(content);
         assert_eq!(result, content);
     }
 
@@ -558,7 +575,7 @@ mod tests {
     fn test_strip_frontmatter_incomplete() {
         // Opening --- but no closing ---
         let content = "---\nname: build\ndescription: Build it\n\n# Body";
-        let result = strip_frontmatter(content);
+        let result = strip_skill_frontmatter(content);
         // Should return original content since frontmatter is incomplete
         assert_eq!(result, content);
     }
@@ -566,14 +583,14 @@ mod tests {
     #[test]
     fn test_strip_frontmatter_empty_body() {
         let content = "---\nname: build\ndescription: Build it\n---\n";
-        let result = strip_frontmatter(content);
+        let result = strip_skill_frontmatter(content);
         assert_eq!(result, "");
     }
 
     #[test]
     fn test_strip_frontmatter_with_leading_whitespace() {
         let content = "  ---\nname: build\ndescription: Build it\n---\n\nBody here.";
-        let result = strip_frontmatter(content);
+        let result = strip_skill_frontmatter(content);
         assert_eq!(result, "Body here.");
     }
 

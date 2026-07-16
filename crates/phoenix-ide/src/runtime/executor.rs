@@ -4822,6 +4822,22 @@ where
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
         let scope_worktree = self.context.work_scope_worktree.clone();
+        let active_project_skills = match self
+            .storage
+            .load_active_project_instruction_bundle(&self.context.conversation_id)
+            .await
+        {
+            Ok(Some(bundle)) => bundle.skills,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::error!(
+                    conv_id = %self.context.conversation_id,
+                    %error,
+                    "Failed to load active project skills for tool invocation"
+                );
+                Vec::new()
+            }
+        };
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -4832,7 +4848,8 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
-        );
+        )
+        .with_active_project_skills(active_project_skills);
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();

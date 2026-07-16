@@ -59,11 +59,29 @@ impl Tool for SkillTool {
             return ToolOutput::error("skill_name is required");
         }
 
-        let skills = phoenix_skills::discover_skills(&ctx.working_dir);
-        match phoenix_skills::invoke_skill(skill_name, args, &skills) {
-            Ok(invocation) => ToolOutput::success(invocation.body),
-            Err(e) => ToolOutput::error(e),
-        }
+        let Some(skill) = ctx
+            .active_project_skills
+            .iter()
+            .find(|skill| skill.name == skill_name)
+        else {
+            let available = ctx
+                .active_project_skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>();
+            return ToolOutput::error(format!(
+                "Skill '{}' not found. Available: {}",
+                skill_name,
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        };
+        let invocation =
+            phoenix_skills::invoke_captured_skill(skill_name, args, &skill.body, &skill.base_dir);
+        ToolOutput::success(invocation.body)
     }
 }
 
@@ -76,6 +94,25 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn test_context(working_dir: std::path::PathBuf) -> ToolContext {
+        let snapshots = phoenix_skills::discover_skills(&working_dir)
+            .into_iter()
+            .map(|skill| {
+                let source_path = skill.skill_md_path().to_string_lossy().into_owned();
+                let base_dir = skill.skill_dir();
+                let body = phoenix_skills::strip_skill_frontmatter(
+                    &std::fs::read_to_string(skill.skill_md_path()).unwrap(),
+                );
+                phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot {
+                    name: skill.name,
+                    description: skill.description,
+                    source_label: "test".into(),
+                    body,
+                    base_dir,
+                    source_path,
+                    content_hash: "test".into(),
+                }
+            })
+            .collect();
         ToolContext::new(
             CancellationToken::new(),
             "test-conv".to_string(),
@@ -87,6 +124,7 @@ mod tests {
             Arc::new(crate::TmuxRegistry::new()),
             None,
         )
+        .with_active_project_skills(snapshots)
     }
 
     fn write_skill(base: &std::path::Path, skill_dir: &str, name: &str, desc: &str, body: &str) {
@@ -181,6 +219,26 @@ mod tests {
         assert!(result.output().contains("Run cargo build."));
         assert!(result.output().contains("Base directory for this skill:"));
         assert!(!result.output().contains("---"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_uses_captured_body_after_skill_file_changes() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(tmp.path(), "build", "build", "Build", "captured body");
+        let ctx = test_context(tmp.path().to_path_buf());
+        write_skill(tmp.path(), "build", "build", "Build", "unconfirmed body");
+
+        let result = SkillTool.run(json!({"skill_name": "build"}), ctx).await;
+
+        assert!(result.is_success());
+        assert!(result.output().contains("captured body"));
+        assert!(!result.output().contains("unconfirmed body"));
+
+        let refreshed_ctx = test_context(tmp.path().to_path_buf());
+        let refreshed = SkillTool
+            .run(json!({"skill_name": "build"}), refreshed_ctx)
+            .await;
+        assert!(refreshed.output().contains("unconfirmed body"));
     }
 
     #[tokio::test]

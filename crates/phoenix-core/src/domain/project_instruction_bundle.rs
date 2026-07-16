@@ -38,6 +38,12 @@ pub struct ProjectSkillSnapshot {
     pub name: String,
     pub description: String,
     pub source_label: String,
+    /// Exact `SKILL.md` instruction body with YAML frontmatter removed.
+    pub body: String,
+    /// Stable directory rendered into invocations so live companion files remain addressable.
+    pub base_dir: String,
+    /// Stable path of the captured `SKILL.md`, retained as snapshot provenance.
+    pub source_path: String,
     pub content_hash: String,
 }
 
@@ -231,6 +237,9 @@ mod tests {
                     name: (*name).into(),
                     description: format!("secret-{name}"),
                     source_label: "test".into(),
+                    body: format!("body-{name}"),
+                    base_dir: "/test/skill".into(),
+                    source_path: "/test/skill/SKILL.md".into(),
                     content_hash: (*hash).into(),
                 })
                 .collect(),

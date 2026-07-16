@@ -628,6 +628,9 @@ CREATE TABLE project_instruction_skills (
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     source_label TEXT NOT NULL,
+    body TEXT NOT NULL,
+    base_dir TEXT NOT NULL,
+    source_path TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     PRIMARY KEY (bundle_id, ordinal),
     UNIQUE (bundle_id, name)

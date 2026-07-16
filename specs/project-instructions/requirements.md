@@ -11,8 +11,13 @@ As a user, I need to see which instruction sources changed and deliberately refr
 ### REQ-PI-001 — Stable Active Bundle
 
 WHEN a conversation prepares a model request
-THE SYSTEM SHALL use one immutable project-instruction bundle containing the applicable `AGENTS.md` / `AGENT.md` guidance and skill-catalog metadata
+THE SYSTEM SHALL use one immutable project-instruction bundle containing the applicable `AGENTS.md` / `AGENT.md` guidance and each skill's catalog metadata, exact frontmatter-stripped `SKILL.md` body, stable source path, and base directory
 AND SHALL keep that bundle unchanged throughout a user turn and its tool loop.
+
+WHEN either the user invokes a slash skill or the model invokes the Skill tool in an existing conversation
+THE SYSTEM SHALL render the invocation from the active bundle's captured skill name, body, and base directory without rediscovering or rereading `SKILL.md`.
+
+Skill companion files remain live resources outside the snapshot and MAY be read through ordinary file tools after invocation.
 
 The system SHALL keep live runtime state, including conversation mode, permissions, and tool availability, outside the project-instruction bundle.
 
@@ -71,7 +76,7 @@ Activation SHALL atomically preserve conversation history, persist a visible con
 ### REQ-PI-007 — Durable Recovery
 
 WHEN Phoenix restarts
-THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles
+THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles, including captured skill bodies and invocation paths,
 AND SHALL preserve the same activation boundary and source manifest.
 
 The system-prompt inspection surface SHALL render the persisted active bundle rather than rediscovering mutable filesystem sources.

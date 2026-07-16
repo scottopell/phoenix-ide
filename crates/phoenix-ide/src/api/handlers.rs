@@ -3185,18 +3185,8 @@ async fn confirm_project_instructions(
             "stale_project_instruction_candidate",
         ))));
     }
-    let changed_manifest = ProjectInstructionChangeManifest::between(&active, &candidate);
     Ok(Json(ConfirmProjectInstructionsResponse {
-        status: ProjectInstructionRefreshStatus {
-            active_bundle_id: active.id,
-            queued_bundle_id: Some(candidate.id),
-            candidate_bundle_id: None,
-            changed_manifest,
-            estimated_rewarm_tokens: candidate.estimated_tokens,
-            rewarm_tokens_are_estimate: true,
-            rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
-            is_queued: true,
-        },
+        status: project_instruction_status(&state, &id, false).await?,
     }))
 }
 
@@ -3677,7 +3667,18 @@ async fn send_chat(
                     skill_invocation: None,
                 }
             } else {
-                crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+                let active_project = ensure_active_project_instructions(
+                    &state,
+                    &id,
+                    FsPath::new(&conversation.cwd),
+                )
+                .await?;
+                crate::message_expander::expand_with_project_skills(
+                    &req.text,
+                    &resolution_root,
+                    &active_project.skills,
+                )
+                .map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
@@ -3757,7 +3758,14 @@ async fn send_chat(
             skill_invocation: None,
         }
     } else {
-        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+        let active_project =
+            ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
+        crate::message_expander::expand_with_project_skills(
+            &req.text,
+            &resolution_root,
+            &active_project.skills,
+        )
+        .map_err(|e| {
             AppError::UnprocessableEntity(ExpansionErrorResponse {
                 error: e.to_string(),
                 error_type: e.error_type().to_string(),

@@ -209,18 +209,25 @@ pub fn discover_project_instruction_bundle_with_options(
 
     let skills = discover_skills_with_options(working_dir, home_override, builtin_dir)
         .into_iter()
-        .map(|skill| {
+        .filter_map(|skill| {
             let source_label = skill_source_label(working_dir, &skill);
+            let source_path = skill.skill_md_path().to_string_lossy().into_owned();
+            let base_dir = skill.skill_dir();
+            let raw = std::fs::read_to_string(skill.skill_md_path()).ok()?;
+            let body = crate::skills::strip_skill_frontmatter(&raw);
             let content_hash = sha256_hex(&format!(
-                "{}\0{}\0{source_label}",
+                "{}\0{}\0{source_label}\0{source_path}\0{base_dir}\0{body}",
                 skill.name, skill.description
             ));
-            ProjectSkillSnapshot {
+            Some(ProjectSkillSnapshot {
                 name: skill.name,
                 description: skill.description,
                 source_label,
+                body,
+                base_dir,
+                source_path,
                 content_hash,
-            }
+            })
         })
         .collect();
 
@@ -647,6 +654,34 @@ mod tests {
             .iter()
             .all(|skill| skill.content_hash.len() == 64));
         assert!(first.estimated_tokens > 0);
+    }
+
+    #[test]
+    fn discovered_skill_body_and_hash_change_together() {
+        let temp = TempDir::new().unwrap();
+        let skill_dir = temp.path().join(".claude/skills/build");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: build\ndescription: Build\n---\n\ncaptured body",
+        )
+        .unwrap();
+        let first =
+            discover_project_instruction_bundle_with_options(temp.path(), Some(temp.path()), None);
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: build\ndescription: Build\n---\n\nchanged body",
+        )
+        .unwrap();
+        let second =
+            discover_project_instruction_bundle_with_options(temp.path(), Some(temp.path()), None);
+
+        assert_eq!(first.skills[0].body, "captured body");
+        assert_eq!(second.skills[0].body, "changed body");
+        assert_ne!(first.skills[0].content_hash, second.skills[0].content_hash);
+        assert!(first.skills[0].source_path.ends_with("/build/SKILL.md"));
+        assert!(first.skills[0].base_dir.ends_with("/build"));
     }
 
     #[test]

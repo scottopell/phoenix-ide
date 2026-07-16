@@ -31,9 +31,17 @@ value SourceChange {
     change: ChangeKind
 }
 
+value SkillSnapshot {
+    name: String
+    body: String
+    base_dir: String
+    source_path: String
+}
+
 value InstructionSnapshot {
     id: String
     estimated_tokens: Integer
+    skills: List<SkillSnapshot>
 }
 
 ------------------------------------------------------------
@@ -159,6 +167,16 @@ rule KeepActiveSnapshotThroughToolLoop {
         let active = instructions.active
         ensures: instructions.active = active
         ensures: ModelRequestUses(conversation_id, active)
+}
+
+rule InvokeSkillFromActiveSnapshot {
+    when: SkillInvocationRequested(conversation_id, skill_name, arguments)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        let active = instructions.active
+        requires: active.skills.any(skill => skill.name = skill_name)
+        ensures: SkillInvocationRenderedFromCapturedBodyAndBaseDirectory(active, skill_name, arguments)
+        ensures: SkillMdNotRediscoveredOrRead(conversation_id, skill_name)
 }
 
 rule RuntimeAuthorityRemainsLive {

@@ -8,7 +8,9 @@
 //! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
 
 use crate::resolution_root::{FileResolution, ResolutionRoot};
+#[cfg(test)]
 use crate::system_prompt::discover_skills;
+use phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot;
 
 /// The result of expanding a user message.
 ///
@@ -35,6 +37,8 @@ pub enum ExpansionError {
     /// `@` reference points to a binary file
     FileNotText { path: String },
     /// Skill was found but invocation failed (e.g., file read error)
+    #[allow(dead_code)]
+    // Retained wire error classification for persisted/preflighted callers.
     SkillInvocationFailed { name: String, error: String },
 }
 
@@ -322,39 +326,59 @@ fn is_path_token_char(c: char) -> bool {
 ///
 /// Returns `Ok(ExpandedMessage)` when all references resolve successfully.
 /// Returns the first `Err(ExpansionError)` encountered when any reference fails.
+#[cfg(test)]
 pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, ExpansionError> {
+    let skills_view = root.skills_view();
+    let live_skills = discover_skills(&skills_view.dir);
+    let snapshots = live_skills
+        .into_iter()
+        .filter_map(|skill| {
+            let source_path = skill.skill_md_path().to_string_lossy().into_owned();
+            let body = std::fs::read_to_string(skill.skill_md_path()).ok()?;
+            let base_dir = skill.skill_dir();
+            Some(ProjectSkillSnapshot {
+                name: skill.name,
+                description: skill.description,
+                source_label: "creation discovery".into(),
+                body: crate::skills::strip_skill_frontmatter(&body),
+                base_dir,
+                source_path,
+                content_hash: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    expand_with_project_skills(text, root, &snapshots)
+}
+
+/// Expand against the exact active project skill snapshot.
+pub fn expand_with_project_skills(
+    text: &str,
+    root: &ResolutionRoot,
+    skills: &[ProjectSkillSnapshot],
+) -> Result<ExpandedMessage, ExpansionError> {
     let refs = tokenize_references(text, &['/', '@']);
 
     // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
     // Check for skill invocation first. Skill expansion replaces the entire
     // message, so it takes priority over file references.
     if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
-        // `skills_view` materializes a branch's committed `SKILL.md` files for a
-        // GitTree root; keep it alive through `invoke_skill`, which reads them
-        // back from the same paths.
-        let skills_view = root.skills_view();
-        let skills = discover_skills(&skills_view.dir);
-        if skills.iter().any(|s| s.name == skill_ref.token) {
+        if let Some(skill) = skills.iter().find(|skill| skill.name == skill_ref.token) {
             // Safety: `skill_ref.span.end` is produced by the tokenizer from
             // `char_indices()` on `text`, so it is always a valid UTF-8
             // boundary.
             #[allow(clippy::string_slice)]
             let arguments = text[skill_ref.span.end..].trim_start();
-            match crate::skills::invoke_skill(&skill_ref.token, arguments, &skills) {
-                Ok(invocation) => {
-                    return Ok(ExpandedMessage {
-                        display_text: text.to_string(),
-                        llm_text: invocation.body.clone(),
-                        skill_invocation: Some(invocation),
-                    });
-                }
-                Err(e) => {
-                    return Err(ExpansionError::SkillInvocationFailed {
-                        name: skill_ref.token.clone(),
-                        error: e,
-                    });
-                }
-            }
+            let invocation = crate::skills::invoke_captured_skill(
+                &skill_ref.token,
+                arguments,
+                &skill.body,
+                &skill.base_dir,
+            );
+            return Ok(ExpandedMessage {
+                display_text: text.to_string(),
+                llm_text: invocation.body.clone(),
+                skill_invocation: Some(invocation),
+            });
         }
     }
 
@@ -864,6 +888,47 @@ mod tests {
         let invocation = result.skill_invocation.as_ref().unwrap();
         assert_eq!(invocation.name, "writing-style");
         assert!(invocation.body.contains("Write in a formal tone."));
+    }
+
+    #[test]
+    fn slash_skill_uses_captured_body_after_skill_file_changes() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(
+            tmp.path(),
+            "writing-style",
+            "writing-style",
+            "Write clearly",
+            "captured body",
+        );
+        let bundle = crate::system_prompt::discover_project_instruction_bundle_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            None,
+        );
+        write_skill(
+            tmp.path(),
+            "writing-style",
+            "writing-style",
+            "Write clearly",
+            "unconfirmed body",
+        );
+
+        let result =
+            expand_with_project_skills("/writing-style", &root(tmp.path()), &bundle.skills)
+                .unwrap();
+
+        assert!(result.llm_text.contains("captured body"));
+        assert!(!result.llm_text.contains("unconfirmed body"));
+
+        let refreshed = crate::system_prompt::discover_project_instruction_bundle_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            None,
+        );
+        let refreshed_result =
+            expand_with_project_skills("/writing-style", &root(tmp.path()), &refreshed.skills)
+                .unwrap();
+        assert!(refreshed_result.llm_text.contains("unconfirmed body"));
     }
 
     #[test]

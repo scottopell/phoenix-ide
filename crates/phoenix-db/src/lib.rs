@@ -757,14 +757,17 @@ async fn insert_project_instruction_bundle_tx(
             .map_err(|_| DbError::Serialization("skill ordinal exceeds i64".to_string()))?;
         sqlx::query(
             "INSERT INTO project_instruction_skills
-             (bundle_id, ordinal, name, description, source_label, content_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (bundle_id, ordinal, name, description, source_label, body, base_dir, source_path, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(id)
         .bind(ordinal)
         .bind(&skill.name)
         .bind(&skill.description)
         .bind(&skill.source_label)
+        .bind(&skill.body)
+        .bind(&skill.base_dir)
+        .bind(&skill.source_path)
         .bind(&skill.content_hash)
         .execute(&mut **tx)
         .await?;
@@ -2338,7 +2341,7 @@ impl Database {
         .await?;
         if !exists {
             let id = uuid::Uuid::new_v4().to_string();
-            insert_project_instruction_bundle_tx(
+            if let Err(insert_error) = insert_project_instruction_bundle_tx(
                 &mut tx,
                 &id,
                 conversation_id,
@@ -2346,7 +2349,17 @@ impl Database {
                 bundle,
                 &Utc::now().to_rfc3339(),
             )
-            .await?;
+            .await
+            {
+                tx.rollback().await?;
+                return match self
+                    .load_active_project_instruction_bundle(conversation_id)
+                    .await?
+                {
+                    Some(active) => Ok(active),
+                    None => Err(insert_error),
+                };
+            }
         }
         tx.commit().await?;
         self.load_active_project_instruction_bundle(conversation_id)
@@ -2603,7 +2616,7 @@ impl Database {
         })
         .collect();
         let skills = sqlx::query(
-            "SELECT name, description, source_label, content_hash
+            "SELECT name, description, source_label, body, base_dir, source_path, content_hash
              FROM project_instruction_skills WHERE bundle_id = ?1 ORDER BY ordinal",
         )
         .bind(&id)
@@ -2614,6 +2627,9 @@ impl Database {
             name: row.get("name"),
             description: row.get("description"),
             source_label: row.get("source_label"),
+            body: row.get("body"),
+            base_dir: row.get("base_dir"),
+            source_path: row.get("source_path"),
             content_hash: row.get("content_hash"),
         })
         .collect();
@@ -8671,6 +8687,9 @@ mod tests {
                 name: format!("skill-{label}"),
                 description: format!("description-{label}"),
                 source_label: format!("source-{label}"),
+                body: format!("body-{label}"),
+                base_dir: format!("/skills/{label}"),
+                source_path: format!("/skills/{label}/SKILL.md"),
                 content_hash: format!("skill-hash-{label}"),
             }],
         }
@@ -8700,6 +8719,9 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(second.guidance[0].content, "guidance-first");
+        assert_eq!(second.skills[0].body, "body-first");
+        assert_eq!(second.skills[0].base_dir, "/skills/first");
+        assert_eq!(second.skills[0].source_path, "/skills/first/SKILL.md");
     }
 
     #[tokio::test]

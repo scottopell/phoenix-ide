@@ -242,14 +242,17 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
 fn expand_prompt(
     prompt: &str,
     cwd: &std::path::Path,
+    skills: &[phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot],
 ) -> Result<crate::message_expander::ExpandedMessage, DriveTurnError> {
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
-    crate::message_expander::expand(prompt, &resolution_root).map_err(|error| {
-        DriveTurnError::Runtime(format!(
-            "prompt expansion failed: {error} ({})",
-            error.error_type()
-        ))
-    })
+    crate::message_expander::expand_with_project_skills(prompt, &resolution_root, skills).map_err(
+        |error| {
+            DriveTurnError::Runtime(format!(
+                "prompt expansion failed: {error} ({})",
+                error.error_type()
+            ))
+        },
+    )
 }
 
 async fn drive_conversation(
@@ -261,7 +264,12 @@ async fn drive_conversation(
     conversation_id: &str,
     started: std::time::Instant,
 ) -> Result<DriveTurnResult, DriveTurnError> {
-    let expanded = expand_prompt(&request.prompt, cwd)?;
+    let discovered = crate::system_prompt::discover_project_instruction_bundle(cwd);
+    let active = db
+        .initialize_project_instruction_bundle_if_absent(conversation_id, &discovered)
+        .await
+        .map_err(|error| DriveTurnError::Runtime(error.to_string()))?;
+    let expanded = expand_prompt(&request.prompt, cwd, &active.skills)?;
     let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
 
     let mut state_rx = manager
@@ -511,7 +519,8 @@ mod tests {
         std::fs::write(directory.join("context.txt"), "EXPANSION_SECRET_7419\n").unwrap();
 
         let prompt = "Read @context.txt and report the token.";
-        let expanded = expand_prompt(prompt, &directory).unwrap();
+        let bundle = crate::system_prompt::discover_project_instruction_bundle(&directory);
+        let expanded = expand_prompt(prompt, &directory, &bundle.skills).unwrap();
 
         assert_eq!(expanded.display_text, prompt);
         assert!(expanded.llm_text.contains("EXPANSION_SECRET_7419"));
