@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
+import { api, ExpansionError, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { cacheDB } from '../cache';
 
@@ -238,9 +238,10 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     context_window_size: 0,
   });
 
-  render(
+  const draftStore = new DraftStore();
+  const page = () => (
     <ConversationContext.Provider value={store}>
-      <DraftContext.Provider value={new DraftStore()}>
+      <DraftContext.Provider value={draftStore}>
         <ConversationReadinessProvider>
           <MemoryRouter initialEntries={[`/c/${routeSegment}${initialSearch}`]}>
             <Routes>
@@ -249,10 +250,11 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
           </MemoryRouter>
         </ConversationReadinessProvider>
       </DraftContext.Provider>
-    </ConversationContext.Provider>,
+    </ConversationContext.Provider>
   );
+  const view = render(page());
 
-  return { store };
+  return { store, ...view, rerenderPage: () => view.rerender(page()) };
 }
 
 afterEach(() => {
@@ -297,6 +299,44 @@ describe('ConversationPage message delivery reconciliation', () => {
     });
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
+    vi.spyOn(api, 'sendMessage').mockRejectedValue(new ExpansionError({
+      error: 'No matching reference',
+      error_type: 'file_not_found',
+      reference: '@missing',
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: '@missing' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('optimistically leaves a resumable error while an accepted retry awaits SSE', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const errorState = {
+      type: 'error' as const,
+      message: 'retryable',
+      error_kind: 'server_overloaded' as const,
+    };
+    const { store } = renderPage(makeConversation({ state: errorState }));
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'retry from error' } });
+    const form = textbox.closest('form');
+    const sendButton = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
+    expect(sendButton).not.toBeNull();
+    fireEvent.click(sendButton!);
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+    response.resolve({ queued: true, steering: false });
+    await response.promise;
+    expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm');
   });
 
   it('rolls back an optimistic phase after a steering response despite non-phase SSE traffic', async () => {
@@ -359,6 +399,59 @@ describe('ConversationPage message delivery reconciliation', () => {
     ).toHaveLength(1);
     response.resolve({ queued: true, steering: false });
     await response.promise;
+  });
+
+  it('retries idle reconciliation when connectivity returns after a transient failure', async () => {
+    const acceptedId = 'accepted-reconnect';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'queued reconnect',
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({
+        conversation_idle: true,
+        entries: [{
+          message_id: acceptedId,
+          status: 'persisted',
+          message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        }],
+      });
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    const { store, rerenderPage } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(1));
+
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'offline', attempt: 1, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    rerenderPage();
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'reconnected', attempt: 0, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    rerenderPage();
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
   });
 
   it('compacts accepted steering entries after newer authoritative idle history contains their IDs', async () => {

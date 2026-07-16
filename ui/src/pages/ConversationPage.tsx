@@ -594,6 +594,54 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     [atom.messages, queuedMessages],
   );
 
+  const viewableMessages = atom.messages;
+
+  // Failed messages are rendered in InputArea with retry/dismiss controls.
+  const failedMessages = useMemo(
+    () => deriveFailedMessages(queuedMessages),
+    [queuedMessages],
+  );
+
+  const atomRef = useRef(atom);
+  atomRef.current = atom;
+
+  useEffect(() => {
+    if (!conversationId || atom.transcriptGeneration === null) return;
+    const currentView = historyViewRef.current;
+    if (
+      currentView.conversationId === conversationId
+      && currentView.transcriptGeneration === atom.transcriptGeneration
+    ) return;
+    historyGenerationRef.current += 1;
+    dispatchHistoryExpansion({
+      type: 'view_changed',
+      view: {
+        conversationId,
+        generation: historyGenerationRef.current,
+        transcriptGeneration: atom.transcriptGeneration,
+      },
+      hasEarlierHistory: atom.transcriptCoverage === 'tail',
+    });
+  }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
+
+  const connectionInfo = useConnection({
+    conversationId,
+    dispatch,
+    getLastAppliedEventSeq: () => eventCursorRef.current,
+    getInitialRequestMode: () => {
+      const latestLoadedMessageSeq = latestMessageSequenceId(atomRef.current.messages);
+      if (latestLoadedMessageSeq === null) return { kind: 'full' };
+      const transcriptGeneration = atomRef.current.transcriptGeneration;
+      if (transcriptGeneration === null) return { kind: 'full' };
+      return { kind: 'messages_after_floor', afterMessageFloor: latestLoadedMessageSeq, transcriptGeneration };
+    },
+  });
+
+  const isOffline =
+    connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
+  const isConnected =
+    connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
+
   // Authoritative echoes are terminal for local queue ownership. Compact them
   // from localStorage instead of merely filtering them from this render.
   useEffect(() => {
@@ -602,7 +650,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   const idleReconciliationKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!conversationId || atom.phase.type !== 'idle') return;
+    if (!conversationId || !isConnected || atom.phase.type !== 'idle') return;
     const accepted = queuedMessages.filter(
       (message) => message.status === 'steering_queued'
         && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0),
@@ -670,6 +718,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     };
   }, [
     conversationId,
+    isConnected,
     atom.phase.type,
     atom.phaseLastAppliedEventSeq,
     queuedMessages,
@@ -678,53 +727,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     dispatch,
     eventCursorRef,
   ]);
-  const viewableMessages = atom.messages;
-
-  // Failed messages are rendered in InputArea with retry/dismiss controls.
-  const failedMessages = useMemo(
-    () => deriveFailedMessages(queuedMessages),
-    [queuedMessages],
-  );
-
-  const atomRef = useRef(atom);
-  atomRef.current = atom;
-
-  useEffect(() => {
-    if (!conversationId || atom.transcriptGeneration === null) return;
-    const currentView = historyViewRef.current;
-    if (
-      currentView.conversationId === conversationId
-      && currentView.transcriptGeneration === atom.transcriptGeneration
-    ) return;
-    historyGenerationRef.current += 1;
-    dispatchHistoryExpansion({
-      type: 'view_changed',
-      view: {
-        conversationId,
-        generation: historyGenerationRef.current,
-        transcriptGeneration: atom.transcriptGeneration,
-      },
-      hasEarlierHistory: atom.transcriptCoverage === 'tail',
-    });
-  }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
-
-  const connectionInfo = useConnection({
-    conversationId,
-    dispatch,
-    getLastAppliedEventSeq: () => eventCursorRef.current,
-    getInitialRequestMode: () => {
-      const latestLoadedMessageSeq = latestMessageSequenceId(atomRef.current.messages);
-      if (latestLoadedMessageSeq === null) return { kind: 'full' };
-      const transcriptGeneration = atomRef.current.transcriptGeneration;
-      if (transcriptGeneration === null) return { kind: 'full' };
-      return { kind: 'messages_after_floor', afterMessageFloor: latestLoadedMessageSeq, transcriptGeneration };
-    },
-  });
-
-  const isOffline =
-    connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
-  const isConnected =
-    connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
 
   // Load conversation by slug — skip if atom already has data from a previous visit
@@ -1323,7 +1325,22 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
       const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
       const phaseBeforePost = atomRef.current.phase;
-      const optimisticPhaseOwner = phaseBeforePost.type === 'idle' ? localId : null;
+      const optimisticPhaseOwner = (
+        phaseBeforePost.type === 'idle' || phaseBeforePost.type === 'error'
+      ) ? localId : null;
+      const rollbackOptimisticPhase = () => {
+        if (
+          optimisticPhaseOwner
+          && atomRef.current.phase.type === 'awaiting_llm'
+          && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
+        ) {
+          dispatch({
+            type: 'local_phase_change',
+            phase: phaseBeforePost,
+            expectedConversationId: conversationId,
+          });
+        }
+      };
 
       try {
         if (isOnline) {
@@ -1345,17 +1362,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             // when the conversation next reaches Idle. Show a "Queued" pill
             // on the message bubble instead of the normal sending spinner.
             markSteeringQueued(localId, phaseEventSeqBeforePost);
-            if (
-              optimisticPhaseOwner
-              && atomRef.current.phase.type === 'awaiting_llm'
-              && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
-            ) {
-              dispatch({
-                type: 'local_phase_change',
-                phase: phaseBeforePost,
-                expectedConversationId: conversationId,
-              });
-            }
+            rollbackOptimisticPhase();
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -1380,22 +1387,13 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           // @reference (REQ-IR-007). Keeping the message in the queue as
           // "failed" would duplicate it alongside the restored draft.
           dismissRef.current(localId);
+          rollbackOptimisticPhase();
           // Re-throw so InputArea can display inline error (REQ-IR-007)
           throw err;
         }
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
-        if (
-          optimisticPhaseOwner
-          && atomRef.current.phase.type === 'awaiting_llm'
-          && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
-        ) {
-          dispatch({
-            type: 'local_phase_change',
-            phase: phaseBeforePost,
-            expectedConversationId: conversationId,
-          });
-        }
+        rollbackOptimisticPhase();
       } finally {
         sendingMessagesRef.current.delete(localId);
       }
