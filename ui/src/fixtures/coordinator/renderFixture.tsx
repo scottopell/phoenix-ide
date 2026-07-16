@@ -1,25 +1,56 @@
 import { useEffect, useMemo, useState } from 'react';
-import { MemoryRouter } from 'react-router-dom';
-import { ConversationContext } from '../../conversation/ConversationContext';
-import { ConversationStore } from '../../conversation/ConversationStore';
-import { DensityContext } from '../../hooks/useDensity';
-import { useMediaQuery } from '../../hooks';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import type { Conversation, GlobalOpenWorkResponse, ImageData } from '../../api';
 import { InputArea } from '../../components/InputArea';
 import { MessageList } from '../../components/MessageList';
 import { StateBar } from '../../components/StateBar';
-import type { Conversation, ImageData } from '../../api';
+import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
+import { ConversationContext } from '../../conversation/ConversationContext';
+import { ConversationStore } from '../../conversation/ConversationStore';
+import { DensityContext } from '../../hooks/useDensity';
+import { CoordinatorPage } from '../../pages/CoordinatorPage';
 import { getMessageListScenario, messageListFixtureData } from '../messageList';
 import '../../index.css';
-import '../../pages/CoordinatorPage.css';
 import type { CoordinatorScenario } from './types';
 
 interface Props {
   scenario: CoordinatorScenario;
 }
 
+const coordinatorId = 'fixture-coordinator';
+
 export function CoordinatorFixture({ scenario }: Props) {
-  const [view, setView] = useState<'conversation' | 'fleet'>(scenario.initialView);
-  const compactLayout = useMediaQuery('(max-width: 1024px)');
+  useDocumentViewportOwnership(true);
+
+  useEffect(() => {
+    document.documentElement.dataset['theme'] = 'dark';
+    document.documentElement.dataset['coordinatorFixtureReady'] = scenario.id;
+    return () => { delete document.documentElement.dataset['coordinatorFixtureReady']; };
+  }, [scenario]);
+
+  return (
+    <MemoryRouter initialEntries={[`/global/${coordinatorId}`]}>
+      <Routes>
+        <Route
+          path="/global/:slug"
+          element={(
+            <CoordinatorPage
+              fixtureData={{
+                coordinatorId,
+                openWork: fixtureOpenWork,
+                initialView: scenario.initialView,
+                ...(scenario.fleetError ? { fleetError: 'projection unavailable' } : {}),
+                conversation: <FixtureConversation working={scenario.working} />,
+              }}
+            />
+          )}
+        />
+      </Routes>
+    </MemoryRouter>
+  );
+}
+
+function FixtureConversation({ working }: { working: boolean }) {
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ImageData[]>([]);
   const store = useMemo(() => new ConversationStore(), []);
@@ -27,7 +58,7 @@ export function CoordinatorFixture({ scenario }: Props) {
     () => messageListFixtureData(getMessageListScenario('compact-latest-expanded')),
     [],
   );
-  const convState = scenario.working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
+  const convState = working ? { type: 'llm_requesting', attempt: 1 } as const : { type: 'idle' } as const;
   const conversation: Conversation = {
     id: transcript.conversationId,
     slug: transcript.slug,
@@ -44,95 +75,85 @@ export function CoordinatorFixture({ scenario }: Props) {
     conv_mode_label: 'Explore',
     browser_session_active: false,
     terminal_uses_tmux: false,
-    work_scope_key: null,
+    work_scope_key: 'global:',
   };
 
-  useEffect(() => {
-    document.documentElement.dataset['theme'] = 'dark';
-    document.documentElement.dataset['coordinatorFixtureReady'] = scenario.id;
-    setView(scenario.initialView);
-    return () => { delete document.documentElement.dataset['coordinatorFixtureReady']; };
-  }, [scenario]);
-
   return (
-    <MemoryRouter>
-      <ConversationContext.Provider value={store}>
-        <DensityContext.Provider value={{ density: 'compact', setDensity: () => {} }}>
-          <main className={`coordinator-page coordinator-page--${view}`} data-coordinator-fixture={scenario.id} style={{ height: '100dvh' }}>
-            <header className="coordinator-header">
-              <button type="button" className="coordinator-back" aria-label="Back">←</button>
-              <div className="coordinator-heading"><h1>Coordinator</h1><p>Durable fleet coordination.</p></div>
-              <div className="coordinator-actions"><button type="button">Refresh fleet</button></div>
-              <div className="coordinator-view-switch" role="group" aria-label="Coordinator view">
-                <button type="button" aria-pressed={view === 'conversation'} onClick={() => setView('conversation')}>Conversation</button>
-                <button type="button" aria-pressed={view === 'fleet'} onClick={() => setView('fleet')}>Fleet <span className="coordinator-view-count">2</span></button>
-              </div>
-            </header>
-
-            <section className="coordinator-conversation" aria-label="Coordinator conversation" hidden={compactLayout && view !== 'conversation'}>
-              <div id="app">
-                <div className="conversation-column">
-                  <MessageList
-                    messages={transcript.messages}
-                    pendingMessages={[]}
-                    convState={convState}
-                    onRetry={() => {}}
-                    onOpenFile={() => {}}
-                    conversationId={transcript.conversationId}
-                    slug={transcript.slug}
-                    transcriptPositioning={{ kind: 'idle', view: { conversationId: transcript.conversationId, generation: 1, transcriptGeneration: 1 } }}
-                  />
-                  <InputArea
-                    cwd={undefined}
-                    scopeKey={transcript.conversationId}
-                    convState={convState}
-                    images={images}
-                    setImages={setImages}
-                    isOffline={false}
-                    failedMessages={[]}
-                    convModeLabel="Explore"
-                    draft={draft}
-                    onDraftChange={setDraft}
-                    onSend={() => {}}
-                    onCancel={() => {}}
-                    onRetry={() => {}}
-                  />
-                  <StateBar
-                    conversation={conversation}
-                    convState={convState}
-                    connectionState="connected"
-                    connectionAttempt={0}
-                    nextRetryIn={null}
-                    contextWindowUsed={16_000}
-                    modelContextWindow={200_000}
-                    phaseStateUpdatedAt={null}
-                  />
-                </div>
-              </div>
-            </section>
-
-            <div className="coordinator-fleet-pane" hidden={compactLayout && view !== 'fleet'}>
-              <section className="coordinator-open-work">
-                <div className="coordinator-section-title"><h2>Fleet</h2><span>2 items</span></div>
-                {scenario.fleetError ? <div className="coordinator-error">Fleet unavailable: projection unavailable</div> : (
-                  <section className="coordinator-project">
-                    <div className="coordinator-project-header"><div><h3>Phoenix</h3><div className="coordinator-path">/work/phoenix</div></div><span>2</span></div>
-                    <div className="coordinator-items">
-                      <article className="coordinator-item">
-                        <div className="coordinator-item-row">
-                          <div className="coordinator-item-main"><div className="coordinator-item-title-row"><a href="/c/mobile-first-coordinator">Restore mobile Coordinator transcript</a><span className="coordinator-state-pill">working</span></div><div className="coordinator-compact-meta"><span>chain</span><span>WORK</span><span>4m</span><span>TASK 44006</span></div></div>
-                          <div className="coordinator-item-actions"><button type="button">{scenario.expanded ? 'Hide details' : 'Show details'}</button><button type="button">Copy ref</button></div>
-                        </div>
-                        {scenario.expanded && <div className="coordinator-item-details"><div className="coordinator-signals"><span>active runtime</span><span>task open</span></div><div className="coordinator-work-meta"><span>CURRENT a27dd240</span><span>ROOT 86f2ce14</span><span>WORKTREE /phoenix/worktrees/mobile-first-coordinator</span><span>REF @work:mobile-first-coordinator</span></div></div>}
-                      </article>
-                    </div>
-                  </section>
-                )}
-              </section>
-            </div>
-          </main>
-        </DensityContext.Provider>
-      </ConversationContext.Provider>
-    </MemoryRouter>
+    <ConversationContext.Provider value={store}>
+      <DensityContext.Provider value={{ density: 'compact', setDensity: () => {} }}>
+        <div id="app">
+          <div className="conversation-column">
+            <MessageList
+              messages={transcript.messages}
+              pendingMessages={[]}
+              convState={convState}
+              onRetry={() => {}}
+              onOpenFile={() => {}}
+              conversationId={transcript.conversationId}
+              slug={transcript.slug}
+              transcriptPositioning={{ kind: 'idle', view: { conversationId: transcript.conversationId, generation: 1, transcriptGeneration: 1 } }}
+            />
+            <InputArea
+              cwd={undefined}
+              scopeKey={transcript.conversationId}
+              convState={convState}
+              images={images}
+              setImages={setImages}
+              isOffline={false}
+              failedMessages={[]}
+              convModeLabel="Explore"
+              draft={draft}
+              onDraftChange={setDraft}
+              onSend={() => {}}
+              onCancel={() => {}}
+              onRetry={() => {}}
+            />
+            <StateBar
+              conversation={conversation}
+              convState={convState}
+              connectionState="connected"
+              connectionAttempt={0}
+              nextRetryIn={null}
+              contextWindowUsed={16_000}
+              modelContextWindow={200_000}
+              phaseStateUpdatedAt={null}
+            />
+          </div>
+        </div>
+      </DensityContext.Provider>
+    </ConversationContext.Provider>
   );
 }
+
+const fixtureOpenWork: GlobalOpenWorkResponse = {
+  generated_at: '2026-01-01T00:00:00Z',
+  has_more: false,
+  groups: [{
+    project_id: 'phoenix',
+    project_name: 'Phoenix',
+    canonical_path: '/work/phoenix',
+    items: [{
+      id: 'mobile-first-coordinator',
+      source: 'chain',
+      title: 'Restore mobile Coordinator transcript',
+      project_id: 'phoenix',
+      current_conversation_id: 'a27dd240-2fb9-426e-835c-3cc48cd84c24',
+      current_conversation_slug: 'mobile-first-coordinator',
+      root_conversation_id: '86f2ce14-durable-coordinator',
+      root_conversation_slug: 'durable-coordinator',
+      updated_at: '2026-01-01T12:00:00Z',
+      mode: 'WORK',
+      state: 'working',
+      task_id: '44006',
+      task_title: 'Make Coordinator mobile-first',
+      task_status: 'in-progress',
+      branch_name: 'task-44006-mobile-first-coordinator',
+      base_branch: 'main',
+      worktree_path: '/phoenix/worktrees/mobile-first-coordinator',
+      member_count: 2,
+      signals: ['active runtime', 'task open'],
+      href: '/c/mobile-first-coordinator',
+      reference: '@work:mobile-first-coordinator',
+    }],
+  }],
+};

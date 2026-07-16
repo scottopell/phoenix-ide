@@ -151,6 +151,18 @@ describe('CoordinatorPage', () => {
     expect(screen.getByRole('textbox', { name: 'Coordinator draft' })).toHaveValue('unsent follow-up');
   });
 
+  it('offers a compact Fleet retry after projection failure', async () => {
+    apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
+    renderPage();
+
+    await screen.findByText(/Fleet unavailable: projection unavailable/);
+    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
+    apiMock.getGlobalOpenWork.mockResolvedValueOnce(openWork());
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    await waitFor(() => expect(apiMock.getGlobalOpenWork).toHaveBeenCalledTimes(2));
+  });
+
   it('mounts the Coordinator even when fleet loading fails', async () => {
     apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
     renderPage();

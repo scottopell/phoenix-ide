@@ -60,6 +60,7 @@
 }
 
 .coordinator-actions button,
+.coordinator-fleet-error button,
 .coordinator-item-actions button,
 .coordinator-open-work > button {
   min-height: 30px;
@@ -74,7 +75,13 @@
   transition: border-color 150ms ease, background-color 150ms ease;
 }
 
+.coordinator-fleet-error button {
+  min-height: 36px;
+  flex: 0 0 auto;
+}
+
 .coordinator-actions button:hover,
+.coordinator-fleet-error button:hover,
 .coordinator-item-actions button:hover,
 .coordinator-open-work > button:hover {
   border-color: var(--accent-blue);
@@ -140,6 +147,13 @@
 .coordinator-error {
   margin: 16px 0;
   color: var(--accent-red);
+}
+
+.coordinator-fleet-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .coordinator-page > .coordinator-error,
@@ -448,6 +462,10 @@
 
   .coordinator-item-actions button {
     flex: 1 1 0;
+    min-height: 44px;
+  }
+
+  .coordinator-fleet-error button {
     min-height: 44px;
   }
 
