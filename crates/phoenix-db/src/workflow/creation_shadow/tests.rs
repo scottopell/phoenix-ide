@@ -566,7 +566,7 @@ async fn replacement_removes_old_forward_graph_before_compensation_graph() {
 }
 
 #[tokio::test]
-async fn older_persisted_revision_cannot_regress_same_attempt_projection() {
+async fn newer_persisted_revision_is_reported_as_corruption() {
     let pool = pool().await;
     let repo = WorkflowRepository::new(pool.clone());
     let persistence = config();
@@ -586,14 +586,15 @@ async fn older_persisted_revision_cannot_regress_same_attempt_projection() {
     .await
     .unwrap();
 
-    adapter
+    let error = adapter
         .persist_after_authoritative_commit(
             &oracle(),
             CreationShadowEvidence::ProjectionStatus(CreationProjectionStatus::Provisioning),
             Utc.timestamp_opt(2_401, 0).single().unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(error, WorkflowRepositoryError::CorruptState(_)));
     let status: String = sqlx::query_scalar(
         "SELECT projection_status FROM creation_shadow_projections WHERE shadow_workflow_id = 'creation-shadow'",
     )
