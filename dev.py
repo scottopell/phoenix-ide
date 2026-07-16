@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime
+import enum
 import fcntl
 import hashlib
 import ipaddress
@@ -6964,6 +6965,7 @@ def native_prod_status():
     if creds_path.exists():
         try:
             import datetime
+
             creds = json.loads(creds_path.read_text())
             expires_at = creds["claudeAiOauth"]["expiresAt"]
             expires_dt = datetime.datetime.fromtimestamp(
@@ -7211,7 +7213,37 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _binary_identity(binary: Path) -> dict[str, str]:
+class ProdSourceKind(enum.Enum):
+    LOCAL_HEAD = "local_head"
+    PUBLISHED_RELEASE = "published_release"
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeIdentity:
+    version: str
+    git_sha: str
+
+    @classmethod
+    def from_value(cls, value: "RuntimeIdentity | dict[str, str]") -> "RuntimeIdentity":
+        if isinstance(value, cls):
+            return value
+        return cls(version=value["version"], git_sha=value["git_sha"])
+
+    def as_dict(self) -> dict[str, str]:
+        return {"version": self.version, "git_sha": self.git_sha}
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparedCandidate:
+    binary: Path
+    source_kind: ProdSourceKind
+    source_commit: str
+    identity: RuntimeIdentity
+    release_tag: str | None = None
+    release_commit: str | None = None
+
+
+def _binary_identity(binary: Path) -> RuntimeIdentity:
     result = subprocess.run(
         [str(binary), "--build-identity"], capture_output=True, text=True, timeout=10, check=True
     )
@@ -7223,7 +7255,7 @@ def _binary_identity(binary: Path) -> dict[str, str]:
         raise SystemExit("candidate binary did not report a valid embedded build identity") from exc
     if not isinstance(version, str) or not version or not isinstance(git_sha, str) or not git_sha or git_sha == "unknown":
         raise SystemExit("candidate binary has an incomplete embedded build identity")
-    return {"version": version, "git_sha": git_sha}
+    return RuntimeIdentity(version=version, git_sha=git_sha)
 
 
 def _launchd_health_probe(env: dict[str, str]) -> tuple[str, bool]:
@@ -7246,18 +7278,20 @@ def _launchd_env_from_plist(path: Path) -> dict[str, str]:
 
 
 def _rollback_identity_matches(
-    rollback_identity: dict[str, str],
-    previous_identity: dict[str, str],
+    rollback_identity: RuntimeIdentity | dict[str, str],
+    previous_identity: RuntimeIdentity | dict[str, str],
     previous_health_json: bool,
 ) -> bool:
-    rollback_sha = rollback_identity["git_sha"]
+    rollback_identity = RuntimeIdentity.from_value(rollback_identity)
+    previous_identity = RuntimeIdentity.from_value(previous_identity)
+    rollback_sha = rollback_identity.git_sha
     if re.fullmatch(r"[0-9a-f]{12}", rollback_sha) is None:
         return False
     if previous_health_json:
         return rollback_identity == previous_identity
     return (
-        rollback_identity["version"] == previous_identity["version"]
-        and previous_identity["git_sha"].startswith(rollback_sha)
+        rollback_identity.version == previous_identity.version
+        and previous_identity.git_sha.startswith(rollback_sha)
     )
 
 
@@ -7269,7 +7303,7 @@ def _parse_legacy_version_body(body: str) -> str | None:
     return value or None
 
 
-def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, bool] | None:
+def _legacy_prod_identity(env: dict[str, str]) -> tuple[RuntimeIdentity, str, bool] | None:
     import ssl
     import urllib.request
 
@@ -7283,12 +7317,12 @@ def _legacy_prod_identity(env: dict[str, str]) -> tuple[dict[str, str], str, boo
             version = _parse_legacy_version_body(response.read().decode())
         if version is None:
             return None
-        return {"version": version, "git_sha": source_sha}, url, tls_enabled_from_env(env)
+        return RuntimeIdentity(version=version, git_sha=source_sha), url, tls_enabled_from_env(env)
     except Exception:
         return None
 
 
-def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
+def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
     import ssl
     import urllib.request
     try:
@@ -7296,7 +7330,7 @@ def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
         context = ssl._create_unverified_context() if insecure_tls else None
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
             value = json.load(response)
-        return {"version": str(value["version"]), "git_sha": str(value["git_sha"])}
+        return RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
     except Exception:
         return None
 
@@ -7304,7 +7338,7 @@ def _current_prod_identity(env: dict[str, str]) -> dict[str, str] | None:
 def _resolve_rollback_identity(
     rollback_binary: Path,
     previous_env: dict[str, str],
-) -> tuple[dict[str, str], str, bool, bool]:
+) -> tuple[RuntimeIdentity, str, bool, bool]:
     previous_identity = _current_prod_identity(previous_env)
     previous_health_url, previous_health_insecure_tls = _launchd_health_probe(previous_env)
     previous_health_json = previous_identity is not None
@@ -7346,20 +7380,26 @@ def _resolve_rollback_identity(
 
 def _release_asset_name() -> str:
     import platform
+
     machine = platform.machine().lower()
-    mapping = {
-        "arm64": "phoenix_ide-aarch64-apple-darwin",
-        "aarch64": "phoenix_ide-aarch64-apple-darwin",
-        "x86_64": "phoenix_ide-x86_64-apple-darwin",
-        "amd64": "phoenix_ide-x86_64-apple-darwin",
-    }
-    try:
-        return mapping[machine]
-    except KeyError as exc:
-        raise SystemExit(f"no published macOS release asset for host architecture {machine!r}") from exc
+    architecture = {
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+    }.get(machine)
+    platform_target = {
+        "darwin": "apple-darwin",
+        "linux": "unknown-linux-musl",
+    }.get(sys.platform)
+    if architecture is None or platform_target is None:
+        raise SystemExit(
+            f"no published release asset for host platform {sys.platform!r} architecture {machine!r}"
+        )
+    return f"phoenix_ide-{architecture}-{platform_target}"
 
 
-def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str, str, str]:
+def _prepare_release_candidate(requested: str, staging: Path) -> PreparedCandidate:
     if requested == "latest":
         view = subprocess.run(
             ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
@@ -7406,23 +7446,48 @@ def _prepare_release_candidate(requested: str, staging: Path) -> tuple[Path, str
     if _file_sha256(binary) != expected.lower():
         raise SystemExit(f"checksum mismatch for release asset {asset_name}")
     binary.chmod(0o755)
-    identity = _binary_identity(binary)
+    identity = RuntimeIdentity.from_value(_binary_identity(binary))
     expected_version = tag.removeprefix("v")
-    if identity["version"] != expected_version:
+    if identity.version != expected_version:
         raise SystemExit(
-            f"release {tag} embeds version {identity['version']}, expected {expected_version}"
+            f"release {tag} embeds version {identity.version}, expected {expected_version}"
         )
-    if identity["git_sha"].endswith("-dirty"):
+    if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
-    if not re.fullmatch(r"[0-9a-f]{12}", identity["git_sha"]):
+    if not re.fullmatch(r"[0-9a-f]{12}", identity.git_sha):
         raise SystemExit(
-            f"release {tag} asset embeds malformed git identity {identity['git_sha']!r}; expected 12 lowercase hex characters"
+            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 lowercase hex characters"
         )
-    if not release_commit.startswith(identity["git_sha"]):
+    if not release_commit.startswith(identity.git_sha):
         raise SystemExit(
-            f"release {tag} resolves to {release_commit}, but the asset embeds {identity['git_sha']}"
+            f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
         )
-    return binary, tag, identity["git_sha"], release_commit
+    return PreparedCandidate(
+        binary=binary,
+        source_kind=ProdSourceKind.PUBLISHED_RELEASE,
+        source_commit=release_commit,
+        identity=identity,
+        release_tag=tag,
+        release_commit=release_commit,
+    )
+
+
+def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
+    binary = prod_build(target=target)
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    identity = RuntimeIdentity.from_value(_binary_identity(binary))
+    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+        raise SystemExit(
+            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit[:12]}"
+        )
+    return PreparedCandidate(
+        binary=binary,
+        source_kind=ProdSourceKind.LOCAL_HEAD,
+        source_commit=source_commit,
+        identity=identity,
+    )
 
 
 _DEPLOY_TERMINAL_STATES = {
@@ -7541,11 +7606,11 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
-def _report_launchd_handoff(transaction_id: str, identity: dict[str, str]) -> None:
+def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> None:
     try:
         print("\n✓ Activation handed to an independent launchd helper")
         print(f"  Transaction: {transaction_id}")
-        print(f"  Candidate: {identity['version']} ({identity['git_sha']})")
+        print(f"  Candidate: {identity.version} ({identity.git_sha})")
         print("  The Phoenix connection may close while the service is replaced.")
         print("  After reconnecting, run: ./dev.py prod status")
     except BrokenPipeError:
@@ -7589,18 +7654,16 @@ def launchd_prod_deploy(release: str | None = None):
             shutil.rmtree(old, ignore_errors=True)
         staging.mkdir(parents=True)
         staging.chmod(0o700)
-        if release:
-            binary, release_tag, embedded_commit, release_commit = _prepare_release_candidate(release, staging)
-            source_commit = release_commit
-            source_kind = "published_release"
-        else:
-            binary = prod_build(target=None)
-            release_tag = None
-            source_commit = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
-            ).stdout.strip()
-            source_kind = "local_head"
-            release_commit = None
+        prepared = (
+            _prepare_release_candidate(release, staging)
+            if release
+            else _prepare_local_candidate(target=None)
+        )
+        binary = prepared.binary
+        release_tag = prepared.release_tag
+        source_commit = prepared.source_commit
+        source_kind = prepared.source_kind.value
+        release_commit = prepared.release_commit
 
         candidate_binary = staging / "candidate-phoenix-ide"
         if binary != candidate_binary:
@@ -7611,13 +7674,12 @@ def launchd_prod_deploy(release: str | None = None):
             check=True,
         )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
-        identity = _binary_identity(candidate_binary)
-        if release and identity["git_sha"] != embedded_commit:
-            raise SystemExit("staged release identity changed after signing")
-        if not release and not source_commit.startswith(identity["git_sha"].removesuffix("-dirty")):
-            raise SystemExit(
-                f"local candidate identity {identity['git_sha']} does not match selected HEAD {source_commit[:12]}"
-            )
+        identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
+        if (
+            identity.version != prepared.identity.version
+            or identity.git_sha != prepared.identity.git_sha
+        ):
+            raise SystemExit("staged candidate identity changed after signing")
 
         env_overrides = dict(launchd_env)
         env_file = _env_file
@@ -7625,7 +7687,7 @@ def launchd_prod_deploy(release: str | None = None):
             print(f"  Loaded env from {env_file}")
         path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
-        plist_content = generate_launchd_plist(identity["version"], extra_env=env_overrides, path_override=path_str)
+        plist_content = generate_launchd_plist(identity.version, extra_env=env_overrides, path_override=path_str)
         candidate_plist = staging / "candidate.plist"
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
@@ -7694,8 +7756,8 @@ def launchd_prod_deploy(release: str | None = None):
             "source_commit": source_commit,
             "release_tag": release_tag,
             "release_commit": release_commit,
-            "expected": identity,
-            "previous": previous_identity,
+            "expected": identity.as_dict(),
+            "previous": previous_identity.as_dict() if previous_identity is not None else None,
             "previous_deployed_sha": previous_deployed_sha,
             "candidate_binary": str(candidate_binary),
             "candidate_binary_sha256": _file_sha256(candidate_binary),
@@ -7727,7 +7789,7 @@ def launchd_prod_deploy(release: str | None = None):
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": identity["version"], "expected_git_sha": identity["git_sha"],
+            "expected_version": identity.version, "expected_git_sha": identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
             "failure": None, "rollback_failure": None,
         })

@@ -308,7 +308,7 @@ class PreparationTests(unittest.TestCase):
     def test_broken_pipe_after_handoff_does_not_release_claim(self):
         with mock.patch("builtins.print", side_effect=BrokenPipeError), \
              mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
-            self.dev._report_launchd_handoff("tx", {"version": "1.0.0", "git_sha": "abc123"})
+            self.dev._report_launchd_handoff("tx", self.dev.RuntimeIdentity("1.0.0", "abc123"))
         release.assert_not_called()
 
     def test_positional_version_is_rejected_with_release_guidance(self):
@@ -329,6 +329,21 @@ class PreparationTests(unittest.TestCase):
         check.assert_not_called()
         build.assert_not_called()
 
+    def test_release_asset_selection_supports_all_native_targets(self):
+        import platform
+
+        cases = [
+            ("darwin", "arm64", "phoenix_ide-aarch64-apple-darwin"),
+            ("darwin", "x86_64", "phoenix_ide-x86_64-apple-darwin"),
+            ("linux", "aarch64", "phoenix_ide-aarch64-unknown-linux-musl"),
+            ("linux", "amd64", "phoenix_ide-x86_64-unknown-linux-musl"),
+        ]
+        for host_platform, machine, expected in cases:
+            with self.subTest(host_platform=host_platform, machine=machine), \
+                 mock.patch.object(self.dev.sys, "platform", host_platform), \
+                 mock.patch.object(platform, "machine", return_value=machine):
+                self.assertEqual(expected, self.dev._release_asset_name())
+
     def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
@@ -345,10 +360,14 @@ class PreparationTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
-            binary, tag, sha, commit = self.dev._prepare_release_candidate("latest", staging)
-            self.assertEqual(asset, binary)
-            self.assertTrue(binary.stat().st_mode & 0o100)
-        self.assertEqual(("v1.2.3", "abc123def456", release_commit), (tag, sha, commit))
+            candidate = self.dev._prepare_release_candidate("latest", staging)
+            self.assertEqual(asset, candidate.binary)
+            self.assertTrue(candidate.binary.stat().st_mode & 0o100)
+        self.assertEqual(self.dev.ProdSourceKind.PUBLISHED_RELEASE, candidate.source_kind)
+        self.assertEqual(
+            ("v1.2.3", "abc123def456", release_commit),
+            (candidate.release_tag, candidate.identity.git_sha, candidate.release_commit),
+        )
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
 
     def test_release_rejects_asset_from_different_commit(self):
@@ -384,6 +403,39 @@ class PreparationTests(unittest.TestCase):
             ]
             with self.assertRaisesRegex(SystemExit, "malformed git identity"):
                 self.dev._prepare_release_candidate("latest", staging)
+
+    def test_local_candidate_binds_exact_head_to_typed_identity(self):
+        commit = "abc123def456" + "0" * 28
+        identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+        with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")) as build, \
+             mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, commit + "\n", ""),
+             ):
+            candidate = self.dev._prepare_local_candidate(target=None)
+        self.assertEqual(self.dev.ProdSourceKind.LOCAL_HEAD, candidate.source_kind)
+        self.assertEqual(commit, candidate.source_commit)
+        self.assertEqual(identity, candidate.identity)
+        self.assertIsNone(candidate.release_tag)
+        self.assertIsNone(candidate.release_commit)
+        build.assert_called_once_with(target=None)
+
+    def test_local_candidate_rejects_identity_from_other_commit(self):
+        with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")), \
+             mock.patch.object(
+                 self.dev,
+                 "_binary_identity",
+                 return_value=self.dev.RuntimeIdentity("2.0.0", "bbbbbbbbbbbb"),
+             ), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+             ):
+            with self.assertRaisesRegex(SystemExit, "does not match selected HEAD"):
+                self.dev._prepare_local_candidate(target=None)
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -490,7 +542,7 @@ class PreparationTests(unittest.TestCase):
              mock.patch("urllib.request.urlopen", return_value=Response()):
             self.dev.PROD_SHA_PATH.write_text("abc123\n")
             identity, url, insecure = self.dev._legacy_prod_identity({"PHOENIX_PORT": "9123"})
-        self.assertEqual({"version": "0.9.0", "git_sha": "abc123"}, identity)
+        self.assertEqual(self.dev.RuntimeIdentity("0.9.0", "abc123"), identity)
         self.assertEqual("http://localhost:9123/version", url)
         self.assertFalse(insecure)
 
