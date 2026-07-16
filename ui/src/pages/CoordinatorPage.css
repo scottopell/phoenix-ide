@@ -48,6 +48,10 @@
   min-width: 0;
 }
 
+.coordinator-fleet-glance {
+  display: none;
+}
+
 .coordinator-header h1 {
   font-size: 24px;
   line-height: 1.2;
@@ -423,6 +427,52 @@
     font-variant-numeric: tabular-nums;
   }
 
+  .coordinator-page--conversation .coordinator-fleet-glance {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 10px;
+    flex: 0 0 auto;
+    align-items: center;
+    width: auto;
+    min-height: 44px;
+    margin: 8px 12px;
+    padding: 7px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    text-align: left;
+  }
+
+  .coordinator-fleet-glance-label {
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .coordinator-fleet-glance-detail {
+    display: flex;
+    min-width: 0;
+    align-items: baseline;
+    gap: 6px;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .coordinator-fleet-glance-detail strong {
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: 12px;
+    text-overflow: ellipsis;
+  }
+
+  .coordinator-fleet-glance-error {
+    color: var(--accent-red);
+  }
+
   .coordinator-conversation,
   .coordinator-fleet-pane {
     flex: 1 1 auto;
@@ -482,6 +532,10 @@
 }
 
 @media (width <= 480px) {
+  .coordinator-fleet-glance-detail > span:first-child {
+    display: none;
+  }
+
   .coordinator-project {
     padding: 12px;
   }

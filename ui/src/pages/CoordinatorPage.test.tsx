@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
 import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
@@ -126,7 +126,7 @@ describe('CoordinatorPage', () => {
     });
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    expect(screen.getByText('Fix coordinator page')).toBeInTheDocument();
+    expect(document.querySelector('.coordinator-fleet-pane a')).toHaveTextContent('Fix coordinator page');
     expect(screen.getByText('TASK 08700')).toBeInTheDocument();
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
   });
@@ -135,15 +135,16 @@ describe('CoordinatorPage', () => {
     renderPage();
 
     const conversation = await screen.findByRole('region', { name: 'Coordinator conversation' });
-    const fleet = screen.getByText('Fix coordinator page').closest('.coordinator-fleet-pane');
+    const fleet = document.querySelector('.coordinator-fleet-pane');
     const draft = screen.getByRole('textbox', { name: 'Coordinator draft' });
     fireEvent.change(draft, { target: { value: 'unsent follow-up' } });
 
     expect(screen.getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'true');
     expect(conversation).not.toHaveAttribute('hidden');
     expect(fleet).toHaveAttribute('hidden');
+    expect(screen.getByRole('button', { name: 'Open Fleet snapshot' })).toHaveTextContent('Fix coordinator page');
 
-    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
     expect(conversation).toHaveAttribute('hidden');
     expect(fleet).not.toHaveAttribute('hidden');
 
@@ -151,12 +152,37 @@ describe('CoordinatorPage', () => {
     expect(screen.getByRole('textbox', { name: 'Coordinator draft' })).toHaveValue('unsent follow-up');
   });
 
+  it('restores Conversation when a compact deep link reuses the route', async () => {
+    function DeepLinkHarness() {
+      const navigate = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigate('/global/conv-coordinator#message-42')}>Open citation</button>
+          <CoordinatorPage />
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/global/conv-coordinator']}>
+        <Routes><Route path="/global/:slug" element={<DeepLinkHarness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
+    const conversation = document.querySelector('.coordinator-conversation');
+    expect(conversation).toHaveAttribute('hidden');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open citation' }));
+    await waitFor(() => expect(conversation).not.toHaveAttribute('hidden'));
+  });
+
   it('offers a compact Fleet retry after projection failure', async () => {
     apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
     renderPage();
 
     await screen.findByText(/Fleet unavailable: projection unavailable/);
-    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
     apiMock.getGlobalOpenWork.mockResolvedValueOnce(openWork());
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
@@ -214,8 +240,9 @@ describe('CoordinatorPage', () => {
   it('expands a fleet row to reveal audit detail and copies the durable reference', async () => {
     renderPage();
 
-    await screen.findByText('Fix coordinator page');
-    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
+    expect(screen.getByRole('link', { name: 'Fix coordinator page' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Show details' }));
 
     expect(screen.getByText('ROOT conv-roo')).toBeInTheDocument();

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
 import { useMediaQuery } from '../hooks';
 import type { GlobalOpenWorkResponse } from '../api';
@@ -22,6 +22,7 @@ interface CoordinatorPageFixtureData {
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
   const navigate = useNavigate();
   const { slug } = useParams<{ slug: string }>();
+  const location = useLocation();
   const compactLayout = useMediaQuery('(max-width: 1024px)');
   const [activeView, setActiveView] = useState<CoordinatorView>(fixtureData?.initialView ?? 'conversation');
   const [openWork, setOpenWork] = useState<GlobalOpenWorkResponse | null>(fixtureData?.openWork ?? null);
@@ -92,6 +93,15 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     () => openWork?.groups.reduce((sum, group) => sum + group.items.length, 0) ?? 0,
     [openWork],
   );
+  const fleetGlance = useMemo(() => {
+    const group = openWork?.groups.find((candidate) => candidate.items.length > 0);
+    const item = group?.items[0];
+    return group && item ? { projectName: group.project_name, item } : null;
+  }, [openWork]);
+
+  useEffect(() => {
+    if (!fixtureData && compactLayout) setActiveView('conversation');
+  }, [compactLayout, fixtureData, location.key]);
 
   const loadMoreOpenWork = async () => {
     if (!openWork || !openWork.has_more || openWorkLoadingMore) return;
@@ -161,6 +171,27 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           </button>
         </div>
       </header>
+
+      <button
+        type="button"
+        className="coordinator-fleet-glance"
+        onClick={() => setActiveView('fleet')}
+        aria-label="Open Fleet snapshot"
+      >
+        <span className="coordinator-fleet-glance-label">Fleet · {itemCount} active</span>
+        {fleetError ? (
+          <span className="coordinator-fleet-glance-detail coordinator-fleet-glance-error">Unavailable</span>
+        ) : fleetGlance ? (
+          <span className="coordinator-fleet-glance-detail">
+            <span>{fleetGlance.projectName}</span>
+            <strong>{fleetGlance.item.title}</strong>
+            <span>{fleetGlance.item.state}</span>
+          </span>
+        ) : (
+          <span className="coordinator-fleet-glance-detail">No active work</span>
+        )}
+        <span aria-hidden="true">›</span>
+      </button>
 
       {error && <div className="coordinator-error">{error}</div>}
       <div className="coordinator-sr-only" aria-live="polite">
