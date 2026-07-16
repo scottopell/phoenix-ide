@@ -177,6 +177,64 @@ class SystemdManifestValidationTests(unittest.TestCase):
             self.validate()
 
 
+class SystemdHandoffStagingTests(SystemdManifestValidationTests):
+    def bundle(self, files):
+        path = self.base / "bundle.json"
+        path.write_text(json.dumps({"transaction_id": self.transaction_id, "files": files}))
+        return path
+
+    def staging_policy(self):
+        staging = self.base / "root-deploy"
+        return helper.ValidationPolicy(
+            transaction_root=staging / "transactions",
+            unit_name=self.policy.unit_name,
+            targets=self.targets,
+            status_path=staging / "status.json",
+            active_path=staging / "active",
+            activation_lock_path=staging / "activation.lock",
+            claim_lock_path=staging / "claim.lock",
+            owner_uid=os.getuid(),
+        )
+
+    def test_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
+        sources = []
+        for name in ("candidate-binary", "candidate.service", "candidate.socket", "helper.py", "manifest.json"):
+            source = self.base / f"source-{name}"
+            source.write_text(name)
+            sources.append({"name": name, "source": str(source), "sha256": digest(source)})
+        policy = self.staging_policy()
+        manifest = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+        self.assertEqual(policy.transaction_root / self.transaction_id / "manifest.json", manifest)
+        self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
+        for item in sources:
+            self.assertEqual(item["name"], (manifest.parent / item["name"]).read_text())
+
+    def test_stage_handoff_rejects_non_allowlisted_artifact_before_claim(self):
+        source = self.base / "secret"
+        source.write_text("secret")
+        policy = self.staging_policy()
+        with self.assertRaisesRegex(helper.ValidationError, "non-allowlisted"):
+            helper.stage_handoff(
+                self.bundle([{"name": "arbitrary", "source": str(source), "sha256": digest(source)}]),
+                os.getuid(),
+                policy,
+            )
+        self.assertFalse(policy.active_path.exists())
+
+    def test_stage_handoff_failure_releases_only_its_own_claim(self):
+        source = self.base / "candidate"
+        source.write_text("candidate")
+        required = [
+            {"name": name, "source": str(source), "sha256": "0" * 64}
+            for name in ("candidate-binary", "candidate.service", "candidate.socket", "helper.py", "manifest.json")
+        ]
+        policy = self.staging_policy()
+        with self.assertRaisesRegex(helper.ValidationError, "checksum mismatch"):
+            helper.stage_handoff(self.bundle(required), os.getuid(), policy)
+        self.assertFalse(policy.active_path.exists())
+        self.assertFalse((policy.transaction_root / self.transaction_id).exists())
+
+
 class FakeSystemctl:
     def __init__(self, manifest, previous_state, *, start_failure=None):
         self.manifest = manifest

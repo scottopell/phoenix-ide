@@ -755,19 +755,134 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                     path.unlink(missing_ok=True)
 
 
+def acquire_claim(transaction_id: str, policy: ValidationPolicy) -> Path:
+    if not TRANSACTION_RE.fullmatch(transaction_id):
+        raise ValidationError("malformed transaction id")
+    policy.transaction_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(policy.transaction_root, 0o700)
+    policy.active_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with policy.claim_lock_path.open("a+") as lock:
+        os.chmod(policy.claim_lock_path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if policy.active_path.exists():
+            owner = policy.active_path.read_text().strip()
+            try:
+                status = json.loads(policy.status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                status = {}
+            if owner and not (
+                status.get("transaction_id") == owner
+                and status.get("state") in TERMINAL_STATES
+            ):
+                raise ConcurrentDeploy(f"deployment transaction {owner} is unresolved")
+        transaction = policy.transaction_root / transaction_id
+        if transaction.exists():
+            raise ValidationError("transaction directory already exists")
+        transaction.mkdir(mode=0o700)
+        atomic_write(policy.active_path, (transaction_id + "\n").encode())
+        return transaction
+
+
+def copy_handoff_file(source: Path, destination: Path, expected_hash: str, source_uid: int, mode: int) -> None:
+    if not SHA256_RE.fullmatch(expected_hash):
+        raise ValidationError("handoff artifact has malformed checksum")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, flags)
+    except OSError as exc:
+        raise ValidationError("handoff artifact cannot be opened safely") from exc
+    temporary = None
+    try:
+        metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != source_uid:
+            raise ValidationError("handoff artifact has unexpected type or owner")
+        if sha256_fd(source_fd) != expected_hash:
+            raise ValidationError("handoff artifact checksum mismatch")
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        output_fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        try:
+            os.fchmod(output_fd, mode)
+            while chunk := os.read(source_fd, 1024 * 1024):
+                os.write(output_fd, chunk)
+            os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+        os.replace(temporary, destination)
+        temporary = None
+        fsync_dir(destination.parent)
+    finally:
+        os.close(source_fd)
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
+    try:
+        bundle = json.loads(bundle_path.read_text())
+        transaction_id = bundle["transaction_id"]
+        files = bundle["files"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("invalid handoff bundle") from exc
+    allowed = {
+        "candidate-binary": 0o700,
+        "candidate.service": 0o600,
+        "candidate.socket": 0o600,
+        "candidate.env": 0o600,
+        "rollback-binary": 0o600,
+        "rollback.service": 0o600,
+        "rollback.socket": 0o600,
+        "rollback.env": 0o600,
+        "helper.py": 0o700,
+        "manifest.json": 0o600,
+    }
+    if not isinstance(files, list) or not files or not all(isinstance(item, dict) for item in files):
+        raise ValidationError("handoff bundle has invalid file entries")
+    names = [item.get("name") for item in files]
+    if len(names) != len(set(names)) or set(names) - set(allowed):
+        raise ValidationError("handoff bundle contains duplicate or non-allowlisted artifacts")
+    if not {"candidate-binary", "candidate.service", "candidate.socket", "helper.py", "manifest.json"} <= set(names):
+        raise ValidationError("handoff bundle is missing required artifacts")
+    transaction = acquire_claim(transaction_id, policy)
+    try:
+        for item in files:
+            name = item["name"]
+            copy_handoff_file(Path(item["source"]), transaction / name, item["sha256"], source_uid, allowed[name])
+        return transaction / "manifest.json"
+    except BaseException:
+        shutil.rmtree(transaction, ignore_errors=True)
+        with policy.claim_lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if policy.active_path.exists() and policy.active_path.read_text().strip() == transaction_id:
+                policy.active_path.unlink()
+                fsync_dir(policy.active_path.parent)
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="store_true")
-    parser.add_argument("activate", nargs="?")
+    parser.add_argument("action", nargs="?", choices=("activate", "stage"))
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--source-uid", type=int)
     args = parser.parse_args()
     if args.protocol_version:
         print(HANDOFF_PROTOCOL_VERSION)
         return 0
-    if args.activate != "activate" or args.manifest is None:
-        parser.error("activation requires activate --manifest PATH")
     if os.geteuid() != 0:
-        raise SystemExit("systemd activation helper must run as root")
+        raise SystemExit("systemd deployment helper must run as root")
+    if args.action == "stage":
+        if args.bundle is None or args.source_uid is None:
+            parser.error("staging requires stage --bundle PATH --source-uid UID")
+        try:
+            print(stage_handoff(args.bundle, args.source_uid, ValidationPolicy.production()))
+            return 0
+        except Exception as exc:
+            print(f"systemd handoff staging failed: {exc}", file=sys.stderr)
+            return 1
+    if args.action != "activate" or args.manifest is None:
+        parser.error("activation requires activate --manifest PATH")
     manifest = None
     try:
         manifest = Manifest.load(args.manifest)
