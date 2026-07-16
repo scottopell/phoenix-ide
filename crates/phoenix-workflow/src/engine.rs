@@ -48,12 +48,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         Ok(Self {
             binding: WorkflowBinding::Authoritative(AuthoritativeWorkflow {
                 workflow_id,
-                version: Version(0),
-                generation: Generation(0),
                 profile: profile.clone(),
                 accepted_protocol: accepted_protocol.clone(),
             }),
-            semantic_authority: Some(accepted_protocol.authority),
             version: Version(0),
             generation: Generation(0),
             status: WorkflowStatus::Active,
@@ -111,7 +108,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 profile: profile.clone(),
                 accepted_protocol: accepted_protocol.clone(),
             }),
-            semantic_authority: None,
             version: Version(0),
             generation: Generation(0),
             status: WorkflowStatus::Active,
@@ -730,6 +726,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             || matches!(choice.kind, ManualChoiceKind::Retry) != commit.retry_at.is_some()
             || (choice.kind == ManualChoiceKind::Fail
                 && commit.next_status != WorkflowStatus::Failed)
+            || (choice.kind == ManualChoiceKind::Retry && commit.next_status != self.status)
             || validate_status_transition(self.status, commit.next_status).is_err()
         {
             return invalid_manual_resolution(Some(existing));
@@ -743,6 +740,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             choice,
             commit,
         );
+        if choice.kind == ManualChoiceKind::Compensate
+            && matches!(effect_outcome, ManualEffectOutcome::Failed)
+        {
+            return invalid_manual_resolution(Some(existing));
+        }
         if matches!(effect_outcome, ManualEffectOutcome::Receipt { .. }) {
             let _ = replacement.evaluate_barriers();
         }
@@ -772,7 +774,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         binding: &InboxDecisionBinding<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
     ) -> Result<AtomicInboxConsumeResult<P>, EngineError> {
-        self.ensure_executable()?;
         let decision = &binding.decision;
         if decision.expected_workflow_version != self.version {
             return Ok(AtomicInboxConsumeResult {
@@ -782,6 +783,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 reducer_events: Vec::new(),
             });
         }
+        self.ensure_executable()?;
         self.validate_plan_against_state(&decision.plan, barrier_events)?;
         let inbox_ids = binding
             .inbox
@@ -806,7 +808,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             };
             if !same_inbox_event(inbox, linked_inbox)
                 || inbox.delivery_status != DeliveryStatus::Pending
-                || decision.plan.event_codec != inbox.event_codec
                 || !P::decision_handles_inbox(&inbox.payload, &decision.plan.event)
             {
                 return Ok(AtomicInboxConsumeResult {
@@ -827,12 +828,16 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return Err(EngineError::InvalidInbox);
         }
         replacement.install_owed_acceptances(&decision.plan, &inbox_ids)?;
+        let mut consumed_inbox_ids = Vec::new();
         for inbox_id in &inbox_ids {
             let Some(inbox) = replacement.reducer_inbox.get_mut(inbox_id) else {
                 return Err(EngineError::InvalidInbox);
             };
-            inbox.delivery_status = DeliveryStatus::Consumed;
-            inbox.consumed_by = Some(transition.transition_id);
+            if !inbox.requires_runtime_acceptance {
+                inbox.delivery_status = DeliveryStatus::Consumed;
+                inbox.consumed_by = Some(transition.transition_id);
+                consumed_inbox_ids.push(*inbox_id);
+            }
         }
         if workflow_status_is_terminal(replacement.status) {
             replacement.retire_terminal_work(transition.transition_id);
@@ -842,7 +847,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         Ok(AtomicInboxConsumeResult {
             outcome: CommitOutcome::Committed,
             transition: Some(transition),
-            consumed_inbox_ids: inbox_ids,
+            consumed_inbox_ids,
             reducer_events: Vec::new(),
         })
     }
@@ -964,10 +969,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         request: &CancellationRequest<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
     ) -> Result<CommitResult<P>, EngineError> {
-        self.ensure_executable()?;
         if request.expected_workflow_version != self.version {
             return Ok(version_conflict_result());
         }
+        self.ensure_executable()?;
         let deletion_from_terminal = matches!(
             self.status,
             WorkflowStatus::Cancelling | WorkflowStatus::Failed | WorkflowStatus::Cancelled
@@ -1121,7 +1126,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
 
     fn ensure_executable(&self) -> Result<(), EngineError> {
         if self.binding.execution_mode() == ExecutionMode::Shadow
-            || self.semantic_authority != Some(SemanticAuthority::EngineProtocol)
+            || self.binding.accepted_protocol().authority != SemanticAuthority::EngineProtocol
         {
             Err(EngineError::ShadowCannotExecute)
         } else {
@@ -1144,10 +1149,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         self.status = decision.plan.next_status;
         self.snapshot = decision.plan.snapshot.clone();
         self.snapshot_codec = decision.plan.snapshot_codec.clone();
-        if let WorkflowBinding::Authoritative(workflow) = &mut self.binding {
-            workflow.version = self.version;
-            workflow.generation = self.generation;
-        }
         self.transition_log.push(transition.clone());
         transition
     }
@@ -1349,13 +1350,40 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         choice: &ManualChoice<P>,
         commit: ManualResolutionCommit<P>,
     ) -> ManualEffectOutcome<P> {
+        let compensation_plan = if choice.kind == ManualChoiceKind::Compensate {
+            let plan = TransitionPlan {
+                next_status: commit.next_status,
+                snapshot: self.snapshot.clone(),
+                snapshot_codec: self.snapshot_codec.clone(),
+                event: commit.transition_event.clone(),
+                event_codec: commit.transition_codec.clone(),
+                effects: commit.compensation_effects.clone(),
+                dependencies: commit.compensation_dependencies.clone(),
+                barriers: vec![],
+                barrier_members: vec![],
+                invalidations: vec![],
+                owed_acceptances: None,
+            };
+            if validate_plan_body(&plan, &BTreeMap::new()).is_err()
+                || plan.effects.iter().any(|effect| {
+                    effect.role != EffectRole::Compensation
+                        || effect.generation != self.generation
+                        || self.effects.contains_key(&effect.effect_id)
+                })
+            {
+                return ManualEffectOutcome::Failed;
+            }
+            Some(plan)
+        } else {
+            None
+        };
         let ManualResolutionCommit {
             transition_codec,
             transition_event,
             next_status,
             retry_at,
-            compensation_effects,
-            compensation_dependencies,
+            compensation_effects: _,
+            compensation_dependencies: _,
         } = commit;
         debug_assert!(
             choice.kind != ManualChoiceKind::Fail || next_status == WorkflowStatus::Failed,
@@ -1372,9 +1400,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         self.next_transition_id += 1;
         self.version = transition.to_version;
         self.status = next_status;
-        if let WorkflowBinding::Authoritative(workflow) = &mut self.binding {
-            workflow.version = self.version;
-        }
         self.transition_log.push(transition);
 
         let effect_outcome = match choice.kind {
@@ -1457,30 +1482,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
         };
 
-        if choice.kind == ManualChoiceKind::Compensate {
-            for declaration in compensation_effects {
-                self.effects.insert(
-                    declaration.effect_id,
-                    EffectState {
-                        declaration,
-                        declared_workflow_version: self.version,
-                        status: EffectStatus::Blocked,
-                        dependencies: BTreeSet::new(),
-                        attempts: vec![],
-                        observations: vec![],
-                        stale_observations: vec![],
-                        claim: None,
-                        destructive_lock: None,
-                        pending_reconciliation: false,
-                        receipt: None,
-                    },
-                );
-            }
-            for dependency in compensation_dependencies {
-                if let Some(effect) = self.effects.get_mut(&dependency.effect_id) {
-                    effect.dependencies.insert(dependency.depends_on_effect_id);
-                }
-            }
+        if let Some(plan) = &compensation_plan {
+            self.install_effects(plan);
             self.refresh_eligibility(Timestamp(0));
         }
 
@@ -1496,9 +1499,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
 
     fn enter_cancellation(&mut self, request: &CancellationRequest<P>) {
         self.generation = self.generation.next();
-        if let WorkflowBinding::Authoritative(workflow) = &mut self.binding {
-            workflow.generation = self.generation;
-        }
         self.status = WorkflowStatus::Cancelling;
         for effect in self.effects.values_mut() {
             if effect.declaration.generation != self.generation {
@@ -1696,13 +1696,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn runtime_acceptance_atomically(
         &mut self,
         binding: &OwedAcceptanceDecisionBinding<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
         disposition: OwedAcceptanceDisposition,
     ) -> Result<RuntimeAcceptanceResult<P>, EngineError> {
-        self.ensure_executable()?;
         let owed_id = binding.owed.id;
         let decision = &binding.decision;
         let Some(existing) = self.owed_acceptances.get(&owed_id).cloned() else {
@@ -1726,6 +1726,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 owed_acceptance: Some(existing),
             });
         }
+        if decision.expected_workflow_version != self.version {
+            return Ok(RuntimeAcceptanceResult {
+                outcome: CommitOutcome::VersionConflict,
+                transition: None,
+                owed_acceptance: Some(existing),
+            });
+        }
+        self.ensure_executable()?;
         let handles_owed = match disposition {
             OwedAcceptanceDisposition::Accepted { .. } => {
                 P::decision_handles_owed_acceptance(&existing.event, &decision.plan.event)
@@ -1738,16 +1746,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
             OwedAcceptanceDisposition::Owed => false,
         };
-        if !handles_owed || decision.plan.event_codec != existing.event_codec {
+        if !handles_owed {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::InvalidPlan,
-                transition: None,
-                owed_acceptance: Some(existing),
-            });
-        }
-        if decision.expected_workflow_version != self.version {
-            return Ok(RuntimeAcceptanceResult {
-                outcome: CommitOutcome::VersionConflict,
                 transition: None,
                 owed_acceptance: Some(existing),
             });
@@ -1786,6 +1787,15 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
             OwedAcceptanceDisposition::Owed => unreachable!("resolution must be terminal"),
         };
+        let inbox = replacement
+            .reducer_inbox
+            .get_mut(&existing.reducer_inbox_id)
+            .ok_or(EngineError::InvalidInbox)?;
+        if inbox.delivery_status != DeliveryStatus::Pending || !inbox.requires_runtime_acceptance {
+            return Err(EngineError::InvalidInbox);
+        }
+        inbox.delivery_status = DeliveryStatus::Consumed;
+        inbox.consumed_by = Some(transition.transition_id);
         if workflow_status_is_terminal(replacement.status) {
             replacement.retire_terminal_work(transition.transition_id);
         }
@@ -1925,7 +1935,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
     ) -> Option<&mut EffectState<P>> {
         if self.binding.execution_mode() == ExecutionMode::Shadow
-            || self.semantic_authority != Some(SemanticAuthority::EngineProtocol)
+            || self.binding.accepted_protocol().authority != SemanticAuthority::EngineProtocol
             || self.crashed_workers.contains(&authority.worker_id)
             || authority.workflow_id != self.binding.workflow_id()
         {
