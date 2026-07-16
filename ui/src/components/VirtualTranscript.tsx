@@ -87,7 +87,7 @@ interface PhysicalStore<T> {
   rowElements: Map<string, HTMLDivElement>;
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
-  preservedViewportTop: number | null;
+  preservedViewport: { top: number; firstKey: string | null } | null;
   pinned: boolean;
   revision: number;
 }
@@ -386,7 +386,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     rowElements: new Map(),
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
-    preservedViewportTop: null,
+    preservedViewport: null,
     pinned: true,
     revision: 0,
   };
@@ -530,14 +530,20 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    const preservedViewportTop = current.preservedViewportTop;
-    current.preservedViewportTop = null;
-    if (preservedViewportTop !== null) current.viewportTop = preservedViewportTop;
-    const anchor = preservedViewportTop !== null || current.pinned ? null : captureTopAnchor(current);
-    const wasPinned = preservedViewportTop === null && current.pinned;
+    const nextKeys = resolvedPhysicalKeys.keys;
+    const preserved = current.preservedViewport;
+    const prefixInserted = preserved !== null
+      && preserved.firstKey !== null
+      && nextKeys.indexOf(preserved.firstKey) > 0;
+    if (prefixInserted) {
+      current.preservedViewport = null;
+      current.viewportTop = preserved.top;
+    }
+    const anchor = prefixInserted || current.pinned ? null : captureTopAnchor(current);
+    const wasPinned = !prefixInserted && current.pinned;
     current.items = items;
     current.getKey = getKey;
-    current.keys = resolvedPhysicalKeys.keys;
+    current.keys = nextKeys;
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(current.keys);
@@ -613,7 +619,10 @@ function VirtualTranscriptInner<T>(
     preserveViewportOnNextItemsChange() {
       const current = storeRef.current;
       if (!current) return;
-      current.preservedViewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.preservedViewport = {
+        top: current.scroller?.scrollTop ?? current.viewportTop,
+        firstKey: current.keys[0] ?? null,
+      };
       current.activeAnchor = null;
     },
     measureOffsetForIndex(index) {

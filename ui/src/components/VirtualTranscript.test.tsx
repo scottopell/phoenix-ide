@@ -528,11 +528,27 @@ describe('VirtualTranscript', () => {
     const viewportTop = scroller.scrollTop;
 
     act(() => ref.current?.preserveViewportOnNextItemsChange());
+    const unrelatedTailUpdate = [...initial, { id: 'streaming-tail', height: 40, label: 'streaming tail' }];
     act(() => {
       view.rerender(
         <VirtualTranscript
           ref={ref}
-          items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...initial]}
+          items={unrelatedTailUpdate}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+    scroller.scrollTop = viewportTop + 25;
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...unrelatedTailUpdate]}
           getKey={(item) => item.id}
           estimatedExtent={20}
           overscan={0}

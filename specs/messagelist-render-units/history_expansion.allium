@@ -214,8 +214,8 @@ rule ReaderExpansionStartsOneRequest {
     requires: view.active_request = null
     requires: view.pending_command = null
     requires: view.failure = null
-    requires: restore_basis in { reader_anchor, following_tail }
-    requires: restore_basis = following_tail
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request = HistoryRequest(
         view: view,
@@ -236,8 +236,8 @@ rule ReaderExpansionRetryClearsAndReplacesFailure {
     requires: view.pending_command = null
     requires: view.failure != null
     requires: view.failure.kind = request_failed
-    requires: restore_basis in { reader_anchor, following_tail }
-    requires: restore_basis = following_tail
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request = HistoryRequest(
         view: view,
@@ -332,6 +332,20 @@ rule FollowingReaderExpansionCreatesNoPositionCommand {
     requires: transcript_generation = view.transcript_generation
     requires: view.active_request.intent = reader_expand
     requires: view.active_request.restore_basis = following_tail
+    ensures: view.coverage = complete
+    ensures: view.pending_command = null
+    ensures: view.active_request = null
+}
+
+rule ReaderViewportExpansionCreatesNoPositionCommand {
+    when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
+    requires: view.active_request != null
+    requires: view.pending_command = null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = reader_expand
+    requires: view.active_request.restore_basis = reader_viewport
     ensures: view.coverage = complete
     ensures: view.pending_command = null
     ensures: view.active_request = null
