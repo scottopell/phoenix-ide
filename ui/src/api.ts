@@ -890,6 +890,7 @@ export interface LlmLanguagePrompts {
   next_task_hint_template: string;
   pr_autofix_instruction_template: string;
   mermaid_rendering_hint: string;
+  coordinator_prompt: string;
 }
 
 export interface LlmLanguageCatalogEntry {

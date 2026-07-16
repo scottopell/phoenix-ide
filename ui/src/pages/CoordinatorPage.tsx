@@ -39,9 +39,19 @@ export function CoordinatorPage() {
         window.dispatchEvent(new CustomEvent('phoenix:coordinator-ready', {
           detail: { conversation: coordinator.conversation },
         }));
-        setResolvedCoordinatorId(coordinator.conversation.id);
-        if (slug !== coordinator.conversation.id) {
-          navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+        if (!slug || slug === coordinator.conversation.id) {
+          setResolvedCoordinatorId(coordinator.conversation.id);
+          if (!slug) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+        } else {
+          api.resolveCoordinatorRoute(slug)
+            .then(({ coordinator_id }) => {
+              if (cancelled) return;
+              if (coordinator_id) setResolvedCoordinatorId(slug);
+              else navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+            })
+            .catch(() => {
+              if (!cancelled) navigate(`/global/${coordinator.conversation.id}`, { replace: true });
+            });
         }
         setError(null);
       })

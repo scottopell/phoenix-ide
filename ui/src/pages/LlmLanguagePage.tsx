@@ -12,6 +12,7 @@ const PROMPT_LABELS: Array<[keyof LlmLanguageCatalogEntry['prompts'], string]> =
   ['next_task_hint_template', 'Next-task hint template'],
   ['pr_autofix_instruction_template', 'PR autofix instruction template'],
   ['mermaid_rendering_hint', 'Mermaid rendering hint'],
+  ['coordinator_prompt', 'Coordinator prompt'],
 ];
 
 function PromptBlock({ label, text }: { label: string; text: string }) {

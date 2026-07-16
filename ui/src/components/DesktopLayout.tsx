@@ -139,24 +139,37 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
 
   useEffect(() => {
-    let currentCoordinator: Conversation | null = null;
+    let active = true;
+    let generation = 0;
     const acceptCoordinator = (conversation: Conversation) => {
-      currentCoordinator = conversation;
+      if (!active) return;
+      generation += 1;
       registerCoordinatorForNotifications(conversation.id);
       setCoordinatorForNotifications(conversation);
     };
-    api.getGlobalCoordinator()
-      .then(({ conversation }) => acceptCoordinator(conversation))
-      .catch(() => {
-        if (!currentCoordinator) setCoordinatorForNotifications(null);
-      });
+    const refreshCoordinator = () => {
+      const requestGeneration = generation;
+      api.getGlobalCoordinator()
+        .then(({ conversation }) => acceptCoordinator(conversation))
+        .catch(() => {
+          if (active && requestGeneration === generation) {
+            setCoordinatorForNotifications(null);
+          }
+        });
+    };
+    refreshCoordinator();
+    const pollId = window.setInterval(refreshCoordinator, 5_000);
     const onCoordinatorReady = (event: Event) => {
       const conversation = (event as CustomEvent<{ conversation?: Conversation }>).detail?.conversation;
       if (conversation) acceptCoordinator(conversation);
     };
     window.addEventListener('phoenix:coordinator-ready', onCoordinatorReady);
-    return () => window.removeEventListener('phoenix:coordinator-ready', onCoordinatorReady);
-  }, [conversations]);
+    return () => {
+      active = false;
+      window.clearInterval(pollId);
+      window.removeEventListener('phoenix:coordinator-ready', onCoordinatorReady);
+    };
+  }, []);
 
   const notificationConversations = useMemo(
     () => coordinatorForNotifications

@@ -84,6 +84,21 @@ function Consumer({ onStore }: { onStore: (store: ConversationStore) => void }) 
 }
 
 describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
+  it('excludes non-user-initiated snapshots hydrated outside list endpoints', async () => {
+    let store: ConversationStore | undefined;
+    render(
+      <ConversationProvider>
+        <Consumer onStore={(value) => { store = value; }} />
+      </ConversationProvider>,
+    );
+    act(() => {
+      store!.upsertSnapshot('ordinary', makeConv('ordinary'));
+      store!.upsertSnapshot('coordinator', makeConv('coordinator', { user_initiated: false }));
+    });
+    await waitFor(() => expect(screen.getByTestId('row-ordinary')).toBeInTheDocument());
+    expect(screen.queryByTestId('row-coordinator')).not.toBeInTheDocument();
+  });
+
   it('SSE-driven update on non-active conversation reflects in the list immediately', async () => {
     let store: ConversationStore | undefined;
     const captureStore = (s: ConversationStore) => {

@@ -325,7 +325,7 @@ export function useConversationsList(): {
       // as independent sidebar conversations. A non-null
       // parent_conversation_id is the structural marker of sub-agent
       // parentage (handoff / continuation conversations leave it null).
-      if (c.parent_conversation_id) continue;
+      if (c.parent_conversation_id || c.user_initiated === false) continue;
       if (c.archived) nextArchived.push(c);
       else nextActive.push(c);
     }

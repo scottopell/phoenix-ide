@@ -185,32 +185,21 @@ async function getConversationMetaForRoute(routeSegment: string) {
 export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
-  const [checkedRouteSlug, setCheckedRouteSlug] = useState<string | null>(
-    routePrefix === '/global' ? (slug ?? null) : null,
-  );
+  const location = useLocation();
 
   useEffect(() => {
-    if (routePrefix === '/global' || !slug) {
-      setCheckedRouteSlug(slug ?? null);
-      return;
-    }
+    if (routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
     let cancelled = false;
     api.resolveCoordinatorRoute(slug)
       .then(({ coordinator_id }) => {
         if (cancelled) return;
         if (coordinator_id) {
           navigate(`/global/${coordinator_id}`, { replace: true });
-        } else {
-          setCheckedRouteSlug(slug ?? null);
         }
       })
-      .catch(() => {
-        if (!cancelled) setCheckedRouteSlug(slug ?? null);
-      });
+      .catch(() => {});
     return () => { cancelled = true; };
-  }, [navigate, routePrefix, slug]);
-
-  if (checkedRouteSlug !== slug) return null;
+  }, [location.hash, navigate, routePrefix, slug]);
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
@@ -1926,6 +1915,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     </>
   ) : null;
 
+  const stateBarConversation = routePrefix === '/global' && conversation
+    ? { ...conversation, cwd: '', worktree_path: null }
+    : conversation;
+
   return (
     <ForkProposalsProvider
       conversationId={conversationId}
@@ -2359,7 +2352,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
-        conversation={conversation as Conversation}
+        conversation={stateBarConversation as Conversation}
         convState={convStateForChildren}
         connectionState={connectionInfo.state}
         connectionAttempt={connectionInfo.attempt}

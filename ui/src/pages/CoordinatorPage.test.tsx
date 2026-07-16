@@ -2,12 +2,13 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
-import type { Conversation, GlobalCoordinatorResponse, GlobalOpenWorkResponse } from '../api';
+import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
     getGlobalOpenWork: vi.fn(),
+    resolveCoordinatorRoute: vi.fn(),
   },
 }));
 
@@ -95,6 +96,7 @@ describe('CoordinatorPage', () => {
     vi.clearAllMocks();
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.getGlobalOpenWork.mockResolvedValue(openWork());
+    apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -123,19 +125,35 @@ describe('CoordinatorPage', () => {
     expect(await screen.findByText('Fleet unavailable: projection unavailable')).toBeInTheDocument();
   });
 
-  it('does not mount an ordinary conversation under the Coordinator shell', async () => {
-    let resolveCoordinator!: (value: GlobalCoordinatorResponse) => void;
-    apiMock.ensureGlobalCoordinator.mockReturnValueOnce(new Promise((resolve) => {
-      resolveCoordinator = resolve;
-    }));
-    renderPage('/global/ordinary-conversation');
+  it('redirects an ordinary conversation away from the Coordinator shell', async () => {
+    apiMock.resolveCoordinatorRoute.mockResolvedValueOnce({ coordinator_id: null });
+    render(
+      <MemoryRouter initialEntries={['/global/ordinary-conversation']}>
+        <Routes>
+          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+        </Routes>
+      </MemoryRouter>,
+    );
 
-    expect(screen.queryByText('Shared conversation runtime /global')).not.toBeInTheDocument();
-    resolveCoordinator({ conversation: coordinatorConversation() });
+    expect(await screen.findByText('/global/conv-coordinator')).toBeInTheDocument();
+    expect(apiMock.resolveCoordinatorRoute).toHaveBeenCalledWith('ordinary-conversation');
+  });
+
+  it('mounts a historical Coordinator chain member without canonicalizing it', async () => {
+    render(
+      <MemoryRouter initialEntries={['/global/old-coordinator#message-source']}>
+        <Routes>
+          <Route path="/global/:slug" element={<><CoordinatorPage /><CurrentPath /></>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
+    expect(screen.getByText('/global/old-coordinator')).toBeInTheDocument();
   });
 
   it('replaces a stale Coordinator continuation URL with the singleton route', async () => {
+    apiMock.resolveCoordinatorRoute.mockResolvedValueOnce({ coordinator_id: null });
     render(
       <MemoryRouter initialEntries={['/global/stale-coordinator']}>
         <Routes>
