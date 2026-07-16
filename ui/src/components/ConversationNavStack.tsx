@@ -44,7 +44,11 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
   }, []);
 
   const handleLoadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
-    onLoadOlderMessages?.(restoreBasis ?? listRef.current?.captureHistoryRestoreBasis());
+    if (!onLoadOlderMessages) return;
+    const list = listRef.current;
+    onLoadOlderMessages(
+      restoreBasis ?? (list ? list.captureHistoryRestoreBasis() : undefined),
+    );
   }, [onLoadOlderMessages]);
 
   return (

@@ -3469,6 +3469,7 @@ async fn send_chat(
         return Ok(Json(ChatResponse {
             queued: true,
             steering: false,
+            already_persisted: true,
         }));
     }
 
@@ -3500,6 +3501,7 @@ async fn send_chat(
         return Ok(Json(ChatResponse {
             queued: true,
             steering: true,
+            already_persisted: false,
         }));
     }
 
@@ -3627,6 +3629,7 @@ async fn send_chat(
             return Ok(Json(ChatResponse {
                 queued: true,
                 steering: true,
+                already_persisted: false,
             }));
         }
 
@@ -3712,6 +3715,7 @@ async fn send_chat(
     Ok(Json(ChatResponse {
         queued: true,
         steering: false,
+        already_persisted: false,
     }))
 }
 

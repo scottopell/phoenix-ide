@@ -1405,6 +1405,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             rollbackOptimisticPhase();
           } else {
             markAccepted(localId, phaseEventSeqBeforePost);
+            if (result.already_persisted) {
+              rollbackOptimisticPhase();
+            }
           }
         } else {
           // Offline path: hand the send off to the offline operation queue

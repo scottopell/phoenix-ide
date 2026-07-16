@@ -245,6 +245,9 @@ pub struct ChatResponse {
     /// Absent (`null`/`undefined` on the client) for normal immediate processing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub steering: bool,
+    /// The supplied message ID was already persisted before this request.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub already_persisted: bool,
 }
 
 /// Response for cancel action.

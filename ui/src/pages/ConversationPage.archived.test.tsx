@@ -381,6 +381,37 @@ describe('ConversationPage message delivery reconciliation', () => {
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
   });
 
+  it('rolls back and reconciles an idempotent direct replay without waiting for SSE', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      queued: true,
+      steering: false,
+      already_persisted: true,
+    });
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: 'idempotent-replay',
+        status: 'persisted',
+        message: { ...historyMessage, message_id: 'idempotent-replay', sequence_id: 20 },
+      }],
+    });
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: 'idempotent-replay',
+      conversationId,
+      text: 'already persisted',
+      timestamp: 1,
+      status: 'pending',
+    }]));
+    const { store } = renderPage(makeConversation());
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
   it('does not repost a successful direct message while its SSE echo is missing', async () => {
     const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
       queued: true,
@@ -399,7 +430,6 @@ describe('ConversationPage message delivery reconciliation', () => {
       ) as Array<{ status: string }>;
       expect(queue[0]?.status).toBe('accepted');
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 

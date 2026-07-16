@@ -1668,7 +1668,7 @@ export const api = {
     images: ImageData[] = [],
     files: FileAttachment[] = [],
     localId: string,
-  ): Promise<{ queued: boolean; steering?: boolean }> {
+  ): Promise<{ queued: boolean; steering?: boolean; already_persisted?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

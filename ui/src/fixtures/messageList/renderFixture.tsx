@@ -82,7 +82,9 @@ export function MessageListFixture({ scenario }: Props) {
   }, [data.messages]);
 
   const reproduceContinuityJump = () => {
-    const basis = messageListRef.current?.captureHistoryRestoreBasis();
+    const messageList = messageListRef.current;
+    if (!messageList) return;
+    const basis = messageList.captureHistoryRestoreBasis();
     if (!basis || basis.kind !== 'reader_anchor') return;
     const measured = measureAnchor(basis.messageId);
     if (!measured) return;
