@@ -723,6 +723,7 @@ pub fn terminal_payload_from_evidence(
     resource: WakeResourceIdentity,
     evidence: WakeTerminalEvidence,
     expires_at: Timestamp,
+    resolved_at: Timestamp,
 ) -> Option<WakeTerminalPayload> {
     if resource != evidence.identity() {
         return None;
@@ -734,13 +735,13 @@ pub fn terminal_payload_from_evidence(
             contract_id,
             resource,
             evidence,
-            resolved_at: occurred_at,
+            resolved_at,
         })
     } else {
         Some(WakeTerminalPayload::Expired {
             contract_id,
             resource,
-            resolved_at: expires_at,
+            resolved_at,
         })
     }
 }

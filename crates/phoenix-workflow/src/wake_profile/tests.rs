@@ -229,6 +229,7 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
         resource.clone(),
         fired_evidence.clone(),
         Timestamp(20),
+        Timestamp(25),
     )
     .expect("matching evidence");
     assert!(matches!(
@@ -237,7 +238,7 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
             contract_id,
             resource: found,
             evidence,
-            resolved_at: Timestamp(19)
+            resolved_at: Timestamp(25)
         } if contract_id == "contract-1" && found == resource && evidence == fired_evidence
     ));
 
@@ -260,6 +261,7 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
             final_tail: vec!["late".into()],
         }),
         Timestamp(20),
+        Timestamp(26),
     )
     .expect("matching evidence");
     assert!(matches!(
@@ -267,7 +269,7 @@ fn fired_vs_expired_vs_forgotten_payloads_are_structurally_distinct() {
         WakeTerminalPayload::Expired {
             contract_id,
             resource: found,
-            resolved_at: Timestamp(20)
+            resolved_at: Timestamp(26)
         } if contract_id == "contract-1" && found == resource
     ));
 
@@ -417,6 +419,7 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
             final_tail: vec![],
         }),
         intent.expires_at,
+        Timestamp(6),
     )
     .expect("matching terminal");
     workflow.accept_receipt(
@@ -596,6 +599,7 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
             final_tail: vec!["done".into()],
         }),
         Timestamp(20),
+        Timestamp(6),
     )
     .expect("matching evidence");
     let accepted = workflow.accept_receipt(
@@ -680,6 +684,7 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         bash_identity("b-15"),
         observed.observation.clone(),
         Timestamp(20),
+        Timestamp(6),
     )
     .expect("matching evidence");
     let owed = acceptance_owed_decl(ReducerInboxId(9), &terminal)

@@ -905,7 +905,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         snapshot: "accepted",
         snapshot_codec: codec("snapshot"),
         event: "consume",
-        event_codec: codec("receipt-event"),
+        event_codec: codec("transition-event"),
         effects: vec![],
         dependencies: vec![],
         barriers: vec![],
@@ -934,6 +934,11 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
         )
         .expect("consume succeeds");
     assert_eq!(result.outcome, CommitOutcome::Committed);
+    assert!(result.consumed_inbox_ids.is_empty());
+    assert_eq!(
+        state.reducer_inbox[&inbox_id].delivery_status,
+        DeliveryStatus::Pending
+    );
     let owed = state
         .owed_acceptances
         .values()
@@ -3749,8 +3754,8 @@ fn review_regressions_reject_misbound_inbox_and_cross_workflow_observation() {
                         next_status: WorkflowStatus::Active,
                         snapshot: "wrong",
                         snapshot_codec: codec("snapshot"),
-                        event: "event-a",
-                        event_codec: codec("wrong-event-codec"),
+                        event: "event-b",
+                        event_codec: codec("event"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -3958,6 +3963,20 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
             disposition: OwedAcceptanceDisposition::Owed,
         },
     );
+    workflow.reducer_inbox.insert(
+        ReducerInboxId(1),
+        ReducerInboxEvent {
+            id: ReducerInboxId(1),
+            effect_id: None,
+            barrier_id: None,
+            kind: ReducerInboxKind::ReceiptAccepted,
+            event_codec: codec("owed"),
+            requires_runtime_acceptance: true,
+            payload: ReducerInboxPayload::Receipt("event-a"),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        },
+    );
     let result = workflow
         .runtime_accept_atomically(
             &OwedAcceptanceDecisionBinding {
@@ -3969,7 +3988,7 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
                         snapshot: "wrong",
                         snapshot_codec: codec("snapshot"),
                         event: "event-a",
-                        event_codec: codec("wrong-event-codec"),
+                        event_codec: codec("runtime-transition"),
                         effects: vec![],
                         dependencies: vec![],
                         barriers: vec![],
@@ -3981,15 +4000,20 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
             },
             &BTreeMap::new(),
         )
-        .expect("typed rejection");
-    assert_eq!(result.outcome, CommitOutcome::InvalidPlan);
-    assert_eq!(workflow.version, Version(0));
-    assert_eq!(
+        .expect("typed acceptance");
+    assert_eq!(result.outcome, CommitOutcome::Committed);
+    assert_eq!(workflow.version, Version(1));
+    assert!(matches!(
         workflow.owed_acceptances[&OwedAcceptanceId(1)].disposition,
-        OwedAcceptanceDisposition::Owed
+        OwedAcceptanceDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        workflow.reducer_inbox[&ReducerInboxId(1)].delivery_status,
+        DeliveryStatus::Consumed
     );
 
-    workflow
+    let mut receipt_workflow = crate::tests::workflow();
+    receipt_workflow
         .commit_transition(
             &ReducerDecision {
                 expected_workflow_version: Version(0),
@@ -3998,9 +4022,9 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
             &barrier_events(),
         )
         .expect("plan");
-    let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
+    let claim = receipt_workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority");
-    let accepted = workflow.accept_receipt(
+    let accepted = receipt_workflow.accept_receipt(
         &authority,
         Timestamp(1),
         Some(claim.attempt.expect("attempt").id),
@@ -4010,7 +4034,9 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
         codec("receipt-event"),
         "reducer-only",
     );
-    assert!(!workflow.reducer_inbox[&accepted.receipt_inbox_ids[0]].requires_runtime_acceptance);
+    assert!(
+        !receipt_workflow.reducer_inbox[&accepted.receipt_inbox_ids[0]].requires_runtime_acceptance
+    );
 }
 
 #[test]
@@ -4313,6 +4339,58 @@ fn retry_and_compensate_manual_choices_do_not_receipt_or_satisfy_barriers() {
             );
         }
     }
+}
+
+#[test]
+fn manual_compensation_effects_are_validated_before_installation() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("plan");
+    let claim = workflow.claim_effect(EffectId(1), "worker", Timestamp(0), LeaseExpiry(10));
+    let choice = ManualChoice {
+        kind: ManualChoiceKind::Compensate,
+        codec: codec("manual"),
+        payload: "compensate",
+        receipt_codec: codec("receipt"),
+        receipt: "must-not-persist",
+        receipt_event_codec: codec("receipt-event"),
+        receipt_event: "must-not-deliver",
+    };
+    let resolution = workflow
+        .require_manual_resolution(
+            &claim.authority.expect("authority"),
+            "worker",
+            Timestamp(1),
+            vec![choice.clone()],
+        )
+        .manual_resolution
+        .expect("manual resolution");
+    let before = workflow.clone();
+
+    let outcome = workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        "operator",
+        &choice,
+        ManualResolutionCommit {
+            transition_codec: codec("manual-transition"),
+            transition_event: "manual-compensate",
+            next_status: WorkflowStatus::Active,
+            retry_at: None,
+            compensation_effects: vec![effect(1, EffectRole::Compensation, Generation(0))],
+            compensation_dependencies: vec![],
+        },
+    );
+
+    assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
+    assert_eq!(workflow, before);
 }
 
 #[test]

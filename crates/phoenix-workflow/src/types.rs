@@ -372,8 +372,6 @@ pub enum ExternalAcceptanceOutcome<H> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeWorkflow {
     pub workflow_id: WorkflowId,
-    pub version: Version,
-    pub generation: Generation,
     pub profile: ProfileRef,
     pub accepted_protocol: ProtocolSelection,
 }
@@ -873,7 +871,6 @@ pub struct BarrierState<P: WorkflowProfile> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct WorkflowState<P: WorkflowProfile> {
     pub binding: WorkflowBinding,
-    pub semantic_authority: Option<SemanticAuthority>,
     pub version: Version,
     pub generation: Generation,
     pub status: WorkflowStatus,
@@ -902,7 +899,6 @@ impl<P: WorkflowProfile> Clone for WorkflowState<P> {
     fn clone(&self) -> Self {
         Self {
             binding: self.binding.clone(),
-            semantic_authority: self.semantic_authority,
             version: self.version,
             generation: self.generation,
             status: self.status,
