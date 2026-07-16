@@ -1513,7 +1513,7 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
     const READ_BREAKPOINT_LIMIT: usize = 50;
 
     let mut messages = items.iter_mut().filter_map(|item| match item {
-        ResponsesApiInputItem::Message { content, .. } => Some(content),
+        ResponsesApiInputItem::Message { role, content } => Some((role, content)),
         ResponsesApiInputItem::AdditionalTools { .. }
         | ResponsesApiInputItem::FunctionCall { .. }
         | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
@@ -1521,7 +1521,15 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
     let Some(_implicit_latest_message) = messages.next_back() else {
         return;
     };
-    for content in messages.rev().take(READ_BREAKPOINT_LIMIT) {
+    for (role, content) in messages.rev().take(READ_BREAKPOINT_LIMIT) {
+        // An explicit cache marker turns text content into an `input_text`
+        // part. That discriminant is only valid on input-role messages; the
+        // Responses API rejects it on an assistant message, whose parts must
+        // be `output_text`/`refusal`. Assistant turns are model output — leave
+        // them a plain string and mark only input-role history.
+        if role == "assistant" {
+            continue;
+        }
         content.mark_last_block();
     }
 }
@@ -2866,6 +2874,73 @@ mod tests {
         assert_eq!(parts[0]["text"], "here is the screenshot");
         assert_eq!(parts[1]["type"], "input_image");
         assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
+    }
+
+    /// The explicit prompt-cache pass (enabled for `gpt-5.6-*`) marks history
+    /// messages by converting their text into an `input_text` part. That
+    /// discriminant is only valid on input-role messages — the Responses API
+    /// rejects it on an assistant message (parts must be `output_text` /
+    /// `refusal`) with HTTP 400. Regression guard: a replayed assistant text
+    /// turn must stay a plain string and never gain an `input_text` part.
+    #[tokio::test]
+    async fn explicit_cache_never_marks_assistant_message_with_input_text() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole};
+
+        let mut req = empty_request();
+        req.messages = vec![
+            LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("first question")],
+            },
+            LlmMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::text("prior answer")],
+            },
+            LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("follow-up question")],
+            },
+        ];
+
+        let translated = translate_to_responses_request("gpt-5.6-sol", &req, false);
+        let json = serde_json::to_value(&translated).unwrap();
+        let input = json["input"].as_array().expect("input array");
+
+        for item in input {
+            if item["role"] == "assistant" {
+                let content = &item["content"];
+                assert!(
+                    content.is_string(),
+                    "assistant content must stay a plain string, not an \
+                     input_text parts array; got {content}"
+                );
+            }
+            if let Some(parts) = item["content"].as_array() {
+                for part in parts {
+                    if part["type"] == "input_text" {
+                        assert_ne!(
+                            item["role"], "assistant",
+                            "assistant message must never carry an input_text part"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The earlier user turn is still eligible for an explicit breakpoint,
+        // so the pass has not been disabled wholesale.
+        let earlier_user_marked = input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"]
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .map(|part| part["type"] == "input_text")
+                    .unwrap_or(false)
+        });
+        assert!(
+            earlier_user_marked,
+            "explicit cache pass should still mark the earlier user message"
+        );
     }
 
     #[tokio::test]
