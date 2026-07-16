@@ -729,6 +729,7 @@ function MessageListImpl({
             ? { type: 'upwardIntent', snapshot }
             : { type: 'downwardMovement', snapshot },
         );
+        if (snapshot.scrollTop < previousTop) requestFromUpwardIntent();
       };
       const onKeyDown = (e: KeyboardEvent) => {
         const target = e.target;
@@ -915,7 +916,12 @@ function MessageListImpl({
     if (!readerIntent && (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading'))) {
       return { kind: 'following_tail' };
     }
-    const anchor = transcriptRef.current?.captureVisibleAnchor();
+    const transcript = transcriptRef.current;
+    if (readerIntent && !transcript?.physicalSnapshot().visibleRange) {
+      transcript?.preserveViewportOnNextItemsChange();
+      return { kind: 'reader_viewport' };
+    }
+    const anchor = transcript?.captureVisibleAnchor();
     if (!anchor) return { kind: 'following_tail' };
     const unit = historicalUnits[anchor.index];
     if (!unit || unit.key !== anchor.key) return { kind: 'following_tail' };
@@ -1170,7 +1176,7 @@ function MessageListImpl({
       <section id="chat-view" className="view active">
         {olderHistoryError && hasOlderMessages && onLoadOlderMessages && (
           <div role="alert">
-            <span>Could not load earlier history.</span>
+            <span>Could not load earlier history: {olderHistoryError}</span>
             <button type="button" onClick={() => requestEarlierHistory('retry')}>
               Retry
             </button>

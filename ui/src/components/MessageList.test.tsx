@@ -97,6 +97,7 @@ const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
   scrollToTail: vi.fn(),
   captureVisibleAnchor: vi.fn(),
+  preserveViewportOnNextItemsChange: vi.fn(),
   measureOffsetForIndex: vi.fn(),
   measureOffsetForIndexAtSnapshot: vi.fn(),
   layoutRevision: vi.fn(),
@@ -116,6 +117,7 @@ beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
+  virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
   virtualTranscriptMock.measureOffsetForIndexAtSnapshot = vi.fn((index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => snapshot.targetIndex === index ? snapshot.targetOffset ?? null : null);
   virtualTranscriptMock.layoutRevision = vi.fn(() => 1);
@@ -157,7 +159,7 @@ vi.mock('./VirtualTranscript', async () => {
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -175,6 +177,7 @@ vi.mock('./VirtualTranscript', async () => {
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToTail: virtualTranscriptMock.scrollToTail,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
+        preserveViewportOnNextItemsChange: virtualTranscriptMock.preserveViewportOnNextItemsChange,
         measureOffsetForIndex: virtualTranscriptMock.measureOffsetForIndex,
         measureOffsetForIndexAtSnapshot: virtualTranscriptMock.measureOffsetForIndexAtSnapshot,
         layoutRevision: virtualTranscriptMock.layoutRevision,
@@ -1708,6 +1711,13 @@ describe('history expansion feedback', () => {
   it('automatically loads earlier history when the reader approaches the loaded start', async () => {
     const onLoadOlderMessages = vi.fn();
     virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    virtualTranscriptMock.currentSnapshot = {
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 1,
+      targetMeasured: false,
+    };
 
     const { container } = render(
       withConvContext(
@@ -1821,7 +1831,52 @@ describe('history expansion feedback', () => {
 
     fireEvent.wheel(scroller, { deltaY: -50 });
 
-    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledWith({ kind: 'reader_viewport' }));
+    expect(virtualTranscriptMock.preserveViewportOnNextItemsChange).toHaveBeenCalledTimes(1);
+    expect(virtualTranscriptMock.captureVisibleAnchor).not.toHaveBeenCalled();
+  });
+
+  it('loads from upward scrollbar movement after a navigation-owned viewport reaches the boundary', async () => {
+    const onLoadOlderMessages = vi.fn();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-history"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-history', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+    virtualTranscriptMock.currentSnapshot = {
+      renderedRange: { startIndex: 0, endIndex: 0 },
+      visibleRange: { startIndex: 0, endIndex: 0 },
+      viewportTop: 100,
+      layoutRevision: 1,
+      targetMeasured: false,
+    };
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 10 });
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    let scrollTop = 100;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => scrollTop });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({ ...virtualTranscriptMock.currentSnapshot }));
+
+    scrollTop = 0;
+    fireEvent.scroll(scroller);
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledWith({
+      kind: 'reader_anchor',
+      messageId: 'msg-1',
+      viewportStartOffset: 10,
+    }));
   });
 
   it('shows a compact retry only after automatic earlier-history loading fails', async () => {
@@ -1843,7 +1898,15 @@ describe('history expansion feedback', () => {
       ),
     );
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Could not load earlier history.');
+    virtualTranscriptMock.currentSnapshot = {
+      renderedRange: { startIndex: 0, endIndex: 0 },
+      visibleRange: { startIndex: 0, endIndex: 0 },
+      viewportTop: 0,
+      layoutRevision: 1,
+      targetMeasured: false,
+    };
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not load earlier history: network unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledWith({ kind: 'following_tail' }));
     act(() => virtualTranscriptMock.rangeChanged?.({

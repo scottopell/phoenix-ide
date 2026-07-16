@@ -14,7 +14,7 @@ use "../virtual-transcript/virtual_transcript.allium" as vt
 
 enum Coverage { tail complete }
 enum RequestIntent { reader_expand deep_link }
-enum RestoreBasis { reader_anchor following_tail target_message }
+enum RestoreBasis { reader_anchor reader_viewport following_tail target_message }
 enum CommandKind { restore_after_prefix_expansion jump_to_message }
 enum FailureKind { request_failed target_not_found anchor_not_found }
 
@@ -525,6 +525,10 @@ contract HistoryExpansionSafety {
         -- message so unitTop - viewportTop equals the captured
         -- viewport_start_offset, preserves the scroll policy's existing reader
         -- or following ownership, and never highlights a message.
+
+    @invariant ReaderViewportExpansionEmitsNoPositioningCommand
+        -- A reader_viewport expansion preserves the physical viewport without
+        -- issuing a message-target positioning command.
 
     @invariant FollowingTailExpansionEmitsNoPositioningCommand
         -- Expanding complete history while following the tail leaves physical

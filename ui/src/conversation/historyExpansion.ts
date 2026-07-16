@@ -6,6 +6,7 @@ export type HistoryView = {
 
 export type RestoreBasis =
   | { kind: 'reader_anchor'; messageId: string; viewportStartOffset: number }
+  | { kind: 'reader_viewport' }
   | { kind: 'following_tail' };
 
 export type HistoryIntent =

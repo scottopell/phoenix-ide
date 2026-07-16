@@ -508,6 +508,44 @@ describe('VirtualTranscript', () => {
     expect(totals.at(-1)).toBe(40);
   });
 
+  it('preserves absolute viewport position for a header-only view across the next prepend', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const initial = makeItems(20, 20);
+    const view = render(
+      <VirtualTranscript
+        ref={ref}
+        items={initial}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        header={<div data-height={500}>System prompt</div>}
+        renderItem={renderRow}
+      />,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    act(() => ref.current?.scrollToIndex(10, 'start'));
+    const viewportTop = scroller.scrollTop;
+
+    act(() => ref.current?.preserveViewportOnNextItemsChange());
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...initial]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+
+    expect(scroller.scrollTop).toBe(viewportTop);
+  });
+
   it('preserves measured extents by stable key across prepends and removes only absent keys', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
 

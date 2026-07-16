@@ -45,6 +45,7 @@ export interface VirtualTranscriptHandle {
   scrollToIndex(index: number, align: 'start' | 'end', viewportStartOffset?: number): void;
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
+  preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
@@ -86,6 +87,7 @@ interface PhysicalStore<T> {
   rowElements: Map<string, HTMLDivElement>;
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
+  preservedViewportTop: number | null;
   pinned: boolean;
   revision: number;
 }
@@ -384,6 +386,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     rowElements: new Map(),
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
+    preservedViewportTop: null,
     pinned: true,
     revision: 0,
   };
@@ -527,8 +530,11 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    const anchor = current.pinned ? null : captureTopAnchor(current);
-    const wasPinned = current.pinned;
+    const preservedViewportTop = current.preservedViewportTop;
+    current.preservedViewportTop = null;
+    if (preservedViewportTop !== null) current.viewportTop = preservedViewportTop;
+    const anchor = preservedViewportTop !== null || current.pinned ? null : captureTopAnchor(current);
+    const wasPinned = preservedViewportTop === null && current.pinned;
     current.items = items;
     current.getKey = getKey;
     current.keys = resolvedPhysicalKeys.keys;
@@ -603,6 +609,12 @@ function VirtualTranscriptInner<T>(
       recompute(current);
       publish();
       return anchor;
+    },
+    preserveViewportOnNextItemsChange() {
+      const current = storeRef.current;
+      if (!current) return;
+      current.preservedViewportTop = current.scroller?.scrollTop ?? current.viewportTop;
+      current.activeAnchor = null;
     },
     measureOffsetForIndex(index) {
       const current = storeRef.current;
