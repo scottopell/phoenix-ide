@@ -130,6 +130,8 @@ PhoenixMobile/Sources/
                             unknown tools fall back to the generic JSON cards
     StateViews.swift        Typed-state detail dispatch (working detail,
                             needs-action cards, error card + dismiss)
+    QuestionCard.swift      In-app question answering (single/multi select,
+                            Other text, dismiss) — TaskApprovalCard's sibling
     AttachmentViews.swift   Base64 image rendering with visible decode
                             fallback; strips for messages + tool results
 ```

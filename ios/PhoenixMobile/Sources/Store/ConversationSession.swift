@@ -375,6 +375,11 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
+                case .respondToQuestions(let answers):
+                    try await api.respondToQuestion(
+                        conversationId: conversationId, answers: answers)
+                case .dismissQuestion:
+                    try await api.dismissQuestion(conversationId: conversationId)
                 }
             } catch {
                 if case .cancel = action {

@@ -355,6 +355,32 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
+    // Question response (awaiting_user_response): the server 409s when the
+    // conversation isn't in that state — e.g. answered from another client.
+
+    func respondToQuestion(conversationId: String, answers: [String: String]) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/respond",
+            body: ["answers": answers],
+            as: SuccessResponse.self)
+    }
+
+    func dismissQuestion(conversationId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/dismiss-question", body: [:],
+            as: SuccessResponse.self)
+    }
+
+    /// Get-or-create the fleet Coordinator — an ordinary conversation that
+    /// answers questions about every other conversation. Everything else
+    /// about it (transcript, SSE, chat) uses the normal conversation surface.
+    func ensureCoordinator() async throws -> Conversation {
+        try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
+            .conversation
+    }
+
     func validateCwd(path: String) async throws -> ValidateCwdResponse {
         try await get(
             "api/validate-cwd",

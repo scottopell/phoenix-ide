@@ -45,6 +45,8 @@ injection first).
 | REQ-IOS-013 task approval | `TaskApprovalCard` (StateViews.swift), approve/reject/feedback actions |
 | REQ-IOS-014 versioned persistence | `DiskStore.saveVersioned/loadVersioned` (tested), per-store schema version constants |
 | REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
+| REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
+| REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
 
 ## Known Gaps / Future Work
 
@@ -53,9 +55,12 @@ injection first).
 - Steering-queue entries are not reorderable/deletable server-side from the app.
 - No archived-conversations view, rename, or delete (archive itself is
   wired via swipe).
-- Task approval is answerable in-app; the remaining needs-action states
-  (respond-to-question, commission review approval) render as cards but
-  resolve from the web UI — natural next ConversationAction cases.
+- Task approval and question answering are resolvable in-app; commission
+  review approval renders as a generic needs-action card and resolves from
+  the web UI — the remaining ConversationAction case, mechanical via the
+  TaskApprovalCard/QuestionCard recipe.
+- Question responses omit option previews and per-answer notes
+  (annotations); the server accepts answers without them.
 - Markdown rendering is inline-only (no fenced code blocks or tables).
 - Native tool renderers cover `bash` and `think` only; all other tools
   (patch, browser, keyword_search, tmux, …) hit the generic JSON cards.

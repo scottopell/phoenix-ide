@@ -465,3 +465,59 @@ THE SYSTEM SHALL indicate the attachment count on the optimistic bubble
 Client-side downscaling keeps multi-megapixel photos from bloating outbox
 files and chat POSTs; the visible-failure rules are the transcript-wide
 omission-is-data-loss principle applied to media.
+
+---
+
+### REQ-IOS-016: Question Answering
+
+WHEN a conversation is awaiting a user response
+THE SYSTEM SHALL render each question with its header, text, and options
+(with descriptions), honoring single- versus multi-select semantics
+AND offer a free-text "Other" answer per question
+AND offer dismissal (with confirmation) as the no-answer resolution
+
+WHEN encoding answers
+THE SYSTEM SHALL key them by question text, with a single-select answer
+being the chosen option label (or the trimmed Other text) and a
+multi-select answer joining chosen labels in declared option order with
+", ", appending trimmed Other text
+AND submission SHALL be disabled until every question has an answer
+AND a selection for a label absent from the current options SHALL not
+count as an answer
+
+WHEN a response is submitted
+THE SYSTEM SHALL follow the interactive-resolution rules of REQ-IOS-013:
+online-only, no optimistic state (the server's state change clears the
+card; concurrent resolution from another client surfaces as the server's
+conflict), controls disabled while offline or in flight, and drafts
+preserved until success
+
+**Rationale:** A stalled agent is worth nothing until answered; this is
+the highest-value blocking state to resolve away from the desk. The
+encoding contract mirrors the web QuestionPanel so the server observes
+identical answer shapes from every client.
+
+---
+
+### REQ-IOS-017: Fleet Coordinator Access
+
+WHEN the user opens the Coordinator
+THE SYSTEM SHALL get-or-create it via the global coordinator endpoint and
+navigate to it as an ordinary conversation (standard transcript, caching,
+outbox, and actions apply unchanged)
+
+WHEN offline with a previously opened Coordinator
+THE SYSTEM SHALL open its cached transcript by the remembered id, with
+new questions queueing through the outbox
+AND first-time opening SHALL require connectivity
+
+WHEN the Coordinator appears in the conversation list
+THE SYSTEM SHALL badge it distinctly
+
+The remembered Coordinator id is per-server state and SHALL be cleared on
+sign-out.
+
+**Rationale:** The Coordinator is Phoenix's most mobile-shaped surface —
+one conversation that answers questions about the whole fleet. Because
+the server models it as an ordinary conversation, the client adds only an
+entry point; every offline guarantee is inherited rather than rebuilt.

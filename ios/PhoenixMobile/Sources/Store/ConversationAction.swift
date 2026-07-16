@@ -25,6 +25,11 @@ enum ConversationAction: Equatable {
     /// Send the plan back with free-text change requests; the agent
     /// revises and re-proposes.
     case provideTaskFeedback(TaskFeedback)
+    /// Answer the agent's questions (awaiting_user_response). Answers are
+    /// keyed by question text, encoded per QuestionAnswers.
+    case respondToQuestions(answers: [String: String])
+    /// Dismiss the questions without answering; the agent proceeds.
+    case dismissQuestion
 
     var waitsForAuthoritativeStateChange: Bool {
         true

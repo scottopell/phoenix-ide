@@ -21,7 +21,7 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(questionCount: Int, firstQuestion: String?)
+    case awaitingUserResponse(questions: [UserQuestion])
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingCommissionReviewApproval
     case awaitingRecovery(message: String)
@@ -64,10 +64,9 @@ enum ConversationState: Equatable {
         case "awaiting_continuation":
             return .awaitingContinuation
         case "awaiting_user_response":
-            let questions = json["questions"]?.arrayValue ?? []
-            return .awaitingUserResponse(
-                questionCount: questions.count,
-                firstQuestion: questions.first?["question"]?.stringValue)
+            let questions = (json["questions"]?.arrayValue ?? [])
+                .compactMap(UserQuestion.parse)
+            return .awaitingUserResponse(questions: questions)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,
@@ -142,5 +141,69 @@ enum ConversationState: Equatable {
         default:
             return false
         }
+    }
+}
+
+/// One question from an awaiting_user_response state (mirror of
+/// `UserQuestion` in ui/src/api.ts). Answer encoding rules live in
+/// QuestionAnswers.
+struct UserQuestion: Equatable {
+    struct Option: Equatable {
+        var label: String
+        var description: String
+    }
+
+    var question: String
+    var header: String
+    var options: [Option]
+    var multiSelect: Bool
+
+    static func parse(_ json: JSONValue) -> UserQuestion? {
+        guard let question = json["question"]?.stringValue else { return nil }
+        return UserQuestion(
+            question: question,
+            header: json["header"]?.stringValue ?? "",
+            options: (json["options"]?.arrayValue ?? []).compactMap { option in
+                guard let label = option["label"]?.stringValue else { return nil }
+                return Option(
+                    label: label,
+                    description: option["description"]?.stringValue ?? "")
+            },
+            multiSelect: json["multiSelect"]?.boolValue ?? false)
+    }
+}
+
+/// Pure answer-map encoding, matching the web QuestionPanel's contract:
+/// answers are keyed by question text; a single-select answer is the chosen
+/// option label (or the free "Other" text); a multi-select answer joins the
+/// chosen labels with ", ", appending trimmed "Other" text when present.
+enum QuestionAnswers {
+    /// nil when any question is unanswered (no selection and no Other text).
+    static func encode(
+        questions: [UserQuestion],
+        selections: [String: Set<String>],
+        otherTexts: [String: String]
+    ) -> [String: String]? {
+        var result: [String: String] = [:]
+        for question in questions {
+            let selected = selections[question.question] ?? []
+            let other = (otherTexts[question.question] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if question.multiSelect {
+                var labels = question.options.map(\.label).filter(selected.contains)
+                if !other.isEmpty { labels.append(other) }
+                guard !labels.isEmpty else { return nil }
+                result[question.question] = labels.joined(separator: ", ")
+            } else {
+                if let label = question.options.map(\.label).first(where: selected.contains) {
+                    result[question.question] = label
+                } else if !other.isEmpty {
+                    result[question.question] = other
+                } else {
+                    return nil
+                }
+            }
+        }
+        return result
     }
 }
