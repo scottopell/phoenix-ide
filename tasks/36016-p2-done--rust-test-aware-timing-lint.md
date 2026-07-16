@@ -6,7 +6,7 @@ After PR #501 ships, evaluate: newer ast-grep relational capabilities, path-scop
 
 ## Implementation
 
-The structural guard uses ast-grep's Rust parser and JSON byte ranges, then correlates suspect waits with enclosing annotated test functions and `#[cfg(test)]` modules. Byte offsets are compared against UTF-8 source bytes so non-ASCII text before a test cannot shift scope detection.
+The structural guard uses ast-grep's Rust parser and typed rule IDs for sleeps, event waits, and timeout wrappers, then correlates their JSON byte ranges with enclosing annotated test functions, positive `cfg(...test...)` scopes, and dedicated test files. Byte offsets are compared against UTF-8 source bytes so non-ASCII text before a test cannot shift scope detection.
 
 It rejects new or changed test lines containing:
 
@@ -15,6 +15,6 @@ It rejects new or changed test lines containing:
 
 Production functions are excluded structurally. A one-line `// test-timing-allow: <reason>` immediately above a wait is available only when elapsed time is itself the behavior being exercised. Empty reasons are rejected.
 
-The repository contains a legacy inventory including intentional delayed protocol fixtures and timing bets owed separate cleanup. Existing `dev.py` check planning owns base selection and resolves one comparison commit; the checker receives that commit, scans both base and working-tree Rust syntax, and compares semantic finding multisets. This catches context-only regressions such as removing a timeout or adding test scope, without failing a legacy finding merely because an unrelated nearby line changed. `--all` reports the complete current inventory for cleanup work.
+The repository contains a legacy inventory including intentional delayed protocol fixtures and timing bets owed separate cleanup. Existing `dev.py` check planning owns base selection and resolves one comparison commit; the checker receives that commit, scans both base and working-tree Rust syntax, and compares semantic finding multisets keyed by file, enclosing module/function identity, wait kind, and normalized expression. This catches context-only regressions such as removing a timeout or adding test scope, distinguishes identical waits in different functions, and avoids failing legacy findings merely because line numbers changed. `--all` reports the complete current inventory for cleanup work.
 
-The checker runs in the existing structural-lint lane and has fixture coverage for annotated tests with stacked attributes, helpers in dedicated test paths and `cfg(test)` scopes, Unicode byte offsets, imported Tokio sleeps, production exclusion, timeout-bounded waits, sleep-only exemptions, and semantic baseline comparison. Checker source changes activate both structural lint and its Python unit tests.
+The checker runs in the existing structural-lint lane and supports Python 3.12+. Fixture coverage includes annotated tests with stacked attributes, helpers in dedicated test paths and positive/composite cfg scopes, `cfg(not(test))` exclusion, Unicode byte offsets, imported Tokio/std sleeps, qualified/imported timeout bounds, sleep-only exemptions, function-level semantic identity, and semantic baseline comparison. Checker source changes activate both structural lint and its Python unit tests.

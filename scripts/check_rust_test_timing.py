@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.13"
+# requires-python = ">=3.12"
 # dependencies = []
 # ///
 """Reject elapsed-time and unbounded-wait synchronization in Rust tests."""
@@ -30,7 +30,7 @@ rule:
     - kind: function_item
     - kind: mod_item
 ---
-id: phoenix-rust-test-timing-smell
+id: phoenix-rust-test-sleep
 language: Rust
 severity: warning
 rule:
@@ -38,7 +38,18 @@ rule:
     - pattern: tokio::time::sleep($DURATION)
     - pattern: std::thread::sleep($DURATION)
     - pattern: thread::sleep($DURATION)
-    - pattern: sleep($DURATION)
+---
+id: phoenix-rust-test-bare-sleep
+language: Rust
+severity: warning
+rule:
+  pattern: sleep($DURATION)
+---
+id: phoenix-rust-test-event-wait
+language: Rust
+severity: warning
+rule:
+  any:
     - pattern: $RECEIVER.recv().await
     - pattern: $NOTIFY.notified().await
 ---
@@ -46,20 +57,25 @@ id: phoenix-rust-test-timeout
 language: Rust
 severity: warning
 rule:
-  pattern: tokio::time::timeout($DURATION, $FUTURE)
+  any:
+    - pattern: tokio::time::timeout($DURATION, $FUTURE)
+    - pattern: timeout($DURATION, $FUTURE)
 """
 
 TEST_ATTR = re.compile(r"#\s*\[\s*(?:tokio::)?test(?:\s*\([^]]*\))?\s*\]")
-CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\([^]]*\btest\b[^]]*\)\s*\]")
+CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(([^]]*)\)\s*\]")
 EXEMPTION = "test-timing-allow:"
-TOKIO_SLEEP_IMPORT = re.compile(
-    r"use\s+tokio::time::(?:sleep|\{[^}]*\bsleep\b[^}]*\})\s*;"
+SLEEP_IMPORT = re.compile(
+    r"use\s+(?:tokio::time|std::thread)::(?:sleep|\{[^}]*\bsleep\b[^}]*\})\s*;"
+)
+TIMEOUT_IMPORT = re.compile(
+    r"use\s+tokio::time::(?:timeout|\{[^}]*\btimeout\b[^}]*\})\s*;"
 )
 
 
 @dataclass(frozen=True)
 class Finding:
-    key: tuple[str, str]
+    key: tuple[str, str, str]
     diagnostic: str
 
 
@@ -85,6 +101,34 @@ def _attached_attributes(prefix: str) -> str:
     return prefix[boundary + 1 :]
 
 
+def _cfg_has_positive_test(expression: str) -> bool:
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[(),]", expression)
+
+    def parse(index: int, negated: bool = False) -> tuple[bool, int]:
+        if index >= len(tokens):
+            return False, index
+        token = tokens[index]
+        if token == "not" and index + 1 < len(tokens) and tokens[index + 1] == "(":
+            result, index = parse(index + 2, not negated)
+            return result, index + (index < len(tokens) and tokens[index] == ")")
+        if index + 1 < len(tokens) and tokens[index + 1] == "(":
+            index += 2
+            found = False
+            while index < len(tokens) and tokens[index] != ")":
+                child, index = parse(index, negated)
+                found = found or child
+                if index < len(tokens) and tokens[index] == ",":
+                    index += 1
+            return found, index + (index < len(tokens) and tokens[index] == ")")
+        return token == "test" and not negated, index + 1
+
+    return parse(0)[0]
+
+
+def _attributes_enable_test(prefix: str) -> bool:
+    return any(_cfg_has_positive_test(match.group(1)) for match in CFG_ATTR.finditer(prefix))
+
+
 def _is_test_scope(filename: str, source: bytes, smell: dict, items: list[dict]) -> bool:
     path = Path(filename)
     if "tests" in path.parts or path.name in {"tests.rs", "testing.rs"}:
@@ -96,11 +140,31 @@ def _is_test_scope(filename: str, source: bytes, smell: dict, items: list[dict])
             continue
         prefix = _attached_attributes(_attribute_prefix(source, start))
         if item["text"].lstrip().startswith("mod "):
-            if CFG_TEST_ATTR.search(prefix):
+            if _attributes_enable_test(prefix):
                 return True
-        elif TEST_ATTR.search(prefix) or CFG_TEST_ATTR.search(prefix):
+        elif TEST_ATTR.search(prefix) or _attributes_enable_test(prefix):
             return True
     return False
+
+
+def _scope_key(smell: dict, items: list[dict]) -> str:
+    point, _ = _bounds(smell)
+    containers = [
+        item for item in items
+        if _bounds(item)[0] <= point < _bounds(item)[1]
+    ]
+    modules = []
+    function = "<module>"
+    for item in sorted(containers, key=lambda candidate: _bounds(candidate)[0]):
+        text = item["text"].lstrip()
+        match = re.match(r"mod\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+        if match:
+            modules.append(match.group(1))
+            continue
+        match = re.search(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)", text.split("{", 1)[0])
+        if match:
+            function = match.group(1)
+    return "::".join([*modules, function])
 
 
 def _is_bounded(smell: dict, timeouts: list[dict]) -> bool:
@@ -137,26 +201,37 @@ def findings(
         source_text = Path(filename).read_text()
         source = source_text.encode()
         items = kinds["phoenix-rust-test-item"]
-        timeouts = kinds["phoenix-rust-test-timeout"]
-        for smell in kinds["phoenix-rust-test-timing-smell"]:
+        timeouts = [
+            timeout for timeout in kinds["phoenix-rust-test-timeout"]
+            if not timeout["text"].lstrip().startswith("timeout(")
+            or TIMEOUT_IMPORT.search(source_text)
+        ]
+        typed_smells = [
+            *(('sleep', smell) for smell in kinds["phoenix-rust-test-sleep"]),
+            *(('sleep', smell) for smell in kinds["phoenix-rust-test-bare-sleep"] if SLEEP_IMPORT.search(source_text)),
+            *(('event', smell) for smell in kinds["phoenix-rust-test-event-wait"]),
+        ]
+        seen_ranges: set[tuple[int, int, str]] = set()
+        for kind, smell in typed_smells:
+            identity = (*_bounds(smell), kind)
+            if identity in seen_ranges:
+                continue
+            seen_ranges.add(identity)
             try:
                 relative = str(Path(filename).resolve().relative_to(source_root))
             except ValueError:
                 relative = _relative_path(filename)
             if not _is_test_scope(relative, source, smell, items):
                 continue
-            if smell["text"].startswith("sleep(") and not TOKIO_SLEEP_IMPORT.search(source_text):
+            is_event_wait = kind == "event"
+            if is_event_wait and _is_bounded(smell, timeouts):
                 continue
-            if ".recv().await" in smell["text"] or ".notified().await" in smell["text"]:
-                if _is_bounded(smell, timeouts):
-                    continue
-            is_event_wait = ".recv().await" in smell["text"] or ".notified().await" in smell["text"]
             if not is_event_wait and _is_exempt(source_text, smell):
                 continue
             location = smell["range"]["start"]
             text = " ".join(smell["text"].split())
             diagnostics.append(Finding(
-                key=(relative, text),
+                key=(relative, _scope_key(smell, items), f"{kind}:{text}"),
                 diagnostic=(
                     f"{relative}:{location['line'] + 1}:{location['column'] + 1}: "
                     f"test timing smell `{text}`; wait for observable evidence"

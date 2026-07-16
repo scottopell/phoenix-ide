@@ -96,7 +96,7 @@ class RustTestTimingTests(unittest.TestCase):
 
     def test_semantic_diff_detects_context_only_changes(self):
         finding = self.checker.Finding(
-            key=("fixture.rs", "rx.recv().await"),
+            key=("fixture.rs", "races", "event:rx.recv().await"),
             diagnostic="current",
         )
         self.assertEqual([finding], self.checker._introduced([finding], []))
@@ -104,14 +104,14 @@ class RustTestTimingTests(unittest.TestCase):
 
     def test_semantic_diff_detects_removed_timeout_wrapper(self):
         unbounded = self.checker.Finding(
-            key=("fixture.rs", "rx.recv().await"),
+            key=("fixture.rs", "races", "event:rx.recv().await"),
             diagnostic="timeout removed",
         )
         self.assertEqual([unbounded], self.checker._introduced([unbounded], []))
 
     def test_semantic_diff_does_not_reflag_unchanged_legacy_finding(self):
         finding = self.checker.Finding(
-            key=("fixture.rs", "rx.recv().await"),
+            key=("fixture.rs", "races", "event:rx.recv().await"),
             diagnostic="line number may differ",
         )
         baseline = self.checker.Finding(key=finding.key, diagnostic="old location")
@@ -136,6 +136,58 @@ class RustTestTimingTests(unittest.TestCase):
             """
         )
         self.assertEqual(1, len(diagnostics))
+
+    def test_std_thread_imported_sleep_is_flagged(self):
+        diagnostics = self.check(
+            """
+            use std::thread::sleep;
+            #[test]
+            fn helper() { sleep(Duration::from_millis(10)); }
+            """
+        )
+        self.assertEqual(1, len(diagnostics))
+
+    def test_imported_timeout_bounds_event_wait(self):
+        diagnostics = self.check(
+            """
+            use tokio::time::timeout;
+            #[tokio::test]
+            async fn helper() {
+                timeout(Duration::from_secs(1), rx.recv()).await.unwrap();
+            }
+            """
+        )
+        self.assertEqual([], diagnostics)
+
+    def test_not_test_cfg_does_not_create_test_scope(self):
+        diagnostics = self.check(
+            """
+            #[cfg(not(test))]
+            async fn production() { done.notified().await; }
+            """
+        )
+        self.assertEqual([], diagnostics)
+
+    def test_unrelated_receiver_method_name_is_still_an_event_wait(self):
+        diagnostics = self.check(
+            """
+            #[tokio::test]
+            async fn helper() { sleepy.recv().await; }
+            """
+        )
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("timeout", diagnostics[0].diagnostic)
+
+    def test_semantic_identity_keeps_identical_waits_in_distinct_functions(self):
+        first = self.checker.Finding(
+            key=("fixture.rs", "first", "event:rx.recv().await"),
+            diagnostic="first",
+        )
+        second = self.checker.Finding(
+            key=("fixture.rs", "second", "event:rx.recv().await"),
+            diagnostic="second",
+        )
+        self.assertEqual([second], self.checker._introduced([first, second], [first]))
 
     def test_exemption_does_not_suppress_unbounded_event_wait(self):
         diagnostics = self.check(
