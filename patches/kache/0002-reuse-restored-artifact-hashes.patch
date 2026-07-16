@@ -1,0 +1,71 @@
+From 2e09865f6dbd6a1fd7aedbd8a7523f2b545a9102 Mon Sep 17 00:00:00 2001
+From: Scott Opell <me@scottopell.com>
+Date: Thu, 16 Jul 2026 00:38:36 -0400
+Subject: [PATCH] perf: reuse known hashes for restored artifacts
+
+---
+ src/store.rs   | 25 +++++++++++++++++++++++++
+ src/wrapper.rs |  4 ++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/store.rs b/src/store.rs
+index 0c8d210..9bd3e6f 100644
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -783,6 +783,16 @@ impl Store {
+         self.file_hasher().record_cached(fingerprint, hash);
+     }
+ 
++    /// Associate a file just materialized from a verified blob with that blob's
++    /// known content hash, avoiding a redundant read when it becomes a compiler input.
++    pub fn record_known_file_hash(&self, path: &Path, hash: &str) {
++        if let crate::cache_key::FileHashLookup::NeedsHash(fingerprint) =
++            self.file_hasher().lookup_cached(path)
++        {
++            self.file_hasher().record_cached(&fingerprint, hash);
++        }
++    }
++
+     /// Check if a committed entry exists for this cache key.
+     pub fn contains(&self, cache_key: &str) -> bool {
+         let entry_dir = self.entry_dir(cache_key);
+@@ -2366,6 +2376,21 @@ mod tests {
+         assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+     }
+ 
++    #[test]
++    fn record_known_file_hash_avoids_reading_materialized_blob() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = Store::open(&test_config(dir.path())).unwrap();
++        let artifact = dir.path().join("artifact.rlib");
++        std::fs::write(&artifact, vec![b'x'; 64 * 1024]).unwrap();
++        let expected = crate::cache_key::hash_file(&artifact).unwrap();
++
++        store.record_known_file_hash(&artifact, &expected);
++        assert!(matches!(
++            store.file_hash_lookup(&artifact),
++            crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
++        ));
++    }
++
+     #[test]
+     fn test_store_put_and_get() {
+         let dir = tempfile::tempdir().unwrap();
+diff --git a/src/wrapper.rs b/src/wrapper.rs
+index 6b317e9..9f7f376 100644
+--- a/src/wrapper.rs
++++ b/src/wrapper.rs
+@@ -1660,6 +1660,10 @@ fn materialize_cached_artifact(
+         }
+     }
+ 
++    if plan.is_empty() {
++        store.record_known_file_hash(target_path, &cached_file.hash);
++    }
++
+     Ok(())
+ }
+ 
+-- 
+2.50.0
+
