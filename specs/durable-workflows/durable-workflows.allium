@@ -60,6 +60,10 @@ value ProfileRef {
     protocol_version: Integer
 }
 
+value ProfileIdentity {
+    profile_id: String
+}
+
 value CodecRef {
     family: String
     version: Integer
@@ -221,7 +225,7 @@ entity DrainProof {
 }
 
 entity ExternalAcceptanceBinding {
-    profile: ProfileRef
+    profile: ProfileIdentity
     authority_scope: String
     idempotency_key: String
     intent_fingerprint: String
@@ -650,7 +654,7 @@ rule AcceptExternallyRetryableWorkflow {
     requires: selection.accepting = true
     requires: selection.external_acceptance_enabled = true
     requires: profile_executor_available(request.profile)
-    requires: not external_acceptance_binding_exists(request.profile, request.authority_scope, request.idempotency_key)
+    requires: not external_acceptance_binding_exists(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key)
     requires: profile_has_lossless_decoder(request.profile, request.snapshot_codec)
     ensures: Workflow.created(
         id: next_workflow_id(), profile: request.profile,
@@ -661,7 +665,7 @@ rule AcceptExternallyRetryableWorkflow {
         snapshot_payload: request.snapshot_payload, accepted_at: now()
     )
     ensures: ExternalAcceptanceBinding.created(
-        profile: request.profile,
+        profile: ProfileIdentity{profile_id: request.profile.profile_id},
         authority_scope: request.authority_scope,
         idempotency_key: request.idempotency_key,
         intent_fingerprint: request.intent_fingerprint,
@@ -674,7 +678,7 @@ rule AcceptExternallyRetryableWorkflow {
 
 rule ReplayExternalAcceptanceBindingBeforeAvailabilityChecks {
     when: ExternalWorkflowAcceptanceRequested(client, request)
-    let binding = external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key)
+    let binding = external_acceptance_binding(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key)
     requires: binding != null
     requires: binding.intent_fingerprint = request.intent_fingerprint
     ensures: ExternalAcceptanceOutcome(binding.receipt)
@@ -683,7 +687,7 @@ rule ReplayExternalAcceptanceBindingBeforeAvailabilityChecks {
 
 rule RejectConflictingExternalAcceptanceKey {
     when: ExternalWorkflowAcceptanceRequested(client, request)
-    let binding = external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key)
+    let binding = external_acceptance_binding(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key)
     requires: binding != null
     requires: binding.intent_fingerprint != request.intent_fingerprint
     ensures: ExternalAcceptanceConflict(request.idempotency_key)
@@ -692,7 +696,7 @@ rule RejectConflictingExternalAcceptanceKey {
 
 rule RejectUnsupportedExternalAcceptanceCodec {
     when: ExternalWorkflowAcceptanceRequested(client, request)
-    requires: external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key) = null
+    requires: external_acceptance_binding(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key) = null
     requires: not profile_has_lossless_decoder(request.profile, request.snapshot_codec)
     ensures: ExternalAcceptanceOutcome(unsupported_codec)
     ensures: not Workflow.created(profile: request.profile, snapshot_codec: request.snapshot_codec)
@@ -701,7 +705,7 @@ rule RejectUnsupportedExternalAcceptanceCodec {
 rule RejectUnavailableExternalAcceptance {
     when: ExternalWorkflowAcceptanceRequested(client, request)
     let selection = accepting_selection_for(request.profile)
-    requires: external_acceptance_binding(request.profile, request.authority_scope, request.idempotency_key) = null
+    requires: external_acceptance_binding(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key) = null
     requires: selection.accepting != true
         or selection.external_acceptance_enabled != true
         or not profile_executor_available(request.profile)

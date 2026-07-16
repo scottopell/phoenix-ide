@@ -195,9 +195,6 @@ entity WakeWorkflowBinding {
     registration_scope: WorkScopeIdentity
     resource: WakeResourceIdentity
     expires_at: Timestamp
-    authority: dwf/SemanticAuthority
-    execution_mode: dwf/ExecutionMode
-    protocol_selection: dwf/ProfileProtocolSelection
     registration_fence_version: Integer
     observe_effect: dwf/Effect
     lifecycle_fence: LifecycleFenceStatus
@@ -293,6 +290,7 @@ config {
 -- unconsumed_wake_delivery_count(conversation), owed_wake_acceptance_count(conversation)
 -- wake_protocol_selection(), authority_is_immutable(binding)
 -- observation_inbox_row_persisted(item), wake_batches_partition_by_workflow_authority(conversation)
+-- conversation_is_terminal_or_archived(conversation)
 
 -- legacy_projection(contract_id), engine_projection(binding)
 -- shadow_projection_is_internal_diagnostic_only(binding)
@@ -359,6 +357,17 @@ rule RegistrationScheduleUsesDefaultBound {
     requires: resource.kind = subagent implies registering_conversation_owns_child(conversation, resource)
     ensures: WakeRegistrationRequested(agent, conversation, resource,
         config.default_max_wait_seconds, tool_use_id)
+}
+
+rule RegistrationRejectsUnavailableSubagentResource {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: resource.kind = subagent
+    requires: not registering_conversation_owns_child(conversation, resource)
+        or not subagent_resource_matches_child_conversation(resource)
+        or conversation_is_terminal_or_archived(conversation)
+        or wake_protocol_selection().accepting != true
+    ensures: WakeRegistrationRejected("wake_unavailable_subagent")
+    ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
 }
 
 rule RegistrationRejectsForeignOrUnstableResource {
@@ -692,6 +701,11 @@ rule WakeParityGateBlocksCutoverOnUnresolvedBlockingDivergence {
 
 rule WakeParityGatePermitsCutoverOnlyWithSemanticParity {
     when: WakeParityGateEvaluated(mirror)
+    requires: deterministic_schedule_suite_green(wake_profile())
+    requires: representative_production_schedule_suite_green(wake_profile())
+    requires: lossless_codec_coverage_verified(wake_profile())
+    requires: rollback_selector_verified(wake_profile())
+    requires: explicit_operator_authorization_recorded(wake_profile())
     requires: not unresolved_blocking_wake_divergence_exists()
     requires: mixed_authority_wake_semantics_are_equal()
     ensures: WakeParityGateOutcome(open)

@@ -9,7 +9,7 @@
 
 ADR-006 established the core product idea for wake contracts: a persisted,
 conversation-scoped obligation to eventually deliver one accountable terminal
-outcome instead of burning repeated LLM turns on polling. Task 47002 approved a
+outcome instead of burning repeated LLM turns on polling. The wake-contract implementation plan approved a
 more precise core protocol before runtime implementation.
 
 Three parts of ADR-006 no longer match the approved implementation contract:
@@ -98,7 +98,7 @@ underlying resource's ownership model.
 ## References
 
 - Superseded decision: ADR-006
-- Authoritative implementation tracker: `tasks/47002-p1-in-progress--implement-wake-plane-core-bash-tmux.md`
+- Authoritative implementation tracker: `tasks/25002-p1-ready--implement-wake-contracts.md`
 - Feature spec: `specs/wake-contracts/requirements.md`
 - Behavioral model: `specs/wake-contracts/wake-contracts.allium`
 - Status summary: `specs/wake-contracts/executive.md`

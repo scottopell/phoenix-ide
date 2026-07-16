@@ -165,6 +165,8 @@ THE SYSTEM SHALL atomically:
      the LLM directly, and
   5. emit `WakeContractFired` SSE
 
+Explicit cancellation SHALL persist and accept its synthetic terminal result through the same durable path without scheduling an LLM turn solely for cancellation.
+
 WHEN a contract's `expires_at` passes without firing
 THE SYSTEM SHALL resolve the contract with cause `Expired` and the same
 durable observation / owed-acceptance delivery path as a normal fire
@@ -189,8 +191,9 @@ guards, and lifecycle conflict checks driven directly by the pending-wake
 lifecycle
 
 Archive, hard-delete, abandon, mark-merged, and any equivalent destructive
-lifecycle operation SHALL query pending wake contracts directly and SHALL reject
-or serialize the lifecycle transition until those contracts are resolved
+lifecycle operation SHALL query pending wake contracts, unconsumed wake
+observations, and owed runtime acceptances directly and SHALL reject or serialize
+the lifecycle transition until those obligations are resolved
 
 **Rationale:** Wake waits are runtime-owned obligations, not proof that the LLM
 is actively executing. Fabricating `is_busy()` would create a duplicate semantic
