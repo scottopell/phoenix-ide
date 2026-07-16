@@ -25,7 +25,7 @@ class CompilerCacheTests(unittest.TestCase):
             self.dev.shutil,
             "which",
             side_effect=lambda name: f"/bin/{name}" if name in installed else None,
-        ):
+        ), mock.patch.object(self.dev, "_ensure_kache_daemon"):
             selected = self.dev._configure_compiler_cache(requested)
             return selected, os.environ.copy()
 
@@ -43,7 +43,7 @@ class CompilerCacheTests(unittest.TestCase):
     def test_auto_uses_kache_when_sccache_is_unavailable(self):
         selected, env = self.configure(installed={"kache"})
         self.assertEqual("kache", selected)
-        self.assertEqual("kache", env["RUSTC_WRAPPER"])
+        self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
         self.assertNotIn("SCCACHE_CACHE_SIZE", env)
 
     def test_none_disables_automatic_wrapper(self):
@@ -56,7 +56,7 @@ class CompilerCacheTests(unittest.TestCase):
             env={"PHOENIX_COMPILER_CACHE": "kache"}, installed={"kache"}
         )
         self.assertEqual("kache", selected)
-        self.assertEqual("kache", env["RUSTC_WRAPPER"])
+        self.assertEqual("/bin/kache", env["RUSTC_WRAPPER"])
 
     def test_cli_selection_takes_precedence_over_environment(self):
         selected, env = self.configure(
@@ -66,6 +66,26 @@ class CompilerCacheTests(unittest.TestCase):
         )
         self.assertEqual("sccache", selected)
         self.assertEqual("sccache", env["RUSTC_WRAPPER"])
+
+    def test_local_kache_binary_is_supported(self):
+        with mock.patch.dict(
+            os.environ, {"PHOENIX_KACHE_BIN": "/opt/local/kache"}, clear=True
+        ), mock.patch.object(self.dev.Path, "is_file", return_value=True), mock.patch.object(
+            self.dev.os, "access", return_value=True
+        ), mock.patch.object(self.dev, "_ensure_kache_daemon") as ensure:
+            selected = self.dev._configure_compiler_cache("kache")
+            self.assertEqual("kache", selected)
+            self.assertEqual("/opt/local/kache", os.environ["RUSTC_WRAPPER"])
+            ensure.assert_called_once_with("/opt/local/kache")
+
+    def test_daemon_gets_short_socket_for_long_cache_path(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(
+            os.environ, {"KACHE_CACHE_DIR": "/very/long/worktree/cache"}, clear=True
+        ), mock.patch.object(self.dev.subprocess, "run", return_value=completed) as run:
+            self.dev._ensure_kache_daemon("/bin/kache")
+            self.assertRegex(os.environ["KACHE_SOCKET_PATH"], r"^/tmp/kache-[0-9a-f]{16}\.sock$")
+            run.assert_called_once()
 
     def test_unavailable_explicit_backend_fails(self):
         with self.assertRaisesRegex(SystemExit, "kache.*not installed"):

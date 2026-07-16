@@ -3858,6 +3858,37 @@ def _append_git_config_override(key, value, environ=None):
 _COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
 
 
+def _kache_binary() -> str | None:
+    configured = os.environ.get("PHOENIX_KACHE_BIN")
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.resolve())
+        return None
+    return shutil.which("kache")
+
+
+def _ensure_kache_daemon(binary: str) -> None:
+    cache_dir = os.environ.get("KACHE_CACHE_DIR")
+    if cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
+        # macOS limits Unix socket paths to 103 bytes. Phoenix worktree paths are
+        # intentionally long, so give the local fork a short, stable socket path.
+        digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
+        os.environ["KACHE_SOCKET_PATH"] = f"/tmp/kache-{digest}.sock"
+
+    result = subprocess.run(
+        [binary, "daemon", "start"],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise SystemExit(f"kache daemon failed to start: {detail}")
+
+
 def _configure_compiler_cache(requested: str | None = None) -> str:
     """Configure the compiler cache without overriding an explicit wrapper."""
     if "RUSTC_WRAPPER" in os.environ:
@@ -3873,20 +3904,28 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     if backend == "none":
         return "none"
 
+    kache_binary = _kache_binary()
     if backend == "auto":
         if shutil.which("sccache"):
             backend = "sccache"
-        elif shutil.which("kache"):
+        elif kache_binary:
             backend = "kache"
         else:
             return "none"
-    elif not shutil.which(backend):
+    elif backend == "kache" and not kache_binary:
         raise SystemExit(
-            f"requested compiler cache {backend!r} is not installed or not on PATH"
+            "requested compiler cache 'kache' is not installed; put it on PATH "
+            "or set PHOENIX_KACHE_BIN"
         )
+    elif backend == "sccache" and not shutil.which("sccache"):
+        raise SystemExit("requested compiler cache 'sccache' is not installed or not on PATH")
 
-    os.environ["RUSTC_WRAPPER"] = backend
-    if backend == "sccache":
+    wrapper = kache_binary if backend == "kache" else backend
+    assert wrapper is not None
+    os.environ["RUSTC_WRAPPER"] = wrapper
+    if backend == "kache":
+        _ensure_kache_daemon(wrapper)
+    elif backend == "sccache":
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
     return backend
 

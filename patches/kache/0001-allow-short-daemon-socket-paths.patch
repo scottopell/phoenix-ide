@@ -1,0 +1,52 @@
+From aed4a6744f9b7a46363681d0efbdc95724b056fe Mon Sep 17 00:00:00 2001
+From: Scott Opell <me@scottopell.com>
+Date: Thu, 16 Jul 2026 00:02:48 -0400
+Subject: [PATCH] fix: allow short daemon socket paths
+
+---
+ src/config.rs | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index 993c86e..8b04e2e 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -267,8 +267,8 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
+ /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
+ /// setting. Deliberately excludes bootstrap/operational vars that have no file
+ /// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
+-/// (operational kill switch), `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`,
+-/// `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
++/// (operational kill switch), `KACHE_SOCKET_PATH` (Unix socket path-length escape hatch),
++/// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
+ /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
+ /// Used only to warn which overrides are being ignored; the gating itself is
+ /// done inline via [`env_or_ignored`].
+@@ -819,7 +819,9 @@ impl Config {
+     }
+ 
+     pub fn socket_path(&self) -> PathBuf {
+-        self.cache_dir.join("daemon.sock")
++        std::env::var_os("KACHE_SOCKET_PATH")
++            .map(PathBuf::from)
++            .unwrap_or_else(|| self.cache_dir.join("daemon.sock"))
+     }
+ 
+     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
+@@ -1535,6 +1537,13 @@ mod tests {
+             config.socket_path(),
+             PathBuf::from("/tmp/kache/daemon.sock")
+         );
++
++        let socket = tempfile::tempdir().unwrap().path().join("kache.sock");
++        // SAFETY: config tests that mutate process environment are serialized.
++        let _lock = config_path_lock();
++        unsafe { std::env::set_var("KACHE_SOCKET_PATH", &socket) };
++        assert_eq!(config.socket_path(), socket);
++        unsafe { std::env::remove_var("KACHE_SOCKET_PATH") };
+     }
+ 
+     #[test]
+-- 
+2.50.0
+
