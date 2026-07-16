@@ -131,9 +131,14 @@ impl GlobalReadService {
                     .to_string(),
             );
         }
+        let coordinator_chain = self.coordinator_chain_ids().await?;
         let hits = self
             .message_retriever
-            .retrieve(query, RetrievalScope::Global, SEARCH_TOP_K)
+            .retrieve(
+                query,
+                RetrievalScope::GlobalExcluding(coordinator_chain),
+                SEARCH_TOP_K,
+            )
             .await
             .map_err(|e| format!("search failed: {e}"))?;
         if hits.is_empty() {
@@ -141,6 +146,27 @@ impl GlobalReadService {
         } else {
             Ok(format_global_search_hits(self, &hits).await)
         }
+    }
+
+    async fn coordinator_chain_ids(&self) -> Result<Vec<String>, String> {
+        let Some(coordinator_id) = self
+            .db
+            .coordinator_conversation_id()
+            .await
+            .map_err(|e| format!("failed to resolve Coordinator: {e}"))?
+        else {
+            return Ok(Vec::new());
+        };
+        let root_id = self
+            .db
+            .chain_root_of(&coordinator_id)
+            .await
+            .map_err(|e| format!("failed to resolve Coordinator chain: {e}"))?
+            .unwrap_or(coordinator_id);
+        self.db
+            .chain_members_forward(&root_id)
+            .await
+            .map_err(|e| format!("failed to read Coordinator chain: {e}"))
     }
 
     pub(crate) async fn read_conversation(
@@ -977,9 +1003,9 @@ async fn resolve_reference_impl(
         let (slug, fragment) = split_fragment(rest);
         let conv = load_conversation_by_slug_or_id(service, slug).await?;
         if let Some(message_id) = fragment.and_then(message_id_fragment) {
-            return resolve_message(service, conv, message_id).await;
+            return resolve_message(service, conv, message_id, true).await;
         }
-        return Ok(resolve_conversation(conv));
+        return Ok(resolve_conversation(conv, true));
     }
     if let Some(rest) = reference.strip_prefix("/chains/") {
         let (id, _) = split_fragment(rest);
@@ -993,9 +1019,9 @@ async fn resolve_reference_impl(
             .await
             .map_err(map_db_not_found)?;
         if let Some(message_id) = message_id {
-            return resolve_message(service, conv, message_id).await;
+            return resolve_message(service, conv, message_id, false).await;
         }
-        return Ok(resolve_conversation(conv));
+        return Ok(resolve_conversation(conv, false));
     }
     if let Some(rest) = reference.strip_prefix("@chain:") {
         let (id, _) = split_fragment(rest);
@@ -1075,8 +1101,12 @@ async fn load_conversation_by_slug_or_id(
     }
 }
 
-fn resolve_conversation(conv: Conversation) -> ResolveGlobalReferenceResponse {
-    let href = Some(conversation_href(&conv));
+fn resolve_conversation(conv: Conversation, global_href: bool) -> ResolveGlobalReferenceResponse {
+    let href = Some(if global_href {
+        format!("/global/{}", conv.id)
+    } else {
+        conversation_href(&conv)
+    });
     let title = conv.title.clone().or(conv.slug.clone());
     ResolveGlobalReferenceResponse {
         kind: "conversation".to_string(),
@@ -1096,6 +1126,7 @@ async fn resolve_message(
     service: &GlobalReadService,
     conv: Conversation,
     message_id: &str,
+    global_href: bool,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let message = service
         .db
@@ -1112,10 +1143,11 @@ async fn resolve_message(
             "message reference target not found".to_string(),
         ));
     }
-    let href = Some(conversation_message_href(
-        &conv,
-        Some((&message.message_id, message.message_type)),
-    ));
+    let href = Some(if global_href {
+        format!("/global/{}#message-{}", conv.id, message.message_id)
+    } else {
+        conversation_message_href(&conv, Some((&message.message_id, message.message_type)))
+    });
     let title = conv.title.clone().or(conv.slug.clone());
     Ok(ResolveGlobalReferenceResponse {
         kind: "message".to_string(),

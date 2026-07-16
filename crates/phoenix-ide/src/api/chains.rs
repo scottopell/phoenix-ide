@@ -522,6 +522,23 @@ pub async fn stream_chain(
 /// Mirrors the check in `ChainQa::prepare_invocation` so failures are
 /// surfaced as 404 here instead of bubbling up as 500 from the Q&A backend.
 async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppError> {
+    if let Some(coordinator_id) = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(db_to_app)?
+    {
+        let coordinator_root = state
+            .db
+            .chain_root_of(&coordinator_id)
+            .await
+            .map_err(db_to_app)?
+            .unwrap_or(coordinator_id);
+        if coordinator_root == root_id {
+            return Err(AppError::NotFound(format!("no chain rooted at {root_id}")));
+        }
+    }
+
     // chain_root_of returns None when the conversation does not exist; the
     // caller can't tell apart "no such conv" from "this conv is a member,
     // not a root" — both map to 404 from the chain API's perspective.

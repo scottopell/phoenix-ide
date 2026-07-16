@@ -32,6 +32,8 @@ pub enum RetrievalScope {
     Conversations(Vec<String>),
     /// Span every conversation in the database (the application-wide case).
     Global,
+    /// Span the application except the supplied conversation ids.
+    GlobalExcluding(Vec<String>),
 }
 
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
@@ -242,13 +244,14 @@ impl MessageRetriever for Fts5Retriever {
         let Some(match_expr) = build_fts_query(query) else {
             return Ok(Vec::new());
         };
-        let scope_ids: &[String] = match &scope {
-            RetrievalScope::Global => &[],
+        let (scope_ids, excluding): (&[String], bool) = match &scope {
+            RetrievalScope::Global => (&[], false),
+            RetrievalScope::GlobalExcluding(ids) => (ids, true),
             RetrievalScope::Conversations(ids) => {
                 if ids.is_empty() {
                     return Ok(Vec::new());
                 }
-                ids
+                (ids, false)
             }
         };
 
@@ -262,7 +265,11 @@ impl MessageRetriever for Fts5Retriever {
                AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
         );
         if !scope_ids.is_empty() {
-            sql.push_str(" AND message_fts.conversation_id IN (");
+            if excluding {
+                sql.push_str(" AND message_fts.conversation_id NOT IN (");
+            } else {
+                sql.push_str(" AND message_fts.conversation_id IN (");
+            }
             for i in 0..scope_ids.len() {
                 if i > 0 {
                     sql.push(',');
