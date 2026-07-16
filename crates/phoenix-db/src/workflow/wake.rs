@@ -446,23 +446,26 @@ impl<'a> WakeWorkflowAdapter<'a> {
         &self,
         registered_at: DateTime<Utc>,
     ) -> WorkflowRepositoryResult<()> {
-        let existing: Option<(String, i64, i64)> = sqlx::query_as(
-            "SELECT profile_id, protocol_version, external_acceptance_enabled \
+        let existing: Option<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT profile_id, selector_version, protocol_version, external_acceptance_enabled \
              FROM workflow_protocol_selections WHERE id = ?1",
         )
         .bind(SELECTION_ID)
         .fetch_optional(self.repository.pool())
         .await?;
-        if let Some((profile, version, external)) = existing {
+        if let Some((profile, selector_version, version, external)) = existing {
             if profile == wake_profile::PROFILE_ID
+                && selector_version == 1
                 && version == i64::from(wake_profile::PROTOCOL_VERSION)
                 && external == 1
             {
                 return Ok(());
             }
-            return Err(WorkflowRepositoryError::CorruptState(
-                "wake protocol selection id is bound to incompatible capabilities".to_owned(),
-            ));
+            return Err(WorkflowRepositoryError::ProtocolSelectionIncompatible {
+                requested_selection_id: SELECTION_ID.to_owned(),
+                existing_selection_id: SELECTION_ID.to_owned(),
+                profile_id: wake_profile::PROFILE_ID.to_owned(),
+            });
         }
 
         let codecs = [
