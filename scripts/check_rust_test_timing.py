@@ -29,6 +29,7 @@ rule:
   any:
     - kind: function_item
     - kind: mod_item
+    - kind: impl_item
     - kind: attribute_item
 ---
 id: phoenix-rust-test-sleep
@@ -53,6 +54,13 @@ rule:
   any:
     - pattern: $RECEIVER.recv().await
     - pattern: $NOTIFY.notified().await
+---
+id: phoenix-rust-test-select
+language: Rust
+severity: warning
+rule:
+  kind: macro_invocation
+  regex: '^tokio::select!'
 ---
 id: phoenix-rust-test-timeout
 language: Rust
@@ -146,6 +154,33 @@ def _attributes_enable_test(prefix: str) -> bool:
     return any(_cfg_has_positive_test(match.group(1)) for match in CFG_ATTR.finditer(prefix))
 
 
+def _test_only_module_files(source_root: Path, grouped: dict[str, dict[str, list[dict]]]) -> set[str]:
+    files = set()
+    for filename, kinds in grouped.items():
+        source = Path(filename).read_bytes()
+        attributes = [
+            item for item in kinds["phoenix-rust-test-item"]
+            if item["text"].lstrip().startswith("#")
+        ]
+        for item in kinds["phoenix-rust-test-item"]:
+            text = item["text"].strip()
+            match = re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", text)
+            if not match:
+                continue
+            start, _ = _bounds(item)
+            if not _attributes_enable_test(_attached_attributes(source, start, attributes)):
+                continue
+            parent = Path(filename).parent
+            candidates = [parent / f"{match.group(1)}.rs", parent / match.group(1) / "mod.rs"]
+            for candidate in candidates:
+                if candidate.exists():
+                    try:
+                        files.add(str(candidate.resolve().relative_to(source_root)))
+                    except ValueError:
+                        pass
+    return files
+
+
 def _is_test_scope(
     filename: str,
     source: bytes,
@@ -162,10 +197,7 @@ def _is_test_scope(
         if not start <= point < end:
             continue
         prefix = _attached_attributes(source, start, attributes)
-        if item["text"].lstrip().startswith("mod "):
-            if _attributes_enable_test(prefix):
-                return True
-        elif TEST_ATTR.search(prefix) or _attributes_enable_test(prefix):
+        if TEST_ATTR.search(prefix) or _attributes_enable_test(prefix):
             return True
     return False
 
@@ -204,6 +236,20 @@ def _is_exempt(source: str, smell: dict) -> bool:
     return marker.startswith("//") and EXEMPTION in marker and marker.split(EXEMPTION, 1)[1].strip() != ""
 
 
+def _select_event_waits(select_macro: dict) -> list[dict]:
+    waits = []
+    base_start, _ = _bounds(select_macro)
+    for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_\.]*\.(?:recv|notified)\s*\(\s*\)", select_macro["text"]):
+        wait = dict(select_macro)
+        wait["text"] = match.group(0)
+        start = base_start + len(select_macro["text"][:match.start()].encode())
+        end = base_start + len(select_macro["text"][:match.end()].encode())
+        wait["range"] = dict(select_macro["range"])
+        wait["range"]["byteOffset"] = {"start": start, "end": end}
+        waits.append(wait)
+    return waits
+
+
 def findings(
     paths: list[str],
     ast_grep: str = "ast-grep",
@@ -220,6 +266,7 @@ def findings(
 
     diagnostics: list[Finding] = []
     source_root = (source_root or Path.cwd()).resolve()
+    test_only_files = _test_only_module_files(source_root, grouped)
     for filename, kinds in grouped.items():
         source_text = Path(filename).read_text()
         source = source_text.encode()
@@ -235,6 +282,7 @@ def findings(
             *(('sleep', smell) for smell in kinds["phoenix-rust-test-sleep"]),
             *(('sleep', smell) for smell in kinds["phoenix-rust-test-bare-sleep"] if SLEEP_IMPORT.search(source_text)),
             *(('event', smell) for smell in kinds["phoenix-rust-test-event-wait"]),
+            *(('event', smell) for macro in kinds["phoenix-rust-test-select"] for smell in _select_event_waits(macro)),
         ]
         seen_ranges: set[tuple[int, int, str]] = set()
         for kind, smell in typed_smells:
@@ -246,7 +294,9 @@ def findings(
                 relative = str(Path(filename).resolve().relative_to(source_root))
             except ValueError:
                 relative = _relative_path(filename)
-            if not _is_test_scope(relative, source, smell, items, attributes):
+            if relative not in test_only_files and not _is_test_scope(
+                relative, source, smell, items, attributes
+            ):
                 continue
             is_event_wait = kind == "event"
             if is_event_wait and _is_bounded(smell, timeouts):

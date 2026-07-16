@@ -209,6 +209,53 @@ class RustTestTimingTests(unittest.TestCase):
         )
         self.assertEqual([second], self.checker._introduced([first, second], [first]))
 
+    def test_out_of_line_cfg_test_module_is_test_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.rs").write_text("#[cfg(test)]\nmod proptests;\n")
+            (root / "proptests.rs").write_text(
+                "async fn helper() { done.notified().await; }\n"
+            )
+            diagnostics = self.checker.findings(
+                [str(root)], source_root=root
+            )
+        self.assertEqual(1, len(diagnostics))
+
+    def test_cfg_test_impl_is_inherited_by_method(self):
+        diagnostics = self.check(
+            """
+            struct Helper;
+            #[cfg(test)]
+            impl Helper {
+                async fn wait(&self) { done.notified().await; }
+            }
+            """
+        )
+        self.assertEqual(1, len(diagnostics))
+
+    def test_select_branch_event_waits_are_flagged_and_can_be_bounded(self):
+        unbounded = self.check(
+            """
+            #[tokio::test]
+            async fn unbounded() {
+                tokio::select! { _ = rx.recv() => {}, _ = done.notified() => {} }
+            }
+            """
+        )
+        self.assertEqual(2, len(unbounded))
+
+        bounded = self.check(
+            """
+            #[tokio::test]
+            async fn bounded() {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::select! { _ = rx.recv() => {}, _ = done.notified() => {} }
+                }).await.unwrap();
+            }
+            """
+        )
+        self.assertEqual([], bounded)
+
     def test_exemption_does_not_suppress_unbounded_event_wait(self):
         diagnostics = self.check(
             """
