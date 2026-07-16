@@ -1,3 +1,4 @@
+-- WakeTerminalDeliveryPersistedThroughReducerAcceptance(conversation)
 -- allium: 3
 -- wake-contracts.allium
 --
@@ -413,7 +414,7 @@ rule WakeRouterFiresOnConditionHold {
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: WakeTerminalDeliveryPersistedThroughReducerAcceptance(contract.conversation)
     ensures: SseEmitted(WakeContractFired, contract.id)
 
     @guidance
@@ -455,7 +456,7 @@ rule WakeRouterForgetsMissingSubAgentHandle {
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: WakeTerminalDeliveryPersistedThroughReducerAcceptance(contract.conversation)
     ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
@@ -478,7 +479,7 @@ rule WakeRouterForgetsMissingTmuxHandle {
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: WakeTerminalDeliveryPersistedThroughReducerAcceptance(contract.conversation)
     ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
@@ -499,7 +500,7 @@ rule WakeRouterFiresOnExpiry {
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: WakeTerminalDeliveryPersistedThroughReducerAcceptance(contract.conversation)
     ensures: SseEmitted(WakeContractExpired, contract.id)
 
     @guidance

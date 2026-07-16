@@ -278,13 +278,14 @@ rule ShellFirstDurableAcceptance {
         conversation_id: intent.conversation_id, accepted: true, committed_at: now()
     )
     ensures: dwf/ExternalAcceptanceBinding.created(
-        profile_id: creation_profile_id(),
+        profile: dwf/ProfileIdentity{profile_id: creation_profile_id()},
         authority_scope: creation_acceptance_scope(raw_intent),
         idempotency_key: creation_acceptance_key(raw_intent),
-        request_fingerprint: creation_request_fingerprint(raw_intent),
+        intent_fingerprint: creation_request_fingerprint(raw_intent),
         workflow: binding.workflow,
-        accepted_protocol: creation_protocol_selection(),
-        committed_at: now()
+        selected_protocol: creation_protocol_selection(),
+        receipt: acceptance,
+        accepted_at: now()
     )
     ensures: CreationAcceptanceProjection.created(
         core_binding: external_acceptance_binding_for(raw_intent),

@@ -715,6 +715,7 @@ rule RejectUnavailableExternalAcceptance {
 
 rule RejectUnavailableWorkflowAcceptance {
     when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
+    requires: execution_mode = authoritative
     requires: accepting_selection_for(profile) = null
         or not profile_executor_available(profile)
     ensures: AcceptanceOutcome(closed_or_unavailable)
@@ -724,7 +725,6 @@ rule RejectUnavailableWorkflowAcceptance {
 rule RejectUnsupportedWorkflowCodec {
     when: WorkflowAcceptanceRequested(profile, execution_mode, authoritative_workflow, snapshot_codec, snapshot_payload)
     requires: not profile_has_lossless_decoder(profile, snapshot_codec)
-             or not profile_executor_available(profile)
     ensures: AcceptanceOutcome(unsupported_codec)
     ensures: not Workflow.created(profile: profile, snapshot_codec: snapshot_codec)
 }

@@ -101,9 +101,9 @@ THE SYSTEM SHALL emit an SSE `WakeContractRegistered` event with the
 contract id, handle reference, condition summary, and `expires_at`
 
 **Rationale:** Registration is the LLM's explicit commitment "I have
-nothing further to do until this fires." The tool call itself does
-not return a synchronous payload to the LLM. The conversation state
-is unchanged — the LLM's next invocation is when the contract fires
+nothing further to do until this fires." The tool call returns a provider-valid
+registration receipt in tool-result history; it does not synchronously wait for
+terminal handle output. The conversation state is unchanged — the LLM's next invocation is when the contract fires
 (or expires / is cancelled / is forgotten). See REQ-WAKE-006 for
 delivery semantics; ADR-006 records the explicit non-state rationale.
 

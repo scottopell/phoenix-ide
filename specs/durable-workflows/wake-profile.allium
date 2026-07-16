@@ -116,6 +116,10 @@ value SubagentTerminalEvidence {
     occurred_at: Timestamp
     child_conversation_id: String
     status: SubagentTerminalStatus
+    success_text: String? when status in {submit_result, implicit_text_completion}
+    error_text: String? when status = submit_error
+    error_kind: String? when status in {submit_error, runtime_failure}
+    persisted_child_terminal_record: String
 }
 
 value WakeTerminalEvidence {
@@ -334,10 +338,10 @@ rule RegistrationScheduleCreatesEngineWorkBeforeReceipt {
     ensures: observe.role = required
     ensures: observe.ambiguity_policy = observable_reconciliation
     ensures: WakeWorkflowBinding.created(
+        workflow: conversation_wake_workflow(conversation, wake_protocol_selection()),
         contract_id: contract_id, conversation: conversation,
         registration_scope: scope, resource: resource, expires_at: expires_at,
-        authority: engine_protocol, execution_mode: authoritative,
-        protocol_selection: wake_protocol_selection(), registration_fence_version: fence_version,
+        registration_fence_version: fence_version,
         observe_effect: observe, lifecycle_fence: open
     )
     ensures: registration_transition_for(intent, observe)

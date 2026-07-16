@@ -405,7 +405,7 @@ reconciliation SHALL forget an unrecoverable non-terminal wake before normal
 serving resumes rather than waiting for the original deadline. Each accepted
 contract SHALL yield exactly one terminal receipt.
 
-The durable wake profile SHALL admit sub-agent terminal waits as a first-class substrate after the Bash/Tmux cutover slice. Their durable resource identity SHALL be the child conversation or agent ID, independent of the parent's WorkScope. Observation SHALL use persisted child terminal evidence and preserve the exact durable child terminal cause required by `specs/subagents/requirements.md`. Parent scope and continuation SHALL govern delivery ownership without changing child resource identity. Sub-agent runtime integration and authority cutover are governed by task 47007 and SHALL NOT block the initial Bash/Tmux adoption gate.
+The durable wake profile SHALL admit sub-agent terminal waits as a first-class substrate. Their durable resource identity SHALL be the child conversation or agent ID, independent of the parent's WorkScope. Observation SHALL use persisted child terminal evidence and preserve the exact durable child terminal cause required by `specs/subagents/requirements.md`. Parent scope and continuation SHALL govern delivery ownership without changing child resource identity.
 
 ### REQ-DWF-WAKE-003: Delivery, Coalescing, and Acceptance
 

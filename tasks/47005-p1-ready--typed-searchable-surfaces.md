@@ -183,7 +183,7 @@ Apply the architecture across:
 5. Markdown, HTML source, and large-text document bodies.
 6. Conversation-message side viewer as it moves through task 47004's unified document viewer.
 
-Do not wait for upstream exact-range Pierre decorations. Phoenix targets remain typed and exact; the Pierre adapter may report a line-level decoration capability until task 47003 lands upstream support.
+Do not wait for upstream exact-range Pierre decorations. Phoenix targets remain typed and exact; the Pierre adapter may report a line-level decoration capability until task 47006 lands upstream support.
 
 ## Implementation sequence
 
@@ -239,4 +239,4 @@ Each migration must remain shippable and remove its superseded representation in
 ## Relationship to other tasks
 
 - **Task 47004** — source-aware side-panel document viewer consolidation should depend on or be sequenced after this foundation. Its unified document viewer consumes typed display projections and the shared find session; it must not copy current file/message find composition.
-- **Task 47003** — upstream Pierre read-only exact-range decorations improves visual fidelity but does not block typed Phoenix search/reveal architecture.
+- **Task 47006** — upstream Pierre read-only exact-range decorations improves visual fidelity but does not block typed Phoenix search/reveal architecture.
