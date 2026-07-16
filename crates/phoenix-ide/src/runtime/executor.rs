@@ -2517,7 +2517,10 @@ where
                     transcript_generation = activation.transcript_generation,
                     "Activated queued project instructions at user-turn boundary"
                 );
-                let _ = self.broadcast_tx.send_persisted_message(activation.message);
+                let _ = self.broadcast_tx.send_persisted_message_with_generation(
+                    activation.message,
+                    Some(activation.transcript_generation),
+                );
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -10713,7 +10716,7 @@ mod steer_drain_detector_tests {
         let mut saw_duration_update = false;
         loop {
             match rx.try_recv() {
-                Ok(SseEvent::Message { message }) => {
+                Ok(SseEvent::Message { message, .. }) => {
                     if message.message_id == "tool-duration-1-result" {
                         saw_tool_message = true;
                     }

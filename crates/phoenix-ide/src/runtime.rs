@@ -751,9 +751,26 @@ impl SseBroadcaster {
     /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
     /// events below this seq are no longer needed for replay).
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
+        self.send_persisted_message_with_generation(message, None)
+    }
+
+    /// Broadcast a persisted boundary message together with the transcript
+    /// generation committed by the same transaction.
+    pub fn send_persisted_message_with_generation(
+        &self,
+        message: crate::db::Message,
+        transcript_generation: Option<i64>,
+    ) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                transcript_generation,
+            },
+            seq,
+            RingOp::Anchor,
+        )
     }
 
     /// Backward-compatible alias for [`SseBroadcaster::send_persisted_message`].
@@ -778,7 +795,14 @@ impl SseBroadcaster {
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                transcript_generation: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
@@ -997,6 +1021,9 @@ pub enum SseEvent {
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
+        /// Conversation transcript generation after a boundary-changing message.
+        /// Present only for project-instruction activation messages.
+        transcript_generation: Option<i64>,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
     /// `message_id` is the target; `sequence_id` is the envelope id used by
@@ -3589,11 +3616,11 @@ mod broadcaster_tests {
 
         assert!(matches!(
             first,
-            SseEvent::Message { ref message } if message.message_id == "reserved-1"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-1"
         ));
         assert!(matches!(
             second,
-            SseEvent::Message { ref message } if message.message_id == "reserved-2"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-2"
         ));
         assert!(matches!(
             queued,
@@ -3774,7 +3801,7 @@ mod broadcaster_tests {
         assert_eq!(highest, 3, "highest_seq covers the eager message at seq 3");
         assert_eq!(events.len(), 2, "token + eager message both in ring");
         match &events[1] {
-            SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, "eager"),
             other => panic!("expected Message, got {other:?}"),
         }
     }

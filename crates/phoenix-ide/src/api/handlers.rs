@@ -10467,7 +10467,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }

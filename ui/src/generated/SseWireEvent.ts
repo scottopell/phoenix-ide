@@ -69,7 +69,7 @@ pending_truncated: boolean, } | { "type": "message", sequence_id: number,
  * validated against `MessageSchema` and transformed to the UI's
  * `Message` type at the valibot boundary.
  */
-message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, 
+message: unknown, transcript_generation?: number, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, 
 /**
  * Tool-execution duration in milliseconds. Present only when the
  * `MessageUpdated` event is emitted for a tool-result message;

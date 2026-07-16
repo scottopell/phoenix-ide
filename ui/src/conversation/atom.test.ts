@@ -917,6 +917,29 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(6);
     });
 
+    it('updates transcript generation from an activation message only when present', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        transcriptGeneration: 4,
+        lastAppliedEventSeq: 8,
+      };
+
+      const activated = dispatch(atom, {
+        type: 'sse_message',
+        message: makeMessage(9, { content: { text: '[project-instructions-activated] refreshed' } }),
+        sequenceId: 9,
+        transcriptGeneration: 5,
+      });
+      expect(activated.transcriptGeneration).toBe(5);
+
+      const normal = dispatch(activated, {
+        type: 'sse_message',
+        message: makeMessage(10),
+        sequenceId: 10,
+      });
+      expect(normal.transcriptGeneration).toBe(5);
+    });
+
     it('clears streamingBuffer atomically on message arrival', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

@@ -2804,7 +2804,7 @@ mod tests {
                         SseEvent::Token { .. } => {
                             last_token_idx = Some(idx);
                         }
-                        SseEvent::Message { message } => {
+                        SseEvent::Message { message, .. } => {
                             if matches!(message.message_type, MessageType::Agent)
                                 && first_agent_msg_idx.is_none()
                             {

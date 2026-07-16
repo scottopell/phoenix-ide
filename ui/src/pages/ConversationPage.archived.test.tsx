@@ -79,6 +79,7 @@ vi.mock('../components/ConversationNavStack', () => ({
     transcriptPositioning,
     olderHistoryError,
     onOpenCommissionReview,
+    systemPrompt,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -94,6 +95,7 @@ vi.mock('../components/ConversationNavStack', () => ({
     };
     olderHistoryError?: string | null;
     onOpenCommissionReview?: (sequenceId: number) => void;
+    systemPrompt?: string;
   }) => {
     navStackProps.onOpenCommissionReview = onOpenCommissionReview;
     return (
@@ -121,6 +123,7 @@ vi.mock('../components/ConversationNavStack', () => ({
             : 'none'}
         </div>
         <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
+        <div data-testid="inspected-system-prompt">{systemPrompt ?? 'none'}</div>
         {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
       </div>
     );
