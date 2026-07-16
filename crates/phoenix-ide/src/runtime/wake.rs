@@ -297,6 +297,10 @@ fn intent_fingerprint(intent: &phoenix_workflow::wake_profile::WakeRegistrationI
             digest.update([0]);
             digest.update(identity.window_id.as_bytes());
         }
+        WakeResourceIdentity::Subagent(identity) => {
+            digest.update(b"subagent\0");
+            digest.update(identity.child_conversation_id.as_bytes());
+        }
     }
     digest.update(intent.registered_at.0.to_be_bytes());
     digest.update(intent.expires_at.0.to_be_bytes());
@@ -461,7 +465,10 @@ where
             .await
             .map_err(|error| error.to_string())?
             .expires_at;
-        let lease_until = std::cmp::min(item_now + CLAIM_LEASE, expires_at);
+        let lease_until = std::cmp::max(
+            item_now + chrono::Duration::seconds(1),
+            std::cmp::min(item_now + CLAIM_LEASE, expires_at),
+        );
         let Some(claim) = adapter
             .claim(
                 &claimable,
@@ -722,6 +729,13 @@ async fn inspect_binding(
                 })
                 .await;
             classify_tmux(binding, identity, inspection, now)
+        }
+        WakeResourceIdentity::Subagent(_) => {
+            if deadline_reached {
+                expired(binding, now)
+            } else {
+                retry(binding, now)
+            }
         }
     }
 }
@@ -1323,7 +1337,9 @@ mod tests {
         let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
             identity: match binding.resource.clone() {
                 WakeResourceIdentity::Bash(identity) => identity,
-                WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+                WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                    unreachable!()
+                }
             },
             status: BashTerminalStatus::Exited,
             occurred_at: Timestamp(100),

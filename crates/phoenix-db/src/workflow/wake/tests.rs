@@ -125,7 +125,9 @@ async fn terminalize_bash(
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match bash() {
             WakeResourceIdentity::Bash(identity) => identity,
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(1_020),
@@ -177,7 +179,9 @@ async fn terminal_evidence_rejects_a_fired_receipt_with_different_evidence_atomi
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match bash() {
             WakeResourceIdentity::Bash(identity) => identity,
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(1_020),
@@ -243,7 +247,9 @@ async fn terminal_evidence_requires_a_fired_receipt() {
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match bash() {
             WakeResourceIdentity::Bash(identity) => identity,
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(1_020),
@@ -292,7 +298,9 @@ async fn fired_evidence_after_expiry_is_rejected_in_atomic_and_direct_receipt_pa
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match bash() {
             WakeResourceIdentity::Bash(identity) => identity,
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(1_101),
@@ -680,7 +688,9 @@ async fn bash_observation_and_terminal_receipt_require_same_exact_authority() {
     let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: match bash() {
             WakeResourceIdentity::Bash(identity) => identity,
-            WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_) => {
+                unreachable!()
+            }
         },
         status: BashTerminalStatus::Exited,
         occurred_at: Timestamp(1_020),
@@ -839,7 +849,7 @@ async fn tmux_typed_observation_rejects_mismatched_resource() {
     let claim = claimed(&repo).await;
     let tmux_identity = match tmux() {
         WakeResourceIdentity::TmuxWindow(identity) => identity,
-        WakeResourceIdentity::Bash(_) => unreachable!(),
+        WakeResourceIdentity::Bash(_) | WakeResourceIdentity::Subagent(_) => unreachable!(),
     };
     let adapter = WakeWorkflowAdapter::new(&repo);
     let wrong = WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {

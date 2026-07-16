@@ -1784,7 +1784,7 @@ CREATE TABLE IF NOT EXISTS wake_workflow_bindings (
     FOREIGN KEY (observe_effect_id, workflow_id)
         REFERENCES workflow_effects(id, workflow_id)
         ON DELETE RESTRICT,
-    CHECK (resource_kind IN ('bash', 'tmux_window')),
+    CHECK (resource_kind IN ('bash', 'tmux_window', 'subagent')),
     CHECK (lifecycle_fence_status IN ('open', 'closed')),
     CHECK (registering_tool_use_id <> ''),
     CHECK (
@@ -1890,7 +1890,7 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
     FOREIGN KEY (receipt_id, observe_effect_id, workflow_id)
         REFERENCES workflow_receipts(id, effect_id, workflow_id)
         ON DELETE CASCADE,
-    CHECK (resource_kind IN ('bash', 'tmux_window')),
+    CHECK (resource_kind IN ('bash', 'tmux_window', 'subagent')),
     CHECK (status IN ('fired', 'expired', 'cancelled', 'forgotten')),
     CHECK (bash_status IS NULL OR bash_status IN ('exited', 'killed', 'kill_pending_kernel')),
     CHECK (tmux_status IS NULL OR tmux_status IN ('exit_marker_observed', 'window_killed')),
@@ -1899,7 +1899,7 @@ CREATE TABLE IF NOT EXISTS wake_terminal_receipts (
     CHECK (bash_tail_end_offset IS NULL OR bash_tail_end_offset >= bash_tail_start_offset),
     CHECK (bash_tail_truncated_before IS NULL OR bash_tail_truncated_before IN (0, 1)),
     CHECK ((resource_kind = 'bash' AND status = 'fired') = (bash_tail_start_offset IS NOT NULL AND bash_tail_end_offset IS NOT NULL AND bash_tail_truncated_before IS NOT NULL)),
-    CHECK (forgotten_reason IS NULL OR forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart')),
+    CHECK (forgotten_reason IS NULL OR forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart', 'phoenix_restart', 'cascade_destroyed_handle', 'tmux_handle_missing')),
     CHECK (cancellation_reason IS NULL OR cancellation_reason IN ('explicit_cancel')),
     CHECK (
         (status = 'fired'

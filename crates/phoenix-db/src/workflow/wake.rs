@@ -376,6 +376,19 @@ impl<'a> WakeWorkflowAdapter<'a> {
             };
             cancelled += u64::from(self.cancel(&request).await?);
         }
+        let owed_inbox_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT oi.inbox_item_id FROM wake_runtime_obligations o \
+             JOIN wake_runtime_obligation_items oi ON oi.obligation_id = o.id \
+             WHERE o.conversation_id = ?1 AND o.status = 'owed'",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.repository.pool())
+        .await?;
+        if !owed_inbox_ids.is_empty() {
+            self.accept_owed_items(conversation_id, &owed_inbox_ids, now)
+                .await?;
+            cancelled += 1;
+        }
         Ok(cancelled)
     }
 
@@ -1139,7 +1152,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(&request.workflow_id)
         .bind(&request.contract_id)
         .bind(&request.observe_effect_id)
-        .bind(match request.resource { WakeResourceIdentity::Bash(_) => "bash", WakeResourceIdentity::TmuxWindow(_) => "tmux_window" })
+        .bind(match request.resource { WakeResourceIdentity::Bash(_) => "bash", WakeResourceIdentity::TmuxWindow(_) => "tmux_window", WakeResourceIdentity::Subagent(_) => "subagent" })
         .bind(terminal_resolved_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
@@ -1695,6 +1708,9 @@ fn evidence_json(evidence: &WakeTerminalEvidence) -> Value {
         WakeTerminalEvidence::TmuxWindow(value) => {
             json!({"type":"tmux_window","identity":resource_json(&WakeResourceIdentity::TmuxWindow(value.identity.clone())),"status":tmux_status(value.status),"occurred_at":value.occurred_at.0,"exit_code":value.exit_code,"duration_ms":value.duration_ms,"final_tail":value.final_tail})
         }
+        WakeTerminalEvidence::Subagent(value) => {
+            json!({"type":"subagent","identity":resource_json(&WakeResourceIdentity::Subagent(value.identity.clone())),"status":format!("{:?}", value.status),"occurred_at":value.occurred_at.0,"result":value.result})
+        }
     }
 }
 
@@ -1712,6 +1728,7 @@ fn terminal_projection(
         resource_kind: match terminal.resource() {
             WakeResourceIdentity::Bash(_) => "bash".to_owned(),
             WakeResourceIdentity::TmuxWindow(_) => "tmux_window".to_owned(),
+            WakeResourceIdentity::Subagent(_) => "subagent".to_owned(),
         },
         status: match terminal {
             WakeTerminalPayload::Fired { .. } => "fired",
@@ -1775,6 +1792,7 @@ fn terminal_projection(
                 projection.tmux_duration_ms = value.duration_ms;
                 projection.tmux_tail.clone_from(&value.final_tail);
             }
+            WakeTerminalEvidence::Subagent(_) => {}
         },
         WakeTerminalPayload::Cancelled { .. } => {
             projection.cancellation_reason = Some("explicit_cancel".to_owned());
@@ -1839,6 +1857,9 @@ fn resource_json(resource: &WakeResourceIdentity) -> Value {
         }
         WakeResourceIdentity::TmuxWindow(value) => {
             json!({"type":"tmux_window","work_scope":scope_json(value.work_scope.kind, &value.work_scope.stable_key),"server_generation":value.server_generation,"window_id":value.window_id})
+        }
+        WakeResourceIdentity::Subagent(value) => {
+            json!({"type":"subagent","child_conversation_id":value.child_conversation_id})
         }
     }
 }
@@ -1926,6 +1947,16 @@ fn resource_columns(
             Some(value.work_scope.stable_key.as_str()),
             Some(value.server_generation.as_str()),
             Some(value.window_id.as_str()),
+        ),
+        WakeResourceIdentity::Subagent(value) => (
+            "subagent",
+            None,
+            None,
+            Some(value.child_conversation_id.as_str()),
+            None,
+            None,
+            None,
+            None,
         ),
     }
 }

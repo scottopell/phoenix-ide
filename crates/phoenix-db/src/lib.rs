@@ -5810,6 +5810,12 @@ impl Database {
         // prune would leave orphaned index rows and hard-deleted content could
         // resurface in recall until the next reconcile (REQ-RET-003).
         let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM workflows WHERE id IN (SELECT workflow_id FROM wake_workflow_bindings WHERE conversation_id = ?1)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(id)
             .execute(&mut *tx)

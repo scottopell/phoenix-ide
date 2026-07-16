@@ -3481,7 +3481,10 @@ async fn send_chat(
     };
     if matches!(
         effective_state,
-        ConvState::Idle | ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+        ConvState::Idle
+            | ConvState::Error { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::AwaitingSubAgents { .. }
     ) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
@@ -3658,6 +3661,7 @@ async fn send_chat(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3717,7 +3721,10 @@ async fn cancel_conversation(
 
     if matches!(
         effective_state,
-        ConvState::Idle | ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+        ConvState::Idle
+            | ConvState::Error { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::AwaitingSubAgents { .. }
     ) {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
