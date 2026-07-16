@@ -1659,12 +1659,6 @@ export function BrowserConsoleLogsView({ rawText }: { rawText: string }) {
   );
 }
 
-// Search tool output is plain text shaped as `relative/path:NN: content` lines,
-// optionally followed by bracketed notes like `[Results limited to 50 ...]` or
-// `[Walk truncated ...]`. Group hits by file so a multi-hit file shows once with
-// its line numbers underneath.
-type SearchHit = { path: string; lineNumber: number; content: string };
-
 type ReadFileRequest = {
   path: string;
   offset: number | null;
@@ -1790,33 +1784,61 @@ function formatReadFileRange(request: ReadFileRequest, parsed: ReadFileParseResu
   return 'from start of file';
 }
 
-function ReadFileResultView({
+export function ReadFileResultView({
   input,
   rawText,
   metadata,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
+  showPath = true,
 }: {
   input: Record<string, unknown>;
   rawText: string;
-  metadata: ReadFileDisplayData;
+  metadata?: ReadFileDisplayData | null;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
+  showPath?: boolean;
 }) {
   const request = useMemo(() => parseReadFileRequest(input), [input]);
   const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
+  const projection = useMemo(
+    () => buildReadFileOutputProjection(rawText, input, toolUseId ? { toolUseId } : {}),
+    [rawText, input, toolUseId],
+  );
   const preview = useMemo(() => boundedReadFileLines(parsed.lines), [parsed.lines]);
   const [showAllReturnedLines, setShowAllReturnedLines] = useState(false);
+  if (!metadata) {
+    return (
+      <ReadFileProjectionView
+        projection={projection}
+        onOpenFile={onOpenFile}
+        activeHighlight={activeHighlight}
+        showPath={showPath}
+      />
+    );
+  }
   const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
   const hasMore = preview.truncated;
   const canExpandReturnedOutput = hasMore;
-  const visibleLines = showAllReturnedLines ? parsed.lines : preview.lines;
+  const visibleLines = showAllReturnedLines || activeHighlight ? parsed.lines : preview.lines;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
+  const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
+  const lineFragments = projection.fragments.filter((fragment) => fragment.kind === 'line');
+  const noteFragments = projection.fragments.filter((fragment) => fragment.kind === 'note');
 
   if (metadata.total_line_count === 0) {
     return (
       <div className="read-file-result read-file-result-fallback" data-read-file-state="empty">
         <div className="read-file-result-meta">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">No file content returned</span>
         </div>
         <div className="read-file-result-empty">(empty file)</div>
@@ -1828,7 +1850,11 @@ function ReadFileResultView({
     return (
       <div className="read-file-result read-file-result-fallback" data-read-file-state="empty-range">
         <div className="read-file-result-meta">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">No lines returned for the requested range</span>
         </div>
         <div className="read-file-result-empty">The file contains {metadata.total_line_count} lines.</div>
@@ -1842,7 +1868,11 @@ function ReadFileResultView({
     <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
       <div className="read-file-result-meta">
         <div className="read-file-result-meta-main">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">
             {metadata.returned_line_count} line{metadata.returned_line_count === 1 ? '' : 's'} • {rangeLabel}
           </span>
@@ -1874,13 +1904,32 @@ function ReadFileResultView({
         </div>
       </div>
       <div className="read-file-result-preview" role="table" aria-label="read_file preview">
-        {visibleLines.map((line) => (
-          <div key={line.lineNumber} className="read-file-result-line" role="row">
-            <span className="read-file-result-lineno" role="cell">{line.lineNumber}</span>
-            <span className="read-file-result-content" role="cell">{line.content || ' '}</span>
-          </div>
-        ))}
+        {visibleLines.map((line) => {
+          const fragment = lineFragments.find((candidate) => candidate.display.lineNumber === line.lineNumber);
+          const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
+          const lineNumberText = String(line.lineNumber);
+          return (
+            <div key={line.lineNumber} className="read-file-result-line" role="row" data-fragment-id={fragment?.fragmentId}>
+              <span className="read-file-result-lineno" role="cell">
+                {keywordFieldHighlight(highlight, 0, lineNumberText)}
+              </span>
+              <span className="read-file-result-content" role="cell">
+                {keywordFieldHighlight(highlight, lineNumberText.length + 1, line.content || ' ')}
+              </span>
+            </div>
+          );
+        })}
       </div>
+      {noteFragments.map((fragment) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="read-file-result-note" data-fragment-id={fragment.fragmentId}>
+            {highlight
+              ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
+              : fragment.display.note}
+          </div>
+        );
+      })}
       {(hasMore || metadata.remaining_line_count > 0) && (
         <div className="read-file-result-more">
           {hasMore && !showAllReturnedLines && (parsed.lines.length > visibleLines.length
@@ -1900,28 +1949,21 @@ export function parseSearchOutput(text: string) {
   return buildSearchOutputProjection(text);
 }
 
-export function ReadFileResultView({
-  rawText,
-  input,
+function ReadFileProjectionView({
+  projection,
   onOpenFile,
-  toolUseId,
-  activeHighlight = null,
-  showPath = true,
+  activeHighlight,
+  showPath,
 }: {
-  rawText: string;
-  input: Record<string, unknown>;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  toolUseId?: string | undefined;
-  activeHighlight?: AgentTextHighlight | null;
-  showPath?: boolean;
+  projection: ReturnType<typeof buildReadFileOutputProjection>;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  activeHighlight: AgentTextHighlight | null;
+  showPath: boolean;
 }) {
-  const parsed = useMemo(
-    () => buildReadFileOutputProjection(rawText, input, toolUseId ? { toolUseId } : {}),
-    [rawText, input, toolUseId],
-  );
-  const pathFragment = parsed.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path') ?? null;
   const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
-  const lineFragments = parsed.fragments.filter((fragment) => fragment.kind === 'line');
+  const lineFragments = projection.fragments.filter((fragment) => fragment.kind === 'line');
+  const noteFragments = projection.fragments.filter((fragment) => fragment.kind === 'note');
 
   return (
     <div className="read-file-results">
@@ -1983,6 +2025,16 @@ export function ReadFileResultView({
           );
         })}
       </div>
+      {noteFragments.map((fragment) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="read-file-result-note" data-fragment-id={fragment.fragmentId}>
+            {highlight
+              ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
+              : fragment.display.note}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -2160,7 +2212,8 @@ export function SearchResultsView({
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function parseKeywordSearchOutput(text: string) {
-  return buildKeywordSearchOutputProjection(text);
+  const projection = buildKeywordSearchOutputProjection(text);
+  return { ...projection, notes: projection.notes.map((note) => note.text) };
 }
 
 function keywordFieldHighlight(
@@ -2190,19 +2243,18 @@ export function KeywordSearchView({
     [rawText, toolUseId],
   );
 
-  // Coverage/incompleteness notes (terms dropped, results truncated, broad
-  // terms skipped). Surfaced in every branch so the signal is never silently
-  // dropped by the renderer.
-  const notesEl =
-    parsed.notes.length > 0 ? (
-      <div className="search-results-notes">
-        {parsed.notes.map((n, i) => (
-          <div key={i} className="search-results-note">
-            {n}
+  const notesEl = parsed.notes.length > 0 ? (
+    <div className="search-results-notes">
+      {parsed.notes.map(({ text, fragment }) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="search-results-note" data-fragment-id={fragment.fragmentId}>
+            {highlight ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : text}
           </div>
-        ))}
-      </div>
-    ) : null;
+        );
+      })}
+    </div>
+  ) : null;
 
   if (parsed.empty) {
     return (
@@ -2212,6 +2264,7 @@ export function KeywordSearchView({
             ? renderHighlightedText(parsed.fragments[0].semanticText, activeHighlight!.start, activeHighlight!.end)
             : 'No relevant files found.'}
         </div>
+        {notesEl}
       </div>
     );
   }
@@ -2231,8 +2284,9 @@ export function KeywordSearchView({
         <pre className="keyword-search-raw-text" data-fragment-id={bodyFragment?.fragmentId}>
           {bodyHighlight && bodyFragment
             ? renderHighlightedText(bodyFragment.semanticText, bodyHighlight.start, bodyHighlight.end)
-            : rawText}
+            : parsed.fallbackText}
         </pre>
+        {notesEl}
       </div>
     );
   }
@@ -2600,14 +2654,17 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
           ) : name === 'read_file' && !isError ? (
             <>
               <ReadFileResultView
-                rawText={toolActiveHighlight && toolActiveHighlight.fragmentId !== 'read-file-path' ? resultText : cappedResultText}
+                rawText={readFileMetadata || (toolActiveHighlight && toolActiveHighlight.fragmentId !== 'read-file-path')
+                  ? resultText
+                  : cappedResultText}
                 input={input as Record<string, unknown>}
                 onOpenFile={onOpenFile}
                 toolUseId={toolId}
+                metadata={readFileMetadata}
                 activeHighlight={toolActiveHighlight}
                 showPath={toolActiveHighlight?.fragmentId === 'read-file-path'}
               />
-              {!toolActiveHighlight && resultText.length > 5000 && (
+              {!readFileMetadata && !toolActiveHighlight && resultText.length > 5000 && (
                 <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>
               )}
             </>

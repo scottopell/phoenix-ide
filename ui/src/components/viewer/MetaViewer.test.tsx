@@ -554,7 +554,9 @@ describe('MetaViewer payload routing', () => {
     await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
       type: 'line', id: 'file:/tmp/project/thing', lineNumber: 2, align: 'center', behavior: 'smooth',
     }));
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'position', position: 0,
+    }));
     codeViewMockState.scrollToCalls.length = 0;
 
     rerender(
@@ -564,7 +566,6 @@ describe('MetaViewer payload routing', () => {
     );
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(codeViewMockState.scrollToCalls).toHaveLength(0);
   });
 

@@ -173,6 +173,25 @@ describe('parseKeywordSearchOutput', () => {
     expect(parsed.notes[1]).toMatch(/results truncated/);
   });
 
+  it('builds stable searchable fragments for coverage notes', () => {
+    const text = [
+      '/abs/path/to/foo.rs: primary hit',
+      '[results truncated: use more specific terms]',
+    ].join('\n');
+    const projection = buildKeywordSearchOutputProjection(text, { toolUseId: 'keyword-notes' });
+    expect(projection.notes).toHaveLength(1);
+    expect(projection.notes[0]?.fragment).toMatchObject({
+      semanticText: 'results truncated: use more specific terms',
+      kind: 'note',
+      revealTarget: {
+        kind: 'tool-result-keyword-search',
+        key: 'keyword-search:keyword-notes',
+        toolUseId: 'keyword-notes',
+      },
+    });
+    expect(projection.fragments).toContain(projection.notes[0]?.fragment);
+  });
+
   it('treats the skipped-broad no-match variant as empty and keeps the note', () => {
     const text = [
       'No matches found for the given search terms.',
@@ -506,6 +525,26 @@ describe('KeywordSearchView', () => {
     );
     expect(container.querySelector('.keyword-search-fallback-note .viewer-find-inline-match--active')?.textContent).toBe('ripgrep');
     expect(container.querySelector('.keyword-search-raw-text .viewer-find-inline-match--active')).toBeNull();
+  });
+
+  it('marks an active coverage note without changing its visible text', () => {
+    const rawText = [
+      '/abs/path/to/foo.rs: primary hit',
+      '[results truncated: use more specific terms]',
+    ].join('\n');
+    const projection = buildKeywordSearchOutputProjection(rawText, { toolUseId: 'keyword-1' });
+    const note = projection.notes[0]!.fragment;
+    const start = note.semanticText.indexOf('truncated');
+    const { container } = render(
+      <KeywordSearchView
+        rawText={rawText}
+        onOpenFile={undefined}
+        toolUseId="keyword-1"
+        activeHighlight={{ fragmentId: note.fragmentId, start, end: start + 'truncated'.length }}
+      />,
+    );
+    expect(container.querySelector('.search-results-note .viewer-find-inline-match--active')?.textContent).toBe('truncated');
+    expect(container.querySelector('.search-results-note')?.textContent).toBe(note.semanticText);
   });
 
   it('renders the empty/none-found state', () => {

@@ -102,6 +102,10 @@ export interface ReadFilePathFragmentDisplay {
   windowLabel?: string;
 }
 
+export interface ReadFileNoteFragmentDisplay {
+  note: string;
+}
+
 export interface ReadFileRevealTarget {
   kind: 'tool-result-read-file';
   toolUseId: string;
@@ -125,6 +129,13 @@ export type ReadFileFragment =
       display: ReadFileLineFragmentDisplay;
       revealTarget: ReadFileRevealTarget;
       kind: 'line';
+    }
+  | {
+      fragmentId: string;
+      semanticText: string;
+      display: ReadFileNoteFragmentDisplay;
+      revealTarget: ReadFileRevealTarget;
+      kind: 'note';
     };
 
 export interface ReadFileOutputProjection {
@@ -220,13 +231,14 @@ export interface KeywordSearchFragment {
   semanticText: string;
   display: KeywordSearchFragmentDisplay;
   revealTarget: ConversationFragmentRevealTarget;
-  kind: 'hit' | 'fallback' | 'empty';
+  kind: 'hit' | 'fallback' | 'empty' | 'note';
   path?: string;
   explanation?: string;
 }
 
 export interface KeywordSearchOutputProjection {
   hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }>;
+  notes: Array<{ text: string; fragment: KeywordSearchFragment }>;
   rawFallback: boolean;
   empty: boolean;
   fallbackText: string | null;
@@ -887,12 +899,27 @@ function buildReadFileProjectionFragments(
   }
 
   const duplicateLineCounts = new Map<string, number>();
+  const duplicateNoteCounts = new Map<string, number>();
   const startLine = typeof input['offset'] === 'number' ? input['offset'] : 1;
   const rawLines = text.split('\n');
   const hasNumberedLines = rawLines.some((line) => parseReadFileRenderedLine(line) !== null);
   for (const [lineIndex, rawLine] of rawLines.entries()) {
     const parsedLine = parseReadFileRenderedLine(rawLine);
-    if (hasNumberedLines && !parsedLine) continue;
+    if (hasNumberedLines && !parsedLine) {
+      const note = rawLine.trim();
+      if (!note || (note.startsWith('[') && note.endsWith(']'))) continue;
+      const duplicateIndex = duplicateNoteCounts.get(note) ?? 0;
+      duplicateNoteCounts.set(note, duplicateIndex + 1);
+      const fragmentId = `read-file-note:${encodeURIComponent(note)}:${duplicateIndex}`;
+      fragments.push({
+        fragmentId,
+        semanticText: note,
+        display: { note },
+        revealTarget: { ...revealBase, fragmentId },
+        kind: 'note',
+      });
+      continue;
+    }
     if (!hasNumberedLines && rawLine === '' && lineIndex === rawLines.length - 1) continue;
     const renderedLine = parsedLine ?? {
       lineNumber: startLine + lineIndex,
@@ -1215,12 +1242,37 @@ export function buildKeywordSearchOutputProjection(
   text: string,
   options: { toolUseId?: string | null } = {},
 ): KeywordSearchOutputProjection {
-  const trimmed = text.trim();
   const revealTarget = {
     kind: 'tool-result-keyword-search' as const,
     key: keywordSearchToolResultKey(options.toolUseId ?? ''),
     toolUseId: options.toolUseId ?? '',
   };
+  const noteCounts = new Map<string, number>();
+  const notes: Array<{ text: string; fragment: KeywordSearchFragment }> = [];
+  const lines: string[] = [];
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('[') && line.endsWith(']')) {
+      const noteText = line.slice(1, -1).trim();
+      const duplicateIndex = noteCounts.get(noteText) ?? 0;
+      noteCounts.set(noteText, duplicateIndex + 1);
+      const fragment: KeywordSearchFragment = {
+        fragmentId: `keyword-search-note:${encodeURIComponent(noteText)}:${duplicateIndex}`,
+        semanticText: noteText,
+        display: { title: noteText },
+        revealTarget,
+        kind: 'note',
+      };
+      notes.push({ text: noteText, fragment });
+    } else {
+      lines.push(rawLine);
+    }
+  }
+
+  const contentText = lines.join('\n');
+  const trimmed = contentText.trim();
+  const noteFragments = notes.map((note) => note.fragment);
   if (
     trimmed === '' ||
     trimmed === 'No matches found for the given search terms.' ||
@@ -1233,12 +1285,12 @@ export function buildKeywordSearchOutputProjection(
       revealTarget,
       kind: 'empty',
     };
-    return { hits: [], rawFallback: false, empty: true, fallbackText: null, fragments: [fragment] };
+    return { hits: [], notes, rawFallback: false, empty: true, fallbackText: null, fragments: [fragment, ...noteFragments] };
   }
 
-  const lines = text.split('\n').filter((l) => l.trim());
-  const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
-  if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
+  const nonEmptyLines = lines.filter((line) => line.trim());
+  const ripgrepShaped = nonEmptyLines.filter((line) => /^[^\s].*?[-:]\d+[-:]/.test(line) || line === '--').length;
+  const fallback = (): KeywordSearchOutputProjection => {
     const title = 'Raw ripgrep results — LLM filter unavailable';
     const titleFragment: KeywordSearchFragment = {
       fragmentId: 'keyword-search-fallback-title',
@@ -1249,59 +1301,56 @@ export function buildKeywordSearchOutputProjection(
     };
     const bodyFragment: KeywordSearchFragment = {
       fragmentId: 'keyword-search-fallback-body',
-      semanticText: text,
-      display: { title, body: text },
+      semanticText: contentText,
+      display: { title, body: contentText },
       revealTarget,
       kind: 'fallback',
     };
-    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [titleFragment, bodyFragment] };
-  }
+    return {
+      hits: [],
+      notes,
+      rawFallback: true,
+      empty: false,
+      fallbackText: contentText,
+      fragments: [titleFragment, bodyFragment, ...noteFragments],
+    };
+  };
+  if (nonEmptyLines.length >= 4 && ripgrepShaped / nonEmptyLines.length > 0.25) return fallback();
 
   const hits: Array<{ path: string; explanation: string; fragment: KeywordSearchFragment }> = [];
   const duplicateCounts = new Map<string, number>();
-  for (const line of lines) {
-    const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
-    if (m && m[1] !== undefined && m[2] !== undefined) {
-      const path = m[1].trim();
-      const explanation = m[2].trim();
-      const semanticText = `${path}: ${explanation}`;
-      const duplicateIndex = duplicateCounts.get(semanticText) ?? 0;
-      duplicateCounts.set(semanticText, duplicateIndex + 1);
-      hits.push({
+  for (const line of nonEmptyLines) {
+    const match = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
+    if (!match?.[1] || match[2] === undefined) continue;
+    const path = match[1].trim();
+    const explanation = match[2].trim();
+    const semanticText = `${path}: ${explanation}`;
+    const duplicateIndex = duplicateCounts.get(semanticText) ?? 0;
+    duplicateCounts.set(semanticText, duplicateIndex + 1);
+    hits.push({
+      path,
+      explanation,
+      fragment: {
+        fragmentId: `keyword-search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
+        semanticText,
+        display: { title: path, body: explanation },
+        revealTarget,
+        kind: 'hit',
         path,
         explanation,
-        fragment: {
-          fragmentId: `keyword-search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
-          semanticText,
-          display: { title: path, body: explanation },
-          revealTarget,
-          kind: 'hit',
-          path,
-          explanation,
-        },
-      });
-    }
+      },
+    });
   }
 
-  if (hits.length === 0 || hits.length * 3 < lines.length) {
-    const title = 'Raw ripgrep results — LLM filter unavailable';
-    const titleFragment: KeywordSearchFragment = {
-      fragmentId: 'keyword-search-fallback-title',
-      semanticText: title,
-      display: { title },
-      revealTarget,
-      kind: 'fallback',
-    };
-    const bodyFragment: KeywordSearchFragment = {
-      fragmentId: 'keyword-search-fallback-body',
-      semanticText: text,
-      display: { title, body: text },
-      revealTarget,
-      kind: 'fallback',
-    };
-    return { hits: [], rawFallback: true, empty: false, fallbackText: text, fragments: [titleFragment, bodyFragment] };
-  }
-  return { hits, rawFallback: false, empty: false, fallbackText: null, fragments: hits.map((hit) => hit.fragment) };
+  if (hits.length === 0 || hits.length * 3 < nonEmptyLines.length) return fallback();
+  return {
+    hits,
+    notes,
+    rawFallback: false,
+    empty: false,
+    fallbackText: null,
+    fragments: [...hits.map((hit) => hit.fragment), ...noteFragments],
+  };
 }
 
 export function buildAgentTextFragments(
