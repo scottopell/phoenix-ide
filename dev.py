@@ -189,6 +189,19 @@ PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
 PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
 PROD_ENV_FILE = Path("/etc/phoenix-ide/phoenix.env")
 PROD_PORT = 8031
+SYSTEMD_DATA_DIR = Path("/var/lib/phoenix-ide")
+SYSTEMD_DB_PATH = SYSTEMD_DATA_DIR / "prod.db"
+SYSTEMD_DEPLOY_DIR = Path("/var/lib/phoenix-ide-deploy")
+SYSTEMD_TRANSACTION_ROOT = SYSTEMD_DEPLOY_DIR / "transactions"
+SYSTEMD_STATUS_PATH = SYSTEMD_DEPLOY_DIR / "status.json"
+SYSTEMD_ACTIVE_PATH = SYSTEMD_DEPLOY_DIR / "active"
+SYSTEMD_ACTIVATION_LOCK_PATH = SYSTEMD_DEPLOY_DIR / "activation.lock"
+SYSTEMD_CLAIM_LOCK_PATH = SYSTEMD_DEPLOY_DIR / "claim.lock"
+SYSTEMD_DEPLOYED_SHA_PATH = SYSTEMD_DATA_DIR / "deployed.sha"
+SYSTEMD_SERVICE_PATH = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
+SYSTEMD_SOCKET_PATH = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket")
+SYSTEMD_HELPER_SOURCE = ROOT / "scripts/systemd_deploy_helper.py"
+SYSTEMD_HANDOFF_PROTOCOL_VERSION = 1
 
 # launchd (native macOS) configuration
 LAUNCHD_LABEL = "com.phoenix-ide.server"
@@ -6186,218 +6199,195 @@ WantedBy=multi-user.target
 """
 
 
-def native_prod_deploy(version: str | None = None):
-    """Build and deploy to production (native Linux)."""
-    # Check if systemd is available
+def _serialize_env_snapshot(env: dict[str, str]) -> str:
+    escaped_newline = "\\n"
+    return "".join(f"{key}={value.replace(chr(10), escaped_newline)}\n" for key, value in env.items())
+
+
+def _systemd_artifact(target: Path | None, source: Path | None = None) -> dict[str, str | None]:
+    if target is None:
+        return {"path": None, "sha256": None}
+    return {"path": str(target), "sha256": _file_sha256(source or target)}
+
+
+def _systemd_current_identity(env: dict[str, str]) -> "RuntimeIdentity | None":
+    identity = _current_prod_identity(env)
+    return RuntimeIdentity.from_value(identity) if identity is not None else None
+
+
+def _systemd_copy_rollback(source: Path, destination: Path) -> Path | None:
+    if not source.exists():
+        return None
+    shutil.copy2(source, destination)
+    destination.chmod(0o600)
+    return destination
+
+
+def _stage_systemd_root_handoff(
+    staging: Path,
+    transaction_id: str,
+    helper: Path,
+    files: list[tuple[str, Path]],
+) -> Path:
+    bundle = staging / "bundle.json"
+    _write_json_atomic(bundle, {
+        "transaction_id": transaction_id,
+        "files": [
+            {"name": name, "source": str(path), "sha256": _file_sha256(path)}
+            for name, path in files
+        ],
+    })
+    bootstrap = SYSTEMD_DEPLOY_DIR / f"bootstrap-{transaction_id}"
+    root_helper = bootstrap / "helper.py"
+    subprocess.run(["sudo", "install", "-d", "-m", "0700", str(bootstrap)], check=True)
+    subprocess.run([
+        "sudo", "install", "-o", "root", "-g", "root", "-m", "0700",
+        str(helper), str(root_helper),
+    ], check=True)
+    result = subprocess.run(
+        [
+            "sudo", "python3", str(root_helper), "stage",
+            "--bundle", str(bundle), "--source-uid", str(os.getuid()),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["sudo", "rm", "-rf", str(bootstrap)], check=False)
+    if result.returncode != 0:
+        raise SystemExit(f"systemd handoff staging failed: {(result.stderr or result.stdout).strip()}")
+    manifest_path = Path(result.stdout.strip())
+    expected = SYSTEMD_TRANSACTION_ROOT / transaction_id / "manifest.json"
+    if manifest_path != expected:
+        raise SystemExit(f"systemd handoff returned unexpected manifest path {manifest_path}")
+    return manifest_path
+
+
+def native_prod_deploy(release: str | None = None):
+    """Prepare and hand systemd activation to an independent root transient unit."""
+    import tempfile
+    import uuid
+
     if not check_systemd_available():
-        print("ERROR: systemd is not available on this system.", file=sys.stderr)
-        print("Production deployment requires systemd for service management.", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("This system is running in a container or non-systemd environment.", file=sys.stderr)
-        print("Options:", file=sys.stderr)
-        print("  - Use './dev.py up' for development mode instead", file=sys.stderr)
-        print("  - This system does not have systemd available", file=sys.stderr)
-        sys.exit(1)
+        raise SystemExit("systemd is not available on this Linux host")
 
-    # Refuse before building if the deploy would expose an unauthenticated server.
-    # The effective service env is .phoenix-ide.env (EnvironmentFile=) PLUS any
-    # systemd drop-in overrides written by `./dev.py prod set` — both reach the
-    # running service, so the preflight must consider both.
-    systemd_env: dict[str, str] = {}
-    _load_env_file(systemd_env)
-    systemd_env.update(_systemd_override_env())
-    _preflight_prod_bind_auth(systemd_env, socket_activated=True)
-
-    # Build
-    binary = prod_build()
-    
-    # Determine version string for display
-    if version is None:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=ROOT, capture_output=True, text=True
-        )
-        version = f"dev-{result.stdout.strip()}"
-    
-    # Create install directory (service keeps running - we'll reload after copy)
-    print(f"Installing to {PROD_INSTALL_DIR}...")
-    subprocess.run(["sudo", "mkdir", "-p", str(PROD_INSTALL_DIR)], check=True)
-    
-    # Copy binary (remove first to handle "text file busy" when process is running)
-    dest = PROD_INSTALL_DIR / "phoenix-ide"
-    subprocess.run(["sudo", "rm", "-f", str(dest)], check=True)
-    subprocess.run(["sudo", "cp", str(binary), str(dest)], check=True)
-    subprocess.run(["sudo", "chmod", "+x", str(dest)], check=True)
-    
-    # Detect service user first so we can set up the DB directory correctly
+    env_snapshot: dict[str, str] = {}
+    env_file_loaded = _load_env_file(env_snapshot)
+    _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
     service_user = detect_service_user()
+    transaction_id = uuid.uuid4().hex
 
-    # For native systemd deployments the service runs as a dedicated system user,
-    # so the DB must live somewhere that user owns — /var/lib/phoenix-ide/ is the
-    # standard Linux convention.  (~/.phoenix-ide is only used for dev/daemon mode.)
-    native_db_dir = Path("/var/lib/phoenix-ide")
-    native_db_path = native_db_dir / "prod.db"
-    subprocess.run(["sudo", "mkdir", "-p", str(native_db_dir)], check=True)
-    # `-R` so an existing prod.db (and its sqlite -shm/-wal sidecars) created
-    # under a previous service_user are migrated to the current one.
-    subprocess.run(["sudo", "chown", "-R", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
-
-    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, OPENAI_USE_CODEX_AUTH, etc.)
-    env_overrides: dict[str, str] = {}
-    env_file_loaded = _load_env_file(env_overrides)
-    if env_file_loaded:
-        print(f"  Loaded env from {env_file_loaded}")
-
-    env_file_path = _install_prod_env_file(env_overrides, service_user)
-    if env_file_path:
-        print(f"  Installed prod env file: {env_file_path} (0640 root:{service_user})")
-
-    # Configure for native deployment.
-    # OAuth token auth: the binary reads ~/.claude/.credentials.json per request.
-    # Requires: chmod g+r ~/.claude/.credentials.json + service user in owner's group.
-    # See skills/phoenix-deployment/SYSTEMD.md for setup instructions.
-    config = dataclasses.replace(
-        NATIVE_SYSTEMD_CONFIG,
-        user=service_user,
-        db_path=str(native_db_path),
-        home_dir=str(Path.home()),
-        env_file_path=env_file_path,
-    )
-
-    # Install systemd socket unit (for socket activation)
-    print("Installing systemd socket unit...")
-    socket_content = generate_systemd_socket(config)
-    socket_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.socket")
-    
-    proc = subprocess.run(
-        ["sudo", "tee", str(socket_file)],
-        input=socket_content.encode(),
-        capture_output=True
-    )
-    if proc.returncode != 0:
-        print(f"Failed to write socket unit: {proc.stderr.decode()}", file=sys.stderr)
-        sys.exit(1)
-
-    # Install systemd service unit
-    print("Installing systemd service unit...")
-    unit_content = generate_systemd_service(config, version)
-    unit_file = Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service")
-
-    proc = subprocess.run(
-        ["sudo", "tee", str(unit_file)],
-        input=unit_content.encode(),
-        capture_output=True
-    )
-    if proc.returncode != 0:
-        print(f"Failed to write service unit: {proc.stderr.decode()}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Reload systemd
-    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
-    
-    # Enable both socket and service
-    subprocess.run(["sudo", "systemctl", "enable", f"{PROD_SERVICE_NAME}.socket"], check=True)
-    subprocess.run(["sudo", "systemctl", "enable", PROD_SERVICE_NAME], check=True)
-    
-    # Check current state
-    socket_active = subprocess.run(
-        ["systemctl", "is-active", f"{PROD_SERVICE_NAME}.socket"],
-        capture_output=True, text=True
-    ).stdout.strip() == "active"
-    
-    service_active = subprocess.run(
-        ["systemctl", "is-active", PROD_SERVICE_NAME],
-        capture_output=True, text=True
-    ).stdout.strip() == "active"
-    
-    if service_active:
-        # Service running - send SIGHUP for hot reload
-        # With socket activation, this triggers graceful shutdown -> systemd restart
-        print("Sending reload signal (SIGHUP) for zero-downtime upgrade...")
-        # Capture MainPID before reload so we can verify the process actually
-        # restarted. is-active alone isn't enough -- if ExecReload fails
-        # (e.g. EPERM signaling across a User= change), the OLD process keeps
-        # serving and the unit still reports active. The /version endpoint
-        # returns the cargo package version, so it can't distinguish either.
-        old_pid = subprocess.run(
-            ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        t0 = time.monotonic()
-        subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
-
-        # Poll for new PID. SIGHUP graceful exit + Restart=always cycles the
-        # process; the new MainPID should appear within a few seconds.
-        new_pid = old_pid
-        for _ in range(15):
-            time.sleep(1)
-            new_pid = subprocess.run(
-                ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if new_pid not in ("0", "", old_pid):
-                break
-
-        if new_pid in ("0", "", old_pid):
-            print(
-                f"\n✗ Reload did not replace the running process "
-                f"(MainPID still {old_pid or '<none>'}).",
-                file=sys.stderr,
-            )
-            print(
-                f"  Inspect: sudo journalctl -u {PROD_SERVICE_NAME} -n 50 --no-pager",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        health_version, elapsed = _wait_for_health(t0, timeout_secs=20.0)
-        if health_version is None:
-            print("WARNING: Health check failed after 20s", file=sys.stderr)
-
-        write_deployed_sha()
-        print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
-        print(f"  Version: {health_version or 'unknown'}")
-        print(f"  Startup: {elapsed:.1f}s")
-        print(f"  Service: {PROD_SERVICE_NAME}")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
-        print(f"  Database: {config.db_path}")
-        print(f"  URL: {_prod_display_url()}")
-    else:
-        # Service not running - start socket first, then service
-        print("Starting socket and service...")
-
-        # Stop any existing (non-socket-activated) service first
-        subprocess.run(["sudo", "systemctl", "stop", PROD_SERVICE_NAME], capture_output=True)
-
-        # Start the socket (service will be started on first connection or explicitly)
-        subprocess.run(["sudo", "systemctl", "start", f"{PROD_SERVICE_NAME}.socket"], check=True)
-        t0 = time.monotonic()
-        subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
-
-        result = subprocess.run(
-            ["systemctl", "is-active", PROD_SERVICE_NAME],
-            capture_output=True, text=True
+    with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
+        staging = Path(temporary)
+        prepared = (
+            _prepare_release_candidate(release, staging)
+            if release
+            else _prepare_local_candidate(target=_linux_musl_target())
         )
-        if result.stdout.strip() != "active":
-            print(f"\n✗ Service failed to start", file=sys.stderr)
-            subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
-            sys.exit(1)
+        candidate_binary = staging / "candidate-binary"
+        if prepared.binary != candidate_binary:
+            shutil.copy2(prepared.binary, candidate_binary)
+        candidate_binary.chmod(0o700)
 
-        health_version, elapsed = _wait_for_health(t0, timeout_secs=20.0)
-        if health_version is None:
-            print("WARNING: Health check failed after 20s", file=sys.stderr)
+        candidate_env = staging / "candidate.env"
+        candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
+        candidate_env.chmod(0o600)
+        config = dataclasses.replace(
+            NATIVE_SYSTEMD_CONFIG,
+            user=service_user,
+            db_path=str(SYSTEMD_DB_PATH),
+            home_dir=str(Path.home()),
+            env_file_path=str(PROD_ENV_FILE) if env_snapshot else None,
+        )
+        candidate_service = staging / "candidate.service"
+        candidate_service.write_text(generate_systemd_service(config, prepared.identity.version))
+        candidate_service.chmod(0o600)
+        candidate_socket = staging / "candidate.socket"
+        candidate_socket.write_text(generate_systemd_socket(config))
+        candidate_socket.chmod(0o600)
 
-        write_deployed_sha()
-        print(f"\n✓ Deployed {version} to production")
-        print(f"  Version: {health_version or 'unknown'}")
-        print(f"  Startup: {elapsed:.1f}s")
-        print(f"  Service: {PROD_SERVICE_NAME}")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-        print(f"  Database: {config.db_path}")
-        print(f"  URL: {_prod_display_url()}")
+        helper = staging / "helper.py"
+        _materialize_source_file(
+            prepared.source_commit,
+            "scripts/systemd_deploy_helper.py",
+            helper,
+            prepared.source_kind.value,
+        )
+        protocol = subprocess.run(
+            [sys.executable, str(helper), "--protocol-version"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if protocol != str(SYSTEMD_HANDOFF_PROTOCOL_VERSION):
+            raise SystemExit(f"systemd helper protocol mismatch: expected {SYSTEMD_HANDOFF_PROTOCOL_VERSION}, got {protocol!r}")
 
+        previous_identity = _systemd_current_identity(env_snapshot)
+
+        root_transaction = SYSTEMD_TRANSACTION_ROOT / transaction_id
+        root_paths = {name: root_transaction / name for name in (
+            "candidate-binary", "candidate.service", "candidate.socket", "candidate.env",
+            "rollback-binary", "rollback.service", "rollback.socket", "rollback.env", "helper.py",
+        )}
+        manifest = {
+            "manifest_version": SYSTEMD_HANDOFF_PROTOCOL_VERSION,
+            "transaction_id": transaction_id,
+            "unit_name": PROD_SERVICE_NAME,
+            "service_user": service_user,
+            "source_kind": prepared.source_kind.value,
+            "source_commit": prepared.source_commit,
+            "release_tag": prepared.release_tag,
+            "release_commit": prepared.release_commit,
+            "expected": prepared.identity.as_dict(),
+            "previous": previous_identity.as_dict() if previous_identity else None,
+            "expected_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version",
+            "previous_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version" if previous_identity else None,
+            "candidate": {
+                "binary": _systemd_artifact(root_paths["candidate-binary"], candidate_binary),
+                "service": _systemd_artifact(root_paths["candidate.service"], candidate_service),
+                "socket": _systemd_artifact(root_paths["candidate.socket"], candidate_socket),
+                "environment": _systemd_artifact(root_paths["candidate.env"], candidate_env) if env_snapshot else _systemd_artifact(None),
+            },
+            "rollback": {
+                "binary": _systemd_artifact(None),
+                "service": _systemd_artifact(None),
+                "socket": _systemd_artifact(None),
+                "environment": _systemd_artifact(None),
+            },
+            "targets": {
+                "binary": str(PROD_INSTALL_DIR / "phoenix-ide"),
+                "service": str(SYSTEMD_SERVICE_PATH),
+                "socket": str(SYSTEMD_SOCKET_PATH),
+                "environment": str(PROD_ENV_FILE),
+                "deployed_sha": str(SYSTEMD_DEPLOYED_SHA_PATH),
+            },
+            "status_path": str(SYSTEMD_STATUS_PATH),
+            "active_path": str(SYSTEMD_ACTIVE_PATH),
+            "activation_lock_path": str(SYSTEMD_ACTIVATION_LOCK_PATH),
+            "claim_lock_path": str(SYSTEMD_CLAIM_LOCK_PATH),
+            "previous_deployed_sha": None,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        local_manifest = staging / "manifest.json"
+        _write_json_atomic(local_manifest, manifest)
+        files = [
+            ("candidate-binary", candidate_binary),
+            ("candidate.service", candidate_service),
+            ("candidate.socket", candidate_socket),
+            ("helper.py", helper),
+            ("manifest.json", local_manifest),
+        ]
+        if env_snapshot:
+            files.append(("candidate.env", candidate_env))
+        root_manifest = _stage_systemd_root_handoff(staging, transaction_id, helper, files)
+
+    activation_unit = f"phoenix-ide-deploy-{transaction_id}"
+    subprocess.run([
+        "sudo", "systemd-run", "--no-block", f"--unit={activation_unit}",
+        "--property=Type=oneshot", "--",
+        "python3", str(root_transaction / "helper.py"), "activate", "--manifest", str(root_manifest),
+    ], check=True)
+    print("\n✓ Activation handed to an independent root systemd unit")
+    print(f"  Transaction: {transaction_id}")
+    print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
+    print("  After reconnecting, run: ./dev.py prod status")
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
     """Load an env file from project root into env dict. Returns path if loaded.
@@ -6933,6 +6923,21 @@ def native_prod_override_unset(name: str):
     print(f"  Service restarted")
 
 
+def _read_systemd_deploy_status() -> dict[str, object] | None:
+    result = subprocess.run(
+        ["sudo", "cat", str(SYSTEMD_STATUS_PATH)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        status = json.loads(result.stdout)
+        return status if isinstance(status, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def native_prod_status():
     """Show production service status (native Linux)."""
     # Check if service exists
@@ -6946,7 +6951,7 @@ def native_prod_status():
         print(f"Production: running")
         print(f"  Port: {PROD_PORT}")
         print(f"  URL: {_prod_display_url()}")
-        print(f"  Database: {PROD_DB_PATH}")
+        print(f"  Database: {SYSTEMD_DB_PATH}")
 
         # Health check
         try:
@@ -6959,6 +6964,20 @@ def native_prod_status():
             print(f"  Commit: {sha}")
     else:
         print(f"Production: {status}")
+
+    deploy_status = _read_systemd_deploy_status()
+    if deploy_status is not None:
+        print("  Deployment:")
+        print(f"    Transaction: {deploy_status.get('transaction_id', '<unknown>')}")
+        print(f"    State: {deploy_status.get('state', '<unknown>')}")
+        expected_version = deploy_status.get("expected_version")
+        expected_sha = deploy_status.get("expected_git_sha")
+        if expected_version and expected_sha:
+            print(f"    Candidate: {expected_version} ({expected_sha})")
+        if deploy_status.get("failure"):
+            print(f"    Failure: {deploy_status['failure']}")
+        if deploy_status.get("rollback_failure"):
+            print(f"    Rollback failure: {deploy_status['rollback_failure']}")
     
     # Show OAuth token status from credentials file (read directly by the binary).
     creds_path = Path.home() / ".claude" / ".credentials.json"
@@ -7378,6 +7397,20 @@ def _resolve_rollback_identity(
     )
 
 
+def _linux_musl_target() -> str:
+    import platform
+
+    architecture = {
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+    }.get(platform.machine().lower())
+    if architecture is None:
+        raise SystemExit(f"no supported Linux musl target for architecture {platform.machine()!r}")
+    return f"{architecture}-unknown-linux-musl"
+
+
 def _release_asset_name() -> str:
     import platform
 
@@ -7569,22 +7602,36 @@ def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
         raise
 
 
-def _materialize_helper(source_commit: str, destination: Path, source_kind: str) -> None:
+def _materialize_source_file(
+    source_commit: str,
+    source_path: str,
+    destination: Path,
+    source_kind: str,
+) -> None:
     if source_kind == "local_head":
         result = subprocess.run(
-            ["git", "show", f"{source_commit}:scripts/launchd_deploy_helper.py"],
+            ["git", "show", f"{source_commit}:{source_path}"],
             cwd=ROOT, capture_output=True,
         )
     else:
         result = subprocess.run(
-            ["gh", "api", f"repos/scottopell/phoenix-ide/contents/scripts/launchd_deploy_helper.py?ref={source_commit}",
+            ["gh", "api", f"repos/scottopell/phoenix-ide/contents/{source_path}?ref={source_commit}",
              "-H", "Accept: application/vnd.github.raw+json"],
             capture_output=True,
         )
     if result.returncode != 0 or not result.stdout:
-        raise SystemExit(f"selected source {source_commit} has no launchd deployment helper")
+        raise SystemExit(f"selected source {source_commit} has no {source_path}")
     destination.write_bytes(result.stdout)
     destination.chmod(0o700)
+
+
+def _materialize_helper(source_commit: str, destination: Path, source_kind: str) -> None:
+    _materialize_source_file(
+        source_commit,
+        "scripts/launchd_deploy_helper.py",
+        destination,
+        source_kind,
+    )
 
 
 def _helper_plist(
@@ -8011,8 +8058,8 @@ def cmd_prod_build():
 def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
     """Deploy local HEAD or an immutable published release."""
     env = detect_prod_env()
-    if release and env != "launchd":
-        raise SystemExit("--release deployment is supported only by native macOS launchd")
+    if release and env == "daemon":
+        raise SystemExit("--release deployment is not yet supported by bare Linux")
     if not release:
         print("Running pre-deploy checks...\n")
         cmd_check(gate=False, pretty=pretty)
@@ -8022,7 +8069,7 @@ def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
         launchd_prod_deploy(release)
 
     elif env == "native":
-        native_prod_deploy()
+        native_prod_deploy(release)
 
     elif env == "daemon":
         print("Detected: No systemd (daemon mode)")

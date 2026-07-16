@@ -26,7 +26,7 @@ from typing import Optional
 
 HANDOFF_PROTOCOL_VERSION = 1
 PRODUCTION_UNIT = "phoenix-ide"
-PRODUCTION_TRANSACTION_ROOT = Path("/var/lib/phoenix-ide/deploy/transactions")
+PRODUCTION_TRANSACTION_ROOT = Path("/var/lib/phoenix-ide-deploy/transactions")
 PRODUCTION_BINARY = Path("/opt/phoenix-ide/phoenix-ide")
 PRODUCTION_SERVICE = Path("/etc/systemd/system/phoenix-ide.service")
 PRODUCTION_SOCKET = Path("/etc/systemd/system/phoenix-ide.socket")
@@ -817,6 +817,44 @@ def copy_handoff_file(source: Path, destination: Path, expected_hash: str, sourc
             Path(temporary).unlink(missing_ok=True)
 
 
+def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path: Path) -> None:
+    manifest = Manifest.load(manifest_path)
+    previous = manifest.previous is not None
+    sources = {
+        "binary": Path(policy.targets.binary),
+        "service": Path(policy.targets.service),
+        "socket": Path(policy.targets.socket),
+        "environment": Path(policy.targets.environment),
+    }
+    rollback = {name: {"path": None, "sha256": None} for name in sources}
+    if previous and not all(sources[name].is_file() for name in ("binary", "service", "socket")):
+        raise ValidationError("existing runtime lacks complete rollback binary and units")
+    for name, source in sources.items():
+        if source.is_symlink():
+            raise ValidationError(f"rollback {name} must not be a symlink")
+        if previous and source.is_file():
+            destination = transaction / f"rollback-{name}"
+            copy_handoff_file(source, destination, sha256(source), 0, 0o600)
+            rollback[name] = {"path": str(destination), "sha256": sha256(destination)}
+    manifest_raw = json.loads(manifest_path.read_text())
+    manifest_raw["rollback"] = rollback
+    deployed_sha = Path(policy.targets.deployed_sha)
+    manifest_raw["previous_deployed_sha"] = deployed_sha.read_text().strip() if deployed_sha.is_file() else None
+    atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
+
+
+def prepare_data_directory(service_user: str, policy: ValidationPolicy) -> None:
+    account = pwd.getpwnam(service_user)
+    data_dir = Path(policy.targets.deployed_sha).parent
+    data_dir.mkdir(parents=True, mode=0o750, exist_ok=True)
+    os.chown(data_dir, account.pw_uid, account.pw_gid)
+    os.chmod(data_dir, 0o750)
+    db_path = data_dir / "prod.db"
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if path.exists():
+            os.chown(path, account.pw_uid, account.pw_gid)
+
+
 def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
     try:
         bundle = json.loads(bundle_path.read_text())
@@ -848,6 +886,10 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
         for item in files:
             name = item["name"]
             copy_handoff_file(Path(item["source"]), transaction / name, item["sha256"], source_uid, allowed[name])
+        manifest_path = transaction / "manifest.json"
+        manifest = Manifest.load(manifest_path)
+        prepare_data_directory(manifest.service_user, policy)
+        capture_rollback(transaction, policy, manifest_path)
         return transaction / "manifest.json"
     except BaseException:
         shutil.rmtree(transaction, ignore_errors=True)

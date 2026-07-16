@@ -198,16 +198,20 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
 
     def test_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
         sources = []
-        for name in ("candidate-binary", "candidate.service", "candidate.socket", "helper.py", "manifest.json"):
+        for name in ("candidate-binary", "candidate.service", "candidate.socket", "helper.py"):
             source = self.base / f"source-{name}"
             source.write_text(name)
             sources.append({"name": name, "source": str(source), "sha256": digest(source)})
+        source_manifest = self.base / "source-manifest.json"
+        source_manifest.write_text(json.dumps(self.raw))
+        sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         policy = self.staging_policy()
-        manifest = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+        with mock.patch.object(helper, "prepare_data_directory"):
+            manifest = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
         self.assertEqual(policy.transaction_root / self.transaction_id / "manifest.json", manifest)
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
-        for item in sources:
-            self.assertEqual(item["name"], (manifest.parent / item["name"]).read_text())
+        self.assertEqual("candidate-binary", (manifest.parent / "candidate-binary").read_text())
+        self.assertEqual(self.raw["expected"], json.loads(manifest.read_text())["expected"])
 
     def test_stage_handoff_rejects_non_allowlisted_artifact_before_claim(self):
         source = self.base / "secret"
