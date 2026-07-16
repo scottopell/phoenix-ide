@@ -97,12 +97,12 @@
 
 .mobile-pr-actions-secondary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(62px, 1fr));
 }
 
 .mobile-pr-actions-hero > *,
 .mobile-pr-actions-secondary > * {
-  min-height: 38px;
+  min-height: 44px;
   min-width: 0;
   border-radius: 8px;
   flex: 1 1 0;
@@ -110,26 +110,26 @@
 }
 
 .mobile-pr-actions-secondary > * {
-  padding: 4px 2px;
+  padding: 5px 3px;
   display: grid;
-  grid-template-rows: 14px 13px;
+  grid-template-rows: auto auto;
   align-content: center;
-  gap: 1px;
+  gap: 2px;
   font-size: 10px;
-  line-height: 1;
+  line-height: 1.15;
   text-align: center;
   text-decoration: none;
 }
 
-.mobile-pr-actions-secondary > * > span {
+.mobile-pr-actions-secondary > * > span:not(.mobile-pr-action-icon) {
   min-width: 0;
-  overflow: visible;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
-.mobile-pr-actions-secondary > * > span:first-child {
+.mobile-pr-action-icon {
   font-size: 13px;
   font-weight: 700;
+  line-height: 1;
 }
 
 .mobile-pr-actions-hero > * {
@@ -147,8 +147,10 @@
 
 .mobile-pr-actions-secondary > .mobile-pr-action {
   display: grid;
-  grid-template-rows: 14px 13px;
+  grid-template-rows: auto auto;
   align-content: center;
+  font-size: 10px;
+  line-height: 1.15;
 }
 
 .mobile-pr-action--hero {
@@ -162,21 +164,21 @@
 
 .mobile-pr-action--review,
 .mobile-pr-action--workspace {
-  border-color: rgb(96 165 250 / 32%);
-  background: rgb(59 130 246 / 9%);
-  color: #9ec7ff;
+  border-color: rgb(96 165 250 / 22%);
+  background: rgb(59 130 246 / 5%);
+  color: #a9c8ed;
 }
 
 .mobile-pr-action--external {
-  border-color: rgb(167 139 250 / 36%);
-  background: rgb(139 92 246 / 10%);
+  border-color: rgb(167 139 250 / 28%);
+  background: rgb(139 92 246 / 7%);
   color: #c4b5fd;
 }
 
 .mobile-pr-action--cleanup {
-  border-color: rgb(74 222 128 / 24%);
-  background: rgb(34 197 94 / 7%);
-  color: #86d9a4;
+  border-color: var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
 }
 
 .mobile-pr-action--danger {
@@ -213,14 +215,12 @@
 
 @keyframes mobile-pr-actions-enter {
   from {
-    max-height: 0;
-    transform: translateY(8px);
+    transform: translateY(8px) scaleY(0.96);
     opacity: 0;
   }
 
   to {
-    max-height: 160px;
-    transform: translateY(0);
+    transform: translateY(0) scaleY(1);
     opacity: 1;
   }
 }

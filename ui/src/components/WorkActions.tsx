@@ -297,10 +297,10 @@ export function WorkControlBar({
             <div className="mobile-pr-actions-hero">{mobileHero}</div>
             <div className="mobile-pr-actions-secondary">
               <button type="button" className="mobile-pr-action mobile-pr-action--review" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>
-                <span aria-hidden="true">Δ</span><span>PR diff</span>
+                <span className="mobile-pr-action-icon" aria-hidden="true">Δ</span><span>PR diff</span>
               </button>
               <button type="button" className="mobile-pr-action mobile-pr-action--workspace" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>
-                <span aria-hidden="true">◫</span><span>Changes</span>
+                <span className="mobile-pr-action-icon" aria-hidden="true">▱</span><span>Workspace</span>
               </button>
               {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
                 <a
@@ -314,17 +314,17 @@ export function WorkControlBar({
                       ? `Open PR #${disposition.secondaryResolve.number}`
                       : 'Create PR on GitHub'}
                 >
-                  <span aria-hidden="true">↗</span><span>GitHub</span>
+                  <span className="mobile-pr-action-icon" aria-hidden="true">↗</span><span>GitHub</span>
                 </a>
               )}
               {!cleanupBlockedByAmbiguity && associatedPrs.length > 1 && (
                 <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>
-                  <span aria-hidden="true">✓</span><span>Cleanup</span>
+                  <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
                 </button>
               )}
               {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
                 <button type="button" className="mobile-pr-action mobile-pr-action--danger" disabled={isLoading} onClick={handleAbandon}>
-                  <span aria-hidden="true">×</span><span>Abandon</span>
+                  <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Abandon</span>
                 </button>
               )}
             </div>
