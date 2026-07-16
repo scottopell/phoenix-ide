@@ -26,12 +26,16 @@ requires positive evidence: open task status or an active/attention state for
 Work mode, and active/attention state or activity within 14 days for Direct,
 Explore, and Branch modes.
 
-The UI now consumes `/api/global/coordinator`, which resolves the singleton
+The UI consumes `/api/global/coordinator`, which resolves the singleton
 Coordinator conversation and lets the page compose that identity with the
-existing deterministic fleet data from `/api/global/open-work`. The bespoke
-Global Recall session API/types/UI are retired from the frontend contract. The
-Coordinator keeps using app-local links, durable references, and bounded global
-read tooling for synthesis and citation workflows.
+existing deterministic fleet data from `/api/global/open-work`. Desktop keeps
+conversation and fleet visible together. Compact viewports use an explicit
+Conversation/Fleet switch so the standard transcript owns a definite viewport
+while fleet triage remains one tap away; the mobile conversation list provides
+a direct Coordinator entry. The bespoke Global Recall session API/types/UI are
+retired from the frontend contract. The Coordinator keeps using app-local
+links, durable references, and bounded global read tooling for synthesis and
+citation workflows.
 
 ## Status Summary
 
@@ -46,7 +50,17 @@ read tooling for synthesis and citation workflows.
 | **REQ-GR-007:** Restrict Phoenix-wide Tools to the Coordinator | ✅ Complete | Global search/read/open-work/reference tools remain reserved for the Coordinator flow |
 | **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Coordinator synthesis is expected to cite app-local conversation/message sources and stable handles |
 | **REQ-GR-009:** Resolve Copied References | ✅ Complete | `/api/global/resolve` supports typed handles and app-local conversation/chain paths |
-| **REQ-GR-010:** Keep the Fleet Snapshot Visible on the Coordinator Surface | ✅ Complete | `/global` remains a Coordinator page with a compact expandable fleet list rather than a bare redirect |
+| **REQ-GR-010:** Keep the Fleet Snapshot Visible on the Coordinator Surface | ✅ Complete | `/global` keeps a compact expandable fleet view in the Coordinator surface; compact viewports switch between a viewport-filling transcript and touch-friendly Fleet view without remounting the conversation |
+
+## Verification Summary
+
+Targeted component tests cover singleton route handling, compact-view switching,
+conversation mount preservation, direct mobile navigation, fleet expansion, and
+viewport ownership. Deterministic Ladle browser QA captures populated idle and
+working transcripts plus compact, expanded, and failed Fleet states at phone,
+small-phone, tablet, and desktop sizes. The capture workflow fails when the
+virtual transcript, a message row, or the composer has zero geometry, or when
+the document overflows horizontally.
 
 ## Scope
 

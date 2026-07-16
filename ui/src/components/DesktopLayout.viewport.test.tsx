@@ -17,7 +17,7 @@ function ruleFor(selector: string): string {
 }
 
 describe('app viewport ownership', () => {
-  it.each(['/new', '/new/', '/c/example', '/c/example/', '/c/with%20space'])(
+  it.each(['/new', '/new/', '/c/example', '/c/example/', '/c/with%20space', '/global', '/global/', '/global/coordinator-id'])(
     'contains the document for the chat shell route %s',
     (pathname) => expect(isViewportOwnedRoute(pathname, false)).toBe(true),
   );

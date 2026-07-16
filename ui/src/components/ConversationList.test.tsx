@@ -38,6 +38,21 @@ vi.mock('../utils', async () => {
 
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
 
+describe('ConversationList — global navigation', () => {
+  it('exposes a labeled Coordinator entry from the mobile list header', () => {
+    function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
+    const { getByRole, getByTestId } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <ConversationList {...defaultProps} conversations={[]} listDensity="mobile" />
+        <Location />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Open Coordinator' }));
+    expect(getByTestId('location')).toHaveTextContent('/global');
+  });
+});
+
 describe('ConversationList — active conversation reveal', () => {
   let originalScrollDescriptor: PropertyDescriptor | undefined;
   let scrollIntoViewSpy: ReturnType<typeof vi.fn>;

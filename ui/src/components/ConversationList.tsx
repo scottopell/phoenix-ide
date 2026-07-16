@@ -815,6 +815,15 @@ export function ConversationList({
           <div className="conversation-list-command-cluster">
             <button
               type="button"
+              className="conversation-list-icon-btn conversation-list-coordinator-btn"
+              onClick={() => navigate('/global')}
+              title="Coordinator"
+              aria-label="Open Coordinator"
+            >
+              <span aria-hidden="true">◎</span>
+            </button>
+            <button
+              type="button"
               className="conversation-list-icon-btn"
               onClick={() => navigate('/terminal')}
               title="Terminal"

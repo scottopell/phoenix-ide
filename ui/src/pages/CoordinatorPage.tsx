@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
+import { useMediaQuery } from '../hooks';
 import type { GlobalOpenWorkResponse } from '../api';
 import './CoordinatorPage.css';
 
@@ -8,9 +9,13 @@ const ConversationPage = lazy(() =>
   import('./ConversationPage').then((module) => ({ default: module.ConversationPage })),
 );
 
+type CoordinatorView = 'conversation' | 'fleet';
+
 export function CoordinatorPage() {
   const navigate = useNavigate();
   const { slug } = useParams<{ slug: string }>();
+  const compactLayout = useMediaQuery('(max-width: 1024px)');
+  const [activeView, setActiveView] = useState<CoordinatorView>('conversation');
   const [openWork, setOpenWork] = useState<GlobalOpenWorkResponse | null>(null);
   const [openWorkLoadingMore, setOpenWorkLoadingMore] = useState(false);
   const [expandedReferences, setExpandedReferences] = useState<Set<string>>(new Set());
@@ -118,14 +123,38 @@ export function CoordinatorPage() {
   };
 
   return (
-    <div className="coordinator-page">
+    <div className={`coordinator-page coordinator-page--${activeView}`}>
       <header className="coordinator-header">
-        <div>
+        <button
+          type="button"
+          className="coordinator-back"
+          onClick={() => navigate(-1)}
+          aria-label="Back"
+        >
+          <span aria-hidden="true">←</span>
+        </button>
+        <div className="coordinator-heading">
           <h1>Coordinator</h1>
           <p>The durable Phoenix-wide coordinator plus a compact, explainable fleet snapshot.</p>
         </div>
         <div className="coordinator-actions">
           <button type="button" onClick={refreshOpenWork}>Refresh fleet</button>
+        </div>
+        <div className="coordinator-view-switch" role="group" aria-label="Coordinator view">
+          <button
+            type="button"
+            aria-pressed={activeView === 'conversation'}
+            onClick={() => setActiveView('conversation')}
+          >
+            Conversation
+          </button>
+          <button
+            type="button"
+            aria-pressed={activeView === 'fleet'}
+            onClick={() => setActiveView('fleet')}
+          >
+            Fleet <span className="coordinator-view-count">{itemCount}</span>
+          </button>
         </div>
       </header>
 
@@ -136,14 +165,21 @@ export function CoordinatorPage() {
       {loading ? <div className="coordinator-muted">Loading…</div> : null}
 
       {slug === resolvedCoordinatorId && (
-        <section className="coordinator-conversation" aria-label="Coordinator conversation">
+        <section
+          className="coordinator-conversation"
+          aria-label="Coordinator conversation"
+          hidden={compactLayout && activeView !== 'conversation'}
+        >
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
             <ConversationPage routePrefix="/global" />
           </Suspense>
         </section>
       )}
 
-      <div className="coordinator-fleet-pane">
+      <div
+        className="coordinator-fleet-pane"
+        hidden={compactLayout && activeView !== 'fleet'}
+      >
         <section className="coordinator-open-work">
         {fleetError && <div className="coordinator-error">Fleet unavailable: {fleetError}</div>}
         <div className="coordinator-section-title">

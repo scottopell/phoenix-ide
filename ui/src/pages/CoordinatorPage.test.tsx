@@ -20,9 +20,23 @@ vi.mock('../api', async () => {
   };
 });
 
+vi.mock('../hooks', async () => {
+  const actual = await vi.importActual<typeof import('../hooks')>('../hooks');
+  return {
+    ...actual,
+    useMediaQuery: () => true,
+  };
+});
+
 vi.mock('./ConversationPage', () => ({
   ConversationPage: ({ routePrefix }: { routePrefix?: string }) => (
-    <div>Shared conversation runtime {routePrefix}</div>
+    <div>
+      Shared conversation runtime {routePrefix}
+      <label>
+        Coordinator draft
+        <input aria-label="Coordinator draft" defaultValue="preserve me" />
+      </label>
+    </div>
   ),
 }));
 
@@ -117,6 +131,26 @@ describe('CoordinatorPage', () => {
     expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
   });
 
+  it('defaults to Conversation and preserves its mounted state while switching to Fleet', async () => {
+    renderPage();
+
+    const conversation = await screen.findByRole('region', { name: 'Coordinator conversation' });
+    const fleet = screen.getByText('Fix coordinator page').closest('.coordinator-fleet-pane');
+    const draft = screen.getByRole('textbox', { name: 'Coordinator draft' });
+    fireEvent.change(draft, { target: { value: 'unsent follow-up' } });
+
+    expect(screen.getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'true');
+    expect(conversation).not.toHaveAttribute('hidden');
+    expect(fleet).toHaveAttribute('hidden');
+
+    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
+    expect(conversation).toHaveAttribute('hidden');
+    expect(fleet).not.toHaveAttribute('hidden');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Conversation' }));
+    expect(screen.getByRole('textbox', { name: 'Coordinator draft' })).toHaveValue('unsent follow-up');
+  });
+
   it('mounts the Coordinator even when fleet loading fails', async () => {
     apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
     renderPage();
@@ -169,6 +203,7 @@ describe('CoordinatorPage', () => {
     renderPage();
 
     await screen.findByText('Fix coordinator page');
+    fireEvent.click(screen.getByRole('button', { name: /Fleet/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Show details' }));
 
     expect(screen.getByText('ROOT conv-roo')).toBeInTheDocument();

@@ -3,7 +3,8 @@ import { useLayoutEffect } from 'react';
 export function isViewportOwnedRoute(pathname: string, desktop: boolean): boolean {
   return (desktop && /^\/$/.test(pathname))
     || /^\/new\/?$/.test(pathname)
-    || /^\/c\/[^/]+\/?$/.test(pathname);
+    || /^\/c\/[^/]+\/?$/.test(pathname)
+    || /^\/global(?:\/[^/]+)?\/?$/.test(pathname);
 }
 
 export function useDocumentViewportOwnership(ownsViewport: boolean): void {
