@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UserNotifications
 
 /// Root composition: server settings, connectivity, API client, stores, and
 /// the active per-conversation sessions.
@@ -60,6 +61,8 @@ final class AppModel {
         _ = connectivity.addRestoreObserver { [weak self] in
             self?.drainPersistedOutboxes()
         }
+        notificationRouter.model = self
+        UNUserNotificationCenter.current().delegate = notificationRouter
     }
 
     private func rebuildAPI() {
@@ -90,6 +93,53 @@ final class AppModel {
     func refreshList() async {
         guard let api else { return }
         await listStore.refresh(api: api)
+        if listStore.lastError == nil {
+            // The user is looking at fresh data — nothing here should nudge
+            // them later.
+            attention.seed(with: listStore.conversations)
+        }
+    }
+
+    // MARK: - Needs-attention nudges (STOPGAP tier — see AttentionMonitor)
+
+    let attention = AttentionMonitor()
+    private let notificationRouter = NotificationRouter()
+    private static let nudgesEnabledKey = "phoenix.backgroundNudges"
+
+    private(set) var backgroundNudgesEnabled =
+        UserDefaults.standard.bool(forKey: AppModel.nudgesEnabledKey)
+    private(set) var nudgeAuthorizationHint: String?
+    /// Set by a notification tap; the list view navigates and clears it.
+    var pendingOpenConversationId: String?
+
+    func setBackgroundNudges(_ enabled: Bool) async {
+        nudgeAuthorizationHint = nil
+        if enabled {
+            guard await AttentionMonitor.requestAuthorization() else {
+                nudgeAuthorizationHint =
+                    "Notifications are off for Phoenix in iOS Settings — enable them there first."
+                backgroundNudgesEnabled = false
+                UserDefaults.standard.set(false, forKey: Self.nudgesEnabledKey)
+                return
+            }
+        }
+        backgroundNudgesEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.nudgesEnabledKey)
+        if enabled {
+            BackgroundRefresh.scheduleNext()
+        }
+    }
+
+    /// One background-fetch cycle: fetch the list, notify on attention
+    /// transitions, and opportunistically freshen the cached list so the
+    /// next cold open is newer. Returns success for BGTask accounting.
+    func runBackgroundAttentionCheck() async -> Bool {
+        guard backgroundNudgesEnabled, let api else { return false }
+        guard let fresh = try? await api.listConversations() else { return false }
+        guard !Task.isCancelled else { return false }
+        await attention.checkAndNotify(fresh)
+        listStore.applyExternal(fresh)
+        return true
     }
 
     // MARK: - Coordinator
@@ -190,6 +240,9 @@ final class AppModel {
         // Streams die in the background anyway; stop them cleanly and
         // persist snapshots. Outboxes are already disk-backed.
         for session in sessions.values { session.stop() }
+        if backgroundNudgesEnabled {
+            BackgroundRefresh.scheduleNext()
+        }
     }
 
     /// Sign-out also clears all cached data: conversations, the last-used
@@ -211,5 +264,35 @@ final class AppModel {
         sessions.removeAll()
         DiskStore.removeAll()
         listStore.reset()
+    }
+}
+
+/// Routes notification taps into the app (deep link to the conversation)
+/// and suppresses banners while the app is foregrounded — the user is
+/// already looking at live state.
+final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
+    weak var model: AppModel?
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let conversationId =
+            response.notification.request.content.userInfo["conversationId"] as? String
+        Task { @MainActor [weak model] in
+            if let conversationId {
+                model?.pendingOpenConversationId = conversationId
+            }
+            completionHandler()
+        }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([])
     }
 }

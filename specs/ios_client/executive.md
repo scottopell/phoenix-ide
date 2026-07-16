@@ -42,11 +42,16 @@ injection first).
 | REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
 | REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
 | REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
+| REQ-IOS-018 nudges (stopgap) | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
 
 ## Known Gaps / Future Work
 
-- No push notifications; updates arrive only while the app is foregrounded
-  with a stream open.
+- Real-time push does not exist yet. The nudge tier (REQ-IOS-018) is an
+  explicit stopgap: best-effort BGAppRefresh polling with local
+  notifications, bounded by iOS's ≥15-minute opportunistic cadence. The
+  intended end state is server-side APNs on durable inbox observations —
+  tracked as `tasks/58046` (blocked on the durable-workflows stack) — at
+  which point the stopgap is deleted, not extended.
 - Steering-queue entries are not reorderable/deletable server-side from the app.
 - No archived-conversations view, rename, or delete (archive itself is
   wired via swipe).

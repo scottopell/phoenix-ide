@@ -432,3 +432,38 @@ sign-out.
 one conversation that answers questions about the whole fleet. Because
 the server models it as an ordinary conversation, the client adds only an
 entry point; every offline guarantee is inherited rather than rebuilt.
+
+---
+
+### REQ-IOS-018: Needs-Attention Nudges (Stopgap Tier)
+
+WHEN the user enables nudges (behind notification authorization)
+THE SYSTEM SHALL schedule opportunistic background refreshes
+AND on each run fetch the conversation list, fire one local notification
+per conversation that newly entered needs-action or error, or completed a
+working turn, and refresh the cached list
+
+WHEN diffing against the last-seen snapshot
+THE SYSTEM SHALL never notify for a conversation absent from the snapshot
+(first sight seeds silently)
+AND SHALL re-seed silently on every foreground refresh, so the user is
+never nudged about state they already saw
+
+WHEN a notification is tapped
+THE SYSTEM SHALL navigate to that conversation (cold launch included)
+
+WHILE the app is foregrounded
+THE SYSTEM SHALL suppress nudge banners
+
+Missed, delayed, or skipped background runs SHALL NOT affect correctness
+— the tier is advisory only, and no product behavior may come to depend
+on a run occurring.
+
+**Rationale:** This is deliberately the *cheap, client-only* tier of the
+notification architecture, not its end state. The intended goal is
+server-side push (APNs) hung on the durable-workflow inbox observations
+(`specs/durable-workflows` REQ-DWF-031), which delivers real-time,
+at-least-once notification without polling; this tier exists only because
+that server capability does not exist yet, and it is designed to be
+deleted — not extended — when it does. iOS controls the refresh cadence
+(≥15 min, best-effort), which bounds how good this tier can ever be.
