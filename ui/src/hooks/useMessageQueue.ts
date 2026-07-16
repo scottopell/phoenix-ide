@@ -7,6 +7,7 @@ import type { FileAttachment, ImageData } from '../api';
  * - `pending`: the client has attempted (or will attempt) to send it, and it
  *   has not yet been echoed back by the server. Rendered in the message list.
  * - `failed`: the POST was rejected. Rendered in the input area with retry UI.
+ * - `accepted`: a direct POST succeeded; the authoritative echo is pending.
  * - `steering_queued`: the POST succeeded but the server queued the message
  *   because the conversation was busy. Rendered in the message list with a
  *   "Queued" indicator and a cancel button.
@@ -15,7 +16,12 @@ import type { FileAttachment, ImageData } from '../api';
  * against `atom.messages[*].message_id`. Once the server echoes the message,
  * the consumer filters it out of the rendered pending list automatically.
  */
-export type MessageStatus = 'pending' | 'failed' | 'steering_queued' | 'recoverable_inconsistency';
+export type MessageStatus =
+  | 'pending'
+  | 'accepted'
+  | 'failed'
+  | 'steering_queued'
+  | 'recoverable_inconsistency';
 
 export interface QueuedMessage {
   localId: string;
@@ -45,7 +51,11 @@ export function derivePendingMessages(
 ): QueuedMessage[] {
   const serverIds = new Set(serverMessageIds);
   return queuedMessages.filter(
-    (q) => (q.status === 'pending' || q.status === 'steering_queued') && !serverIds.has(q.localId),
+    (q) => (
+      q.status === 'pending'
+      || q.status === 'accepted'
+      || q.status === 'steering_queued'
+    ) && !serverIds.has(q.localId),
   );
 }
 
@@ -65,6 +75,8 @@ interface UseMessageQueueReturn {
   enqueue: (text: string, images?: ImageData[], files?: FileAttachment[]) => QueuedMessage;
   /** Mark a message as failed. */
   markFailed: (localId: string) => void;
+  /** Mark a direct message as accepted while awaiting its authoritative echo. */
+  markAccepted: (localId: string, acceptedAfterEventSeq: number) => void;
   /** Mark a message as steering_queued (server accepted but deferred). */
   markSteeringQueued: (localId: string, acceptedAfterEventSeq: number) => void;
   /** Accepted entry is absent after authoritative idle reconciliation. */
@@ -193,6 +205,16 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     );
   }, [updateMessages]);
 
+  const markAccepted = useCallback((localId: string, acceptedAfterEventSeq: number) => {
+    updateMessages(prev =>
+      prev.map(m =>
+        m.localId === localId
+          ? { ...m, status: 'accepted' as const, acceptedAfterEventSeq }
+          : m
+      )
+    );
+  }, [updateMessages]);
+
   // Mark a message as steering_queued (server accepted but deferred)
   const markSteeringQueued = useCallback((localId: string, acceptedAfterEventSeq: number) => {
     updateMessages(prev =>
@@ -236,6 +258,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     queuedMessages: currentMessages,
     enqueue,
     markFailed,
+    markAccepted,
     markSteeringQueued,
     markRecoverableInconsistency,
     reconcileAuthoritative,

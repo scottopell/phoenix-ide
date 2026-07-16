@@ -58,6 +58,17 @@ describe('derivePendingMessages', () => {
     expect(out.map((q) => q.localId)).toEqual(['a', 'b']);
   });
 
+  it('renders accepted direct and steering entries until authoritative history has them', () => {
+    const queue = [
+      queued('direct', { status: 'accepted' }),
+      queued('steering', { status: 'steering_queued' }),
+    ];
+    expect(derivePendingMessages(queue, []).map((q) => q.localId)).toEqual([
+      'direct',
+      'steering',
+    ]);
+  });
+
   // Acceptance criterion: "send a message, receive the SSE echo → rendered
   // exactly once (not twice during the overlap window)".
   it('acceptance: echoed message disappears from pending as soon as server has it', () => {
@@ -171,6 +182,18 @@ describe('useMessageQueue', () => {
     const { result } = renderHook(() => useMessageQueue('conv-1'));
     // Runtime check: key absent on the hook's return value.
     expect('markSent' in (result.current as object)).toBe(false);
+  });
+
+  it('marks a direct POST as accepted with its phase watermark', () => {
+    seed('conv-1', { localId: 'direct' });
+    const { result } = renderHook(() => useMessageQueue('conv-1'));
+
+    act(() => result.current.markAccepted('direct', 17));
+
+    expect(result.current.queuedMessages[0]).toMatchObject({
+      status: 'accepted',
+      acceptedAfterEventSeq: 17,
+    });
   });
 
   it('compacts entries observed in authoritative history from state and storage', () => {

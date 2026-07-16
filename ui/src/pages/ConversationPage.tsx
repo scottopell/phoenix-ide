@@ -581,6 +581,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     queuedMessages,
     enqueue,
     markFailed,
+    markAccepted,
     markSteeringQueued,
     markRecoverableInconsistency,
     reconcileAuthoritative,
@@ -652,8 +653,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   useEffect(() => {
     if (!conversationId || !isConnected || atom.phase.type !== 'idle') return;
     const accepted = queuedMessages.filter(
-      (message) => message.status === 'steering_queued'
-        && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0),
+      (message) => (
+        message.status === 'accepted' || message.status === 'steering_queued'
+      ) && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0),
     );
     if (accepted.length === 0) return;
 
@@ -664,13 +666,32 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     let cancelled = false;
     void (async () => {
       try {
-        const result = await api.reconcileAcceptedMessages(
-          conversationId,
-          accepted.map((message) => message.localId),
+        const settledResults = await Promise.allSettled(
+          Array.from({ length: Math.ceil(accepted.length / 100) }, (_, index) => {
+            const chunk = accepted.slice(index * 100, (index + 1) * 100);
+            return api.reconcileAcceptedMessages(
+              conversationId,
+              chunk.map((message) => message.localId),
+            );
+          }),
         );
         if (cancelled) return;
 
-        const persisted = result.entries.filter((entry) => entry.status === 'persisted');
+        const results = settledResults.flatMap((result) =>
+          result.status === 'fulfilled' ? [result.value] : []
+        );
+        if (results.length === 0) {
+          throw new Error('All accepted-message reconciliation chunks failed');
+        }
+        if (results.length < settledResults.length) {
+          idleReconciliationKeyRef.current = null;
+          console.warn('[message-queue] some reconciliation chunks failed', {
+            conversationId,
+            failedChunks: settledResults.length - results.length,
+          });
+        }
+        const entries = results.flatMap((result) => result.entries);
+        const persisted = entries.filter((entry) => entry.status === 'persisted');
         const current = atomRef.current;
         if (
           persisted.length > 0
@@ -693,8 +714,8 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           reconcileAuthoritative(persisted.map((entry) => entry.message_id));
         }
 
-        if (result.conversation_idle) {
-          for (const entry of result.entries) {
+        if (results.every((result) => result.conversation_idle)) {
+          for (const entry of entries) {
             if (entry.status === 'absent') {
               markRecoverableInconsistency(entry.message_id);
             }
@@ -1363,6 +1384,8 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             // on the message bubble instead of the normal sending spinner.
             markSteeringQueued(localId, phaseEventSeqBeforePost);
             rollbackOptimisticPhase();
+          } else {
+            markAccepted(localId, phaseEventSeqBeforePost);
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -1398,7 +1421,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
@@ -1425,7 +1448,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     if (!isConnected || !conversationId || isArchived) return;
 
     for (const msg of pendingMessages) {
-      if (msg.status === 'steering_queued') continue;
+      if (msg.status === 'accepted' || msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }

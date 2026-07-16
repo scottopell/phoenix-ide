@@ -381,6 +381,28 @@ describe('ConversationPage message delivery reconciliation', () => {
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
   });
 
+  it('does not repost a successful direct message while its SSE echo is missing', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      queued: true,
+      steering: false,
+    });
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'accepted without echo' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      const queue = JSON.parse(
+        localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]',
+      ) as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('accepted');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('prevents overlapping composer submissions while the first POST is unresolved', async () => {
     const response = deferred<{ queued: boolean; steering: boolean }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
@@ -399,6 +421,82 @@ describe('ConversationPage message delivery reconciliation', () => {
     ).toHaveLength(1);
     response.resolve({ queued: true, steering: false });
     await response.promise;
+  });
+
+  it('exact-ID reconciles an accepted direct message after its SSE echo is missed', async () => {
+    const acceptedId = 'accepted-direct';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'accepted direct',
+      timestamp: 1,
+      status: 'accepted',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: acceptedId,
+        status: 'persisted',
+        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+      }],
+    });
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain(acceptedId);
+  });
+
+  it('chunks more than 100 accepted entries within the reconciliation API limit', async () => {
+    const acceptedIds = Array.from({ length: 205 }, (_, index) => `accepted-${index}`);
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify(acceptedIds.map((localId) => ({
+      localId,
+      conversationId,
+      text: localId,
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }))));
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, ids) => ({
+      conversation_idle: true,
+      entries: ids.map((messageId, index) => ({
+        message_id: messageId,
+        status: 'persisted' as const,
+        message: { ...historyMessage, message_id: messageId, sequence_id: index + 20 },
+      })),
+    }));
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.reconcileAcceptedMessages).mock.calls.map((call) => call[1].length)).toEqual([
+      100, 100, 5,
+    ]);
   });
 
   it('retries idle reconciliation when connectivity returns after a transient failure', async () => {
