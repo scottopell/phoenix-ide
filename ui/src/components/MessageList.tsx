@@ -77,6 +77,7 @@ import {
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
 } from '../conversation/transcriptPositioning';
+import { findConversationFragmentElement } from './viewer-find/conversationFragmentElement';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1179,8 +1180,9 @@ function MessageListImpl({
       row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
       row.scrollIntoView({ block: 'center' });
       if (unitMatch.fragmentId) {
-        const fragment = row.querySelector(`[data-fragment-id="${CSS.escape(unitMatch.fragmentId)}"]`);
-        fragment?.scrollIntoView({ block: 'center' });
+        const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
+        const revealTarget = source?.revealTarget ?? { kind: 'agent-text' as const, key: unitMatch.fragmentId };
+        findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget)?.scrollIntoView({ block: 'center' });
       }
     }, delay));
     return () => timers.forEach(clearTimeout);

@@ -165,6 +165,27 @@ describe('findSession', () => {
     expect(result.commands).toEqual([]);
   });
 
+  it('replace-results reveals a retained active match when its target is refreshed', () => {
+    const alpha = makeMatch('alpha', 0);
+    const beta = makeMatch('beta', 1);
+    let state = openFindSession(createClosedFindSession<Target, FocusOrigin>(), makeSurface({
+      query: 'a',
+      matches: [alpha, beta],
+      focusOrigin: { scope: 'viewer', token: 'origin-1' },
+    })).state;
+    state = activateFindSessionMatch(state, beta.id).state;
+
+    const movedBeta = makeMatch('beta', 8);
+    const result = replaceFindSessionResults(state, [alpha, movedBeta]);
+
+    expect(result.state.status).toBe('open');
+    if (result.state.status !== 'open') throw new Error('expected open state');
+    expect(result.state.activeMatchId).toBe(beta.id);
+    expect(result.commands).toEqual([
+      { kind: 'reveal-match', matchId: beta.id, target: movedBeta.target },
+    ]);
+  });
+
   it('replace-results falls back to the nearest prior ordinal on shrink, insertion, reorder, and removal', () => {
     const a = makeMatch('a', 0);
     const b = makeMatch('b', 1);

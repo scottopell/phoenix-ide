@@ -541,7 +541,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByText('0 results')).toBeInTheDocument();
   });
 
-  it('preserves the semantic active match when lines are inserted before it on the same path without extra scrolls', async () => {
+  it('preserves and re-reveals the semantic active match when insertions move it', async () => {
     const { rerender } = render(
       <ReviewNotesProvider>
         <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta\ngamma' }} />
@@ -566,7 +566,9 @@ describe('MetaViewer payload routing', () => {
     );
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    expect(codeViewMockState.scrollToCalls).toHaveLength(0);
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'line', id: 'file:/tmp/project/thing', lineNumber: 3, align: 'center', behavior: 'smooth',
+    }));
   });
 
   it('keeps repeated identical file matches distinct', async () => {

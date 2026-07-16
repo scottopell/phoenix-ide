@@ -192,6 +192,15 @@ describe('parseKeywordSearchOutput', () => {
     expect(projection.fragments).toContain(projection.notes[0]?.fragment);
   });
 
+  it('orders structured keyword fragments as rendered: notes before hits', () => {
+    const projection = buildKeywordSearchOutputProjection([
+      '/abs/path/to/foo.rs: primary hit',
+      '[results truncated: use more specific terms]',
+    ].join('\n'), { toolUseId: 'keyword-order' });
+
+    expect(projection.fragments.map((fragment) => fragment.kind)).toEqual(['note', 'hit']);
+  });
+
   it('treats the skipped-broad no-match variant as empty and keeps the note', () => {
     const text = [
       'No matches found for the given search terms.',

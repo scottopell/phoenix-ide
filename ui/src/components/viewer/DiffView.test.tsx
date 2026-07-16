@@ -152,7 +152,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
-  it('preserves the exact active diff match when insertions appear before it without scrolling', async () => {
+  it('preserves and re-reveals the exact active diff match when insertions move it', async () => {
     const base = [
       'diff --git a/foo.txt b/foo.txt',
       'index 0000000..1111111 100644',
@@ -210,7 +210,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     );
 
     await waitFor(() => expect(screen.getByText('3 of 3')).toBeInTheDocument());
-    expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore);
+    await waitFor(() => expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore + 1));
   });
 
   it('keeps repeated identical diff matches distinct', async () => {

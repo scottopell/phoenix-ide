@@ -159,13 +159,16 @@ export function replaceFindSessionResults<TTarget, TFocusOrigin>(
   matches: readonly FindSessionMatch<TTarget>[],
 ): ReduceFindSessionResult<TTarget, TFocusOrigin> {
   if (state.status === 'closed') return { state, commands: [] };
+  const previousActiveMatch = state.matches.find((match) => match.id === state.activeMatchId);
   const nextState = reconcileOpenState(state, state.query, matches, state.activeMatchId);
+  const nextActiveMatch = nextState.matches.find((match) => match.id === nextState.activeMatchId);
   const activeMatchChanged = nextState.activeMatchId !== state.activeMatchId;
+  const activeTargetChanged = previousActiveMatch?.target !== nextActiveMatch?.target;
   return {
     state: nextState,
     commands: nextState.activeMatchId === null
       ? [{ kind: 'clear-decorations' }]
-      : activeMatchChanged
+      : activeMatchChanged || activeTargetChanged
         ? revealCommand(nextState)
         : [],
   };

@@ -1349,7 +1349,7 @@ export function buildKeywordSearchOutputProjection(
     rawFallback: false,
     empty: false,
     fallbackText: null,
-    fragments: [...hits.map((hit) => hit.fragment), ...noteFragments],
+    fragments: [...noteFragments, ...hits.map((hit) => hit.fragment)],
   };
 }
 
