@@ -75,15 +75,15 @@ THE SYSTEM SHALL organize available work actions into three logical zones:
   (REQ-WAB-004).
 
 WHEN the conversation is presented in a narrow mobile viewport
-THE SYSTEM SHALL preserve the same zone membership and `WorkDisposition` semantics while
-rendering at most the single primary verb in persistent conversation chrome.
-THE SYSTEM SHALL make the other present verbs available through one viewport-bound work-actions
-dialog, and SHALL NOT require the transcript to surrender its primary viewport area to a wrapped
-multi-row action bar.
+THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
+rail containing the actionable associated PRs and their current status.
+THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
 
-The mobile dialog SHALL use the same explicit active PR and the same derived disposition as the
-persistent primary. Moving a verb into the dialog changes only its presentation: it does not
-change whether the verb is present, primary, legal, or which PR it targets.
+WHEN the user activates a PR in the rail
+THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
+region upward from the rail. The expanded region SHALL present the active PR's single hero action
+in one row and its supporting context actions in a separate row. Closing or switching the expanded
+region changes only presentation; it does not create a parallel active-PR selection.
 
 ---
 
@@ -106,9 +106,10 @@ A RESOLVE disposition may additionally carry a single **secondary** link-out (th
 the primary and never glows; it exists only alongside an `address_feedback` primary. This does
 not violate the single-primary rule: there is still exactly one glowing button.
 
-On mobile, the primary verb remains the sole emphasized work verb even when it is rendered in
-persistent chrome and repeated inside the work-actions dialog for complete grouped access. The
-dialog trigger is disclosure, not a second work verb or primary.
+On mobile, the expanded active-PR region SHALL emphasize exactly one hero action. Supporting
+review, link-out, cleanup, and abandon controls SHALL remain visually secondary. Cleanup SHALL
+never be inferred as the mobile hero action from repository structure alone; when legal, it remains
+available only among supporting context actions.
 
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
 presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
@@ -283,23 +284,26 @@ continuation, so the suppressed bar matches the server-side legality gate.
 
 ---
 
-### REQ-WAB-011: Mobile Work-Actions Dialog
+### REQ-WAB-011: Mobile Active-PR Rail
 
-WHEN secondary work actions are disclosed on mobile
-THE SYSTEM SHALL render one modal work-actions dialog that:
+WHEN actionable associated PRs exist on mobile
+THE SYSTEM SHALL render a thin PR rail directly above the conversation input that:
 
-- is bounded to the viewport and scrolls internally without horizontal overflow;
-- moves focus into the dialog on open and restores focus to its trigger on close;
-- can be dismissed with an explicit close control, Escape, or the backdrop;
-- presents active-PR selection, REVIEW, RESOLVE, and FINISH controls as distinct semantic groups;
-- uses touch targets of at least 44 CSS pixels for interactive controls;
-- represents associated PR history as structured PR identity, branch, and state rather than as
-  the authority for active selection; and
-- keeps ambiguous PR-specific verbs unavailable until the user explicitly selects an actionable
-  PR through `pr-association`.
+- contains only open or draft actionable PRs, never closed or merged history;
+- identifies each PR by number and current state;
+- marks the explicit active PR without silently selecting one;
+- shows feedback freshness as a compact notification-style badge on its targeted PR;
+- scrolls horizontally rather than wrapping into multiple persistent rows; and
+- uses the full repository-plus-PR identity when selecting or expanding a PR.
 
-The dialog SHALL NOT store a parallel active PR, infer by recency, or reinterpret a compatibility
-primary-PR projection as authoritative.
+WHEN the active PR is expanded
+THE SYSTEM SHALL animate a non-modal action region into rows above the rail. The first row SHALL
+contain the single hero action. A supporting row SHALL provide the legal review, GitHub link-out,
+cleanup, and abandon controls without promoting cleanup as the suggested action. The action region
+SHALL expose active-PR branch context and SHALL collapse when the active PR is activated again.
+
+The rail SHALL NOT store a parallel active PR, infer by recency, show closed PRs as selectable, or
+reinterpret a compatibility primary-PR projection as authoritative.
 
 ---
 

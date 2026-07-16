@@ -1136,7 +1136,7 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
   });
 });
 
-describe('WorkControlBar — mobile work dialog (REQ-WAB-011)', () => {
+describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
   const enableMobile = () => {
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
@@ -1153,7 +1153,15 @@ describe('WorkControlBar — mobile work dialog (REQ-WAB-011)', () => {
     });
   };
 
-  it('renders only one contextual work verb persistently and discloses secondary actions', () => {
+  const twoOpenPrSelection = (active = true): AssociatedPrStatusEnvelope => ({
+    associated_prs: [
+      ...selection().associated_prs,
+      { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+    ],
+    ...(active ? { active_pr: selection().active_pr } : {}),
+  });
+
+  it('shows a thin rail of open PRs and expands the selected PR actions upward', () => {
     enableMobile();
     const handle = prStatusHandle({
       found: true,
@@ -1163,102 +1171,47 @@ describe('WorkControlBar — mobile work dialog (REQ-WAB-011)', () => {
       check_state: 'failing',
       feedback_freshness: { state: 'new', count: 3 },
       feedback_status: 'open',
-      selection: selection(),
+      selection: twoOpenPrSelection(),
     });
     renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        onSendMessage={vi.fn()}
-        prStatusHandle={handle}
-      />,
+      <WorkControlBar conversationId="conv-mobile" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
     );
 
-    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address 3 new feedback on PR #12');
-    expect(screen.queryByText('Workspace diff')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Work details' }));
-    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 open 3 new feedback/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: /#13 open/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open 3 new feedback/ }));
+    expect(screen.getByTestId('mobile-pr-actions')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 3 new');
+    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clean up' })).not.toHaveClass('work-actions-btn--primary');
   });
 
-  it('requires explicit selection for ambiguous PRs and pins through the shared handle', async () => {
+  it('pins a different open PR through the shared handle', async () => {
     enableMobile();
-    const ambiguousSelection: AssociatedPrStatusEnvelope = {
-      associated_prs: [
-        ...selection().associated_prs,
-        {
-          ...selection().associated_prs[0]!,
-          pr_number: 13,
-          title: 'Second PR',
-          url: 'https://github.com/o/r/pull/13',
-          head: 'task-124',
-        },
-      ],
-    };
     const pinActivePr = vi.fn().mockResolvedValue(undefined);
-    const handle = prStatusHandle({ found: false, selection: ambiguousSelection }, { pinActivePr });
+    const handle = prStatusHandle({ found: false, selection: twoOpenPrSelection(false) }, { pinActivePr });
     renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-ambiguous"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
+      <WorkControlBar conversationId="conv-mobile-select" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
-    expect(screen.getByRole('button', { name: 'Choose active PR · 2 open' })).toBeInTheDocument();
-    expect(pinActivePr).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Choose active PR · 2 open' }));
-    fireEvent.click(screen.getByRole('button', { name: /#13 Second PR/ }));
+    fireEvent.click(screen.getByRole('button', { name: /#13 open/ }));
     await waitFor(() => expect(pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 13 }));
   });
 
-  it('keeps the chooser open and reports a failed active-PR mutation', async () => {
+  it('reports a failed active-PR mutation without inventing a selection', async () => {
     enableMobile();
-    const ambiguousSelection: AssociatedPrStatusEnvelope = {
-      associated_prs: [
-        ...selection().associated_prs,
-        { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
-      ],
-    };
     const pinActivePr = vi.fn().mockRejectedValue(new Error('Could not save selection'));
-    const handle = prStatusHandle({ found: false, selection: ambiguousSelection }, { pinActivePr });
+    const handle = prStatusHandle({ found: false, selection: twoOpenPrSelection(false) }, { pinActivePr });
     renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-pin-error"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
+      <WorkControlBar conversationId="conv-mobile-error" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Choose active PR · 2 open' }));
-    fireEvent.click(screen.getByRole('button', { name: /#13 Second PR/ }));
+    fireEvent.click(screen.getByRole('button', { name: /#13 open/ }));
     expect(await screen.findByText('Could not save selection')).toBeInTheDocument();
-    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
-  });
-
-  it('closes on Escape and restores focus to the disclosure trigger', async () => {
-    enableMobile();
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-focus"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
-      />,
-    );
-    const trigger = screen.getByRole('button', { name: 'Work details' });
-    fireEvent.click(trigger);
-    expect(screen.getByRole('dialog', { name: 'Work details' })).toBeInTheDocument();
-    fireEvent.keyDown(document, { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Work details' })).not.toBeInTheDocument());
-    expect(trigger).toHaveFocus();
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
   });
 });

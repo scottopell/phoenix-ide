@@ -37,13 +37,13 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
       return;
     }
 
-    const workDetails = document.querySelector<HTMLButtonElement>('.mobile-work-sheet-trigger');
-    if (scenario.chooserOpen && workDetails?.getAttribute('aria-expanded') !== 'true') {
-      workDetails?.click();
+    const activePrChip = document.querySelector<HTMLButtonElement>('.mobile-pr-chip--active');
+    if (scenario.chooserOpen && activePrChip?.getAttribute('aria-expanded') !== 'true') {
+      activePrChip?.click();
       return;
     }
 
-    if (scenario.chooserOpen && !document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+    if (scenario.chooserOpen && !document.querySelector('[data-testid="mobile-pr-actions"]')) return;
 
     document.documentElement.dataset['mobileMultiPrConversationFixtureReady'] = scenario.id;
     observer?.disconnect();
@@ -72,7 +72,7 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
         resumeInference: async () => undefined,
       };
     }
-    const hasActivePr = scenario.id === 'active-pr-actions';
+    const hasActivePr = scenario.id === 'active-pr-actions' || scenario.id === 'chooser-open';
     const status = hasActivePr ? mobileMultiPrActiveStatus : mobileMultiPrStatus;
     return {
       state: { status: 'ready', prStatus: status },

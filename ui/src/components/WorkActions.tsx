@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
@@ -117,12 +117,9 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
-  const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
+  const [expandedMobilePrIdentity, setExpandedMobilePrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const isMobile = useIsMobile();
-  const mobileSheetTitleId = useId();
-  const mobileSheetRef = useRef<HTMLDivElement>(null);
-  const mobileSheetTriggerRef = useRef<HTMLButtonElement>(null);
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
@@ -195,47 +192,6 @@ export function WorkControlBar({
     return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
   }, [actionablePrs, associatedPrs]);
 
-  useEffect(() => {
-    if (!mobileSheetOpen) return;
-    const dialog = mobileSheetRef.current;
-    const trigger = mobileSheetTriggerRef.current;
-    const focusable = dialog?.querySelector<HTMLElement>('button:not([disabled]), a[href]');
-    (focusable ?? dialog)?.focus();
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setMobileSheetOpen(false);
-        return;
-      }
-      if (event.key !== 'Tab' || !dialog) return;
-      const items = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), a[href]')];
-      if (items.length === 0) return;
-      const first = items[0]!;
-      const last = items[items.length - 1]!;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    const onFocusIn = (event: FocusEvent) => {
-      if (dialog && event.target instanceof Node && !dialog.contains(event.target)) {
-        (dialog.querySelector<HTMLElement>('button:not([disabled]), a[href]') ?? dialog).focus();
-      }
-    };
-    document.addEventListener('keydown', onKeyDown);
-    document.addEventListener('focusin', onFocusIn);
-    return () => {
-      document.removeEventListener('keydown', onKeyDown);
-      document.removeEventListener('focusin', onFocusIn);
-      document.body.style.overflow = previousOverflow;
-      trigger?.focus();
-    };
-  }, [mobileSheetOpen]);
-
   const handleCleanUp = async () => {
     setError(null);
     setMarkingMerged(true);
@@ -266,9 +222,13 @@ export function WorkControlBar({
     }
   };
 
-  const selectMobilePr = async (pr: (typeof associatedPrs)[number]) => {
-    if (!prStatusHandle.pinActivePr) return;
+  const selectMobilePr = async (pr: (typeof associatedPrs)[number], selected: boolean) => {
     const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+    if (selected) {
+      setExpandedMobilePrIdentity((current) => current === identity ? null : identity);
+      return;
+    }
+    if (!prStatusHandle.pinActivePr) return;
     setSavingPrIdentity(identity);
     setError(null);
     try {
@@ -277,6 +237,7 @@ export function WorkControlBar({
         repo_name: pr.repo_name,
         pr_number: pr.pr_number,
       });
+      setExpandedMobilePrIdentity(identity);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to select active PR');
     } finally {
@@ -307,152 +268,91 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (isMobile) {
-    const openSheet = () => setMobileSheetOpen(true);
-    const mobilePrimary = prStatusHandle.ambiguous && actionablePrs.length > 1 ? (
-      <button type="button" className="mobile-work-primary work-actions-btn--primary" onClick={openSheet}>
-        Choose active PR · {actionablePrs.length} open
-      </button>
-    ) : disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
+    const activeIdentity = activePr
+      ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
+      : null;
+    const expanded = activeIdentity !== null && expandedMobilePrIdentity === activeIdentity;
+    const mobileHero = disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
       <button
         type="button"
-        className="mobile-work-primary work-actions-btn--primary"
+        className="mobile-pr-action mobile-pr-action--hero"
         data-testid="mobile-primary-address-feedback"
         disabled={capturing}
         onClick={handleAddressFeedback}
       >
-        {capturing ? `Capturing ${activePrLabel}…` : `Address ${freshnessLabel ?? ''} feedback on ${activePrLabel}`.replace('  ', ' ')}
+        {capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}
       </button>
-    ) : disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' ? (
+    ) : disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
       <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-    ) : disposition.primary === 'review' ? (
-      <button type="button" className="mobile-work-primary work-actions-btn--primary" onClick={() => openDiffFullscreen('workspace')}>
-        Review workspace changes
+    ) : (
+      <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('active_pr')}>
+        Review {activePrLabel}
       </button>
-    ) : disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
-      <button type="button" className="mobile-work-primary work-actions-btn--primary" disabled={isLoading} onClick={handleCleanUp}>
-        {markingMerged ? 'Cleaning…' : 'Clean up'}
-      </button>
-    ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
-      <button type="button" className="mobile-work-primary work-actions-btn--primary" disabled={isLoading} onClick={handleAbandon}>
-        {abandoning ? 'Abandoning…' : 'Abandon'}
-      </button>
-    ) : null;
+    );
 
     return (
-      <div className="mobile-work-controls" data-testid="mobile-work-controls">
-        <div className="mobile-work-rail">
-          {mobilePrimary}
-          <button
-            ref={mobileSheetTriggerRef}
-            type="button"
-            className="mobile-work-sheet-trigger"
-            aria-haspopup="dialog"
-            aria-expanded={mobileSheetOpen}
-            onClick={openSheet}
-          >
-            Work details
-          </button>
-        </div>
-        {error && <div className="work-actions-error">{error}</div>}
-        {mobileSheetOpen && (
-          <div className="mobile-work-sheet-backdrop" onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setMobileSheetOpen(false);
-          }}>
-            <div
-              ref={mobileSheetRef}
-              className="mobile-work-sheet"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby={mobileSheetTitleId}
-              tabIndex={-1}
-            >
-              <header className="mobile-work-sheet-header">
-                <div>
-                  <h2 id={mobileSheetTitleId}>Work details</h2>
-                  <p>{activePr ? `${activePrLabel} · ${activePr.head}` : `${associatedPrs.length} associated PRs`}</p>
-                </div>
-                <button type="button" className="mobile-work-sheet-close" aria-label="Close work details" onClick={() => setMobileSheetOpen(false)}>×</button>
-              </header>
-
-              {associatedPrs.length > 0 && (
-                <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-prs`}>
-                  <h3 id={`${mobileSheetTitleId}-prs`}>Pull requests</h3>
-                  {prStatusHandle.ambiguous && <p className="mobile-work-sheet-guidance">Choose one open PR to enable PR-specific actions.</p>}
-                  <div className="mobile-work-pr-list">
-                    {associatedPrs.map((pr) => {
-                      const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
-                      const selected = activePr?.pr_number === pr.pr_number && activePr.repo_owner === pr.repo_owner && activePr.repo_name === pr.repo_name;
-                      const actionable = pr.display_state === 'open' || pr.display_state === 'draft';
-                      const content = (
-                        <>
-                          <span className="mobile-work-pr-title">#{pr.pr_number} {pr.title}</span>
-                          <span className="mobile-work-pr-meta">{pr.head} → {pr.base}</span>
-                          <span className="mobile-work-pr-state">{pr.display_state}{selected ? ' · active' : ''}{savingPrIdentity === identity ? ' · saving…' : ''}</span>
-                        </>
-                      );
-                      return actionable ? (
-                        <button
-                          key={identity}
-                          type="button"
-                          className={`mobile-work-pr${selected ? ' mobile-work-pr--active' : ''}`}
-                          aria-pressed={selected}
-                          disabled={savingPrIdentity !== null}
-                          onClick={() => selectMobilePr(pr)}
-                        >
-                          {content}
-                        </button>
-                      ) : (
-                        <div key={identity} className="mobile-work-pr mobile-work-pr--history">
-                          {content}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
+      <div className="mobile-pr-dock" data-testid="mobile-work-controls">
+        {expanded && (
+          <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
+            <div className="mobile-pr-actions-hero">{mobileHero}</div>
+            <div className="mobile-pr-actions-secondary">
+              <button type="button" className="mobile-pr-action" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>PR diff</button>
+              <button type="button" className="mobile-pr-action" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>Workspace</button>
+              {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+                <a
+                  className="mobile-pr-action"
+                  href={disposition.secondaryResolve.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={disposition.secondaryResolve.kind === 'merge_pr'
+                    ? `Merge on GitHub #${disposition.secondaryResolve.number}`
+                    : disposition.secondaryResolve.kind === 'open_pr'
+                      ? `Open PR #${disposition.secondaryResolve.number}`
+                      : 'Create PR on GitHub'}
+                >
+                  GitHub ↗
+                </a>
               )}
-
-              <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-review`}>
-                <h3 id={`${mobileSheetTitleId}-review`}>Review</h3>
-                <button type="button" className="mobile-work-sheet-action" onClick={() => openDiffFullscreen('workspace')}>Workspace diff</button>
-                {canShowPrDiff && <button type="button" className="mobile-work-sheet-action" onClick={() => openDiffFullscreen('active_pr')}>{activePrLabel} diff</button>}
-              </section>
-
-              {disposition.resolve && !prStatusHandle.ambiguous && (
-                <section className="mobile-work-sheet-section" aria-labelledby={`${mobileSheetTitleId}-resolve`}>
-                  <h3 id={`${mobileSheetTitleId}-resolve`}>Pull request</h3>
-                  {disposition.resolve.kind === 'address_feedback' && prSpecificActionsEnabled ? (
-                    <button type="button" className="mobile-work-sheet-action mobile-work-sheet-action--primary" disabled={capturing} onClick={handleAddressFeedback}>
-                      {addressFeedbackLabel}{freshnessLabel ? ` · ${freshnessLabel}` : ''}
-                    </button>
-                  ) : disposition.resolve.kind !== 'address_feedback' ? (
-                    <ResolveLink verb={disposition.resolve} primary={false} coverageMarker={coverageMarker} />
-                  ) : null}
-                  {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
-                    <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
-                  )}
-                </section>
+              {!cleanupBlockedByAmbiguity && associatedPrs.length > 1 && (
+                <button type="button" className="mobile-pr-action mobile-pr-action--quiet" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
               )}
-
-              {(disposition.showCleanUp || disposition.showAbandon) && !cleanupBlockedByAmbiguity && (
-                <section className="mobile-work-sheet-section mobile-work-sheet-section--finish" aria-labelledby={`${mobileSheetTitleId}-finish`}>
-                  <h3 id={`${mobileSheetTitleId}-finish`}>Finish</h3>
-                  {disposition.showCleanUp && (
-                    <div className="mobile-work-finish-action">
-                      <button type="button" className="mobile-work-sheet-action" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
-                      <p>{cleanUpHintText(isBranch)}</p>
-                    </div>
-                  )}
-                  {disposition.showAbandon && (
-                    <div className="mobile-work-finish-action">
-                      <button type="button" className="mobile-work-sheet-action mobile-work-sheet-action--danger" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
-                      <p>{abandonHintText(isBranch)}</p>
-                    </div>
-                  )}
-                </section>
+              {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
+                <button type="button" className="mobile-pr-action mobile-pr-action--quiet" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
               )}
+            </div>
+            <div className="mobile-pr-actions-context">
+              <strong>{activePrLabel}</strong>
+              <span>{activePr?.head} → {activePr?.base}</span>
             </div>
           </div>
         )}
+        <div className="mobile-pr-rail" aria-label="Open pull requests">
+          {actionablePrs.map((pr) => {
+            const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+            const selected = identity === activeIdentity;
+            const isExpanded = selected && expanded;
+            return (
+              <button
+                key={identity}
+                type="button"
+                className={`mobile-pr-chip${selected ? ' mobile-pr-chip--active' : ''}`}
+                data-pr-identity={identity}
+                aria-pressed={selected}
+                aria-expanded={isExpanded}
+                disabled={savingPrIdentity !== null}
+                onClick={() => selectMobilePr(pr, selected)}
+              >
+                <span className={`mobile-pr-status-dot mobile-pr-status-dot--${pr.display_state}`} aria-hidden="true" />
+                <span className="mobile-pr-chip-number">#{pr.pr_number}</span>
+                <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
+                {selected && freshnessLabel && (
+                  <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>{freshnessLabel.replace(' new', '')}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {error && <div className="work-actions-error">{error}</div>}
       </div>
     );
   }
