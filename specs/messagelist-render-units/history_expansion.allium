@@ -66,6 +66,7 @@ surface HistoryExpansionController {
     provides:
         ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
         ReaderExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+        ReaderRestoreUpdated(view, request_token, restore_basis, anchor_message_id, viewport_start_offset)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
         LoadedTargetRequested(view, command_token, target_message_id)
         DeepLinkTargetChanged(view, target_message_id)
@@ -298,6 +299,19 @@ rule StaleHistorySuccessCannotMutateView {
     ensures: view.pending_command = view.pending_command
     ensures: view.active_request = view.active_request
     ensures: view.failure = view.failure
+}
+
+rule ActiveReaderExpansionTracksLatestRestoreBasis {
+    when: ReaderRestoreUpdated(view, request_token, restore_basis, anchor_message_id, viewport_start_offset)
+    requires: view.active_request != null
+    requires: view.active_request.token = request_token
+    requires: view.active_request.intent = reader_expand
+    requires: restore_basis in { reader_anchor, reader_viewport }
+    requires: restore_basis = reader_viewport
+        or anchor_message_id != null and viewport_start_offset != null
+    ensures: view.active_request.restore_basis = restore_basis
+    ensures: view.active_request.anchor_message_id = anchor_message_id
+    ensures: view.active_request.viewport_start_offset = viewport_start_offset
 }
 
 rule ReaderExpansionCreatesContinuityCommand {
@@ -539,6 +553,10 @@ contract HistoryExpansionSafety {
         -- message so unitTop - viewportTop equals the captured
         -- viewport_start_offset, preserves the scroll policy's existing reader
         -- or following ownership, and never highlights a message.
+
+    @invariant ActiveReaderExpansionUsesLatestRestoreBasis
+        -- Reader movement during an active reader expansion updates that
+        -- request's restore basis only when request token and view identity match.
 
     @invariant ReaderViewportExpansionEmitsNoPositioningCommand
         -- A reader_viewport expansion preserves the physical viewport without

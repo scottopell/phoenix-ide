@@ -127,6 +127,7 @@ interface MessageListProps {
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
+  onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   transcriptPositioning: TranscriptPositioningInput;
@@ -347,6 +348,7 @@ function MessageListImpl({
   onChaptersChange,
   hasOlderMessages = false,
   onLoadOlderMessages,
+  onUpdateOlderMessagesRestore,
   loadingOlderMessages = false,
   olderHistoryError,
   transcriptPositioning,
@@ -550,6 +552,7 @@ function MessageListImpl({
   const earlierHistoryRequestScheduledRef = useRef(false);
   const cancelScheduledEarlierHistoryRef = useRef<(() => void) | null>(null);
   const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
+  const updateEarlierHistoryRestoreRef = useRef<() => void>(() => {});
   const touchStartYRef = useRef<number | null>(null);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
@@ -730,6 +733,7 @@ function MessageListImpl({
             : { type: 'downwardMovement', snapshot },
         );
         if (snapshot.scrollTop < previousTop) requestFromUpwardIntent();
+        updateEarlierHistoryRestoreRef.current();
       };
       const onKeyDown = (e: KeyboardEvent) => {
         const target = e.target;
@@ -953,6 +957,10 @@ function MessageListImpl({
     });
   }, [captureHistoryRestoreBasis, conversationId, currentHistoryViewKey, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
   requestEarlierHistoryRef.current = requestEarlierHistory;
+  updateEarlierHistoryRestoreRef.current = () => {
+    if (!loadingOlderMessages || !onUpdateOlderMessagesRestore) return;
+    onUpdateOlderMessagesRestore(captureHistoryRestoreBasis(true));
+  };
 
   useEffect(() => {
     cancelScheduledEarlierHistoryRef.current?.();

@@ -975,6 +975,17 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     });
   }, [loadOlderMessagesForIntent]);
 
+  const updateOlderMessagesRestore = useCallback((restore: RestoreBasis) => {
+    const active = historyExpansion.activeRequest;
+    if (!active || active.intent.kind !== 'reader_expansion') return;
+    dispatchHistoryExpansion({
+      type: 'reader_restore_updated',
+      requestToken: active.token,
+      view: active.view,
+      restore,
+    });
+  }, [historyExpansion.activeRequest]);
+
   useEffect(() => {
     dispatchHistoryExpansion({ type: 'target_changed', targetMessageId: targetMessageId ?? null });
   }, [targetMessageId]);
@@ -1996,6 +2007,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         systemPrompt={atom.systemPrompt ?? undefined}
         hasOlderMessages={historyExpansion.coverage === 'tail'}
         onLoadOlderMessages={loadOlderMessages}
+        onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
         loadingOlderMessages={historyExpansion.activeRequest !== null}
         olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
           ? historyExpansion.failure.message

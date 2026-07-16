@@ -100,6 +100,48 @@ describe('history expansion reducer', () => {
     expect(missing.activeRequest).toBeNull();
   });
 
+  it('uses the latest view-bound reader restore basis when history finishes loading', () => {
+    const currentView = view('a', 1);
+    let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: manualRequest(currentView),
+    });
+    state = reduceHistoryExpansion(state, {
+      type: 'reader_restore_updated',
+      requestToken: 1,
+      view: currentView,
+      restore: { kind: 'reader_anchor', messageId: 'latest', viewportStartOffset: 22 },
+    });
+    state = reduceHistoryExpansion(state, {
+      type: 'history_loaded', requestToken: 1, view: currentView, targetPresent: true, commandToken: 101,
+    });
+
+    expect(state.pendingCommand).toMatchObject({
+      kind: 'restore_after_prefix_expansion',
+      messageId: 'latest',
+      viewportStartOffset: 22,
+    });
+  });
+
+  it('ignores reader restore updates from a stale view or request token', () => {
+    const currentView = view('a', 1);
+    const state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: manualRequest(currentView),
+    });
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'reader_restore_updated',
+      requestToken: 2,
+      view: currentView,
+      restore: { kind: 'reader_viewport' },
+    })).toBe(state);
+    expect(reduceHistoryExpansion(state, {
+      type: 'reader_restore_updated',
+      requestToken: 1,
+      view: view('b', 2),
+      restore: { kind: 'reader_viewport' },
+    })).toBe(state);
+  });
+
   it('matching acknowledgement consumes once and stale acknowledgement is ignored', () => {
     const currentView = view('a', 1);
     let state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
