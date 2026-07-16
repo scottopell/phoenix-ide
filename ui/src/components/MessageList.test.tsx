@@ -12,6 +12,7 @@ import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
+import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 // MessageList now subscribes to the conversation store for
 // useStreamingStartedAt (session-stable key). Wrap renders in a
@@ -3151,7 +3152,11 @@ it('find navigation carries read_file fragment reveal target for offscreen navig
   const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
   expect(renderedAgent?.message.message_id).toBe('agent-read-file');
   expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-read-1', lineNumber: 8 });
-  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('read-file-line:second%20alpha%20line:0');
+  const expectedFragmentId = buildReadFileOutputProjection(
+    '     7\tconst alpha = 1;\n     8\tsecond alpha line',
+    { path: 'src/foo.ts', offset: 7, limit: 2 },
+  ).fragments.find((fragment) => fragment.kind === 'line' && fragment.display.lineNumber === 8)?.fragmentId;
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe(expectedFragmentId);
   expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
 });
 

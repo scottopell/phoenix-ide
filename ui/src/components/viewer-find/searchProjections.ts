@@ -873,6 +873,15 @@ function parseReadFileRenderedLine(line: string): { lineNumber: number; content:
   };
 }
 
+function boundedFragmentHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function buildReadFileProjectionFragments(
   text: string,
   input: Record<string, unknown>,
@@ -928,7 +937,7 @@ function buildReadFileProjectionFragments(
     };
     const duplicateIndex = duplicateLineCounts.get(renderedLine.content) ?? 0;
     duplicateLineCounts.set(renderedLine.content, duplicateIndex + 1);
-    const fragmentId = `read-file-line:${encodeURIComponent(renderedLine.content)}:${duplicateIndex}`;
+    const fragmentId = `read-file-line:${boundedFragmentHash(renderedLine.content)}:${duplicateIndex}`;
     fragments.push({
       fragmentId,
       semanticText: `${renderedLine.lineNumber}\t${renderedLine.content}`,
@@ -1050,33 +1059,58 @@ function semanticConsoleLogsText(resultText: string): string {
 function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux'): string {
   try {
     const parsed = JSON.parse(resultText);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return semanticObjectText(parsed);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resultText;
     const record = parsed as Record<string, unknown>;
-    const semantic = semanticObjectText(record);
-    const visibleLabels: string[] = [];
+    if (typeof record['error'] === 'string') {
+      const messageKey = family === 'bash' ? 'error_message' : 'message';
+      return [
+        `error: ${record['error']}`,
+        typeof record[messageKey] === 'string' ? record[messageKey] : '',
+        family === 'bash' && typeof record['hint'] === 'string' ? record['hint'] : '',
+      ].filter(Boolean).join('\n');
+    }
+
+    const visible: string[] = [];
     const status = typeof record['status'] === 'string' ? record['status'] : '';
     if (family === 'bash') {
       const statusLabel = status === 'still_running'
         ? 'still running'
         : status === 'kill_pending_kernel'
           ? 'kill pending (kernel)'
-          : status;
-      if (statusLabel) visibleLabels.push(statusLabel);
+          : status === 'tombstoned' && typeof record['final_cause'] === 'string'
+            ? `tombstoned · ${record['final_cause']}`
+            : status;
+      if (statusLabel) visible.push(statusLabel);
+      if (typeof record['handle'] === 'string') visible.push(record['handle']);
+      if (typeof record['label'] === 'string') visible.push(record['label']);
       if ((status === 'exited' || status === 'tombstoned') && record['exit_code'] !== null && record['exit_code'] !== undefined) {
-        visibleLabels.push(`exit code ${String(record['exit_code'])}`);
+        visible.push(`exit code ${String(record['exit_code'])}`);
       }
       if ((status === 'killed' || status === 'tombstoned') && typeof record['signal_number'] === 'number') {
-        visibleLabels.push(`signal ${String(record['signal_number'])}`);
+        visible.push(`signal ${String(record['signal_number'])}`);
       }
-      if (record['truncated_before'] === true) visibleLabels.push('[output truncated before this view]');
+      if (typeof record['kill_signal_sent'] === 'string') visible.push(`kill: ${record['kill_signal_sent']}`);
+      if (typeof record['signal_sent'] === 'string' && record['signal_sent'] !== record['kill_signal_sent']) {
+        visible.push(`signal_sent: ${record['signal_sent']}`);
+      }
+      if (typeof record['waited_ms'] === 'number') visible.push(`waited ${Math.round(record['waited_ms'])} ms`);
+      if (typeof record['duration_ms'] === 'number') visible.push(`duration ${Math.round(record['duration_ms'])} ms`);
+      if (record['truncated_before'] === true) visible.push('[output truncated before this view]');
+      if (Array.isArray(record['lines'])) {
+        visible.push(record['lines'].map((line) =>
+          line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
+            ? (line as { bytes: string }).bytes
+            : '').join('\n'));
+      }
     } else {
-      if (status) visibleLabels.push(status);
-      if (record['exit_code'] !== null && record['exit_code'] !== undefined) {
-        visibleLabels.push(`exit code ${String(record['exit_code'])}`);
-      }
-      if (record['truncated'] === true) visibleLabels.push('[output truncated]');
+      if (status) visible.push(status);
+      if (record['exit_code'] !== null && record['exit_code'] !== undefined) visible.push(`exit code ${String(record['exit_code'])}`);
+      if (typeof record['duration_ms'] === 'number') visible.push(`${Math.round(record['duration_ms'])} ms`);
+      if (typeof record['stdout'] === 'string' && record['stdout']) visible.push(`stdout\n${record['stdout']}`);
+      if (typeof record['stderr'] === 'string' && record['stderr']) visible.push(`stderr\n${record['stderr']}`);
+      if (record['truncated'] === true) visible.push('[output truncated]');
     }
-    return [...visibleLabels, semantic].filter(Boolean).join('\n');
+    return visible.filter(Boolean).join('\n');
   } catch {
     return resultText;
   }

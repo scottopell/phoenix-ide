@@ -267,6 +267,20 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByText(/focused on lines 3–5/)).toBeInTheDocument();
   });
 
+  it('enables find when a focused markdown range renders in the line-aware source viewer', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: '# Heading\nparagraph alpha\nparagraph second line',
+      focus: { kind: 'range', startLine: 2, endLine: 3 },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+  });
+
   it('lets a focused large HTML file still toggle from line-aware source to sandboxed preview', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({

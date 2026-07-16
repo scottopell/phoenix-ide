@@ -263,8 +263,8 @@ describe('buildReadFileOutputProjection parity', () => {
     expect(built.fullText).toBe('src/foo.ts:7-8\n7\tconst alpha = 1;\n8\tsecond alpha line');
     expect(built.fragments.map((fragment) => fragment.fragmentId)).toEqual([
       'read-file-path',
-      'read-file-line:const%20alpha%20%3D%201%3B:0',
-      'read-file-line:second%20alpha%20line:0',
+      expect.stringMatching(/^read-file-line:[a-z0-9]+:0$/),
+      expect.stringMatching(/^read-file-line:[a-z0-9]+:0$/),
     ]);
     expect(built.fragments[1]?.revealTarget).toMatchObject({
       kind: 'tool-result-read-file',

@@ -228,7 +228,7 @@ describe('typed semantic display projections', () => {
       undefined,
       { toolUseId: 'tmux-1' },
     );
-    expect(projection.fullText).toContain('stdout: semantic output');
+    expect(projection.fullText).toContain('stdout\nsemantic output');
     expect(projection.fullText).not.toContain('{');
     expect(projection.fragments[0].revealTarget).toMatchObject({
       kind: 'tool-result-terminal',
@@ -255,6 +255,33 @@ describe('typed semantic display projections', () => {
     expect(tmux.fullText).toContain('[output truncated]');
   });
 
+  it('excludes structured terminal fields that the renderer does not display', () => {
+    const bash = buildTerminalToolResultProjection(
+      'bash',
+      JSON.stringify({
+        status: 'exited',
+        exit_code: 0,
+        lines: [{ offset: 7, bytes: 'visible output' }],
+        oldest_offset: 7,
+        next_offset: 8,
+        work_scope_key: 'hidden-work-scope',
+      }),
+      undefined,
+    );
+    expect(bash.fullText).toContain('visible output');
+    expect(bash.fullText).not.toContain('oldest offset');
+    expect(bash.fullText).not.toContain('hidden-work-scope');
+    expect(bash.fullText).not.toContain('offset: 7');
+
+    const tmux = buildTerminalToolResultProjection(
+      'tmux',
+      JSON.stringify({ status: 'exited', stdout: 'visible stdout', window_id: '@hidden-window' }),
+      undefined,
+    );
+    expect(tmux.fullText).toContain('visible stdout');
+    expect(tmux.fullText).not.toContain('@hidden-window');
+  });
+
   it('skips numbered read_file metadata while retaining legacy plain lines', () => {
     const numbered = buildReadFileOutputProjection(
       '     7\talpha\n     8\tbeta\n\n[12 more lines not shown. Use offset=9 to continue.]\n',
@@ -269,6 +296,15 @@ describe('typed semantic display projections', () => {
       '4\tplain alpha',
       '5\tplain beta',
     ]);
+  });
+
+  it('uses bounded opaque ids for arbitrarily long read_file lines', () => {
+    const secret = `token-${'x'.repeat(20_000)}`;
+    const projection = buildReadFileOutputProjection(`     1\t${secret}`, { path: 'secret.txt' });
+    const line = projection.fragments.find((fragment) => fragment.kind === 'line');
+    expect(line?.semanticText).toContain(secret);
+    expect(line?.fragmentId).not.toContain('token');
+    expect(line?.fragmentId.length).toBeLessThan(64);
   });
 
   it('keeps complete sub-agent outcomes searchable behind compact previews', () => {
@@ -553,9 +589,13 @@ describe('buildConversationSearchProjection', () => {
 
     const compactProjection = buildConversationSearchProjection(units, 'alpha', { density: 'compact' });
     expect(compactProjection.matches).toHaveLength(2);
-    const lineMatch = compactProjection.matches.find((match) => match.target.kind === 'unit-text'
-      && match.target.fragmentId === 'read-file-line:second%20alpha%20line:0');
-    expect(lineMatch).toBeTruthy();
+    const lineMatch = compactProjection.matches.find((match) => {
+      if (match.target.kind !== 'unit-text' || !match.target.fragmentId) return false;
+      const source = compactProjection.sources.find((candidate) => candidate.id === match.target.sourceId);
+      return source?.fragmentId === match.target.fragmentId && source.text.includes('second alpha line');
+    });
+    expect(lineMatch?.target.kind === 'unit-text' ? lineMatch.target.fragmentId : null)
+      .toMatch(/^read-file-line:[a-z0-9]+:0$/);
     expect(compactProjection.sources.find((source) => source.fragmentId === 'read-file-path')?.revealTarget).toMatchObject({
       kind: 'tool-result-read-file',
       toolUseId: 'tool-read',
@@ -574,7 +614,7 @@ describe('buildConversationSearchProjection', () => {
       ]),
       toolResultsByUseId: new Map([[
         'middle-tool',
-        toolMsg('middle-result', 'middle-tool', { content: JSON.stringify({ status: 'exited', stdout: 'tool shared token', exit_code: 0 }) }),
+        toolMsg('middle-result', 'middle-tool', { content: JSON.stringify({ status: 'exited', lines: [{ bytes: 'tool shared token' }], exit_code: 0 }) }),
       ]]),
     }];
 

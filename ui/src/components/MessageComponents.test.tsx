@@ -12,6 +12,7 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { buildRenderUnits } from '../conversation/renderUnits';
+import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 let mockDensity: 'full' | 'compact' = 'full';
 
@@ -2199,14 +2200,15 @@ describe('compact tool summaries', () => {
     const results = new Map<string, Message>([
       ['tool-read', toolMessage('tool-read', '     1\thidden token')],
     ]);
+    const fragmentId = buildReadFileOutputProjection('     1\thidden token', { path: 'src/hidden.ts' }).fragments[1]!.fragmentId;
     const revealRequest = {
       nonce: 1,
       unitKey: 'unit-1',
-      fragmentId: 'read-file-line:hidden%20token:0',
+      fragmentId,
       revealTarget: {
         kind: 'tool-result-read-file' as const,
         toolUseId: 'tool-read',
-        fragmentId: 'read-file-line:hidden%20token:0',
+        fragmentId,
         lineNumber: 1,
         path: 'src/hidden.ts',
       },
@@ -2239,7 +2241,7 @@ describe('compact tool summaries', () => {
       ['read-a', toolMessage('read-a', '     1\tsame token')],
       ['read-b', toolMessage('read-b', '     1\tsame token')],
     ]);
-    const fragmentId = 'read-file-line:same%20token:0';
+    const fragmentId = buildReadFileOutputProjection('     1\tsame token', { path: 'b.ts' }).fragments[1]!.fragmentId;
 
     const { container } = render(
       <MemoryRouter>
