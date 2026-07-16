@@ -310,7 +310,7 @@ rule ActiveReaderExpansionTracksLatestRestoreBasis {
     requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request.restore_basis = restore_basis
-    ensures: view.active_request.anchor_message_id = anchor_message_id
+    ensures: view.active_request.message_id = anchor_message_id
     ensures: view.active_request.viewport_start_offset = viewport_start_offset
 }
 
