@@ -2644,7 +2644,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     ]);
     return render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1">
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1">
           <AgentMessage
             message={message}
             toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
@@ -2742,7 +2742,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     ]);
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1">
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1">
           <AgentMessage
             message={message}
             toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
@@ -2755,6 +2755,79 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     // After the second (refetch) fetch lands, the Review affordance shows.
     expect(await screen.findByRole('button', { name: 'Review' })).toBeInTheDocument();
     expect(listMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops a fork approval outcome when route ownership changes while the action is pending', async () => {
+    let resolveApproval!: (value: { fork_conversation_id: string }) => void;
+    (api.approveForkProposal as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => { resolveApproval = resolve; }),
+    );
+    (api.listForkProposals as ReturnType<typeof vi.fn>).mockResolvedValue([
+      proposal({ status: 'pending' }),
+    ]);
+    const onOutcome = vi.fn();
+    const onError = vi.fn();
+
+    function ApproveHarness() {
+      const fork = useForkProposals();
+      return fork
+        ? <button type="button" onClick={() => void fork.approve('prop-1')}>trigger-approve</button>
+        : null;
+    }
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
+          <ApproveHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText('trigger-approve'));
+    rerender(
+      <MemoryRouter>
+        <ForkProposalsProvider ownerGeneration={2} conversationId="agent-2" onOutcome={onOutcome} onError={onError}>
+          <ApproveHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    resolveApproval({ fork_conversation_id: 'stale-fork' });
+    await act(async () => Promise.resolve());
+
+    expect(onOutcome).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('carries the initiating route owner through a fork approval outcome', async () => {
+    (api.approveForkProposal as ReturnType<typeof vi.fn>).mockResolvedValue({
+      fork_conversation_id: 'fork-conv-9',
+    });
+    (api.listForkProposals as ReturnType<typeof vi.fn>).mockResolvedValue([
+      proposal({ status: 'pending' }),
+    ]);
+    const onOutcome = vi.fn();
+
+    function ApproveHarness() {
+      const fork = useForkProposals();
+      return fork
+        ? <button type="button" onClick={() => void fork.approve('prop-1')}>trigger-approve-owned</button>
+        : null;
+    }
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider ownerGeneration={7} conversationId="agent-1" onOutcome={onOutcome}>
+          <ApproveHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText('trigger-approve-owned'));
+
+    await waitFor(() => expect(onOutcome).toHaveBeenCalledWith({
+      kind: 'spawned',
+      conversationId: 'fork-conv-9',
+      ownerGeneration: 7,
+    }));
   });
 
   // Bug 3: a dismiss that returns no_op (resolved in another tab) must NOT show a
@@ -2784,7 +2857,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome}>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" onOutcome={onOutcome}>
           <DismissHarness />
         </ForkProposalsProvider>
       </MemoryRouter>,
@@ -2798,7 +2871,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     });
 
     await waitFor(() => {
-      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved' });
+      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved', ownerGeneration: 1 });
     });
     // A no_op dismiss never reports a 'dismissed' outcome...
     expect(onOutcome).not.toHaveBeenCalledWith({ kind: 'dismissed' });
@@ -2822,7 +2895,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     function Harness({ terminal }: { terminal: boolean }) {
       return (
         <MemoryRouter>
-          <ForkProposalsProvider conversationId="agent-1" originTerminal={terminal}>
+          <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" originTerminal={terminal}>
             <AgentMessage
               message={message}
               toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
@@ -2869,7 +2942,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1" originTerminal={true}>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" originTerminal={true}>
           <AgentMessage
             message={message}
             toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
@@ -2898,7 +2971,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1" originTerminal={true}>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" originTerminal={true}>
           <AgentMessage
             message={message}
             toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
@@ -2942,7 +3015,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
           <ApproveHarness />
         </ForkProposalsProvider>
       </MemoryRouter>,
@@ -2988,7 +3061,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
     render(
       <MemoryRouter>
-        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
+        <ForkProposalsProvider ownerGeneration={1} conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
           <ApproveHarness />
         </ForkProposalsProvider>
       </MemoryRouter>,
@@ -3000,7 +3073,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     });
 
     await waitFor(() => {
-      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved' });
+      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved', ownerGeneration: 1 });
     });
     // A genuine resolution never surfaces a conflict error.
     expect(onError).not.toHaveBeenCalled();

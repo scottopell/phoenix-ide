@@ -101,7 +101,7 @@ export function ToolResultsFixture({ scenario }: Props) {
   if (!mockInstalled) return null;
 
   return (
-    <ForkProposalsProvider conversationId={data.conversationId}>
+    <ForkProposalsProvider ownerGeneration={1} conversationId={data.conversationId}>
       <ToolResultsFixtureContent scenario={scenario} />
     </ForkProposalsProvider>
   );

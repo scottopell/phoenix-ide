@@ -29,6 +29,7 @@ import type { ForkProposalSummary } from '../api';
  *  can navigate / toast (the provider owns no router or toast of its own). */
 export interface ForkActionOutcome {
   kind: 'spawned' | 'dismissed' | 'promoted' | 'already_resolved';
+  ownerGeneration: number;
   /** Target conversation id for `spawned` (the Work fork) / `promoted` (the
    *  Explore refinement). Absent for `dismissed` / `already_resolved`. */
   conversationId?: string;
@@ -66,6 +67,8 @@ export interface ForkProposalsProviderProps {
    *  conversation yet) the provider is inert: it fetches nothing and every
    *  lookup misses. */
   conversationId?: string | undefined;
+  /** Monotonic route-owner generation captured when an action begins. */
+  ownerGeneration: number;
   /** True once the origin conversation has reached a terminal state (merged /
    *  abandoned / context-exhausted / handed off). The backend retires pending
    *  proposals to `dismissed` on that transition; the provider refetches once
@@ -81,6 +84,7 @@ export interface ForkProposalsProviderProps {
 export function ForkProposalsProvider({
   children,
   conversationId,
+  ownerGeneration,
   originTerminal,
   onOutcome,
   onError,
@@ -92,6 +96,12 @@ export function ForkProposalsProvider({
   // Latest conversation id, read inside async actions without re-binding them.
   const convIdRef = useRef<string | undefined>(conversationId);
   convIdRef.current = conversationId;
+  const ownerGenerationRef = useRef(ownerGeneration);
+  ownerGenerationRef.current = ownerGeneration;
+  const actionStillOwned = useCallback(
+    (id: string, generation: number) => convIdRef.current === id && ownerGenerationRef.current === generation,
+    [],
+  );
 
   // Latest fetched list, so a failed refetch can return prior state and a 409
   // handler can inspect a proposal's reconciled status without racing React's
@@ -199,17 +209,25 @@ export function ForkProposalsProvider({
   // resolved); a still-`pending` status means the conflict was a precondition
   // failure, so surface its message and leave the modal open for a retry.
   const handleActionConflict = useCallback(
-    async (proposalId: string, err: ConflictError, fallbackMessage: string) => {
+    async (
+      proposalId: string,
+      err: ConflictError,
+      fallbackMessage: string,
+      id: string,
+      generation: number,
+    ) => {
+      if (!actionStillOwned(id, generation)) return;
       const list = await refetch();
+      if (!actionStillOwned(id, generation)) return;
       const reconciled = list.find((p) => p.id === proposalId);
       if (!reconciled || reconciled.status !== 'pending') {
         setOpenProposalId(null);
-        onOutcome?.({ kind: 'already_resolved' });
+        onOutcome?.({ kind: 'already_resolved', ownerGeneration: generation });
         return;
       }
       onError?.(err.message || fallbackMessage);
     },
-    [refetch, onOutcome, onError],
+    [actionStillOwned, refetch, onOutcome, onError],
   );
 
   /** Optimistically mark a proposal resolved so the affordance withdraws
@@ -226,61 +244,68 @@ export function ForkProposalsProvider({
   const approve = useCallback(
     async (proposalId: string) => {
       const id = convIdRef.current;
+      const generation = ownerGenerationRef.current;
       if (!id) return;
       try {
         const { fork_conversation_id } = await api.approveForkProposal(id, proposalId);
+        if (!actionStillOwned(id, generation)) return;
         markResolved(proposalId, {
           status: 'spawned',
           fork_conversation_id,
         });
         setOpenProposalId(null);
-        onOutcome?.({ kind: 'spawned', conversationId: fork_conversation_id });
-        refetch();
+        onOutcome?.({ kind: 'spawned', conversationId: fork_conversation_id, ownerGeneration: generation });
+        void refetch();
       } catch (e) {
+        if (!actionStillOwned(id, generation)) return;
         if (e instanceof ConflictError) {
-          await handleActionConflict(proposalId, e, 'Failed to approve proposal');
+          await handleActionConflict(proposalId, e, 'Failed to approve proposal', id, generation);
         } else {
           onError?.(e instanceof Error ? e.message : 'Failed to approve proposal');
-          refetch();
+          void refetch();
         }
       }
     },
-    [markResolved, onOutcome, onError, refetch, handleActionConflict],
+    [actionStillOwned, markResolved, onOutcome, onError, refetch, handleActionConflict],
   );
 
   const dismiss = useCallback(
     async (proposalId: string) => {
       const id = convIdRef.current;
+      const generation = ownerGenerationRef.current;
       if (!id) return;
       try {
         const { no_op } = await api.dismissForkProposal(id, proposalId);
+        if (!actionStillOwned(id, generation)) return;
         setOpenProposalId(null);
         if (no_op) {
           // Another tab already resolved (spawned/promoted) this proposal. Do
           // not force a local `dismissed` status — the refetch in `finally`
           // reconciles the store to the true status and its fork/refinement id.
-          onOutcome?.({ kind: 'already_resolved' });
+          onOutcome?.({ kind: 'already_resolved', ownerGeneration: generation });
         } else {
           markResolved(proposalId, { status: 'dismissed' });
-          onOutcome?.({ kind: 'dismissed' });
+          onOutcome?.({ kind: 'dismissed', ownerGeneration: generation });
         }
       } catch (e) {
+        if (!actionStillOwned(id, generation)) return;
         if (e instanceof ConflictError) {
           setOpenProposalId(null);
-          onOutcome?.({ kind: 'already_resolved' });
+          onOutcome?.({ kind: 'already_resolved', ownerGeneration: generation });
         } else {
           onError?.(e instanceof Error ? e.message : 'Failed to dismiss proposal');
         }
       } finally {
-        refetch();
+        if (actionStillOwned(id, generation)) void refetch();
       }
     },
-    [markResolved, onOutcome, onError, refetch],
+    [actionStillOwned, markResolved, onOutcome, onError, refetch],
   );
 
   const requestChanges = useCallback(
     async (proposalId: string, note: string) => {
       const id = convIdRef.current;
+      const generation = ownerGenerationRef.current;
       if (!id) return;
       try {
         const { refinement_conversation_id } = await api.requestChangesForkProposal(
@@ -288,23 +313,25 @@ export function ForkProposalsProvider({
           proposalId,
           note,
         );
+        if (!actionStillOwned(id, generation)) return;
         markResolved(proposalId, {
           status: 'promoted',
           refinement_conversation_id,
         });
         setOpenProposalId(null);
-        onOutcome?.({ kind: 'promoted', conversationId: refinement_conversation_id });
-        refetch();
+        onOutcome?.({ kind: 'promoted', conversationId: refinement_conversation_id, ownerGeneration: generation });
+        void refetch();
       } catch (e) {
+        if (!actionStillOwned(id, generation)) return;
         if (e instanceof ConflictError) {
-          await handleActionConflict(proposalId, e, 'Failed to request changes');
+          await handleActionConflict(proposalId, e, 'Failed to request changes', id, generation);
         } else {
           onError?.(e instanceof Error ? e.message : 'Failed to request changes');
-          refetch();
+          void refetch();
         }
       }
     },
-    [markResolved, onOutcome, onError, refetch, handleActionConflict],
+    [actionStillOwned, markResolved, onOutcome, onError, refetch, handleActionConflict],
   );
 
   const value = useMemo<ForkProposalsValue>(

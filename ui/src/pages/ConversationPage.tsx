@@ -1374,8 +1374,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     targetConversationId: string,
     missingMessage: string,
     failureMessage: string,
+    ownerGeneration = conversationRouteOwnerRef.current.generation,
   ) => {
-    const ownerGeneration = conversationRouteOwnerRef.current.generation;
+    if (conversationRouteOwnerRef.current.generation !== ownerGeneration) return;
     const resolution = await resolveOwnedConversationTarget(
       targetConversationId,
       ownerGeneration,
@@ -1412,6 +1413,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
               outcome.conversationId,
               `Created ${label} conversation.`,
               `Created ${label} conversation.`,
+              outcome.ownerGeneration,
             );
           }
           break;
@@ -2004,6 +2006,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   return (
     <ForkProposalsProvider
       conversationId={conversationId}
+      ownerGeneration={conversationRouteOwnerRef.current.generation}
       originTerminal={isArchived || isTerminalConversationState(convStateForChildren)}
       onOutcome={handleForkOutcome}
       onError={showError}
