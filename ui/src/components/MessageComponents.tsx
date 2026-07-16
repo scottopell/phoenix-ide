@@ -2081,10 +2081,10 @@ export function PatchResultView({
 
 function renderSearchResultPath(
   path: string,
-  hits: readonly { fragment: { fragmentId: string } }[],
+  fragmentId: string,
   activeHighlight: AgentTextHighlight | null,
 ): React.ReactNode {
-  if (!activeHighlight || !hits.some((hit) => hit.fragment.fragmentId === activeHighlight.fragmentId)) return path;
+  if (activeHighlight?.fragmentId !== fragmentId) return path;
   return keywordFieldHighlight(activeHighlight, 0, path);
 }
 
@@ -2144,15 +2144,19 @@ export function SearchResultsView({
                   )
                 }
                 title="Open file"
+                data-fragment-id={group.fragment.fragmentId}
               >
-                {renderSearchResultPath(group.path, group.hits, activeHighlight)}
+                {renderSearchResultPath(group.path, group.fragment.fragmentId, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
               </button>
             ) : (
-              <span className="search-results-filepath search-results-filepath-static">
-                {renderSearchResultPath(group.path, group.hits, activeHighlight)}
+              <span
+                className="search-results-filepath search-results-filepath-static"
+                data-fragment-id={group.fragment.fragmentId}
+              >
+                {renderSearchResultPath(group.path, group.fragment.fragmentId, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
@@ -2162,12 +2166,11 @@ export function SearchResultsView({
               {group.hits.map((hit) => {
                 const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
                 const lineText = String(hit.lineNumber);
-                const pathPrefixLength = hit.path.length + 1;
-                const contentStart = pathPrefixLength + lineText.length + 2;
+                const contentStart = lineText.length + 2;
                 const lineNumberContent = (
                   <>
                     <span className="search-result-lineno">
-                      {keywordFieldHighlight(highlight, pathPrefixLength, lineText)}
+                      {keywordFieldHighlight(highlight, 0, lineText)}
                     </span>
                     <span className="search-result-content">
                       {keywordFieldHighlight(highlight, contentStart, hit.content || ' ')}

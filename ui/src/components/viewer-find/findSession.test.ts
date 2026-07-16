@@ -165,6 +165,24 @@ describe('findSession', () => {
     expect(result.commands).toEqual([]);
   });
 
+  it('replace-results does not reveal a retained active match with an equal rebuilt target', () => {
+    const alpha = makeMatch('alpha', 0);
+    const beta = makeMatch('beta', 1);
+    let state = openFindSession(createClosedFindSession<Target, FocusOrigin>(), makeSurface({
+      query: 'a',
+      matches: [alpha, beta],
+      focusOrigin: { scope: 'viewer', token: 'origin-1' },
+    })).state;
+    state = activateFindSessionMatch(state, beta.id).state;
+
+    const result = replaceFindSessionResults(state, [makeMatch('alpha', 0), makeMatch('beta', 1)]);
+
+    expect(result.state.status).toBe('open');
+    if (result.state.status !== 'open') throw new Error('expected open state');
+    expect(result.state.activeMatchId).toBe(beta.id);
+    expect(result.commands).toEqual([]);
+  });
+
   it('replace-results reveals a retained active match when its target is refreshed', () => {
     const alpha = makeMatch('alpha', 0);
     const beta = makeMatch('beta', 1);

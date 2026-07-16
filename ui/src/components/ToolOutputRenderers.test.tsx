@@ -445,9 +445,16 @@ describe('SearchResultsView', () => {
     expect(screen.getAllByText(/println!/)).toHaveLength(1);
   });
 
+  it('projects a grouped path once and excludes it from per-hit text', () => {
+    const projection = buildSearchOutputProjection(text, { toolUseId: 'search-1' });
+    expect(projection.groups[0]?.fragment.semanticText).toBe('src/foo.rs');
+    expect(projection.fragments.filter((fragment) => fragment.semanticText.includes('src/foo.rs'))).toHaveLength(1);
+    expect(projection.groups[0]?.hits.every((hit) => !hit.fragment.semanticText.includes('src/foo.rs'))).toBe(true);
+  });
+
   it('marks a path-only active occurrence in the grouped path field', () => {
     const projection = buildSearchOutputProjection(text, { toolUseId: 'search-1' });
-    const targetFragment = projection.hits[0]!.fragment;
+    const targetFragment = projection.groups[0]!.fragment;
     const { container } = render(
       <SearchResultsView
         rawText={text}

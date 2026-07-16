@@ -481,6 +481,49 @@ describe('buildConversationSearchProjection', () => {
     expect(compactProjection.matches).toHaveLength(0);
   });
 
+  it('excludes successful image-rendered tool results from transcript text search', () => {
+    const imageResult = {
+      ...toolMsg('image-result', 'image-tool', { result: 'Screenshot taken', images: [{ data: 'base64', media_type: 'image/png' }] }),
+    };
+    const legacyScreenshot = {
+      ...toolMsg('screenshot-result', 'screenshot-tool', { result: 'Screenshot taken' }),
+      display_data: { type: 'image', media_type: 'image/png', data: 'legacy-base64' },
+    };
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'images',
+      isFirstInTurn: true,
+      agent: agentMsg('images', [
+        { type: 'tool_use', id: 'image-tool', name: 'read_image', input: { path: 'capture.png' } },
+        { type: 'tool_use', id: 'screenshot-tool', name: 'browser_take_screenshot', input: {} },
+      ]),
+      toolResultsByUseId: new Map([
+        ['image-tool', imageResult],
+        ['screenshot-tool', legacyScreenshot],
+      ]),
+    }];
+
+    expect(buildConversationSearchProjection(units, 'Screenshot taken', { density: 'full' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'legacy-base64', { density: 'full' }).matches).toHaveLength(0);
+  });
+
+  it('keeps image-tool errors searchable as visible text', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'image-error',
+      isFirstInTurn: true,
+      agent: agentMsg('image-error', [
+        { type: 'tool_use', id: 'image-tool', name: 'read_image', input: { path: 'missing.png' } },
+      ]),
+      toolResultsByUseId: new Map([[
+        'image-tool',
+        toolMsg('image-result', 'image-tool', { error: 'image missing', is_error: true }),
+      ]]),
+    }];
+
+    expect(buildConversationSearchProjection(units, 'image missing', { density: 'full' }).matches).toHaveLength(1);
+  });
+
   it('keeps force-expanded latest compact text searchable past the first line', () => {
     const message = agentMsg('a1', [{ type: 'text', text: 'first line\nvisible second line alpha' }]);
     message.display_data = { forceExpandedText: true };

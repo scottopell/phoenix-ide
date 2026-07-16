@@ -257,7 +257,7 @@ export interface SearchResultFragment {
   semanticText: string;
   display: SearchResultFragmentDisplay;
   revealTarget: SearchResultRevealTarget;
-  kind: 'hit' | 'note' | 'empty' | 'fallback';
+  kind: 'group' | 'hit' | 'note' | 'empty' | 'fallback';
 }
 
 export interface SearchHitProjection {
@@ -270,6 +270,7 @@ export interface SearchHitProjection {
 export interface SearchGroupProjection {
   path: string;
   hits: SearchHitProjection[];
+  fragment: SearchResultFragment;
 }
 
 export interface SearchOutputProjection {
@@ -1175,13 +1176,14 @@ export function buildSearchOutputProjection(
       const path = m[1];
       const lineNumber = parseInt(m[2], 10);
       const content = m[3] ?? '';
-      const semanticText = `${path}:${lineNumber}: ${content}`;
-      const duplicateIndex = duplicateCounts.get(semanticText) ?? 0;
-      duplicateCounts.set(semanticText, duplicateIndex + 1);
+      const semanticText = `${lineNumber}: ${content}`;
+      const identityText = `${path}:${semanticText}`;
+      const duplicateIndex = duplicateCounts.get(identityText) ?? 0;
+      duplicateCounts.set(identityText, duplicateIndex + 1);
       const fragment: SearchResultFragment = {
-        fragmentId: `search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
+        fragmentId: `search-hit:${encodeURIComponent(identityText)}:${duplicateIndex}`,
         semanticText,
-        display: { path, lineNumber, content },
+        display: { path: '', lineNumber, content },
         revealTarget: { ...revealBase, path, lineNumber },
         kind: 'hit',
       };
@@ -1214,11 +1216,21 @@ export function buildSearchOutputProjection(
 
   const groups: SearchGroupProjection[] = [];
   const seen = new Map<string, number>();
+  const pathCounts = new Map<string, number>();
   for (const hit of hits) {
     const idx = seen.get(hit.path);
     if (idx === undefined) {
       seen.set(hit.path, groups.length);
-      groups.push({ path: hit.path, hits: [hit] });
+      const duplicateIndex = pathCounts.get(hit.path) ?? 0;
+      pathCounts.set(hit.path, duplicateIndex + 1);
+      const fragment: SearchResultFragment = {
+        fragmentId: `search-group:${encodeURIComponent(hit.path)}:${duplicateIndex}`,
+        semanticText: hit.path,
+        display: { path: hit.path },
+        revealTarget: { ...revealBase, path: hit.path },
+        kind: 'group',
+      };
+      groups.push({ path: hit.path, hits: [hit], fragment });
     } else {
       groups[idx]!.hits.push(hit);
     }
@@ -1232,7 +1244,7 @@ export function buildSearchOutputProjection(
     rawFallback: false,
     fallbackText: null,
     fragments: [
-      ...hits.map((hit) => hit.fragment),
+      ...groups.flatMap((group) => [group.fragment, ...group.hits.map((hit) => hit.fragment)]),
       ...notes.map((note) => note.fragment),
     ],
   };
@@ -1385,6 +1397,16 @@ const STRUCTURED_BROWSER_PROFILE_ACTIONS = new Set([
   'trace_stop',
 ]);
 
+function toolResultRendersAsImage(toolName: string | undefined, toolResult: Message): boolean {
+  const content = toolResult.content as ToolResultContent | undefined;
+  if ((content?.images?.length ?? 0) > 0) return true;
+  if (toolName !== 'read_image' && toolName !== 'browser_take_screenshot') return false;
+  const displayData = toolResult.display_data as { type?: unknown; media_type?: unknown; data?: unknown } | null | undefined;
+  return displayData?.type === 'image'
+    && typeof displayData.media_type === 'string'
+    && typeof displayData.data === 'string';
+}
+
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
@@ -1417,6 +1439,7 @@ function agentTurnSources(
         ? block.input['action']
         : null;
       const structuredProfile = profileAction !== null && STRUCTURED_BROWSER_PROFILE_ACTIONS.has(profileAction);
+      if (!isError && toolResultRendersAsImage(block.name, toolResult)) return;
       if (isError) {
         const errorFamily: TerminalToolResultFamily = block.name === 'bash' || block.name === 'tmux'
           ? block.name

@@ -163,7 +163,7 @@ export function replaceFindSessionResults<TTarget, TFocusOrigin>(
   const nextState = reconcileOpenState(state, state.query, matches, state.activeMatchId);
   const nextActiveMatch = nextState.matches.find((match) => match.id === nextState.activeMatchId);
   const activeMatchChanged = nextState.activeMatchId !== state.activeMatchId;
-  const activeTargetChanged = previousActiveMatch?.target !== nextActiveMatch?.target;
+  const activeTargetChanged = !sameFindTarget(previousActiveMatch?.target, nextActiveMatch?.target);
   return {
     state: nextState,
     commands: nextState.activeMatchId === null
@@ -289,6 +289,24 @@ function reconcileActiveMatchId<TTarget>(
 
 function indexOfActiveMatch<TTarget, TFocusOrigin>(state: FindSessionOpenState<TTarget, TFocusOrigin>): number {
   return state.activeMatchId === null ? -1 : state.matches.findIndex((match) => match.id === state.activeMatchId);
+}
+
+function sameFindTarget(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== typeof right || left === null || right === null) return false;
+  if (typeof left !== 'object') return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => sameFindTarget(value, right[index]));
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.hasOwn(rightRecord, key) && sameFindTarget(leftRecord[key], rightRecord[key]));
 }
 
 function revealCommand<TTarget, TFocusOrigin>(
