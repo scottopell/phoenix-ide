@@ -406,11 +406,12 @@ describe('commission review tool rendering', () => {
     expect(screen.getByText('7/9 files reviewed')).toBeInTheDocument();
     expect(screen.getByText('model output repaired')).toBeInTheDocument();
     expect(screen.getByText('src/large-a.ts · per file cap')).toBeInTheDocument();
-    expect(screen.getByText('+1 more files')).toBeInTheDocument();
-    expect(screen.getByText('review findings first')).toBeInTheDocument();
+    expect(screen.getByText('src/large-d.ts · per file cap')).toBeInTheDocument();
+    expect(screen.queryByText('+1 more files')).not.toBeInTheDocument();
+    expect(screen.getAllByText('review findings first').length).toBeGreaterThan(0);
     expect(screen.getByText('Finding 0')).toBeInTheDocument();
-    expect(screen.getByText('+1 more findings not shown')).toBeInTheDocument();
-    expect(screen.queryByText('Finding 5')).not.toBeInTheDocument();
+    expect(screen.getByText('Finding 5')).toBeInTheDocument();
+    expect(screen.queryByText('+1 more findings not shown')).not.toBeInTheDocument();
   });
 
   it('renders the state-machine rejected result from raw tool content', () => {
@@ -580,7 +581,7 @@ describe('commission review tool rendering', () => {
 
     expect(screen.getByText('{"status":"failed"}')).toBeInTheDocument();
     expect(screen.getByText('Failed')).toBeInTheDocument();
-    expect(screen.getByText('retry')).toBeInTheDocument();
+    expect(screen.getAllByText('retry').length).toBeGreaterThan(0);
     expect(screen.getByText('No actionable findings were produced.')).toBeInTheDocument();
     expect(screen.getByText('Rejected')).toBeInTheDocument();
     expect(screen.getByText('Review was rejected before findings were produced.')).toBeInTheDocument();

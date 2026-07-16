@@ -49,9 +49,12 @@ export function CommissionReviewSummaryCard({
 }: CommissionReviewSummaryCardProps) {
   const outcomeClass = commissionReviewOutcomeClass(data);
   const outcomeLabel = commissionReviewOutcomeLabel(data);
+  const showFullDetails = mode === 'full';
+  const canOpenFullReview = !showFullDetails && requestSequenceId !== undefined && onOpenFullReview !== undefined;
+  const renderAllDetails = showFullDetails || !canOpenFullReview;
   const findingsPreview = [...data.findings]
     .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
-    .slice(0, mode === 'inline' ? COMMISSION_REVIEW_FINDINGS_PREVIEW_LIMIT : data.findings.length);
+    .slice(0, renderAllDetails ? data.findings.length : COMMISSION_REVIEW_FINDINGS_PREVIEW_LIMIT);
   const remainingFindings = Math.max(0, data.findings.length - findingsPreview.length);
   const severityBadges = ('findingSummary' in data
     ? ([
@@ -62,7 +65,6 @@ export function CommissionReviewSummaryCard({
       ] satisfies Array<[CommissionReviewFinding['severity'], number]>)
     : []).filter((entry) => entry[1] > 0);
   const coverageLabel = 'summary' in data ? `${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed` : null;
-  const showFullDetails = mode === 'full';
   const stageDetails = [
     ['target collection', data.stageStatus.targetCollection],
     ['diff collection', data.stageStatus.diffCollection],
@@ -73,8 +75,6 @@ export function CommissionReviewSummaryCard({
   const findingRationaleFallback = (finding: CommissionReviewFinding) => {
     return finding.rationale.length > 0 ? finding.rationale : 'No rationale provided by the reviewer.';
   };
-  const canOpenFullReview = !showFullDetails && requestSequenceId !== undefined && onOpenFullReview !== undefined;
-
   return (
     <section className={`commission-review-result ${outcomeClass} ${showFullDetails ? 'commission-review-result--full' : ''}`} aria-label="Commission review summary">
       <div className="commission-review-summary-header">
@@ -147,9 +147,9 @@ export function CommissionReviewSummaryCard({
             <div className="commission-review-callout coverage-gap">
               <div className="commission-review-callout-title">Unreviewed files</div>
               <ul>
-                {(showFullDetails ? data.unreviewed : data.unreviewed.slice(0, 3)).map((entry) => <li key={`${entry.file}-${entry.reason ?? 'na'}`}>{entry.file}{entry.reason ? ` · ${formatCommissionReviewLabel(entry.reason)}` : ''}</li>)}
+                {(renderAllDetails ? data.unreviewed : data.unreviewed.slice(0, 3)).map((entry) => <li key={`${entry.file}-${entry.reason ?? 'na'}`}>{entry.file}{entry.reason ? ` · ${formatCommissionReviewLabel(entry.reason)}` : ''}</li>)}
               </ul>
-              {!showFullDetails && data.unreviewed.length > 3 && <div className="commission-review-more">+{data.unreviewed.length - 3} more files</div>}
+              {!renderAllDetails && data.unreviewed.length > 3 && <div className="commission-review-more">+{data.unreviewed.length - 3} more files</div>}
             </div>
           )}
           {data.retryRecommendation !== 'do_not_retry' && (
@@ -161,7 +161,7 @@ export function CommissionReviewSummaryCard({
         </div>
       )}
 
-      {showFullDetails && (
+      {renderAllDetails && (
         <div className="commission-review-status-grid" aria-label="Commission review status details">
           <div><span>status</span><strong>{formatCommissionReviewLabel(data.status)}</strong></div>
           <div><span>review</span><strong>{formatCommissionReviewLabel(data.reviewStatus)}</strong></div>
@@ -180,7 +180,7 @@ export function CommissionReviewSummaryCard({
         </div>
       )}
 
-      {showFullDetails && data.warnings.length > 0 && (
+      {renderAllDetails && data.warnings.length > 0 && (
         <div className="commission-review-detail-block" aria-label="Commission review detailed warnings">
           <div className="commission-review-findings-header">Detailed warnings</div>
           <ul className="commission-review-warning-list">
@@ -197,7 +197,7 @@ export function CommissionReviewSummaryCard({
 
       {findingsPreview.length > 0 ? (
         <div className="commission-review-findings">
-          <div className="commission-review-findings-header">{showFullDetails ? 'Findings' : 'Top findings'}</div>
+          <div className="commission-review-findings-header">{renderAllDetails ? 'Findings' : 'Top findings'}</div>
           <ol>
             {findingsPreview.map((finding, index) => (
               <li key={`${finding.file}-${finding.line ?? 'na'}-${finding.title}-${index}`} className={`commission-review-finding ${finding.severity}`}>
