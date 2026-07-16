@@ -445,6 +445,7 @@ function MessageListImpl({
     () => createSurfaceKey(`conversation-transcript:${conversationId ?? 'empty'}`),
     [conversationId],
   );
+  const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
   const [findRevealVersion, setFindRevealVersion] = useState(0);
   const handleFindCommands = useCallback((commands: readonly FindSessionCommand<ConversationSearchMatchTarget, HTMLElement | null>[]) => {
     commands.forEach((command) => {
@@ -460,6 +461,7 @@ function MessageListImpl({
         case 'clear-decorations':
           scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
             .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+          setPendingRevealRequest(null);
           break;
       }
     });
@@ -495,7 +497,6 @@ function MessageListImpl({
   const activeFindMatchKey = activeFindMatch
     ? `${activeFindMatch.kind}:${activeFindMatch.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}:${findRevealVersion}`
     : null;
-  const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
   const activeFindRevealTarget = activeFindMatch?.kind === 'unit-text'
     ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.sourceId)?.revealTarget ?? null
     : null;

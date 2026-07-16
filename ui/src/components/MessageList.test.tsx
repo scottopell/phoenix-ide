@@ -39,6 +39,7 @@ function PushScopeOnMount({ scopeId, children }: { scopeId: string; children: Re
 // real component, so this counts actual re-renders — the render-unit
 // identity regression test (task 58044) asserts state ticks don't bump it.
 const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
+const agentMessageMockState = vi.hoisted(() => ({ autoHandleReveal: true }));
 const agentMessageProps = vi.hoisted(
   () => [] as Array<{
     message: Message;
@@ -67,7 +68,7 @@ vi.mock('./MessageComponents', async () => {
         ...(revealRequest !== undefined ? { revealRequest } : {}),
         ...(activeHighlight !== undefined ? { activeHighlight } : {}),
       });
-      if (revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
@@ -145,6 +146,7 @@ beforeEach(() => {
   virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
+  agentMessageMockState.autoHandleReveal = true;
 });
 
 vi.mock('./VirtualTranscript', async () => {
@@ -340,6 +342,34 @@ describe('MessageList', () => {
     const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
     window.dispatchEvent(escape);
     expect(escape.defaultPrevented).toBe(false);
+  });
+
+  it('clears an unhandled reveal request when the query clears its active match', async () => {
+    agentMessageMockState.autoHandleReveal = false;
+    const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'hidden alpha match' }] } as Message;
+    render(withConvContext(
+      <MessageList
+        messages={[message]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-pending-reveal"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-pending-reveal', generation: 1, transcriptGeneration: 1 } }}
+      />,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    await waitFor(() => expect(
+      [...agentMessageProps].reverse().find((entry) => entry.revealRequest)?.revealRequest,
+    ).toBeTruthy());
+
+    fireEvent.change(input, { target: { value: '' } });
+
+    await waitFor(() => expect(agentMessageProps.at(-1)?.revealRequest).toBeUndefined());
+    expect(input).toBeInTheDocument();
   });
 
   it('steps from the normalized transcript match index after results shrink', async () => {
