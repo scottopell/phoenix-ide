@@ -1180,6 +1180,50 @@ fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<b
     Ok(false)
 }
 
+fn verify_registered_phoenix_worktree(
+    repo_root: &std::path::Path,
+    worktree_path: &std::path::Path,
+) -> Result<(), String> {
+    for path in [
+        repo_root.join(".phoenix"),
+        repo_root.join(".phoenix/worktrees"),
+        worktree_path.to_path_buf(),
+    ] {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlinked Phoenix worktree path: {}",
+                path.display()
+            ));
+        }
+    }
+
+    let listed = phoenix_core::git::command()
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|error| format!("git worktree inventory failed to start: {error}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git worktree inventory failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    let expected = std::fs::canonicalize(worktree_path)
+        .map_err(|error| format!("cannot canonicalize worktree path: {error}"))?;
+    let registered = String::from_utf8(listed.stdout)
+        .map_err(|error| format!("git worktree inventory is not UTF-8: {error}"))?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| path == expected);
+    if !registered {
+        return Err("path is not registered as a Git worktree".to_string());
+    }
+    Ok(())
+}
+
 /// Reclaim a clean Phoenix worktree whose persisted scope has no owner.
 /// Dirty or unreadable worktrees are retained so startup recovery cannot erase
 /// uncommitted evidence.
@@ -1190,6 +1234,7 @@ fn reclaim_unowned_worktree(
     let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(worktree_path) else {
         return Err("path is not a canonical Phoenix worktree".to_string());
     };
+    verify_registered_phoenix_worktree(&repo_root, worktree_path)?;
 
     let status = phoenix_core::git::command()
         .args([
@@ -1885,6 +1930,65 @@ mod reconcile_worktrees_tests {
         assert!(
             !branch_exists,
             "the original owner's temp branch must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_unregistered_nested_checkout_without_cleaning_ignored_files() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        db.find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let path = repo_root.join(".phoenix/worktrees/unregistered");
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        std::fs::write(path.join("target/evidence"), "keep").unwrap();
+        let status = phoenix_core::git::command()
+            .args(["init", "-q"])
+            .current_dir(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        reconcile_worktrees(&db).await;
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("target/evidence")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retains_symlinked_external_checkout_without_cleaning_ignored_files() {
+        use std::os::unix::fs::symlink;
+
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        db.find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = external.path();
+        let status = phoenix_core::git::command()
+            .args(["init", "-q"])
+            .current_dir(external_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(external_root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(external_root.join("target")).unwrap();
+        std::fs::write(external_root.join("target/evidence"), "keep").unwrap();
+        let link = repo_root.join(".phoenix/worktrees/symlinked");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(external_root, &link).unwrap();
+
+        let result = reclaim_unowned_worktree(&link, None);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(external_root.join("target/evidence")).unwrap(),
+            "keep"
         );
     }
 
