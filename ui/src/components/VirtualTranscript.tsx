@@ -655,6 +655,7 @@ function VirtualTranscriptInner<T>(
     const current = storeRef.current;
     if (!current?.scroller) return;
     current.viewportTop = current.scroller.scrollTop;
+    if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = current.scroller.clientHeight;
     current.activeAnchor = captureTopAnchor(current);
     recompute(current);

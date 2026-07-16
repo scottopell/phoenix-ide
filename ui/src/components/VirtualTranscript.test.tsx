@@ -1,5 +1,5 @@
 import { type ReactElement } from 'react';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
@@ -544,6 +544,7 @@ describe('VirtualTranscript', () => {
       );
     });
     scroller.scrollTop = viewportTop + 25;
+    fireEvent.scroll(scroller);
     act(() => {
       view.rerender(
         <VirtualTranscript
@@ -559,7 +560,7 @@ describe('VirtualTranscript', () => {
       );
     });
 
-    expect(scroller.scrollTop).toBe(viewportTop);
+    expect(scroller.scrollTop).toBe(viewportTop + 25);
   });
 
   it('preserves measured extents by stable key across prepends and removes only absent keys', () => {
