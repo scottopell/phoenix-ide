@@ -141,7 +141,8 @@ export function DiffView({
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-      codeViewRef.current?.scrollToNote(note);
+      const codeView = codeViewRef.current;
+      if (codeView) codeView.scrollToNote(note);
       highlight(note.id);
       closePanel();
     },
@@ -153,7 +154,8 @@ export function DiffView({
       document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
       return;
     }
-    codeViewRef.current?.scrollToFindTarget(target);
+    const codeView = codeViewRef.current;
+    if (codeView) codeView.scrollToFindTarget(target);
   }, []);
 
   const handleFindQueryChange = useCallback((query: string) => {

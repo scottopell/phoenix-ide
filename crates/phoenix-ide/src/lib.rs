@@ -1139,7 +1139,7 @@ async fn reconcile_worktrees(db: &Database) {
 }
 
 fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<bool, String> {
-    let submodules = std::process::Command::new("git")
+    let submodules = phoenix_core::git::command()
         .args(["submodule", "status", "--recursive"])
         .current_dir(worktree_path)
         .output()
@@ -1156,7 +1156,7 @@ fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<b
         let Some(relative) = line.split_ascii_whitespace().nth(1) else {
             continue;
         };
-        let ignored = std::process::Command::new("git")
+        let ignored = phoenix_core::git::command()
             .args([
                 "ls-files",
                 "--others",
@@ -1191,7 +1191,7 @@ fn reclaim_unowned_worktree(
         return Err("path is not a canonical Phoenix worktree".to_string());
     };
 
-    let status = std::process::Command::new("git")
+    let status = phoenix_core::git::command()
         .args([
             "status",
             "--porcelain",
@@ -1211,7 +1211,7 @@ fn reclaim_unowned_worktree(
         return Ok(false);
     }
 
-    let ignored = std::process::Command::new("git")
+    let ignored = phoenix_core::git::command()
         .args([
             "ls-files",
             "--others",
@@ -1645,7 +1645,7 @@ mod reconcile_worktrees_tests {
     }
 
     fn add_worktree(repo_root: &std::path::Path, path: &str, branch: &str) {
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["worktree", "add", "-q", "-b", branch, path, "main"])
             .current_dir(repo_root)
             .status()
@@ -1871,7 +1871,7 @@ mod reconcile_worktrees_tests {
         reconcile_worktrees(&db).await;
 
         assert!(!std::path::Path::new(&wt_path).exists());
-        let branch_exists = std::process::Command::new("git")
+        let branch_exists = phoenix_core::git::command()
             .args([
                 "show-ref",
                 "--verify",
@@ -1905,7 +1905,7 @@ mod reconcile_worktrees_tests {
         reconcile_worktrees(&db).await;
 
         assert!(!std::path::Path::new(&wt_path).exists());
-        let branch_exists = std::process::Command::new("git")
+        let branch_exists = phoenix_core::git::command()
             .args([
                 "show-ref",
                 "--verify",
@@ -1928,13 +1928,13 @@ mod reconcile_worktrees_tests {
             .await
             .unwrap();
         std::fs::write(repo_root.join(".gitignore"), "target/\n").unwrap();
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["add", ".gitignore"])
             .current_dir(&repo_root)
             .status()
             .unwrap();
         assert!(status.success());
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args([
                 "-c",
                 "user.email=t@example.com",
@@ -1977,13 +1977,13 @@ mod reconcile_worktrees_tests {
             .await
             .unwrap();
         std::fs::write(repo_root.join(".gitignore"), ".env\n").unwrap();
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["add", ".gitignore"])
             .current_dir(&repo_root)
             .status()
             .unwrap();
         assert!(status.success());
-        let status = std::process::Command::new("git")
+        let status = phoenix_core::git::command()
             .args([
                 "-c",
                 "user.email=t@example.com",
@@ -2030,7 +2030,7 @@ mod reconcile_worktrees_tests {
         let submodule_tmp = tempfile::tempdir().unwrap();
         let submodule_root = submodule_tmp.path();
         let run = |cwd: &std::path::Path, args: &[&str]| {
-            let status = std::process::Command::new("git")
+            let status = phoenix_core::git::command()
                 .args(args)
                 .current_dir(cwd)
                 .status()
@@ -2116,7 +2116,7 @@ mod reconcile_worktrees_tests {
         let submodule_tmp = tempfile::tempdir().unwrap();
         let submodule_root = submodule_tmp.path();
         let run = |cwd: &std::path::Path, args: &[&str]| {
-            let status = std::process::Command::new("git")
+            let status = phoenix_core::git::command()
                 .args(args)
                 .current_dir(cwd)
                 .status()

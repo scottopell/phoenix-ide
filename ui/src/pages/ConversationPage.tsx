@@ -409,18 +409,22 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // conversation subtree below it) on every pointer move — React state catches
   // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
   const appElementRef = useRef<HTMLDivElement | null>(null);
+  const setAppCssVariable = useCallback((name: string, value: string) => {
+    const appElement = appElementRef.current;
+    if (appElement) appElement.style.setProperty(name, value);
+  }, []);
   useLayoutEffect(() => {
-    appElementRef.current?.style.setProperty(
+    setAppCssVariable(
       '--viewer-pane-width',
       `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
     );
-  }, [viewerPane.collapsed, viewerPane.size]);
+  }, [viewerPane.collapsed, viewerPane.size, setAppCssVariable]);
   const handleViewerLiveResize = useCallback((size: number, collapsed: boolean) => {
-    appElementRef.current?.style.setProperty(
+    setAppCssVariable(
       '--viewer-pane-width',
       `${collapsed ? 0 : size}px`,
     );
-  }, []);
+  }, [setAppCssVariable]);
 
   // Mobile-only file browser overlay. The prose reader itself reads its
   // open-file state from `fileExplorer.openFileState` (URL-driven), so
@@ -534,17 +538,17 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // re-render this page. The xterm fit is driven by a ResizeObserver on the
   // panel element, so it keeps tracking the live height without React.
   useLayoutEffect(() => {
-    appElementRef.current?.style.setProperty(
+    setAppCssVariable(
       '--terminal-pane-height',
       `${terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}px`,
     );
-  }, [terminalPane.collapsed, terminalPane.size]);
+  }, [terminalPane.collapsed, terminalPane.size, setAppCssVariable]);
   const handleTerminalLiveResize = useCallback((size: number, collapsed: boolean) => {
-    appElementRef.current?.style.setProperty(
+    setAppCssVariable(
       '--terminal-pane-height',
       `${collapsed ? TERMINAL_COLLAPSED_PX : size}px`,
     );
-  }, []);
+  }, [setAppCssVariable]);
 
   // Callback ref for `#app`. The layout effects above only re-run on pane-state
   // changes; the conversation-load path first paints a skeleton `#app` (without
@@ -1866,8 +1870,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // Derived: model context window is a pure function of the current model's
   // spec. Falls back to 200_000 for legacy surfaces when availableModels hasn't
   // loaded yet or the model isn't in the registry.
-  const actualModelContextWindow =
-    availableModels?.find((m) => m.id === atom.conversation?.model)?.context_window ?? null;
+  const matchingModel = availableModels
+    ? availableModels.find((model) => model.id === atom.conversation?.model)
+    : undefined;
+  const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
   const modelContextWindow = actualModelContextWindow ?? 200_000;
 
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list

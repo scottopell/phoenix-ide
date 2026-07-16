@@ -1030,7 +1030,8 @@ function MessageListImpl({
     const active = transcriptPositioningStateRef.current.active;
     const phase = transcriptPositioningStateRef.current.phase;
     if (active && phase?.kind === 'awaiting_physical') {
-      const physicalSnapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? snapshot;
+      const transcript = transcriptRef.current;
+      const physicalSnapshot = transcript ? transcript.physicalSnapshot(phase.targetIndex) : snapshot;
       dispatchTranscriptPositioningRef.current({
         type: 'physical_observed',
         commandKey: active.key,

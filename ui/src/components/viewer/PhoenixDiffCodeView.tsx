@@ -192,7 +192,9 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         downPath = e.composedPath();
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
-          const rendered = (codeViewRef.current?.getInstance()?.getRenderedItems() ?? []).map(
+          const codeView = codeViewRef.current;
+          const instance = codeView ? codeView.getInstance() : null;
+          const rendered = (instance ? instance.getRenderedItems() : []).map(
             (r) => ({ element: r.element, item: r.item as PhoenixDiffItem }),
           );
           const target = resolveTouchedLine(downPath, rendered);

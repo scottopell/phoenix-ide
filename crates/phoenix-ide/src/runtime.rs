@@ -3096,17 +3096,21 @@ impl RuntimeManager {
             return Ok((conv.state, row_state_updated_at, false));
         }
 
+        if conv.state.is_terminal() {
+            tracing::debug!(
+                conv_id = %conversation_id,
+                state = ?std::mem::discriminant(&conv.state),
+                "Restoring persisted terminal state"
+            );
+            return Ok((conv.state, row_state_updated_at, false));
+        }
+
         match &conv.state {
             ConvState::Provisioning { .. }
-            | ConvState::CreationFailed { .. }
-            | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
-            | ConvState::ContextExhausted { .. }
-            | ConvState::HandedOff { .. }
-            | ConvState::SeededLlmRequesting { .. }
-            | ConvState::Terminal => {
+            | ConvState::SeededLlmRequesting { .. } => {
                 tracing::debug!(
                     conv_id = %conversation_id,
                     state = ?std::mem::discriminant(&conv.state),
@@ -4114,6 +4118,43 @@ mod scope_liveness_tests {
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
         assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_completed_and_failed() {
+        let mgr = test_manager().await;
+        for (id, terminal) in [
+            (
+                "completed",
+                ConvState::Completed {
+                    result: "done".to_string(),
+                },
+            ),
+            (
+                "failed",
+                ConvState::Failed {
+                    error: "boom".to_string(),
+                    error_kind: crate::db::ErrorKind::SubAgentError,
+                },
+            ),
+        ] {
+            mgr.db()
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .expect("create");
+            mgr.db()
+                .update_conversation_state(id, &terminal)
+                .await
+                .expect("set terminal");
+
+            let (state, _ts, needs_auto_continue) =
+                mgr.determine_resume_state(id).await.expect("resume");
+            assert_eq!(
+                std::mem::discriminant(&state),
+                std::mem::discriminant(&terminal)
+            );
+            assert!(!needs_auto_continue);
+        }
     }
 
     #[tokio::test]

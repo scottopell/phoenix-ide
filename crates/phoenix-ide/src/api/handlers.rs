@@ -3162,10 +3162,7 @@ fn db_message_selection_for_stream(
 }
 
 fn stream_state_starts_runtime(state: &ConvState) -> bool {
-    !matches!(
-        state,
-        ConvState::CreationFailed { .. } | ConvState::CreationCancelled { .. }
-    )
+    !state.is_terminal()
 }
 
 async fn read_stream_init_messages_with_tail(
@@ -7238,6 +7235,14 @@ mod conversation_cwd_validation_tests {
                 job_id: "job".to_string(),
             }
         ));
+        assert!(!stream_state_starts_runtime(&ConvState::Completed {
+            result: "done".to_string(),
+        }));
+        assert!(!stream_state_starts_runtime(&ConvState::Failed {
+            error: "boom".to_string(),
+            error_kind: crate::db::ErrorKind::SubAgentError,
+        }));
+        assert!(!stream_state_starts_runtime(&ConvState::Terminal));
         assert!(stream_state_starts_runtime(&ConvState::Idle));
     }
 
