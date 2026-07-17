@@ -612,6 +612,19 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('does not index collapsed think input without an owned reveal target', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn', key: 'thinking-tool', isFirstInTurn: true,
+      agent: agentMsg('thinking-tool', [
+        { type: 'tool_use', id: 'think-running', name: 'think', input: { thoughts: 'hidden reasoning needle' } },
+      ]),
+      toolResultsByUseId: new Map(),
+    }];
+
+    expect(buildConversationSearchProjection(units, 'hidden reasoning needle', { density: 'full' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'think', { density: 'full' }).matches).toHaveLength(0);
+  });
+
   it('indexes only visible structured browser-profile summaries', () => {
     const result = toolMsg('profile-result', 'profile-tool', { result: 'opaque raw sample needle' });
     result.display_data = {

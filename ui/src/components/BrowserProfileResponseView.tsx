@@ -70,12 +70,24 @@ export function buildBrowserProfileVisibleText(
     case 'heap_snapshot': {
       if (data['baseline'] === undefined) return `heap_snapshot\n${fallbackText}`;
       const detached = data['detached_dom_nodes'] as { baseline?: unknown; post?: unknown } | undefined;
-      return ['heap diff', String(data['baseline'] ?? ''), String(data['post'] ?? ''), `nodes ${String(data['node_count_delta'] ?? 0)}`, `self size ${String(data['self_size_delta_bytes'] ?? 0)}`, `detached DOM ${String(detached?.baseline ?? 0)} → ${String(detached?.post ?? 0)}`, data['retained_size_approximate'] === true ? 'retained-size approximated by self_size delta' : ''].filter(Boolean).join('\n');
+      const nodeDelta = typeof data['node_count_delta'] === 'number' ? data['node_count_delta'] : 0;
+      const sizeDelta = typeof data['self_size_delta_bytes'] === 'number' ? data['self_size_delta_bytes'] : 0;
+      const detachedBaseline = typeof detached?.baseline === 'number' ? detached.baseline : 0;
+      const detachedPost = typeof detached?.post === 'number' ? detached.post : 0;
+      return [
+        'heap diff',
+        String(data['baseline'] ?? ''),
+        String(data['post'] ?? ''),
+        `nodes ${fmtSigned(nodeDelta)}`,
+        `self size ${fmtSignedBytes(sizeDelta)}`,
+        `detached DOM ${detachedBaseline} → ${detachedPost} (${fmtSigned(detachedPost - detachedBaseline)})`,
+        data['retained_size_approximate'] === true ? 'retained-size approximated by self_size delta; true retained needs dominator-tree walk.' : '',
+      ].filter(Boolean).join('\n');
     }
     case 'metrics': {
       const metrics = data['metrics'];
       if (!metrics || typeof metrics !== 'object') return `metrics\n${fallbackText}`;
-      return ['metrics', 'Performance.getMetrics', ...Object.entries(metrics as Record<string, unknown>).flatMap(([name, value]) => typeof value === 'number' && Number.isFinite(value) ? [`${name} ${value}`] : [])].join('\n');
+      return ['metrics', 'Performance.getMetrics', ...Object.entries(metrics as Record<string, unknown>).flatMap(([name, value]) => typeof value === 'number' && Number.isFinite(value) ? [`${name} ${fmtMetricValue(name, value)}`] : [])].join('\n');
     }
     case 'cpu_stop':
     case 'cpu_summary': {

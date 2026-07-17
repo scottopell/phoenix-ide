@@ -17,6 +17,30 @@ describe('BrowserProfileResponseView find highlighting', () => {
     expect(text).toContain('DOM nodes\nmin 1,500 · max 1,600 · last 1,600');
     expect(text).not.toContain('JS heap');
   });
+
+  it('projects formatted heap deltas instead of hidden raw byte values', () => {
+    const text = buildBrowserProfileVisibleText('heap_snapshot', {
+      baseline: '/tmp/before.heapsnapshot', post: '/tmp/after.heapsnapshot',
+      node_count_delta: 1200, self_size_delta_bytes: 1024,
+      detached_dom_nodes: { baseline: 2, post: 4 }, retained_size_approximate: true,
+    }, 'opaque');
+
+    expect(text).toContain('nodes +1,200');
+    expect(text).toContain('self size +1.0 KB');
+    expect(text).toContain('detached DOM 2 → 4 (+2)');
+    expect(text).not.toContain('self size 1024');
+  });
+
+  it('projects metrics using the same visible units as the table', () => {
+    const text = buildBrowserProfileVisibleText('metrics', {
+      metrics: { JSHeapUsedSize: 1_048_576, TaskDuration: 1.25, Nodes: 1234 },
+    }, 'opaque');
+
+    expect(text).toContain('JSHeapUsedSize 1.0 MB');
+    expect(text).toContain('TaskDuration 1.250 s');
+    expect(text).toContain('Nodes 1,234');
+    expect(text).not.toContain('JSHeapUsedSize 1048576');
+  });
   it('marks an active occurrence in the visible scenario summary', () => {
     const displayData = {
       outcome: 'completed', requested_runs: 2, warmup: 1,

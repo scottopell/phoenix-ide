@@ -1524,7 +1524,7 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       const toolUseId = block.id ?? '';
       const inputText = formatToolInput(block.name || 'tool', block.input ?? {}, block.display).display;
-      if (inputText) {
+      if (inputText && block.name !== 'think') {
         const fragmentId = 'tool-use-input';
         out.push({
           role: `tool-use-input-${index}`,
