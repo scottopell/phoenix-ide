@@ -14385,6 +14385,12 @@ mod tests {
         )
         .await
         .unwrap();
+        db.initialize_project_instruction_bundle_if_absent(
+            &coordinator.id,
+            &instruction_bundle("coordinator"),
+        )
+        .await
+        .unwrap();
 
         let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
             ContinueOutcome::Created(conversation) => conversation,
