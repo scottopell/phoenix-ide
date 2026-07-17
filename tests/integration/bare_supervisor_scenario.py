@@ -77,6 +77,9 @@ def transaction(layout, fixture, port, transaction_id, *, previous, wrong=False)
     }
     path = directory / "manifest.json"
     write(path, json.dumps(manifest, sort_keys=True))
+    for artifact in directory.iterdir():
+        artifact.chmod(0o400)
+    directory.chmod(0o500)
     return transaction_id, digest(path)
 
 

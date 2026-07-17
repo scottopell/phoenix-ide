@@ -97,6 +97,9 @@ class BareTransactionTests(unittest.TestCase):
         path = self.transaction / "manifest.json"
         path.write_text(__import__("json").dumps(value))
         path.chmod(0o600)
+        for artifact in self.transaction.iterdir():
+            artifact.chmod(0o400)
+        self.transaction.chmod(0o500)
         return path
 
     def test_activation_accepts_only_transaction_id_and_manifest_hash(self):

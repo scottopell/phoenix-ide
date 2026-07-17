@@ -318,9 +318,9 @@ class Supervisor:
         if self.child is not None and self.child_identity is not None and direct_child_matches(self.child, self.child_identity):
             child = dataclasses.asdict(self.child_identity)
             child["runtime"] = dataclasses.asdict(self.child_identity.runtime)
-            return {"supervisor_pid": os.getpid(), "child": child}
+            return {"protocol_version": PROTOCOL_VERSION, "supervisor_pid": os.getpid(), "child": child}
         self.child_identity = None
-        return {"supervisor_pid": os.getpid(), "child": None}
+        return {"protocol_version": PROTOCOL_VERSION, "supervisor_pid": os.getpid(), "child": None}
 
     def stop_child(self, timeout: float = 10) -> None:
         if self.child is None:
@@ -393,7 +393,7 @@ class Supervisor:
         if manifest.manifest_version != PROTOCOL_VERSION or manifest.transaction_id != transaction_id:
             raise SupervisorError("transaction protocol or identity mismatch")
         metadata = transaction.stat()
-        if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077:
+        if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o200:
             raise SupervisorError("transaction directory ownership or mode is unsafe")
         validate_runtime_identity(manifest.expected)
         validate_health_url(manifest.expected_health_url)
@@ -558,7 +558,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="store_true")
     parser.add_argument("--root", type=Path, default=Path.home() / ".phoenix-ide")
-    parser.add_argument("action", nargs="?", choices=("run", "status", "stop", "shutdown-supervisor"))
+    parser.add_argument("action", nargs="?", choices=("run", "status", "stop", "shutdown-supervisor", "activate"))
+    parser.add_argument("--transaction-id")
+    parser.add_argument("--manifest-sha256")
     args = parser.parse_args()
     if args.protocol_version:
         print(PROTOCOL_VERSION)
@@ -568,10 +570,12 @@ def main() -> int:
         return 0
     if args.action is None:
         parser.error("an action is required")
-    response = request(
-        Layout(args.root).socket,
-        {"protocol_version": PROTOCOL_VERSION, "action": args.action},
-    )
+    payload = {"protocol_version": PROTOCOL_VERSION, "action": args.action}
+    if args.action == "activate":
+        if args.transaction_id is None or args.manifest_sha256 is None:
+            parser.error("activate requires --transaction-id and --manifest-sha256")
+        payload.update(transaction_id=args.transaction_id, manifest_sha256=args.manifest_sha256)
+    response = request(Layout(args.root).socket, payload)
     print(json.dumps(response, sort_keys=True, indent=2))
     return 0
 

@@ -6672,180 +6672,198 @@ def _wait_for_health(
     return None, time.monotonic() - t0
 
 
-def prod_daemon_deploy():
-    """Deploy as background daemon in ~/.phoenix-ide/ (no systemd).
+def _bare_layout() -> dict[str, Path]:
+    root = Path.home() / ".phoenix-ide"
+    return {
+        "root": root,
+        "supervisor": root / "bin/phoenix-supervisor.py",
+        "binary": root / "bin/phoenix-ide",
+        "environment": root / "config/phoenix.env",
+        "transactions": root / "deploy/transactions",
+        "status": root / "deploy/status.json",
+        "socket": root / "run/supervisor.sock",
+        "deployed_sha": root / "deployed.sha",
+    }
 
-    Used when systemd is not available (containers, non-systemd Linux).
-    Daemonizes the process and returns to shell immediately.
-    """
-    # Refuse before building if the deploy would expose an unauthenticated server.
-    # The daemon child inherits the deploying shell's os.environ and then layers
-    # .phoenix-ide.env on top (see env assembly below), so preflight against that
-    # same merge -- and honor PHOENIX_BIND_ADDR (a loopback bind is safe).
-    daemon_preflight_env = os.environ.copy()
-    _load_env_file(daemon_preflight_env)
-    _preflight_prod_bind_auth(daemon_preflight_env, socket_activated=False)
 
-    # Build binary (keep debug symbols for debugging)
-    binary = prod_build(strip=False)
-
-    # Set up environment
-    env = os.environ.copy()
-    env["PHOENIX_PORT"] = str(PROD_PORT)  # Use prod port (8031)
-
-    prod_dir = Path.home() / ".phoenix-ide"
-    prod_dir.mkdir(parents=True, exist_ok=True)
-
-    prod_db_path = prod_dir / "prod.db"
-    prod_log_path = prod_dir / "prod.log"
-    prod_pid_path = prod_dir / "prod.pid"
-
-    env["PHOENIX_DB_PATH"] = str(prod_db_path)
-    # Unified logging: the binary owns the log file. stdout off so the Popen
-    # redirect below only captures pre-logger / panic output (same file).
-    env["PHOENIX_LOG_FILE"] = str(prod_log_path)
-    env["PHOENIX_LOG_STDOUT"] = "false"
-
-    # Load .phoenix-ide.env (overrides auto-detection)
-    env_file = _load_env_file(env)
-    if env_file:
-        print(f"  Loaded env from {env_file}")
-    else:
-        print(f"  No .phoenix-ide.env found (using auto-detection)")
-
-    # Configure LLM auth
-    llm_mode = _configure_llm_env(env)
-    print(f"  LLM mode: {llm_mode}")
-
-    # Stop existing daemon if running
-    if prod_pid_path.exists():
-        try:
-            with open(prod_pid_path) as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, 15)  # SIGTERM
-            time.sleep(1)
-        except (ProcessLookupError, ValueError):
-            pass  # Process already dead or invalid PID
-        prod_pid_path.unlink(missing_ok=True)
-
-    # Start daemonized process. Fresh log per deploy, then append: the binary's
-    # appender and this redirect both open O_APPEND so writes interleave safely.
-    prod_log_path.write_text("")
-    t0 = time.monotonic()
-    with open(prod_log_path, "a") as log:
-        proc = subprocess.Popen(
-            [str(binary)],
-            env=env,
+def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_source: Path) -> None:
+    if layout["socket"].exists():
+        running = subprocess.run(
+            [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "status"],
+            capture_output=True,
+            text=True,
+        )
+        if running.returncode == 0:
+            try:
+                running_protocol = str(json.loads(running.stdout)["protocol_version"])
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise SystemExit("running bare supervisor did not report its protocol version") from exc
+            if running_protocol != protocol:
+                raise SystemExit(
+                    "running bare supervisor uses an incompatible protocol; stop it from an external shell "
+                    "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
+                )
+            return
+        layout["socket"].unlink(missing_ok=True)
+    layout["supervisor"].parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(selected_source, layout["supervisor"])
+    layout["supervisor"].chmod(0o700)
+    with (layout["root"] / "supervisor.log").open("ab") as log:
+        subprocess.Popen(
+            [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "run"],
+            stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
-            start_new_session=True  # Daemonize: detach from terminal
+            start_new_session=True,
+            close_fds=True,
         )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if layout["socket"].exists():
+            return
+        time.sleep(0.05)
+    raise SystemExit("bare Linux supervisor did not become ready")
 
-    # Save PID
-    with open(prod_pid_path, "w") as f:
-        f.write(str(proc.pid))
 
-    # Bail early if the process dies before the endpoint comes up.
-    def _check_alive() -> None:
-        if proc.poll() is not None:
-            print("ERROR: Server failed to start. Check logs:", file=sys.stderr)
-            print(f"  {prod_log_path}", file=sys.stderr)
-            sys.exit(1)
+def prod_daemon_deploy(release: str | None = None):
+    """Deploy through the persistent same-user supervisor on Linux without systemd."""
+    import tempfile
+    import uuid
 
-    health_version, elapsed = _wait_for_health(t0, env, timeout_secs=20.0)
-    _check_alive()
-    if health_version is None:
-        print("WARNING: Server started but health check failed after 20s", file=sys.stderr)
+    env_snapshot: dict[str, str] = {}
+    _load_env_file(env_snapshot)
+    env_snapshot.setdefault("PHOENIX_PORT", str(PROD_PORT))
+    env_snapshot.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
+    env_snapshot.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
+    env_snapshot.setdefault("PHOENIX_LOG_STDOUT", "false")
+    _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
+    layout = _bare_layout()
+    transaction_id = uuid.uuid4().hex
 
-    write_deployed_sha()
-    print(f"\n✓ Deployed daemon to production")
-    print(f"  Version: {health_version or 'unknown'}")
-    print(f"  Startup: {elapsed:.1f}s")
-    print(f"  Port: {PROD_PORT}")
-    print(f"  Database: {prod_db_path}")
-    print(f"  Logs: {prod_log_path}")
-    print(f"  PID: {proc.pid} (saved to {prod_pid_path})")
-    print(f"  LLM Mode: {llm_mode}")
-    print(f"  URL: {_prod_display_url(env)}")
-    print()
-    print("Use './dev.py prod status' to check status")
-    print("Use './dev.py prod stop' to stop the server")
+    with tempfile.TemporaryDirectory(prefix=f"phoenix-bare-{transaction_id}-") as td:
+        staging = Path(td)
+        prepared = (
+            _prepare_release_candidate(release, staging)
+            if release else _prepare_local_candidate(target=_linux_musl_target())
+        )
+        supervisor_source = staging / "supervisor.py"
+        _materialize_source_file(
+            prepared.source_commit,
+            "scripts/bare_supervisor.py",
+            supervisor_source,
+            prepared.source_kind.value,
+        )
+        protocol = subprocess.run(
+            [sys.executable, str(supervisor_source), "--protocol-version"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if protocol != "1":
+            raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
+
+        _start_bare_supervisor(layout, protocol, supervisor_source)
+
+        transaction = layout["transactions"] / transaction_id
+        transaction.mkdir(parents=True, mode=0o700)
+        candidate = transaction / "candidate-binary"
+        shutil.copy2(prepared.binary, candidate)
+        candidate.chmod(0o600)
+        candidate_env = transaction / "candidate.env"
+        candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
+        candidate_env.chmod(0o600)
+        previous_identity = _current_prod_identity(env_snapshot)
+        rollback_binary = None
+        rollback_env = None
+        if previous_identity is not None:
+            if not layout["binary"].is_file() or not layout["environment"].is_file():
+                raise SystemExit("running bare production lacks rollback binary or environment")
+            rollback_binary = transaction / "rollback-binary"
+            rollback_env = transaction / "rollback.env"
+            shutil.copy2(layout["binary"], rollback_binary)
+            shutil.copy2(layout["environment"], rollback_env)
+            rollback_binary.chmod(0o600)
+            rollback_env.chmod(0o600)
+        manifest = {
+            "manifest_version": 1,
+            "transaction_id": transaction_id,
+            "expected": prepared.identity.as_dict(),
+            "previous": previous_identity.as_dict() if previous_identity else None,
+            "expected_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version",
+            "previous_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version" if previous_identity else None,
+            "candidate_binary": {"name": candidate.name, "sha256": _file_sha256(candidate)},
+            "candidate_environment": {"name": candidate_env.name, "sha256": _file_sha256(candidate_env)},
+            "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
+            "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
+            "source_commit": prepared.source_commit,
+            "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        manifest_path = transaction / "manifest.json"
+        _write_json_atomic(manifest_path, manifest)
+        manifest_hash = _file_sha256(manifest_path)
+        for artifact in transaction.iterdir():
+            artifact.chmod(0o400)
+        transaction.chmod(0o500)
+
+    result = subprocess.run([
+        sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]),
+        "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"bare deployment failed: {(result.stderr or result.stdout).strip()}")
+    response = json.loads(result.stdout)
+    state = response.get("state")
+    if state != "committed":
+        raise SystemExit(f"bare deployment ended in {state}; run ./dev.py prod status")
+    print("\n✓ Deployed through persistent bare Linux supervisor")
+    print(f"  Transaction: {transaction_id}")
+    print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
+    print(f"  Database: {Path.home() / '.phoenix-ide/prod.db'}")
+    print(f"  Logs: {Path.home() / '.phoenix-ide/prod.log'}")
 
 
 def prod_daemon_status():
-    """Show daemon deployment status."""
-    prod_dir = Path.home() / ".phoenix-ide"
-    prod_pid_path = prod_dir / "prod.pid"
-    prod_log_path = prod_dir / "prod.log"
-
-    if not prod_pid_path.exists():
-        print("Status: Not running (no PID file)")
+    """Show supervisor and managed-child status."""
+    layout = _bare_layout()
+    if not layout["socket"].exists():
+        print("Status: Supervisor not running")
         return
-
-    try:
-        with open(prod_pid_path) as f:
-            pid = int(f.read().strip())
-
-        # Check if process exists
-        os.kill(pid, 0)  # Signal 0 = check existence
-        print(f"Status: Running (PID {pid})")
-
-        # Health check
-        try:
-            import urllib.request
-            _open_prod_health(timeout=2).close()
-            print(f"  Health: OK")
-        except Exception as e:
-            print(f"  Health: Unreachable ({type(e).__name__}: {e})")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  URL: {_prod_display_url()}")
-
-        if sha := read_deployed_sha():
-            print(f"  Commit: {sha}")
-        print(f"  Logs: {prod_log_path}")
-
-    except ProcessLookupError:
-        print(f"Status: Dead (PID {pid} not found)")
-        print("Run './dev.py prod deploy' to restart")
-    except (ValueError, FileNotFoundError):
-        print("Status: Unknown (invalid PID file)")
+    result = subprocess.run(
+        [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "status"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Status: Supervisor unreachable ({(result.stderr or result.stdout).strip()})")
+        return
+    value = json.loads(result.stdout)
+    child = value.get("child")
+    print(f"Supervisor: running (PID {value.get('supervisor_pid')})")
+    if child is None:
+        print("Phoenix: stopped")
+    else:
+        runtime = child["runtime"]
+        print(f"Phoenix: running (PID {child['pid']}, start {child['proc_start_time']})")
+        print(f"  Identity: {runtime['version']} ({runtime['git_sha']})")
+    if layout["status"].exists():
+        status = json.loads(layout["status"].read_text())
+        print(f"  Deployment: {status.get('state')} ({status.get('transaction_id')})")
+    print(f"  Logs: {Path.home() / '.phoenix-ide/prod.log'}")
 
 
 def prod_daemon_stop():
-    """Stop daemon deployment."""
-    prod_dir = Path.home() / ".phoenix-ide"
-    prod_pid_path = prod_dir / "prod.pid"
-
-    if not prod_pid_path.exists():
-        print("No daemon running (no PID file)")
+    """Stop the supervisor-owned Phoenix child while preserving the supervisor."""
+    layout = _bare_layout()
+    if not layout["socket"].exists():
+        print("No bare Linux supervisor running")
         return
+    result = subprocess.run(
+        [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "stop"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"failed to stop supervised Phoenix: {(result.stderr or result.stdout).strip()}")
+    print("✓ Phoenix stopped; supervisor remains running")
 
-    try:
-        with open(prod_pid_path) as f:
-            pid = int(f.read().strip())
-
-        print(f"Stopping daemon (PID {pid})...")
-        os.kill(pid, 15)  # SIGTERM
-
-        # Wait for graceful shutdown
-        for _ in range(10):
-            time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-        else:
-            print("Graceful shutdown timed out, forcing...")
-            os.kill(pid, 9)  # SIGKILL
-
-        prod_pid_path.unlink(missing_ok=True)
-        print("✓ Stopped")
-
-    except ProcessLookupError:
-        print(f"Process {pid} not found (already stopped)")
-        prod_pid_path.unlink(missing_ok=True)
-    except (ValueError, FileNotFoundError):
-        print("Invalid or missing PID file")
 
 
 def get_systemd_override_dir() -> Path:
@@ -8058,8 +8076,6 @@ def cmd_prod_build():
 def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
     """Deploy local HEAD or an immutable published release."""
     env = detect_prod_env()
-    if release and env == "daemon":
-        raise SystemExit("--release deployment is not yet supported by bare Linux")
     if not release:
         print("Running pre-deploy checks...\n")
         cmd_check(gate=False, pretty=pretty)
@@ -8072,10 +8088,10 @@ def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
         native_prod_deploy(release)
 
     elif env == "daemon":
-        print("Detected: No systemd (daemon mode)")
-        print("    Running production build as background daemon")
+        print("Detected: Bare Linux (persistent supervisor mode)")
+        print("    Deploying through the same-user Phoenix supervisor")
         print()
-        prod_daemon_deploy()
+        prod_daemon_deploy(release)
 
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
