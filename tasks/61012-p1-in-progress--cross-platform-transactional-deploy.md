@@ -82,9 +82,9 @@ Extend the transactional production deployment foundation from native macOS laun
 - Add a standard-library fixture runtime with `--build-identity`, `/api/version`, and `/version` plus controlled startup delay, crash, wrong identity, graceful termination, and direct-bind/socket-activation modes.
 - Use exact deterministic old, candidate, and wrong version/SHA pairs for injected failures; retain one real-Phoenix Linux smoke test after fixture-driven coverage.
 
-### Bare-Linux Docker substrate
+### Bare-Linux acceptance substrate
 
-- Use an unprivileged non-root Linux container without systemd, with a minimal PID 1, Linux `/proc`, Unix sockets, and no host credentials, Docker socket, or production mounts.
+- Do not require Docker as a bare-Linux acceptance substrate. Run Linux-gated supervisor integration tests on a real Linux host or CI environment without relying on systemd for process ownership.
 - Prove supervisor survival after initiator death, direct parent/child ownership, owner-only IPC and filesystem modes, `SO_PEERCRED` UID enforcement, stale/replayed handoff rejection, hash/path validation, secret redaction, exact PID/start-time/version/SHA binding, restart reconciliation, and child-only `prod stop`.
 
 ## Completion documentation

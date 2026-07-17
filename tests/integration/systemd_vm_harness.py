@@ -18,6 +18,8 @@ TEMPLATE = ROOT / "tests/integration/lima-systemd.yaml"
 HELPER = ROOT / "scripts/systemd_deploy_helper.py"
 FIXTURE = ROOT / "tests/integration/fixture_runtime.py"
 SCENARIO = ROOT / "tests/integration/systemd_transaction_scenario.py"
+BARE_SUPERVISOR = ROOT / "scripts/bare_supervisor.py"
+BARE_SCENARIO = ROOT / "tests/integration/bare_supervisor_scenario.py"
 NAME_PREFIX = "phoenix-qa-systemd-"
 LIVE_UNITS = {"phoenix-ide.service", "phoenix-ide.socket"}
 LIVE_PORT = 8031
@@ -170,6 +172,24 @@ def copy_bundle(instance, guest_root):
     return tuple(bundle.values())
 
 
+def bare_supervisor_journey(instance, fixture):
+    bare_root = f"/var/tmp/phoenix-qa-bare-{instance.removeprefix(NAME_PREFIX)}"
+    guest_supervisor = f"/tmp/{instance}-bare-supervisor.py"
+    guest_scenario = f"/tmp/{instance}-bare-scenario.py"
+    run(["limactl", "copy", "--backend=scp", str(BARE_SUPERVISOR), f"{instance}:{guest_supervisor}"])
+    run(["limactl", "copy", "--backend=scp", str(BARE_SCENARIO), f"{instance}:{guest_scenario}"])
+    try:
+        result = lima_shell(
+            instance,
+            f"python3 {guest_scenario} --supervisor {guest_supervisor} --fixture {fixture} "
+            f"--root {bare_root} --port 49154",
+            timeout=30,
+        )
+        print(f"PASS: bare supervisor ownership {result.stdout.strip()}")
+    finally:
+        lima_shell(instance, f"rm -rf {bare_root}", check=False)
+
+
 def transaction_journey(instance, guest_root, unit, port, mode, helper, fixture, scenario):
     refuse_production_resources(instance, unit, guest_root, port)
     uid = lima_shell(instance, "id -u").stdout.strip()
@@ -271,6 +291,7 @@ def main():
             run(["limactl", "copy", "--backend=scp", str(initiator), f"{instance}:{guest_initiator}"])
             qualify(instance, unit, guest_root, token, guest_initiator)
             helper, fixture, scenario = copy_bundle(instance, guest_root)
+            bare_supervisor_journey(instance, fixture)
             success_root = f"{guest_root}-success"
             transaction_journey(instance, success_root, f"{NAME_PREFIX}service-{suffix}", 49152, "success", helper, fixture, scenario)
             rollback_root = f"{guest_root}-rollback"
