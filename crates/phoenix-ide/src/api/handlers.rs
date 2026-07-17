@@ -17,8 +17,9 @@ use super::git_handlers::{
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
-    dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
-    request_changes_on_fork_proposal, task_feedback,
+    approve_work_tools, dismiss_fork_proposal, list_fork_proposals, mark_merged,
+    reject_commission_review, reject_task, reject_work_tools, request_changes_on_fork_proposal,
+    task_feedback,
 };
 use super::sse::sse_stream;
 use super::types::{
@@ -197,6 +198,14 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/continue",
             post(continue_conversation),
+        )
+        .route(
+            "/api/conversations/:id/approve-work-tools",
+            post(approve_work_tools),
+        )
+        .route(
+            "/api/conversations/:id/reject-work-tools",
+            post(reject_work_tools),
         )
         // Task approval (REQ-BED-028)
         .route("/api/conversations/:id/approve-task", post(approve_task))

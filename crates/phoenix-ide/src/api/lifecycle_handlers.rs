@@ -11,7 +11,9 @@ use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
 use crate::git_ops::capture_branch_diff;
 use crate::runtime::fork_resolve::ForkResolveError;
-use crate::state_machine::state::{CommissionReviewApprovalOutcome, TaskApprovalOutcome};
+use crate::state_machine::state::{
+    CommissionReviewApprovalOutcome, TaskApprovalOutcome, WorkToolApprovalOutcome,
+};
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
 
@@ -57,6 +59,62 @@ fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError
 // ============================================================
 // Task Approval (REQ-BED-028)
 // ============================================================
+
+pub(crate) async fn approve_work_tools(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    if !matches!(conv.state, ConvState::AwaitingWorkToolApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting Work tool approval".to_string(),
+        ));
+    }
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::WorkToolApprovalDecided {
+                outcome: WorkToolApprovalOutcome::Approved,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+pub(crate) async fn reject_work_tools(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    if !matches!(conv.state, ConvState::AwaitingWorkToolApproval { .. }) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting Work tool approval".to_string(),
+        ));
+    }
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::WorkToolApprovalDecided {
+                outcome: WorkToolApprovalOutcome::Rejected,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+    Ok(Json(SuccessResponse { success: true }))
+}
 
 pub(crate) async fn approve_task(
     State(state): State<AppState>,

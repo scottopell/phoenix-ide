@@ -2595,6 +2595,17 @@ impl RuntimeManager {
                 )
             } else {
                 let registry = match conv.conv_mode {
+                    ConvMode::Explore { .. }
+                        if self
+                            .db
+                            .has_full_work_tools(conversation_id)
+                            .await
+                            .map_err(|e| e.to_string())? =>
+                    {
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                            .with_propose_task()
+                            .with_commission_review()
+                    }
                     ConvMode::Explore { .. } => ToolRegistry::explore(
                         &context.tasks_dir_name,
                         agent_catalog.to_vec(),

@@ -510,6 +510,7 @@ mod random_walk {
     use crate::proptests::{effects_are_valid, is_valid_state, test_context};
     use crate::state::{
         ConvContext, ConvState, SubAgentOutcome, TaskApprovalOutcome, ToolCall, ToolInput,
+        WorkToolApprovalOutcome,
     };
     use crate::transition::transition;
     use phoenix_core::domain::db_schema::{ErrorKind, ToolResult};
@@ -836,6 +837,9 @@ mod random_walk {
             }
 
             // Terminal states -- events are absorbed, generate anything
+            ConvState::AwaitingWorkToolApproval { .. } => Event::WorkToolApprovalDecided {
+                outcome: WorkToolApprovalOutcome::Rejected,
+            },
             ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal

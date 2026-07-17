@@ -21,7 +21,7 @@ pub struct SteerEntry {
 use crate::domain::llm_types::{ContentBlock, Usage};
 use crate::domain::sm_state::{
     CommissionReviewApprovalOutcome, PendingSubAgent, QuestionAnnotation, SubAgentOutcome,
-    TaskApprovalOutcome, ToolCall,
+    TaskApprovalOutcome, ToolCall, WorkToolApprovalOutcome,
 };
 use std::collections::HashMap;
 
@@ -136,6 +136,9 @@ pub enum Event {
     UserTriggerContinuation,
 
     // Task approval events (REQ-BED-028)
+    WorkToolApprovalDecided {
+        outcome: WorkToolApprovalOutcome,
+    },
     /// User responded to a proposed task plan.
     ///
     /// Matches the `TaskApprovalDecided(conversation, decision)` trigger in
@@ -263,6 +266,7 @@ impl Event {
             Event::ContinuationResponse { .. } => "ContinuationResponse",
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::UserTriggerContinuation => "UserTriggerContinuation",
+            Event::WorkToolApprovalDecided { .. } => "WorkToolApprovalDecided",
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::CommissionReviewApprovalDecided { .. } => "CommissionReviewApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
@@ -368,6 +372,9 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
+    WorkToolApprovalDecided {
+        outcome: WorkToolApprovalOutcome,
+    },
     TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
@@ -546,6 +553,9 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             // Parent-only events
+            Event::WorkToolApprovalDecided { outcome } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::WorkToolApprovalDecided { outcome },
+            )),
             Event::TaskApprovalDecided { outcome } => {
                 Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                     outcome,
@@ -707,7 +717,8 @@ impl TryFrom<Event> for SubAgentEvent {
             // SteerDrainedUserMessages is parent-only: steering is a parent-
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
-            Event::TaskApprovalDecided { .. }
+            Event::WorkToolApprovalDecided { .. }
+            | Event::TaskApprovalDecided { .. }
             | Event::CommissionReviewApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
@@ -756,6 +767,7 @@ impl ParentEvent {
         match self {
             ParentEvent::Core(e) => e.variant_name(),
             ParentEvent::Parent(e) => match e {
+                ParentOnlyEvent::WorkToolApprovalDecided { .. } => "WorkToolApprovalDecided",
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::CommissionReviewApprovalDecided { .. } => {
                     "CommissionReviewApprovalDecided"

@@ -112,6 +112,12 @@ pub enum CommissionReviewApprovalAvailability {
     Unavailable { reason: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkToolApprovalOutcome {
+    Approved,
+    Rejected,
+}
+
 /// User decision for a pending `commission_review` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommissionReviewApprovalOutcome {
@@ -130,6 +136,11 @@ pub enum CommissionReviewApprovalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeTaskInput {
     pub task_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestWorkToolsInput {
+    pub reason: String,
 }
 
 /// A single question presented to the user (REQ-AUQ-001)
@@ -191,6 +202,7 @@ pub enum ToolInput {
     CommissionReview(CommissionReviewInput),
     ApprovedCommissionReview(ApprovedCommissionReviewInput),
     ProposeTask(ProposeTaskInput),
+    RequestWorkTools(RequestWorkToolsInput),
     AskUserQuestion(AskUserQuestionInput),
     /// The tool name did not match any registered tool. Carries the original
     /// name and payload so the executor can still dispatch by name (e.g. MCP
@@ -319,6 +331,10 @@ impl<'de> Deserialize<'de> for ToolInput {
             "propose_task" => {
                 parse_tool_input_or_malformed::<ProposeTaskInput>("propose_task", payload)
             }
+            "request_work_tools" => parse_tool_input_or_malformed::<RequestWorkToolsInput>(
+                "request_work_tools",
+                payload,
+            ),
             "ask_user_question" => {
                 parse_tool_input_or_malformed::<AskUserQuestionInput>("ask_user_question", payload)
             }
@@ -385,6 +401,12 @@ impl From<ProposeTaskInput> for ToolInput {
         ToolInput::ProposeTask(input)
     }
 }
+
+impl From<RequestWorkToolsInput> for ToolInput {
+    fn from(input: RequestWorkToolsInput) -> Self {
+        ToolInput::RequestWorkTools(input)
+    }
+}
 impl From<AskUserQuestionInput> for ToolInput {
     fn from(input: AskUserQuestionInput) -> Self {
         ToolInput::AskUserQuestion(input)
@@ -408,6 +430,7 @@ impl ToolInput {
                 "commission_review"
             }
             ToolInput::ProposeTask(_) => "propose_task",
+            ToolInput::RequestWorkTools(_) => "request_work_tools",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
             ToolInput::Unknown { name, .. } | ToolInput::Malformed { name, .. } => name,
         }
@@ -438,6 +461,9 @@ impl ToolInput {
                 serde_json::to_value(input).unwrap_or(Value::Null)
             }
             ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::RequestWorkTools(input) => {
+                serde_json::to_value(input).unwrap_or(Value::Null)
+            }
             ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } | ToolInput::Malformed { input, .. } => input.clone(),
         }
@@ -753,6 +779,7 @@ mod tests {
                 | ConvState::CreationCancelled { .. }
                 | ConvState::AwaitingRecovery { .. }
                 | ConvState::AwaitingContinuation { .. }
+                | ConvState::AwaitingWorkToolApproval { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
                 | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -923,7 +950,9 @@ pub enum ConvState {
     Idle,
 
     /// LLM request in flight, with retry tracking
-    LlmRequesting { attempt: u32 },
+    LlmRequesting {
+        attempt: u32,
+    },
 
     /// Fresh handoff successor whose approved-plan seed is already durable.
     /// Runtime resume treats this as `LlmRequesting` so the first request can
@@ -940,7 +969,9 @@ pub enum ConvState {
     },
 
     /// Creation was cancelled; original intent remains available for restart.
-    CreationCancelled { job_id: String },
+    CreationCancelled {
+        job_id: String,
+    },
 
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
@@ -1013,7 +1044,9 @@ pub enum ConvState {
     },
 
     /// Sub-agent completed successfully (terminal state, sub-agent only)
-    Completed { result: String },
+    Completed {
+        result: String,
+    },
 
     /// Sub-agent failed (terminal state, sub-agent only)
     Failed {
@@ -1057,6 +1090,10 @@ pub enum ConvState {
         rejected_tool_calls: Vec<ToolCall>,
         /// Retry attempt for the continuation request
         attempt: u32,
+    },
+
+    AwaitingWorkToolApproval {
+        reason: String,
     },
 
     /// Awaiting user approval of a proposed task plan (REQ-BED-028).
@@ -1103,7 +1140,9 @@ pub enum ConvState {
     },
 
     /// This conversation handed live work to a successor conversation.
-    HandedOff { successor_conv_id: String },
+    HandedOff {
+        successor_conv_id: String,
+    },
 
     /// Task lifecycle completed or abandoned — conversation is permanently read-only.
     /// Rejects all events. Preserved on server restart (not reset to Idle).
@@ -1185,6 +1224,9 @@ pub enum ParentState {
         recovery_kind: RecoveryKind,
         resume: RecoveryResumeTarget,
     },
+    AwaitingWorkToolApproval {
+        reason: String,
+    },
     AwaitingTaskApproval {
         task_file: String,
         title: String,
@@ -1244,6 +1286,9 @@ impl From<ParentState> for ConvState {
                 recovery_kind,
                 resume,
             },
+            ParentState::AwaitingWorkToolApproval { reason } => {
+                ConvState::AwaitingWorkToolApproval { reason }
+            }
             ParentState::AwaitingTaskApproval {
                 task_file,
                 title,
@@ -1468,6 +1513,9 @@ impl TryFrom<ConvState> for ParentState {
                 recovery_kind,
                 resume,
             }),
+            ConvState::AwaitingWorkToolApproval { reason } => {
+                Ok(ParentState::AwaitingWorkToolApproval { reason })
+            }
             ConvState::AwaitingTaskApproval {
                 task_file,
                 title,
@@ -1600,6 +1648,7 @@ impl TryFrom<ConvState> for SubAgentState {
             | ConvState::CreationFailed { .. }
             | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingWorkToolApproval { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -1637,6 +1686,7 @@ impl ParentState {
         match self {
             ParentState::Core(c) => c.variant_name(),
             ParentState::AwaitingRecovery { .. } => "AwaitingRecovery",
+            ParentState::AwaitingWorkToolApproval { .. } => "AwaitingWorkToolApproval",
             ParentState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ParentState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
             ParentState::AwaitingCommissionReviewApproval { .. } => {
@@ -1805,6 +1855,7 @@ impl ConvState {
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
+                | ConvState::AwaitingWorkToolApproval { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::AwaitingRecovery { .. }
@@ -1837,6 +1888,7 @@ impl ConvState {
             | Self::CancellingSubAgents { .. }
             | Self::Completed { .. }
             | Self::AwaitingContinuation { .. }
+            | Self::AwaitingWorkToolApproval { .. }
             | Self::AwaitingTaskApproval { .. }
             | Self::AwaitingUserResponse { .. }
             | Self::AwaitingCommissionReviewApproval { .. }
@@ -1872,6 +1924,7 @@ impl ConvState {
             ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
             ConvState::ContextExhausted { .. } => "ContextExhausted",
             ConvState::HandedOff { .. } => "HandedOff",
+            ConvState::AwaitingWorkToolApproval { .. } => "AwaitingWorkToolApproval",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
             ConvState::AwaitingCommissionReviewApproval { .. } => {
@@ -1916,6 +1969,7 @@ impl ConvState {
             | ConvState::Error { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingWorkToolApproval { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => StepResult::Continue,
@@ -1933,7 +1987,8 @@ impl ConvState {
         match self {
             ConvState::Idle => "idle",
             ConvState::CreationFailed { .. } | ConvState::Error { .. } => "error",
-            ConvState::AwaitingTaskApproval { .. }
+            ConvState::AwaitingWorkToolApproval { .. }
+            | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
@@ -1961,7 +2016,8 @@ impl ConvState {
         match self {
             ConvState::Idle => DisplayState::Idle,
             ConvState::CreationFailed { .. } | ConvState::Error { .. } => DisplayState::Error,
-            ConvState::AwaitingTaskApproval { .. }
+            ConvState::AwaitingWorkToolApproval { .. }
+            | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,
             ConvState::CreationCancelled { .. }

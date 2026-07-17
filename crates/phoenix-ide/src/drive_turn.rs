@@ -471,8 +471,10 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             error_kind: error_kind.clone(),
         }),
         ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
+        ConvState::AwaitingWorkToolApproval { .. } | ConvState::AwaitingUserResponse { .. } => {
+            Some(StableOutcome::AwaitingUserResponse)
+        }
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
-        ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
         ConvState::AwaitingCommissionReviewApproval { .. } => {
             Some(StableOutcome::AwaitingCommissionReviewApproval)
         }

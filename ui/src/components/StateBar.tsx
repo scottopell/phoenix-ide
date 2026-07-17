@@ -825,6 +825,10 @@ export function StateBar({
                 ? "creation cancelled"
                 : "completed";
             break;
+          case 'awaiting_work_tool_approval':
+            stateText = 'awaiting Work tool approval';
+            dotClass += ' awaiting';
+            break;
           case 'awaiting_task_approval':
           case 'awaiting_commission_review_approval':
             dotClass += ' approval';

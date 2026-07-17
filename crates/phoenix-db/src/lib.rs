@@ -4210,6 +4210,38 @@ impl Database {
         Ok(queue)
     }
 
+    /// Persist the full Work-tool grant for a conversation.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation does not exist or the database update fails.
+    pub async fn grant_full_work_tools(&self, id: &str) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE conversations SET full_work_tools_granted = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Read whether a conversation has a persistent full Work-tool grant.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation does not exist or the database read fails.
+    pub async fn has_full_work_tools(&self, id: &str) -> DbResult<bool> {
+        let value: i64 =
+            sqlx::query_scalar("SELECT full_work_tools_granted FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| DbError::ConversationNotFound(id.to_string()))?;
+        Ok(value != 0)
+    }
+
     /// Update conversation mode (e.g., Explore -> Work on task approval)
     ///
     /// # Errors

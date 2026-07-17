@@ -442,6 +442,7 @@ export type ConversationState =
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
+  | { type: 'awaiting_work_tool_approval'; reason: string }
   | {
       type: 'awaiting_commission_review_approval';
       brief: string;
@@ -487,6 +488,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'cancelling':
     case 'cancelling_tool':
     case 'cancelling_sub_agents':
+    case 'awaiting_work_tool_approval':
     case 'awaiting_task_approval':
     case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
@@ -2080,6 +2082,18 @@ export const api = {
   async rejectTask(convId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/reject-task`, { method: 'POST' });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject task'); }
+    return resp.json();
+  },
+
+  async approveWorkTools(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/approve-work-tools`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve Work tools'); }
+    return resp.json();
+  },
+
+  async rejectWorkTools(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/reject-work-tools`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject Work tools'); }
     return resp.json();
   },
 

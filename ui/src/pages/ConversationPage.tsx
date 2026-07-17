@@ -83,6 +83,9 @@ const ConversationDiffViewer = lazy(() =>
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
+const WorkToolApprovalReader = lazy(() =>
+  import('../components/WorkToolApprovalReader').then((m) => ({ default: m.WorkToolApprovalReader })),
+);
 const CommissionReviewApproval = lazy(() =>
   import('../components/CommissionReviewApproval').then((m) => ({ default: m.CommissionReviewApproval })),
 );
@@ -471,6 +474,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [showWorkToolApproval, setShowWorkToolApproval] = useState(false);
   const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
   const taskApprovalError = atom.uiError?.type === 'BackendError' ? atom.uiError.message : null;
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
@@ -1259,6 +1263,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       // ignore
     }
   }, [conversationId, setDraftIfEmptyCb, requestComposerFocus]);
+
+  useEffect(() => {
+    setShowWorkToolApproval(atom.phase.type === 'awaiting_work_tool_approval' && !isArchived);
+  }, [atom.phase.type, isArchived]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -2639,6 +2647,16 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       {isDesktop && terminalSplitPane}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
+      {showWorkToolApproval && !isArchived && atom.phase.type === 'awaiting_work_tool_approval' && (
+        <Suspense fallback={null}>
+          <WorkToolApprovalReader
+            conversationId={conversationId!}
+            reason={atom.phase.reason}
+            onClose={() => setShowWorkToolApproval(false)}
+          />
+        </Suspense>
+      )}
+
       {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
         <Suspense fallback={null}>
           <TaskApprovalReader

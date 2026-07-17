@@ -20,7 +20,7 @@ use super::state::{
     AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
     RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput, WorkToolApprovalOutcome,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -419,7 +419,8 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::ToolExecuting { .. }
-        | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::AwaitingWorkToolApproval { .. } => Err(TransitionError::AgentBusy),
 
         // transition_core: CancellationInProgress
         ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
@@ -1715,6 +1716,45 @@ pub fn transition_parent(
     event: ParentEvent,
 ) -> Result<ParentTransitionResult, TransitionError> {
     match (state, event) {
+        (
+            ParentState::AwaitingWorkToolApproval { .. },
+            ParentEvent::Parent(ParentOnlyEvent::WorkToolApprovalDecided {
+                outcome: WorkToolApprovalOutcome::Approved,
+            }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
+                .with_effect(Effect::GrantWorkTools)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm),
+        ),
+
+        (
+            ParentState::AwaitingWorkToolApproval { .. },
+            ParentEvent::Parent(ParentOnlyEvent::WorkToolApprovalDecided {
+                outcome: WorkToolApprovalOutcome::Rejected,
+            })
+            | ParentEvent::Core(CoreEvent::UserCancel { .. }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistMessage {
+                    content: phoenix_core::domain::db_schema::MessageContent::system(
+                        "Full Work toolset request rejected.",
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()),
+        ),
+
+        (
+            ParentState::AwaitingWorkToolApproval { .. },
+            ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
+        ) => Err(TransitionError::AgentBusy),
+
         // ============================================================
         // Parent-only state: AwaitingTaskApproval
         // ============================================================
@@ -2169,6 +2209,78 @@ pub fn transition_parent(
                 stamp_retry_count(&mut dd, final_attempt);
                 dd
             };
+            if let Some((tool, input)) = tool_calls.iter().find_map(|tool| match &tool.input {
+                ToolInput::RequestWorkTools(input) => Some((tool, input)),
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::CommissionReview(_)
+                | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
+            }) {
+                let message = if tool_calls.len() != 1 {
+                    Some("request_work_tools must be the only tool in response".to_string())
+                } else if !matches!(context.mode_context, Some(ModeContext::Explore { .. })) {
+                    Some(
+                        "request_work_tools is available only in restricted Explore mode"
+                            .to_string(),
+                    )
+                } else if input.reason.trim().is_empty() {
+                    Some("request_work_tools requires a non-empty reason".to_string())
+                } else {
+                    None
+                };
+
+                let display_data = make_display_data(&content);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+
+                if let Some(message) = message {
+                    let results = tool_calls
+                        .iter()
+                        .map(|call| ToolResult::error(call.id.clone(), message.clone()))
+                        .collect();
+                    let checkpoint = CheckpointData::tool_round(assistant_message, results)
+                        .expect("one result per work-tool request response tool call");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                let checkpoint = CheckpointData::tool_round(
+                    assistant_message,
+                    vec![ToolResult::success(
+                        tool.id.clone(),
+                        "Full Work toolset requested".to_string(),
+                    )],
+                )
+                .expect("request_work_tools produces one tool use and one result");
+                return Ok(
+                    ParentTransitionResult::new(ParentState::AwaitingWorkToolApproval {
+                        reason: input.reason.trim().to_string(),
+                    })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change()),
+                );
+            }
+
             // REQ-BED-028: propose_task interception (checked first).
             //
             // Find the propose_task call whether it parsed as typed input or
@@ -2191,6 +2303,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitError(_)
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::RequestWorkTools(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
@@ -2440,6 +2553,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitError(_)
                 | ToolInput::ProposeTask(_)
                 | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::RequestWorkTools(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
@@ -2604,6 +2718,7 @@ pub fn transition_parent(
                 | ToolInput::ProposeTask(_)
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::RequestWorkTools(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2838,6 +2953,7 @@ pub fn transition_parent(
                 }
                 ParentState::Core(_)
                 | ParentState::AwaitingRecovery { .. }
+                | ParentState::AwaitingWorkToolApproval { .. }
                 | ParentState::AwaitingTaskApproval { .. }
                 | ParentState::AwaitingUserResponse { .. }
                 | ParentState::AwaitingCommissionReviewApproval { .. }
@@ -3220,6 +3336,7 @@ pub fn transition_sub_agent(
                     | ToolInput::ProposeTask(_)
                     | ToolInput::CommissionReview(_)
                     | ToolInput::ApprovedCommissionReview(_)
+                    | ToolInput::RequestWorkTools(_)
                     | ToolInput::AskUserQuestion(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
@@ -3501,6 +3618,7 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::Failed { .. }
         | ConvState::Error { .. }
         | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingWorkToolApproval { .. }
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -3901,6 +4019,7 @@ mod tests {
             | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingWorkToolApproval { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -6648,6 +6767,7 @@ mod tests {
             let execute_effect = result.effects.iter().find_map(|effect| match effect {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
+                | Effect::GrantWorkTools
                 | Effect::PersistState
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
@@ -6696,6 +6816,7 @@ mod tests {
                 | ToolInput::SubmitError(_)
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ProposeTask(_)
+                | ToolInput::RequestWorkTools(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. }) => {

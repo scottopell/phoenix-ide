@@ -14,6 +14,7 @@ pub mod process_inspection;
 mod propose_task;
 mod read_file;
 mod read_image;
+mod request_work_tools;
 mod search;
 mod skill;
 mod subagent;
@@ -40,6 +41,7 @@ pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
 pub use read_file::ReadFileTool;
 pub use read_image::ReadImageTool;
+pub use request_work_tools::RequestWorkToolsTool;
 pub use search::SearchTool;
 pub use skill::SkillTool;
 pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
@@ -663,6 +665,7 @@ impl ToolRegistry {
             tasks_dir_name,
         )));
         tools.push(Arc::new(ProposeTaskTool));
+        tools.push(Arc::new(RequestWorkToolsTool));
         Self { tools }
     }
 
@@ -688,6 +691,7 @@ impl ToolRegistry {
             tasks_dir_name,
         )));
         tools.push(Arc::new(ProposeTaskTool));
+        tools.push(Arc::new(RequestWorkToolsTool));
         Self { tools }
     }
 
@@ -1086,6 +1090,7 @@ mod tests {
             no_sandbox_policy(),
         ));
         assert!(explore.contains("propose_task"));
+        assert!(explore.contains("request_work_tools"));
         assert!(explore.contains("ask_user_question"));
         assert!(explore.contains("browser_wait_for_selector"));
         assert!(explore.contains("spawn_agents"));

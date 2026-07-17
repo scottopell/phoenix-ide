@@ -236,7 +236,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "replace_global_recall_with_coordinator",
         sql: MIGRATION_044,
     },
+    Migration {
+        version: 45,
+        name: "add_full_work_tools_grant",
+        sql: MIGRATION_045,
+    },
 ];
+
+const MIGRATION_045: &str = r"
+ALTER TABLE conversations ADD COLUMN full_work_tools_granted INTEGER NOT NULL DEFAULT 0
+    CHECK (full_work_tools_granted IN (0, 1));
+";
 
 const MIGRATION_044: &str = r"
 CREATE TABLE coordinator (

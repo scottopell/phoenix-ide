@@ -55,7 +55,7 @@ export function formatShortDateTime(isoStr: string): string {
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
-    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
+    case 'awaiting_work_tool_approval': case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -69,7 +69,7 @@ export function isAgentWorking(state: ConversationState): boolean {
 export function canCancelConversationState(state: ConversationState): boolean {
   switch (state.type) {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
-    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery': case 'provisioning':
+    case 'awaiting_sub_agents': case 'awaiting_work_tool_approval': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery': case 'provisioning':
       return true;
     case 'idle': case 'creation_failed': case 'creation_cancelled': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
@@ -84,7 +84,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
     case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
-    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
+    case 'awaiting_work_tool_approval': case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'awaiting_recovery':
@@ -144,7 +144,7 @@ export function getStateDescription(state: ConversationState): string {
       return 'creation cancelled';
     case 'handed_off':
       return 'handed off';
-    case 'awaiting_task_approval':
+    case 'awaiting_work_tool_approval': case 'awaiting_task_approval':
     case 'awaiting_commission_review_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
@@ -289,6 +289,11 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     case 'cancelling_sub_agents':
       return { type: 'cancelling_sub_agents', pending: (obj['pending'] as PendingSubAgent[]) ?? [] };
+    case 'awaiting_work_tool_approval':
+      return {
+        type: 'awaiting_work_tool_approval',
+        reason: (obj['reason'] as string) ?? '',
+      };
     case 'awaiting_task_approval':
       return {
         type: 'awaiting_task_approval',

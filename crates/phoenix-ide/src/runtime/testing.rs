@@ -823,6 +823,10 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
+    async fn grant_full_work_tools(&self, _conv_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn update_conversation_mode(
         &self,
         conv_id: &str,

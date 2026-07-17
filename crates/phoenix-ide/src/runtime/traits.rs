@@ -153,6 +153,8 @@ pub trait StateStore: Send + Sync {
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
 
+    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String>;
+
     /// Update the conversation mode (e.g., Explore -> Work on task approval)
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
 
@@ -435,6 +437,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
+    }
+
+    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String> {
+        (**self).grant_full_work_tools(conv_id).await
     }
 
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
@@ -749,6 +755,13 @@ impl StateStore for DatabaseStorage {
         Ok(conv.state)
     }
 
+    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String> {
+        self.db
+            .grant_full_work_tools(conv_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
         self.db
             .update_conversation_mode(conv_id, mode)
@@ -1045,7 +1058,9 @@ impl ToolExecutor for ToolRegistryExecutor {
         // Reuse the frozen catalog so the upgraded registry advertises the same
         // agent_type enum the executor resolves against (REQ-AG-008).
         self.swap_registry(
-            ToolRegistry::direct(self.agent_catalog.to_vec()).with_commission_review(),
+            ToolRegistry::direct(self.agent_catalog.to_vec())
+                .with_propose_task()
+                .with_commission_review(),
         );
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }

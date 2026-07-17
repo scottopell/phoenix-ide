@@ -591,6 +591,9 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
         | ConvState::AwaitingSubAgents { .. }
         | ConvState::CancellingSubAgents { .. } => signals.push("active".to_string()),
         ConvState::AwaitingRecovery { .. } => signals.push("recovery needed".to_string()),
+        ConvState::AwaitingWorkToolApproval { .. } => {
+            signals.push("work tool approval pending".to_string());
+        }
         ConvState::AwaitingTaskApproval { .. } => signals.push("task approval pending".to_string()),
         ConvState::AwaitingUserResponse { .. }
         | ConvState::AwaitingCommissionReviewApproval { .. }

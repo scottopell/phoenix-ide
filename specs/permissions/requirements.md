@@ -127,7 +127,8 @@ Some LLM tool calls are intercepted by the conversation state-machine reducer
 and handled as typed state transitions, never becoming an "execute this tool"
 effect and so never reaching the runtime tool-executor boundary the seam gates.
 This class is: subagent delegation (`spawn_agents`), task proposal
-(`propose_task`), user questioning (`ask_user_question`), and subagent terminal
+(`propose_task`), Explore capability escalation (`request_work_tools`), user
+questioning (`ask_user_question`), and subagent terminal
 submission (`submit_result` / `submit_error`).
 
 THE SYSTEM SHALL treat these as a structural exception to REQ-PERM-001 — they are
@@ -143,6 +144,28 @@ A future permission layer must not assume the seam covers them; their gate is th
 typed transition, not Layer 0. (Delegation specifically is also intent-relative —
 whether a delegated task is authorized is a Tier B judgment, not an intrinsic
 one — which is a second reason it sits outside intent-agnostic Layer 0.)
+
+### REQ-PERM-008: User-approved Explore capability escalation
+
+WHEN a restricted Explore conversation determines that completing exploration
+requires the full Work toolset
+THE SYSTEM SHALL allow the agent to request that toolset with a concrete reason
+AND SHALL require an explicit user decision before exposing or executing any
+additional tool.
+
+WHEN the user approves the request
+THE SYSTEM SHALL keep the conversation in Explore mode
+AND SHALL expose the same full tool registry and execution sandbox policy used
+by Work conversations
+AND SHALL persist the grant for the lifetime of the conversation, including
+runtime restarts.
+
+WHEN the user rejects the request
+THE SYSTEM SHALL keep the restricted Explore toolset.
+
+THE SYSTEM SHALL keep this capability decision separate from task proposal and
+task approval; approval SHALL NOT create a task, change a worktree, or begin the
+Work lifecycle.
 
 ## Non-Goals
 
