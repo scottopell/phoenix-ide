@@ -1408,11 +1408,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             // on the message bubble instead of the normal sending spinner.
             markSteeringQueued(localId, phaseEventSeqBeforePost);
             rollbackOptimisticPhase();
-          } else {
+          } else if (result.already_persisted) {
             markAccepted(localId, phaseEventSeqBeforePost);
-            if (result.already_persisted) {
-              rollbackOptimisticPhase();
-            }
+            rollbackOptimisticPhase();
           }
         } else {
           // Offline path: hand the send off to the offline operation queue

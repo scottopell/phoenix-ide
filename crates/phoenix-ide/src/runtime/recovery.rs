@@ -25,8 +25,6 @@ pub enum RecoveryReason {
     EmptyConversation,
     /// Last message is not a tool result
     LastMessageNotTool,
-    /// Persisted in-flight state owns a trailing user/skill turn.
-    PersistedDirectTurn,
     /// No agent message found in conversation
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
@@ -66,20 +64,6 @@ impl RecoveryDecision {
             reason: RecoveryReason::InterruptedMidTurn,
         }
     }
-}
-
-pub fn persisted_direct_turn(state: &ConvState, messages: &[Message]) -> Option<RecoveryDecision> {
-    let last = messages.last()?;
-    if matches!(state, ConvState::LlmRequesting { .. })
-        && matches!(last.message_type, MessageType::User | MessageType::Skill)
-    {
-        return Some(RecoveryDecision {
-            state: state.clone(),
-            needs_auto_continue: true,
-            reason: RecoveryReason::PersistedDirectTurn,
-        });
-    }
-    None
 }
 
 /// Analyze messages to determine if a conversation needs auto-continuation.
@@ -311,16 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_in_flight_state_owns_trailing_user_turn() {
-        let messages = vec![user_msg(1, "Hello")];
-        let decision = persisted_direct_turn(&ConvState::LlmRequesting { attempt: 1 }, &messages)
-            .expect("persisted turn");
-        assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::PersistedDirectTurn);
-        assert!(persisted_direct_turn(&ConvState::Idle, &messages).is_none());
-    }
-
-    #[test]
     fn test_only_user_message() {
         let messages = vec![user_msg(1, "Hello")];
         let decision = should_auto_continue(&messages);
@@ -422,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_followed_by_user() {
-        // A settled trailing user message must not restart automatically.
+        // User interrupted while agent was working
         let messages = vec![
             user_msg(1, "Do something"),
             agent_tool_use_only(2, &["bash"]),
@@ -824,8 +798,13 @@ mod proptests {
 
             let decision = should_auto_continue(&messages);
 
+            // If last message is NOT tool, cannot auto-continue
             if !matches!(last_type, MessageType::Tool) {
-                prop_assert!(!decision.needs_auto_continue);
+                prop_assert!(
+                    !decision.needs_auto_continue,
+                    "Auto-continued with last message type {:?}",
+                    last_type
+                );
             }
         }
     }
@@ -898,9 +877,6 @@ mod proptests {
             match decision.reason {
                 RecoveryReason::EmptyConversation => {
                     prop_assert!(messages.is_empty());
-                }
-                RecoveryReason::PersistedDirectTurn => {
-                    prop_assert!(false, "history-only recovery cannot emit persisted turn reason");
                 }
                 RecoveryReason::LastMessageNotTool => {
                     prop_assert!(!matches!(

@@ -698,7 +698,7 @@ pub fn transition_core(
                     message_id.clone(),
                     user_agent.clone(),
                     skill_invocation.clone(),
-                    true,
+                    false,
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())

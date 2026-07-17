@@ -412,7 +412,7 @@ describe('ConversationPage message delivery reconciliation', () => {
     });
   });
 
-  it('does not repost a successful direct message while its SSE echo is missing', async () => {
+  it('keeps a fresh direct message retryable while its SSE echo is missing', async () => {
     const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
       queued: true,
       steering: false,
@@ -428,7 +428,7 @@ describe('ConversationPage message delivery reconciliation', () => {
       const queue = JSON.parse(
         localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]',
       ) as Array<{ status: string }>;
-      expect(queue[0]?.status).toBe('accepted');
+      expect(queue[0]?.status).toBe('pending');
     });
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });

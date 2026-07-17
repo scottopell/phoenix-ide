@@ -2869,40 +2869,6 @@ impl RuntimeManager {
         }
     }
 
-    pub async fn claim_direct_user_turn(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        message_id: &str,
-        content: &crate::db::MessageContent,
-        display_data: Option<&serde_json::Value>,
-        expected_state: &ConvState,
-    ) -> Result<bool, String> {
-        let handle = self.get_or_create(conversation_id).await?;
-        let claimed_state = ConvState::LlmRequesting { attempt: 1 };
-        let seq = handle.broadcast_tx.next_seq();
-        let Some(message) = self
-            .db
-            .claim_direct_user_turn(
-                message_id,
-                conversation_id,
-                seq,
-                content,
-                display_data,
-                expected_state,
-                &claimed_state,
-            )
-            .await
-            .map_err(|error| format!("Failed to claim direct user turn: {error}"))?
-        else {
-            return Ok(false);
-        };
-        let _ = handle.broadcast_tx.send_message(message);
-        self.evict_runtime(conversation_id, EvictionReason::CreationProvisioned)
-            .await;
-        let _ = self.get_or_create(conversation_id).await?;
-        Ok(true)
-    }
-
     pub async fn send_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -3184,8 +3150,7 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let decision = recovery::persisted_direct_turn(&conv.state, &messages)
-            .unwrap_or_else(|| recovery::should_auto_continue(&messages));
+        let decision = recovery::should_auto_continue(&messages);
 
         tracing::debug!(
             conv_id = %conversation_id,
