@@ -100,6 +100,17 @@ impl SendChatApplicationService {
         if let Some(receipt) = receipts.get(&req.message_id) {
             return replay_receipt(receipt, &req, &request_fingerprint);
         }
+        if let Some((queued_conversation_id, queued_entry)) =
+            find_queued_message(&self.db, &req.message_id).await?
+        {
+            if queued_conversation_id != req.conversation_id
+                || !queued_retry_matches(&queued_entry, &req)
+            {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+            receipts.remove(&req.message_id);
+            return Ok(SendChatOutcome::QueuedAsSteering);
+        }
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
                 message: "Conversation is archived and unavailable for messaging.".to_string(),
@@ -112,18 +123,6 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
-        if let Some(entry) = steering_queue
-            .iter()
-            .find(|entry| entry.message_id == req.message_id)
-        {
-            let validated_files = validate_files(&req).await?;
-            let expanded = expand_request(&self.db, &conversation, &req).await?;
-            if !queued_entry_matches(entry, &req, &expanded, &validated_files) {
-                return Err(SendChatServiceError::IdempotencyConflict);
-            }
-            receipts.remove(&req.message_id);
-            return Ok(SendChatOutcome::QueuedAsSteering);
-        }
 
         let effective_state = self
             .effective_state(&conversation.id, &conversation.state)
@@ -168,13 +167,15 @@ impl SendChatApplicationService {
                     },
                 )
                 .await;
-                record_pr_auto_fix_context_baseline(
+                if let Err(error) = record_pr_auto_fix_context_baseline(
                     self.runtime.db(),
                     &conversation.id,
                     &expanded.display_text,
                 )
                 .await
-                .map_err(|e| SendChatServiceError::Internal(format!("{e:?}")))?;
+                {
+                    tracing::warn!(conversation_id = %conversation.id, error = ?error, "Message accepted but PR auto-fix baseline recording failed");
+                }
                 return Ok(SendChatOutcome::QueuedAsSteering);
             }
             return Ok(SendChatOutcome::Rejected {
@@ -209,13 +210,15 @@ impl SendChatApplicationService {
             },
         )
         .await;
-        record_pr_auto_fix_context_baseline(
+        if let Err(error) = record_pr_auto_fix_context_baseline(
             self.runtime.db(),
             &conversation.id,
             &expanded.display_text,
         )
         .await
-        .map_err(|e| SendChatServiceError::Internal(format!("{e:?}")))?;
+        {
+            tracing::warn!(conversation_id = %conversation.id, error = ?error, "Message accepted but PR auto-fix baseline recording failed");
+        }
         Ok(SendChatOutcome::Delivered)
     }
 
@@ -342,14 +345,34 @@ async fn insert_transient_receipt(
     receipts.insert(message_id, receipt);
 }
 
-fn queued_entry_matches(
+async fn find_queued_message(
+    db: &crate::db::Database,
+    message_id: &str,
+) -> Result<Option<(String, phoenix_core::domain::sm_event::SteerEntry)>, SendChatServiceError> {
+    let Some(conversation_id) = db
+        .steering_conversation_id_for_message(message_id)
+        .await
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let entry = db
+        .get_steering_queue(&conversation_id)
+        .await
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+        .into_iter()
+        .find(|entry| entry.message_id == message_id)
+        .ok_or_else(|| {
+            SendChatServiceError::Internal("steering message disappeared during lookup".to_string())
+        })?;
+    Ok(Some((conversation_id, entry)))
+}
+
+fn queued_retry_matches(
     entry: &phoenix_core::domain::sm_event::SteerEntry,
     req: &SendChatRequest,
-    expanded: &ExpandedDispatchMessage,
-    validated_files: &[phoenix_core::domain::db_schema::FileAttachment],
 ) -> bool {
-    entry.text == expanded.display_text
-        && entry.llm_text == expanded.llm_text
+    entry.text == req.text
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -358,9 +381,18 @@ fn queued_entry_matches(
             .all(|(stored, requested)| {
                 stored.data == requested.data && stored.media_type == requested.media_type
             })
-        && entry.files == validated_files
+        && entry.files.len() == req.files.len()
+        && entry
+            .files
+            .iter()
+            .zip(&req.files)
+            .all(|(stored, requested)| {
+                stored.original_name == requested.original_name
+                    && stored.media_type == requested.media_type
+                    && stored.size_bytes == requested.size_bytes
+                    && stored.stored_path == requested.stored_path
+            })
         && entry.user_agent == req.user_agent
-        && entry.skill_invocation == expanded.skill_invocation
 }
 
 fn persisted_user_message_matches(
@@ -478,8 +510,37 @@ fn transition_code(err: &TransitionError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{persisted_skill_matches, MessageExpansionPolicy, SendChatRequest};
+    use super::{
+        persisted_skill_matches, queued_retry_matches, MessageExpansionPolicy, SendChatRequest,
+    };
     use phoenix_core::domain::db_schema::SkillContent;
+
+    #[test]
+    fn queued_retry_compares_submitted_payload_not_mutable_expansion() {
+        let request = SendChatRequest {
+            conversation_id: "conv-1".to_string(),
+            text: "@file:notes.md".to_string(),
+            message_id: "message-1".to_string(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::ExpandReferences,
+        };
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: request.text.clone(),
+            llm_text: Some("old expanded file contents".to_string()),
+            images: vec![],
+            files: vec![],
+            message_id: request.message_id.clone(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+
+        assert!(queued_retry_matches(&entry, &request));
+        let mut conflicting = request.clone();
+        conflicting.text = "different submission".to_string();
+        assert!(!queued_retry_matches(&entry, &conflicting));
+    }
 
     #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {

@@ -1,7 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConversationState, type GlobalOpenWorkResponse } from '../api';
+import { api, type GlobalOpenWorkResponse } from '../api';
 import { useMediaQuery } from '../hooks';
+import { isAgentWorking } from '../utils';
 import { useConversationPhase } from '../conversation';
 import './CoordinatorPage.css';
 
@@ -29,13 +30,6 @@ interface OpenWorkState {
   refreshedAt: string | null;
 }
 
-const WORKING_STATE_TYPES = new Set<ConversationState['type']>([
-  'awaiting_llm',
-  'llm_requesting',
-  'seeded_llm_requesting',
-  'tool_executing',
-]);
-
 export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
   const navigate = useNavigate();
   const { slug } = useParams<{ slug: string }>();
@@ -55,7 +49,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     refreshedAt: fixtureData?.openWork.generated_at ?? null,
   });
   const coordinatorPhase = useConversationPhase(slug ?? null);
-  const previousCoordinatorState = useRef<ConversationState['type'] | null>(coordinatorPhase?.type ?? null);
+  const previousCoordinatorWorking = useRef(coordinatorPhase ? isAgentWorking(coordinatorPhase) : null);
   const appliedQueryRef = useRef('');
   const datasetGenerationRef = useRef(0);
   const latestRequestRef = useRef(0);
@@ -170,10 +164,10 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
 
   useEffect(() => {
     if (fixtureData) return;
-    const previous = previousCoordinatorState.current;
-    const current = coordinatorPhase?.type ?? null;
-    previousCoordinatorState.current = current;
-    if (previous && current && WORKING_STATE_TYPES.has(previous) && !WORKING_STATE_TYPES.has(current)) {
+    const previous = previousCoordinatorWorking.current;
+    const current = coordinatorPhase ? isAgentWorking(coordinatorPhase) : null;
+    previousCoordinatorWorking.current = current;
+    if (previous === true && current === false) {
       void refreshOpenWork();
     }
   }, [coordinatorPhase?.type, fixtureData, refreshOpenWork]);

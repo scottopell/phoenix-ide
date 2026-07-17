@@ -238,7 +238,7 @@ describe('CoordinatorPage', () => {
   });
 
   it('refreshes open work when the coordinator turn completes', async () => {
-    let phase: { type: 'llm_requesting'; attempt: number } | { type: 'idle' } = { type: 'llm_requesting', attempt: 1 };
+    let phase: { type: 'seeded_llm_requesting'; attempt: number } | { type: 'idle' } = { type: 'seeded_llm_requesting', attempt: 1 };
     conversationPhaseMock.mockImplementation(() => phase);
 
     const { rerender } = render(
