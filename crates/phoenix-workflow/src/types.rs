@@ -125,6 +125,8 @@ pub enum ScheduleStatus {
 pub enum WorkflowStatus {
     Active,
     Cancelling,
+    ManualResolution,
+    Incompatible,
     Cancelled,
     DeletionPending,
     Deleted,
@@ -469,16 +471,6 @@ pub struct CancellationRequest<P: WorkflowProfile> {
     pub invalidations: Vec<EffectInvalidationDecl>,
     pub terminal_receipt: Option<CancellationReceiptDecl<P>>,
     pub compensation_plan: TransitionPlan<P>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct DeliveryDeclCompat<P: WorkflowProfile> {
-    pub effect_id: Option<EffectId>,
-    pub barrier_id: Option<BarrierId>,
-    pub consumer_kind: &'static str,
-    pub event_codec: CodecRef,
-    pub requires_runtime_acceptance: bool,
-    pub payload: DeliveryPayload<P>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -952,19 +944,6 @@ impl<P: WorkflowProfile> Clone for CancellationRequest<P> {
             invalidations: self.invalidations.clone(),
             terminal_receipt: self.terminal_receipt.clone(),
             compensation_plan: self.compensation_plan.clone(),
-        }
-    }
-}
-
-impl<P: WorkflowProfile> Clone for DeliveryDeclCompat<P> {
-    fn clone(&self) -> Self {
-        Self {
-            effect_id: self.effect_id,
-            barrier_id: self.barrier_id,
-            consumer_kind: self.consumer_kind,
-            event_codec: self.event_codec.clone(),
-            requires_runtime_acceptance: self.requires_runtime_acceptance,
-            payload: self.payload.clone(),
         }
     }
 }

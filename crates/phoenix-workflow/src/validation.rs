@@ -57,12 +57,8 @@ pub enum PlanError {
 pub enum EngineError {
     #[error("plan validation failed: {0:?}")]
     InvalidPlan(PlanError),
-    #[error("protocol selection is not accepting new workflows")]
-    ProtocolNotAccepting,
     #[error("workflow profile does not match the selected protocol profile")]
     ProfileProtocolMismatch,
-    #[error("workflow binding is shadow-only and cannot execute")]
-    ShadowCannotExecute,
     #[error("validated plan omitted barrier event for barrier {0:?}")]
     MissingValidatedBarrierEvent(BarrierId),
     #[error("reducer inbox item is missing or already consumed")]
@@ -139,11 +135,22 @@ pub(crate) fn validate_status_transition(
                     | WorkflowStatus::DeletionPending
             )
         }
-        WorkflowStatus::DeletionPending => matches!(next_status, WorkflowStatus::Deleted),
-        WorkflowStatus::Cancelled
+        WorkflowStatus::ManualResolution => matches!(
+            next_status,
+            WorkflowStatus::ManualResolution
+                | WorkflowStatus::Active
+                | WorkflowStatus::Cancelling
+                | WorkflowStatus::Cancelled
+                | WorkflowStatus::DeletionPending
+                | WorkflowStatus::Completed
+                | WorkflowStatus::Failed
+        ),
+        WorkflowStatus::Incompatible
+        | WorkflowStatus::Cancelled
         | WorkflowStatus::Deleted
         | WorkflowStatus::Completed
         | WorkflowStatus::Failed => false,
+        WorkflowStatus::DeletionPending => matches!(next_status, WorkflowStatus::Deleted),
     };
     if valid {
         Ok(())
