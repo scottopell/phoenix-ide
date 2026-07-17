@@ -170,7 +170,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     if (previous === true && current === false) {
       void refreshOpenWork();
     }
-  }, [coordinatorPhase?.type, fixtureData, refreshOpenWork]);
+  }, [coordinatorPhase, fixtureData, refreshOpenWork]);
 
   const itemCount = useMemo(
     () => openWork.data?.groups.reduce((sum, group) => sum + group.items.length, 0) ?? 0,
