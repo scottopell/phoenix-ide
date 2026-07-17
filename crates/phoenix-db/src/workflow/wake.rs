@@ -399,6 +399,19 @@ impl<'a> WakeWorkflowAdapter<'a> {
         successor_id: &str,
     ) -> WorkflowRepositoryResult<u64> {
         let mut tx = self.repository.pool().begin().await?;
+        let persisted_successor: Option<String> =
+            sqlx::query_scalar("SELECT continued_in_conv_id FROM conversations WHERE id = ?1")
+                .bind(predecessor_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        if persisted_successor.as_deref() != Some(successor_id) {
+            tx.rollback().await?;
+            return Err(WorkflowRepositoryError::CorruptState(
+                "wake continuation ownership transfer does not match the persisted continuation"
+                    .to_owned(),
+            ));
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO wake_registration_fences (conversation_id, version, status) \
              SELECT ?1, version, status FROM wake_registration_fences WHERE conversation_id = ?2",
@@ -646,6 +659,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
                     workflow_id,
                     handle_receipt,
                 } => {
+                    insert_registration_fence(&mut tx, request).await?;
                     insert_registration_core(&mut tx, request, &receipt, &snapshot, &commit)
                         .await?;
                     insert_registration_transition(&mut tx, &commit).await?;
@@ -1468,6 +1482,30 @@ async fn insert_registration_transition(
     )
     .bind(&member.barrier_id)
     .bind(&member.effect_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_registration_fence(
+    tx: &mut Transaction<'_, Sqlite>,
+    request: &WakeRegistrationRequest,
+) -> WorkflowRepositoryResult<()> {
+    let next =
+        request
+            .fence_version
+            .checked_add(1)
+            .ok_or(WorkflowRepositoryError::VersionOutOfRange(
+                request.fence_version,
+            ))?;
+    let next = i64::try_from(next)
+        .map_err(|_| WorkflowRepositoryError::VersionOutOfRange(request.fence_version))?;
+    sqlx::query(
+        "INSERT INTO wake_registration_fences (conversation_id, version, status) \
+         VALUES (?1, ?2, 'open') ON CONFLICT(conversation_id) DO NOTHING",
+    )
+    .bind(&request.intent.conversation_id)
+    .bind(next)
     .execute(&mut **tx)
     .await?;
     Ok(())

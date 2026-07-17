@@ -1384,45 +1384,18 @@ async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTermina
     if !output.status.success() {
         return TmuxTerminalInspection::Missing;
     }
-    let pane_state = tokio::process::Command::new("tmux")
-        .args([
-            "-S",
-            &sock,
-            "display-message",
-            "-p",
-            "-t",
-            window_id,
-            "#{pane_dead}|#{pane_pid}",
-        ])
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await;
-    let Ok(pane_state) = pane_state else {
-        return TmuxTerminalInspection::Unavailable;
-    };
-    if !pane_state.status.success() {
-        return TmuxTerminalInspection::Missing;
-    }
-    let pane_state = String::from_utf8_lossy(&pane_state.stdout);
-    let pane_is_dead = pane_state
-        .trim()
-        .split_once('|')
-        .is_some_and(|(dead, pid)| dead == "1" && !pid.is_empty());
-    let captured = String::from_utf8_lossy(&output.stdout);
-    if pane_is_dead {
-        if let Some(exit_code) = parse_exit_marker(&captured) {
-            return TmuxTerminalInspection::Terminal {
-                exit_code,
-                occurred_at: parse_occurred_at_marker(&captured),
-                duration_ms: parse_duration_ms(&captured),
-                final_tail: terminal_tail(&captured),
-            };
+    terminal_inspection_from_capture(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn terminal_inspection_from_capture(captured: &str) -> TmuxTerminalInspection {
+    parse_exit_marker(captured).map_or(TmuxTerminalInspection::Live, |exit_code| {
+        TmuxTerminalInspection::Terminal {
+            exit_code,
+            occurred_at: parse_occurred_at_marker(captured),
+            duration_ms: parse_duration_ms(captured),
+            final_tail: terminal_tail(captured),
         }
-    }
-    TmuxTerminalInspection::Live
+    })
 }
 
 fn terminal_tail(output: &str) -> Vec<String> {
@@ -1672,6 +1645,15 @@ mod tests {
         );
         assert!(registry.mark_window_killed(&identity).await);
         assert_eq!(registry.inspect_window(&identity).await, terminal);
+    }
+
+    #[test]
+    fn recovered_command_marker_is_terminal_without_pane_death_authority() {
+        let captured = "command output\n[phoenix] process exited with code 0\n";
+        assert!(matches!(
+            terminal_inspection_from_capture(captured),
+            TmuxTerminalInspection::Terminal { exit_code: 0, .. }
+        ));
     }
 
     #[test]

@@ -360,6 +360,54 @@ async fn fired_evidence_after_expiry_is_rejected_in_atomic_and_direct_receipt_pa
 }
 
 #[tokio::test]
+async fn continuation_owner_transfer_requires_the_persisted_edge_and_replays() {
+    let (pool, repo) = registered(bash()).await;
+    sqlx::query("INSERT INTO conversations (id, slug) VALUES ('successor', 'successor'), ('unrelated', 'unrelated')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    let error = adapter
+        .transfer_conversation_owner("conv-wake", "unrelated")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, WorkflowRepositoryError::CorruptState(_)));
+    assert!(adapter
+        .has_pending_for_conversation("conv-wake")
+        .await
+        .unwrap());
+
+    sqlx::query(
+        "UPDATE conversations SET continued_in_conv_id = 'successor' WHERE id = 'conv-wake'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        adapter
+            .transfer_conversation_owner("conv-wake", "successor")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .transfer_conversation_owner("conv-wake", "successor")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!adapter
+        .has_pending_for_conversation("conv-wake")
+        .await
+        .unwrap());
+    assert!(adapter
+        .has_pending_for_conversation("successor")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn pending_lookup_and_scope_rekey_follow_live_resource_ownership() {
     let (pool, repo) = registered(bash()).await;
     let adapter = WakeWorkflowAdapter::new(&repo);
@@ -630,24 +678,58 @@ async fn registration_replay_uses_stable_intent_not_fresh_acceptance_time() {
 }
 
 #[tokio::test]
-async fn registration_replay_repairs_an_incomplete_invariant() {
-    let (pool, repo) = registered(bash()).await;
-    sqlx::query("DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let replay = WakeWorkflowAdapter::new(&repo)
-        .register(&registration(bash()))
-        .await
-        .unwrap();
-    assert!(matches!(replay, WakeRegistrationResult::Replay { .. }));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wake_workflow_bindings")
-            .fetch_one(&pool)
+async fn registration_replay_repairs_each_missing_graph_component() {
+    for (table, delete_sql, count_sql) in [
+        (
+            "wake_workflow_bindings",
+            "DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'",
+            "SELECT COUNT(*) FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'",
+        ),
+        (
+            "workflow_barrier_members",
+            "DELETE FROM workflow_barrier_members WHERE barrier_id = 'wake-registration:wake-workflow'",
+            "SELECT COUNT(*) FROM workflow_barrier_members WHERE barrier_id = 'wake-registration:wake-workflow'",
+        ),
+        (
+            "workflow_barriers",
+            "DELETE FROM workflow_barrier_members WHERE barrier_id = 'wake-registration:wake-workflow'; DELETE FROM workflow_barriers WHERE workflow_id = 'wake-workflow'",
+            "SELECT COUNT(*) FROM workflow_barriers WHERE workflow_id = 'wake-workflow'",
+        ),
+        (
+            "workflow_effects",
+            "DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'; DELETE FROM workflow_barrier_members WHERE barrier_id = 'wake-registration:wake-workflow'; DELETE FROM workflow_effects WHERE workflow_id = 'wake-workflow'",
+            "SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = 'wake-workflow'",
+        ),
+        (
+            "workflow_transitions",
+            "DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'; DELETE FROM workflow_barrier_members WHERE barrier_id = 'wake-registration:wake-workflow'; DELETE FROM workflow_barriers WHERE workflow_id = 'wake-workflow'; DELETE FROM workflow_effects WHERE workflow_id = 'wake-workflow'; DELETE FROM workflow_transitions WHERE workflow_id = 'wake-workflow'",
+            "SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = 'wake-workflow'",
+        ),
+        (
+            "wake_registration_fences",
+            "DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'; DELETE FROM wake_registration_fences WHERE conversation_id = 'conv-wake'",
+            "SELECT COUNT(*) FROM wake_registration_fences WHERE conversation_id = 'conv-wake'",
+        ),
+    ] {
+        let (pool, repo) = registered(bash()).await;
+        sqlx::raw_sql(delete_sql)
+            .execute(&pool)
             .await
-            .unwrap(),
-        1
-    );
+            .unwrap_or_else(|error| panic!("failed deleting {table}: {error}"));
+        let replay = WakeWorkflowAdapter::new(&repo)
+            .register(&registration(bash()))
+            .await
+            .unwrap();
+        assert!(matches!(replay, WakeRegistrationResult::Replay { .. }));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(count_sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1,
+            "replay did not repair {table}"
+        );
+    }
 }
 
 #[tokio::test]

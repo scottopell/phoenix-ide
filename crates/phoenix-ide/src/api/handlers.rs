@@ -3719,6 +3719,21 @@ async fn send_chat(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeCancellationAction {
+    None,
+    ReturnAfterCancellation,
+    ContinueRuntimeCancellation,
+}
+
+fn wake_cancellation_action(state: &ConvState) -> WakeCancellationAction {
+    match state {
+        ConvState::Idle => WakeCancellationAction::ReturnAfterCancellation,
+        ConvState::AwaitingSubAgents { .. } => WakeCancellationAction::ContinueRuntimeCancellation,
+        _ => WakeCancellationAction::None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
@@ -3777,13 +3792,8 @@ async fn cancel_conversation(
         }));
     }
 
-    if matches!(
-        effective_state,
-        ConvState::Idle
-            | ConvState::Error { .. }
-            | ConvState::ContextExhausted { .. }
-            | ConvState::AwaitingSubAgents { .. }
-    ) {
+    let wake_action = wake_cancellation_action(&effective_state);
+    if wake_action != WakeCancellationAction::None {
         let repository =
             phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
         let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
@@ -3792,10 +3802,12 @@ async fn cancel_conversation(
             .map_err(|error| AppError::Internal(error.to_string()))?;
         if cancelled > 0 {
             state.runtime.kick_wake_worker();
-            return Ok(Json(CancelResponse {
-                ok: true,
-                no_op: false,
-            }));
+            if wake_action == WakeCancellationAction::ReturnAfterCancellation {
+                return Ok(Json(CancelResponse {
+                    ok: true,
+                    no_op: false,
+                }));
+            }
         }
     }
 
@@ -10362,6 +10374,38 @@ pub(crate) mod hard_delete_cascade_tests {
             SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wake_cancellation_only_returns_early_for_idle_delivery() {
+        assert_eq!(
+            wake_cancellation_action(&ConvState::Idle),
+            WakeCancellationAction::ReturnAfterCancellation
+        );
+        assert_eq!(
+            wake_cancellation_action(&ConvState::AwaitingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                spawn_tool_id: Some("spawn".to_string()),
+                completion:
+                    phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
+            }),
+            WakeCancellationAction::ContinueRuntimeCancellation
+        );
+        assert_eq!(
+            wake_cancellation_action(&ConvState::Error {
+                message: "error".to_string(),
+                error_kind: crate::db::ErrorKind::ServerError,
+                resets_at: None,
+            }),
+            WakeCancellationAction::None
+        );
+        assert_eq!(
+            wake_cancellation_action(&ConvState::ContextExhausted {
+                summary: "summary".to_string(),
+            }),
+            WakeCancellationAction::None
+        );
     }
 
     #[tokio::test]

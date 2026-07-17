@@ -937,10 +937,12 @@ mod tests {
             "tmux_run must register the exact window identity"
         );
         let inspection = registry.inspect_window(&identity).await;
-        assert_eq!(
-            inspection,
-            TmuxTerminalInspection::Live,
-            "interactive shell must remain targetable; pane: {pane}"
+        assert!(
+            matches!(
+                inspection,
+                TmuxTerminalInspection::Terminal { exit_code: 7, .. }
+            ),
+            "command marker must remain terminal evidence while the interactive shell stays targetable; pane: {pane}"
         );
         let rekeyed_scope = phoenix_core::work_scope::WorkScope::Worktree(
             cwd_tmp
@@ -958,10 +960,10 @@ mod tests {
             work_scope: rekeyed_scope.clone(),
             ..identity
         };
-        assert_eq!(
+        assert!(matches!(
             registry.inspect_window(&rekeyed_identity).await,
-            TmuxTerminalInspection::Live
-        );
+            TmuxTerminalInspection::Terminal { exit_code: 7, .. }
+        ));
         assert!(registry.get_existing(&rekeyed_scope).await.is_some());
         assert_eq!(
             registry.conversation_count().await,
@@ -1327,10 +1329,10 @@ mod tests {
             restarted.get_existing(&scope).await.is_none(),
             "new registry simulates Phoenix restart"
         );
-        assert_eq!(
+        assert!(matches!(
             restarted.inspect_window(&identity).await,
-            TmuxTerminalInspection::Live
-        );
+            TmuxTerminalInspection::Terminal { exit_code: 3, .. }
+        ));
         assert!(
             restarted.get_existing(&scope).await.is_none(),
             "read-only inspection must not materialize registry inventory"

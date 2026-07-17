@@ -736,9 +736,7 @@ impl ToolRegistry {
     /// Full tool suite -- same as Work mode.
     #[must_use]
     pub fn direct(agents: Vec<phoenix_agents::AgentDefinition>) -> Self {
-        let mut registry = Self::new_with_options(false, agents);
-        registry.tools.retain(|tool| tool.name() != "wait_until");
-        registry
+        Self::new_with_options(false, agents)
     }
 
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
@@ -1048,7 +1046,7 @@ mod tests {
     #[test]
     fn wait_until_is_parent_only() {
         assert!(names(&ToolRegistry::standard()).contains("wait_until"));
-        assert!(!names(&ToolRegistry::direct(Vec::new())).contains("wait_until"));
+        assert!(names(&ToolRegistry::direct(Vec::new())).contains("wait_until"));
         assert!(!names(&ToolRegistry::for_subagent_work()).contains("wait_until"));
         assert!(
             !names(&ToolRegistry::for_subagent_explore(sandbox_policy())).contains("wait_until")
