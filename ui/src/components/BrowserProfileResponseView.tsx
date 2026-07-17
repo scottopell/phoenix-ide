@@ -33,9 +33,75 @@ interface Props {
   displayData: Record<string, unknown> | undefined;
   fallbackText: string;
   isError: boolean;
+  activeHighlight?: { fragmentId: string; start: number; end: number } | null | undefined;
 }
 
-export function BrowserProfileResponseView({ action, displayData, fallbackText, isError }: Props) {
+function highlightProfileText(text: string, start: number, end: number) {
+  if (start < 0 || end <= start || start >= text.length) return text;
+  const boundedEnd = Math.min(end, text.length);
+  return <>{text.slice(0, start)}<mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(start, boundedEnd)}</mark>{text.slice(boundedEnd)}</>;
+}
+
+function visibleStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function buildBrowserProfileVisibleText(
+  action: string,
+  data: Record<string, unknown> | undefined,
+  fallbackText: string,
+  isError = false,
+): string {
+  if (!data) return `${action}\n${fallbackText}`;
+  if (isError && action !== 'run_scenario') return `${action}\n${fallbackText}`;
+  switch (action) {
+    case 'run_scenario': {
+      const outcome = String(data['outcome'] ?? 'unknown');
+      const samples = Array.isArray(data['raw_samples']) ? data['raw_samples'] : [];
+      const requested = typeof data['requested_runs'] === 'number' ? `${samples.length}/${data['requested_runs']} runs` : '';
+      const warmup = typeof data['warmup'] === 'number' && data['warmup'] > 0 ? `+${data['warmup']} warmup discarded` : '';
+      const blocked = typeof data['blocked_step'] === 'string' ? `Blocked step: ${data['blocked_step']}` : '';
+      const warnings = visibleStrings(data['methodology_warnings']);
+      const path = typeof data['samples_path'] === 'string' ? `Raw samples written to ${data['samples_path']}` : '';
+      return [outcome === 'completed' ? '✓ completed' : outcome === 'blocked' ? '✗ blocked' : outcome, requested, warmup, warnings.length ? `${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : '', blocked, ...warnings, path].filter(Boolean).join('\n');
+    }
+    case 'heap_snapshot': {
+      if (data['baseline'] === undefined) return `heap_snapshot\n${fallbackText}`;
+      const detached = data['detached_dom_nodes'] as { baseline?: unknown; post?: unknown } | undefined;
+      return ['heap diff', String(data['baseline'] ?? ''), String(data['post'] ?? ''), `nodes ${String(data['node_count_delta'] ?? 0)}`, `self size ${String(data['self_size_delta_bytes'] ?? 0)}`, `detached DOM ${String(detached?.baseline ?? 0)} → ${String(detached?.post ?? 0)}`, data['retained_size_approximate'] === true ? 'retained-size approximated by self_size delta' : ''].filter(Boolean).join('\n');
+    }
+    case 'metrics': {
+      const metrics = data['metrics'];
+      if (!metrics || typeof metrics !== 'object') return `metrics\n${fallbackText}`;
+      return ['metrics', 'Performance.getMetrics', ...Object.entries(metrics as Record<string, unknown>).flatMap(([name, value]) => typeof value === 'number' && Number.isFinite(value) ? [`${name} ${value}`] : [])].join('\n');
+    }
+    case 'cpu_stop':
+    case 'cpu_summary': {
+      const summary = data['cpu_summary'] as Record<string, unknown> | undefined;
+      if (!summary || !Array.isArray(summary['top_by_self'])) return `${action}\n${fallbackText}`;
+      const entries = [...(summary['top_by_self'] as unknown[]), ...(Array.isArray(summary['top_by_total']) ? summary['top_by_total'] as unknown[] : [])];
+      return ['CPU profile', typeof summary['path'] === 'string' ? summary['path'] : '', ...entries.flatMap((entry) => entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>)['label'] === 'string' ? [String((entry as Record<string, unknown>)['label'])] : [])].filter(Boolean).join('\n');
+    }
+    case 'trace_stop': {
+      const trace = data['trace'] as Record<string, unknown> | undefined;
+      if (!trace) return `trace_stop\n${fallbackText}`;
+      return ['trace', typeof trace['event_count'] === 'number' ? `${trace['event_count']} events` : '', typeof trace['long_task_count'] === 'number' ? `${trace['long_task_count']} long tasks` : '', trace['timed_out'] === true ? 'timed out — partial trace' : '', typeof trace['path'] === 'string' ? trace['path'] : '', ...(Array.isArray(trace['long_tasks']) ? trace['long_tasks'].flatMap((entry) => entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>)['name'] === 'string' ? [String((entry as Record<string, unknown>)['name'])] : []) : [])].filter(Boolean).join('\n');
+    }
+    default:
+      return `${action}\n${fallbackText}`;
+  }
+}
+
+export function BrowserProfileResponseView({ action, displayData, fallbackText, isError, activeHighlight = null }: Props) {
+  if (activeHighlight) {
+    const visibleText = buildBrowserProfileVisibleText(action, displayData, fallbackText, isError);
+    return (
+      <div className="profile-response" data-fragment-id="browser-profile-visible">
+        {highlightProfileText(visibleText, activeHighlight.start, activeHighlight.end)}
+      </div>
+    );
+  }
   if (isError) {
     // Blocked scenarios still carry a structured payload. Everything else
     // is a plain error message — show the text as-is with an action chip.

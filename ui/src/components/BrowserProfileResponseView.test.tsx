@@ -2,6 +2,29 @@ import { describe, expect, it } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { BrowserProfileResponseView } from './BrowserProfileResponseView';
 
+describe('BrowserProfileResponseView find highlighting', () => {
+  it('marks an active occurrence in the visible scenario summary', () => {
+    const displayData = {
+      outcome: 'completed', requested_runs: 2, warmup: 1,
+      methodology_warnings: ['Visible warning text'], raw_samples: [{ duration_ms: 1 }, { duration_ms: 2 }],
+    };
+    const visibleText = '✓ completed\n2/2 runs\n+1 warmup discarded\n1 warning\nVisible warning text';
+    const start = visibleText.indexOf('Visible warning');
+    const { container } = render(
+      <BrowserProfileResponseView
+        action="run_scenario"
+        displayData={displayData}
+        fallbackText="opaque"
+        isError={false}
+        activeHighlight={{ fragmentId: 'browser-profile-visible', start, end: start + 'Visible warning'.length }}
+      />,
+    );
+
+    expect(container.querySelector('[data-fragment-id="browser-profile-visible"] .viewer-find-inline-match--active')?.textContent)
+      .toBe('Visible warning');
+  });
+});
+
 describe('BrowserProfileResponseView', () => {
   describe('run_scenario', () => {
     const sampleData = {

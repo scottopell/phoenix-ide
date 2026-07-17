@@ -12,6 +12,7 @@ import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierr
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 import { formatToolInput, skillResultVisibleText } from '../toolInputDisplay';
 import { buildCommissionReviewInlineSearchFragments, parseCommissionReviewResult } from '../../features/commissionReview/model';
+import { buildBrowserProfileVisibleText } from '../BrowserProfileResponseView';
 
 export interface SearchableSourceMatch<TTarget> {
   sourceId: string;
@@ -213,6 +214,12 @@ export interface MessageTextRevealTarget {
   fragmentId: string;
 }
 
+export interface BrowserProfileResultRevealTarget {
+  kind: 'tool-result-browser-profile';
+  toolUseId: string;
+  fragmentId: string;
+}
+
 export interface CommissionReviewResultRevealTarget {
   kind: 'tool-result-commission-review';
   toolUseId: string;
@@ -235,6 +242,7 @@ export type ConversationFragmentRevealTarget =
   | MessageTextRevealTarget
   | MessageAttachmentRevealTarget
   | ToolUseInputRevealTarget
+  | BrowserProfileResultRevealTarget
   | CommissionReviewResultRevealTarget
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
@@ -1527,6 +1535,19 @@ function agentTurnSources(
             : 'opaque';
         for (const fragment of buildTerminalToolResultProjection(errorFamily, resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+        return;
+      }
+      if (block.name === 'browser_profile' && structuredProfile) {
+        const fragmentId = 'browser-profile-visible';
+        const visibleText = buildBrowserProfileVisibleText(profileAction ?? '', toolResult.display_data as Record<string, unknown> | undefined, resultText, isError);
+        if (visibleText) {
+          out.push({
+            role: `browser-profile-${index}`,
+            text: visibleText,
+            fragmentId,
+            revealTarget: { kind: 'tool-result-browser-profile', toolUseId, fragmentId },
+          });
         }
         return;
       }

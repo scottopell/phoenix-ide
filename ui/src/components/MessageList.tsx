@@ -1291,6 +1291,7 @@ function MessageListImpl({
                 || activeFindRevealTarget?.kind === 'message-text'
                 || activeFindRevealTarget?.kind === 'tool-use-input'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'
+                || activeFindRevealTarget?.kind === 'tool-result-browser-profile'
                 || activeFindRevealTarget?.kind === 'tool-result-commission-review'
                 || activeFindRevealTarget?.kind === 'tool-result-patch'
                 || activeFindRevealTarget?.kind === 'tool-result-terminal'

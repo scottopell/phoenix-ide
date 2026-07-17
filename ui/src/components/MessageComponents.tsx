@@ -2233,6 +2233,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || terminalProjection.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
       || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || (name === 'browser_profile' && activeHighlight.fragmentId === 'browser-profile-visible')
       || (name === 'skill' && activeHighlight.fragmentId === 'skill-result-visible')
       || (name === 'commission_review' && activeHighlight.fragmentId.startsWith('commission-review-')))
     ? activeHighlight
@@ -2298,7 +2299,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
       return;
     }
-    if (revealRequest.revealTarget.kind === 'tool-result-commission-review') {
+    if (revealRequest.revealTarget.kind === 'tool-result-browser-profile'
+      || revealRequest.revealTarget.kind === 'tool-result-commission-review') {
       if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
       return;
     }
@@ -2463,6 +2465,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
               displayData={result?.display_data as Record<string, unknown> | undefined}
               fallbackText={resultText}
               isError={isError}
+              activeHighlight={toolActiveHighlight}
             />
           ) : name === 'browser_recent_console_logs' && !isError ? (
             <BrowserConsoleLogsView rawText={resultText} />

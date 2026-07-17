@@ -605,6 +605,29 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('indexes only visible structured browser-profile summaries', () => {
+    const result = toolMsg('profile-result', 'profile-tool', { result: 'opaque raw sample needle' });
+    result.display_data = {
+      outcome: 'completed', requested_runs: 2, warmup: 1,
+      methodology_warnings: ['Visible warning text'],
+      raw_samples: [{ duration_ms: 123, secret: 'hidden raw sample needle' }, { duration_ms: 456 }],
+      samples_path: '/tmp/samples.json',
+    };
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn', key: 'profile', isFirstInTurn: true,
+      agent: agentMsg('profile', [{ type: 'tool_use', id: 'profile-tool', name: 'browser_profile', input: { action: 'run_scenario' } }]),
+      toolResultsByUseId: new Map([['profile-tool', result]]),
+    }];
+
+    const visible = buildConversationSearchProjection(units, 'Visible warning text', { density: 'full' });
+    expect(visible.matches).toHaveLength(1);
+    expect(visible.sources.find((source) => source.fragmentId === 'browser-profile-visible')?.revealTarget).toEqual({
+      kind: 'tool-result-browser-profile', toolUseId: 'profile-tool', fragmentId: 'browser-profile-visible',
+    });
+    expect(buildConversationSearchProjection(units, 'hidden raw sample needle', { density: 'full' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'opaque raw sample needle', { density: 'full' }).matches).toHaveLength(0);
+  });
+
   it('indexes only the visible source and snippet for completed skill results', () => {
     const resultText = [
       'Base directory for this skill: /tmp/skill',
