@@ -3468,11 +3468,6 @@ async fn send_chat(
             message_id = %req.message_id,
             "Duplicate message detected, returning success (idempotent)"
         );
-        state
-            .runtime
-            .resume_persisted_user_turn_if_unhandled(&id, &req.message_id)
-            .await
-            .map_err(AppError::Internal)?;
         return Ok(Json(ChatResponse {
             queued: true,
             steering: false,
@@ -3720,27 +3715,24 @@ async fn send_chat(
     else {
         unreachable!("persist_user_message always returns PersistMessage")
     };
-    state
+    let claimed = state
         .runtime
-        .persist_direct_user_message(&id, &req.message_id, &content, display_data.as_ref())
+        .claim_direct_user_turn(
+            &id,
+            &req.message_id,
+            &content,
+            display_data.as_ref(),
+            &effective_state,
+        )
         .await
         .map_err(AppError::Internal)?;
-
-    let event = Event::UserMessage {
-        text: display_text.clone(),
-        llm_text: chat_llm_text,
-        images,
-        files,
-        message_id: req.message_id,
-        user_agent: req.user_agent,
-        skill_invocation: expanded.skill_invocation,
-    };
-
-    state
-        .runtime
-        .send_event(&id, event)
-        .await
-        .map_err(AppError::BadRequest)?;
+    if !claimed {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation state changed while accepting the message; retry as a follow-up."
+                .to_string(),
+            "agent_busy",
+        ))));
+    }
     record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
 
     Ok(Json(ChatResponse {
@@ -13190,6 +13182,12 @@ mod chat_authority_tests {
         assert!(!response.0.steering);
         assert!(!response.0.already_persisted);
         assert!(state.db.message_exists(&message_id).await.expect("query"));
+        let conversation = state
+            .db
+            .get_conversation("c-durable")
+            .await
+            .expect("conversation");
+        assert_eq!(conversation.state, ConvState::LlmRequesting { attempt: 1 });
     }
 
     /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.

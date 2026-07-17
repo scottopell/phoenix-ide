@@ -2869,63 +2869,38 @@ impl RuntimeManager {
         }
     }
 
-    pub async fn resume_persisted_user_turn_if_unhandled(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        message_id: &str,
-    ) -> Result<bool, String> {
-        if self
-            .effective_conversation_state(conversation_id)
-            .await
-            .is_some_and(|state| state.is_busy())
-        {
-            return Ok(false);
-        }
-        let messages = self
-            .db
-            .get_latest_messages(conversation_id, 1)
-            .await
-            .map_err(|error| error.to_string())?;
-        let is_unhandled = messages.last().is_some_and(|message| {
-            message.message_id == message_id
-                && matches!(
-                    message.message_type,
-                    crate::db::MessageType::User | crate::db::MessageType::Skill
-                )
-        });
-        if !is_unhandled {
-            return Ok(false);
-        }
-
-        self.evict_runtime(conversation_id, EvictionReason::CreationProvisioned)
-            .await;
-        let _ = self.get_or_create(conversation_id).await?;
-        Ok(true)
-    }
-
-    pub async fn persist_direct_user_message(
+    pub async fn claim_direct_user_turn(
         self: &Arc<Self>,
         conversation_id: &str,
         message_id: &str,
         content: &crate::db::MessageContent,
         display_data: Option<&serde_json::Value>,
-    ) -> Result<(), String> {
+        expected_state: &ConvState,
+    ) -> Result<bool, String> {
         let handle = self.get_or_create(conversation_id).await?;
+        let claimed_state = ConvState::LlmRequesting { attempt: 1 };
         let seq = handle.broadcast_tx.next_seq();
-        let message = self
+        let Some(message) = self
             .db
-            .add_message_with_seq(
+            .claim_direct_user_turn(
                 message_id,
                 conversation_id,
                 seq,
                 content,
                 display_data,
-                None,
+                expected_state,
+                &claimed_state,
             )
             .await
-            .map_err(|error| format!("Failed to persist direct user message: {error}"))?;
+            .map_err(|error| format!("Failed to claim direct user turn: {error}"))?
+        else {
+            return Ok(false);
+        };
         let _ = handle.broadcast_tx.send_message(message);
-        Ok(())
+        self.evict_runtime(conversation_id, EvictionReason::CreationProvisioned)
+            .await;
+        let _ = self.get_or_create(conversation_id).await?;
+        Ok(true)
     }
 
     pub async fn send_event(
@@ -3209,7 +3184,8 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let decision = recovery::should_auto_continue(&messages);
+        let decision = recovery::persisted_direct_turn(&conv.state, &messages)
+            .unwrap_or_else(|| recovery::should_auto_continue(&messages));
 
         tracing::debug!(
             conv_id = %conversation_id,

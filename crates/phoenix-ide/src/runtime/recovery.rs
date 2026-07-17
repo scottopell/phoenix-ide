@@ -25,8 +25,8 @@ pub enum RecoveryReason {
     EmptyConversation,
     /// Last message is not a tool result
     LastMessageNotTool,
-    /// A persisted user message has no subsequent turn output.
-    InterruptedAfterUserMessage,
+    /// Persisted in-flight state owns a trailing user/skill turn.
+    PersistedDirectTurn,
     /// No agent message found in conversation
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
@@ -68,6 +68,20 @@ impl RecoveryDecision {
     }
 }
 
+pub fn persisted_direct_turn(state: &ConvState, messages: &[Message]) -> Option<RecoveryDecision> {
+    let last = messages.last()?;
+    if matches!(state, ConvState::LlmRequesting { .. })
+        && matches!(last.message_type, MessageType::User | MessageType::Skill)
+    {
+        return Some(RecoveryDecision {
+            state: state.clone(),
+            needs_auto_continue: true,
+            reason: RecoveryReason::PersistedDirectTurn,
+        });
+    }
+    None
+}
+
 /// Analyze messages to determine if a conversation needs auto-continuation.
 ///
 /// A conversation needs auto-continuation when:
@@ -89,17 +103,6 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         // banner dismissed) persists a hidden marker as the last message.
         // Treat it as a settled Idle, never an interrupted tool turn.
         return RecoveryDecision::idle(reason);
-    }
-
-    if matches!(
-        last_msg.message_type,
-        MessageType::User | MessageType::Skill
-    ) {
-        return RecoveryDecision {
-            state: ConvState::LlmRequesting { attempt: 1 },
-            needs_auto_continue: true,
-            reason: RecoveryReason::InterruptedAfterUserMessage,
-        };
     }
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
@@ -174,7 +177,7 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
     let mut count = 0;
     for msg in messages.iter().rev() {
         match &msg.content {
-            MessageContent::User(_) => break, // new turn boundary — stop counting
+            MessageContent::User(_) | MessageContent::Skill(_) => break,
             MessageContent::System(sys) if sys.text.contains(RESTART_SYSTEM_MESSAGE_MARKER) => {
                 count += 1;
             }
@@ -308,12 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn persisted_in_flight_state_owns_trailing_user_turn() {
+        let messages = vec![user_msg(1, "Hello")];
+        let decision = persisted_direct_turn(&ConvState::LlmRequesting { attempt: 1 }, &messages)
+            .expect("persisted turn");
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::PersistedDirectTurn);
+        assert!(persisted_direct_turn(&ConvState::Idle, &messages).is_none());
+    }
+
+    #[test]
     fn test_only_user_message() {
         let messages = vec![user_msg(1, "Hello")];
         let decision = should_auto_continue(&messages);
-        assert_eq!(decision.state, ConvState::LlmRequesting { attempt: 1 });
-        assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::InterruptedAfterUserMessage);
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
     }
 
     #[test]
@@ -409,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_followed_by_user() {
-        // A persisted trailing user message is an interrupted next turn.
+        // A settled trailing user message must not restart automatically.
         let messages = vec![
             user_msg(1, "Do something"),
             agent_tool_use_only(2, &["bash"]),
@@ -417,8 +430,8 @@ mod tests {
             user_msg(4, "Actually, cancel that"),
         ];
         let decision = should_auto_continue(&messages);
-        assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::InterruptedAfterUserMessage);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
     }
 
     // =========================================================================
@@ -782,7 +795,7 @@ mod proptests {
     }
 
     // =========================================================================
-    // Property: Auto-continue requires a resumable trailing message
+    // Property: Auto-continue requires tool as last message
     // =========================================================================
 
     proptest! {
@@ -811,11 +824,8 @@ mod proptests {
 
             let decision = should_auto_continue(&messages);
 
-            if decision.needs_auto_continue {
-                prop_assert!(matches!(
-                    last_type,
-                    MessageType::Tool | MessageType::User | MessageType::Skill
-                ));
+            if !matches!(last_type, MessageType::Tool) {
+                prop_assert!(!decision.needs_auto_continue);
             }
         }
     }
@@ -889,12 +899,8 @@ mod proptests {
                 RecoveryReason::EmptyConversation => {
                     prop_assert!(messages.is_empty());
                 }
-                RecoveryReason::InterruptedAfterUserMessage => {
-                    prop_assert!(matches!(
-                        messages.last().unwrap().message_type,
-                        MessageType::User | MessageType::Skill
-                    ));
-                    prop_assert!(decision.needs_auto_continue);
+                RecoveryReason::PersistedDirectTurn => {
+                    prop_assert!(false, "history-only recovery cannot emit persisted turn reason");
                 }
                 RecoveryReason::LastMessageNotTool => {
                     prop_assert!(!matches!(
