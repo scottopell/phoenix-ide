@@ -495,13 +495,14 @@ describe('MetaViewer payload routing', () => {
     unmount();
     render(
       <ReviewNotesProvider>
-        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# Title\n\nparagraph alpha' }} />
       </ReviewNotesProvider>,
     );
     expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
   it('keeps source-style Markdown fallbacks searchable', () => {

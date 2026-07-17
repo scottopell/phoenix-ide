@@ -62,6 +62,14 @@ describe('TaskApprovalReader markdown rendering', () => {
     expect(container.querySelector('code')).toHaveTextContent('alpha');
     expect(container.querySelector('a')).toHaveAttribute('href', 'https://example.test');
   });
+
+  it('marks active matches in tight list-item text', async () => {
+    const { container } = renderTaskApprovalReader('- alpha\n- beta');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(container.querySelector('li .viewer-find-match--active')).toHaveTextContent('alpha'));
+  });
 });
 
 describe('TaskApprovalReader feedback action emphasis', () => {

@@ -411,6 +411,18 @@ export interface BlockSearchSource extends SearchableSource<BlockSearchMatchTarg
 
 export type BlockSearchProjection = SearchableSourceProjection<BlockSearchMatchTarget, BlockSearchSource>;
 
+export function buildMarkdownFileSearchText(content: string): string {
+  const lines: string[] = [];
+  for (const block of buildMarkdownDisplayBlocks(content)) {
+    const lineIndex = Math.max(0, block.lineNumber - 1);
+    while (lines.length <= lineIndex) lines.push('');
+    lines[lineIndex] = lines[lineIndex]
+      ? `${lines[lineIndex]} ${block.searchableText}`
+      : block.searchableText;
+  }
+  return lines.join('\n');
+}
+
 export function buildFileSearchProjection(content: string, query: string): FileSearchProjection {
   const sources: FileSearchSource[] = [];
   let lineStart = 0;

@@ -533,6 +533,7 @@ function markdownHighlightForRange(markdown: string, start: number, end: number)
 function markdownHighlightPlugin(highlight: MarkdownHighlight) {
   return () => (tree: HastNode) => {
     const target = findMarkdownHighlightTarget(tree, highlight);
+    if (target?.tagName === 'code') return;
     if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
   };
 }

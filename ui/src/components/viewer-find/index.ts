@@ -32,6 +32,7 @@ export {
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
+  buildMarkdownFileSearchText,
   buildKeywordSearchOutputProjection,
   buildMarkdownDisplayBlocks,
   buildPatchOutputProjection,

@@ -1260,6 +1260,22 @@ describe('agent Markdown find activation', () => {
     expect(container.querySelector('[data-fragment-id="agent-text-0"] strong')).toHaveTextContent('target');
     expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')).toHaveTextContent('target');
   });
+
+  it('does not corrupt fenced code while its searched fragment is active', () => {
+    const sourceText = '```ts\nconst target = 1;\n```';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-code-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start: 6, end: 12 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')).toHaveTextContent('const target = 1;');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')).not.toHaveTextContent('[object Object]');
+  });
 });
 
 describe('ordinary message find highlighting', () => {

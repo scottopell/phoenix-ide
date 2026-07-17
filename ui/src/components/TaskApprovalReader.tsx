@@ -598,7 +598,7 @@ export function TaskApprovalReader({
             h6: annotatable('h6', 'heading'),
             td: annotatable('td', 'tableCell'),
             th: annotatable('th', 'tableCell'),
-            li: annotatable('li', undefined, false),
+            li: annotatable('li'),
             blockquote: annotatable('blockquote', undefined, false),
             code: ({
               className,

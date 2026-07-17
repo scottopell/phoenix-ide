@@ -21,7 +21,7 @@ import {
   FindBar,
   activeSessionMatchIndex,
   buildFileSearchProjection,
-  buildMarkdownDisplayBlocks,
+  buildMarkdownFileSearchText,
   createSurfaceKey,
   projectionMatchesToSessionMatches,
   useFindSession,
@@ -254,7 +254,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
   const findEligible = (textLike && !htmlPreview) || largeFallback;
   const renderedMarkdownFindText = useMemo(
-    () => renderedMarkdown ? buildMarkdownDisplayBlocks(content).map((block) => block.searchableText).join('\n') : '',
+    () => renderedMarkdown ? buildMarkdownFileSearchText(content) : '',
     [content, renderedMarkdown],
   );
   const findSourceText = findEligible ? (renderedMarkdown ? renderedMarkdownFindText : content) : '';
