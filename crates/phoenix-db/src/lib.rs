@@ -782,6 +782,60 @@ async fn insert_project_instruction_bundle_tx(
     Ok(())
 }
 
+async fn copy_active_project_instruction_bundle_to_child_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    parent_conversation_id: &str,
+    child_conversation_id: &str,
+    created_at: &str,
+) -> DbResult<String> {
+    let source: Option<(String, i64)> = sqlx::query_as(
+        "SELECT id, estimated_tokens FROM project_instruction_bundles
+         WHERE conversation_id = ?1 AND role = 'active'",
+    )
+    .bind(parent_conversation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((source_id, estimated_tokens)) = source else {
+        return Err(DbError::Serialization(format!(
+            "parent conversation {parent_conversation_id} has no active project instruction bundle"
+        )));
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO project_instruction_bundles
+         (id, conversation_id, role, estimated_tokens, created_at)
+         VALUES (?1, ?2, 'active', ?3, ?4)",
+    )
+    .bind(&id)
+    .bind(child_conversation_id)
+    .bind(estimated_tokens)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO project_instruction_guidance
+         (bundle_id, ordinal, relative_path, content, content_hash)
+         SELECT ?1, ordinal, relative_path, content, content_hash
+         FROM project_instruction_guidance WHERE bundle_id = ?2 ORDER BY ordinal",
+    )
+    .bind(&id)
+    .bind(&source_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO project_instruction_skills
+         (bundle_id, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash)
+         SELECT ?1, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash
+         FROM project_instruction_skills WHERE bundle_id = ?2 ORDER BY ordinal",
+    )
+    .bind(&id)
+    .bind(&source_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -2389,49 +2443,12 @@ impl Database {
         child_conversation_id: &str,
     ) -> DbResult<ProjectInstructionBundle> {
         let mut tx = self.pool.begin().await?;
-        let source: Option<(String, i64)> = sqlx::query_as(
-            "SELECT id, estimated_tokens FROM project_instruction_bundles
-             WHERE conversation_id = ?1 AND role = 'active'",
+        copy_active_project_instruction_bundle_to_child_tx(
+            &mut tx,
+            parent_conversation_id,
+            child_conversation_id,
+            &Utc::now().to_rfc3339(),
         )
-        .bind(parent_conversation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((source_id, estimated_tokens)) = source else {
-            return Err(DbError::Serialization(format!(
-                "parent conversation {parent_conversation_id} has no active project instruction bundle"
-            )));
-        };
-        let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO project_instruction_bundles
-             (id, conversation_id, role, estimated_tokens, created_at)
-             VALUES (?1, ?2, 'active', ?3, ?4)",
-        )
-        .bind(&id)
-        .bind(child_conversation_id)
-        .bind(estimated_tokens)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO project_instruction_guidance
-             (bundle_id, ordinal, relative_path, content, content_hash)
-             SELECT ?1, ordinal, relative_path, content, content_hash
-             FROM project_instruction_guidance WHERE bundle_id = ?2 ORDER BY ordinal",
-        )
-        .bind(&id)
-        .bind(&source_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO project_instruction_skills
-             (bundle_id, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash)
-             SELECT ?1, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash
-             FROM project_instruction_skills WHERE bundle_id = ?2 ORDER BY ordinal",
-        )
-        .bind(&id)
-        .bind(&source_id)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         self.load_active_project_instruction_bundle(child_conversation_id)
@@ -5105,6 +5122,7 @@ impl Database {
     ///      Direct: no worktree fields). `cwd`, `project_id`, and `model` are inherited.
     ///      State is fresh `Idle`; `continued_in_conv_id` is NULL.
     ///   2. UPDATE the parent's `continued_in_conv_id` to the new row's id.
+    ///   3. Copy the parent's active instruction bundle into a fresh child-owned bundle.
     ///
     /// Preconditions checked before the INSERT runs:
     ///   - Parent exists (else `ConversationNotFound`).
@@ -5258,6 +5276,12 @@ impl Database {
             // Parent vanished during the race. Surface as NotFound.
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
+
+        // The continuation must become visible with its own immutable active
+        // bundle in the same commit as both conversation-link changes. Missing
+        // parent snapshots fail closed and roll back the inserted child.
+        copy_active_project_instruction_bundle_to_child_tx(&mut tx, parent_id, &new_id, &now_str)
+            .await?;
 
         sqlx::query(
             "UPDATE coordinator SET conversation_id = ?1 WHERE singleton = 1 AND conversation_id = ?2",
@@ -13874,6 +13898,17 @@ mod tests {
         .await
         .unwrap();
 
+        db.initialize_project_instruction_bundle_if_absent(
+            id,
+            &NewProjectInstructionBundle {
+                estimated_tokens: 0,
+                guidance: vec![],
+                skills: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
         let exhausted = ConvState::ContextExhausted {
             summary: "parent's summary of what happened".to_string(),
         };
@@ -14172,6 +14207,119 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn continuation_without_parent_bundle_rolls_back_child_and_link() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation_with_project(
+            "parent-no-bundle",
+            "parent-no-bundle",
+            "/tmp",
+            true,
+            None,
+            Some("test-model"),
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            "parent-no-bundle",
+            &ConvState::ContextExhausted {
+                summary: "full".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(db.continue_conversation("parent-no-bundle").await.is_err());
+        assert_eq!(db.list_conversations().await.unwrap().len(), 1);
+        assert!(db
+            .get_conversation("parent-no-bundle")
+            .await
+            .unwrap()
+            .continued_in_conv_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_copies_captured_bundle_not_mutated_filesystem_source() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let skill_path = temp.path().join("SKILL.md");
+        std::fs::write(&skill_path, "captured body").unwrap();
+        db.create_conversation_with_project(
+            "parent-captured-bundle",
+            "parent-captured-bundle",
+            temp.path().to_str().unwrap(),
+            true,
+            None,
+            Some("test-model"),
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        let captured = NewProjectInstructionBundle {
+            estimated_tokens: 2,
+            guidance: vec![],
+            skills: vec![ProjectSkillSnapshot {
+                name: "captured".to_string(),
+                description: "captured".to_string(),
+                argument_hint: None,
+                source_label: "test".to_string(),
+                body: "captured body".to_string(),
+                base_dir: temp.path().to_string_lossy().into_owned(),
+                source_path: skill_path.to_string_lossy().into_owned(),
+                content_hash: "captured-hash".to_string(),
+            }],
+        };
+        db.initialize_project_instruction_bundle_if_absent("parent-captured-bundle", &captured)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "parent-captured-bundle",
+            &ConvState::ContextExhausted {
+                summary: "full".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::write(&skill_path, "mutated body").unwrap();
+
+        let child = match db
+            .continue_conversation("parent-captured-bundle")
+            .await
+            .unwrap()
+        {
+            ContinueOutcome::Created(child) => child,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected child, got {other:?}")
+            }
+        };
+        let child_bundle = db
+            .load_active_project_instruction_bundle(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_bundle.skills[0].body, "captured body");
+        let parent_bundle = db
+            .load_active_project_instruction_bundle("parent-captured-bundle")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(child_bundle.id, parent_bundle.id);
+    }
+
+    /// Sequential slugs: first continuation is `{root}-2`, multi-level chains
     /// Sequential slugs: first continuation is `{root}-2`, multi-level chains
     /// use the root slug (not the parent slug) so names don't compound.
     #[tokio::test]

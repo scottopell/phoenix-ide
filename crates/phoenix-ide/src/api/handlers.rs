@@ -4110,6 +4110,20 @@ async fn continue_conversation(
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
 
+    // Legacy conversations may predate snapshots. Initialize the parent before
+    // entering the DB continuation transaction; the DB itself fails closed if
+    // no active bundle is present, so no child can become visible without one.
+    let parent = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| match error {
+            DbError::ConversationNotFound(message) => AppError::NotFound(message),
+            other => AppError::Internal(other.to_string()),
+        })?;
+    ensure_active_project_instructions(&state, &id, FsPath::new(&parent.cwd)).await?;
+
     let outcome = state
         .runtime
         .db()

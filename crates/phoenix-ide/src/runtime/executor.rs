@@ -3003,8 +3003,18 @@ where
             }) {
                 return Err("steering batch spans different project-instruction snapshots".into());
             }
-            self.activate_queued_project_instructions(expected_queued_bundle_id)
-                .await?;
+            if let Err(error) = self
+                .activate_queued_project_instructions(expected_queued_bundle_id)
+                .await
+            {
+                // `maybe_drain_steering_queue` moved this batch out with
+                // `mem::take`. Activation is the first durable boundary action,
+                // so put it back ahead of anything appended meanwhile before
+                // returning. The DB queue remains untouched.
+                entries.append(&mut self.steering_queue);
+                self.steering_queue = entries;
+                return Err(error);
+            }
             // These steers are becoming a new user turn. Expansion happened at
             // enqueue time while the prior turn was active, so rerender slash
             // invocations from the now-active snapshot selected at this boundary.
@@ -3016,7 +3026,12 @@ where
                 let resolution_root =
                     crate::resolution_root::ResolutionRoot::working_dir(&self.context.working_dir);
                 for entry in &mut entries {
-                    if entry.skill_invocation.is_none() {
+                    // The old active snapshot may not have recognized a newly
+                    // activated skill at enqueue time. Reconsider slash-shaped
+                    // text at the actual turn boundary; unknown slash text still
+                    // passes through unchanged under the expander's semantics.
+                    if entry.skill_invocation.is_none() && !entry.text.trim_start().starts_with('/')
+                    {
                         continue;
                     }
                     let expanded = crate::message_expander::expand_with_project_skills(
@@ -9823,6 +9838,18 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn accepted_user_turn_without_queued_instructions_resets_parent_tool_cycles() {
+        let (mut rt, _) =
+            build_runtime_with_state_and_queue("conv-cycle-reset", ConvState::Idle, vec![]);
+        rt.parent_tool_cycle_count = 7;
+        rt.parent_tool_cycle_cap = 0; // isolate boundary reset from request dispatch increment
+
+        rt.process_event(user_message("m1")).await.unwrap();
+
+        assert_eq!(rt.parent_tool_cycle_count, 0);
+    }
+
+    #[tokio::test]
     async fn activation_db_error_fills_reserved_sequence() {
         let (mut rt, storage) =
             build_runtime_with_state_and_queue("conv-activation-error", ConvState::Idle, vec![]);
@@ -9835,6 +9862,7 @@ mod steer_drain_detector_tests {
             },
         );
         storage.set_fail_project_instruction_activation(true);
+        rt.parent_tool_cycle_count = 7;
         let mut event = user_message("activation-error");
         if let Event::UserMessage {
             expected_queued_project_instruction_bundle_id,
@@ -9852,6 +9880,7 @@ mod steer_drain_detector_tests {
         ));
         assert_eq!(rt.broadcast_tx.next_seq(), 2);
         assert!(storage.get_all_messages("conv-activation-error").is_empty());
+        assert_eq!(rt.parent_tool_cycle_count, 7);
     }
 
     #[tokio::test]
@@ -9920,6 +9949,7 @@ mod steer_drain_detector_tests {
             },
         );
 
+        rt.parent_tool_cycle_count = 7;
         assert!(rt.process_event(user_message("rejected")).await.is_err());
 
         assert!(storage
@@ -9935,6 +9965,7 @@ mod steer_drain_detector_tests {
         assert!(storage
             .get_all_messages("conv-rejected-boundary")
             .is_empty());
+        assert_eq!(rt.parent_tool_cycle_count, 7);
     }
 
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
@@ -10008,33 +10039,88 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn failed_idle_activation_restores_drained_entries_before_concurrent_append() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-restore-drain",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![mk_entry("old-1", "first"), mk_entry("old-2", "second")],
+        );
+        let queued_id = storage.queue_project_instruction_bundle(
+            "conv-restore-drain",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        for entry in &mut rt.steering_queue {
+            entry.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        }
+
+        let old_state = rt.state.clone();
+        rt.state = ConvState::Idle;
+        let drain = rt
+            .maybe_drain_steering_queue(&old_state, false)
+            .expect("initial drain");
+        let mut appended = mk_entry("new-3", "third");
+        appended.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        rt.steering_queue.push(appended);
+        storage.set_fail_project_instruction_activation(true);
+
+        assert!(rt
+            .run_effects_with_inline_drain(vec![], drain, &mut vec![])
+            .await
+            .is_err());
+        assert_eq!(
+            rt.steering_queue
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "new-3"]
+        );
+        assert!(storage.get_all_messages("conv-restore-drain").is_empty());
+
+        storage.set_fail_project_instruction_activation(false);
+        rt.state = ConvState::Idle;
+        let retry = rt
+            .maybe_drain_steering_queue(&ConvState::LlmRequesting { attempt: 1 }, false)
+            .expect("retry drain");
+        rt.run_effects_with_inline_drain(vec![], retry, &mut vec![])
+            .await
+            .unwrap();
+
+        let ids = storage
+            .get_all_messages("conv-restore-drain")
+            .into_iter()
+            .filter_map(|message| {
+                matches!(message.content, MessageContent::User(_)).then_some(message.message_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["old-1", "old-2", "new-3"]);
+    }
+
+    #[tokio::test]
     async fn idle_drain_rerenders_slash_skill_from_activated_queue() {
         use phoenix_core::domain::project_instruction_bundle::{
             NewProjectInstructionBundle, ProjectSkillSnapshot,
         };
-        use phoenix_core::domain::skill_invocation::SkillInvocation;
-
         let skill_bundle = |body: &str| NewProjectInstructionBundle {
             estimated_tokens: 1,
             guidance: vec![],
             skills: vec![ProjectSkillSnapshot {
-                name: "alpha".to_string(),
+                name: "new-skill".to_string(),
                 description: "test".to_string(),
                 argument_hint: None,
                 source_label: ".agents/skills".to_string(),
                 body: body.to_string(),
-                base_dir: "/tmp/.agents/skills/alpha".to_string(),
-                source_path: "/tmp/.agents/skills/alpha/SKILL.md".to_string(),
+                base_dir: "/tmp/.agents/skills/new-skill".to_string(),
+                source_path: "/tmp/.agents/skills/new-skill/SKILL.md".to_string(),
                 content_hash: body.to_string(),
             }],
         };
-        let mut entry = mk_entry("slash-steer", "/alpha");
-        entry.llm_text = Some("active body".to_string());
-        entry.skill_invocation = Some(SkillInvocation {
-            name: "alpha".to_string(),
-            body: "active body".to_string(),
-            skill_dir: "/tmp/.agents/skills/alpha".to_string(),
-        });
+        // Enqueued while the old active snapshot did not know this skill, so
+        // enqueue-time expansion deliberately captured no invocation.
+        let entry = mk_entry("slash-steer", "  /new-skill argument");
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-slash-idle-drain",
             ConvState::LlmRequesting { attempt: 1 },
@@ -10043,7 +10129,11 @@ mod steer_drain_detector_tests {
         storage
             .initialize_project_instruction_bundle_if_absent(
                 "conv-slash-idle-drain",
-                &skill_bundle("active body"),
+                &NewProjectInstructionBundle {
+                    estimated_tokens: 0,
+                    guidance: vec![],
+                    skills: vec![],
+                },
             )
             .await
             .unwrap();
@@ -10064,7 +10154,8 @@ mod steer_drain_detector_tests {
             })
             .expect("drained skill message");
         assert!(skill.body.contains("queued body"));
-        assert!(!skill.body.contains("active body"));
+        assert!(skill.body.contains("argument"));
+        assert_eq!(skill.name, "new-skill");
     }
 
     /// Task 60004: entering Idle with a non-empty steering queue must NOT

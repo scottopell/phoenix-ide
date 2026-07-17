@@ -17,7 +17,7 @@ AND SHALL keep that bundle unchanged throughout a user turn and its tool loop.
 WHEN either the user invokes a slash skill or the model invokes the Skill tool in an existing conversation
 THE SYSTEM SHALL render the invocation from the bundle governing that invocation's turn, using its captured skill name, body, and base directory without rediscovering or rereading `SKILL.md`.
 
-A direct user message that starts the next turn, and steering known to start a later turn, SHALL expand slash skills from the queued bundle when one is waiting; invocation within the active turn SHALL expand from the active bundle.
+A direct user message that starts the next turn, and steering known to start a later turn, SHALL expand slash skills from the queued bundle when one is waiting; invocation within the active turn SHALL expand from the active bundle. At an idle steering boundary, slash-shaped entries SHALL be reconsidered after queued-bundle activation even when enqueue-time expansion under the old active bundle found no skill. Unknown slash text SHALL retain its non-skill behavior.
 
 Skill companion files remain live resources outside the snapshot and MAY be read through ordinary file tools after invocation.
 
@@ -41,6 +41,10 @@ AND SHALL NOT discover project instructions independently for the child.
 
 IF the parent predates project-instruction snapshots
 THEN THE SYSTEM SHALL initialize the parent once from the parent's working directory before copying its active bundle to the child.
+
+WHEN a context continuation is created
+THE SYSTEM SHALL copy the parent's persisted active bundle into a fresh child-owned active bundle in the same transaction that creates the child and links the parent,
+AND SHALL fail without exposing or linking a child if the parent has no active bundle or the copy cannot complete.
 
 For asynchronously provisioned conversations, only the creation worker SHALL initialize the initial bundle, after it has finalized the conversation's effective working directory. The metadata/mode update and initial-bundle insertion SHALL be one transaction fenced by the worker identity, claim token, generation, unexpired lease, and expected stage; a stale claimant SHALL NOT insert a bundle. The committed bundle SHALL govern initial slash-skill expansion, including seeded-empty and expansion-preflighted creation paths. While the creation job is not `Ready` — including failed, cancelled, and deletion-pending states — conversation-scoped project-instruction, system-prompt inspection, and skill-catalog endpoints SHALL return a typed unavailable/conflict response and SHALL NOT discover or persist instructions from the provisional working directory.
 
@@ -89,6 +93,8 @@ Activation SHALL atomically preserve conversation history, persist a visible con
 A rejected user message SHALL NOT activate the queued bundle, advance transcript generation, or add an activation timeline event.
 
 Each accepted user-authored turn SHALL be bound to the exact queued bundle used for slash expansion, or explicitly to the active bundle when no queue existed. Activation SHALL compare-and-swap that expected bundle ID before any turn effects. If the queue was removed or replaced, the system SHALL reject the turn rather than execute an expansion from one bundle under another bundle, and SHALL emit a sequenced resynchronization error without leaving an SSE sequence gap.
+
+If activation rejects an idle-drained steering batch, the runtime SHALL restore every drained entry ahead of entries appended during activation so an immediate retry can drain the complete FIFO batch exactly once; the failed attempt SHALL NOT alter the persisted steering queue.
 
 ### REQ-PI-007 — Durable Recovery
 
