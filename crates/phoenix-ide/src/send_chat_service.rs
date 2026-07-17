@@ -80,8 +80,7 @@ impl SendChatApplicationService {
         if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
             let persisted_matches = match &message.content {
                 phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
-                    let expanded = expand_request(&self.db, &conversation, &req).await?;
-                    persisted_skill_matches(skill, &req, &expanded)
+                    persisted_skill_matches(skill, &req)
                 }
                 content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
                     persisted_user_message_matches(content, &req)
@@ -158,7 +157,8 @@ impl SendChatApplicationService {
                     .enqueue_steer_message(&conversation.id, event)
                     .await
                     .map_err(SendChatServiceError::Dispatch)?;
-                insert_bounded_receipt(
+                insert_transient_receipt(
+                    &self.db,
                     &mut receipts,
                     req.message_id.clone(),
                     ChatAcceptanceReceipt {
@@ -166,7 +166,8 @@ impl SendChatApplicationService {
                         request_fingerprint,
                         steering: true,
                     },
-                );
+                )
+                .await;
                 record_pr_auto_fix_context_baseline(
                     self.runtime.db(),
                     &conversation.id,
@@ -197,7 +198,8 @@ impl SendChatApplicationService {
             .send_event(&conversation.id, event)
             .await
             .map_err(SendChatServiceError::Dispatch)?;
-        insert_bounded_receipt(
+        insert_transient_receipt(
+            &self.db,
             &mut receipts,
             req.message_id.clone(),
             ChatAcceptanceReceipt {
@@ -205,7 +207,8 @@ impl SendChatApplicationService {
                 request_fingerprint,
                 steering: false,
             },
-        );
+        )
+        .await;
         record_pr_auto_fix_context_baseline(
             self.runtime.db(),
             &conversation.id,
@@ -313,15 +316,27 @@ async fn expand_message(
     })
 }
 
-fn insert_bounded_receipt(
+async fn insert_transient_receipt(
+    db: &crate::db::Database,
     receipts: &mut std::collections::HashMap<String, ChatAcceptanceReceipt>,
     message_id: String,
     receipt: ChatAcceptanceReceipt,
 ) {
-    const MAX_TRANSIENT_RECEIPTS: usize = 1_024;
-    if receipts.len() >= MAX_TRANSIENT_RECEIPTS {
-        if let Some(expired_id) = receipts.keys().next().cloned() {
-            receipts.remove(&expired_id);
+    const CLEANUP_THRESHOLD: usize = 1_024;
+    if receipts.len() >= CLEANUP_THRESHOLD {
+        let candidates = receipts
+            .iter()
+            .map(|(id, receipt)| (id.clone(), receipt.conversation_id.clone()))
+            .collect::<Vec<_>>();
+        for (id, conversation_id) in candidates {
+            let persisted = db.message_exists(&id).await.unwrap_or(false);
+            let queued = db
+                .get_steering_queue(&conversation_id)
+                .await
+                .is_ok_and(|queue| queue.iter().any(|entry| entry.message_id == id));
+            if persisted || queued {
+                receipts.remove(&id);
+            }
         }
     }
     receipts.insert(message_id, receipt);
@@ -380,14 +395,8 @@ fn persisted_user_message_matches(
 fn persisted_skill_matches(
     skill: &phoenix_core::domain::db_schema::SkillContent,
     req: &SendChatRequest,
-    expanded: &ExpandedDispatchMessage,
 ) -> bool {
-    let Some(invocation) = expanded.skill_invocation.as_ref() else {
-        return false;
-    };
-    skill.name == invocation.name
-        && skill.body == invocation.body
-        && skill.trigger == req.text
+    skill.trigger == req.text
         && skill.files.len() == req.files.len()
         && skill
             .files
@@ -469,11 +478,8 @@ fn transition_code(err: &TransitionError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        persisted_skill_matches, ExpandedDispatchMessage, MessageExpansionPolicy, SendChatRequest,
-    };
+    use super::{persisted_skill_matches, MessageExpansionPolicy, SendChatRequest};
     use phoenix_core::domain::db_schema::SkillContent;
-    use phoenix_core::domain::skill_invocation::SkillInvocation;
 
     #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {
@@ -486,15 +492,6 @@ mod tests {
             user_agent: None,
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         };
-        let expanded = ExpandedDispatchMessage {
-            display_text: request.text.clone(),
-            llm_text: None,
-            skill_invocation: Some(SkillInvocation {
-                name: "build".to_string(),
-                body: "expanded body".to_string(),
-                skill_dir: "/skills/build".to_string(),
-            }),
-        };
         let persisted = SkillContent {
             name: "build".to_string(),
             body: "expanded body".to_string(),
@@ -502,6 +499,9 @@ mod tests {
             files: vec![],
         };
 
-        assert!(persisted_skill_matches(&persisted, &request, &expanded));
+        assert!(persisted_skill_matches(&persisted, &request));
+        let mut changed_definition = persisted.clone();
+        changed_definition.body = "definition changed after commit".to_string();
+        assert!(persisted_skill_matches(&changed_definition, &request));
     }
 }

@@ -110,6 +110,7 @@ pub(crate) enum GlobalMessageTargetError {
     UnsupportedSyntax,
     CoordinatorChainRejected,
     ConversationNotFound(String),
+    SubAgentRejected,
     ResolutionFailed(String),
 }
 
@@ -121,6 +122,7 @@ impl GlobalMessageTargetError {
             Self::UnsupportedSyntax => "unsupported_target_syntax",
             Self::CoordinatorChainRejected => "coordinator_chain_rejected",
             Self::ConversationNotFound(_) => "target_not_found",
+            Self::SubAgentRejected => "sub_agent_target_rejected",
             Self::ResolutionFailed(_) => "target_resolution_failed",
         }
     }
@@ -136,6 +138,7 @@ impl std::fmt::Display for GlobalMessageTargetError {
                 "Coordinator cannot message itself or its continuation chain"
             ),
             Self::ConversationNotFound(id) => write!(f, "conversation not found: {id}"),
+            Self::SubAgentRejected => write!(f, "Coordinator cannot message a sub-agent conversation; message its parent conversation instead"),
             Self::ResolutionFailed(message) => write!(f, "target resolution failed: {message}"),
         }
     }
@@ -1344,6 +1347,9 @@ async fn resolve_global_message_target(
         .get_conversation(&candidate)
         .await
         .map_err(|_| GlobalMessageTargetError::ConversationNotFound(candidate.clone()))?;
+    if conversation.parent_conversation_id.is_some() {
+        return Err(GlobalMessageTargetError::SubAgentRejected);
+    }
     if service
         .coordinator_chain_ids()
         .await
