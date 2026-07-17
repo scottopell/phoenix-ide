@@ -889,6 +889,27 @@ describe('MessageList', () => {
     expect(container.querySelector('[data-render-unit-key="msg-1"] .message')).not.toHaveClass('jump-highlight');
   });
 
+  it('keeps a coordinator system prompt header but hides project instruction refresh', () => {
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="coordinator-id"
+          systemPrompt="COORDINATOR SYSTEM PROMPT"
+          usesProjectInstructions={false}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'coordinator-id', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    expect(container.querySelector('.system-prompt-block')).not.toBeNull();
+    expect(container.querySelector('.project-instructions-refresh')).toBeNull();
+  });
+
   // Toggling the system prompt must not change the VirtualTranscript header's
   // component *type*, only its props. A type swap forces VirtualTranscript to
   // unmount/remount the slot and recompute total list height — a visible

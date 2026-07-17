@@ -197,6 +197,7 @@ export const SseInitDataSchema = v.looseObject({
 export const SseMessageDataSchema = v.looseObject({
   sequence_id: v.number(),
   message: MessageSchema,
+  transcript_generation: v.exactOptional(v.number()),
 }) satisfies v.GenericSchema<unknown, WireMessageData>;
 
 /** `message_updated`: in-place mutation of an existing message's mutable

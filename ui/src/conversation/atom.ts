@@ -210,7 +210,13 @@ export interface InitPayload {
 // in-flight `await api.foo(...)` resolves after the user has navigated away.
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload; epoch?: number }
-  | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
+  | {
+      type: 'sse_message';
+      message: Message;
+      sequenceId: number;
+      transcriptGeneration?: number;
+      epoch?: number;
+    }
   | {
       type: 'sse_message_updated';
       sequenceId: number;
@@ -591,9 +597,15 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_message': {
       const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
       if (idx >= 0) {
-        return atom;
+        return action.transcriptGeneration === undefined
+          ? atom
+          : { ...atom, transcriptGeneration: action.transcriptGeneration };
       }
-      let nextAtom: ConversationAtom = { ...atom, streamingBuffer: null };
+      let nextAtom: ConversationAtom = {
+        ...atom,
+        streamingBuffer: null,
+        transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+      };
       let nextMessage = action.message;
       ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
       return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
@@ -889,6 +901,9 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_message',
         message: res.output.message,
         sequenceId: res.output.sequence_id,
+        ...(res.output.transcript_generation != null && {
+          transcriptGeneration: res.output.transcript_generation,
+        }),
       });
     }
     case 'message_updated': {

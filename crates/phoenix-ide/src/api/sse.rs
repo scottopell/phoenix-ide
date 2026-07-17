@@ -161,14 +161,21 @@ mod tests {
                     "pending_truncated": pending_truncated,
                 })
             }
-            SseEvent::Message { message } => {
+            SseEvent::Message {
+                message,
+                transcript_generation,
+            } => {
                 let sequence_id = message.sequence_id;
                 let message_value = enrich_message_for_api(message);
-                json!({
+                let mut obj = json!({
                     "type": "message",
                     "sequence_id": sequence_id,
                     "message": message_value,
-                })
+                });
+                if let Some(generation) = transcript_generation {
+                    obj["transcript_generation"] = json!(generation);
+                }
+                obj
             }
             SseEvent::MessageUpdated {
                 sequence_id,
@@ -499,7 +506,10 @@ mod tests {
                 presentation_mode: "working".to_string(),
                 state_updated_at: ts(),
             },
-            SseEvent::Message { message: eager },
+            SseEvent::Message {
+                message: eager,
+                transcript_generation: None,
+            },
         ];
         let event = SseEvent::Init {
             sequence_id: 45,
@@ -572,8 +582,25 @@ mod tests {
     fn parity_message_user() {
         let event = SseEvent::Message {
             message: fixture_user_message(),
+            transcript_generation: None,
         };
         assert_parity(&event);
+        assert!(typed_sse_event_to_value(&event)
+            .get("transcript_generation")
+            .is_none());
+    }
+
+    #[test]
+    fn parity_message_with_transcript_generation() {
+        let event = SseEvent::Message {
+            message: fixture_user_message(),
+            transcript_generation: Some(7),
+        };
+        assert_parity(&event);
+        assert_eq!(
+            typed_sse_event_to_value(&event).get("transcript_generation"),
+            Some(&json!(7))
+        );
     }
 
     #[test]
@@ -584,6 +611,7 @@ mod tests {
         // path must produce the same merged content.
         let event = SseEvent::Message {
             message: fixture_agent_message_with_bash(),
+            transcript_generation: None,
         };
         assert_parity(&event);
 

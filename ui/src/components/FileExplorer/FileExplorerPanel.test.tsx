@@ -67,8 +67,8 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1') {
-  return render(
+function panelTree(conversationId = 'conv-1', instructionSnapshotVersion = 1) {
+  return (
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
         <ViewerSlotProvider scopeKey={conversationId} browserSessionActive={false}>
@@ -78,6 +78,7 @@ function renderPanel(conversationId = 'conv-1') {
               onToggle={() => {}}
               rootPath="/repo"
               conversationId={conversationId}
+              instructionSnapshotVersion={instructionSnapshotVersion}
               showToast={() => {}}
               showError={() => {}}
               branchName="main"
@@ -86,8 +87,12 @@ function renderPanel(conversationId = 'conv-1') {
           </FileExplorerProvider>
         </ViewerSlotProvider>
       </ConversationProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderPanel(conversationId = 'conv-1', instructionSnapshotVersion = 1) {
+  return render(panelTree(conversationId, instructionSnapshotVersion));
 }
 
 beforeEach(() => {
@@ -140,6 +145,67 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     expect(tasksHeader).toHaveAttribute('aria-expanded', 'true');
     expect(await screen.findByText('blocked-one')).toBeInTheDocument();
     expect(screen.queryByText('ready-one')).not.toBeInTheDocument();
+  });
+
+  it('renders the captured conversation skill body without reading the live file', async () => {
+    const capturedSkills: SkillEntry[] = [{
+      ...skill('project-one', 'project', '/repo/project/.agents/skills/project-one/SKILL.md'),
+      body: 'old captured body',
+    }];
+    vi.mocked(api.listConversationSkills).mockResolvedValue({ skills: capturedSkills });
+
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+    fireEvent.click(await screen.findByText('/project-one'));
+
+    expect(await screen.findByText('old captured body')).toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).startsWith('/api/files/read'))).toBe(false);
+  });
+
+  it('refreshes a selected skill body when the same conversation version advances', async () => {
+    const oldSkill = { ...skill('project-one', 'project', '/repo/project/.agents/skills/project-one/SKILL.md'), body: 'old captured body' };
+    const newSkill = { ...oldSkill, body: 'new captured body' };
+    vi.mocked(api.listConversationSkills)
+      .mockResolvedValueOnce({ skills: [oldSkill] })
+      .mockResolvedValueOnce({ skills: [newSkill] });
+
+    const view = renderPanel('conv-1', 1);
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+    fireEvent.click(await screen.findByText('/project-one'));
+    expect(await screen.findByText('old captured body')).toBeInTheDocument();
+
+    view.rerender(panelTree('conv-1', 2));
+
+    expect(await screen.findByText('new captured body')).toBeInTheDocument();
+    expect(screen.queryByText('old captured body')).not.toBeInTheDocument();
+    expect(api.listConversationSkills).toHaveBeenCalledTimes(2);
+  });
+
+  it('closes the skill viewer when a refresh removes the selected skill', async () => {
+    const selected = { ...skill('project-one', 'project', '/repo/project/.agents/skills/project-one/SKILL.md'), body: 'captured body' };
+    vi.mocked(api.listConversationSkills)
+      .mockResolvedValueOnce({ skills: [selected] })
+      .mockResolvedValueOnce({ skills: [] });
+
+    const view = renderPanel('conv-1', 1);
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+    fireEvent.click(await screen.findByText('/project-one'));
+    expect(await screen.findByText('captured body')).toBeInTheDocument();
+
+    view.rerender(panelTree('conv-1', 2));
+
+    expect(await screen.findByText('No skills discovered for this conversation.')).toBeInTheDocument();
+    expect(screen.queryByText('captured body')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Back/ })).not.toBeInTheDocument();
+  });
+
+  it('does not refetch skills for an ordinary rerender with an unchanged version', async () => {
+    const view = renderPanel('conv-1', 1);
+    await waitFor(() => expect(api.listConversationSkills).toHaveBeenCalledTimes(1));
+
+    view.rerender(panelTree('conv-1', 1));
+
+    await waitFor(() => expect(api.listConversationSkills).toHaveBeenCalledTimes(1));
   });
 
   it('keeps Skills expanded and preserves skill group state after Back', async () => {

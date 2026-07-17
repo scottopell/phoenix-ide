@@ -8,6 +8,7 @@ export {
   useConversationEventCursorRef,
   useLastSseEventAt,
   useLastSseEventAtRef,
+  useTranscriptGeneration,
   useConversationSnapshot,
   useConversationsList,
   useConversationSelectors,

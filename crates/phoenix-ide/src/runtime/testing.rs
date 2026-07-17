@@ -479,6 +479,13 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
 // In-Memory Storage
 // ============================================================================
 
+#[derive(Default)]
+struct TestProjectInstructionBundles {
+    active: Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+    queued: Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+    transcript_generation: i64,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
@@ -490,6 +497,8 @@ pub struct InMemoryStorage {
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    project_instruction_bundles: Mutex<HashMap<String, TestProjectInstructionBundles>>,
+    fail_project_instruction_activation: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -507,6 +516,8 @@ impl InMemoryStorage {
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
+            project_instruction_bundles: Mutex::new(HashMap::new()),
+            fail_project_instruction_activation: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -557,6 +568,37 @@ impl InMemoryStorage {
     /// Read back the stored `conv_mode` (test-only).
     pub fn get_mode(&self, conv_id: &str) -> Option<crate::db::ConvMode> {
         self.modes.lock().unwrap().get(conv_id).cloned()
+    }
+
+    pub fn set_fail_project_instruction_activation(&self, fail: bool) {
+        *self.fail_project_instruction_activation.lock().unwrap() = fail;
+    }
+
+    pub fn queue_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+        bundle: phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle,
+    ) -> String {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionBundle, ProjectInstructionBundleRole,
+        };
+        let queued_id = uuid::Uuid::new_v4().to_string();
+        let queued = ProjectInstructionBundle {
+            id: queued_id.clone(),
+            conversation_id: conv_id.to_string(),
+            role: ProjectInstructionBundleRole::Queued,
+            estimated_tokens: bundle.estimated_tokens,
+            created_at: chrono::Utc::now(),
+            guidance: bundle.guidance,
+            skills: bundle.skills,
+        };
+        self.project_instruction_bundles
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .queued = Some(queued);
+        queued_id
     }
 
     /// Get all messages for a conversation
@@ -900,6 +942,110 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn initialize_project_instruction_bundle_if_absent(
+        &self,
+        conv_id: &str,
+        bundle: &phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle,
+    ) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, String>
+    {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionBundle, ProjectInstructionBundleRole,
+        };
+        let mut bundles = self.project_instruction_bundles.lock().unwrap();
+        let entry = bundles.entry(conv_id.to_string()).or_default();
+        Ok(entry
+            .active
+            .get_or_insert_with(|| ProjectInstructionBundle {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conv_id.to_string(),
+                role: ProjectInstructionBundleRole::Active,
+                estimated_tokens: bundle.estimated_tokens,
+                created_at: chrono::Utc::now(),
+                guidance: bundle.guidance.clone(),
+                skills: bundle.skills.clone(),
+            })
+            .clone())
+    }
+
+    async fn load_active_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+        String,
+    > {
+        Ok(self
+            .project_instruction_bundles
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .and_then(|entry| entry.active.clone()))
+    }
+
+    async fn load_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle>,
+        String,
+    > {
+        Ok(self
+            .project_instruction_bundles
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .and_then(|entry| entry.queued.clone()))
+    }
+
+    async fn activate_queued_project_instruction_bundle(
+        &self,
+        conv_id: &str,
+        expected_queued_bundle_id: &str,
+        sequence_id: i64,
+    ) -> Result<
+        Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionActivation>,
+        String,
+    > {
+        use phoenix_core::domain::project_instruction_bundle::{
+            ProjectInstructionActivation, ProjectInstructionBundleRole,
+        };
+        if *self.fail_project_instruction_activation.lock().unwrap() {
+            return Err("injected project instruction activation failure".into());
+        }
+        let mut bundles = self.project_instruction_bundles.lock().unwrap();
+        let mut messages = self.messages.lock().unwrap();
+        let entry = bundles.entry(conv_id.to_string()).or_default();
+        if entry.queued.as_ref().map(|bundle| bundle.id.as_str()) != Some(expected_queued_bundle_id)
+        {
+            return Ok(None);
+        }
+        let mut queued = entry.queued.take().expect("queued bundle checked above");
+        queued.role = ProjectInstructionBundleRole::Active;
+        entry.active = Some(queued);
+        entry.transcript_generation += 1;
+        let content = MessageContent::System(crate::db::SystemContent {
+            text: crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER.to_string(),
+        });
+        let message = Message {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        messages
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        Ok(Some(ProjectInstructionActivation {
+            transcript_generation: entry.transcript_generation,
+            message,
+        }))
+    }
+
     async fn update_steering_queue(
         &self,
         conv_id: &str,
@@ -1053,6 +1199,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .expect("Failed to send message");
@@ -1345,6 +1492,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1467,6 +1615,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1570,6 +1719,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1687,6 +1837,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2410,6 +2561,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2524,6 +2676,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2668,6 +2821,7 @@ mod tests {
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: None,
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 })
                 .await
                 .unwrap();
@@ -2687,7 +2841,7 @@ mod tests {
                         SseEvent::Token { .. } => {
                             last_token_idx = Some(idx);
                         }
-                        SseEvent::Message { message } => {
+                        SseEvent::Message { message, .. } => {
                             if matches!(message.message_type, MessageType::Agent)
                                 && first_agent_msg_idx.is_none()
                             {
@@ -3101,6 +3255,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -3149,6 +3304,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();

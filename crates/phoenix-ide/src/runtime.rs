@@ -746,14 +746,40 @@ impl SseBroadcaster {
         self.send_with_ring(event, seq, RingOp::Append)
     }
 
+    /// Fill an already-reserved sequence with a replayable ephemeral event.
+    pub fn send_reserved_seq(
+        &self,
+        seq: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send_with_ring(build(seq), seq, RingOp::Append)
+    }
+
     /// Broadcast a persisted `Message` event using the DB-allocated
     /// `message.sequence_id`, advance the broadcaster's counter, AND reset
     /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
     /// events below this seq are no longer needed for replay).
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
+        self.send_persisted_message_with_generation(message, None)
+    }
+
+    /// Broadcast a persisted boundary message together with the transcript
+    /// generation committed by the same transaction.
+    pub fn send_persisted_message_with_generation(
+        &self,
+        message: crate::db::Message,
+        transcript_generation: Option<i64>,
+    ) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Anchor)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                transcript_generation,
+            },
+            seq,
+            RingOp::Anchor,
+        )
     }
 
     /// Backward-compatible alias for [`SseBroadcaster::send_persisted_message`].
@@ -778,7 +804,14 @@ impl SseBroadcaster {
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
-        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+        self.send_with_ring(
+            SseEvent::Message {
+                message,
+                transcript_generation: None,
+            },
+            seq,
+            RingOp::Append,
+        )
     }
 
     /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
@@ -997,6 +1030,9 @@ pub enum SseEvent {
     /// [`SseBroadcaster::send_message`], folds into the broadcaster's counter.
     Message {
         message: crate::db::Message,
+        /// Conversation transcript generation after a boundary-changing message.
+        /// Present only for project-instruction activation messages.
+        transcript_generation: Option<i64>,
     },
     /// An existing message's mutable fields changed. Carries only the delta —
     /// `message_id` is the target; `sequence_id` is the envelope id used by
@@ -2198,6 +2234,41 @@ impl RuntimeManager {
             }
         };
 
+        // A child inherits the exact persisted snapshot governing its parent.
+        // Legacy parents are initialized once from their own working directory;
+        // the child must never discover mutable sources independently.
+        if match self
+            .db
+            .load_active_project_instruction_bundle(&parent_conversation_id)
+            .await
+        {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                let discovered = crate::system_prompt::discover_project_instruction_bundle(
+                    std::path::Path::new(&parent_conv.cwd),
+                );
+                self.db
+                    .initialize_project_instruction_bundle_if_absent(
+                        &parent_conversation_id,
+                        &discovered,
+                    )
+                    .await
+                    .is_err()
+            }
+            Err(_) => true,
+        } {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Failed to prepare parent project instructions".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
@@ -2234,6 +2305,27 @@ impl RuntimeManager {
                 return;
             }
         };
+
+        if let Err(error) = self
+            .db
+            .copy_active_project_instruction_bundle_to_child(&parent_conversation_id, &conv.id)
+            .await
+        {
+            tracing::error!(%error, child_id = %conv.id, "Failed to inherit parent project instructions");
+            if let Err(cleanup_error) = self.db.delete_conversation(&conv.id).await {
+                tracing::error!(%cleanup_error, child_id = %conv.id, "Failed to remove child after instruction-copy failure");
+            }
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: format!("Failed to inherit parent project instructions: {error}"),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
         // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
@@ -2414,6 +2506,7 @@ impl RuntimeManager {
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: Some("Phoenix Sub-Agent".to_string()),
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 })
                 .await;
 
@@ -2991,6 +3084,7 @@ impl RuntimeManager {
             ref message_id,
             ref user_agent,
             ref skill_invocation,
+            ref expected_queued_project_instruction_bundle_id,
         } = event
         else {
             return Err("enqueue_steer_message expects Event::SteerMessage".into());
@@ -3005,6 +3099,8 @@ impl RuntimeManager {
             message_id: message_id.clone(),
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),
+            expected_queued_project_instruction_bundle_id:
+                expected_queued_project_instruction_bundle_id.clone(),
         };
         let db = self.db();
         let mut queue = db
@@ -3589,11 +3685,11 @@ mod broadcaster_tests {
 
         assert!(matches!(
             first,
-            SseEvent::Message { ref message } if message.message_id == "reserved-1"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-1"
         ));
         assert!(matches!(
             second,
-            SseEvent::Message { ref message } if message.message_id == "reserved-2"
+            SseEvent::Message { ref message, .. } if message.message_id == "reserved-2"
         ));
         assert!(matches!(
             queued,
@@ -3774,7 +3870,7 @@ mod broadcaster_tests {
         assert_eq!(highest, 3, "highest_seq covers the eager message at seq 3");
         assert_eq!(events.len(), 2, "token + eager message both in ring");
         match &events[1] {
-            SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, "eager"),
             other => panic!("expected Message, got {other:?}"),
         }
     }

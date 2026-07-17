@@ -22,7 +22,8 @@ use super::lifecycle_handlers::{
 use super::sse::sse_stream;
 use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
-    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+    CodeSearchQuery, CodeSearchResponse, ConfirmProjectInstructionsRequest,
+    ConfirmProjectInstructionsResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
@@ -43,6 +44,10 @@ use crate::git_ops::{
 };
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use crate::system_prompt::discover_project_instruction_bundle;
+use phoenix_core::domain::project_instruction_bundle::{
+    ProjectInstructionChangeManifest, ProjectInstructionRefreshStatus,
+};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -246,6 +251,18 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/system-prompt",
             get(get_system_prompt),
+        )
+        .route(
+            "/api/conversations/:id/project-instructions",
+            get(get_project_instructions),
+        )
+        .route(
+            "/api/conversations/:id/project-instructions/preview",
+            post(preview_project_instructions),
+        )
+        .route(
+            "/api/conversations/:id/project-instructions/confirm",
+            post(confirm_project_instructions),
         )
         // One-shot shell-command suggestion. Stateless: a single LLM
         // completion with no conversation, no tools, no persistence. The
@@ -3038,6 +3055,194 @@ async fn inspect_bash_handle(
     Ok(Json(assembly.inspection))
 }
 
+const REWARM_ESTIMATE_NOTICE: &str =
+    "Estimated one-time input-token rewarm; actual provider cache behavior may differ.";
+
+async fn require_project_instruction_snapshot_ready(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<bool, AppError> {
+    let creation_job = state
+        .db
+        .get_conversation_creation_job_for_conversation(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if creation_job.as_ref().is_some_and(|job| {
+        !matches!(
+            job.protocol.status,
+            phoenix_core::domain::creation_protocol::CreationStatus::Ready
+        )
+    }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Project instructions are unavailable until conversation provisioning finishes",
+            "conversation_provisioning",
+        ))));
+    }
+    Ok(creation_job.is_some())
+}
+
+async fn ensure_active_project_instructions(
+    state: &AppState,
+    conversation_id: &str,
+    cwd: &FsPath,
+) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, AppError> {
+    let has_creation_job =
+        require_project_instruction_snapshot_ready(state, conversation_id).await?;
+    if let Some(active) = state
+        .db
+        .load_active_project_instruction_bundle(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Ok(active);
+    }
+    if has_creation_job {
+        return Err(AppError::TypedInternal {
+            message: "Conversation provisioning completed without a project-instruction snapshot"
+                .to_string(),
+            error_type: "project_instruction_snapshot_unavailable".to_string(),
+        });
+    }
+    let discovered = discover_project_instruction_bundle(cwd);
+    state
+        .db
+        .initialize_project_instruction_bundle_if_absent(conversation_id, &discovered)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+async fn project_instructions_for_next_turn(
+    state: &AppState,
+    conversation_id: &str,
+    cwd: &FsPath,
+) -> Result<phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle, AppError> {
+    if let Some(queued) = state
+        .db
+        .load_queued_project_instruction_bundle(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Ok(queued);
+    }
+    ensure_active_project_instructions(state, conversation_id, cwd).await
+}
+
+fn steering_starts_later_turn(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. }
+    )
+}
+
+async fn project_instruction_status(
+    state: &AppState,
+    id: &str,
+    persist_preview: bool,
+) -> Result<ProjectInstructionRefreshStatus, AppError> {
+    let conversation = state
+        .db
+        .get_conversation(id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let cwd = FsPath::new(&conversation.cwd);
+    let active = ensure_active_project_instructions(state, id, cwd).await?;
+    let queued = state
+        .db
+        .load_queued_project_instruction_bundle(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let discovered = discover_project_instruction_bundle(cwd);
+    let transient = phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundle {
+        id: String::new(),
+        conversation_id: id.to_string(),
+        role: phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Candidate,
+        estimated_tokens: discovered.estimated_tokens,
+        created_at: chrono::Utc::now(),
+        guidance: discovered.guidance.clone(),
+        skills: discovered.skills.clone(),
+    };
+    let candidate = if persist_preview {
+        Some(
+            state
+                .db
+                .persist_or_replace_project_instruction_candidate(id, &discovered)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        )
+    } else {
+        state
+            .db
+            .load_project_instruction_candidate(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    };
+    let comparison = queued.as_ref().unwrap_or(&active);
+    let changed_manifest = ProjectInstructionChangeManifest::between(comparison, &transient);
+
+    Ok(ProjectInstructionRefreshStatus {
+        active_bundle_id: active.id,
+        queued_bundle_id: queued.as_ref().map(|bundle| bundle.id.clone()),
+        candidate_bundle_id: candidate.map(|bundle| bundle.id),
+        changed_manifest,
+        estimated_rewarm_tokens: transient.estimated_tokens,
+        rewarm_tokens_are_estimate: true,
+        rewarm_estimate_notice: REWARM_ESTIMATE_NOTICE.to_string(),
+        is_queued: queued.is_some(),
+    })
+}
+
+async fn get_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProjectInstructionRefreshStatus>, AppError> {
+    Ok(Json(project_instruction_status(&state, &id, false).await?))
+}
+
+async fn preview_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ProjectInstructionRefreshStatus>, AppError> {
+    Ok(Json(project_instruction_status(&state, &id, true).await?))
+}
+
+async fn confirm_project_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmProjectInstructionsRequest>,
+) -> Result<Json<ConfirmProjectInstructionsResponse>, AppError> {
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd)).await?;
+    let candidate = state
+        .db
+        .load_project_instruction_candidate(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let Some(_) = candidate.filter(|bundle| bundle.id == request.candidate_bundle_id) else {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "The project-instruction preview is missing or has been replaced; preview again before confirming",
+            "stale_project_instruction_candidate",
+        ))));
+    };
+    let confirmed = state
+        .db
+        .confirm_project_instruction_candidate(&id, &request.candidate_bundle_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if !confirmed {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "The project-instruction preview is missing or has been replaced; preview again before confirming",
+            "stale_project_instruction_candidate",
+        ))));
+    }
+    Ok(Json(ConfirmProjectInstructionsResponse {
+        status: project_instruction_status(&state, &id, false).await?,
+    }))
+}
+
 async fn get_system_prompt(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3089,7 +3294,8 @@ async fn get_system_prompt(
     {
         crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
     } else {
-        crate::system_prompt::build_system_prompt(
+        let project_instructions = ensure_active_project_instructions(&state, &id, &cwd).await?;
+        crate::system_prompt::build_system_prompt_with_project_instructions(
             &cwd,
             &tasks_dir_name,
             is_sub_agent,
@@ -3097,6 +3303,7 @@ async fn get_system_prompt(
             conversation.llm_language,
             persona.as_deref(),
             explore_bash,
+            &project_instructions,
         )
     };
 
@@ -3501,6 +3708,7 @@ async fn send_chat(
 
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
+            let mut expected_queued_project_instruction_bundle_id = None;
             let expanded = if state
                 .db
                 .is_coordinator_conversation(&conversation.id)
@@ -3513,7 +3721,23 @@ async fn send_chat(
                     skill_invocation: None,
                 }
             } else {
-                crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+                let project_instructions = if steering_starts_later_turn(&effective_state) {
+                    project_instructions_for_next_turn(&state, &id, FsPath::new(&conversation.cwd))
+                        .await?
+                } else {
+                    ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd))
+                        .await?
+                };
+                expected_queued_project_instruction_bundle_id =
+                    (project_instructions.role
+                        == phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Queued)
+                    .then(|| project_instructions.id.clone().into_boxed_str());
+                crate::message_expander::expand_with_project_skills(
+                    &req.text,
+                    &resolution_root,
+                    &project_instructions.skills,
+                )
+                .map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
@@ -3541,6 +3765,7 @@ async fn send_chat(
                 message_id: req.message_id,
                 user_agent: req.user_agent,
                 skill_invocation: expanded.skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             };
             tracing::info!(
                 conv_id = %id,
@@ -3581,6 +3806,7 @@ async fn send_chat(
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
+    let mut expected_queued_project_instruction_bundle_id = None;
     let expanded = if state
         .db
         .is_coordinator_conversation(&conversation.id)
@@ -3593,7 +3819,18 @@ async fn send_chat(
             skill_invocation: None,
         }
     } else {
-        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+        let project_instructions =
+            project_instructions_for_next_turn(&state, &id, FsPath::new(&conversation.cwd)).await?;
+        expected_queued_project_instruction_bundle_id =
+            (project_instructions.role
+                == phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Queued)
+            .then(|| project_instructions.id.clone().into_boxed_str());
+        crate::message_expander::expand_with_project_skills(
+            &req.text,
+            &resolution_root,
+            &project_instructions.skills,
+        )
+        .map_err(|e| {
             AppError::UnprocessableEntity(ExpansionErrorResponse {
                 error: e.to_string(),
                 error_type: e.error_type().to_string(),
@@ -3629,6 +3866,7 @@ async fn send_chat(
         message_id: req.message_id,
         user_agent: req.user_agent,
         skill_invocation: expanded.skill_invocation,
+        expected_queued_project_instruction_bundle_id,
     };
 
     state
@@ -3871,6 +4109,20 @@ async fn continue_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
+
+    // Legacy conversations may predate snapshots. Initialize the parent before
+    // entering the DB continuation transaction; the DB itself fails closed if
+    // no active bundle is present, so no child can become visible without one.
+    let parent = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| match error {
+            DbError::ConversationNotFound(message) => AppError::NotFound(message),
+            other => AppError::Internal(other.to_string()),
+        })?;
+    ensure_active_project_instructions(&state, &id, FsPath::new(&parent.cwd)).await?;
 
     let outcome = state
         .runtime
@@ -5853,10 +6105,7 @@ fn find_literal_match(line: &str, query: &str, case_sensitive: bool) -> Option<(
     None
 }
 
-/// Discover skills available for the conversation's working directory (REQ-IR-005).
-///
-/// Calls `discover_skills()` from `system_prompt.rs` and returns each skill's
-/// name, description, and optional `argument_hint` for frontend autocomplete.
+/// Return the immutable skill catalog active for a conversation (REQ-IR-005, REQ-PI-007).
 async fn list_conversation_skills(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -5867,10 +6116,23 @@ async fn list_conversation_skills(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let active =
+        ensure_active_project_instructions(&state, &id, std::path::Path::new(&conversation.cwd))
+            .await?;
 
-    let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(SkillsResponse {
-        skills: skill_entries_from_dir(&cwd, None),
+        skills: active
+            .skills
+            .into_iter()
+            .map(|skill| SkillEntry {
+                name: skill.name,
+                description: skill.description,
+                argument_hint: skill.argument_hint,
+                source: skill.source_label,
+                path: skill.source_path,
+                body: Some(skill.body),
+            })
+            .collect(),
     }))
 }
 
@@ -5911,8 +6173,7 @@ async fn list_project_skills(
 /// frontend. When `strip_prefix` is set (a `GitTree` materialization root),
 /// filesystem skill paths are rewritten relative to it so the frontend sees the
 /// ref-relative `SKILL.md` location instead of an ephemeral temp path; built-in
-/// skill paths (outside the prefix) are left absolute. Shared by the
-/// conversation-scoped and directory-scoped handlers.
+/// skill paths (outside the prefix) are left absolute.
 fn skill_entries_from_dir(
     dir: &std::path::Path,
     strip_prefix: Option<&std::path::Path>,
@@ -5939,6 +6200,7 @@ fn skill_entries_from_dir(
                 argument_hint: s.argument_hint,
                 source,
                 path,
+                body: None,
             }
         })
         .collect()
@@ -7238,6 +7500,417 @@ mod conversation_cwd_validation_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod project_instruction_refresh_tests {
+    use super::*;
+    use phoenix_core::domain::project_instruction_bundle::ProjectInstructionSourceChangeKind;
+
+    async fn setup() -> (AppState, tempfile::TempDir) {
+        let state = super::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "initial-secret").unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let skill = cwd.join(".agents/skills/alpha");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: alpha\ndescription: initial skill secret\nargument-hint: <snapshot-arg>\n---\nbody",
+        )
+        .unwrap();
+        state
+            .db
+            .create_conversation(
+                "instruction-api",
+                "instruction-api",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        (state, root)
+    }
+
+    fn creation_job(
+        conversation_id: &str,
+        cwd: &std::path::Path,
+    ) -> crate::db::InsertConversationCreationJob {
+        crate::db::InsertConversationCreationJob {
+            id: format!("job-{conversation_id}"),
+            conversation_id: conversation_id.to_string(),
+            message_id: Some(format!("message-{conversation_id}")),
+            intent: crate::db::ConversationCreationIntent {
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: None,
+                text: "hello".to_string(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: format!("message-{conversation_id}"),
+                images: vec![],
+                files: vec![],
+                mode: Some("direct".to_string()),
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_skills_use_active_snapshot_while_project_skills_remain_live() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root.path().join("project/.agents/skills/alpha")).unwrap();
+        let beta = root.path().join("project/.agents/skills/beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(
+            beta.join("SKILL.md"),
+            "---\nname: beta\ndescription: live beta\n---\nbody",
+        )
+        .unwrap();
+
+        let Json(conversation_skills) =
+            list_conversation_skills(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let Json(project_skills) = list_project_skills(Query(ProjectSkillsQuery {
+            cwd: root.path().join("project").to_string_lossy().into_owned(),
+            mode: None,
+            base_branch: None,
+        }))
+        .await
+        .unwrap();
+
+        assert!(conversation_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "alpha"));
+        assert_eq!(
+            conversation_skills
+                .skills
+                .iter()
+                .find(|skill| skill.name == "alpha")
+                .and_then(|skill| skill.argument_hint.as_deref()),
+            Some("<snapshot-arg>")
+        );
+        assert!(!conversation_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "beta"));
+        assert!(project_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "beta"));
+        assert!(!project_skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "alpha"));
+    }
+
+    #[tokio::test]
+    async fn conversation_skills_serve_captured_body_without_leaking_it_to_live_discovery() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::write(
+            root.path().join("project/.agents/skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: mutated\n---\nmutated live body",
+        )
+        .unwrap();
+
+        let Json(conversation_skills) =
+            list_conversation_skills(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let captured = conversation_skills
+            .skills
+            .iter()
+            .find(|skill| skill.name == "alpha")
+            .unwrap();
+        assert_eq!(captured.body.as_deref(), Some("body"));
+
+        let Json(project_skills) = list_project_skills(Query(ProjectSkillsQuery {
+            cwd: root.path().join("project").to_string_lossy().into_owned(),
+            mode: None,
+            base_branch: None,
+        }))
+        .await
+        .unwrap();
+        let live = project_skills
+            .skills
+            .iter()
+            .find(|skill| skill.name == "alpha")
+            .unwrap();
+        assert_eq!(live.description, "mutated");
+        assert!(live.body.is_none());
+        let wire = serde_json::to_value(&project_skills).unwrap();
+        assert!(wire["skills"][0].get("body").is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provisioning_endpoints_do_not_initialize_from_placeholder_cwd() {
+        let state = super::hard_delete_cascade_tests::make_test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let placeholder = root.path().join("placeholder");
+        let final_cwd = root.path().join("final");
+        std::fs::create_dir_all(&placeholder).unwrap();
+        std::fs::create_dir_all(final_cwd.join(".agents/skills/final-skill")).unwrap();
+        std::fs::write(
+            final_cwd.join(".agents/skills/final-skill/SKILL.md"),
+            "---\nname: final-skill\ndescription: final cwd skill\n---\nbody",
+        )
+        .unwrap();
+        state
+            .db
+            .create_conversation(
+                "provisioning-snapshot",
+                "provisioning-snapshot",
+                placeholder.to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let job = creation_job("provisioning-snapshot", &placeholder);
+        state
+            .db
+            .insert_conversation_creation_job(&job)
+            .await
+            .unwrap();
+
+        for result in [
+            get_project_instructions(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+            list_conversation_skills(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+            get_system_prompt(
+                State(state.clone()),
+                Path("provisioning-snapshot".to_string()),
+            )
+            .await
+            .map(|_| ()),
+        ] {
+            match result {
+                Err(AppError::Conflict(detail)) => {
+                    assert_eq!(detail.error_type, "conversation_provisioning");
+                }
+                other => panic!("expected provisioning conflict, got {other:?}"),
+            }
+        }
+        assert!(state
+            .db
+            .load_active_project_instruction_bundle("provisioning-snapshot")
+            .await
+            .unwrap()
+            .is_none());
+
+        state
+            .db
+            .update_conversation_cwd_recovery_only(
+                "provisioning-snapshot",
+                final_cwd.to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        let claimed = state
+            .db
+            .claim_next_conversation_creation_job(
+                &phoenix_core::domain::creation_protocol::CreationWorkerId("test-worker".into()),
+                &phoenix_core::domain::creation_protocol::CreationClaimToken("test-token".into()),
+                chrono::Utc::now(),
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let crate::db::CreationClaimOutcome::Claimed(claimed) = claimed else {
+            panic!("expected claimed job");
+        };
+        let phoenix_core::domain::creation_protocol::CreationStatus::Claimed(claim) =
+            claimed.protocol.status
+        else {
+            panic!("expected claim authority");
+        };
+        let discovered = discover_project_instruction_bundle(&final_cwd);
+        state
+            .db
+            .initialize_project_instruction_bundle_if_absent("provisioning-snapshot", &discovered)
+            .await
+            .unwrap();
+        state
+            .db
+            .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let Json(skills) = list_conversation_skills(
+            State(state.clone()),
+            Path("provisioning-snapshot".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(skills
+            .skills
+            .iter()
+            .any(|skill| skill.name == "final-skill"));
+        let active = state
+            .db
+            .load_active_project_instruction_bundle("provisioning-snapshot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(active
+            .skills
+            .iter()
+            .any(|skill| skill.name == "final-skill"));
+    }
+
+    #[tokio::test]
+    async fn preview_reports_content_free_path_skill_and_estimate_data() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "changed-secret").unwrap();
+        std::fs::write(root.path().join("project/AGENTS.md"), "added-secret").unwrap();
+        std::fs::remove_dir_all(root.path().join("project/.agents/skills/alpha")).unwrap();
+        let beta = root.path().join("project/.agents/skills/beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(
+            beta.join("SKILL.md"),
+            "---\nname: beta\ndescription: beta skill secret\n---\nbody",
+        )
+        .unwrap();
+
+        let Json(status) =
+            preview_project_instructions(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+
+        assert!(status.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "../AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Changed
+        }));
+        assert!(status.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Added
+        }));
+        assert!(status.changed_manifest.skills.iter().any(|change| {
+            change.name == "alpha" && change.status == ProjectInstructionSourceChangeKind::Removed
+        }));
+        assert!(status.changed_manifest.skills.iter().any(|change| {
+            change.name == "beta" && change.status == ProjectInstructionSourceChangeKind::Added
+        }));
+        assert!(status.rewarm_tokens_are_estimate);
+        assert!(status
+            .rewarm_estimate_notice
+            .contains("actual provider cache behavior"));
+        assert!(status.estimated_rewarm_tokens > 0);
+        let wire = serde_json::to_string(&status).unwrap();
+        assert!(!wire.contains("changed-secret"));
+        assert!(!wire.contains("added-secret"));
+        assert!(!wire.contains("skill secret"));
+    }
+
+    #[tokio::test]
+    async fn system_prompt_inspection_uses_persisted_active_bundle_after_source_mutation() {
+        let (state, root) = setup().await;
+        let Json(initial) =
+            get_system_prompt(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert!(initial.system_prompt.contains("initial-secret"));
+
+        std::fs::write(root.path().join("AGENTS.md"), "mutated-secret").unwrap();
+        let Json(after) = get_system_prompt(State(state), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        assert!(after.system_prompt.contains("initial-secret"));
+        assert!(!after.system_prompt.contains("mutated-secret"));
+    }
+
+    #[tokio::test]
+    async fn confirm_is_exact_and_later_preview_preserves_queue() {
+        let (state, root) = setup().await;
+        let Json(first) =
+            preview_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "reviewed-secret").unwrap();
+        let Json(reviewed) =
+            preview_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let reviewed_id = reviewed.candidate_bundle_id.clone().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "background-secret").unwrap();
+        let Json(background) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(
+            background.candidate_bundle_id.as_deref(),
+            Some(reviewed_id.as_str())
+        );
+
+        let stale_confirmation = confirm_project_instructions(
+            State(state.clone()),
+            Path("instruction-api".to_string()),
+            Json(ConfirmProjectInstructionsRequest {
+                candidate_bundle_id: first.candidate_bundle_id.unwrap(),
+            }),
+        )
+        .await;
+        assert!(matches!(stale_confirmation, Err(AppError::Conflict(_))));
+        let _ = confirm_project_instructions(
+            State(state.clone()),
+            Path("instruction-api".to_string()),
+            Json(ConfirmProjectInstructionsRequest {
+                candidate_bundle_id: reviewed_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(root.path().join("AGENTS.md"), "later-secret").unwrap();
+        let Json(later) =
+            get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(
+            later.queued_bundle_id.as_deref(),
+            Some(reviewed_id.as_str())
+        );
+        assert!(later.is_queued);
+        assert!(later.changed_manifest.guidance.iter().any(|change| {
+            change.relative_path == "../AGENTS.md"
+                && change.status == ProjectInstructionSourceChangeKind::Changed
+        }));
+        let queued = state
+            .db
+            .load_queued_project_instruction_bundle("instruction-api")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.guidance[0].content, "reviewed-secret");
     }
 }
 
@@ -10132,7 +10805,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("live message after subscribe");
         match live {
-            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            SseEvent::Message { message, .. } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
     }
@@ -12954,6 +13627,100 @@ mod chat_authority_tests {
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
         }
+    }
+
+    fn skill_bundle(
+        body: &str,
+    ) -> phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+        use phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot;
+        phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+            estimated_tokens: 1,
+            guidance: vec![],
+            skills: vec![ProjectSkillSnapshot {
+                name: "alpha".to_string(),
+                description: "test".to_string(),
+                argument_hint: None,
+                source_label: ".agents/skills".to_string(),
+                body: body.to_string(),
+                base_dir: "/tmp/.agents/skills/alpha".to_string(),
+                source_path: "/tmp/.agents/skills/alpha/SKILL.md".to_string(),
+                content_hash: body.to_string(),
+            }],
+        }
+    }
+
+    async fn seed_active_and_queue_changed_skill(state: &AppState, id: &str) {
+        state
+            .db
+            .initialize_project_instruction_bundle_if_absent(id, &skill_bundle("active body"))
+            .await
+            .unwrap();
+        let candidate = state
+            .db
+            .persist_or_replace_project_instruction_candidate(id, &skill_bundle("queued body"))
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .confirm_project_instruction_candidate(id, &candidate.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn direct_slash_message_expands_from_queued_next_turn_bundle() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-queued-skill", "skill", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        seed_active_and_queue_changed_skill(&state, "c-queued-skill").await;
+
+        let _ = send_chat(
+            State(state.clone()),
+            Path("c-queued-skill".to_string()),
+            Json(ChatRequest {
+                text: "/alpha".to_string(),
+                message_id: "queued-skill-message".to_string(),
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let messages = state.db.get_messages("c-queued-skill").await.unwrap();
+                if let Some(skill) = messages.iter().find_map(|message| match &message.content {
+                    crate::db::MessageContent::Skill(skill) => Some(skill),
+                    _ => None,
+                }) {
+                    assert!(skill.body.contains("queued body"));
+                    assert!(!skill.body.contains("active body"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user message persisted");
+    }
+
+    #[test]
+    fn cancelling_steering_is_classified_as_a_later_turn() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![],
+            completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: None,
+        };
+        assert!(steering_starts_later_turn(&state));
+        assert!(!steering_starts_later_turn(&ConvState::LlmRequesting {
+            attempt: 1
+        }));
     }
 
     /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.

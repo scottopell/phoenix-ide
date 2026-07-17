@@ -7,6 +7,9 @@ import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktree
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
+import type { ProjectInstructionRefreshStatus } from './generated/ProjectInstructionRefreshStatus';
+import type { ConfirmProjectInstructionsRequest } from './generated/ConfirmProjectInstructionsRequest';
+import type { ConfirmProjectInstructionsResponse } from './generated/ConfirmProjectInstructionsResponse';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -690,6 +693,9 @@ export interface SkillEntry {
    * (extracted to `<HOME>/.phoenix-ide/builtin-skills/` at startup).
    */
   source: string;
+  /** Captured body for a conversation's active instruction snapshot. Absent
+   *  from directory-scoped live discovery responses. */
+  body?: string;
   /** Absolute path to the SKILL.md file. Always populated; built-in skills
    *  point at their extracted location. */
   path: string;
@@ -1692,8 +1698,65 @@ export const api = {
 
   async getSystemPrompt(convId: string): Promise<string> {
     const resp = await fetch(`/api/conversations/${convId}/system-prompt`);
-    if (!resp.ok) throw new Error('Failed to fetch system prompt');
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({
+        error: 'Failed to fetch system prompt',
+        error_type: 'unknown',
+      }));
+      if (resp.status === 409) throw new ConflictError(detail as ConflictErrorDetail);
+      throw new Error(detail.error || 'Failed to fetch system prompt');
+    }
     return (await resp.json()).system_prompt;
+  },
+
+  async getProjectInstructionRefreshStatus(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<ProjectInstructionRefreshStatus> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/project-instructions`,
+      signal ? { signal } : undefined,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch project-instruction refresh status');
+    return resp.json();
+  },
+
+  async previewProjectInstructionRefresh(
+    convId: string,
+    signal?: AbortSignal,
+  ): Promise<ProjectInstructionRefreshStatus> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/project-instructions/preview`,
+      { method: 'POST', ...(signal ? { signal } : {}) },
+    );
+    if (!resp.ok) throw new Error('Failed to preview project-instruction refresh');
+    return resp.json();
+  },
+
+  async confirmProjectInstructionRefresh(
+    convId: string,
+    candidateBundleId: string,
+  ): Promise<ConfirmProjectInstructionsResponse> {
+    const request: ConfirmProjectInstructionsRequest = {
+      candidate_bundle_id: candidateBundleId,
+    };
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/project-instructions/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({
+        error: 'Failed to queue project-instruction refresh',
+        error_type: 'unknown',
+      })) as ConflictErrorDetail;
+      if (resp.status === 409) throw new ConflictError(detail);
+      throw new Error(detail.error || 'Failed to queue project-instruction refresh');
+    }
+    return resp.json();
   },
 
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string; is_git: boolean }> {

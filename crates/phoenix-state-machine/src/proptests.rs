@@ -292,6 +292,7 @@ fn arb_user_message_event() -> impl Strategy<Value = Event> {
         message_id: uuid::Uuid::new_v4().to_string(),
         user_agent: None,
         skill_invocation: None,
+        expected_queued_project_instruction_bundle_id: None,
     })
 }
 
@@ -495,7 +496,8 @@ proptest! {
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
             skill_invocation: None,
-        };
+            expected_queued_project_instruction_bundle_id: None,
+};
 
         let result = transition(&state, &test_context(), event);
         prop_assert!(result.is_ok(), "Error recovery failed: {:?}", result);
@@ -565,7 +567,8 @@ proptest! {
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
             skill_invocation: None,
-        };
+            expected_queued_project_instruction_bundle_id: None,
+};
         let result = transition(&state, &test_context(), event);
         // Busy states either return AgentBusy, CancellationInProgress, or InvalidTransition
         prop_assert!(
@@ -589,7 +592,8 @@ proptest! {
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
             skill_invocation: None,
-        };
+            expected_queued_project_instruction_bundle_id: None,
+};
         let result = transition(&state, &test_context(), event);
         prop_assert!(
             matches!(result, Err(TransitionError::ContextExhausted)),
@@ -690,7 +694,8 @@ proptest! {
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
             skill_invocation: None,
-        };
+            expected_queued_project_instruction_bundle_id: None,
+};
 
         let result = transition(&state, &test_context(), event);
         prop_assert!(result.is_ok(), "Idle should accept messages: {:?}", result);
@@ -1084,6 +1089,7 @@ fn test_complete_tool_cycle() {
             message_id: uuid::Uuid::new_v4().to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         },
     )
     .unwrap();
@@ -2290,7 +2296,8 @@ proptest! {
                 message_id: "test-msg".to_string(),
                 user_agent: None,
                 skill_invocation: None,
-            },
+                expected_queued_project_instruction_bundle_id: None,
+},
         ) {
             state = result.new_state;
         }

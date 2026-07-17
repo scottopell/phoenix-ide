@@ -4,6 +4,8 @@ pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use phoenix_core::domain::project_instruction_bundle::ProjectInstructionRefreshStatus;
+
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
@@ -549,6 +551,10 @@ pub struct SkillEntry {
     /// literal `"builtin"` for skills bundled with the phoenix binary
     /// (extracted to `<HOME>/.phoenix-ide/builtin-skills/` at startup).
     pub source: String,
+    /// Captured body from a conversation's active instruction snapshot.
+    /// Directory-scoped live discovery intentionally omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     /// Absolute path to the SKILL.md file. Always populated; built-in skills
     /// point at the extracted location.
     pub path: String,
@@ -1291,4 +1297,16 @@ impl ErrorResponse {
             error_type: Some(error_type.into()),
         }
     }
+}
+
+#[derive(Debug, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConfirmProjectInstructionsRequest {
+    pub candidate_bundle_id: String,
+}
+
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ConfirmProjectInstructionsResponse {
+    pub status: ProjectInstructionRefreshStatus,
 }

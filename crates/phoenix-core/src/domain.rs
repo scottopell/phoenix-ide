@@ -16,6 +16,7 @@ pub mod patch_types;
 pub mod pr_display_state;
 pub mod pr_feedback_status;
 pub mod process_inspection;
+pub mod project_instruction_bundle;
 pub mod quota_details;
 pub mod retry_policy;
 pub mod skill_invocation;

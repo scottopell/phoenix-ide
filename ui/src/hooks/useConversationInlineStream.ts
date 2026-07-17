@@ -178,6 +178,9 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             type: 'sse_message',
             message: res.output.message,
             sequenceId: res.output.sequence_id,
+            ...(res.output.transcript_generation != null && {
+              transcriptGeneration: res.output.transcript_generation,
+            }),
           },
         });
       });

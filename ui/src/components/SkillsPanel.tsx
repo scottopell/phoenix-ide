@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { api } from '../api';
 import type { SkillEntry } from '../api';
 import { GroundingSection, GroundingState } from './GroundingPanel';
@@ -7,6 +7,8 @@ import './SkillsPanel.css';
 
 interface SkillsPanelProps {
   conversationId: string | undefined;
+  instructionSnapshotVersion?: number | null | undefined;
+  onSkillsRefreshed?: (skills: SkillEntry[]) => void;
   onSkillClick?: (skill: SkillEntry) => void;
   expanded?: boolean;
   onToggleExpanded?: (expanded: boolean) => void;
@@ -18,6 +20,8 @@ interface SkillsPanelProps {
 
 export function SkillsPanel({
   conversationId,
+  instructionSnapshotVersion,
+  onSkillsRefreshed,
   onSkillClick,
   expanded: controlledExpanded,
   onToggleExpanded,
@@ -34,34 +38,41 @@ export function SkillsPanel({
   const expandedGroups = controlledExpandedGroups ?? internalExpandedGroups;
   const setExpandedGroups = onExpandedGroupsChange ?? setInternalExpandedGroups;
   const hasControlledGroups = controlledExpandedGroups !== undefined && controlledExpandedGroups !== null;
+  const requestGenerationRef = useRef(0);
+  const hasControlledGroupsRef = useRef(hasControlledGroups);
+  const setExpandedGroupsRef = useRef(setExpandedGroups);
+  const onSkillsRefreshedRef = useRef(onSkillsRefreshed);
+  hasControlledGroupsRef.current = hasControlledGroups;
+  setExpandedGroupsRef.current = setExpandedGroups;
+  onSkillsRefreshedRef.current = onSkillsRefreshed;
 
   useEffect(() => {
+    const requestGeneration = ++requestGenerationRef.current;
     if (!conversationId) {
       setSkills([]);
+      onSkillsRefreshedRef.current?.([]);
       return;
     }
 
-    let cancelled = false;
     const controller = new AbortController();
 
     api.listConversationSkills(conversationId, controller.signal)
       .then(resp => {
-        if (!cancelled) {
-          setSkills(resp.skills);
-          const groups = groupSkills(resp.skills);
-          if (!hasControlledGroups) setExpandedGroups(new Set(groups.keys()));
+        if (requestGeneration !== requestGenerationRef.current) return;
+        setSkills(resp.skills);
+        onSkillsRefreshedRef.current?.(resp.skills);
+        if (!hasControlledGroupsRef.current) {
+          setExpandedGroupsRef.current(new Set(groupSkills(resp.skills).keys()));
         }
       })
       .catch(() => {
-        if (!cancelled) setSkills([]);
+        if (requestGeneration !== requestGenerationRef.current || controller.signal.aborted) return;
+        setSkills([]);
+        onSkillsRefreshedRef.current?.([]);
       });
 
-
-  return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [conversationId, hasControlledGroups, setExpandedGroups]);
+    return () => controller.abort();
+  }, [conversationId, instructionSnapshotVersion]);
 
   const grouped = useMemo(() => groupSkills(skills), [skills]);
 

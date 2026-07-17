@@ -346,6 +346,9 @@ export function useConnection({
               type: 'sse_message',
               message: msg,
               sequenceId: msg.sequence_id,
+              ...(res.data.transcript_generation != null && {
+                transcriptGeneration: res.data.transcript_generation,
+              }),
             });
           });
 

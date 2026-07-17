@@ -684,6 +684,9 @@ THE SYSTEM SHALL create a new conversation that inherits:
   - the parent's worktree, if any (Work, Branch, and Explore modes all have worktrees — see REQ-PROJ-028 for Explore worktree creation on first message), via ownership transfer rather than destroy-and-recreate
   - any uncommitted changes in that worktree
   - for Work mode, the parent's task_id and associated task file
+  - a fresh child-owned immutable copy of the parent's persisted active project-instruction bundle
+
+The child row, parent continuation link, and child active project-instruction bundle SHALL commit atomically. If the parent has no active bundle or copying fails, no continuation child or parent link SHALL become visible.
 
 WHEN the parent has a worktree
 THE SYSTEM SHALL transfer worktree ownership atomically in a single database transaction:

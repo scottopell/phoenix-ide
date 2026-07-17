@@ -248,6 +248,31 @@ describe('parseEvent', () => {
       expect(actions).toHaveLength(0);
     });
 
+    it('accepts an optional transcript generation on an activation message', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseMessageDataSchema,
+        makeEvent({ sequence_id: 5, message: goodMsg, transcript_generation: 2 }),
+        'message',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.data.transcript_generation).toBe(2);
+    });
+
+    it('rejects a non-numeric transcript generation', () => {
+      inProdMode(() => {
+        const { dispatch } = mockDispatch();
+        const res = parseEvent(
+          SseMessageDataSchema,
+          makeEvent({ sequence_id: 5, message: goodMsg, transcript_generation: '2' }),
+          'message',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+      });
+    });
+
     it('rejects a message whose sequence_id arrives as a string', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();

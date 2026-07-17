@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
+import { api, ConflictError, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { cacheDB } from '../cache';
 
@@ -32,7 +32,7 @@ vi.mock('../api', async () => {
       getPrStatus: vi.fn(() => Promise.resolve({ found: false })),
       getCredentialStatus: vi.fn(() => Promise.resolve('valid')),
       getConversationUsage: vi.fn(() => Promise.resolve({ total_tokens: 0, turns: [] })),
-      getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
+      getSystemPrompt: vi.fn(() => Promise.resolve('')),
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
       getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
@@ -79,6 +79,8 @@ vi.mock('../components/ConversationNavStack', () => ({
     transcriptPositioning,
     olderHistoryError,
     onOpenCommissionReview,
+    systemPrompt,
+    usesProjectInstructions,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -94,6 +96,8 @@ vi.mock('../components/ConversationNavStack', () => ({
     };
     olderHistoryError?: string | null;
     onOpenCommissionReview?: (sequenceId: number) => void;
+    systemPrompt?: string;
+    usesProjectInstructions?: boolean;
   }) => {
     navStackProps.onOpenCommissionReview = onOpenCommissionReview;
     return (
@@ -121,6 +125,8 @@ vi.mock('../components/ConversationNavStack', () => ({
             : 'none'}
         </div>
         <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
+        <div data-testid="inspected-system-prompt">{systemPrompt ?? 'none'}</div>
+        {systemPrompt && usesProjectInstructions && <button type="button">Refresh project instructions</button>}
         {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
       </div>
     );
@@ -252,6 +258,23 @@ afterEach(() => {
 });
 
 describe('ConversationPage archived read-only rendering', () => {
+  it('retries the system prompt after provisioning becomes confirmed live', async () => {
+    vi.mocked(api.getSystemPrompt)
+      .mockRejectedValueOnce(new ConflictError({
+        error: 'Conversation is still provisioning',
+        error_type: 'conversation_provisioning',
+      }))
+      .mockResolvedValueOnce('ready system prompt');
+
+    renderPage(makeConversation());
+
+    await waitFor(() => {
+      expect(screen.getByTestId('inspected-system-prompt')).toHaveTextContent('ready system prompt');
+    });
+    expect(screen.getByRole('button', { name: 'Refresh project instructions' })).toBeInTheDocument();
+    expect(api.getSystemPrompt).toHaveBeenCalledTimes(2);
+  });
+
   it('shows message history but hides composer, work actions, terminal, files, and work scope for archived idle conversations', async () => {
     renderPage(makeConversation({ archived: true }));
 

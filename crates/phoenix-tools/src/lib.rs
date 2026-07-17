@@ -251,6 +251,10 @@ pub struct ToolContext {
     /// Working directory for file operations
     pub working_dir: PathBuf,
 
+    /// Skill definitions from the conversation's active project-instruction snapshot.
+    pub active_project_skills:
+        Arc<[phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot]>,
+
     /// Browser session manager (access via `browser()` method)
     browser_sessions: Arc<BrowserSessionManager>,
 
@@ -308,6 +312,7 @@ impl ToolContext {
             cancel,
             conversation_id,
             working_dir,
+            active_project_skills: Arc::from([]),
             browser_sessions,
             bash_handles,
             llm_selector,
@@ -316,6 +321,16 @@ impl ToolContext {
             worktree_path,
             work_scope,
         }
+    }
+
+    /// Attach the immutable skill catalog active for this conversation.
+    #[must_use]
+    pub fn with_active_project_skills(
+        mut self,
+        skills: Vec<phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot>,
+    ) -> Self {
+        self.active_project_skills = skills.into();
+        self
     }
 
     /// Get or create the browser session for this conversation's

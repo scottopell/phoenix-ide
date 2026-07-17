@@ -4,6 +4,7 @@ import {
   useConversationsList,
   useConversationsRefresh,
   useConversationSnapshot,
+  useTranscriptGeneration,
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
@@ -210,6 +211,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
   const activeConversation = useConversationSnapshot(activeSlug);
+  const instructionSnapshotVersion = useTranscriptGeneration(activeSlug);
   const activeConversationId = activeConversation?.id;
   // Live work-scope inventory (SSE-fed) for the active conversation, threaded
   // into FileExplorerPanel's Work scope section + collapsed-rail badge
@@ -279,6 +281,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             onToggle={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
             rootPath={effectiveCwd}
             conversationId={activeConversation?.id}
+            instructionSnapshotVersion={instructionSnapshotVersion}
             showToast={showSuccess}
             showError={showError}
             branchName={activeConversation?.branch_name}

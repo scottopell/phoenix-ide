@@ -571,6 +571,7 @@ mod random_walk {
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: None,
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 },
                 1 => Event::TaskResolved {
                     system_message: random_string(rng, 15),
@@ -735,6 +736,7 @@ mod random_walk {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
 
             ConvState::AwaitingRecovery { .. } => match rng.random_range(0..3) {

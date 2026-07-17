@@ -236,6 +236,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "replace_global_recall_with_coordinator",
         sql: MIGRATION_044,
     },
+    Migration {
+        version: 45,
+        name: "create_project_instruction_bundles",
+        sql: MIGRATION_045,
+    },
+    Migration {
+        version: 46,
+        name: "add_project_skill_argument_hints_and_steer_bundle_binding",
+        sql: MIGRATION_046,
+    },
 ];
 
 const MIGRATION_044: &str = r"
@@ -587,6 +597,54 @@ WHERE 1 = (
 );
 
 DROP TABLE work_scope_pr_feedback_baselines_old;
+";
+
+const MIGRATION_046: &str = r"
+ALTER TABLE project_instruction_skills ADD COLUMN argument_hint TEXT;
+ALTER TABLE steering_messages ADD COLUMN expected_queued_project_instruction_bundle_id TEXT;
+";
+
+const MIGRATION_045: &str = r"
+CREATE TABLE project_instruction_bundles (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('active', 'queued', 'candidate', 'historical')),
+    estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens >= 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX one_active_project_instruction_bundle
+ON project_instruction_bundles(conversation_id) WHERE role = 'active';
+CREATE UNIQUE INDEX one_queued_project_instruction_bundle
+ON project_instruction_bundles(conversation_id) WHERE role = 'queued';
+CREATE UNIQUE INDEX one_candidate_project_instruction_bundle
+ON project_instruction_bundles(conversation_id) WHERE role = 'candidate';
+CREATE INDEX project_instruction_bundles_conversation
+ON project_instruction_bundles(conversation_id, created_at);
+
+CREATE TABLE project_instruction_guidance (
+    bundle_id TEXT NOT NULL REFERENCES project_instruction_bundles(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    relative_path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (bundle_id, ordinal),
+    UNIQUE (bundle_id, relative_path)
+);
+
+CREATE TABLE project_instruction_skills (
+    bundle_id TEXT NOT NULL REFERENCES project_instruction_bundles(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    source_label TEXT NOT NULL,
+    body TEXT NOT NULL,
+    base_dir TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (bundle_id, ordinal),
+    UNIQUE (bundle_id, name)
+);
 ";
 
 const MIGRATION_014: &str = r"

@@ -22,6 +22,7 @@ interface Props {
   onToggle: () => void;
   rootPath?: string | null | undefined;
   conversationId: string | undefined;
+  instructionSnapshotVersion?: number | null;
   showToast: (message: string, duration?: number) => void;
   showError: (message: string, duration?: number) => void;
   branchName?: string | null | undefined;
@@ -46,7 +47,7 @@ const DEFAULT_TASK_GROUP_EXPANDED: Record<string, boolean> = {
   'wont-do': false,
 };
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, instructionSnapshotVersion, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
@@ -81,6 +82,13 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
   }, [openFile]);
+
+  const handleSkillsRefreshed = useCallback((refreshedSkills: SkillEntry[]) => {
+    setSelectedSkill(selected => {
+      if (!selected) return null;
+      return refreshedSkills.find(skill => skill.name === selected.name) ?? null;
+    });
+  }, []);
 
   if (collapsed) {
     return (
@@ -141,8 +149,8 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
         )}
       </div>
-      {detailViewer || (
-        <>
+      {detailViewer}
+      <div style={{ display: detailViewer ? 'none' : 'contents' }}>
           {rootPath && (
             <div className="fe-tree-scroll">
               <FileTree
@@ -160,6 +168,8 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           <SkillsPanel
             conversationId={conversationId}
             onSkillClick={setSelectedSkill}
+            instructionSnapshotVersion={instructionSnapshotVersion}
+            onSkillsRefreshed={handleSkillsRefreshed}
             expanded={skillsPanelExpanded}
             onToggleExpanded={setSkillsPanelExpanded}
             expandedGroups={skillsGroupExpanded}
@@ -186,8 +196,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               onToggleExpanded={setWorkScopeExpanded}
             />
           )}
-        </>
-      )}
+      </div>
     </aside>
   );
 }

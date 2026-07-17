@@ -29,7 +29,9 @@ use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
     Effect, Event, StepResult,
 };
-use crate::system_prompt::{build_system_prompt, ModeContext};
+use crate::system_prompt::{
+    build_system_prompt_with_project_instructions, discover_project_instruction_bundle, ModeContext,
+};
 use crate::tools::{BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_llm::{
@@ -2499,13 +2501,73 @@ where
         Ok(())
     }
 
-    async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
-        if matches!(event, Event::UserMessage { .. }) {
-            self.parent_tool_cycle_count = 0;
-        }
+    async fn activate_queued_project_instructions(
+        &self,
+        expected_queued_bundle_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(expected_queued_bundle_id) = expected_queued_bundle_id else {
+            return Ok(());
+        };
 
+        let (reserved_broadcast_range, reserved_seqs) =
+            self.broadcast_tx.reserve_next_persisted_message_range(1);
+        let _reserved_broadcast_range = reserved_broadcast_range;
+        let sequence_id = reserved_seqs[0];
+        match self
+            .storage
+            .activate_queued_project_instruction_bundle(
+                &self.context.conversation_id,
+                expected_queued_bundle_id,
+                sequence_id,
+            )
+            .await
+        {
+            Ok(Some(activation)) => {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    transcript_generation = activation.transcript_generation,
+                    "Activated queued project instructions at user-turn boundary"
+                );
+                let _ = self.broadcast_tx.send_persisted_message_with_generation(
+                    activation.message,
+                    Some(activation.transcript_generation),
+                );
+                Ok(())
+            }
+            Ok(None) => {
+                let error =
+                    "queued project instructions changed before turn activation".to_string();
+                let _ = self
+                    .broadcast_tx
+                    .send_reserved_seq(sequence_id, |seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "retry the message with the current project instructions",
+                        ),
+                    });
+                Err(error)
+            }
+            Err(error) => {
+                tracing::error!(
+                    conv_id = %self.context.conversation_id,
+                    %error,
+                    "Failed to activate queued project instructions"
+                );
+                let _ = self
+                    .broadcast_tx
+                    .send_reserved_seq(sequence_id, |seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "start the next turn",
+                        ),
+                    });
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // Steering messages are buffered rather than fed to the state machine.
         // They are delivered as `UserMessage` when the conversation next enters `Idle`.
         if let Event::SteerMessage {
@@ -2516,6 +2578,7 @@ where
             message_id,
             user_agent,
             skill_invocation,
+            expected_queued_project_instruction_bundle_id,
         } = event
         {
             let entry = crate::state_machine::event::SteerEntry {
@@ -2526,6 +2589,7 @@ where
                 message_id: message_id.clone(),
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             };
             self.steering_queue.push(entry);
             let queue_position = self.steering_queue.len() - 1;
@@ -2589,7 +2653,16 @@ where
                 }
             }
 
-            // Pure state transition
+            // Compute the pure transition before performing boundary side effects.
+            // A rejected UserMessage must not activate a queued snapshot.
+            let expected_queued_bundle_id = match &current_event {
+                Event::UserMessage {
+                    expected_queued_project_instruction_bundle_id,
+                    ..
+                } => Some(expected_queued_project_instruction_bundle_id.clone()),
+                _ => None,
+            };
+            let starts_user_turn = expected_queued_bundle_id.is_some();
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2609,6 +2682,17 @@ where
                     return Err(e.to_string());
                 }
             };
+
+            if starts_user_turn {
+                // Activation must precede transition effects so the first model
+                // request observes the new snapshot, but follows validation so
+                // rejected messages leave the queue and timeline untouched.
+                self.activate_queued_project_instructions(
+                    expected_queued_bundle_id.flatten().as_deref(),
+                )
+                .await?;
+                self.parent_tool_cycle_count = 0;
+            }
 
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
@@ -2867,12 +2951,16 @@ where
     /// the drain event's persist effects inline, then run the deferred
     /// `RequestLlm`. Guarantees the spawned LLM task reads a DB that already
     /// contains the steered messages.
+    #[allow(clippy::too_many_lines)]
     async fn run_effects_with_inline_drain(
         &mut self,
         original_effects: Vec<Effect>,
         drain_event: Event,
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
+        let Event::SteerDrainedUserMessages { mut entries } = drain_event else {
+            unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
+        };
         let mut deferred_request_llm: Option<Effect> = None;
         // Cosmetic (task 60004): when the inline drain enters from Idle, the
         // original transition's Idle state-change SSE would briefly render the
@@ -2882,6 +2970,84 @@ where
         // LlmRequesting state-change. Mid-turn drains enter from LlmRequesting,
         // not Idle, so their state-change is correct and not suppressed.
         let suppress_intermediate_state_change = matches!(self.state, ConvState::Idle);
+        // An idle-entry drain starts a new user-authored turn. Activate before
+        // persisting any drained user message. The LlmRequesting mid-turn drain
+        // deliberately skips this boundary action.
+        if suppress_intermediate_state_change {
+            if entries.iter().all(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .is_none()
+            }) {
+                let queued_id = self
+                    .storage
+                    .load_queued_project_instruction_bundle(&self.context.conversation_id)
+                    .await?
+                    .map(|bundle| bundle.id.into_boxed_str());
+                for entry in &mut entries {
+                    entry
+                        .expected_queued_project_instruction_bundle_id
+                        .clone_from(&queued_id);
+                }
+            }
+            let expected_queued_bundle_id = entries.first().and_then(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .as_deref()
+            });
+            if entries.iter().any(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .as_deref()
+                    != expected_queued_bundle_id
+            }) {
+                return Err("steering batch spans different project-instruction snapshots".into());
+            }
+            if let Err(error) = self
+                .activate_queued_project_instructions(expected_queued_bundle_id)
+                .await
+            {
+                // `maybe_drain_steering_queue` moved this batch out with
+                // `mem::take`. Activation is the first durable boundary action,
+                // so put it back ahead of anything appended meanwhile before
+                // returning. The DB queue remains untouched.
+                entries.append(&mut self.steering_queue);
+                self.steering_queue = entries;
+                return Err(error);
+            }
+            // These steers are becoming a new user turn. Expansion happened at
+            // enqueue time while the prior turn was active, so rerender slash
+            // invocations from the now-active snapshot selected at this boundary.
+            let project_instructions = self
+                .storage
+                .load_active_project_instruction_bundle(&self.context.conversation_id)
+                .await?;
+            if let Some(project_instructions) = project_instructions {
+                let resolution_root =
+                    crate::resolution_root::ResolutionRoot::working_dir(&self.context.working_dir);
+                for entry in &mut entries {
+                    // The old active snapshot may not have recognized a newly
+                    // activated skill at enqueue time. Reconsider slash-shaped
+                    // text at the actual turn boundary; unknown slash text still
+                    // passes through unchanged under the expander's semantics.
+                    if entry.skill_invocation.is_none() && !entry.text.trim_start().starts_with('/')
+                    {
+                        continue;
+                    }
+                    let expanded = crate::message_expander::expand_with_project_skills(
+                        &entry.text,
+                        &resolution_root,
+                        &project_instructions.skills,
+                    )
+                    .map_err(|error| {
+                        format!("failed to expand drained steering message: {error}")
+                    })?;
+                    entry.llm_text =
+                        (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+                    entry.skill_invocation = expanded.skill_invocation;
+                }
+            }
+        }
         for effect in original_effects {
             if matches!(effect, Effect::RequestLlm) {
                 deferred_request_llm = Some(effect);
@@ -2904,9 +3070,6 @@ where
             }
         }
 
-        let Event::SteerDrainedUserMessages { entries } = drain_event else {
-            unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
-        };
         let drain_result = transition(
             &self.state,
             &self.context,
@@ -4465,12 +4628,54 @@ where
                     phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
                 };
 
-            // Build system prompt with AGENTS.md content + mode context
-            // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = if is_coordinator {
                 crate::system_prompt::build_coordinator_system_prompt(llm_language)
             } else {
-                build_system_prompt(
+                // Legacy conversations acquire one immutable snapshot on their first
+                // request. A storage failure is terminal for this request: falling
+                // back to live discovery would silently change guidance mid-session.
+                let project_instructions = match storage
+                    .load_active_project_instruction_bundle(&conv_id)
+                    .await
+                {
+                    Ok(Some(bundle)) => bundle,
+                    Ok(None) if is_sub_agent => {
+                        let error = format!(
+                            "sub-agent {conv_id} has no inherited project instruction snapshot"
+                        );
+                        tracing::error!(conv_id = %conv_id, "{error}");
+                        let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                        return;
+                    }
+                    Ok(None) => {
+                        let discovered = discover_project_instruction_bundle(&working_dir);
+                        match storage
+                            .initialize_project_instruction_bundle_if_absent(&conv_id, &discovered)
+                            .await
+                        {
+                            Ok(bundle) => bundle,
+                            Err(error) => {
+                                tracing::error!(
+                                    conv_id = %conv_id,
+                                    %error,
+                                    "Failed to initialize project instruction snapshot"
+                                );
+                                let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            conv_id = %conv_id,
+                            %error,
+                            "Failed to load active project instruction snapshot"
+                        );
+                        let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                        return;
+                    }
+                };
+                build_system_prompt_with_project_instructions(
                     &working_dir,
                     &tasks_dir_name,
                     is_sub_agent,
@@ -4478,6 +4683,7 @@ where
                     llm_language,
                     persona.as_deref(),
                     explore_bash_capability,
+                    &project_instructions,
                 )
             };
 
@@ -4738,6 +4944,22 @@ where
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
         let scope_worktree = self.context.work_scope_worktree.clone();
+        let active_project_skills = match self
+            .storage
+            .load_active_project_instruction_bundle(&self.context.conversation_id)
+            .await
+        {
+            Ok(Some(bundle)) => bundle.skills,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::error!(
+                    conv_id = %self.context.conversation_id,
+                    %error,
+                    "Failed to load active project skills for tool invocation"
+                );
+                Vec::new()
+            }
+        };
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -4748,7 +4970,8 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
-        );
+        )
+        .with_active_project_skills(active_project_skills);
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -9096,6 +9319,9 @@ mod explore_prompt_cache_shape_tests {
 
     struct TaskCreatingPatchExecutor {
         task_path: PathBuf,
+        guidance_path: PathBuf,
+        storage: Arc<InMemoryStorage>,
+        conv_id: String,
     }
 
     #[async_trait]
@@ -9110,6 +9336,21 @@ mod explore_prompt_cache_shape_tests {
                 return None;
             }
             std::fs::write(&self.task_path, "# Draft\n").unwrap();
+            std::fs::write(&self.guidance_path, "live guidance changed\n").unwrap();
+            self.storage.queue_project_instruction_bundle(
+                &self.conv_id,
+                phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                    estimated_tokens: 4,
+                    guidance: vec![
+                        phoenix_core::domain::project_instruction_bundle::ProjectGuidanceSnapshot {
+                            relative_path: "AGENTS.md".to_string(),
+                            content: "exact queued guidance".to_string(),
+                            content_hash: "queued-hash".to_string(),
+                        },
+                    ],
+                    skills: vec![],
+                },
+            );
             Some(ToolOutput::success("created task draft"))
         }
 
@@ -9123,9 +9364,12 @@ mod explore_prompt_cache_shape_tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn explore_tool_loop_keeps_system_prompt_and_cache_key_stable_after_task_file_write() {
+    async fn project_instructions_stay_stable_until_next_user_turn_activates_exact_queue() {
         let temp = TempDir::new().unwrap();
+        let guidance_path = temp.path().join("AGENTS.md");
+        std::fs::write(&guidance_path, "original guidance\n").unwrap();
         let tasks_dir = temp.path().join("tasks");
         std::fs::create_dir(&tasks_dir).unwrap();
         std::fs::write(
@@ -9164,16 +9408,24 @@ mod explore_prompt_cache_shape_tests {
             end_turn: true,
             usage: Usage::default(),
         });
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("next turn complete")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
 
         let (event_tx, runtime_event_rx) = mpsc::channel(32);
         let broadcaster = SseBroadcaster::new(128, 0);
         let runtime = ConversationRuntime::new(
             context,
             ConvState::Idle,
-            storage,
+            storage.clone(),
             llm.clone(),
             Arc::new(TaskCreatingPatchExecutor {
                 task_path: tasks_dir.join(format!("{hinted_id}-p2-ready--draft.md")),
+                guidance_path,
+                storage: storage.clone(),
+                conv_id: conv_id.to_string(),
             }),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
@@ -9195,6 +9447,7 @@ mod explore_prompt_cache_shape_tests {
                 message_id: "user-msg-1".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -9211,12 +9464,72 @@ mod explore_prompt_cache_shape_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
+        let queued_id = storage
+            .load_queued_project_instruction_bundle(conv_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        event_tx
+            .send(Event::UserMessage {
+                text: "start next turn".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "user-msg-2".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: Some(queued_id.into()),
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while llm.recorded_requests().len() < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for next-turn LLM request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
         let requests = llm.recorded_requests();
         assert!(tasks_dir
             .join(format!("{hinted_id}-p2-ready--draft.md"))
             .is_file());
         assert_eq!(requests[0].system.len(), requests[1].system.len());
         assert_eq!(requests[0].system[0].text, requests[1].system[0].text);
+        assert!(requests[0].system[0].text.contains("original guidance"));
+        assert!(!requests[1].system[0].text.contains("live guidance changed"));
+        assert!(requests[2].system[0].text.contains("exact queued guidance"));
+        assert!(!requests[2].system[0].text.contains("live guidance changed"));
+        let messages = storage.get_all_messages(conv_id);
+        let activation_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    &message.content,
+                    MessageContent::System(system)
+                        if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+                )
+            })
+            .expect("activation timeline message");
+        let second_user_index = messages
+            .iter()
+            .position(|message| message.message_id == "user-msg-2")
+            .expect("second user message");
+        assert!(activation_index < second_user_index);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    &message.content,
+                    MessageContent::System(system)
+                        if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+                ))
+                .count(),
+            1,
+            "the mid-turn tool-loop request must not activate the queue"
+        );
         assert_eq!(
             requests[0].cache_key.as_str(),
             requests[1].cache_key.as_str()
@@ -9430,6 +9743,7 @@ mod steer_drain_detector_tests {
             message_id: id.to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         }
     }
 
@@ -9492,6 +9806,168 @@ mod steer_drain_detector_tests {
         (rt, storage)
     }
 
+    fn user_message(id: &str) -> Event {
+        Event::UserMessage {
+            text: "hello".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: id.to_string(),
+            user_agent: None,
+            skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn user_turn_without_queued_instructions_does_not_consume_sequence() {
+        let (mut rt, _) =
+            build_runtime_with_state_and_queue("conv-no-queue", ConvState::Idle, vec![]);
+        let mut events = rt.broadcast_tx.subscribe();
+
+        rt.process_event(user_message("m1")).await.unwrap();
+
+        let emitted_count = std::iter::from_fn(|| events.try_recv().ok()).count();
+        assert_eq!(emitted_count, 3);
+        assert_eq!(rt.broadcast_tx.current_seq(), 3);
+        assert_eq!(
+            rt.broadcast_tx.next_seq(),
+            4,
+            "activation preflight must not leave an unused sequence between user-message effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_user_turn_without_queued_instructions_resets_parent_tool_cycles() {
+        let (mut rt, _) =
+            build_runtime_with_state_and_queue("conv-cycle-reset", ConvState::Idle, vec![]);
+        rt.parent_tool_cycle_count = 7;
+        rt.parent_tool_cycle_cap = 0; // isolate boundary reset from request dispatch increment
+
+        rt.process_event(user_message("m1")).await.unwrap();
+
+        assert_eq!(rt.parent_tool_cycle_count, 0);
+    }
+
+    #[tokio::test]
+    async fn activation_db_error_fills_reserved_sequence() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-activation-error", ConvState::Idle, vec![]);
+        let queued_id = storage.queue_project_instruction_bundle(
+            "conv-activation-error",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        storage.set_fail_project_instruction_activation(true);
+        rt.parent_tool_cycle_count = 7;
+        let mut event = user_message("activation-error");
+        if let Event::UserMessage {
+            expected_queued_project_instruction_bundle_id,
+            ..
+        } = &mut event
+        {
+            *expected_queued_project_instruction_bundle_id = Some(queued_id.into());
+        }
+        let mut events = rt.broadcast_tx.subscribe();
+
+        assert!(rt.process_event(event).await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Error { sequence_id: 1, .. })
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
+        assert!(storage.get_all_messages("conv-activation-error").is_empty());
+        assert_eq!(rt.parent_tool_cycle_count, 7);
+    }
+
+    #[tokio::test]
+    async fn changed_queue_rejects_bound_turn_and_fills_reserved_sequence() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-queue-cas", ConvState::Idle, vec![]);
+        let queued_a = storage.queue_project_instruction_bundle(
+            "conv-queue-cas",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        let mut event = user_message("bound-to-a");
+        if let Event::UserMessage {
+            expected_queued_project_instruction_bundle_id,
+            ..
+        } = &mut event
+        {
+            *expected_queued_project_instruction_bundle_id = Some(queued_a.into());
+        }
+        let queued_b = storage.queue_project_instruction_bundle(
+            "conv-queue-cas",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 2,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        let mut events = rt.broadcast_tx.subscribe();
+
+        assert!(rt.process_event(event).await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Error { sequence_id: 1, .. })
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
+        assert_eq!(
+            storage
+                .load_queued_project_instruction_bundle("conv-queue-cas")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            queued_b
+        );
+        assert!(storage.get_all_messages("conv-queue-cas").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_user_message_does_not_activate_queued_instructions() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-rejected-boundary",
+            ConvState::ContextExhausted {
+                summary: "full".to_string(),
+            },
+            vec![],
+        );
+        storage.queue_project_instruction_bundle(
+            "conv-rejected-boundary",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+
+        rt.parent_tool_cycle_count = 7;
+        assert!(rt.process_event(user_message("rejected")).await.is_err());
+
+        assert!(storage
+            .load_queued_project_instruction_bundle("conv-rejected-boundary")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .load_active_project_instruction_bundle("conv-rejected-boundary")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_all_messages("conv-rejected-boundary")
+            .is_empty());
+        assert_eq!(rt.parent_tool_cycle_count, 7);
+    }
+
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
     fn extract_steer_drain_entries(events: &[Event]) -> Vec<Vec<SteerEntry>> {
         events
@@ -9523,15 +9999,34 @@ mod steer_drain_detector_tests {
             ConvState::LlmRequesting { attempt: 1 },
             queue,
         );
+        let queued_id = storage.queue_project_instruction_bundle(
+            "conv-drain-idle",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
 
         let result = TransitionResult::new(ConvState::Idle);
+        for entry in &mut rt.steering_queue {
+            entry.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        }
         rt.apply_transition_result(result)
             .await
             .expect("apply_transition_result must succeed");
 
         // Persists ran inline → messages now in storage in FIFO order.
         let msgs = storage.get_all_messages("conv-drain-idle");
-        let persisted_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert!(matches!(
+            &msgs[0].content,
+            MessageContent::System(system)
+                if system.text == crate::db::Database::PROJECT_INSTRUCTIONS_ACTIVATED_MARKER
+        ));
+        let persisted_ids: Vec<&str> = msgs[1..]
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
         assert_eq!(persisted_ids, vec!["s1", "s2", "s3"]);
 
         assert!(
@@ -9541,6 +10036,126 @@ mod steer_drain_detector_tests {
         // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
         // SteerDrainedUserMessages arm).
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn failed_idle_activation_restores_drained_entries_before_concurrent_append() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-restore-drain",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![mk_entry("old-1", "first"), mk_entry("old-2", "second")],
+        );
+        let queued_id = storage.queue_project_instruction_bundle(
+            "conv-restore-drain",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        for entry in &mut rt.steering_queue {
+            entry.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        }
+
+        let old_state = rt.state.clone();
+        rt.state = ConvState::Idle;
+        let drain = rt
+            .maybe_drain_steering_queue(&old_state, false)
+            .expect("initial drain");
+        let mut appended = mk_entry("new-3", "third");
+        appended.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        rt.steering_queue.push(appended);
+        storage.set_fail_project_instruction_activation(true);
+
+        assert!(rt
+            .run_effects_with_inline_drain(vec![], drain, &mut vec![])
+            .await
+            .is_err());
+        assert_eq!(
+            rt.steering_queue
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "new-3"]
+        );
+        assert!(storage.get_all_messages("conv-restore-drain").is_empty());
+
+        storage.set_fail_project_instruction_activation(false);
+        rt.state = ConvState::Idle;
+        let retry = rt
+            .maybe_drain_steering_queue(&ConvState::LlmRequesting { attempt: 1 }, false)
+            .expect("retry drain");
+        rt.run_effects_with_inline_drain(vec![], retry, &mut vec![])
+            .await
+            .unwrap();
+
+        let ids = storage
+            .get_all_messages("conv-restore-drain")
+            .into_iter()
+            .filter_map(|message| {
+                matches!(message.content, MessageContent::User(_)).then_some(message.message_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["old-1", "old-2", "new-3"]);
+    }
+
+    #[tokio::test]
+    async fn idle_drain_rerenders_slash_skill_from_activated_queue() {
+        use phoenix_core::domain::project_instruction_bundle::{
+            NewProjectInstructionBundle, ProjectSkillSnapshot,
+        };
+        let skill_bundle = |body: &str| NewProjectInstructionBundle {
+            estimated_tokens: 1,
+            guidance: vec![],
+            skills: vec![ProjectSkillSnapshot {
+                name: "new-skill".to_string(),
+                description: "test".to_string(),
+                argument_hint: None,
+                source_label: ".agents/skills".to_string(),
+                body: body.to_string(),
+                base_dir: "/tmp/.agents/skills/new-skill".to_string(),
+                source_path: "/tmp/.agents/skills/new-skill/SKILL.md".to_string(),
+                content_hash: body.to_string(),
+            }],
+        };
+        // Enqueued while the old active snapshot did not know this skill, so
+        // enqueue-time expansion deliberately captured no invocation.
+        let entry = mk_entry("slash-steer", "  /new-skill argument");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-slash-idle-drain",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![entry],
+        );
+        storage
+            .initialize_project_instruction_bundle_if_absent(
+                "conv-slash-idle-drain",
+                &NewProjectInstructionBundle {
+                    estimated_tokens: 0,
+                    guidance: vec![],
+                    skills: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let queued_id = storage
+            .queue_project_instruction_bundle("conv-slash-idle-drain", skill_bundle("queued body"));
+        rt.steering_queue[0].expected_queued_project_instruction_bundle_id = Some(queued_id.into());
+
+        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
+            .await
+            .unwrap();
+
+        let skill = storage
+            .get_all_messages("conv-slash-idle-drain")
+            .into_iter()
+            .find_map(|message| match message.content {
+                MessageContent::Skill(skill) => Some(skill),
+                _ => None,
+            })
+            .expect("drained skill message");
+        assert!(skill.body.contains("queued body"));
+        assert!(skill.body.contains("argument"));
+        assert_eq!(skill.name, "new-skill");
     }
 
     /// Task 60004: entering Idle with a non-empty steering queue must NOT
@@ -10514,7 +11129,7 @@ mod steer_drain_detector_tests {
         let mut saw_duration_update = false;
         loop {
             match rx.try_recv() {
-                Ok(SseEvent::Message { message }) => {
+                Ok(SseEvent::Message { message, .. }) => {
                     if message.message_id == "tool-duration-1-result" {
                         saw_tool_message = true;
                     }

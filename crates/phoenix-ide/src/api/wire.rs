@@ -265,6 +265,9 @@ pub enum SseWireEvent {
         /// `Message` type at the valibot boundary.
         #[ts(type = "unknown")]
         message: EnrichedMessage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        transcript_generation: Option<i64>,
     },
     /// In-place mutation of an existing message's mutable fields.
     MessageUpdated {
@@ -456,7 +459,10 @@ impl From<SseEvent> for SseWireEvent {
                 pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
                 pending_truncated,
             },
-            SseEvent::Message { message } => {
+            SseEvent::Message {
+                message,
+                transcript_generation,
+            } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —
                 // this is what the client already expects (see
                 // `ui/src/sseSchemas.ts` `SseMessageDataSchema`).
@@ -464,6 +470,7 @@ impl From<SseEvent> for SseWireEvent {
                 SseWireEvent::Message {
                     sequence_id,
                     message: EnrichedMessage::from(message),
+                    transcript_generation,
                 }
             }
             SseEvent::MessageUpdated {

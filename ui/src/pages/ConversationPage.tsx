@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ConflictError, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -330,6 +330,8 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const historyGenerationRef = useRef(0);
   const historyRequestTokenRef = useRef(0);
   const historyCommandTokenRef = useRef(0);
+  const systemPromptRequestTokenRef = useRef(0);
+  const systemPromptRequestKeyRef = useRef<string | null>(null);
   const historyViewRef = useRef({ conversationId: '', generation: 0, transcriptGeneration: 0 });
   const [historyExpansion, dispatchHistoryExpansion] = useReducer(
     reduceHistoryExpansion,
@@ -1062,14 +1064,43 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     };
   }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch, eventCursorRef]);
 
-  // Fetch system prompt once when conversationId is known
+  const projectInstructionsActivationMessageId = useMemo(() => {
+    for (let index = atom.messages.length - 1; index >= 0; index -= 1) {
+      const message = atom.messages[index];
+      const text = (message?.content as { text?: string } | undefined)?.text;
+      if (text?.startsWith('[project-instructions-activated]')) return message?.message_id ?? null;
+    }
+    return null;
+  }, [atom.messages]);
+
   useEffect(() => {
     if (!conversationId) return;
-    api
-      .getSystemPrompt(conversationId)
-      .then((sp) => dispatch({ type: 'set_system_prompt', systemPrompt: sp, expectedConversationId: conversationId }))
-      .catch((err) => console.warn('Failed to load system prompt:', err));
-  }, [conversationId, dispatch]);
+    const requestKey = `${conversationId}:${projectInstructionsActivationMessageId ?? 'initial'}:${confirmedLive ? 'live' : 'provisioning'}`;
+    if (systemPromptRequestKeyRef.current === requestKey) return;
+    systemPromptRequestKeyRef.current = requestKey;
+    const requestToken = ++systemPromptRequestTokenRef.current;
+    const expectedConversationId = conversationId;
+    const expectedActivationMessageId = projectInstructionsActivationMessageId;
+
+    api.getSystemPrompt(expectedConversationId)
+      .then((systemPrompt) => {
+        if (requestToken !== systemPromptRequestTokenRef.current) return;
+        if (atomRef.current.conversationId !== expectedConversationId) return;
+        const latestActivationMessageId = [...atomRef.current.messages].reverse().find((message) => {
+          const text = (message.content as { text?: string } | undefined)?.text;
+          return text?.startsWith('[project-instructions-activated]');
+        })?.message_id ?? null;
+        if (latestActivationMessageId !== expectedActivationMessageId) return;
+        dispatch({ type: 'set_system_prompt', systemPrompt, expectedConversationId });
+      })
+      .catch((err) => {
+        if (requestToken !== systemPromptRequestTokenRef.current) return;
+        if (err instanceof ConflictError && err.detail.error_type === 'conversation_provisioning') {
+          systemPromptRequestKeyRef.current = null;
+        }
+        console.warn('Failed to load system prompt:', err);
+      });
+  }, [confirmedLive, conversationId, dispatch, projectInstructionsActivationMessageId]);
 
   // availableModels is populated by the shared useModels() poller above.
 
@@ -1994,6 +2025,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
+        usesProjectInstructions={routePrefix !== '/global'}
         hasOlderMessages={historyExpansion.coverage === 'tail'}
         onLoadOlderMessages={loadOlderMessages}
         loadingOlderMessages={historyExpansion.activeRequest !== null}

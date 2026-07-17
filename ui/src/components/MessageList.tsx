@@ -61,6 +61,7 @@ import {
   type TailActivity,
 } from '../conversation/scrollMachine';
 import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion';
+import { ProjectInstructionsRefresh } from './ProjectInstructionsRefresh';
 import {
   initialTranscriptPositioningState,
   reduceTranscriptPositioning,
@@ -111,6 +112,7 @@ interface MessageListProps {
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   systemPrompt?: string | undefined;
+  usesProjectInstructions?: boolean | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
@@ -290,6 +292,10 @@ interface SystemPromptHeaderProps {
   expanded: boolean;
   onToggle: () => void;
   contentRef: React.RefObject<HTMLPreElement>;
+  conversationId: string | undefined;
+  conversationState: ConversationState;
+  projectInstructionsActivationMessageId: string | undefined;
+  usesProjectInstructions: boolean;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -297,15 +303,30 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   expanded,
   onToggle,
   contentRef,
+  conversationId,
+  conversationState,
+  projectInstructionsActivationMessageId,
+  usesProjectInstructions,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
       <div className={`system-prompt-block${expanded ? ' expanded' : ''}`}>
         <div className="system-prompt-header" onClick={onToggle}>
           <span className="system-prompt-label">System prompt</span>
-          <span className="system-prompt-toggle">
-            {expanded ? <ChevronDown /> : <ChevronRight />}
-            {expanded ? ' hide' : ' show'}
+          <span className="system-prompt-header-actions">
+            {conversationId && usesProjectInstructions && (
+              <span onClick={(event) => event.stopPropagation()}>
+                <ProjectInstructionsRefresh
+                  conversationId={conversationId}
+                  conversationState={conversationState}
+                  activationMessageId={projectInstructionsActivationMessageId}
+                />
+              </span>
+            )}
+            <span className="system-prompt-toggle">
+              {expanded ? <ChevronDown /> : <ChevronRight />}
+              {expanded ? ' hide' : ' show'}
+            </span>
           </span>
         </div>
         {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
@@ -338,6 +359,7 @@ function MessageListImpl({
   onOpenFile,
   onOpenCommissionReview,
   systemPrompt,
+  usesProjectInstructions = true,
   conversationId,
   slug,
   filePathRootDir,
@@ -412,6 +434,14 @@ function MessageListImpl({
     () => [...historicalUnits, ...tailUnits],
     [historicalUnits, tailUnits],
   );
+  const projectInstructionsActivationMessageId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      const text = (message?.content as { text?: string } | undefined)?.text;
+      if (text?.startsWith('[project-instructions-activated]')) return message?.message_id;
+    }
+    return undefined;
+  }, [messages]);
 
   const latestAgentKey = useMemo(() => {
     for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
@@ -1125,6 +1155,10 @@ function MessageListImpl({
               expanded={systemPromptExpanded}
               onToggle={toggleSystemPrompt}
               contentRef={systemPromptRef}
+              conversationId={conversationId}
+              conversationState={convState}
+              projectInstructionsActivationMessageId={projectInstructionsActivationMessageId}
+              usesProjectInstructions={usesProjectInstructions}
             />
           ) : null}
           empty={<EmptyTranscriptState />}

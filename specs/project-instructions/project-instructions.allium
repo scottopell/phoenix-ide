@@ -1,0 +1,234 @@
+-- allium: 3
+-- Project Instruction Snapshot Lifecycle
+--
+-- Scope: explicit refresh of conversation-scoped project guidance and skill metadata
+-- Excludes: path-scoped nested guidance discovered during file operations
+
+------------------------------------------------------------
+-- Values
+------------------------------------------------------------
+
+enum RefreshState {
+    current
+    changed
+    queued
+}
+
+enum ChangeKind {
+    added
+    changed
+    removed
+}
+
+enum SourceKind {
+    guidance
+    skill
+}
+
+value SourceChange {
+    kind: SourceKind
+    name: String
+    change: ChangeKind
+}
+
+value SkillSnapshot {
+    name: String
+    argument_hint: String?
+    body: String
+    base_dir: String
+    source_path: String
+}
+
+value InstructionSnapshot {
+    id: String
+    estimated_tokens: Integer
+    skills: List<SkillSnapshot>
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ProjectInstructions {
+    conversation_id: String
+    active: InstructionSnapshot
+    queued: InstructionSnapshot?
+    candidate: InstructionSnapshot?
+    refresh_state: RefreshState
+    manifest: List<SourceChange>
+    transcript_generation: Integer
+
+    invariant QueuedStateHasQueuedSnapshot {
+        refresh_state = queued implies queued != null
+    }
+
+    invariant CandidateContentsAreNotInManifest {
+        manifest.all(change => change.name != "")
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule InitializeProjectInstructions {
+    when: ConversationNeedsModelRequest(conversation_id)
+    requires: not exists instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id
+    ensures: ProjectInstructions.created(
+        conversation_id: conversation_id,
+        active: ResolveCurrentProjectInstructions(conversation_id),
+        queued: null,
+        candidate: null,
+        refresh_state: current,
+        manifest: {},
+        transcript_generation: CurrentTranscriptGeneration(conversation_id))
+}
+
+rule InheritProjectInstructionsBeforeSubAgentStarts {
+    when: SubAgentConversationCreated(parent_conversation_id, child_conversation_id)
+    for parent in ProjectInstructions
+        where parent.conversation_id = parent_conversation_id:
+        requires: not exists child in ProjectInstructions
+            where child.conversation_id = child_conversation_id
+        ensures: ProjectInstructions.created(
+            conversation_id: child_conversation_id,
+            active: CopyWithNewIdentity(parent.active),
+            queued: null,
+            candidate: null,
+            refresh_state: current,
+            manifest: {},
+            transcript_generation: CurrentTranscriptGeneration(child_conversation_id))
+        ensures: ChildRuntimeCannotStartBeforeInstructionsExist(child_conversation_id)
+        ensures: ProjectInstructionsNotDiscoveredForChild(child_conversation_id)
+}
+
+rule CommitCreationMetadataAndInitialInstructionsUnderClaim {
+    when: CreationWorkerCommitsMetadata(conversation_id, claim, finalized_working_directory)
+    requires: CreationClaimIsCurrent(claim)
+    ensures: CreationMetadataAndInstructionsCommittedAtomically(
+        conversation_id,
+        ResolveProjectInstructions(finalized_working_directory))
+}
+
+rule RejectInitialInstructionsFromStaleCreationClaim {
+    when: CreationWorkerCommitsMetadata(conversation_id, claim, _)
+    requires: not CreationClaimIsCurrent(claim)
+    ensures: CreationMetadataNotCommitted(conversation_id, claim)
+    ensures: ProjectInstructionsNotCreatedByClaim(conversation_id, claim)
+}
+
+rule ObserveStatusWithoutReplacingCandidate {
+    when: ProjectInstructionStatusRequested(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        let candidate = instructions.candidate
+        ensures: instructions.candidate = candidate
+        ensures: CurrentSourceManifestShown(conversation_id)
+}
+
+rule PreviewChangedInstructionsFromActive {
+    when: UserRequestsInstructionRefresh(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued = null
+        ensures: instructions.candidate = ResolveCurrentProjectInstructions(conversation_id)
+        ensures: instructions.manifest = SourceManifest(instructions.active, instructions.candidate)
+        ensures: instructions.refresh_state = changed
+        ensures: RefreshPreviewShown(instructions.candidate.id, instructions.manifest, instructions.candidate.estimated_tokens, true)
+}
+
+rule PreviewNewerInstructionsFromQueue {
+    when: UserRequestsInstructionRefresh(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued != null
+        ensures: instructions.candidate = ResolveCurrentProjectInstructions(conversation_id)
+        ensures: instructions.manifest = SourceManifest(instructions.queued, instructions.candidate)
+        ensures: RefreshPreviewShown(instructions.candidate.id, instructions.manifest, instructions.candidate.estimated_tokens, true)
+}
+
+rule ConfirmExactCandidate {
+    when: UserConfirmsInstructionRefresh(conversation_id, candidate_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.candidate != null
+        requires: instructions.candidate.id = candidate_id
+        ensures: instructions.queued = instructions.candidate
+        ensures: instructions.candidate = null
+        ensures: instructions.refresh_state = queued
+}
+
+rule RejectStaleConfirmation {
+    when: UserConfirmsInstructionRefresh(conversation_id, candidate_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.candidate = null or instructions.candidate.id != candidate_id
+        ensures: StaleCandidateReported(conversation_id)
+}
+
+rule PreserveQueueWhenSourcesChangeAgain {
+    when: ProjectInstructionSourcesChange(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued != null
+        ensures: NewerInstructionsAvailable(conversation_id)
+}
+
+rule ActivateBeforeNextUserTurn {
+    when: UserAuthoredTurnStarting(conversation_id, expected_queued_snapshot_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued != null
+        let queued = instructions.queued
+        requires: instructions.queued.id = expected_queued_snapshot_id
+        let generation = instructions.transcript_generation
+        ensures: instructions.active = queued
+        ensures: instructions.queued = null
+        ensures: instructions.refresh_state = current
+        ensures: instructions.transcript_generation = generation + 1
+        ensures: InstructionRefreshTimelineEventEmitted(conversation_id)
+        ensures: ProviderContinuationInvalidated(conversation_id)
+        ensures: DurableContentFreeSystemTimelineEventPersisted(conversation_id)
+        ensures: TimelineEventExcludedFromModelContext(conversation_id)
+}
+
+rule RejectTurnWhenExpectedQueueChanged {
+    when: UserAuthoredTurnStarting(conversation_id, expected_queued_snapshot_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued = null or instructions.queued.id != expected_queued_snapshot_id
+        ensures: UserAuthoredTurnRejected(conversation_id)
+        ensures: SequencedResynchronizationErrorEmitted(conversation_id)
+        ensures: NoSseSequenceGap(conversation_id)
+}
+
+rule KeepActiveSnapshotThroughToolLoop {
+    -- Mid-turn steering drains continue the existing turn and do not trigger
+    -- ActivateBeforeNextUserTurn; idle-entry drains do trigger that rule first.
+    when: ToolLoopContinues(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        let active = instructions.active
+        ensures: instructions.active = active
+        ensures: ModelRequestUses(conversation_id, active)
+}
+
+rule InvokeSkillFromActiveSnapshot {
+    when: SkillInvocationRequested(conversation_id, skill_name, arguments)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        let active = instructions.active
+        requires: active.skills.any(skill => skill.name = skill_name)
+        ensures: SkillInvocationRenderedFromCapturedBodyAndBaseDirectory(active, skill_name, arguments)
+        ensures: SkillMdNotRediscoveredOrRead(conversation_id, skill_name)
+}
+
+rule RuntimeAuthorityRemainsLive {
+    when: RuntimeAuthorityChanges(conversation_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        let active = instructions.active
+        ensures: instructions.active = active
+        ensures: NextModelRequestUsesCurrentRuntimeAuthority(conversation_id)
+}
