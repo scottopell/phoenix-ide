@@ -1928,9 +1928,21 @@ export function TerminalToolResultHighlight({
   fragmentId: string;
   activeHighlight: AgentTextHighlight;
 }) {
+  const maxLength = 5_000;
+  const windowStart = semanticText.length > maxLength
+    ? Math.max(0, Math.min(activeHighlight.start - Math.floor(maxLength / 2), semanticText.length - maxLength))
+    : 0;
+  const visibleText = semanticText.slice(windowStart, windowStart + maxLength);
+  const visibleHighlight = {
+    ...activeHighlight,
+    start: activeHighlight.start - windowStart,
+    end: activeHighlight.end - windowStart,
+  };
   return (
     <pre className="tool-block-output-content" data-fragment-id={fragmentId}>
-      {renderHighlightedText(semanticText, activeHighlight.start, activeHighlight.end)}
+      {windowStart > 0 ? '…\n' : ''}
+      {renderHighlightedText(visibleText, visibleHighlight.start, visibleHighlight.end)}
+      {windowStart + visibleText.length < semanticText.length ? '\n…' : ''}
     </pre>
   );
 }

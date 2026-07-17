@@ -8,11 +8,17 @@ import { oneDark, oneLight } from '../../utils/syntaxHighlighter';
 import { AnnotatableBlock } from './AnnotatableBlock';
 import type { ViewerBodyProps } from './AnnotatableBlock';
 import { MermaidDiagram } from '../MermaidDiagram';
-import { buildFileSearchProjection, buildMarkdownFileSearchText } from '../viewer-find';
+import { buildMarkdownFileSearchProjection } from '../viewer-find';
 
 // Stable plugin reference — a fresh array each render defeats ReactMarkdown's
 // internal memoization and forces a full re-parse.
 const REMARK_PLUGINS = [remarkGfm];
+
+function markdownChildText(node: React.ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (!isValidElement<{ children?: React.ReactNode }>(node)) return '';
+  return Children.toArray(node.props.children).map(markdownChildText).join('');
+}
 
 function decorateMarkdownFindChildren(
   children: React.ReactNode,
@@ -68,15 +74,16 @@ export function MarkdownViewerBody({
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   const findProjection = useMemo(
-    () => findQuery ? buildFileSearchProjection(buildMarkdownFileSearchText(content), findQuery) : { sources: [], matches: [] },
+    () => findQuery ? buildMarkdownFileSearchProjection(content, findQuery) : { sources: [], matches: [] },
     [content, findQuery],
   );
-  const matchesByLine = useMemo(() => {
-    const matches = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+  const matchesByLineAndText = useMemo(() => {
+    const matches = new Map<string, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
-      const lineMatches = matches.get(match.target.lineNumber) ?? [];
-      lineMatches.push({ start: match.start, end: match.end, occurrenceIndex });
-      matches.set(match.target.lineNumber, lineMatches);
+      const key = `${match.target.lineNumber}:${match.sourceText}`;
+      const blockMatches = matches.get(key) ?? [];
+      blockMatches.push({ start: match.start, end: match.end, occurrenceIndex });
+      matches.set(key, blockMatches);
     });
     return matches;
   }, [findProjection.matches]);
@@ -86,12 +93,17 @@ export function MarkdownViewerBody({
   // every block element and every fenced-code highlight to re-render.
   const components = useMemo(() => {
     const rawLines = content.split('\n');
+
     const annotatable = (Tag: React.ElementType) =>
       ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number }; end?: { line?: number } } }; [key: string]: unknown }) => {
         const ln = node?.position?.start?.line ?? 0;
         const startLine = (node?.position?.start?.line ?? 1) - 1;
         const endLine = (node?.position?.end?.line ?? startLine + 1) - 1;
         const rawLineContent = rawLines.slice(startLine, endLine + 1).join(' ').slice(0, 200);
+        const renderedText = Children.toArray(children).map(markdownChildText).join('').trim();
+        const exactMatches = matchesByLineAndText.get(`${ln}:${renderedText}`);
+        const blockMatches = exactMatches ?? [...matchesByLineAndText]
+          .find(([key]) => key.startsWith(`${ln}:`) && renderedText.includes(key.slice(key.indexOf(':') + 1)))?.[1] ?? [];
         return (
           <AnnotatableBlock
             as={Tag}
@@ -104,8 +116,8 @@ export function MarkdownViewerBody({
             lineRef={(el) => registerLineRef(ln, el)}
             {...props}
           >
-            {matchesByLine.has(ln)
-              ? decorateMarkdownFindChildren(children, matchesByLine.get(ln) ?? [], activeFindOccurrence ?? -1)
+            {blockMatches.length > 0
+              ? decorateMarkdownFindChildren(children, blockMatches, activeFindOccurrence ?? -1)
               : children}
           </AnnotatableBlock>
         );
@@ -134,7 +146,7 @@ export function MarkdownViewerBody({
         );
       },
     } as unknown as Components;
-  }, [activeFindOccurrence, content, highlightedLine, matchesByLine, modifiedLines, onAnnotate, registerLineRef, syntaxStyle]);
+  }, [activeFindOccurrence, content, highlightedLine, matchesByLineAndText, modifiedLines, onAnnotate, registerLineRef, syntaxStyle]);
 
   return (
     <div className="viewer-markdown">

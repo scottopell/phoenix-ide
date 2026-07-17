@@ -21,7 +21,7 @@ import {
   FindBar,
   activeSessionMatchIndex,
   buildFileSearchProjection,
-  buildMarkdownFileSearchText,
+  buildMarkdownFileSearchProjection,
   createSurfaceKey,
   projectionMatchesToSessionMatches,
   useFindSession,
@@ -253,11 +253,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
   const findEligible = (textLike && !htmlPreview) || largeFallback;
-  const renderedMarkdownFindText = useMemo(
-    () => renderedMarkdown ? buildMarkdownFileSearchText(content) : '',
-    [content, renderedMarkdown],
-  );
-  const findSourceText = findEligible ? (renderedMarkdown ? renderedMarkdownFindText : content) : '';
+  const findSourceText = findEligible ? content : '';
   const restoreFindFocus = useCallback((focusOrigin: HTMLElement | null) => {
     queueMicrotask(() => (focusOrigin ?? findButtonRef.current)?.focus());
   }, []);
@@ -301,8 +297,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const findQuery = findSession?.query ?? '';
   const shouldProjectFind = findEligible && findQuery.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
-    () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, findQuery) : { sources: [], matches: [] }),
-    [findQuery, findSourceText, shouldProjectFind],
+    () => (shouldProjectFind
+      ? renderedMarkdown
+        ? buildMarkdownFileSearchProjection(content, findQuery)
+        : buildFileSearchProjection(findSourceText, findQuery)
+      : { sources: [], matches: [] }),
+    [content, findQuery, findSourceText, renderedMarkdown, shouldProjectFind],
   );
   const sessionMatches = useMemo(
     () => projectionMatchesToSessionMatches(findProjection.matches, stableFileMatchId(findProjection.sources)),
@@ -614,7 +614,6 @@ function stableFileMatchId(
     const leftContext = match.sourceText.slice(Math.max(0, match.start - 32), match.start);
     const rightContext = match.sourceText.slice(match.end, Math.min(match.sourceText.length, match.end + 32));
     const semanticSignature = [
-      match.target.lineNumber,
       `${match.start}:${match.end}`,
       boundedFileMatchHash(match.sourceText),
       boundedFileMatchHash(previous),

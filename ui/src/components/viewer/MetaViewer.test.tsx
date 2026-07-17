@@ -503,6 +503,16 @@ describe('MetaViewer payload routing', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
     expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('alpha');
+    expect(document.querySelector('[data-line="3"] .viewer-find-match--active')).toHaveTextContent('alpha');
+  });
+
+  it('marks a match in a later table cell with block-local offsets', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '| first | second target |\n| --- | --- |' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'target' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('target');
   });
 
   it('keeps source-style Markdown fallbacks searchable', () => {

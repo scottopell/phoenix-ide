@@ -2,7 +2,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, UserMessage } from './MessageComponents';
+import { SubAgentStatus, AgentMessage, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -1275,6 +1275,23 @@ describe('agent Markdown find activation', () => {
 
     expect(container.querySelector('[data-fragment-id="agent-text-0"]')).toHaveTextContent('const target = 1;');
     expect(container.querySelector('[data-fragment-id="agent-text-0"]')).not.toHaveTextContent('[object Object]');
+  });
+});
+
+describe('TerminalToolResultHighlight', () => {
+  it('caps large active output around the match', () => {
+    const semanticText = `${'a'.repeat(8_000)}needle${'b'.repeat(8_000)}`;
+    const start = semanticText.indexOf('needle');
+    const { container } = render(
+      <TerminalToolResultHighlight
+        semanticText={semanticText}
+        fragmentId="terminal-result"
+        activeHighlight={{ fragmentId: 'terminal-result', start, end: start + 6 }}
+      />,
+    );
+
+    expect(container.querySelector('pre')?.textContent?.length).toBeLessThan(5_100);
+    expect(container.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('needle');
   });
 });
 
