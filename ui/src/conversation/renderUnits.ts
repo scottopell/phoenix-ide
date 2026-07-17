@@ -97,6 +97,7 @@ export interface TailBuildInputs {
   convState: ConversationState;
   streamingHandle: StreamingHandle | null;
   endsInAgentRun: boolean;
+  finalizedAgentKeys?: ReadonlySet<string>;
 }
 
 /** Singleton key for the sub-agent status tail unit. React reconciler
@@ -238,7 +239,7 @@ export function buildHistoricalUnits(
 }
 
 export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {
-  const { convState, streamingHandle, endsInAgentRun } = inputs;
+  const { convState, streamingHandle, endsInAgentRun, finalizedAgentKeys } = inputs;
 
   const tailUnits: TailUnit[] = [];
 
@@ -250,7 +251,7 @@ export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {
     });
   }
 
-  if (streamingHandle !== null) {
+  if (streamingHandle !== null && !finalizedAgentKeys?.has(streamingHandle.key)) {
     // First in turn when no finalized agent message has appeared yet this run:
     // the live stream then renders the same `message-header` the finalized first
     // message will, so the header row doesn't pop in on finalize. A continuation
@@ -260,6 +261,11 @@ export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {
       kind: 'streaming_agent',
       key: streamingHandle.key,
       isFirstInTurn: !endsInAgentRun,
+    });
+  } else if (streamingHandle !== null) {
+    debug('suppressed finalized streaming unit', {
+      key: streamingHandle.key,
+      reason: 'historical_key_owns_identity',
     });
   }
 
@@ -272,6 +278,11 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     convState: inputs.convState,
     streamingHandle: inputs.streamingHandle,
     endsInAgentRun,
+    finalizedAgentKeys: new Set(
+      historicalUnits
+        .filter((unit) => unit.kind === 'agent_turn')
+        .map((unit) => unit.key),
+    ),
   });
   return { historicalUnits, tailUnits };
 }

@@ -395,8 +395,17 @@ function MessageListImpl({
     [messages, pendingMessages],
   );
   const tailUnits = useMemo(
-    () => buildTailUnits({ convState, streamingHandle, endsInAgentRun }),
-    [convState, streamingHandle, endsInAgentRun],
+    () => buildTailUnits({
+      convState,
+      streamingHandle,
+      endsInAgentRun,
+      finalizedAgentKeys: new Set(
+        historicalUnits
+          .filter((unit) => unit.kind === 'agent_turn')
+          .map((unit) => unit.key),
+      ),
+    }),
+    [convState, streamingHandle, endsInAgentRun, historicalUnits],
   );
 
   const allUnits = useMemo<RenderUnit[]>(

@@ -58,9 +58,9 @@ value ConvState {
 }
 
 -- The streaming buffer's identity-stable handle. The transform reads
--- only its existence (via isStreaming) and a stable key derived from
--- buffer.startedAt. Per-token text mutates the buffer behind a
--- subscription; the transform does not see token deltas.
+-- only its existence (via isStreaming) and the request identity shared
+-- with the finalized assistant message. Per-token text mutates the
+-- buffer behind a subscription; the transform does not see token deltas.
 value StreamingHandle {
     key: String
 }
@@ -469,8 +469,25 @@ rule AppendStreamingTailUnit {
     requires: b.phase = "tail_assembly"
     requires: b.is_streaming = true
     requires: b.streaming_handle != null
+    requires: not b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
 
     ensures: b.tail = append(b.tail, streaming_unit(b.streaming_handle))
+    ensures: b.phase = "tail_assembly"
+}
+
+-- A finalized assistant unit and its streaming predecessor share one
+-- identity. If independently subscribed inputs briefly expose both forms,
+-- the finalized historical unit owns that identity and no second physical
+-- unit is emitted.
+rule SkipStreamingWhenFinalized {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+    requires: b.is_streaming = true
+    requires: b.streaming_handle != null
+    requires: b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
+
+    ensures: b.tail = b.tail
     ensures: b.phase = "tail_assembly"
 }
 
@@ -592,57 +609,29 @@ invariant EveryHistoricalUnitHasSource {
             b.phase = "done" implies historical_unit_has_source(b, u)
 }
 
--- Unit keys are unique across the historical list. React's reconciler
--- depends on this for stable in-place updates — particularly for the
--- pending → sent transition (a pending_user unit and the user unit
--- that replaces it share a key, but only one of the two appears in
--- b.historical at a time).
-invariant HistoricalUnitKeysAreUnique {
+-- Unit keys are unique across the complete physical list. Pending and
+-- acknowledged user forms, and streaming and finalized assistant forms,
+-- share an identity across transitions but never coexist as two units.
+invariant RenderUnitKeysAreUnique {
     for b in Builders:
         for u in b.historical:
             for v in b.historical:
                 b.phase = "done" and u != v implies u.key != v.key
+        and for u in b.tail:
+            for v in b.tail:
+                b.phase = "done" and u != v implies u.key != v.key
+        and for u in b.historical:
+            for v in b.tail:
+                b.phase = "done" implies u.key != v.key
 }
 
--- The streaming tail unit's key is identity-stable across token
--- arrivals (the StreamingHandle.key is derived from buffer.startedAt,
--- not from per-token state). This is the React identity guarantee
--- that preserves the StreamingMessage leaf component state during
--- streaming.
---
--- Mechanism: the handle's key is computed once when the streaming
--- buffer starts (sse_token → SseTokenAccumulated transitions buffer
--- from null to non-null with a fresh startedAt). Subsequent token
--- arrivals advance buffer.text and buffer.lastSequence but leave
--- startedAt fixed. The key derived from startedAt is therefore stable
--- for the lifetime of the streaming session.
+-- The streaming tail unit's request key is identity-stable across token
+-- arrivals. This is the React identity guarantee that preserves the
+-- StreamingMessage leaf component state during streaming and lets the
+-- finalized assistant replace it in place.
 invariant StreamingKeyStableDuringStream {
     for b in Builders:
         b.phase = "done"
         and b.is_streaming = true
         implies b.streaming_handle.key = streaming_key_from_buffer(b)
 }
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
--- Q1. Tool result with no tool_use_id: SkipOrphanTool covers the
---     "no preceding agent" case, and EmitAgentTurnUnit's @guidance
---     covers the "agent present but tool_use_id missing" case via
---     debug_log + skip-from-map. Both are silent drops with logging.
---     The design.md flags this as worth confirming. If a stricter
---     contract is wanted ("every tool result must pair"), this spec
---     would gain a rule that aborts the transform on missing pairing,
---     surfacing a UIError instead of a silent drop.
---
--- Q2. System message in the middle of an agent run: this spec treats
---     system as run-preserving (does not flip b.in_agent_run). This
---     matches today's behavior. If a future product decision is that
---     a system note should start a new turn for header purposes,
---     EmitSystemUnitWithText would flip in_agent_run = false; the
---     FirstInTurnReflectsPriorRun invariant captures the immediate
---     predecessor only and would need extension.
---
--- Q3. Continuation and error message_type: today's code treats these
---     as unknown (skipped via SkipUnknownType). If they need rendering,
---     a new HistoricalKind variant + emission rule lands here.

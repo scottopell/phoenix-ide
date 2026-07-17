@@ -79,6 +79,7 @@ interface PhysicalStore<T> {
   viewportExtent: number;
   overscan: number;
   activeAnchor: VirtualTranscriptAnchor | null;
+  duplicateKeySignature: string;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
   rowElements: Map<string, HTMLDivElement>;
@@ -146,11 +147,39 @@ function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number)
   return snapshot.targetIndex === index ? snapshot.targetOffset ?? null : null;
 }
 
-function resolveKeys<T>(
+interface ResolvedPhysicalKeys {
+  keys: string[];
+  duplicateKeys: string[];
+}
+
+function resolvePhysicalKeys<T>(
   items: readonly T[],
   getKey: (item: T, index: number) => string,
-): string[] {
-  return items.map((item, index) => getKey(item, index));
+): ResolvedPhysicalKeys {
+  const occurrences = new Map<string, number>();
+  const duplicateKeys = new Set<string>();
+  const keys = items.map((item, index) => {
+    const semanticKey = getKey(item, index);
+    const occurrence = occurrences.get(semanticKey) ?? 0;
+    occurrences.set(semanticKey, occurrence + 1);
+    if (occurrence === 0) return semanticKey;
+    duplicateKeys.add(semanticKey);
+    return `${semanticKey}\u0000duplicate:${occurrence}`;
+  });
+  return { keys, duplicateKeys: [...duplicateKeys] };
+}
+
+function reportDuplicateKeys<T>(
+  store: PhysicalStore<T>,
+  duplicateKeys: readonly string[],
+): void {
+  const signature = duplicateKeys.join('\u0000');
+  if (signature === store.duplicateKeySignature) return;
+  store.duplicateKeySignature = signature;
+  if (duplicateKeys.length === 0) return;
+  console.error('[VirtualTranscript] duplicate semantic keys quarantined', {
+    duplicateKeys,
+  });
 }
 
 function estimatedExtentForKey<T>(store: PhysicalStore<T>) {
@@ -334,7 +363,8 @@ function unobserveElement<T>(store: PhysicalStore<T>, element: Element | null): 
 }
 
 function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
-  const keys = resolveKeys(props.items, props.getKey);
+  const resolvedKeys = resolvePhysicalKeys(props.items, props.getKey);
+  const keys = resolvedKeys.keys;
   const store: PhysicalStore<T> = {
     items: props.items,
     keys,
@@ -348,6 +378,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     viewportExtent: 0,
     overscan: clampNonNegative(props.overscan ?? 0),
     activeAnchor: null,
+    duplicateKeySignature: '',
     scroller: null,
     headerElement: null,
     rowElements: new Map(),
@@ -357,6 +388,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     revision: 0,
   };
   recompute(store);
+  reportDuplicateKeys(store, resolvedKeys.duplicateKeys);
   return store;
 }
 
@@ -396,7 +428,9 @@ function VirtualTranscriptInner<T>(
     const wasPinned = store.pinned;
     store.items = items;
     store.getKey = getKey;
-    store.keys = resolveKeys(items, getKey);
+    const resolvedKeys = resolvePhysicalKeys(items, getKey);
+    reportDuplicateKeys(store, resolvedKeys.duplicateKeys);
+    store.keys = resolvedKeys.keys;
     store.estimatedExtent = estimatedExtent;
     store.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(store.keys);
@@ -485,7 +519,9 @@ function VirtualTranscriptInner<T>(
     const wasPinned = current.pinned;
     current.items = items;
     current.getKey = getKey;
-    current.keys = resolveKeys(items, getKey);
+    const resolvedKeys = resolvePhysicalKeys(items, getKey);
+    reportDuplicateKeys(current, resolvedKeys.duplicateKeys);
+    current.keys = resolvedKeys.keys;
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(current.keys);
@@ -626,7 +662,7 @@ function VirtualTranscriptInner<T>(
             <div className="virtual-transcript__spacer" style={{ height: topSpacer }} />
           {visibleItems.map((item, offset) => {
             const index = (range?.startIndex ?? 0) + offset;
-            const key = getKey(item, index);
+            const key = store.keys[index]!;
             return (
               <div
                 key={key}

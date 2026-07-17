@@ -141,6 +141,52 @@ describe('VirtualTranscript', () => {
     expect(getComputedStyle(scroller as Element).overflowAnchor).toBe('none');
   });
 
+  it('quarantines duplicate semantic keys into independent physical rows', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    const items = [
+      { id: 'same', label: 'Item first', height: 20 },
+      { id: 'same', label: 'Item second', height: 60 },
+      { id: 'same', label: 'Item third', height: 30 },
+      ...makeItems(10, 20),
+    ];
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={items}
+        getKey={(item) => item.id}
+        estimatedExtent={(item) => item.height}
+        overscan={200}
+        initialTail={false}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    const duplicateRows = Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-index]')).slice(0, 3);
+    const physicalKeys = duplicateRows.map((row) => row.dataset['virtualKey']);
+    expect(new Set(physicalKeys).size).toBe(3);
+    expect(physicalKeys[0]).toBe('same');
+    expect(physicalKeys[1]).toContain('duplicate:1');
+    expect(physicalKeys[2]).toContain('duplicate:2');
+    expect(error).toHaveBeenCalledWith(
+      '[VirtualTranscript] duplicate semantic keys quarantined',
+      { duplicateKeys: ['same'] },
+    );
+
+    act(() => ref.current?.scrollToIndex(3, 'start'));
+    const anchoredTop = scrollTopOf(scroller);
+    act(() => resizeObservers[0]!.triggerEntries([
+      [duplicateRows[0]!, 25],
+      [duplicateRows[1]!, 70],
+      [duplicateRows[2]!, 35],
+    ]));
+    expect(scrollTopOf(scroller)).toBe((anchoredTop ?? 0) + 20);
+    expect(ref.current?.captureVisibleAnchor()?.key).toBe('item-0');
+  });
+
   it('initially tails and reports signed physical anchor offsets', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
