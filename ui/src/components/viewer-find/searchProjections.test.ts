@@ -476,7 +476,7 @@ describe('buildConversationSearchProjection', () => {
     expect(mermaidProjection.matches[0]?.target.sourceId).toContain('agent-text-0');
 
     const hiddenToolProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
-    expect(hiddenToolProjection.matches).toHaveLength(0);
+    expect(hiddenToolProjection.matches).toHaveLength(1);
 
     const thinkProjection = buildConversationSearchProjection(units, 'visible alpha result', { density: 'compact' });
     expect(thinkProjection.matches).toHaveLength(1);
@@ -548,6 +548,50 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('indexes visible inputs for completed tools with the same owned target', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'completed-tool-input',
+      isFirstInTurn: true,
+      agent: agentMsg('completed-tool-input', [
+        { type: 'tool_use', id: 'bash-complete', name: 'bash', input: { op: 'run', cmd: 'pnpm test --filter completed-alpha' } },
+      ]),
+      toolResultsByUseId: new Map([['bash-complete', toolMsg('bash-result', 'bash-complete', { result: 'done' })]]),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'completed-alpha', { density: 'full' });
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.sources.find((source) => source.fragmentId === 'tool-use-input')?.revealTarget).toEqual({
+      kind: 'tool-use-input',
+      toolUseId: 'bash-complete',
+      fragmentId: 'tool-use-input',
+    });
+  });
+
+  it('projects visible commission-review summaries instead of opaque result text', () => {
+    const displayData = {
+      kind: 'commission_review', status: 'success', review_status: 'completed', findings_status: 'available', findings_trust: 'high', retry_recommendation: 'do_not_retry',
+      stage_status: {}, finding_summary: { total: 1, critical: 0, high: 1, medium: 0, low: 0 }, warnings_summary: ['Review warning'],
+      summary: { target: { repo_root: '/repo', base: 'main', head: 'feature' }, files_changed: 2, files_reviewed: 1, insertions: 4, deletions: 1, elapsed_ms: 100, reviewer_summary: 'Summary visible' },
+      unreviewed: [{ file: 'src/unreviewed.ts', reason: 'too_large' }],
+      findings: [{ severity: 'high', file: 'src/finding.ts', line: 7, title: 'Visible finding title', rationale: 'Visible rationale' }], warnings: [],
+    };
+    const result = toolMsg('review-result', 'review-tool', { result: 'opaque-hidden-result' });
+    result.display_data = displayData;
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn', key: 'review', isFirstInTurn: true,
+      agent: agentMsg('review', [{ type: 'tool_use', id: 'review-tool', name: 'commission_review', input: { brief: 'Review it' } }]),
+      toolResultsByUseId: new Map([['review-tool', result]]),
+    }];
+
+    const finding = buildConversationSearchProjection(units, 'Visible finding title', { density: 'full' });
+    expect(finding.matches).toHaveLength(1);
+    expect(finding.sources.find((source) => source.fragmentId === 'commission-review-finding-0')?.revealTarget).toEqual({
+      kind: 'tool-result-commission-review', toolUseId: 'review-tool', fragmentId: 'commission-review-finding-0',
+    });
+    expect(buildConversationSearchProjection(units, 'opaque-hidden-result', { density: 'full' }).matches).toHaveLength(0);
+  });
+
   it('indexes tool results but excludes unowned tool header and input metadata', () => {
     const units: RenderUnit[] = [
       {
@@ -564,7 +608,7 @@ describe('buildConversationSearchProjection', () => {
     ];
 
     const fullInputProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'full' });
-    expect(fullInputProjection.matches).toHaveLength(0);
+    expect(fullInputProjection.matches).toHaveLength(1);
     expect(buildConversationSearchProjection(units, 'bash ls', { density: 'full' }).matches).toHaveLength(0);
 
     const fullResultProjection = buildConversationSearchProjection(units, 'hidden alpha result', { density: 'full' });
@@ -572,7 +616,7 @@ describe('buildConversationSearchProjection', () => {
     expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-result-0');
 
     const compactProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
-    expect(compactProjection.matches).toHaveLength(0);
+    expect(compactProjection.matches).toHaveLength(1);
   });
 
   it('excludes successful image-rendered tool results from transcript text search', () => {
@@ -681,6 +725,7 @@ describe('buildConversationSearchProjection', () => {
       projection.sources.find((source) => source.id === match.target.sourceId)?.role);
     expect(matchingSources).toEqual([
       'agent-text-0',
+      'tool-use-input-1',
       'tool-use-result-1:terminal-result:bash',
       'agent-text-2',
     ]);
@@ -855,6 +900,7 @@ describe('buildConversationSearchProjection', () => {
       ['skill', 'skill-message', '/dogfood alpha --trace\nalpha.txt'],
       ['system', 'system-message', 'System alpha'],
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
+      ['agent_turn', 'tool-use-input-1', '"alpha" in src'],
       ['agent_turn', 'tool-use-result-1:search-note:Tool%20alpha%20result:0', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'completed summarize beta path done\npending inspect alpha path'],
     ]);
@@ -869,6 +915,7 @@ describe('buildConversationSearchProjection', () => {
       'skill',
       'skill',
       'system',
+      'agent_turn',
       'agent_turn',
       'agent_turn',
       'sub_agent_status',

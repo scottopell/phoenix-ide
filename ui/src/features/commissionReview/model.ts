@@ -290,6 +290,44 @@ export function parseCommissionReviewResult(displayData: unknown, rawContent: st
   };
 }
 
+export type CommissionReviewSearchFragment = { fragmentId: string; text: string };
+
+export function buildCommissionReviewInlineSearchFragments(data: CommissionReviewDisplayData): CommissionReviewSearchFragment[] {
+  const fragments: CommissionReviewSearchFragment[] = [
+    { fragmentId: 'commission-review-header', text: `Commission review\n${formatCommissionReviewLabel(data.reviewStatus)} · trust ${formatCommissionReviewLabel(data.findingsTrust)}` },
+    { fragmentId: 'commission-review-outcome', text: commissionReviewOutcomeLabel(data) },
+  ];
+  if ('summary' in data) {
+    fragments.push(
+      { fragmentId: 'commission-review-coverage', text: `coverage\n${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed` },
+      { fragmentId: 'commission-review-target', text: `${data.summary.target.base} → ${data.summary.target.head}\n${data.summary.target.repoRoot}` },
+    );
+    if (data.summary.reviewerSummary) fragments.push({ fragmentId: 'commission-review-summary', text: data.summary.reviewerSummary });
+    const severities = [
+      ['critical', data.findingSummary.critical],
+      ['high', data.findingSummary.high],
+      ['medium', data.findingSummary.medium],
+      ['low', data.findingSummary.low],
+    ].filter((entry) => Number(entry[1]) > 0).map(([severity, count]) => `${severity} ${count}`);
+    if (severities.length > 0) fragments.push({ fragmentId: 'commission-review-severities', text: severities.join('\n') });
+  } else if (data.reviewerSummary) {
+    fragments.push({ fragmentId: 'commission-review-summary', text: data.reviewerSummary });
+  }
+  data.warningsSummary.forEach((warning, index) => fragments.push({ fragmentId: `commission-review-warning-${index}`, text: warning }));
+  data.unreviewed.slice(0, 3).forEach((entry, index) => fragments.push({
+    fragmentId: `commission-review-unreviewed-${index}`,
+    text: `${entry.file}${entry.reason ? ` · ${formatCommissionReviewLabel(entry.reason)}` : ''}`,
+  }));
+  [...data.findings]
+    .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
+    .slice(0, 5)
+    .forEach((finding, index) => fragments.push({
+      fragmentId: `commission-review-finding-${index}`,
+      text: `${finding.severity}\n${finding.title}\n${finding.file}${finding.line !== undefined ? `:${finding.line}` : ''}${finding.symbol ? ` · ${finding.symbol}` : ''}\n${finding.rationale || 'No rationale provided by the reviewer.'}${finding.suggestedFix ? `\nFix: ${finding.suggestedFix}` : ''}`,
+    }));
+  return fragments;
+}
+
 export function commissionReviewOutcomeLabel(data: CommissionReviewDisplayData): string {
   switch (data.status) {
     case 'success': return data.findingSummary.total > 0 ? 'Findings' : 'Clean';

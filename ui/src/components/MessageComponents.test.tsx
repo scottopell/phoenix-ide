@@ -240,6 +240,28 @@ describe('commission review tool rendering', () => {
     expect(screen.queryByText(/"brief"/)).not.toBeInTheDocument();
   });
 
+  it('marks active occurrences in structured commission inputs and findings', () => {
+    const inputText = 'brief: Review before merge\nfocus: concurrency alpha';
+    const inputStart = inputText.indexOf('concurrency alpha');
+    const result = toolMessage('commission-highlight-result', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData({
+      finding_summary: { total: 1, critical: 0, high: 1, medium: 0, low: 0 },
+      findings: [{ severity: 'high', file: 'src/finding.ts', line: 7, title: 'Visible alpha finding', rationale: 'Visible rationale' }],
+    });
+    const findingText = 'high\nVisible alpha finding\nsrc/finding.ts:7\nVisible rationale';
+    const findingStart = findingText.indexOf('alpha');
+    const message = agentMessage('commission-highlight-agent', [{ type: 'tool_use', id: 'commission-highlight', name: 'commission_review', input: { brief: 'Review before merge', focus: 'concurrency alpha' } }]);
+    const { container, rerender } = render(
+      <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={{ owner: 'tool-input', toolUseId: 'commission-highlight', fragmentId: 'tool-use-input', start: inputStart, end: inputStart + 'concurrency alpha'.length }} /></MemoryRouter>,
+    );
+    expect(container.querySelector('[data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent).toBe('concurrency alpha');
+
+    rerender(
+      <MemoryRouter><AgentMessage message={message} toolResults={new Map([['commission-highlight', result]])} activeHighlight={{ owner: 'tool-result', toolUseId: 'commission-highlight', fragmentId: 'commission-review-finding-0', start: findingStart, end: findingStart + 5 }} /></MemoryRouter>,
+    );
+    expect(container.querySelector('[data-fragment-id="commission-review-finding-0"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
+  });
+
   it('renders a clean structured summary for successful reviews with no findings', () => {
     const result = toolMessage('tool-commission-review-clean', JSON.stringify({ ok: true }));
     result.display_data = commissionReviewDisplayData();

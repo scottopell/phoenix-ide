@@ -2203,7 +2203,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || terminalProjection.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
-      || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || (name === 'commission_review' && activeHighlight.fragmentId.startsWith('commission-review-')))
     ? activeHighlight
     : null;
   const inputActiveHighlight = activeHighlight?.owner === 'tool-input'
@@ -2264,6 +2265,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   useEffect(() => {
     if (!revealRequest) return;
     if (revealRequest.revealTarget.kind === 'tool-use-input') {
+      if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-commission-review') {
       if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
       return;
     }
@@ -2382,7 +2387,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
 
       {/* Tool input - always visible */}
       {commissionReviewInput ? (
-        <CommissionReviewInputView input={commissionReviewInput} />
+        <CommissionReviewInputView input={commissionReviewInput} activeHighlight={inputActiveHighlight} />
       ) : (
         <div
           className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}
@@ -2460,6 +2465,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
           ) : commissionReviewDisplayData ? (
             <CommissionReviewSummaryCard
               data={commissionReviewDisplayData}
+              activeHighlight={toolActiveHighlight}
               formatDuration={formatToolDuration}
               requestSequenceId={requestSequenceId}
               onOpenFullReview={onOpenCommissionReview}

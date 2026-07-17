@@ -11,6 +11,7 @@ import type { RenderUnit } from '../../conversation/renderUnits';
 import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierreDiffMapping';
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 import { formatToolInput } from '../toolInputDisplay';
+import { buildCommissionReviewInlineSearchFragments, parseCommissionReviewResult } from '../../features/commissionReview/model';
 
 export interface SearchableSourceMatch<TTarget> {
   sourceId: string;
@@ -202,6 +203,12 @@ export interface KeywordSearchRevealTarget {
   toolUseId: string;
 }
 
+export interface CommissionReviewResultRevealTarget {
+  kind: 'tool-result-commission-review';
+  toolUseId: string;
+  fragmentId: string;
+}
+
 export interface ToolUseInputRevealTarget {
   kind: 'tool-use-input';
   toolUseId: string;
@@ -216,6 +223,7 @@ export interface ConversationTextFragmentRevealTarget {
 export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
   | ToolUseInputRevealTarget
+  | CommissionReviewResultRevealTarget
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
   | ReadFileRevealTarget
@@ -1477,21 +1485,19 @@ function agentTurnSources(
       return;
     }
     if (block.type === 'tool_use') {
-      const toolResult = toolResultsByUseId.get(block.id ?? '');
-      if (!toolResult) {
-        const toolUseId = block.id ?? '';
-        const inputText = formatToolInput(block.name || 'tool', block.input ?? {}, block.display).display;
-        if (inputText) {
-          const fragmentId = 'tool-use-input';
-          out.push({
-            role: `tool-use-input-${index}`,
-            text: inputText,
-            fragmentId,
-            revealTarget: { kind: 'tool-use-input', toolUseId, fragmentId },
-          });
-        }
-        return;
+      const toolUseId = block.id ?? '';
+      const inputText = formatToolInput(block.name || 'tool', block.input ?? {}, block.display).display;
+      if (inputText) {
+        const fragmentId = 'tool-use-input';
+        out.push({
+          role: `tool-use-input-${index}`,
+          text: inputText,
+          fragmentId,
+          revealTarget: { kind: 'tool-use-input', toolUseId, fragmentId },
+        });
       }
+      const toolResult = toolResultsByUseId.get(toolUseId);
+      if (!toolResult) return;
       const resultText = toolResultText(toolResult);
       const resultContent = toolResult.content as ToolResultContent | undefined;
       const isError = resultContent?.is_error === true || typeof resultContent?.error === 'string';
@@ -1510,6 +1516,18 @@ function agentTurnSources(
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
         }
         return;
+      }
+      if (block.name === 'commission_review') {
+        const data = parseCommissionReviewResult(toolResult.display_data, resultText);
+        if (data) {
+          buildCommissionReviewInlineSearchFragments(data).forEach((fragment, fragmentIndex) => out.push({
+            role: `commission-review-${index}-${fragmentIndex}`,
+            text: fragment.text,
+            fragmentId: fragment.fragmentId,
+            revealTarget: { kind: 'tool-result-commission-review', toolUseId, fragmentId: fragment.fragmentId },
+          }));
+          return;
+        }
       }
       const subAgentFragments = buildSubAgentCardFragments(toolResult?.display_data, block.id ?? '');
       if (subAgentFragments.length > 0) {
