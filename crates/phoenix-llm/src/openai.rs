@@ -2154,6 +2154,7 @@ mod tests {
                     return;
                 }
                 if marker.contains("stall") {
+                    // test-timing-allow: scripted server stall is the timeout behavior under test
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     continue;
                 }

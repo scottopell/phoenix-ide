@@ -4078,6 +4078,7 @@ mod tests {
                 .pop_front()
                 .expect("unscripted request");
             if exchange.delay > Duration::ZERO {
+                // test-timing-allow: scripted transport latency is the behavior exercised by timeout tests
                 tokio::time::sleep(exchange.delay).await;
             }
             for message in exchange.server_messages {

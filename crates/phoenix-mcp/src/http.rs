@@ -1250,6 +1250,7 @@ mod tests {
                 &get_responses,
             );
             if response.delay_ms > 0 {
+                // test-timing-allow: scripted HTTP response latency drives recovery/timeout behavior
                 tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
             }
             let response_body = match &response.echo_result {
@@ -1763,6 +1764,7 @@ mod tests {
         .await;
         // Past one local backoff interval a buggy poll loop would have issued a
         // second GET; a stopped stream stays at one.
+        // test-timing-allow: crossing the retry interval proves a terminal response stops polling
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(
             server.get_requests.lock().unwrap().len(),
@@ -1789,6 +1791,7 @@ mod tests {
 
         // The GET carried the negotiated session, and the stream stopped rather
         // than re-GETting a dead session in a loop.
+        // test-timing-allow: crossing the reconnect interval proves a dead session is not retried
         tokio::time::sleep(Duration::from_millis(300)).await;
         let gets = server.get_recorded();
         assert_eq!(gets.len(), 1, "a dead session must not be re-GETted");
