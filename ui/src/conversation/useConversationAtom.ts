@@ -181,6 +181,22 @@ export function useLastSseEventAt(slug: string): number {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
+/** Subscribes to the live transcript version without subscribing to message bodies. */
+export function useTranscriptGeneration(slug: string | null): number | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => (slug ? store.getSnapshot(slug).transcriptGeneration : null),
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 /**
  * Like {@link useLastSseEventAt}, but writes the heartbeat clock into a ref
  * instead of returning it as a render-driving value. The heartbeat bumps on
