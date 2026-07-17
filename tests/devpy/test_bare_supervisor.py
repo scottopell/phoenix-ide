@@ -55,6 +55,124 @@ class BareSupervisorUnitTests(unittest.TestCase):
             owner.dispatch({"protocol_version": 99, "action": "status"})
 
 
+class BareTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.layout = supervisor.Layout(Path(self.temporary.name) / "phoenix")
+        self.layout.transactions.mkdir(parents=True, mode=0o700)
+        self.transaction_id = "b" * 32
+        self.transaction = self.layout.transactions / self.transaction_id
+        self.transaction.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def artifact(self, name, content):
+        path = self.transaction / name
+        path.write_text(content)
+        path.chmod(0o600)
+        return {"name": name, "sha256": supervisor.sha256(path)}
+
+    def manifest(self, *, previous=False):
+        candidate_binary = self.artifact("candidate-binary", "new binary")
+        candidate_environment = self.artifact("candidate.env", "MODE=new\n")
+        rollback_binary = self.artifact("rollback-binary", "old binary") if previous else None
+        rollback_environment = self.artifact("rollback.env", "MODE=old\n") if previous else None
+        value = {
+            "manifest_version": 1,
+            "transaction_id": self.transaction_id,
+            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
+            "expected_health_url": "http://127.0.0.1:49155/api/version",
+            "previous_health_url": "http://127.0.0.1:49155/api/version" if previous else None,
+            "candidate_binary": candidate_binary,
+            "candidate_environment": candidate_environment,
+            "rollback_binary": rollback_binary,
+            "rollback_environment": rollback_environment,
+            "source_commit": "b" * 40,
+            "previous_deployed_sha": "a" * 40 if previous else None,
+            "created_at": "2026-07-15T00:00:00+00:00",
+            "health_timeout_secs": 1,
+        }
+        path = self.transaction / "manifest.json"
+        path.write_text(__import__("json").dumps(value))
+        path.chmod(0o600)
+        return path
+
+    def test_activation_accepts_only_transaction_id_and_manifest_hash(self):
+        path = self.manifest()
+        owner = supervisor.Supervisor(self.layout)
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 12)))
+        state = owner.activate(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("committed", state)
+        self.assertEqual("new binary", self.layout.binary.read_text())
+        self.assertEqual("MODE=new\n", self.layout.environment.read_text())
+        self.assertEqual("b" * 40, self.layout.deployed_sha.read_text().strip())
+        self.assertFalse(self.layout.active_file.exists())
+        self.assertEqual("committed", __import__("json").loads(self.layout.status_file.read_text())["state"])
+
+    def test_identity_failure_restores_previous_runtime(self):
+        self.layout.binary.parent.mkdir(parents=True)
+        self.layout.binary.write_text("old binary")
+        self.layout.environment.parent.mkdir(parents=True)
+        self.layout.environment.write_text("MODE=old\n")
+        self.layout.deployed_sha.write_text("a" * 40 + "\n")
+        path = self.manifest(previous=True)
+        owner = supervisor.Supervisor(self.layout)
+        owner.child = mock.Mock()
+        calls = 0
+
+        def start(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise supervisor.SupervisorError("wrong identity")
+            return supervisor.ChildIdentity(43, 101, supervisor.RuntimeIdentity("1.0.0", "a" * 12))
+
+        owner.start_child = mock.Mock(side_effect=start)
+        owner.stop_child = mock.Mock()
+        state = owner.activate(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertEqual("old binary", self.layout.binary.read_text())
+        self.assertEqual("MODE=old\n", self.layout.environment.read_text())
+        self.assertEqual("a" * 40, self.layout.deployed_sha.read_text().strip())
+        self.assertFalse(self.layout.active_file.exists())
+
+    def test_completed_transaction_cannot_be_replayed(self):
+        path = self.manifest()
+        owner = supervisor.Supervisor(self.layout)
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(42, 100, supervisor.RuntimeIdentity("2.0.0", "b" * 12)))
+        owner.activate(self.transaction_id, supervisor.sha256(path))
+        with self.assertRaisesRegex(supervisor.SupervisorError, "already been used"):
+            owner.activate(self.transaction_id, supervisor.sha256(path))
+
+    def test_rollback_failure_preserves_claim_and_both_failures(self):
+        self.layout.binary.parent.mkdir(parents=True)
+        self.layout.binary.write_text("old binary")
+        self.layout.environment.parent.mkdir(parents=True)
+        self.layout.environment.write_text("MODE=old\n")
+        path = self.manifest(previous=True)
+        owner = supervisor.Supervisor(self.layout)
+        owner.stop_child = mock.Mock()
+        owner.start_child = mock.Mock(side_effect=[
+            supervisor.SupervisorError("candidate wrong"),
+            supervisor.SupervisorError("rollback failed"),
+        ])
+        state = owner.activate(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("activation_failed_rollback_failed", state)
+        self.assertEqual(self.transaction_id, self.layout.active_file.read_text().strip())
+        status = __import__("json").loads(self.layout.status_file.read_text())
+        self.assertEqual("candidate wrong", status["failure"])
+        self.assertEqual("rollback failed", status["rollback_failure"])
+
+    def test_manifest_hash_mismatch_is_rejected_before_claim(self):
+        self.manifest()
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "manifest checksum mismatch"):
+            owner.activate(self.transaction_id, "0" * 64)
+        self.assertFalse(self.layout.active_file.exists())
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc and SO_PEERCRED")
 class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
     def setUp(self):
