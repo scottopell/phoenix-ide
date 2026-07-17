@@ -37,7 +37,7 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
-import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, truncateToolInputValue as truncateValue } from './toolInputDisplay';
+import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -283,11 +283,12 @@ function SkillToolBlock({
   const inputText = skillCommandFromInput(input);
 
   if (activeHighlight) {
+    const visibleResult = skillResultVisibleText(resultText);
     return (
       <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
-        <pre className="tool-block-output-content" data-fragment-id={activeHighlight.fragmentId}>
-          {renderHighlightedText(resultText, activeHighlight.start, activeHighlight.end)}
-        </pre>
+        <div className="skill-tool-status-row" data-fragment-id={activeHighlight.fragmentId}>
+          {renderHighlightedText(visibleResult, activeHighlight.start, activeHighlight.end)}
+        </div>
       </div>
     );
   }
@@ -367,7 +368,7 @@ function FileChips({ files }: { files: { original_name: string; size_bytes: numb
 
 export const UserMessage = memo(UserMessageImpl);
 
-function UserMessageImpl({ message }: { message: Message }) {
+function UserMessageImpl({ message, activeHighlight = null }: { message: Message; activeHighlight?: ConversationHighlight | null }) {
   const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; files?: { original_name: string; size_bytes: number; stored_path?: string }[]; is_meta?: boolean };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
@@ -392,7 +393,11 @@ function UserMessageImpl({ message }: { message: Message }) {
         </span>
       </div>
       <div className="message-content">
-        <SkillCommandText text={text} />
+        <span data-fragment-id="message-text">
+          {activeHighlight?.owner === 'message-text'
+            ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+            : <SkillCommandText text={text} />}
+        </span>
         {images.length > 0 && (
           <div className="message-images">
             {images.map((img, idx) => (
@@ -419,10 +424,12 @@ export const QueuedUserMessage = memo(QueuedUserMessageImpl);
 function QueuedUserMessageImpl({
   message,
   onCancelSteering,
+  activeHighlight = null,
 }: {
   message: QueuedMessage;
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
+  activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
   return (
@@ -449,7 +456,11 @@ function QueuedUserMessageImpl({
         )}
       </div>
       <div className="message-content">
-        <SkillCommandText text={message.text} />
+        <span data-fragment-id="message-text">
+          {activeHighlight?.owner === 'message-text'
+            ? renderHighlightedText(message.text, activeHighlight.start, activeHighlight.end)
+            : <SkillCommandText text={message.text} />}
+        </span>
         {message.images.length > 0 && (
           <div className="message-images">
             {message.images.map((img, idx) => (
@@ -472,7 +483,8 @@ function QueuedUserMessageImpl({
 // Compact-density helpers
 // ============================================================================
 
-function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
+// eslint-disable-next-line react-refresh/only-export-components
+export function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
   if (start < 0 || end <= start || start >= text.length) return text;
   return (
     <>
@@ -599,6 +611,7 @@ export interface AgentTextHighlight {
 }
 
 export type ConversationHighlight = AgentTextHighlight & (
+  | { owner: 'message-text' }
   | { owner: 'agent-text' }
   | { owner: 'tool-input'; toolUseId: string }
   | { owner: 'tool-result'; toolUseId: string }
@@ -2201,6 +2214,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
       || terminalProjection.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
       || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || (name === 'skill' && activeHighlight.fragmentId === 'skill-result-visible')
       || (name === 'commission_review' && activeHighlight.fragmentId.startsWith('commission-review-')))
     ? activeHighlight
     : null;

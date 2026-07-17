@@ -41,6 +41,7 @@ import {
   SubAgentStatus,
   SkillCommandText,
   formatMessageTime,
+  renderHighlightedText,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
@@ -200,13 +201,14 @@ function renderHistoricalUnit(
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
-      return <UserMessage message={unit.message} />;
+      return <UserMessage message={unit.message} activeHighlight={activeHighlight} />;
     case 'pending_user':
       return (
         <QueuedUserMessage
           message={unit.message}
           onRetry={onRetry}
           onCancelSteering={onCancelSteering}
+          activeHighlight={activeHighlight}
         />
       );
     case 'skill': {
@@ -223,7 +225,11 @@ function renderHistoricalUnit(
             )}
           </div>
           <div className="message-content">
-            <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />
+            <span data-fragment-id="message-text">
+              {activeHighlight?.owner === 'message-text'
+                ? renderHighlightedText(trigger, activeHighlight.start, activeHighlight.end)
+                : <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />}
+            </span>
             <SkillFileChips files={c.files ?? []} />
           </div>
         </div>
@@ -257,7 +263,11 @@ function renderHistoricalUnit(
       if (!text) return null;
       return (
         <div className="system-message">
-          <span className="system-message-text">{text}</span>
+          <span className="system-message-text" data-fragment-id="message-text">
+            {activeHighlight?.owner === 'message-text'
+              ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+              : text}
+          </span>
         </div>
       );
     }
@@ -514,8 +524,10 @@ function MessageListImpl({
       start: activeFindMatch.start,
       end: activeFindMatch.end,
     };
-    return activeFindRevealTarget.kind === 'agent-text'
-      ? { ...range, owner: 'agent-text' }
+    return activeFindRevealTarget.kind === 'message-text'
+      ? { ...range, owner: 'message-text' }
+      : activeFindRevealTarget.kind === 'agent-text'
+        ? { ...range, owner: 'agent-text' }
       : activeFindRevealTarget.kind === 'tool-use-input'
         ? { ...range, owner: 'tool-input', toolUseId: activeFindRevealTarget.toolUseId }
         : 'toolUseId' in activeFindRevealTarget
@@ -1257,6 +1269,7 @@ function MessageListImpl({
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (
                 activeFindRevealTarget?.kind === 'agent-text'
+                || activeFindRevealTarget?.kind === 'message-text'
                 || activeFindRevealTarget?.kind === 'tool-use-input'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'
                 || activeFindRevealTarget?.kind === 'tool-result-commission-review'

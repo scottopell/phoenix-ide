@@ -110,6 +110,13 @@ export function skillCommandFromInput(input: Record<string, unknown>): string {
   return args ? `/${skillName} ${args}` : `/${skillName}`;
 }
 
+export function skillResultVisibleText(resultText: string): string {
+  const sourceMatch = /^Base directory for this skill:\s*(.+)$/m.exec(resultText);
+  const body = resultText.replace(/^Base directory for this skill:\s*.+\n?/m, '').trim();
+  const snippet = body.split('\n').find((line) => line.trim().length > 0)?.replace(/^#\s*/, '').trim() ?? '';
+  return [sourceMatch?.[1] ? `${sourceMatch[1]}/SKILL.md` : '', snippet].filter(Boolean).join('\n');
+}
+
 export interface ToolInputDisplay {
   display: string;
   isMultiline: boolean;

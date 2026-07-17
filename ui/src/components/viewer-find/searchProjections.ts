@@ -10,7 +10,7 @@ import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierreDiffMapping';
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
-import { formatToolInput } from '../toolInputDisplay';
+import { formatToolInput, skillResultVisibleText } from '../toolInputDisplay';
 import { buildCommissionReviewInlineSearchFragments, parseCommissionReviewResult } from '../../features/commissionReview/model';
 
 export interface SearchableSourceMatch<TTarget> {
@@ -203,6 +203,11 @@ export interface KeywordSearchRevealTarget {
   toolUseId: string;
 }
 
+export interface MessageTextRevealTarget {
+  kind: 'message-text';
+  fragmentId: string;
+}
+
 export interface CommissionReviewResultRevealTarget {
   kind: 'tool-result-commission-review';
   toolUseId: string;
@@ -222,6 +227,7 @@ export interface ConversationTextFragmentRevealTarget {
 
 export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
+  | MessageTextRevealTarget
   | ToolUseInputRevealTarget
   | CommissionReviewResultRevealTarget
   | SearchResultRevealTarget
@@ -654,17 +660,17 @@ export function buildConversationSearchProjection(
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
       case 'user':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageText(unit.message));
+        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
         break;
       case 'pending_user':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageText(unit.message));
+        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
         break;
       case 'skill':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageText(unit.message));
+        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
         break;
       case 'system':
         if (!isHiddenSystemMessage(unit.message)) {
-          addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageText(unit.message));
+          addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
         }
         break;
       case 'agent_turn':
@@ -1419,14 +1425,14 @@ export function buildKeywordSearchOutputProjection(
 export function buildAgentTextFragments(
   blocks: readonly ContentBlock[],
   density: 'full' | 'compact',
-  options: { forceExpandedText?: boolean | undefined } = {},
+  options: { forceExpandedText?: boolean | undefined; forSearch?: boolean | undefined } = {},
 ): ConversationTextFragment[] {
   const out: ConversationTextFragment[] = [];
   blocks.forEach((block, index) => {
     if (block.type !== 'text') return;
     const sourceText = block.text ?? '';
-    const markdownBlocks = buildMarkdownDisplayBlocks(sourceText);
-    const semanticText = markdownBlocks.length > 0
+    const markdownBlocks = options.forSearch ? buildMarkdownDisplayBlocks(sourceText) : [];
+    const semanticText = options.forSearch && markdownBlocks.length > 0
       ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')
       : sourceText;
     const fragmentId = `agent-text-${index}`;
@@ -1473,7 +1479,7 @@ function agentTurnSources(
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> = [];
   const textFragments = new Map(
-    buildAgentTextFragments(blocks, density, { forceExpandedText })
+    buildAgentTextFragments(blocks, density, { forceExpandedText, forSearch: true })
       .map((fragment) => [fragment.fragmentId, fragment] as const),
   );
   blocks.forEach((block, index) => {
@@ -1514,6 +1520,19 @@ function agentTurnSources(
             : 'opaque';
         for (const fragment of buildTerminalToolResultProjection(errorFamily, resultText, toolResult.display_data, block.id ? { toolUseId: block.id } : {}).fragments) {
           out.push({ role: `tool-use-result-${index}:${fragment.fragmentId}`, text: fragment.semanticText, fragmentId: fragment.fragmentId, revealTarget: fragment.revealTarget });
+        }
+        return;
+      }
+      if (block.name === 'skill') {
+        const visibleResult = skillResultVisibleText(resultText);
+        if (visibleResult) {
+          const fragmentId = 'skill-result-visible';
+          out.push({
+            role: `skill-result-${index}`,
+            text: visibleResult,
+            fragmentId,
+            revealTarget: { kind: 'tool-result-terminal', toolUseId, fragmentId, family: 'opaque' },
+          });
         }
         return;
       }

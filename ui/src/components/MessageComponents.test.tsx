@@ -1221,6 +1221,22 @@ describe('message copy affordances', () => {
   });
 });
 
+describe('ordinary message find highlighting', () => {
+  it('marks the exact active occurrence in a user message fragment', () => {
+    const message = { ...agentMessage('user-find', []), message_type: 'user', content: { text: 'visible alpha message' } } as Message;
+    const { container } = render(
+      <MemoryRouter>
+        <UserMessage
+          message={message}
+          activeHighlight={{ owner: 'message-text', fragmentId: 'message-text', start: 8, end: 13 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="message-text"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
+  });
+});
+
 describe('skill command rendering', () => {
   it('renders slash-command user messages as a flat command chip with normal args', () => {
     render(
@@ -1296,7 +1312,8 @@ describe('skill command rendering', () => {
 
   it('marks active skill result text through the skill renderer', () => {
     const resultText = 'Base directory for this skill: /tmp/skill\n# Unique skill token';
-    const fragmentId = 'terminal-result:opaque';
+    const fragmentId = 'skill-result-visible';
+    const visibleResult = '/tmp/skill/SKILL.md\nUnique skill token';
     const { container } = render(
       <MemoryRouter>
         <AgentMessage
@@ -1309,8 +1326,8 @@ describe('skill command rendering', () => {
             owner: 'tool-result',
             toolUseId: 'tool-skill-find',
             fragmentId,
-            start: resultText.indexOf('Unique'),
-            end: resultText.indexOf('Unique') + 'Unique'.length,
+            start: visibleResult.indexOf('Unique'),
+            end: visibleResult.indexOf('Unique') + 'Unique'.length,
           }}
         />
       </MemoryRouter>,

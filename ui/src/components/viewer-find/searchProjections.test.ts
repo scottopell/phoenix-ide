@@ -312,11 +312,19 @@ describe('typed semantic display projections', () => {
   it('projects agent prose from rendered Markdown text, not source-only syntax', () => {
     const fragments = buildAgentTextFragments([
       { type: 'text', text: 'Read **bold docs** at [the guide](https://example.test/secret-url).' },
-    ], 'full');
+    ], 'full', { forSearch: true });
 
     expect(fragments[0]?.semanticText).toBe('Read bold docs at the guide.');
     expect(fragments[0]?.semanticText).not.toContain('https://');
     expect(fragments[0]?.display.sourceText).toContain('[the guide]');
+  });
+
+  it('does not parse Markdown when building ordinary render fragments', () => {
+    const source = 'Read **bold docs** at [the guide](https://example.test/secret-url).';
+    const fragments = buildAgentTextFragments([{ type: 'text', text: source }], 'full');
+
+    expect(fragments[0]?.semanticText).toBe(source);
+    expect(fragments[0]?.display.sourceText).toBe(source);
   });
 
   it('keeps complete sub-agent outcomes searchable behind compact previews', () => {
@@ -415,6 +423,26 @@ describe('bounded keyword-search identities', () => {
     expect(hit?.semanticText).toContain(explanation);
     expect(hit?.fragmentId).not.toContain(explanation);
     expect(hit?.fragmentId.length).toBeLessThan(128);
+  });
+});
+
+describe('owned ordinary-message sources', () => {
+  it('assigns typed message-text reveal targets to user, queued, skill, and system units', () => {
+    const units: RenderUnit[] = [
+      { kind: 'user', key: 'user', message: { ...systemMsg('user', 'user alpha'), message_type: 'user' } },
+      { kind: 'pending_user', key: 'pending', message: queued('pending', 'pending alpha') },
+      { kind: 'skill', key: 'skill', message: { ...skillMsg('skill', ''), content: { text: '', trigger: '/demo alpha' } } as Message },
+      { kind: 'system', key: 'system', message: systemMsg('system', 'system alpha') },
+    ];
+    const projection = buildConversationSearchProjection(units, 'alpha', { density: 'full' });
+
+    expect(projection.matches).toHaveLength(4);
+    expect(projection.sources.map((source) => source.revealTarget)).toEqual([
+      { kind: 'message-text', fragmentId: 'message-text' },
+      { kind: 'message-text', fragmentId: 'message-text' },
+      { kind: 'message-text', fragmentId: 'message-text' },
+      { kind: 'message-text', fragmentId: 'message-text' },
+    ]);
   });
 });
 
@@ -546,6 +574,23 @@ describe('buildConversationSearchProjection', () => {
       toolUseId: 'bash-running',
       fragmentId: 'tool-use-input',
     });
+  });
+
+  it('indexes only the visible source and snippet for completed skill results', () => {
+    const resultText = [
+      'Base directory for this skill: /tmp/skill',
+      '# Visible skill title',
+      'hidden implementation body token',
+    ].join('\n');
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn', key: 'skill-result', isFirstInTurn: true,
+      agent: agentMsg('skill-result', [{ type: 'tool_use', id: 'skill-tool', name: 'skill', input: { skill_name: 'agent-browser', args: '' } }]),
+      toolResultsByUseId: new Map([['skill-tool', toolMsg('skill-result-message', 'skill-tool', { result: resultText })]]),
+    }];
+
+    expect(buildConversationSearchProjection(units, 'Visible skill title', { density: 'full' }).matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, '/tmp/skill/SKILL.md', { density: 'full' }).matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, 'hidden implementation body token', { density: 'full' }).matches).toHaveLength(0);
   });
 
   it('indexes the slash-style visible skill command instead of generic JSON', () => {
