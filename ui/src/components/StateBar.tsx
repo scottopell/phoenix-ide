@@ -970,13 +970,24 @@ export function StateBar({
     prStatus && !prStatus.found
       ? unavailablePrHint(prStatus.unavailable_reason)
       : null;
+  const mobileActionablePrs = prStatusHandle?.activeSelection?.associated_prs.filter(
+    (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+  ) ?? [];
+  const mobileActivePrIsActionable = Boolean(
+    prStatusHandle?.activePrSummary
+    && mobileActionablePrs.some(
+      (pr) => pr.repo_owner === prStatusHandle.activePrSummary?.repo_owner
+        && pr.repo_name === prStatusHandle.activePrSummary?.repo_name
+        && pr.pr_number === prStatusHandle.activePrSummary?.pr_number,
+    ),
+  );
+  const mobilePrRailCanRepresentSelection = mobileActionablePrs.length > 0
+    && (!prStatusHandle?.activePrSummary || mobileActivePrIsActionable);
   const mobilePrRailOwnsSelection = Boolean(
     isMobile
     && (isWork || isBranchMode)
     && ['idle', 'error', 'context_exhausted'].includes(convState.type)
-    && prStatusHandle?.activeSelection?.associated_prs.some(
-      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
-    ),
+    && mobilePrRailCanRepresentSelection
   );
 
   const cwdSummary = summarizePath(conversation?.cwd);
