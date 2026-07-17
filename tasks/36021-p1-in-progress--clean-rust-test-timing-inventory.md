@@ -9,5 +9,6 @@ Classify every finding from `scripts/check_rust_test_timing.py --all crates/` as
 - Removed a redundant post-readiness cancellation delay, bounded the uncooperative release mock directly, and deleted a vacuous buffering smoke test with no postcondition.
 - Added local rationales to explicit LLM/MCP scripted latency and retry-interval behavior drivers.
 - Removed all 12 MCP findings with request/publication watches, tracked background-task completion, identity-bound scripted-transport witnesses, and direct polling of deliberately parked futures.
-- Current inventory: 34 findings.
-- Remaining clusters include terminal relay ownership, process/credential settlement, and browser/tool protocol fixtures; these require subsystem-specific deterministic witnesses or narrowly justified behavior drivers.
+- Removed all 12 terminal findings with forwarded-frame ingestion witnesses, connection-readiness oneshots, retained watch versions, and an explicitly gated permit-serialization test.
+- Current inventory: 21 findings.
+- Remaining clusters include process/credential settlement and browser/tool protocol fixtures; these require subsystem-specific deterministic witnesses or narrowly justified behavior drivers.

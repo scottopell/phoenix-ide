@@ -542,7 +542,7 @@ mod reclaim_tests {
     use phoenix_terminal::test_helpers::full_command;
     use std::sync::{Arc, Mutex};
     use tokio::io::{duplex, AsyncWriteExt};
-    use tokio::sync::{watch, Semaphore};
+    use tokio::sync::{oneshot, watch, Semaphore};
 
     /// Build a `TerminalHandle`-shaped value suitable for reclaim tests.
     /// We reuse the real struct but back `master_fd` with `/dev/null` since
@@ -582,7 +582,8 @@ mod reclaim_tests {
     async fn run_connection(
         handle: Arc<TerminalHandle>,
         shell_writes: Vec<u8>,
-    ) -> (RelayExit, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        ready: oneshot::Sender<()>,
+    ) -> RelayExit {
         // Acquire the permit via the same path the handler uses. This blocks
         // until any previous relay releases its permit, matching production
         // behaviour exactly.
@@ -598,15 +599,6 @@ mod reclaim_tests {
         let stop_rx = handle.stop_tx.subscribe();
 
         let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
-
-        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-        // Drain ws frames into the unbounded channel the test asserts against.
-        let drain = tokio::spawn(async move {
-            while let Some(frame) = ws_rx.next().await {
-                let _ = frames_tx.send(frame);
-            }
-        });
 
         let tracker = Arc::clone(&handle.tracker);
         let handle_clone = Arc::clone(&handle);
@@ -632,16 +624,28 @@ mod reclaim_tests {
             exit
         });
 
-        if !shell_writes.is_empty() {
+        if shell_writes.is_empty() {
+            ready.send(()).expect("connection readiness receiver");
+        } else {
             shell_end.write_all(&shell_writes).await.unwrap();
+            // A forwarded frame proves the relay ingested the same PTY bytes
+            // into the tracker before the test sends its stop signal.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut forwarded = 0;
+                while forwarded < shell_writes.len() {
+                    let frame = ws_rx.next().await.expect("WS output must remain open");
+                    assert_eq!(frame[0], 0x00);
+                    forwarded += frame.len() - 1;
+                }
+            })
+            .await
+            .expect("relay must forward all PTY bytes");
+            ready.send(()).expect("connection readiness receiver");
         }
-        // Let the reader ingest.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let exit = relay.await.unwrap();
-        drop(drain);
         drop(shell_end);
-        (exit, frames_rx)
+        exit
     }
 
     /// Acceptance: two sequential connections for the same `conv_id` — the
@@ -653,13 +657,16 @@ mod reclaim_tests {
         // Connection 1: capture "cmd1", then signal Detach to evict.
         let h1 = Arc::clone(&handle);
         let writes_1 = full_command("cmd1", "out1\n", Some(0));
-        let conn_1 = tokio::spawn(async move { run_connection(h1, writes_1).await });
-
-        // Give conn_1 time to acquire the permit and start its relay.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (ready_sender_1, ready_1) = oneshot::channel();
+        let conn_1 =
+            tokio::spawn(async move { run_connection(h1, writes_1, ready_sender_1).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_1)
+            .await
+            .expect("connection 1 must become ready")
+            .expect("connection 1 readiness sender");
         handle.stop_tx.send(StopReason::Detach).unwrap();
 
-        let (exit_1, _) = conn_1.await.unwrap();
+        let exit_1 = conn_1.await.unwrap();
         assert_eq!(
             exit_1,
             RelayExit::Stopped(StopReason::Detach),
@@ -671,12 +678,16 @@ mod reclaim_tests {
         // permit on exit.
         let h2 = Arc::clone(&handle);
         let writes_2 = full_command("cmd2", "out2\n", Some(0));
-        let conn_2 = tokio::spawn(async move { run_connection(h2, writes_2).await });
-
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let (ready_sender_2, ready_2) = oneshot::channel();
+        let conn_2 =
+            tokio::spawn(async move { run_connection(h2, writes_2, ready_sender_2).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_2)
+            .await
+            .expect("connection 2 must become ready")
+            .expect("connection 2 readiness sender");
         handle.stop_tx.send(StopReason::Detach).unwrap();
 
-        let (exit_2, _) = conn_2.await.unwrap();
+        let exit_2 = conn_2.await.unwrap();
         assert!(
             matches!(
                 exit_2,
@@ -708,10 +719,15 @@ mod reclaim_tests {
         // Run + detach relay 1.
         let h1 = Arc::clone(&handle);
         let writes_1 = full_command("a", "1\n", Some(0));
-        let conn_1 = tokio::spawn(async move { run_connection(h1, writes_1).await });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (ready_sender_1, ready_1) = oneshot::channel();
+        let conn_1 =
+            tokio::spawn(async move { run_connection(h1, writes_1, ready_sender_1).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_1)
+            .await
+            .expect("connection 1 must become ready")
+            .expect("connection 1 readiness sender");
         handle.stop_tx.send(StopReason::Detach).unwrap();
-        let (_, _) = conn_1.await.unwrap();
+        conn_1.await.unwrap();
 
         // Tracker already has "a".
         assert_eq!(
@@ -726,10 +742,15 @@ mod reclaim_tests {
         // Run + detach relay 2.
         let h2 = Arc::clone(&handle);
         let writes_2 = full_command("b", "2\n", Some(0));
-        let conn_2 = tokio::spawn(async move { run_connection(h2, writes_2).await });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (ready_sender_2, ready_2) = oneshot::channel();
+        let conn_2 =
+            tokio::spawn(async move { run_connection(h2, writes_2, ready_sender_2).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_2)
+            .await
+            .expect("connection 2 must become ready")
+            .expect("connection 2 readiness sender");
         handle.stop_tx.send(StopReason::Detach).unwrap();
-        let (_, _) = conn_2.await.unwrap();
+        conn_2.await.unwrap();
 
         // Same external tracker now has "b" (reclaim preserved the Arc).
         let texts: Vec<String> = external_tracker
@@ -764,11 +785,13 @@ mod reclaim_tests {
         // Sitting relay holds the one permit. We'll evict it after both
         // reclaimers have started their acquire.
         let h_sit = Arc::clone(&handle);
-        let sitting = tokio::spawn(async move { run_connection(h_sit, Vec::new()).await });
-
-        // Give the sitting relay time to acquire the permit and subscribe
-        // to stop_tx.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (sitting_ready_tx, sitting_ready_rx) = oneshot::channel();
+        let sitting =
+            tokio::spawn(async move { run_connection(h_sit, Vec::new(), sitting_ready_tx).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), sitting_ready_rx)
+            .await
+            .expect("sitting connection must become ready")
+            .expect("sitting connection readiness sender");
         assert_eq!(
             handle.attach_permit.available_permits(),
             0,
@@ -779,32 +802,30 @@ mod reclaim_tests {
         // Must never exceed 1.
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let release_gate = Arc::new(Semaphore::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Each racer goes through the real `acquire_permit` path, holds the
-        // permit briefly (simulating a relay lifetime), then releases. If
-        // the semaphore were broken, both racers could be inside the
-        // "holding" region simultaneously — we trip the max_seen > 1 check.
+        // Each racer holds the real attach permit until the test explicitly
+        // releases it. The entry channel makes the serialization observable.
         let racer = |label: &'static str| {
             let h = Arc::clone(&handle);
             let inflight = Arc::clone(&inflight);
             let max_seen = Arc::clone(&max_seen);
-            let order = Arc::clone(&order);
+            let release_gate = Arc::clone(&release_gate);
+            let entered_tx = entered_tx.clone();
             tokio::spawn(async move {
-                // Drive a detach on the sitting relay; idempotent if already
-                // driven by a sibling racer.
                 let _ = h.stop_tx.send(StopReason::Detach);
-                let got = acquire_permit("race", Arc::clone(&h)).await;
-                let (handle_back, permit) = got.expect("permit acquisition must succeed");
+                let (handle_back, permit) = acquire_permit("race", Arc::clone(&h))
+                    .await
+                    .expect("permit acquisition must succeed");
 
-                // Record entry order and check single-occupancy.
-                order.lock().unwrap().push(label);
                 let now = inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-
-                // Simulate a relay lifetime. If another racer is holding the
-                // permit concurrently, `max_seen` will observe > 1.
-                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                entered_tx
+                    .send(label)
+                    .expect("entry receiver must remain open");
+                let release = release_gate.acquire().await.expect("release gate");
+                release.forget();
 
                 inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 drop(permit);
@@ -815,13 +836,29 @@ mod reclaim_tests {
 
         let r1 = racer("r1");
         let r2 = racer("r2");
+        drop(entered_tx);
 
-        let (exit_sit, _) = sitting.await.unwrap();
+        let exit_sit = sitting.await.unwrap();
         assert_eq!(
             exit_sit,
             RelayExit::Stopped(StopReason::Detach),
             "sitting relay must exit via Detach"
         );
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("first racer must acquire")
+            .expect("racer entry channel");
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "second racer cannot enter while the first holds the permit"
+        );
+        release_gate.add_permits(1);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("second racer must acquire after release")
+            .expect("racer entry channel");
+        release_gate.add_permits(1);
 
         let l1 = r1.await.unwrap();
         let l2 = r2.await.unwrap();
@@ -837,8 +874,7 @@ mod reclaim_tests {
         // Both racers eventually got the permit — first one immediately
         // after the sitting relay released, second one after the first
         // released. No deadlock, no double-teardown.
-        let seen = order.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "both racers must eventually acquire");
+        let seen = [first, second];
         assert!(
             seen.contains(&l1) && seen.contains(&l2),
             "both labels present; got {seen:?}"
@@ -903,12 +939,16 @@ mod reclaim_tests {
         // the permit on exit regardless of which teardown branch the handler
         // would take.
         let h = Arc::clone(&handle);
-        let conn = tokio::spawn(async move { run_connection(h, Vec::new()).await });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (ready_sender, ready) = oneshot::channel();
+        let conn = tokio::spawn(async move { run_connection(h, Vec::new(), ready_sender).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .expect("connection must become ready")
+            .expect("connection readiness sender");
 
         // TearDown path — models conversation-terminal cleanup (REQ-TERM-012).
         handle.stop_tx.send(StopReason::TearDown).unwrap();
-        let (exit, _) = conn.await.unwrap();
+        let exit = conn.await.unwrap();
         assert_eq!(exit, RelayExit::Stopped(StopReason::TearDown));
 
         // Permit returned to the semaphore → a future reclaimer can acquire.

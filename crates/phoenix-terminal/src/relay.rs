@@ -436,6 +436,19 @@ mod tests {
         mpsc::channel(cap)
     }
 
+    async fn wait_for_forwarded_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut forwarded = 0;
+            while forwarded < expected {
+                let frame = rx.next().await.expect("WS output must remain open");
+                assert_eq!(frame[0], 0x00);
+                forwarded += frame.len() - 1;
+            }
+        })
+        .await
+        .expect("relay must forward all PTY bytes");
+    }
+
     // ── Test 1: PtyOutputForwarded invariant ──────────────────────────────────
 
     /// Spec invariant `PtyOutputForwarded` (REQ-TERM-004, REQ-TERM-010):
@@ -834,7 +847,7 @@ mod tests {
 
         let (mut shell_end, pty_end) = tokio::io::duplex(4096);
         let tracker = make_tracker();
-        let (ws_tx, _ws_rx) = ws_out_channel(32);
+        let (ws_tx, mut ws_rx) = ws_out_channel(32);
         let ws_in = futures::stream::pending::<Vec<u8>>().boxed();
 
         let (stop_tx, stop_rx) = watch::channel(StopReason::Running);
@@ -860,8 +873,9 @@ mod tests {
             .await
         });
 
-        // Give the relay a moment to ingest the write, then signal detach.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The outgoing frame proves the reader ingested these same bytes into
+        // the tracker before forwarding them (PtyOutputForwarded).
+        wait_for_forwarded_bytes(&mut ws_rx, bytes.len()).await;
         stop_tx.send(StopReason::Detach).unwrap();
 
         let exit = relay.await.unwrap();
@@ -910,7 +924,8 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The receiver was created before the send, so watch retains this
+        // version even if the relay task has not reached `changed()` yet.
         stop_tx.send(StopReason::TearDown).unwrap();
 
         let exit = relay.await.unwrap();
@@ -929,7 +944,7 @@ mod tests {
 
         // --- Relay 1: capture "first" command, then detach. ------------------
         let (mut shell_end_1, pty_end_1) = tokio::io::duplex(4096);
-        let (ws_tx_1, _ws_rx_1) = ws_out_channel(32);
+        let (ws_tx_1, mut ws_rx_1) = ws_out_channel(32);
         let ws_in_1 = futures::stream::pending::<Vec<u8>>().boxed();
         let (stop_tx_1, stop_rx_1) = watch::channel(StopReason::Running);
 
@@ -949,11 +964,9 @@ mod tests {
             .await
         });
 
-        shell_end_1
-            .write_all(&full_command("first", "ok\n", Some(0)))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let first = full_command("first", "ok\n", Some(0));
+        shell_end_1.write_all(&first).await.unwrap();
+        wait_for_forwarded_bytes(&mut ws_rx_1, first.len()).await;
         stop_tx_1.send(StopReason::Detach).unwrap();
 
         let exit_1 = relay_1.await.unwrap();
@@ -961,7 +974,7 @@ mod tests {
 
         // --- Relay 2: capture "second" command on the SAME tracker. ---------
         let (mut shell_end_2, pty_end_2) = tokio::io::duplex(4096);
-        let (ws_tx_2, _ws_rx_2) = ws_out_channel(32);
+        let (ws_tx_2, mut ws_rx_2) = ws_out_channel(32);
         let ws_in_2 = futures::stream::pending::<Vec<u8>>().boxed();
         let (stop_tx_2, stop_rx_2) = watch::channel(StopReason::Running);
 
@@ -981,11 +994,9 @@ mod tests {
             .await
         });
 
-        shell_end_2
-            .write_all(&full_command("second", "also ok\n", Some(0)))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = full_command("second", "also ok\n", Some(0));
+        shell_end_2.write_all(&second).await.unwrap();
+        wait_for_forwarded_bytes(&mut ws_rx_2, second.len()).await;
         stop_tx_2.send(StopReason::Detach).unwrap();
         let exit_2 = relay_2.await.unwrap();
         assert_eq!(exit_2, RelayExit::Stopped(StopReason::Detach));
