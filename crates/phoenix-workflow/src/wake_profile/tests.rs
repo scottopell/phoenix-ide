@@ -170,6 +170,37 @@ fn registration_receipt_and_barrier_round_trip_preserve_contract_resource_and_de
 }
 
 #[test]
+fn subagent_terminal_evidence_is_exhaustive_and_requires_persisted_child_record() {
+    use super::{PersistedChildTerminalRecord, SubagentTerminalOutcome};
+
+    assert!(PersistedChildTerminalRecord::new("").is_none());
+    let record = PersistedChildTerminalRecord::new("child-terminal-row-1")
+        .expect("persisted child terminal record");
+    assert_eq!(record.as_str(), "child-terminal-row-1");
+
+    let outcomes = [
+        SubagentTerminalOutcome::SubmitResult {
+            result: "done".into(),
+        },
+        SubagentTerminalOutcome::SubmitError {
+            kind: "invalid_result".into(),
+            error: "bad result".into(),
+        },
+        SubagentTerminalOutcome::ImplicitTextCompletion {
+            result: "done".into(),
+        },
+        SubagentTerminalOutcome::RuntimeFailure {
+            kind: "worker_lost".into(),
+        },
+        SubagentTerminalOutcome::ContextExhausted,
+        SubagentTerminalOutcome::WallClockTimeout,
+        SubagentTerminalOutcome::IndependentlyObservedCancellation,
+        SubagentTerminalOutcome::TurnLimitHardStop,
+    ];
+    assert_eq!(outcomes.len(), 8);
+}
+
+#[test]
 fn bash_and_tmux_evidence_are_typed_and_match_exact_identity() {
     let bash = bash_identity("b-1");
     let bash_evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
@@ -372,8 +403,21 @@ fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload
     assert!(workflow.owed_acceptances.is_empty());
     assert_eq!(
         workflow.effects[&REGISTRATION_EFFECT_ID].status,
-        EffectStatus::Invalidated
+        EffectStatus::Receipted
     );
+    let receipt = workflow.effects[&REGISTRATION_EFFECT_ID]
+        .receipt
+        .as_ref()
+        .expect("cancellation receipt is bound to observe effect");
+    assert!(matches!(
+        receipt.receipt,
+        WakeTerminalPayload::Cancelled { .. }
+    ));
+    assert_eq!(
+        result.reducer_events[0].effect_id,
+        Some(REGISTRATION_EFFECT_ID)
+    );
+    assert!(!result.reducer_events[0].requires_runtime_acceptance);
     assert_eq!(
         workflow.effects[&REGISTRATION_EFFECT_ID]
             .declaration

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::types::{
-    BarrierId, BarrierMemberDecl, EffectDecl, EffectId, EffectRole, Generation, ReceiptFamily,
-    TransitionPlan, WorkflowProfile, WorkflowStatus,
+    BarrierId, BarrierMemberDecl, CodecRef, EffectDecl, EffectId, EffectRole, Generation,
+    ReceiptFamily, SupportedCodecRegistry, TransitionPlan, WorkflowProfile, WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub enum PlanError {
     DuplicateBarrierId(BarrierId),
     BarrierIdCollision(BarrierId),
     MissingCodec(&'static str),
+    UnsupportedCodec(CodecRef),
     MissingEffectFamily(EffectId),
     MissingEffectKind(EffectId),
     CompensationOutsideCancellation(EffectId),
@@ -88,16 +89,18 @@ pub fn validate_plan<P: WorkflowProfile>(
     current_status: WorkflowStatus,
     plan: &TransitionPlan<P>,
     barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
+    supported_codecs: &SupportedCodecRegistry,
 ) -> Result<(), PlanError> {
     validate_status_transition(current_status, plan.next_status)?;
-    validate_plan_body(plan, barrier_events)
+    validate_plan_body(plan, barrier_events, supported_codecs)
 }
 
 pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     plan: &TransitionPlan<P>,
     barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
+    supported_codecs: &SupportedCodecRegistry,
 ) -> Result<(), PlanError> {
-    validate_plan_codecs(plan)?;
+    validate_plan_codecs(plan, supported_codecs)?;
     if matches!(
         plan.next_status,
         WorkflowStatus::Cancelled
@@ -150,7 +153,10 @@ pub(crate) fn validate_status_transition(
     }
 }
 
-fn validate_plan_codecs<P: WorkflowProfile>(plan: &TransitionPlan<P>) -> Result<(), PlanError> {
+fn validate_plan_codecs<P: WorkflowProfile>(
+    plan: &TransitionPlan<P>,
+    supported_codecs: &SupportedCodecRegistry,
+) -> Result<(), PlanError> {
     if plan.snapshot_codec.family.is_empty() {
         return Err(PlanError::MissingCodec("snapshot"));
     }
@@ -178,6 +184,25 @@ fn validate_plan_codecs<P: WorkflowProfile>(plan: &TransitionPlan<P>) -> Result<
             if owed.event_codec.family.is_empty() {
                 return Err(PlanError::MissingCodec("owed_acceptance"));
             }
+        }
+    }
+    for codec in std::iter::once(&plan.snapshot_codec)
+        .chain(std::iter::once(&plan.event_codec))
+        .chain(plan.effects.iter().map(|effect| &effect.codec))
+        .chain(
+            plan.barriers
+                .iter()
+                .map(|barrier| &barrier.reducer_event_codec),
+        )
+        .chain(
+            plan.owed_acceptances
+                .iter()
+                .flatten()
+                .map(|owed| &owed.event_codec),
+        )
+    {
+        if !supported_codecs.supports(codec) {
+            return Err(PlanError::UnsupportedCodec(codec.clone()));
         }
     }
     Ok(())

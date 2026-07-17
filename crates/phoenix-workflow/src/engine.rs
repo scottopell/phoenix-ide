@@ -45,6 +45,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 "snapshot",
             )));
         }
+        if !accepted_protocol.supported_codecs.supports(&snapshot_codec) {
+            return Err(EngineError::InvalidPlan(PlanError::UnsupportedCodec(
+                snapshot_codec,
+            )));
+        }
         Ok(Self {
             binding: WorkflowBinding::Authoritative(AuthoritativeWorkflow {
                 workflow_id,
@@ -99,6 +104,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if snapshot_codec.family.is_empty() {
             return Err(EngineError::InvalidPlan(PlanError::MissingCodec(
                 "snapshot",
+            )));
+        }
+        if !accepted_protocol.supported_codecs.supports(&snapshot_codec) {
+            return Err(EngineError::InvalidPlan(PlanError::UnsupportedCodec(
+                snapshot_codec,
             )));
         }
         Ok(Self {
@@ -417,6 +427,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if observation_codec.family.is_empty() {
             return AuthorityOutcome::StaleAuthority;
         }
+        if !self
+            .binding
+            .accepted_protocol()
+            .supported_codecs
+            .supports(&observation_codec)
+        {
+            return AuthorityOutcome::StaleAuthority;
+        }
         let observation_id = ObservationId(self.next_observation_id);
         if let Some(effect) = self.effect_authorized_mut(authority, now) {
             if !effect.attempts.iter().any(|attempt| {
@@ -487,6 +505,24 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             };
         }
         if receipt_codec.family.is_empty() || receipt_event_codec.family.is_empty() {
+            return ReceiptAcceptance {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                receipt_inbox_ids: Vec::new(),
+                reducer_events: Vec::new(),
+            };
+        }
+        if !self
+            .binding
+            .accepted_protocol()
+            .supported_codecs
+            .supports(&receipt_codec)
+            || !self
+                .binding
+                .accepted_protocol()
+                .supported_codecs
+                .supports(&receipt_event_codec)
+        {
             return ReceiptAcceptance {
                 outcome: AuthorityOutcome::StaleAuthority,
                 receipt: None,
@@ -653,6 +689,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         {
             return stale_reconciliation_outcome();
         }
+        let supported_codecs = &self.binding.accepted_protocol().supported_codecs;
+        if permitted_choices.iter().any(|choice| {
+            !supported_codecs.supports(&choice.codec)
+                || !supported_codecs.supports(&choice.receipt_codec)
+                || !supported_codecs.supports(&choice.receipt_event_codec)
+        }) {
+            return stale_reconciliation_outcome();
+        }
         let resolution_id = ManualResolutionId(self.next_manual_resolution_id);
         let workflow_version = self.version;
         let Some(effect) = self.effect_authorized_mut(authority, now) else {
@@ -699,6 +743,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         commit: ManualResolutionCommit<P>,
     ) -> ManualResolutionOutcome<P> {
         if self.ensure_executable().is_err() {
+            return invalid_manual_resolution(None);
+        }
+        let supported_codecs = &self.binding.accepted_protocol().supported_codecs;
+        if !supported_codecs.supports(&commit.transition_codec)
+            || !supported_codecs.supports(&choice.receipt_codec)
+            || !supported_codecs.supports(&choice.receipt_event_codec)
+        {
             return invalid_manual_resolution(None);
         }
         let Some(existing) = self
@@ -997,14 +1048,44 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         self.validate_cancellation_plan_against_state(&request.compensation_plan, barrier_events)?;
         if request.next_snapshot_codec.family.is_empty()
             || request.event_codec.family.is_empty()
-            || request
-                .reducer_inbox_events
-                .iter()
-                .any(|event| event.event_codec.family.is_empty())
+            || request.terminal_receipt.as_ref().is_some_and(|receipt| {
+                receipt.receipt_codec.family.is_empty() || receipt.event_codec.family.is_empty()
+            })
         {
             return Err(EngineError::InvalidPlan(PlanError::MissingCodec(
                 "cancellation",
             )));
+        }
+
+        for codec in [&request.next_snapshot_codec, &request.event_codec]
+            .into_iter()
+            .chain(
+                request
+                    .terminal_receipt
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|receipt| [&receipt.receipt_codec, &receipt.event_codec]),
+            )
+        {
+            if !self
+                .binding
+                .accepted_protocol()
+                .supported_codecs
+                .supports(codec)
+            {
+                return Err(EngineError::InvalidPlan(PlanError::UnsupportedCodec(
+                    codec.clone(),
+                )));
+            }
+        }
+        if let Some(receipt) = &request.terminal_receipt {
+            if !self.effects.get(&receipt.effect_id).is_some_and(|effect| {
+                effect.declaration.generation == self.generation && effect.receipt.is_none()
+            }) {
+                return Err(EngineError::InvalidPlan(PlanError::UnknownEffectReference(
+                    receipt.effect_id,
+                )));
+            }
         }
 
         let mut replacement = self.clone();
@@ -1016,8 +1097,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         replacement.suppress_cancellation_work(transition.transition_id);
         replacement.apply_invalidations(&decision.plan.invalidations);
         replacement.install_effects(&decision.plan);
-        let reducer_events =
-            replacement.materialize_cancellation_inbox_events(&request.reducer_inbox_events);
+        let reducer_events = request
+            .terminal_receipt
+            .as_ref()
+            .map(|receipt| replacement.materialize_cancellation_receipt(receipt))
+            .into_iter()
+            .collect();
         replacement.install_barriers(&decision.plan, barrier_events)?;
         if decision.plan.owed_acceptances.is_some() {
             return Err(EngineError::InvalidInbox);
@@ -1379,7 +1464,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 invalidations: vec![],
                 owed_acceptances: None,
             };
-            if validate_plan_body(&plan, &BTreeMap::new()).is_err()
+            if validate_plan_body(
+                &plan,
+                &BTreeMap::new(),
+                &self.binding.accepted_protocol().supported_codecs,
+            )
+            .is_err()
                 || plan.effects.iter().any(|effect| {
                     effect.role != EffectRole::Compensation
                         || effect.generation != self.generation
@@ -1627,42 +1717,50 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
     }
 
-    fn materialize_cancellation_inbox_events(
+    fn materialize_cancellation_receipt(
         &mut self,
-        declarations: &[crate::ReducerInboxDecl<P>],
-    ) -> Vec<ReducerInboxEvent<P>> {
-        let mut reducer_events = Vec::with_capacity(declarations.len());
-        for declaration in declarations {
-            let event = ReducerInboxEvent {
-                id: ReducerInboxId(self.next_inbox_id),
-                effect_id: declaration.effect_id,
-                barrier_id: declaration.barrier_id,
-                kind: declaration.kind,
-                event_codec: declaration.event_codec.clone(),
-                requires_runtime_acceptance: declaration.requires_runtime_acceptance,
-                payload: match &declaration.payload {
-                    ReducerInboxPayload::Receipt(payload) => {
-                        ReducerInboxPayload::Receipt(payload.clone())
-                    }
-                    ReducerInboxPayload::Barrier(payload) => {
-                        ReducerInboxPayload::Barrier(payload.clone())
-                    }
-                },
-                delivery_status: if workflow_status_is_terminal(self.status) {
-                    DeliveryStatus::Suppressed {
-                        reason: SuppressionReason::Cancelled,
-                    }
-                } else {
-                    DeliveryStatus::Pending
-                },
-                consumed_by: None,
-            };
-            self.next_inbox_id += 1;
-            self.reducer_inbox
-                .insert(event.id, clone_reducer_inbox_event(&event));
-            reducer_events.push(event);
-        }
-        reducer_events
+        declaration: &crate::CancellationReceiptDecl<P>,
+    ) -> ReducerInboxEvent<P> {
+        let effect = self
+            .effects
+            .get_mut(&declaration.effect_id)
+            .expect("validated cancellation receipt effect");
+        let receipt = ReceiptRecord {
+            id: ReceiptId(self.next_receipt_id),
+            authority: manual_receipt_authority(
+                self.binding.workflow_id(),
+                effect.declared_workflow_version,
+                effect.declaration.generation,
+                declaration.effect_id,
+            ),
+            attempt_id: None,
+            origin: ReceiptOrigin::Manual,
+            receipt_codec: declaration.receipt_codec.clone(),
+            receipt: declaration.receipt.clone(),
+            generation: effect.declaration.generation,
+        };
+        self.next_receipt_id += 1;
+        effect.receipt = Some(receipt);
+        effect.status = EffectStatus::Receipted;
+        effect.claim = None;
+        effect.destructive_lock = None;
+        effect.pending_reconciliation = false;
+
+        let event = ReducerInboxEvent {
+            id: ReducerInboxId(self.next_inbox_id),
+            effect_id: Some(declaration.effect_id),
+            barrier_id: None,
+            kind: ReducerInboxKind::ReceiptAccepted,
+            event_codec: declaration.event_codec.clone(),
+            requires_runtime_acceptance: false,
+            payload: ReducerInboxPayload::Receipt(declaration.event.clone()),
+            delivery_status: DeliveryStatus::Pending,
+            consumed_by: None,
+        };
+        self.next_inbox_id += 1;
+        self.reducer_inbox
+            .insert(event.id, clone_reducer_inbox_event(&event));
+        event
     }
 
     fn lock_grant_for_claim(
@@ -1844,6 +1942,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         self.validate_plan_against_state_for_path(plan, barrier_events, true)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_plan_against_state_for_path(
         &self,
         plan: &TransitionPlan<P>,
@@ -1862,9 +1961,20 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             };
             validate_status_transition(WorkflowStatus::Cancelling, next_status)
                 .map_err(EngineError::InvalidPlan)?;
-            validate_plan_body(plan, barrier_events).map_err(EngineError::InvalidPlan)?;
+            validate_plan_body(
+                plan,
+                barrier_events,
+                &self.binding.accepted_protocol().supported_codecs,
+            )
+            .map_err(EngineError::InvalidPlan)?;
         } else {
-            validate_plan(self.status, plan, barrier_events).map_err(EngineError::InvalidPlan)?;
+            validate_plan(
+                self.status,
+                plan,
+                barrier_events,
+                &self.binding.accepted_protocol().supported_codecs,
+            )
+            .map_err(EngineError::InvalidPlan)?;
         }
         let mut family_ambiguity = self
             .effects

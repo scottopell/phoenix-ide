@@ -83,10 +83,27 @@ pub struct ProfileRef {
     pub protocol_version: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CodecRef {
     pub family: &'static str,
     pub version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedCodecRegistry(BTreeSet<CodecRef>);
+
+impl SupportedCodecRegistry {
+    #[must_use]
+    pub fn new(codecs: impl IntoIterator<Item = CodecRef>) -> Option<Self> {
+        let codecs = codecs.into_iter().collect::<BTreeSet<_>>();
+        (!codecs.is_empty() && codecs.iter().all(|codec| !codec.family.is_empty()))
+            .then_some(Self(codecs))
+    }
+
+    #[must_use]
+    pub fn supports(&self, codec: &CodecRef) -> bool {
+        self.0.contains(codec)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -300,6 +317,7 @@ pub enum EffectAmbiguity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolSelection {
     pub profile: ProfileRef,
+    pub supported_codecs: SupportedCodecRegistry,
     pub authority: SemanticAuthority,
     pub accepting: bool,
     pub runtime_acceptance_enabled: bool,
@@ -549,6 +567,15 @@ pub struct OwedAcceptanceDecisionBinding<P: WorkflowProfile> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancellationReceiptDecl<P: WorkflowProfile> {
+    pub effect_id: EffectId,
+    pub receipt_codec: CodecRef,
+    pub receipt: P::Receipt,
+    pub event_codec: CodecRef,
+    pub event: P::ReceiptReducerEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancellationRequest<P: WorkflowProfile> {
     pub expected_workflow_version: Version,
     pub next_snapshot: P::Snapshot,
@@ -556,7 +583,7 @@ pub struct CancellationRequest<P: WorkflowProfile> {
     pub event: P::Event,
     pub event_codec: CodecRef,
     pub invalidations: Vec<EffectInvalidationDecl>,
-    pub reducer_inbox_events: Vec<ReducerInboxDecl<P>>,
+    pub terminal_receipt: Option<CancellationReceiptDecl<P>>,
     pub compensation_plan: TransitionPlan<P>,
 }
 

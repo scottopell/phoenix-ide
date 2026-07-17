@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    BarrierId, CancellationRequest, ClaimAuthority, CodecRef, EffectAmbiguity, EffectDecl,
-    EffectId, EffectInvalidationDecl, EffectRole, EffectState, EffectStatus, Generation,
-    ManualChoice, ManualChoiceKind, ObservationRecord, OwedAcceptanceDecl, ProfileRef,
-    ProtocolSelection, ReducerDecision, ReducerInboxDecl, ReducerInboxEvent, ReducerInboxId,
-    ReducerInboxKind, ReducerInboxPayload, SemanticAuthority, ShadowDivergenceKind, Timestamp,
-    TransitionPlan, Version, WorkflowProfile, WorkflowState, WorkflowStatus,
+    BarrierId, CancellationReceiptDecl, CancellationRequest, ClaimAuthority, CodecRef,
+    EffectAmbiguity, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole, EffectState,
+    EffectStatus, Generation, ManualChoice, ManualChoiceKind, ObservationRecord,
+    OwedAcceptanceDecl, ProfileRef, ProtocolSelection, ReducerDecision, ReducerInboxEvent,
+    ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, SemanticAuthority, ShadowDivergenceKind,
+    SupportedCodecRegistry, Timestamp, TransitionPlan, Version, WorkflowProfile, WorkflowState,
+    WorkflowStatus,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -109,18 +110,6 @@ pub enum TmuxTerminalStatus {
     WindowKilled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentTerminalStatus {
-    SubmitResult,
-    SubmitError,
-    WallClockTimeout,
-    IndependentlyObservedCancellation,
-    TurnLimitHardStop,
-    ImplicitTextCompletion,
-    RuntimeFailure,
-    ContextExhausted,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashTerminalEvidence {
     pub identity: BashResourceIdentity,
@@ -144,18 +133,38 @@ pub struct TmuxTerminalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedChildTerminalRecord(String);
+
+impl PersistedChildTerminalRecord {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubagentTerminalOutcome {
     SubmitResult { result: String },
-    SubmitError { error: String },
+    SubmitError { kind: String, error: String },
     ImplicitTextCompletion { result: String },
-    RuntimeFailure { kind: String, error: String },
+    RuntimeFailure { kind: String },
     ContextExhausted,
+    WallClockTimeout,
+    IndependentlyObservedCancellation,
+    TurnLimitHardStop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentTerminalEvidence {
     pub identity: SubagentResourceIdentity,
     pub occurred_at: Timestamp,
+    pub persisted_child_terminal_record: PersistedChildTerminalRecord,
     pub outcome: SubagentTerminalOutcome,
 }
 
@@ -443,10 +452,23 @@ pub fn profile() -> ProfileRef {
     }
 }
 
+fn supported_codecs() -> SupportedCodecRegistry {
+    SupportedCodecRegistry::new([
+        snapshot_codec(),
+        event_codec(),
+        intent_codec(),
+        manual_codec(),
+        barrier_codec(),
+        terminal_codec(),
+    ])
+    .unwrap_or_else(|| unreachable!("static wake codec registry is non-empty and valid"))
+}
+
 #[must_use]
 pub fn protocol(selector: &'static str, accepting: bool) -> ProtocolSelection {
     ProtocolSelection {
         profile: profile(),
+        supported_codecs: supported_codecs(),
         authority: SemanticAuthority::EngineProtocol,
         accepting,
         runtime_acceptance_enabled: true,
@@ -667,14 +689,21 @@ pub fn cancellation_request(
         event: WakeRegistrationEvent::CancelRequested,
         event_codec: event_codec(),
         invalidations,
-        reducer_inbox_events: vec![ReducerInboxDecl {
-            effect_id: None,
-            barrier_id: None,
-            kind: ReducerInboxKind::ReceiptAccepted,
-            event_codec: terminal_codec(),
-            requires_runtime_acceptance: false,
-            payload: ReducerInboxPayload::Receipt(cancelled_terminal),
-        }],
+        terminal_receipt: workflow
+            .effects
+            .iter()
+            .find(|(_, effect)| {
+                effect.declaration.kind == OBSERVE_HANDLE_KIND
+                    && effect.declaration.generation == workflow.generation
+                    && effect.receipt.is_none()
+            })
+            .map(|(effect_id, _)| CancellationReceiptDecl {
+                effect_id: *effect_id,
+                receipt_codec: terminal_codec(),
+                receipt: cancelled_terminal.clone(),
+                event_codec: terminal_codec(),
+                event: cancelled_terminal,
+            }),
         compensation_plan: TransitionPlan {
             next_status: WorkflowStatus::Cancelled,
             snapshot: next_snapshot.clone(),
