@@ -997,7 +997,10 @@ mod tests {
         tokio::time::timeout(StdDuration::from_secs(5), async {
             loop {
                 if matches!(
-                    manager.bash_handles().inspect_terminal(&handle_id).await,
+                    manager
+                        .bash_handles()
+                        .inspect_terminal(&WorkScope::Conversation("conv".to_owned()), &handle_id)
+                        .await,
                     phoenix_tools::bash::BashTerminalInspection::Terminal { .. }
                 ) {
                     break;
