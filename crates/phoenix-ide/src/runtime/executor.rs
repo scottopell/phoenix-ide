@@ -4764,7 +4764,8 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
-        );
+        )
+        .with_root_conversation_id(self.context.root_conversation_id.clone());
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();

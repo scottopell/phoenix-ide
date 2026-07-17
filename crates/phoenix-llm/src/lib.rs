@@ -197,21 +197,31 @@ pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     model_id: String,
     provider: &'static str,
-    transport: &'static str,
+    streaming_transport: &'static str,
 }
 
 impl LoggingService {
     pub fn new(
         inner: Arc<dyn LlmService>,
         provider: &'static str,
-        transport: &'static str,
+        streaming_transport: &'static str,
     ) -> Self {
         let model_id = inner.model_id().to_string();
         Self {
             inner,
             model_id,
             provider,
-            transport,
+            streaming_transport,
+        }
+    }
+
+    fn transport_for(&self, streaming: bool) -> &'static str {
+        if self.streaming_transport == "in_process" {
+            "in_process"
+        } else if streaming {
+            self.streaming_transport
+        } else {
+            "http_json"
         }
     }
 }
@@ -223,6 +233,7 @@ impl LoggingService {
     /// local log filtering. Usage/error fields are `Empty` until the call
     /// resolves.
     fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
+        let transport = self.transport_for(streaming);
         let telemetry = request.telemetry.as_ref();
         let generated_request_id = format!("llm-{}", rand::random::<u64>());
         let request_id = telemetry.map_or(generated_request_id.as_str(), |value| {
@@ -236,7 +247,7 @@ impl LoggingService {
             otel.status_code = tracing::field::Empty,
             model = %self.model_id,
             provider = self.provider,
-            transport = self.transport,
+            transport,
             streaming,
             conv_id = telemetry.map(|value| value.conversation_id.as_str()),
             root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
@@ -358,5 +369,27 @@ impl LlmService for LoggingService {
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {
         self.inner.continuation_request_limits()
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use crate::mock::MockLlmService;
+
+    #[test]
+    fn logging_transport_matches_the_actual_call_path() {
+        let http = LoggingService::new(Arc::new(MockLlmService), "anthropic", "http_sse");
+        assert_eq!(http.transport_for(false), "http_json");
+        assert_eq!(http.transport_for(true), "http_sse");
+
+        let codex =
+            LoggingService::new(Arc::new(MockLlmService), "openai", "websocket_or_http_sse");
+        assert_eq!(codex.transport_for(false), "http_json");
+        assert_eq!(codex.transport_for(true), "websocket_or_http_sse");
+
+        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", "in_process");
+        assert_eq!(mock.transport_for(false), "in_process");
+        assert_eq!(mock.transport_for(true), "in_process");
     }
 }

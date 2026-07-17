@@ -248,6 +248,9 @@ pub struct ToolContext {
     /// The conversation this tool is executing within
     pub conversation_id: String,
 
+    /// Root conversation for trace correlation across sub-agents.
+    pub root_conversation_id: String,
+
     /// Working directory for file operations
     pub working_dir: PathBuf,
 
@@ -303,10 +306,12 @@ impl ToolContext {
         tmux_registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
     ) -> Self {
+        let root_conversation_id = conversation_id.clone();
         let work_scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
         Self {
             cancel,
             conversation_id,
+            root_conversation_id,
             working_dir,
             browser_sessions,
             bash_handles,
@@ -316,6 +321,12 @@ impl ToolContext {
             worktree_path,
             work_scope,
         }
+    }
+
+    #[must_use]
+    pub fn with_root_conversation_id(mut self, root_conversation_id: String) -> Self {
+        self.root_conversation_id = root_conversation_id;
+        self
     }
 
     /// Get or create the browser session for this conversation's

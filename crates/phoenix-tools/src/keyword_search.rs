@@ -448,7 +448,12 @@ impl KeywordSearchTool {
             }],
             tools: vec![],
             max_tokens: Some(4096),
-            telemetry: None,
+            telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
+                conversation_id: ctx.conversation_id.clone(),
+                root_conversation_id: ctx.root_conversation_id.clone(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                retry_attempt: 1,
+            }),
             // Shared by every keyword-search filter call so FILTER_SYSTEM_PROMPT caches.
             cache_key: PromptCacheKey::stable("keyword-search-filter"),
         };

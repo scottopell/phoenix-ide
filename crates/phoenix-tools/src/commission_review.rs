@@ -450,7 +450,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             }],
             tools: vec![],
             max_tokens: Some(4096),
-            telemetry: None,
+            telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
+                conversation_id: ctx.conversation_id.clone(),
+                root_conversation_id: ctx.root_conversation_id.clone(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                retry_attempt: 1,
+            }),
             cache_key: PromptCacheKey::stable(format!(
                 "commission-review:{}:{index}",
                 ctx.conversation_id
