@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    BarrierDecl, BarrierId, BarrierMemberDecl, CancellationRequest, ClaimAuthority, CodecRef,
-    EffectAmbiguity, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole, EffectState,
-    EffectStatus, Generation, ManualChoice, ManualChoiceKind, ObservationRecord,
-    OwedAcceptanceDecl, ProfileRef, ProtocolSelection, ReceiptFamily, ReducerDecision,
-    ReducerInboxDecl, ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload,
-    SemanticAuthority, ShadowDivergenceKind, Timestamp, TransitionPlan, Version, WorkflowProfile,
-    WorkflowState, WorkflowStatus,
+    BarrierId, CancellationRequest, ClaimAuthority, CodecRef, EffectAmbiguity, EffectDecl,
+    EffectId, EffectInvalidationDecl, EffectRole, EffectState, EffectStatus, Generation,
+    ManualChoice, ManualChoiceKind, ObservationRecord, OwedAcceptanceDecl, ProfileRef,
+    ProtocolSelection, ReducerDecision, ReducerInboxDecl, ReducerInboxEvent, ReducerInboxId,
+    ReducerInboxKind, ReducerInboxPayload, SemanticAuthority, ShadowDivergenceKind, Timestamp,
+    TransitionPlan, Version, WorkflowProfile, WorkflowState, WorkflowStatus,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -145,11 +144,19 @@ pub struct TmuxTerminalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentTerminalOutcome {
+    SubmitResult { result: String },
+    SubmitError { error: String },
+    ImplicitTextCompletion { result: String },
+    RuntimeFailure { kind: String, error: String },
+    ContextExhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentTerminalEvidence {
     pub identity: SubagentResourceIdentity,
-    pub status: SubagentTerminalStatus,
     pub occurred_at: Timestamp,
-    pub result: Option<String>,
+    pub outcome: SubagentTerminalOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,8 +383,8 @@ impl WorkflowProfile for WakeProfile {
         )
     }
 
-    fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool {
-        !matches!(event, WakeTerminalPayload::Cancelled { .. })
+    fn receipt_requires_runtime_acceptance(_event: &Self::ReceiptReducerEvent) -> bool {
+        false
     }
 
     fn decision_handles_inbox(
@@ -596,15 +603,8 @@ pub fn registration_decision(
                     destructive_resource: None,
                 }],
                 dependencies: vec![],
-                barriers: vec![BarrierDecl {
-                    barrier_id: REGISTRATION_BARRIER_ID,
-                    reducer_event_codec: barrier_codec(),
-                }],
-                barrier_members: vec![BarrierMemberDecl {
-                    barrier_id: REGISTRATION_BARRIER_ID,
-                    effect_id: REGISTRATION_EFFECT_ID,
-                    receipt_family: ReceiptFamily::CurrentGenerationEffect,
-                }],
+                barriers: vec![],
+                barrier_members: vec![],
                 invalidations: vec![],
                 owed_acceptances: None,
             },

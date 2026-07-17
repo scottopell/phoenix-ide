@@ -2,24 +2,23 @@ use std::collections::BTreeMap;
 
 use crate::{
     AuthorityOutcome, ClaimOutcome, CommitOutcome, EffectStatus, LeaseExpiry, ManualChoiceKind,
-    ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, Timestamp, Version, WorkflowId,
-    WorkflowProfile, WorkflowState,
+    ReducerInboxId, ReducerInboxPayload, Timestamp, Version, WorkflowId, WorkflowProfile,
+    WorkflowState,
 };
 
 use super::{
     acceptance_owed_decl, authoritative_observation, barrier_events, cancellation_request,
     cancelled_terminal_payload, compare_receipts, continuation_from_snapshot,
     deadline_matches_exactly, evidence_matches_resource, fence_accepts, forgotten_terminal_payload,
-    inbox_contains_registration_barrier, lifecycle_fence, manual_choices, profile,
-    project_runtime_availability, protocol, registration_decision, registration_fence,
-    registration_receipt, shadow_comparison, terminal_codec, terminal_payload_from_evidence,
-    transfer_continuation, BashResourceIdentity, BashTerminalEvidence, BashTerminalStatus,
-    FenceStatus, ObserveHandleIntent, RuntimeAvailability, RuntimeAvailabilityProjection,
-    TmuxResourceIdentity, TmuxTerminalEvidence, TmuxTerminalStatus, WakeCancellationOutcome,
-    WakeCancellationReason, WakeForgottenReason, WakeManualPayload, WakeProfile,
-    WakeRegistrationIntent, WakeRegistrationReceipt, WakeResourceIdentity,
-    WakeShadowComparisonKind, WakeTerminalEvidence, WakeTerminalPayload, WorkScopeIdentity,
-    WorkScopeKind, REGISTRATION_BARRIER_ID, REGISTRATION_EFFECT_ID,
+    lifecycle_fence, manual_choices, profile, project_runtime_availability, protocol,
+    registration_decision, registration_fence, registration_receipt, shadow_comparison,
+    terminal_codec, terminal_payload_from_evidence, transfer_continuation, BashResourceIdentity,
+    BashTerminalEvidence, BashTerminalStatus, FenceStatus, ObserveHandleIntent,
+    RuntimeAvailability, RuntimeAvailabilityProjection, TmuxResourceIdentity, TmuxTerminalEvidence,
+    TmuxTerminalStatus, WakeCancellationOutcome, WakeCancellationReason, WakeForgottenReason,
+    WakeManualPayload, WakeProfile, WakeRegistrationIntent, WakeRegistrationReceipt,
+    WakeResourceIdentity, WakeShadowComparisonKind, WakeTerminalEvidence, WakeTerminalPayload,
+    WorkScopeIdentity, WorkScopeKind, REGISTRATION_BARRIER_ID, REGISTRATION_EFFECT_ID,
 };
 
 fn scope() -> WorkScopeIdentity {
@@ -424,6 +423,7 @@ fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection()
     .expect("matching terminal");
     workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(5),
         Some(attempt.id),
         crate::ReceiptOrigin::Execution,
@@ -541,9 +541,8 @@ fn shadow_comparison_maps_all_specified_kinds() {
 }
 
 #[test]
-fn registration_barrier_receipt_round_trip_is_deterministic() {
+fn terminal_receipt_does_not_refire_registration_barrier() {
     let mut workflow = workflow();
-    let receipt = registration_receipt(&registration_intent(tmux_identity("win-14")));
     let (decision, events) = registration_decision(
         Version(0),
         &registration_intent(tmux_identity("win-14")),
@@ -565,6 +564,7 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
     assert_eq!(
         workflow.record_observation(
             &authority,
+            Timestamp(5),
             Timestamp(5),
             attempt.id,
             terminal_codec(),
@@ -604,6 +604,7 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
     .expect("matching evidence");
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(5),
         Some(attempt.id),
         crate::ReceiptOrigin::Execution,
@@ -613,16 +614,7 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
         terminal,
     );
     assert_eq!(accepted.outcome, AuthorityOutcome::Authorized);
-    assert_eq!(accepted.reducer_events.len(), 1);
-    let barrier = &accepted.reducer_events[0];
-    assert_eq!(barrier.kind, ReducerInboxKind::BarrierSatisfied);
-    assert_eq!(
-        barrier.payload,
-        ReducerInboxPayload::Barrier(super::WakeBarrierEvent::RegistrationObserved {
-            receipt: receipt.clone()
-        })
-    );
-    assert!(inbox_contains_registration_barrier(barrier, &receipt));
+    assert!(accepted.reducer_events.is_empty());
 }
 
 #[test]
@@ -661,6 +653,7 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
     assert_eq!(
         workflow.record_observation(
             &authority,
+            Timestamp(6),
             Timestamp(6),
             attempt.id,
             terminal_codec(),

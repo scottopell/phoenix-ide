@@ -517,6 +517,7 @@ fn observations_and_receipts_require_matching_attempt() {
         workflow.record_observation(
             &authority,
             Timestamp(1),
+            Timestamp(1),
             AttemptId(999),
             codec("observation"),
             "saw"
@@ -527,6 +528,7 @@ fn observations_and_receipts_require_matching_attempt() {
         workflow.record_observation(
             &authority,
             Timestamp(1),
+            Timestamp(1),
             attempt.id,
             codec("observation"),
             "saw"
@@ -535,6 +537,7 @@ fn observations_and_receipts_require_matching_attempt() {
     );
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(2),
         Some(AttemptId(999)),
         ReceiptOrigin::Execution,
@@ -563,6 +566,7 @@ fn receipt_and_reducer_event_codecs_are_persisted_independently() {
     let attempt = claim.attempt.expect("attempt created");
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -600,6 +604,7 @@ fn stale_observations_are_retained_diagnostically() {
     assert_eq!(
         workflow.record_observation(
             &authority,
+            Timestamp(2),
             Timestamp(2),
             attempt.id,
             codec("observation"),
@@ -658,6 +663,7 @@ fn barrier_satisfaction_returns_all_events() {
     let first_attempt = first.attempt.expect("attempt created");
     let _ = workflow.accept_receipt(
         &first_authority,
+        first_authority.worker_id,
         Timestamp(1),
         Some(first_attempt.id),
         ReceiptOrigin::Execution,
@@ -671,6 +677,7 @@ fn barrier_satisfaction_returns_all_events() {
     let second_attempt = second.attempt.expect("attempt created");
     let accepted = workflow.accept_receipt(
         &second_authority,
+        second_authority.worker_id,
         Timestamp(2),
         Some(second_attempt.id),
         ReceiptOrigin::Execution,
@@ -891,6 +898,7 @@ fn owed_acceptance_requires_exact_consumed_inbox_link() {
     let attempt = claim.attempt.expect("attempt created");
     let accepted = state.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -1319,6 +1327,7 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
     let attempt = claim.attempt.expect("attempt created");
     let rejected = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Manual,
@@ -1400,6 +1409,7 @@ fn runtime_acceptance_requires_exact_one_to_one_inbox_mapping() {
     let attempt = claim.attempt.expect("attempt created");
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -1622,6 +1632,7 @@ fn runtime_acceptance_capability_is_independent_from_external_acceptance() {
     let attempt = claim.attempt.expect("attempt");
     let receipt = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -1812,6 +1823,7 @@ fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
     let attempt = claim.attempt.expect("attempt");
     let receipt = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -1913,6 +1925,7 @@ fn suppression_persists_typed_disposition() {
     let attempt = claim.attempt.expect("attempt created");
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -2037,6 +2050,7 @@ fn reject_unknown_and_receipted_invalidations() {
     let attempt = claim.attempt.expect("attempt created");
     let _ = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -2253,6 +2267,7 @@ fn cancel_only_invalidates_active_like_effects() {
     let attempt = claim.attempt.expect("attempt created");
     let _ = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -2452,6 +2467,7 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
         receipt_path
             .accept_receipt(
                 &reconciliation,
+                reconciliation.worker_id,
                 Timestamp(10),
                 Some(reconciliation_attempt.id),
                 ReceiptOrigin::Execution,
@@ -2467,6 +2483,7 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
         receipt_path
             .accept_receipt(
                 &reconciliation,
+                reconciliation.worker_id,
                 Timestamp(10),
                 Some(reconciliation_attempt.id),
                 ReceiptOrigin::Reconciliation,
@@ -2791,6 +2808,7 @@ fn reducer_only_inbox_consumes_without_owed_but_receipt_requires_exact_runtime_a
     let attempt = claim.attempt.expect("attempt");
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -2988,6 +3006,7 @@ fn observation_codec_persists_and_empty_family_is_rejected() {
         workflow.record_observation(
             &authority,
             Timestamp(1),
+            Timestamp(1),
             attempt.id,
             codec("observation"),
             "observed"
@@ -3002,6 +3021,7 @@ fn observation_codec_persists_and_empty_family_is_rejected() {
     assert_eq!(
         workflow.record_observation(
             &authority,
+            Timestamp(1),
             Timestamp(1),
             attempt.id,
             CodecRef {
@@ -3191,6 +3211,7 @@ fn empty_receipt_codecs_are_rejected() {
     let before = workflow.clone();
     let accepted = workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(attempt.id),
         ReceiptOrigin::Execution,
@@ -3275,6 +3296,7 @@ fn forged_or_missing_destructive_resource_lock_is_rejected() {
         workflow.record_observation(
             &forged,
             Timestamp(1),
+            Timestamp(1),
             attempt.id,
             codec("observation"),
             "forged"
@@ -3290,6 +3312,7 @@ fn forged_or_missing_destructive_resource_lock_is_rejected() {
         workflow
             .accept_receipt(
                 &forged_lock,
+                forged_lock.worker_id,
                 Timestamp(1),
                 Some(attempt.id),
                 ReceiptOrigin::Execution,
@@ -3493,6 +3516,7 @@ fn review_regressions_preserve_renewed_authority_and_ambiguity_family_contract()
         workflow.record_observation(
             &renewed_authority,
             Timestamp(2),
+            Timestamp(2),
             attempt.id,
             codec("observation"),
             "after-renewal",
@@ -3562,6 +3586,7 @@ fn renewed_claim_rejects_the_pre_renewal_authority_for_non_destructive_effects()
         workflow.record_observation(
             &original_authority,
             Timestamp(2),
+            Timestamp(2),
             attempt.id,
             codec("observation"),
             "stale bearer",
@@ -3571,6 +3596,7 @@ fn renewed_claim_rejects_the_pre_renewal_authority_for_non_destructive_effects()
     assert_eq!(
         workflow.record_observation(
             &renewed_authority,
+            Timestamp(2),
             Timestamp(2),
             attempt.id,
             codec("observation"),
@@ -3615,7 +3641,8 @@ fn post_terminal_receipt_is_durably_suppressed_instead_of_pending() {
         )
         .expect("complete workflow");
     let accepted = workflow.accept_receipt(
-        &claim.authority.expect("authority"),
+        &claim.authority.clone().expect("authority"),
+        claim.authority.expect("authority").worker_id,
         Timestamp(1),
         Some(claim.attempt.expect("attempt").id),
         ReceiptOrigin::Execution,
@@ -3803,6 +3830,7 @@ fn review_regressions_reject_misbound_inbox_and_cross_workflow_observation() {
     assert_eq!(
         workflow.record_observation(
             &authority,
+            Timestamp(2),
             Timestamp(2),
             claim.attempt.expect("attempt").id,
             codec("observation"),
@@ -4026,6 +4054,7 @@ fn review_regressions_reject_misbound_owed_decision_and_profile_controls_receipt
     let authority = claim.authority.expect("authority");
     let accepted = receipt_workflow.accept_receipt(
         &authority,
+        authority.worker_id,
         Timestamp(1),
         Some(claim.attempt.expect("attempt").id),
         ReceiptOrigin::Execution,
@@ -4409,7 +4438,8 @@ fn terminal_manual_receipt_and_post_terminal_barrier_are_suppressed() {
     let first =
         terminal_workflow.claim_effect(EffectId(1), "worker-1", Timestamp(0), LeaseExpiry(10));
     let first_receipt = terminal_workflow.accept_receipt(
-        &first.authority.expect("authority"),
+        &first.authority.clone().expect("authority"),
+        first.authority.expect("authority").worker_id,
         Timestamp(1),
         Some(first.attempt.expect("attempt").id),
         ReceiptOrigin::Execution,
@@ -4452,7 +4482,8 @@ fn terminal_manual_receipt_and_post_terminal_barrier_are_suppressed() {
         terminal_workflow.claim_effect(EffectId(2), "worker-2", Timestamp(1), LeaseExpiry(10));
     terminal_workflow.status = WorkflowStatus::Completed;
     let second_receipt = terminal_workflow.accept_receipt(
-        &second.authority.expect("authority"),
+        &second.authority.clone().expect("authority"),
+        second.authority.expect("authority").worker_id,
         Timestamp(2),
         Some(second.attempt.expect("attempt").id),
         ReceiptOrigin::Execution,
