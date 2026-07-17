@@ -29,6 +29,15 @@
   background: var(--bg-secondary);
 }
 
+.mobile-pr-dock-note {
+  padding: 4px 8px 6px;
+  display: block;
+}
+
+.mobile-pr-action--hero .work-actions-pr-coverage {
+  margin-left: 8px;
+}
+
 .mobile-pr-rail {
   min-height: 36px;
   padding: 4px 8px;

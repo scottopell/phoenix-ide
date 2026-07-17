@@ -139,6 +139,15 @@ export function WorkControlBar({
     () => associatedPrs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft'),
     [associatedPrs],
   );
+  const activePrIsActionable = Boolean(
+    activePr
+    && actionablePrs.some(
+      (pr) => pr.repo_owner === activePr.repo_owner
+        && pr.repo_name === activePr.repo_name
+        && pr.pr_number === activePr.pr_number,
+    ),
+  );
+  const mobileRailCanRepresentActiveSelection = actionablePrs.length > 0 && (!activePr || activePrIsActionable);
   const diffLabel = useMemo(
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
@@ -268,11 +277,23 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (isMobile) {
-    if (actionablePrs.length === 0) {
+    if (!mobileRailCanRepresentActiveSelection) {
       return (
         <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+          )}
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--hero"
+              data-testid="mobile-primary-address-feedback"
+              disabled={capturing}
+              onClick={handleAddressFeedback}
+            >
+              <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+              <CoverageMarker marker={coverageMarker} />
+            </button>
           )}
           {disposition.primary === 'review' && (
             <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
@@ -280,10 +301,28 @@ export function WorkControlBar({
             </button>
           )}
           {disposition.showCleanUp && !cleanupBlockedByAmbiguity && (
-            <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--cleanup"
+              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+              title={cleanUpHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleCleanUp}
+            >
+              Clean up
+            </button>
           )}
           {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
-            <button type="button" className="mobile-pr-action mobile-pr-action--danger" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--danger"
+              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+              title={abandonHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleAbandon}
+            >
+              Abandon
+            </button>
           )}
           {disposition.note && <span className="work-actions-note">{disposition.note.text}</span>}
           {error && <div className="work-actions-error" role="alert">{error}</div>}
@@ -303,7 +342,8 @@ export function WorkControlBar({
         disabled={capturing}
         onClick={handleAddressFeedback}
       >
-        {capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}
+        <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+        <CoverageMarker marker={coverageMarker} />
       </button>
     ) : disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
       <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
@@ -341,12 +381,26 @@ export function WorkControlBar({
                 </a>
               )}
               {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
-                <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--cleanup"
+                  aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+                  title={cleanUpHintText(isBranch)}
+                  disabled={isLoading}
+                  onClick={handleCleanUp}
+                >
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
                 </button>
               )}
               {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
-                <button type="button" className="mobile-pr-action mobile-pr-action--danger" disabled={isLoading} onClick={handleAbandon}>
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--danger"
+                  aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+                  title={abandonHintText(isBranch)}
+                  disabled={isLoading}
+                  onClick={handleAbandon}
+                >
                   <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Abandon</span>
                 </button>
               )}
@@ -384,6 +438,7 @@ export function WorkControlBar({
           })}
         </div>
         {error && <div className="work-actions-error" role="alert">{error}</div>}
+        {note && <span className="work-actions-note mobile-pr-dock-note">{note.text}</span>}
       </div>
     );
   }

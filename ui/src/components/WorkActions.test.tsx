@@ -1188,7 +1188,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--danger');
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
   });
 
   it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
@@ -1199,7 +1199,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Clean up' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -1220,7 +1220,89 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Abandon' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+  });
+
+  it('renders feedback coverage warnings on the mobile Address feedback hero', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-coverage" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    const hero = screen.getByTestId('mobile-primary-address-feedback');
+    expect(hero.querySelector('.work-actions-pr-coverage')).toHaveTextContent('GitHub sign-in needed');
+  });
+
+  it('preserves terminal action explanations on mobile', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-hints" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Captures a diff snapshot'));
+  });
+
+  it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
+    enableMobile();
+    const mixedSelection = selection({
+      associated_prs: [
+        { ...selection().associated_prs[0]!, state: 'CLOSED', display_state: 'merged' },
+        { ...selection().associated_prs[0]!, pr_number: 13, title: 'Still open', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+      ],
+    });
+    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: mixedSelection });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-terminal-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('No confirmation'));
+    expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
+  });
+
+  it('renders disposition guidance beside an actionable PR rail', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-continued" convModeLabel="Work" phaseType="idle" continuedInConvId="continued-conversation" prStatusHandle={prStatusHandle()} />,
+    );
+
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
+  });
+
+  it('keeps Address feedback for a cached PR before associations load', () => {
+    enableMobile();
+    const handle = prStatusHandle(
+      { found: true, number: 12, url: 'https://github.com/o/r/pull/12', display_state: 'open', check_state: 'failing', feedback_status: 'open' },
+      { activeSelection: null, activePrSummary: null, ambiguous: false },
+    );
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-cached" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
   });
 
   it('pins a different open PR through the shared handle', async () => {

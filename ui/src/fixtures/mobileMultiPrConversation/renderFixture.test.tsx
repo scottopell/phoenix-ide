@@ -94,7 +94,7 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(screen.getByRole('button', { name: 'PR #423 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--danger');
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });
