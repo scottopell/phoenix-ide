@@ -1272,6 +1272,7 @@ fn capsule_priority(item: &GlobalOpenWorkItem) -> u8 {
         "failed",
         "recovery",
         "context_exhausted",
+        "contextexhausted",
     ]
     .iter()
     .any(|needle| state.contains(needle))
@@ -1284,6 +1285,7 @@ fn capsule_priority(item: &GlobalOpenWorkItem) -> u8 {
                 "error",
                 "recovery",
                 "blocked",
+                "needs action",
             ]
             .iter()
             .any(|needle| signal.contains(needle))
@@ -1311,6 +1313,13 @@ async fn resolve_global_message_target(
     } else if let Some(rest) = reference.strip_prefix("@work:") {
         let (id, _) = split_fragment(rest);
         let root_id = first_token(id);
+        if root_id.is_empty() {
+            return Err(GlobalMessageTargetError::MissingId);
+        }
+        resolve_current_work_conversation_id(service, root_id).await?
+    } else if let Some(rest) = reference.strip_prefix("/chains/") {
+        let (root_id, _) = split_fragment(rest);
+        let root_id = first_token(root_id);
         if root_id.is_empty() {
             return Err(GlobalMessageTargetError::MissingId);
         }
@@ -1674,10 +1683,10 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_current_work_capsule, format_open_work_for_agent, group_conversation_chains,
-        is_intrinsically_closed, is_open_work_candidate, message_id_fragment, paginate_open_work,
-        parse_conv_handle, split_fragment, GlobalOpenWorkItem, GlobalOpenWorkProject,
-        GlobalOpenWorkResponse, GlobalOpenWorkSource,
+        capsule_priority, format_current_work_capsule, format_open_work_for_agent,
+        group_conversation_chains, is_intrinsically_closed, is_open_work_candidate,
+        message_id_fragment, paginate_open_work, parse_conv_handle, split_fragment,
+        GlobalOpenWorkItem, GlobalOpenWorkProject, GlobalOpenWorkResponse, GlobalOpenWorkSource,
     };
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::ConvState;
@@ -1767,6 +1776,38 @@ mod tests {
         let output = format_open_work_for_agent(&first, 0);
         assert!(output.contains("has_more: true"));
         assert!(output.contains("next_offset: 2"));
+    }
+
+    #[test]
+    fn context_exhausted_variants_are_attention_priority() {
+        let now = Utc::now();
+        let mut item = GlobalOpenWorkItem {
+            id: "a".to_string(),
+            source: GlobalOpenWorkSource::Conversation,
+            title: "Continue work".to_string(),
+            project_id: None,
+            current_conversation_id: "a".to_string(),
+            current_conversation_slug: None,
+            root_conversation_id: "a".to_string(),
+            root_conversation_slug: None,
+            updated_at: now,
+            mode: "Work".to_string(),
+            state: "ContextExhausted".to_string(),
+            task_id: None,
+            task_title: None,
+            task_status: None,
+            branch_name: None,
+            base_branch: None,
+            worktree_path: None,
+            member_count: 1,
+            signals: vec![],
+            href: "/c/a".to_string(),
+            reference: "@work:a".to_string(),
+        };
+        assert_eq!(capsule_priority(&item), 0);
+        item.state = "Idle".to_string();
+        item.signals = vec!["needs action".to_string()];
+        assert_eq!(capsule_priority(&item), 0);
     }
 
     #[test]

@@ -71,10 +71,28 @@ impl SendChatApplicationService {
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let request_fingerprint = request_fingerprint(&req)?;
         let mut receipts = self.runtime.lock_chat_acceptance().await;
+        let conversation = self
+            .runtime
+            .db()
+            .get_conversation(&req.conversation_id)
+            .await
+            .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
         if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
-            if message.conversation_id != req.conversation_id
-                || !persisted_message_matches(&message.content, &req)
-            {
+            let persisted_matches = match &message.content {
+                phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
+                    let expanded = expand_request(&self.db, &conversation, &req).await?;
+                    persisted_skill_matches(skill, &req, &expanded)
+                }
+                content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
+                    persisted_user_message_matches(content, &req)
+                }
+                phoenix_core::domain::db_schema::MessageContent::Agent(_)
+                | phoenix_core::domain::db_schema::MessageContent::Tool(_)
+                | phoenix_core::domain::db_schema::MessageContent::System(_)
+                | phoenix_core::domain::db_schema::MessageContent::Error(_)
+                | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
+            };
+            if message.conversation_id != req.conversation_id || !persisted_matches {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             receipts.remove(&req.message_id);
@@ -83,13 +101,6 @@ impl SendChatApplicationService {
         if let Some(receipt) = receipts.get(&req.message_id) {
             return replay_receipt(receipt, &req, &request_fingerprint);
         }
-
-        let conversation = self
-            .runtime
-            .db()
-            .get_conversation(&req.conversation_id)
-            .await
-            .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
                 message: "Conversation is archived and unavailable for messaging.".to_string(),
@@ -337,7 +348,7 @@ fn queued_entry_matches(
         && entry.skill_invocation == expanded.skill_invocation
 }
 
-fn persisted_message_matches(
+fn persisted_user_message_matches(
     content: &phoenix_core::domain::db_schema::MessageContent,
     req: &SendChatRequest,
 ) -> bool {
@@ -355,6 +366,30 @@ fn persisted_message_matches(
             })
         && user.files.len() == req.files.len()
         && user
+            .files
+            .iter()
+            .zip(&req.files)
+            .all(|(stored, requested)| {
+                stored.original_name == requested.original_name
+                    && stored.media_type == requested.media_type
+                    && stored.size_bytes == requested.size_bytes
+                    && stored.stored_path == requested.stored_path
+            })
+}
+
+fn persisted_skill_matches(
+    skill: &phoenix_core::domain::db_schema::SkillContent,
+    req: &SendChatRequest,
+    expanded: &ExpandedDispatchMessage,
+) -> bool {
+    let Some(invocation) = expanded.skill_invocation.as_ref() else {
+        return false;
+    };
+    skill.name == invocation.name
+        && skill.body == invocation.body
+        && skill.trigger == req.text
+        && skill.files.len() == req.files.len()
+        && skill
             .files
             .iter()
             .zip(&req.files)
@@ -429,5 +464,44 @@ fn transition_code(err: &TransitionError) -> &'static str {
         TransitionError::AgentBusy => "agent_busy",
         TransitionError::CancellationInProgress => "cancellation_in_progress",
         TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        persisted_skill_matches, ExpandedDispatchMessage, MessageExpansionPolicy, SendChatRequest,
+    };
+    use phoenix_core::domain::db_schema::SkillContent;
+    use phoenix_core::domain::skill_invocation::SkillInvocation;
+
+    #[test]
+    fn persisted_skill_retry_matches_expanded_invocation() {
+        let request = SendChatRequest {
+            conversation_id: "conv-1".to_string(),
+            text: "/build now".to_string(),
+            message_id: "message-1".to_string(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::ExpandReferences,
+        };
+        let expanded = ExpandedDispatchMessage {
+            display_text: request.text.clone(),
+            llm_text: None,
+            skill_invocation: Some(SkillInvocation {
+                name: "build".to_string(),
+                body: "expanded body".to_string(),
+                skill_dir: "/skills/build".to_string(),
+            }),
+        };
+        let persisted = SkillContent {
+            name: "build".to_string(),
+            body: "expanded body".to_string(),
+            trigger: request.text.clone(),
+            files: vec![],
+        };
+
+        assert!(persisted_skill_matches(&persisted, &request, &expanded));
     }
 }
