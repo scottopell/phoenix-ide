@@ -754,6 +754,89 @@ mod tests {
         assert_ne!(direct, work);
     }
 
+    #[tokio::test]
+    async fn inherited_child_prompt_uses_parent_snapshot_after_mutation_and_restart() {
+        let temp = TempDir::new().unwrap();
+        let guidance_path = temp.path().join("AGENTS.md");
+        fs::write(&guidance_path, "parent snapshot guidance").unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "build",
+            "build",
+            "Parent snapshot skill body.",
+        );
+        let snapshot =
+            discover_project_instruction_bundle_with_options(temp.path(), Some(temp.path()), None);
+        let db_path = temp.path().join("snapshot.db");
+        let db = crate::db::Database::open(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation(
+            "parent",
+            "parent",
+            temp.path().to_str().unwrap(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_conversation(
+            "child",
+            "child",
+            temp.path().to_str().unwrap(),
+            false,
+            Some("parent"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.initialize_project_instruction_bundle_if_absent("parent", &snapshot)
+            .await
+            .unwrap();
+
+        fs::write(&guidance_path, "mutated guidance").unwrap();
+        write_skill(
+            temp.path(),
+            ".claude/skills",
+            "build",
+            "build",
+            "Mutated skill body.",
+        );
+        db.copy_active_project_instruction_bundle_to_child("parent", "child")
+            .await
+            .unwrap();
+        drop(db);
+
+        let reopened = crate::db::Database::open(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::db::run_pending_migrations(reopened.pool())
+            .await
+            .unwrap();
+        let child = reopened
+            .load_active_project_instruction_bundle("child")
+            .await
+            .unwrap()
+            .unwrap();
+        let prompt = build_system_prompt_with_project_instructions(
+            temp.path(),
+            "tasks",
+            true,
+            Some(&ModeContext::Direct),
+            LlmLanguage::default(),
+            None,
+            ExploreBashCapability::Unavailable,
+            &child,
+        );
+        assert!(prompt.contains("parent snapshot guidance"));
+        assert!(prompt.contains("Parent snapshot skill body."));
+        assert!(!prompt.contains("mutated guidance"));
+        assert!(!prompt.contains("Mutated skill body."));
+    }
+
     #[test]
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();

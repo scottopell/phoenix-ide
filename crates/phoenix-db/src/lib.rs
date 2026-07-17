@@ -151,6 +151,12 @@ pub enum CreationCasOutcome {
     ClaimLost,
 }
 
+#[derive(Debug, Clone)]
+pub enum CreationMetadataCommitOutcome {
+    Applied(ProjectInstructionBundle),
+    ClaimLost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreationResourceReservation {
     pub id: String,
@@ -2367,6 +2373,71 @@ impl Database {
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("active bundle disappeared after initialization".to_string())
+            })
+    }
+
+    /// Copy a parent's active normalized instruction rows into a new immutable
+    /// active bundle owned by the child conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent has no active bundle, the child already
+    /// has one, or any normalized row cannot be copied atomically.
+    pub async fn copy_active_project_instruction_bundle_to_child(
+        &self,
+        parent_conversation_id: &str,
+        child_conversation_id: &str,
+    ) -> DbResult<ProjectInstructionBundle> {
+        let mut tx = self.pool.begin().await?;
+        let source: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, estimated_tokens FROM project_instruction_bundles
+             WHERE conversation_id = ?1 AND role = 'active'",
+        )
+        .bind(parent_conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((source_id, estimated_tokens)) = source else {
+            return Err(DbError::Serialization(format!(
+                "parent conversation {parent_conversation_id} has no active project instruction bundle"
+            )));
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO project_instruction_bundles
+             (id, conversation_id, role, estimated_tokens, created_at)
+             VALUES (?1, ?2, 'active', ?3, ?4)",
+        )
+        .bind(&id)
+        .bind(child_conversation_id)
+        .bind(estimated_tokens)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO project_instruction_guidance
+             (bundle_id, ordinal, relative_path, content, content_hash)
+             SELECT ?1, ordinal, relative_path, content, content_hash
+             FROM project_instruction_guidance WHERE bundle_id = ?2 ORDER BY ordinal",
+        )
+        .bind(&id)
+        .bind(&source_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO project_instruction_skills
+             (bundle_id, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash)
+             SELECT ?1, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash
+             FROM project_instruction_skills WHERE bundle_id = ?2 ORDER BY ordinal",
+        )
+        .bind(&id)
+        .bind(&source_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.load_active_project_instruction_bundle(child_conversation_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("copied active bundle disappeared after commit".to_string())
             })
     }
 
@@ -6051,9 +6122,10 @@ impl Database {
         update: &ConversationCreationMetadataUpdate,
         mode: &ConvMode,
         model: &str,
+        initial_project_instructions: &NewProjectInstructionBundle,
         expected_stage: CreationStage,
         next_stage: CreationStage,
-    ) -> DbResult<CreationCasOutcome> {
+    ) -> DbResult<CreationMetadataCommitOutcome> {
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
@@ -6129,7 +6201,25 @@ impl Database {
                 Ok(result) => {
                     if result.rows_affected() == 0 {
                         tx.rollback().await?;
-                        return Ok(CreationCasOutcome::ClaimLost);
+                        return Ok(CreationMetadataCommitOutcome::ClaimLost);
+                    }
+                    let active_exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM project_instruction_bundles
+                         WHERE conversation_id = ?1 AND role = 'active')",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !active_exists {
+                        insert_project_instruction_bundle_tx(
+                            &mut tx,
+                            &uuid::Uuid::new_v4().to_string(),
+                            id,
+                            ProjectInstructionBundleRole::Active,
+                            initial_project_instructions,
+                            &now,
+                        )
+                        .await?;
                     }
                     let stage_updated = sqlx::query(
                         "UPDATE conversation_creation_jobs SET stage = ?1, updated_at = ?2
@@ -6148,10 +6238,19 @@ impl Database {
                     .await?;
                     if stage_updated.rows_affected() != 1 {
                         tx.rollback().await?;
-                        return Ok(CreationCasOutcome::ClaimLost);
+                        return Ok(CreationMetadataCommitOutcome::ClaimLost);
                     }
                     tx.commit().await?;
-                    return Ok(CreationCasOutcome::Applied);
+                    let active = self
+                        .load_active_project_instruction_bundle(id)
+                        .await?
+                        .ok_or_else(|| {
+                            DbError::Serialization(
+                                "active bundle disappeared after creation metadata commit"
+                                    .to_string(),
+                            )
+                        })?;
+                    return Ok(CreationMetadataCommitOutcome::Applied(active));
                 }
                 Err(sqlx::Error::Database(ref e))
                     if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
@@ -8739,6 +8838,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_instruction_bundle_is_an_exact_new_snapshot_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("instructions.db");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("parent", "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("child", "child", "/tmp", false, Some("parent"), None)
+            .await
+            .unwrap();
+        let parent = db
+            .initialize_project_instruction_bundle_if_absent(
+                "parent",
+                &instruction_bundle("snapshot"),
+            )
+            .await
+            .unwrap();
+        let child = db
+            .copy_active_project_instruction_bundle_to_child("parent", "child")
+            .await
+            .unwrap();
+        assert_ne!(child.id, parent.id);
+        assert_eq!(child.estimated_tokens, parent.estimated_tokens);
+        assert_eq!(child.guidance, parent.guidance);
+        assert_eq!(child.skills, parent.skills);
+        drop(db);
+
+        let reopened = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(reopened.pool()).await.unwrap();
+        let recovered = reopened
+            .load_active_project_instruction_bundle("child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.guidance, parent.guidance);
+        assert_eq!(recovered.skills[0].body, "body-snapshot");
+    }
+
+    #[tokio::test]
     async fn concurrent_project_instruction_initializers_return_one_active_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation(
@@ -9585,7 +9724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_claim_cannot_commit_creation_metadata() {
+    async fn stale_claim_cannot_seed_bundle_after_successor_claim_commits() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
         let now = Utc::now();
@@ -9604,9 +9743,28 @@ mod tests {
         let CreationStatus::Claimed(claim) = job.protocol.status else {
             panic!("expected claim authority");
         };
-        db.cancel_conversation_creation("conv-stale-metadata", now)
+        sqlx::query(
+            "UPDATE conversation_creation_jobs SET lease_until = ?1 WHERE id = 'job-stale-metadata'",
+        )
+        .bind((now - chrono::Duration::seconds(1)).to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let successor = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
             .await
             .unwrap();
+        let CreationClaimOutcome::Claimed(successor_job) = successor else {
+            panic!("expected successor claim");
+        };
+        let CreationStatus::Claimed(successor_claim) = successor_job.protocol.status else {
+            panic!("expected successor authority");
+        };
 
         let outcome = db
             .update_conversation_creation_metadata_and_mode(
@@ -9622,20 +9780,52 @@ mod tests {
                 },
                 &ConvMode::Direct,
                 "stale-model",
+                &NewProjectInstructionBundle {
+                    estimated_tokens: 0,
+                    guidance: vec![],
+                    skills: vec![],
+                },
                 CreationStage::ValidateIntent,
                 CreationStage::ResolveRepository,
             )
             .await
             .unwrap();
 
-        assert_eq!(outcome, CreationCasOutcome::ClaimLost);
+        assert!(matches!(outcome, CreationMetadataCommitOutcome::ClaimLost));
+        assert!(db
+            .load_active_project_instruction_bundle("conv-stale-metadata")
+            .await
+            .unwrap()
+            .is_none());
+
+        let winner = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-stale-metadata",
+                &successor_claim,
+                "conv-stale-metadata",
+                &ConversationCreationMetadataUpdate {
+                    slug: Some("winner-slug".to_string()),
+                    title: Some(Some("winner title".to_string())),
+                    cwd: Some("/winner-final-cwd".to_string()),
+                    project_id: Some(None),
+                    desired_base_branch: Some(None),
+                },
+                &ConvMode::Direct,
+                "winner-model",
+                &instruction_bundle("winner"),
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        let CreationMetadataCommitOutcome::Applied(bundle) = winner else {
+            panic!("successor claim must commit");
+        };
+        assert_eq!(bundle.guidance[0].content, "guidance-winner");
+        assert_eq!(bundle.skills[0].body, "body-winner");
         let conversation = db.get_conversation("conv-stale-metadata").await.unwrap();
-        assert_ne!(conversation.slug.as_deref(), Some("stale-slug"));
-        assert_ne!(conversation.cwd, "/stale");
-        assert!(matches!(
-            conversation.state,
-            ConvState::CreationCancelled { .. }
-        ));
+        assert_eq!(conversation.slug.as_deref(), Some("winner-slug"));
+        assert_eq!(conversation.cwd, "/winner-final-cwd");
     }
 
     #[tokio::test]

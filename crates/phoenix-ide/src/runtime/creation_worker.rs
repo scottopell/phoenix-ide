@@ -619,41 +619,8 @@ async fn provision_conversation(
         && intent.text.trim().is_empty()
         && images.is_empty()
         && files.is_empty();
-    let discovered = crate::system_prompt::discover_project_instruction_bundle(
-        std::path::Path::new(&effective_cwd),
-    );
-    let active = manager
-        .db()
-        .initialize_project_instruction_bundle_if_absent(&job.conversation_id, &discovered)
-        .await
-        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
-    let expanded_initial_message = if seeded_empty {
-        None
-    } else {
-        let expanded = if intent.expansion_preflighted {
-            (
-                intent.text.clone(),
-                intent.llm_text.clone(),
-                intent.skill_invocation.clone(),
-            )
-        } else {
-            let resolution_root =
-                crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-            let expanded = crate::message_expander::expand_with_project_skills(
-                &intent.text,
-                &resolution_root,
-                &active.skills,
-            )
-            .map_err(|e| {
-                (
-                    format!("{} ({})", e, e.error_type()),
-                    ErrorKind::InvalidRequest,
-                )
-            })?;
-            let llm_text =
-                (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
-            (expanded.display_text, llm_text, expanded.skill_invocation)
-        };
+
+    let active = if creation_metadata_needs_commit(job.protocol.stage) {
         checkpoint_creation_stage(
             manager,
             job,
@@ -661,15 +628,9 @@ async fn provision_conversation(
             phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage,
         )
         .await?;
-        Some(expanded)
-    };
-    let metadata_expected_stage = if seeded_empty {
-        phoenix_core::domain::creation_protocol::CreationStage::FinalizeAttachments
-    } else {
-        phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage
-    };
-
-    if creation_metadata_needs_commit(job.protocol.stage) {
+        let discovered = crate::system_prompt::discover_project_instruction_bundle(
+            std::path::Path::new(&effective_cwd),
+        );
         let metadata_outcome = manager
             .db()
             .update_conversation_creation_metadata_and_mode(
@@ -685,19 +646,60 @@ async fn provision_conversation(
                 },
                 &conv_mode,
                 &resolved_model,
-                metadata_expected_stage,
+                &discovered,
+                phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage,
                 phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata,
             )
             .await
             .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
-        if matches!(metadata_outcome, crate::db::CreationCasOutcome::ClaimLost) {
+        let crate::db::CreationMetadataCommitOutcome::Applied(active) = metadata_outcome else {
             return Err((
-                "creation claim was lost before metadata commit".to_string(),
+                "creation claim was lost before metadata and instruction commit".to_string(),
                 ErrorKind::Cancelled,
             ));
-        }
+        };
         job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
-    }
+        active
+    } else {
+        manager
+            .db()
+            .load_active_project_instruction_bundle(&job.conversation_id)
+            .await
+            .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+            .ok_or_else(|| {
+                (
+                    "committed creation metadata has no active project instruction bundle"
+                        .to_string(),
+                    ErrorKind::ServerError,
+                )
+            })?
+    };
+
+    let expanded_initial_message = if seeded_empty {
+        None
+    } else if intent.expansion_preflighted {
+        Some((
+            intent.text.clone(),
+            intent.llm_text.clone(),
+            intent.skill_invocation.clone(),
+        ))
+    } else {
+        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
+        let expanded = crate::message_expander::expand_with_project_skills(
+            &intent.text,
+            &resolution_root,
+            &active.skills,
+        )
+        .map_err(|e| {
+            (
+                format!("{} ({})", e, e.error_type()),
+                ErrorKind::InvalidRequest,
+            )
+        })?;
+        let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+        Some((expanded.display_text, llm_text, expanded.skill_invocation))
+    };
+
     let persisted_conversation = manager
         .db()
         .get_conversation(&job.conversation_id)

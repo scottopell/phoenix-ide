@@ -2234,6 +2234,41 @@ impl RuntimeManager {
             }
         };
 
+        // A child inherits the exact persisted snapshot governing its parent.
+        // Legacy parents are initialized once from their own working directory;
+        // the child must never discover mutable sources independently.
+        if match self
+            .db
+            .load_active_project_instruction_bundle(&parent_conversation_id)
+            .await
+        {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                let discovered = crate::system_prompt::discover_project_instruction_bundle(
+                    std::path::Path::new(&parent_conv.cwd),
+                );
+                self.db
+                    .initialize_project_instruction_bundle_if_absent(
+                        &parent_conversation_id,
+                        &discovered,
+                    )
+                    .await
+                    .is_err()
+            }
+            Err(_) => true,
+        } {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "Failed to prepare parent project instructions".to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
@@ -2270,6 +2305,27 @@ impl RuntimeManager {
                 return;
             }
         };
+
+        if let Err(error) = self
+            .db
+            .copy_active_project_instruction_bundle_to_child(&parent_conversation_id, &conv.id)
+            .await
+        {
+            tracing::error!(%error, child_id = %conv.id, "Failed to inherit parent project instructions");
+            if let Err(cleanup_error) = self.db.delete_conversation(&conv.id).await {
+                tracing::error!(%cleanup_error, child_id = %conv.id, "Failed to remove child after instruction-copy failure");
+            }
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: format!("Failed to inherit parent project instructions: {error}"),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
         // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of

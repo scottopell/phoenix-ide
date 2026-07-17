@@ -4624,6 +4624,14 @@ where
                     .await
                 {
                     Ok(Some(bundle)) => bundle,
+                    Ok(None) if is_sub_agent => {
+                        let error = format!(
+                            "sub-agent {conv_id} has no inherited project instruction snapshot"
+                        );
+                        tracing::error!(conv_id = %conv_id, "{error}");
+                        let _ = llm_tx.send(LlmOutcome::NetworkError { message: error });
+                        return;
+                    }
                     Ok(None) => {
                         let discovered = discover_project_instruction_bundle(&working_dir);
                         match storage

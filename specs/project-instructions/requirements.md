@@ -31,9 +31,18 @@ WHEN instruction sources differ from the active or already-queued bundle
 THE SYSTEM SHALL indicate that newer project instructions are available
 AND SHALL NOT apply them until the user confirms **Refresh project instructions**.
 
-New conversations SHALL resolve the latest applicable sources for their initial bundle.
+New top-level conversations SHALL resolve the latest applicable sources for their initial bundle.
 
-For asynchronously provisioned conversations, only the creation worker SHALL initialize the initial bundle, after it has finalized the conversation's effective working directory. While the creation job is not `Ready` — including failed, cancelled, and deletion-pending states — conversation-scoped project-instruction, system-prompt inspection, and skill-catalog endpoints SHALL return a typed unavailable/conflict response and SHALL NOT discover or persist instructions from the provisional working directory.
+WHEN a sub-agent is spawned
+THE SYSTEM SHALL create a new active immutable bundle by copying the parent's persisted active bundle exactly, including ordered guidance, skill metadata and bodies, and token estimate,
+AND SHALL assign the child bundle a new identity,
+AND SHALL complete that copy before the child runtime can make its first model request,
+AND SHALL NOT discover project instructions independently for the child.
+
+IF the parent predates project-instruction snapshots
+THEN THE SYSTEM SHALL initialize the parent once from the parent's working directory before copying its active bundle to the child.
+
+For asynchronously provisioned conversations, only the creation worker SHALL initialize the initial bundle, after it has finalized the conversation's effective working directory. The metadata/mode update and initial-bundle insertion SHALL be one transaction fenced by the worker identity, claim token, generation, unexpired lease, and expected stage; a stale claimant SHALL NOT insert a bundle. The committed bundle SHALL govern initial slash-skill expansion, including seeded-empty and expansion-preflighted creation paths. While the creation job is not `Ready` — including failed, cancelled, and deletion-pending states — conversation-scoped project-instruction, system-prompt inspection, and skill-catalog endpoints SHALL return a typed unavailable/conflict response and SHALL NOT discover or persist instructions from the provisional working directory.
 
 ### REQ-PI-003 — Source Manifest
 

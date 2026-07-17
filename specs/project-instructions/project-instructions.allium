@@ -85,6 +85,39 @@ rule InitializeProjectInstructions {
         transcript_generation: CurrentTranscriptGeneration(conversation_id))
 }
 
+rule InheritProjectInstructionsBeforeSubAgentStarts {
+    when: SubAgentConversationCreated(parent_conversation_id, child_conversation_id)
+    for parent in ProjectInstructions
+        where parent.conversation_id = parent_conversation_id:
+        requires: not exists child in ProjectInstructions
+            where child.conversation_id = child_conversation_id
+        ensures: ProjectInstructions.created(
+            conversation_id: child_conversation_id,
+            active: CopyWithNewIdentity(parent.active),
+            queued: null,
+            candidate: null,
+            refresh_state: current,
+            manifest: {},
+            transcript_generation: CurrentTranscriptGeneration(child_conversation_id))
+        ensures: ChildRuntimeCannotStartBeforeInstructionsExist(child_conversation_id)
+        ensures: ProjectInstructionsNotDiscoveredForChild(child_conversation_id)
+}
+
+rule CommitCreationMetadataAndInitialInstructionsUnderClaim {
+    when: CreationWorkerCommitsMetadata(conversation_id, claim, finalized_working_directory)
+    requires: CreationClaimIsCurrent(claim)
+    ensures: CreationMetadataAndInstructionsCommittedAtomically(
+        conversation_id,
+        ResolveProjectInstructions(finalized_working_directory))
+}
+
+rule RejectInitialInstructionsFromStaleCreationClaim {
+    when: CreationWorkerCommitsMetadata(conversation_id, claim, _)
+    requires: not CreationClaimIsCurrent(claim)
+    ensures: CreationMetadataNotCommitted(conversation_id, claim)
+    ensures: ProjectInstructionsNotCreatedByClaim(conversation_id, claim)
+}
+
 rule ObserveStatusWithoutReplacingCandidate {
     when: ProjectInstructionStatusRequested(conversation_id)
     for instructions in ProjectInstructions
