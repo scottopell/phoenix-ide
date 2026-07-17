@@ -409,6 +409,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         &mut self,
         authority: &ClaimAuthority,
         now: Timestamp,
+        observed_at: Timestamp,
         attempt_id: AttemptId,
         observation_codec: CodecRef,
         observation: P::Observation,
@@ -429,7 +430,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 attempt_id,
                 observation_codec,
                 observation,
-                observed_at: now,
+                observed_at,
                 recorded_at: now,
                 authoritative: true,
             });
@@ -468,6 +469,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn accept_receipt(
         &mut self,
         authority: &ClaimAuthority,
+        worker_id: &str,
         now: Timestamp,
         attempt_id: Option<AttemptId>,
         origin: ReceiptOrigin,
@@ -476,6 +478,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         receipt_event_codec: CodecRef,
         receipt_event: P::ReceiptReducerEvent,
     ) -> ReceiptAcceptance<P> {
+        if authority.worker_id != worker_id {
+            return ReceiptAcceptance {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                receipt_inbox_ids: Vec::new(),
+                reducer_events: Vec::new(),
+            };
+        }
         if receipt_codec.family.is_empty() || receipt_event_codec.family.is_empty() {
             return ReceiptAcceptance {
                 outcome: AuthorityOutcome::StaleAuthority,
@@ -699,11 +709,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return invalid_manual_resolution(None);
         };
         if existing.status == ResolutionStatus::Resolved
-            && existing.accepted_choice.as_ref().is_some_and(|accepted| {
-                accepted.kind == choice.kind
-                    && accepted.codec == choice.codec
-                    && accepted.payload == choice.payload
-            })
+            && existing
+                .accepted_choice
+                .as_ref()
+                .is_some_and(|accepted| manual_choices_equal(accepted, choice))
         {
             return ManualResolutionOutcome {
                 outcome: CommitOutcome::AlreadyCommitted,
@@ -1315,6 +1324,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 || !P::owed_acceptance_matches_inbox(&owed.event, &inbox.payload)
             {
                 return Err(EngineError::InvalidInbox);
+            }
+            if self.owed_acceptances.values().any(|existing| {
+                existing.reducer_inbox_id == owed.reducer_inbox_id
+                    && existing.disposition == OwedAcceptanceDisposition::Owed
+            }) {
+                continue;
             }
             let id = OwedAcceptanceId(self.next_owed_acceptance_id);
             self.next_owed_acceptance_id += 1;
@@ -2044,6 +2059,19 @@ fn same_owed_acceptance_source<E: Eq>(
         && existing.source_kind == supplied.source_kind
         && existing.event_codec == supplied.event_codec
         && existing.event == supplied.event
+}
+
+fn manual_choices_equal<P: WorkflowProfile>(
+    left: &ManualChoice<P>,
+    right: &ManualChoice<P>,
+) -> bool {
+    left.kind == right.kind
+        && left.codec == right.codec
+        && left.payload == right.payload
+        && left.receipt_codec == right.receipt_codec
+        && left.receipt == right.receipt
+        && left.receipt_event_codec == right.receipt_event_codec
+        && left.receipt_event == right.receipt_event
 }
 
 fn manual_choice_permitted<P: WorkflowProfile>(

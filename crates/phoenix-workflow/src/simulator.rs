@@ -101,6 +101,7 @@ impl<P: WorkflowProfile> Simulator<P> {
                 let _ = self.workflow.record_observation(
                     &authority,
                     self.now,
+                    self.now,
                     attempt_id,
                     observation_codec,
                     observation,
