@@ -5,7 +5,7 @@
 --
 -- Scope: The Work Actions surface rendered on Work and Branch conversations
 --        while the conversation is idle, errored, or context-exhausted.
---        Governs visibility, three-zone and active-PR rail presentation, the
+--        Governs visibility, compact and active-PR rail presentation, the
 --        single-primary rule, WorkDisposition derivation, verb labels, tooltip
 --        copy, and the no-disabled-as-status / no-two-step-toggle principles.
 --
@@ -134,7 +134,7 @@ enum BarViewport {
 }
 
 enum BarPresentationKind {
-    three_zone
+    compact_rail
     | pr_rail
 }
 
@@ -644,12 +644,12 @@ rule PrRailPresentedWhenRepresentable {
     ensures: bar.presentation.selection_owner = work_actions
 }
 
-rule ThreeZonePresentedWhenRailUnavailable {
+rule CompactRailPresentedWhenPrRailUnavailable {
     when: WorkActionsBarRendered(bar)
 
     requires: not should_present_pr_rail(bar.inputs)
 
-    ensures: bar.presentation.kind = three_zone
+    ensures: bar.presentation.kind = compact_rail
     ensures: bar.presentation.pr_rail = null
     ensures: bar.presentation.selection_owner = state_bar
 }

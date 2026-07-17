@@ -9,6 +9,9 @@ const storyFor = (id: string): Story => {
   };
 };
 
+export const InitialPrLoading = storyFor('initial-pr-loading');
+InitialPrLoading.storyName = 'initial-pr-loading';
+
 export const CachedOpenStable = storyFor('cached-open-stable');
 CachedOpenStable.storyName = 'cached-open-stable';
 

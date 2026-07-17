@@ -1,6 +1,7 @@
 import type { ConversationPrStatusState } from '../../hooks/useConversationPrStatus';
 
 export const workActionsScenarioDefinitions = [
+  { id: 'initial-pr-loading', title: 'Initial PR metadata loading' },
   { id: 'cached-open-stable', title: 'Cached open PR keeps Address feedback primary' },
   { id: 'fresh-address-feedback', title: 'Fresh open PR with new feedback' },
   { id: 'passing-address-feedback-merge-secondary', title: 'Passing PR with Merge secondary' },

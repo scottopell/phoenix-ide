@@ -1,0 +1,1 @@
+Replace the oversized desktop Work Actions fallback that flashes while PR metadata loads with a stable compact rail presentation. Keep lifecycle actions accessible without the giant three-zone controls, cover loading and single/no-PR states, and add deterministic visual regression coverage.

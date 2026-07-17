@@ -33,6 +33,14 @@ function ready(prStatus: PrStatusResponse): WorkActionsScenario['prState'] {
 }
 
 const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'title'>> = {
+  'initial-pr-loading': {
+    description: 'Models first render before GitHub metadata arrives. The compact rail remains stable and keeps lifecycle actions small.',
+    convModeLabel: 'Work',
+    phaseType: 'idle',
+    continuedInConvId: null,
+    canSendMessage: true,
+    prState: { status: 'loading', prStatus: null },
+  },
   'cached-open-stable': {
     description: 'Models the cached PR seed before the fresh request completes: Address feedback is already the primary, with Open PR as the safe secondary link-out.',
     convModeLabel: 'Work',

@@ -552,9 +552,12 @@ describe('WorkControlBar — checking / loading', () => {
     );
 
     expect(document.querySelector('.work-actions-checking-note')).toBeInTheDocument();
-    expect(screen.getByText(/Checking PR/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Checking PR/i)).toHaveLength(2);
     expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('WorkspaceChecking PR…');
   });
 });
 
@@ -1217,7 +1220,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByRole('button', { name: /#12 Fix CI open task-123$/ })).toBeInTheDocument();
   });
 
-  it('falls back when an explicit active PR is absent from associated summaries', () => {
+  it('uses the compact desktop rail when an explicit active PR is absent from associated summaries', () => {
     const handle = prStatusHandle({
       found: false,
       selection: {
@@ -1234,17 +1237,18 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
     );
 
-    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
-    expect(screen.getByText('Done?')).toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
   });
 
-  it('keeps the legacy desktop presentation for a single actionable PR', () => {
+  it('uses the compact desktop rail for a single actionable PR', () => {
     renderWithProviders(
       <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,
     );
 
-    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
-    expect(screen.getByText('Done?')).toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
+    expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
   });
 });
 

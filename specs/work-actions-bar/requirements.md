@@ -83,9 +83,12 @@ WHEN a desktop conversation has multiple actionable associated PRs and its activ
 actionable or absent
 THE SYSTEM SHALL replace the persistent multi-zone action bar with a PR rail whose entries show the
 PR number, title, branch, open-or-draft status, and actionable feedback freshness.
-WHEN a desktop conversation has fewer than two actionable associated PRs, or its active PR cannot be
-represented by that rail
-THE SYSTEM SHALL preserve the three-zone presentation and the StateBar active-PR selector fallback.
+WHEN a desktop conversation has fewer than two actionable associated PRs, its active PR cannot be
+represented by the PR-selector rail, or PR metadata is still loading
+THE SYSTEM SHALL preserve the StateBar active-PR selector fallback and present the derived Work
+Actions verbs in one thin, horizontally scrollable rail. The system SHALL NOT render a larger
+intermediate action bar while PR metadata loads. Loading, single-PR, terminal-PR, and no-PR states
+SHALL use the same compact rail geometry so metadata refresh does not cause a large layout shift.
 
 WHEN the user activates a PR in the rail
 THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
@@ -98,8 +101,8 @@ SHALL be hidden only while the Work Actions rail can represent and owns that sel
 
 ### REQ-WAB-003: Single Primary Across the Entire Bar
 
-THE SYSTEM SHALL render exactly one button as the glowing primary at any time across all
-three zones — or, in the continuation case, no primary at all.
+THE SYSTEM SHALL render exactly one button as the glowing primary at any time across the action
+surface — or, in the continuation case, no primary at all.
 
 WHEN `WorkDisposition` produces a RESOLVE verb (idle phase only), that verb is the primary.
 WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-forward action
