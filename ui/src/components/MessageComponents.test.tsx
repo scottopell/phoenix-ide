@@ -1238,6 +1238,27 @@ describe('agent Markdown find activation', () => {
 
     expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')?.textContent).toBe('guide');
     expect(container.querySelector('[data-fragment-id="agent-text-0"]')?.textContent).toBe('Read bold docs at the guide.');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] a')).toHaveAttribute('href', 'https://example.test/hidden');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] strong')).toHaveTextContent('bold docs');
+  });
+
+  it('preserves list structure while highlighting a rendered Markdown item', () => {
+    const sourceText = '- first item\n- second **target** item';
+    const renderedText = 'first item\nsecond target item';
+    const start = renderedText.indexOf('target');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-list-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end: start + 'target'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelectorAll('[data-fragment-id="agent-text-0"] li')).toHaveLength(2);
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] strong')).toHaveTextContent('target');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')).toHaveTextContent('target');
   });
 });
 

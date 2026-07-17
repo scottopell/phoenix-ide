@@ -436,6 +436,15 @@ describe('BrowserProfileResponseView', () => {
       },
     };
 
+    it('projects visible CPU table headings, values, percentages, and sampled time', () => {
+      const text = buildBrowserProfileVisibleText('cpu_stop', cpuData, 'opaque');
+
+      expect(text).toContain('sampled 401.5 ms');
+      expect(text).toContain('Top by SELF time');
+      expect(text).toContain('380.0ms\n94.6%\nbusyLoop  app.js:42');
+      expect(text).toContain('Top call-tree nodes by TOTAL time');
+    });
+
     it('renders sampled wall time and hot-function rows', () => {
       render(
         <BrowserProfileResponseView
@@ -497,6 +506,18 @@ describe('BrowserProfileResponseView', () => {
       );
       expect(screen.getByText(/hitCount fallback/)).toBeInTheDocument();
       expect(screen.getByText('7.0hits')).toBeInTheDocument();
+    });
+
+    it('projects the visible hit-count fallback warning and units', () => {
+      const text = buildBrowserProfileVisibleText('cpu_summary', {
+        cpu_summary: {
+          path: '/tmp/x.json', hitcount_fallback: true, total: 7,
+          top_by_self: [{ label: 'f a.js:1', value: 7, percent: 100 }], top_by_total: [],
+        },
+      }, 'opaque');
+
+      expect(text).toContain('hitCount fallback — relative weight only');
+      expect(text).toContain('7.0hits\n100.0%\nf a.js:1');
     });
 
     it('falls back to the text status line when display_data is missing', () => {

@@ -497,6 +497,97 @@ function QueuedUserMessageImpl({
 // Compact-density helpers
 // ============================================================================
 
+type MarkdownHighlight = {
+  sourceStart: number;
+  sourceEnd: number;
+  start: number;
+  end: number;
+};
+
+type HastNode = {
+  type?: string;
+  value?: string;
+  position?: { start?: { offset?: number }; end?: { offset?: number } };
+  children?: HastNode[];
+  tagName?: string;
+  properties?: Record<string, unknown>;
+};
+
+function markdownHighlightForRange(markdown: string, start: number, end: number): MarkdownHighlight | null {
+  let blockStart = 0;
+  for (const block of buildMarkdownDisplayBlocks(markdown)) {
+    const blockEnd = blockStart + block.searchableText.length;
+    if (start >= blockStart && end <= blockEnd) {
+      return {
+        sourceStart: block.sourceRange.start,
+        sourceEnd: block.sourceRange.end,
+        start: start - blockStart,
+        end: end - blockStart,
+      };
+    }
+    blockStart = blockEnd + 1;
+  }
+  return null;
+}
+
+function markdownHighlightPlugin(highlight: MarkdownHighlight) {
+  return () => (tree: HastNode) => {
+    const target = findMarkdownHighlightTarget(tree, highlight);
+    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
+  };
+}
+
+function findMarkdownHighlightTarget(node: HastNode, highlight: MarkdownHighlight): HastNode | null {
+  const nodeStart = node.position?.start?.offset;
+  const nodeEnd = node.position?.end?.offset;
+  const containsSourceRange = nodeStart !== undefined
+    && nodeEnd !== undefined
+    && nodeStart <= highlight.sourceStart
+    && nodeEnd >= highlight.sourceEnd;
+  if (!containsSourceRange) return null;
+  for (const child of node.children ?? []) {
+    if (!child.children) continue;
+    const target = findMarkdownHighlightTarget(child, highlight);
+    if (target) return target;
+  }
+  return node.children ? node : null;
+}
+
+function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): void {
+  let cursor = 0;
+  const visit = (parent: HastNode) => {
+    const nextChildren: HastNode[] = [];
+    for (const child of parent.children ?? []) {
+      if (child.type !== 'text' || typeof child.value !== 'string') {
+        visit(child);
+        nextChildren.push(child);
+        continue;
+      }
+      const childStart = cursor;
+      const childEnd = childStart + child.value.length;
+      const overlapStart = Math.max(start, childStart);
+      const overlapEnd = Math.min(end, childEnd);
+      if (overlapStart < overlapEnd) {
+        const localStart = overlapStart - childStart;
+        const localEnd = overlapEnd - childStart;
+        if (localStart > 0) nextChildren.push({ type: 'text', value: child.value.slice(0, localStart) });
+        nextChildren.push({
+          type: 'element',
+          tagName: 'mark',
+          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'] },
+          children: [{ type: 'text', value: child.value.slice(localStart, localEnd) }],
+        });
+        if (localEnd < child.value.length) nextChildren.push({ type: 'text', value: child.value.slice(localEnd) });
+      } else {
+        nextChildren.push(child);
+      }
+      cursor = childEnd;
+    }
+    if (parent.children) parent.children = nextChildren;
+  };
+  visit(node);
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
   if (start < 0 || end <= start || start >= text.length) return text;
@@ -823,9 +914,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
       : null;
-    const highlightedSemanticText = highlight
-      ? buildMarkdownDisplayBlocks(fragment.display.sourceText).map((block) => block.searchableText).join('\n') || fragment.display.sourceText
-      : fragment.semanticText;
+    const markdownHighlight = highlight
+      ? markdownHighlightForRange(fragment.display.sourceText, highlight.start, highlight.end)
+      : null;
 
     if (!expanded) {
       return (
@@ -840,16 +931,15 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     }
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
-        <div className="agent-text-block">
-          {highlight ? (
-            <div className="viewer-find-inline-highlight" data-active-fragment-highlight>
-              {renderHighlightedText(highlightedSemanticText, highlight.start, highlight.end)}
-            </div>
-          ) : (
-            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-              {fragment.display.sourceText}
-            </ReactMarkdown>
-          )}
+        <div className="agent-text-block" {...(highlight ? { 'data-active-fragment-highlight': true } : {})}>
+          <ReactMarkdown
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={markdownHighlight ? [markdownHighlightPlugin(markdownHighlight)] : []}
+            components={markdownComponents}
+            urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}
+          >
+            {fragment.display.sourceText}
+          </ReactMarkdown>
         </div>
       </div>
     );

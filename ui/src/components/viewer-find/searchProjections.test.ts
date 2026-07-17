@@ -293,6 +293,13 @@ describe('typed semantic display projections', () => {
     expect(numberedLines.map((fragment) => fragment.semanticText)).toEqual(['7\talpha', '8\tbeta']);
     expect(numbered.fullText).not.toContain('more lines not shown');
 
+    const mixed = buildReadFileOutputProjection(
+      '     1\t[package]\n[dependencies]\n     3\tserde = "1"',
+      { path: 'Cargo.toml' },
+    );
+    expect(mixed.fullText).toContain('[dependencies]');
+    expect(mixed.fragments.find((fragment) => fragment.semanticText === '[dependencies]')?.kind).toBe('note');
+
     const legacy = buildReadFileOutputProjection('plain alpha\nplain beta\n', { path: 'legacy.txt', offset: 4 });
     expect(legacy.fragments.filter((fragment) => fragment.kind === 'line').map((fragment) => fragment.semanticText)).toEqual([
       '4\tplain alpha',

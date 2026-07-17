@@ -81,8 +81,23 @@ export function buildBrowserProfileVisibleText(
     case 'cpu_summary': {
       const summary = data['cpu_summary'] as Record<string, unknown> | undefined;
       if (!summary || !Array.isArray(summary['top_by_self'])) return `${action}\n${fallbackText}`;
-      const entries = [...(summary['top_by_self'] as unknown[]), ...(Array.isArray(summary['top_by_total']) ? summary['top_by_total'] as unknown[] : [])];
-      return ['CPU profile', typeof summary['path'] === 'string' ? summary['path'] : '', ...entries.flatMap((entry) => entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>)['label'] === 'string' ? [String((entry as Record<string, unknown>)['label'])] : [])].filter(Boolean).join('\n');
+      const topBySelf = sanitizeCpuEntries(summary['top_by_self']);
+      const topByTotal = sanitizeCpuEntries(summary['top_by_total']);
+      if (topBySelf.length === 0) return `${action}\n${fallbackText}`;
+      const hitCountFallback = summary['hitcount_fallback'] === true;
+      const unit = hitCountFallback ? 'hits' : 'ms';
+      const rows = (entries: CpuHotEntry[]) => entries.map((entry) => `${entry.value.toFixed(1)}${unit}\n${entry.percent.toFixed(1)}%\n${entry.label}`);
+      return [
+        'CPU profile',
+        hitCountFallback
+          ? 'hitCount fallback — relative weight only'
+          : typeof summary['total'] === 'number' ? `sampled ${summary['total'].toFixed(1)} ms` : '',
+        typeof summary['path'] === 'string' ? summary['path'] : '',
+        'Top by SELF time',
+        'aggregated per function — where CPU is actually spent',
+        ...rows(topBySelf),
+        ...(topByTotal.length > 0 ? ['Top call-tree nodes by TOTAL time', 'self + descendants — may double-count recursion', ...rows(topByTotal)] : []),
+      ].filter(Boolean).join('\n');
     }
     case 'trace_stop': {
       const trace = data['trace'] as Record<string, unknown> | undefined;

@@ -921,6 +921,10 @@ function parseReadFileRenderedLine(line: string): { lineNumber: number; content:
   };
 }
 
+function isReadFilePaginationNote(line: string): boolean {
+  return /^\[\d+ more lines? not shown\.(?: Use offset=\d+ to continue\.)?\]$/.test(line.trim());
+}
+
 function boundedFragmentHash(text: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index += 1) {
@@ -966,7 +970,7 @@ function buildReadFileProjectionFragments(
     const parsedLine = parseReadFileRenderedLine(rawLine);
     if (hasNumberedLines && !parsedLine) {
       const note = rawLine.trim();
-      if (!note || (note.startsWith('[') && note.endsWith(']'))) continue;
+      if (!note || isReadFilePaginationNote(note)) continue;
       const duplicateIndex = duplicateNoteCounts.get(note) ?? 0;
       duplicateNoteCounts.set(note, duplicateIndex + 1);
       const fragmentId = `read-file-note:${encodeURIComponent(note)}:${duplicateIndex}`;
