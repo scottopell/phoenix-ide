@@ -693,6 +693,9 @@ export interface SkillEntry {
    * (extracted to `<HOME>/.phoenix-ide/builtin-skills/` at startup).
    */
   source: string;
+  /** Captured body for a conversation's active instruction snapshot. Absent
+   *  from directory-scoped live discovery responses. */
+  body?: string;
   /** Absolute path to the SKILL.md file. Always populated; built-in skills
    *  point at their extracted location. */
   path: string;
@@ -1695,7 +1698,14 @@ export const api = {
 
   async getSystemPrompt(convId: string): Promise<string> {
     const resp = await fetch(`/api/conversations/${convId}/system-prompt`);
-    if (!resp.ok) throw new Error('Failed to fetch system prompt');
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({
+        error: 'Failed to fetch system prompt',
+        error_type: 'unknown',
+      }));
+      if (resp.status === 409) throw new ConflictError(detail as ConflictErrorDetail);
+      throw new Error(detail.error || 'Failed to fetch system prompt');
+    }
     return (await resp.json()).system_prompt;
   },
 

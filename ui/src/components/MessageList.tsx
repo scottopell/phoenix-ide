@@ -112,6 +112,7 @@ interface MessageListProps {
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   systemPrompt?: string | undefined;
+  usesProjectInstructions?: boolean | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
@@ -294,6 +295,7 @@ interface SystemPromptHeaderProps {
   conversationId: string | undefined;
   conversationState: ConversationState;
   projectInstructionsActivationMessageId: string | undefined;
+  usesProjectInstructions: boolean;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -304,6 +306,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   conversationId,
   conversationState,
   projectInstructionsActivationMessageId,
+  usesProjectInstructions,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
@@ -311,7 +314,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
         <div className="system-prompt-header" onClick={onToggle}>
           <span className="system-prompt-label">System prompt</span>
           <span className="system-prompt-header-actions">
-            {conversationId && (
+            {conversationId && usesProjectInstructions && (
               <span onClick={(event) => event.stopPropagation()}>
                 <ProjectInstructionsRefresh
                   conversationId={conversationId}
@@ -356,6 +359,7 @@ function MessageListImpl({
   onOpenFile,
   onOpenCommissionReview,
   systemPrompt,
+  usesProjectInstructions = true,
   conversationId,
   slug,
   filePathRootDir,
@@ -1145,6 +1149,7 @@ function MessageListImpl({
               conversationId={conversationId}
               conversationState={convState}
               projectInstructionsActivationMessageId={projectInstructionsActivationMessageId}
+              usesProjectInstructions={usesProjectInstructions}
             />
           ) : null}
           empty={<EmptyTranscriptState />}

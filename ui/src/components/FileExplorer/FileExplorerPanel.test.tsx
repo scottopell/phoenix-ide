@@ -142,6 +142,21 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     expect(screen.queryByText('ready-one')).not.toBeInTheDocument();
   });
 
+  it('renders the captured conversation skill body without reading the live file', async () => {
+    const capturedSkills: SkillEntry[] = [{
+      ...skill('project-one', 'project', '/repo/project/.agents/skills/project-one/SKILL.md'),
+      body: 'old captured body',
+    }];
+    vi.mocked(api.listConversationSkills).mockResolvedValue({ skills: capturedSkills });
+
+    renderPanel();
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+    fireEvent.click(await screen.findByText('/project-one'));
+
+    expect(await screen.findByText('old captured body')).toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).startsWith('/api/files/read'))).toBe(false);
+  });
+
   it('keeps Skills expanded and preserves skill group state after Back', async () => {
     renderPanel();
 

@@ -6116,6 +6116,7 @@ async fn list_conversation_skills(
                 argument_hint: skill.argument_hint,
                 source: skill.source_label,
                 path: skill.source_path,
+                body: Some(skill.body),
             })
             .collect(),
     }))
@@ -6185,6 +6186,7 @@ fn skill_entries_from_dir(
                 argument_hint: s.argument_hint,
                 source,
                 path,
+                body: None,
             }
         })
         .collect()
@@ -7598,6 +7600,47 @@ mod project_instruction_refresh_tests {
             .skills
             .iter()
             .any(|skill| skill.name == "alpha"));
+    }
+
+    #[tokio::test]
+    async fn conversation_skills_serve_captured_body_without_leaking_it_to_live_discovery() {
+        let (state, root) = setup().await;
+        let _ = get_project_instructions(State(state.clone()), Path("instruction-api".to_string()))
+            .await
+            .unwrap();
+        std::fs::write(
+            root.path().join("project/.agents/skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: mutated\n---\nmutated live body",
+        )
+        .unwrap();
+
+        let Json(conversation_skills) =
+            list_conversation_skills(State(state), Path("instruction-api".to_string()))
+                .await
+                .unwrap();
+        let captured = conversation_skills
+            .skills
+            .iter()
+            .find(|skill| skill.name == "alpha")
+            .unwrap();
+        assert_eq!(captured.body.as_deref(), Some("body"));
+
+        let Json(project_skills) = list_project_skills(Query(ProjectSkillsQuery {
+            cwd: root.path().join("project").to_string_lossy().into_owned(),
+            mode: None,
+            base_branch: None,
+        }))
+        .await
+        .unwrap();
+        let live = project_skills
+            .skills
+            .iter()
+            .find(|skill| skill.name == "alpha")
+            .unwrap();
+        assert_eq!(live.description, "mutated");
+        assert!(live.body.is_none());
+        let wire = serde_json::to_value(&project_skills).unwrap();
+        assert!(wire["skills"][0].get("body").is_none());
     }
 
     #[tokio::test]

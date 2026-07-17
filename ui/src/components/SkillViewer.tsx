@@ -53,8 +53,14 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
     setPromptError(null);
     setPromptContent(null);
 
-    // Built-ins are extracted to disk at server startup, so they share the
-    // same read endpoint as filesystem skills.
+    if (skill.body !== undefined) {
+      setPromptContent(skill.body);
+      setLoading(false);
+      return () => { cancelled = true; };
+    }
+
+    // Live directory-scoped skills have no captured body. Built-ins are
+    // extracted to disk at startup, so both kinds use the file endpoint.
     fetch(`/api/files/read?path=${encodeURIComponent(skill.path)}`)
       .then(async (resp) => {
         if (!resp.ok) {
@@ -80,7 +86,7 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
       });
 
     return () => { cancelled = true; };
-  }, [skill.path]);
+  }, [skill.body, skill.path]);
 
   const handleInsert = () => {
     window.dispatchEvent(

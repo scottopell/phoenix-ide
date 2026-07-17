@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ConflictError, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -1075,7 +1075,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   useEffect(() => {
     if (!conversationId) return;
-    const requestKey = `${conversationId}:${projectInstructionsActivationMessageId ?? 'initial'}`;
+    const requestKey = `${conversationId}:${projectInstructionsActivationMessageId ?? 'initial'}:${confirmedLive ? 'live' : 'provisioning'}`;
     if (systemPromptRequestKeyRef.current === requestKey) return;
     systemPromptRequestKeyRef.current = requestKey;
     const requestToken = ++systemPromptRequestTokenRef.current;
@@ -1094,11 +1094,13 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         dispatch({ type: 'set_system_prompt', systemPrompt, expectedConversationId });
       })
       .catch((err) => {
-        if (requestToken === systemPromptRequestTokenRef.current) {
-          console.warn('Failed to load system prompt:', err);
+        if (requestToken !== systemPromptRequestTokenRef.current) return;
+        if (err instanceof ConflictError && err.detail.error_type === 'conversation_provisioning') {
+          systemPromptRequestKeyRef.current = null;
         }
+        console.warn('Failed to load system prompt:', err);
       });
-  }, [conversationId, dispatch, projectInstructionsActivationMessageId]);
+  }, [confirmedLive, conversationId, dispatch, projectInstructionsActivationMessageId]);
 
   // availableModels is populated by the shared useModels() poller above.
 
@@ -2023,6 +2025,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
+        usesProjectInstructions={routePrefix !== '/global'}
         hasOlderMessages={historyExpansion.coverage === 'tail'}
         onLoadOlderMessages={loadOlderMessages}
         loadingOlderMessages={historyExpansion.activeRequest !== null}

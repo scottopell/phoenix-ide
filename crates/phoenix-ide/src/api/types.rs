@@ -551,6 +551,10 @@ pub struct SkillEntry {
     /// literal `"builtin"` for skills bundled with the phoenix binary
     /// (extracted to `<HOME>/.phoenix-ide/builtin-skills/` at startup).
     pub source: String,
+    /// Captured body from a conversation's active instruction snapshot.
+    /// Directory-scoped live discovery intentionally omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     /// Absolute path to the SKILL.md file. Always populated; built-in skills
     /// point at the extracted location.
     pub path: String,
