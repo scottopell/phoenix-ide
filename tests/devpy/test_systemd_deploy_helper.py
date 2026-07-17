@@ -382,6 +382,17 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         )
         self.assertEqual("systemd-analyze", calls[0][0])
 
+    def test_legacy_dropins_block_activation_before_disruption(self):
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41))
+        with tempfile.TemporaryDirectory() as td:
+            override_dir = Path(td)
+            (override_dir / "legacy.conf").write_text("[Service]\nEnvironment=X=1\n")
+            with mock.patch.object(helper, "legacy_override_dir", return_value=override_dir):
+                with self.assertRaisesRegex(helper.ActivationError, "move required values to .phoenix-ide.env"):
+                    helper.prepare_installs(manifest, controller)
+        self.assertFalse(controller.disruption_started)
+
     def test_success_atomically_installs_candidate_and_commits(self):
         self.install_previous()
         manifest = self.manifest()
@@ -499,13 +510,24 @@ class SystemdActivationTests(SystemdManifestValidationTests):
 
     def test_first_install_rollback_removes_only_transaction_created_data_directory(self):
         manifest = dataclasses.replace(self.manifest(), data_directory_preexisting=False)
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
         data_dir = Path(manifest.targets.deployed_sha).parent
         data_dir.mkdir(exist_ok=True)
         (data_dir / "transaction-created").write_text("remove me")
         controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
-        with mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")):
+        original_rmtree = shutil.rmtree
+        claim_held_during_cleanup = []
+
+        def remove(path, *args, **kwargs):
+            if Path(path) == data_dir:
+                claim_held_during_cleanup.append(self.policy.active_path.exists())
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")), \
+             mock.patch.object(helper.shutil, "rmtree", side_effect=remove):
             state = helper.activate(manifest, controller)
         self.assertEqual("activation_failed_rolled_back", state)
+        self.assertEqual([True], claim_held_during_cleanup)
         self.assertFalse(data_dir.exists())
 
     def test_rollback_failure_preserves_claim_and_both_failures(self):

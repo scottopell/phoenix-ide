@@ -191,6 +191,8 @@ class BareDeployCommandTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 if "activate" in command:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "state": "committed"}), "")
+                if "status" in command:
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1, "child": None}), "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def materialize(_commit, _source, destination, _kind):
@@ -231,6 +233,7 @@ class BareDeployCommandTests(unittest.TestCase):
             installed_env = (layout["transactions"] / ("d" * 32) / "candidate.env").read_text()
             self.assertIn(f"HOME={Path.home()}", installed_env)
             self.assertIn(f"PATH={self.dev.os.environ.get('PATH', self.dev.os.defpath)}", installed_env)
+            self.assertFalse(manifest["previous_running"])
 
 
 if __name__ == "__main__":

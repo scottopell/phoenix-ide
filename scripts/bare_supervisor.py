@@ -71,6 +71,7 @@ class TransactionManifest:
     source_commit: str
     previous_deployed_sha: Optional[str]
     created_at: str
+    previous_running: bool = True
     health_timeout_secs: float = 30
 
     @classmethod
@@ -495,13 +496,14 @@ class Supervisor:
             finally:
                 prepared_binary.unlink(missing_ok=True)
                 prepared_environment.unlink(missing_ok=True)
-            self.start_child(
-                [str(self.layout.binary)],
-                parse_environment(self.layout.environment),
-                manifest.previous,
-                manifest.previous_health_url,
-                manifest.health_timeout_secs,
-            )
+            if manifest.previous_running:
+                self.start_child(
+                    [str(self.layout.binary)],
+                    parse_environment(self.layout.environment),
+                    manifest.previous,
+                    manifest.previous_health_url,
+                    manifest.health_timeout_secs,
+                )
             if manifest.previous_deployed_sha is None:
                 self.layout.deployed_sha.unlink(missing_ok=True)
             else:
@@ -509,6 +511,21 @@ class Supervisor:
         self.transaction_status(manifest, manifest_hash, "activation_failed_rolled_back", failure)
         self.layout.active_file.unlink(missing_ok=True)
         return "activation_failed_rolled_back"
+
+    def baseline_matches(self, manifest: TransactionManifest) -> bool:
+        current_sha = self.layout.deployed_sha.read_text().strip() if self.layout.deployed_sha.exists() else None
+        if current_sha != manifest.previous_deployed_sha:
+            return False
+        if manifest.previous is None:
+            return not self.layout.binary.exists() and not self.layout.environment.exists()
+        if manifest.rollback_binary is None or manifest.rollback_environment is None:
+            return False
+        return (
+            self.layout.binary.is_file()
+            and self.layout.environment.is_file()
+            and sha256(self.layout.binary) == manifest.rollback_binary.sha256
+            and sha256(self.layout.environment) == manifest.rollback_environment.sha256
+        )
 
     def activate(self, transaction_id: str, manifest_hash: str) -> str:
         manifest, candidate_binary, candidate_environment, rollback_binary, rollback_environment = self.validated_transaction(
@@ -532,6 +549,8 @@ class Supervisor:
             active = self.layout.active_file.read_text().strip() if self.layout.active_file.exists() else ""
             if active and active != transaction_id:
                 raise SupervisorError(f"deployment transaction {active} is unresolved")
+            if not self.baseline_matches(manifest):
+                raise SupervisorError("stale transaction baseline")
             write_text_atomic(self.layout.active_file, transaction_id)
             reserved = []
             try:
@@ -620,6 +639,8 @@ class Supervisor:
         if state == "committed":
             return manifest.expected, manifest.expected_health_url
         if state in {"activation_failed_rolled_back", "precondition_failed"}:
+            if not manifest.previous_running:
+                return None, None
             return manifest.previous, manifest.previous_health_url
         raise SupervisorError(f"durable state {state!r} has no verified runtime")
 

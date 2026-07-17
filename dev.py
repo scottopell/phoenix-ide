@@ -6782,6 +6782,17 @@ def _configure_bare_reboot_persistence(layout: dict[str, Path]) -> bool:
     return False
 
 
+def _bare_child_running(layout: dict[str, Path]) -> bool:
+    result = subprocess.run(
+        [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "status"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"cannot inspect bare supervisor child state: {(result.stderr or result.stdout).strip()}")
+    return json.loads(result.stdout).get("child") is not None
+
+
 def _discard_unclaimed_bare_transaction(transaction: Path) -> None:
     if not transaction.exists():
         return
@@ -6830,6 +6841,7 @@ def prod_daemon_deploy(release: str | None = None):
 
         _start_bare_supervisor(layout, protocol, supervisor_source)
         _configure_bare_reboot_persistence(layout)
+        previous_running = _bare_child_running(layout)
 
         transaction = layout["transactions"] / transaction_id
         transaction.mkdir(parents=True, mode=0o700)
@@ -6864,6 +6876,7 @@ def prod_daemon_deploy(release: str | None = None):
             "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
             "source_commit": prepared.source_commit,
             "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
+            "previous_running": previous_running,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         manifest_path = transaction / "manifest.json"

@@ -689,7 +689,16 @@ def service_user_from_unit(path: Path) -> str:
     return users[0]
 
 
+def legacy_override_dir(unit_name: str) -> Path:
+    return Path("/etc/systemd/system") / f"{unit_name}.service.d"
+
+
 def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstalls:
+    override_dir = legacy_override_dir(manifest.unit_name)
+    if override_dir.is_dir() and any(override_dir.glob("*.conf")):
+        raise ActivationError(
+            f"legacy systemd overrides exist at {override_dir}; move required values to .phoenix-ide.env and remove the drop-ins"
+        )
     candidate_service = Path(manifest.candidate.service.path)
     candidate_socket = Path(manifest.candidate.socket.path)
     systemctl.verify_units(candidate_service, candidate_socket, Path(manifest.candidate.binary.path))
@@ -830,7 +839,6 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                 cleanup_data_dir = restore(manifest, controller, previous_state, prepared)
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
                 if cleanup_data_dir is not None:
-                    release_claim(manifest)
                     shutil.rmtree(cleanup_data_dir)
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:

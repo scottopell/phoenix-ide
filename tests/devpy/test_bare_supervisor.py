@@ -155,6 +155,7 @@ class BareTransactionTests(unittest.TestCase):
         self.layout.environment.parent.mkdir(parents=True)
         self.layout.environment.write_text("MODE=old\n")
         path = self.manifest(previous=True)
+        self.layout.deployed_sha.write_text("a" * 40 + "\n")
         owner = supervisor.Supervisor(self.layout)
         owner.stop_child = mock.Mock()
         owner.start_child = mock.Mock(side_effect=[
@@ -346,6 +347,31 @@ class BareTransactionTests(unittest.TestCase):
              mock.patch.object(supervisor.os, "chmod"):
             owner.serve()
         self.assertEqual(["bind", "listen", "reconcile"], [event[0] for event in events])
+
+    def test_stale_baseline_is_rejected_before_claim(self):
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        self.layout.deployed_sha.parent.mkdir(parents=True, exist_ok=True)
+        self.layout.deployed_sha.write_text("c" * 40 + "\n")
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "stale transaction baseline"):
+            owner.activate(self.transaction_id, manifest_hash)
+        self.assertFalse(self.layout.active_file.exists())
+
+    def test_stopped_previous_runtime_remains_stopped_after_rollback(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        raw = __import__("json").loads(path.read_text())
+        raw["previous_running"] = False
+        path.chmod(0o600)
+        path.write_text(__import__("json").dumps(raw, sort_keys=True))
+        path.chmod(0o400)
+        owner = supervisor.Supervisor(self.layout)
+        owner.start_child = mock.Mock(side_effect=supervisor.SupervisorError("candidate failed"))
+        state = owner.activate(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("activation_failed_rolled_back", state)
+        owner.start_child.assert_called_once()
+        self.assertIsNone(owner.child_identity)
 
     def test_manifest_hash_mismatch_is_rejected_before_claim(self):
         self.manifest()
