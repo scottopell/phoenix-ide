@@ -78,6 +78,32 @@ fn codec(name: &'static str) -> CodecRef {
 fn protocol() -> ProtocolSelection {
     ProtocolSelection {
         profile: profile(),
+        supported_codecs: SupportedCodecRegistry::new(
+            [
+                "snapshot",
+                "event",
+                "event-a",
+                "intent",
+                "observation",
+                "receipt",
+                "receipt-event",
+                "barrier",
+                "owed",
+                "manual",
+                "manual-transition",
+                "cancel-event",
+                "compensate-event",
+                "terminal",
+                "runtime-event",
+                "runtime-transition",
+                "transition-event",
+                "actual",
+                "expected",
+            ]
+            .into_iter()
+            .map(codec),
+        )
+        .expect("test codecs"),
         authority: SemanticAuthority::EngineProtocol,
         accepting: true,
         runtime_acceptance_enabled: true,
@@ -176,7 +202,12 @@ fn workflow() -> WorkflowState<TestProfile> {
 #[test]
 fn validates_happy_path_plan() {
     assert_eq!(
-        validate_plan(WorkflowStatus::Active, &plan(), &barrier_events()),
+        validate_plan(
+            WorkflowStatus::Active,
+            &plan(),
+            &barrier_events(),
+            &protocol().supported_codecs
+        ),
         Ok(())
     );
 }
@@ -187,7 +218,12 @@ fn rejects_duplicate_effect_ids() {
     plan.effects
         .push(effect(1, EffectRole::Required, Generation(0)));
     assert_eq!(
-        validate_plan(WorkflowStatus::Active, &plan, &barrier_events()),
+        validate_plan(
+            WorkflowStatus::Active,
+            &plan,
+            &barrier_events(),
+            &protocol().supported_codecs
+        ),
         Err(PlanError::DuplicateEffectId(EffectId(1)))
     );
 }
@@ -200,7 +236,12 @@ fn rejects_dependency_cycles() {
         depends_on_effect_id: EffectId(2),
     });
     assert_eq!(
-        validate_plan(WorkflowStatus::Active, &plan, &barrier_events()),
+        validate_plan(
+            WorkflowStatus::Active,
+            &plan,
+            &barrier_events(),
+            &protocol().supported_codecs
+        ),
         Err(PlanError::DependencyCycle)
     );
 }
@@ -1072,7 +1113,7 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan,
             },
             &cancel_events,
@@ -1090,6 +1131,36 @@ fn cancellation_bumps_generation_and_revokes_prior_claims() {
             .outcome,
         AuthorityOutcome::StaleAuthority
     );
+}
+
+#[test]
+fn accepted_protocol_rejects_unsupported_plan_codec_without_mutation() {
+    let mut workflow = workflow();
+    let before = workflow.clone();
+    let mut unsupported = plan();
+    unsupported.event_codec = CodecRef {
+        family: "event",
+        version: 2,
+    };
+
+    let error = workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: unsupported,
+            },
+            &barrier_events(),
+        )
+        .expect_err("unsupported codec must not commit");
+
+    assert_eq!(
+        error,
+        EngineError::InvalidPlan(PlanError::UnsupportedCodec(CodecRef {
+            family: "event",
+            version: 2,
+        }))
+    );
+    assert_eq!(workflow, before);
 }
 
 #[test]
@@ -1137,7 +1208,7 @@ fn invalid_cancellation_plan_does_not_mutate_state() {
             invalidations: vec![EffectInvalidationDecl {
                 effect_id: EffectId(1),
             }],
-            reducer_inbox_events: vec![],
+            terminal_receipt: None,
             compensation_plan: TransitionPlan {
                 next_status: WorkflowStatus::Active,
                 snapshot: "cancelled",
@@ -1190,7 +1261,7 @@ fn stale_cancellation_cas_does_not_mutate_state() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan: TransitionPlan {
                     next_status: WorkflowStatus::Active,
                     snapshot: "cancelled",
@@ -1797,7 +1868,7 @@ fn cas_conflict_wins_before_plan_validation_in_versioned_paths() {
                 event: "cancel",
                 event_codec: codec("event"),
                 invalidations: vec![],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan: invalid,
             },
             &barrier_events(),
@@ -2287,7 +2358,7 @@ fn cancel_only_invalidates_active_like_effects() {
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan: TransitionPlan {
                     next_status: WorkflowStatus::Active,
                     snapshot: "cancelled",
@@ -2715,7 +2786,7 @@ fn cancellation_active_compensation_cannot_reopen_and_stays_cancelling() {
                 event: "cancel",
                 event_codec: codec("cancel-event"),
                 invalidations: vec![],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan: TransitionPlan {
                     next_status: WorkflowStatus::Active,
                     snapshot: "should-not-reopen",
@@ -3080,7 +3151,7 @@ fn empty_cancellation_codecs_are_rejected_atomically() {
             event: "cancel",
             event_codec: codec("cancel-event"),
             invalidations: vec![],
-            reducer_inbox_events: vec![],
+            terminal_receipt: None,
             compensation_plan: TransitionPlan {
                 next_status: WorkflowStatus::Cancelling,
                 snapshot: "cancelled",
@@ -3358,7 +3429,7 @@ proptest! {
             invalidations: vec![],
             owed_acceptances: None,
         };
-        let result = validate_plan(WorkflowStatus::Active, &plan, &BTreeMap::from([(BarrierId(10), "barrier")]));
+        let result = validate_plan(WorkflowStatus::Active, &plan, &BTreeMap::from([(BarrierId(10), "barrier")]), &protocol().supported_codecs);
         let has_two_cycle = dependencies.iter().any(|left| {
             dependencies.iter().any(|right| {
                 left.effect_id == right.depends_on_effect_id && left.depends_on_effect_id == right.effect_id
@@ -3402,13 +3473,23 @@ fn review_regressions_validate_identity_codecs_status_and_compensation_path() {
     let mut invalid = plan();
     invalid.effects[0].family = "";
     assert_eq!(
-        validate_plan(WorkflowStatus::Active, &invalid, &barrier_events()),
+        validate_plan(
+            WorkflowStatus::Active,
+            &invalid,
+            &barrier_events(),
+            &protocol().supported_codecs
+        ),
         Err(PlanError::MissingEffectFamily(EffectId(1)))
     );
     let mut invalid = plan();
     invalid.effects[0].kind = "";
     assert_eq!(
-        validate_plan(WorkflowStatus::Active, &invalid, &barrier_events()),
+        validate_plan(
+            WorkflowStatus::Active,
+            &invalid,
+            &barrier_events(),
+            &protocol().supported_codecs
+        ),
         Err(PlanError::MissingEffectKind(EffectId(1)))
     );
 
@@ -3932,7 +4013,7 @@ fn review_regressions_cancellation_suppresses_manual_and_owed_work_atomically() 
                 invalidations: vec![EffectInvalidationDecl {
                     effect_id: EffectId(1),
                 }],
-                reducer_inbox_events: vec![],
+                terminal_receipt: None,
                 compensation_plan: TransitionPlan {
                     next_status: WorkflowStatus::Cancelled,
                     snapshot: "cancelled",
@@ -4146,7 +4227,7 @@ fn review_regression_rejects_empty_manual_choice_codec() {
 }
 
 #[test]
-fn terminal_cancellation_delivery_is_suppressed_and_drainable() {
+fn cancellation_without_terminal_receipt_emits_no_delivery() {
     let mut workflow = workflow();
     let result = workflow
         .cancel_with_compensation(
@@ -4157,14 +4238,7 @@ fn terminal_cancellation_delivery_is_suppressed_and_drainable() {
                 event: "cancel",
                 event_codec: codec("event"),
                 invalidations: vec![],
-                reducer_inbox_events: vec![ReducerInboxDecl {
-                    effect_id: None,
-                    barrier_id: None,
-                    kind: ReducerInboxKind::ReceiptAccepted,
-                    event_codec: codec("cancel-event"),
-                    requires_runtime_acceptance: false,
-                    payload: ReducerInboxPayload::Receipt("cancel-event"),
-                }],
+                terminal_receipt: None,
                 compensation_plan: TransitionPlan {
                     next_status: WorkflowStatus::Cancelled,
                     snapshot: "cancelled",
@@ -4184,13 +4258,7 @@ fn terminal_cancellation_delivery_is_suppressed_and_drainable() {
         .expect("cancellation");
 
     assert_eq!(result.outcome, CommitOutcome::Committed);
-    assert_eq!(result.reducer_events.len(), 1);
-    assert_eq!(
-        result.reducer_events[0].delivery_status,
-        DeliveryStatus::Suppressed {
-            reason: SuppressionReason::Cancelled,
-        }
-    );
+    assert!(result.reducer_events.is_empty());
     assert_eq!(
         drain_proof(&protocol(), [&workflow]).categories["pending_reducer_inbox"].count,
         0
@@ -4209,7 +4277,7 @@ fn terminal_cancellation_plan_cannot_declare_remaining_compensation_effects() {
             event: "cancel",
             event_codec: codec("event"),
             invalidations: vec![],
-            reducer_inbox_events: vec![],
+            terminal_receipt: None,
             compensation_plan: TransitionPlan {
                 next_status: WorkflowStatus::Cancelled,
                 snapshot: "cancelled",
@@ -4573,7 +4641,7 @@ fn deletion_compensation_can_generation_bump_from_failed_or_cancelled() {
                     event: "delete",
                     event_codec: codec("event"),
                     invalidations: vec![],
-                    reducer_inbox_events: vec![],
+                    terminal_receipt: None,
                     compensation_plan: TransitionPlan {
                         next_status: WorkflowStatus::DeletionPending,
                         snapshot: "deleting",
