@@ -268,6 +268,29 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (isMobile) {
+    if (actionablePrs.length === 0) {
+      return (
+        <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
+          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+          )}
+          {disposition.primary === 'review' && (
+            <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
+              Review workspace changes
+            </button>
+          )}
+          {disposition.showCleanUp && !cleanupBlockedByAmbiguity && (
+            <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>Clean up</button>
+          )}
+          {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
+            <button type="button" className="mobile-pr-action mobile-pr-action--danger" disabled={isLoading} onClick={handleAbandon}>Abandon</button>
+          )}
+          {disposition.note && <span className="work-actions-note">{disposition.note.text}</span>}
+          {error && <div className="work-actions-error" role="alert">{error}</div>}
+        </div>
+      );
+    }
+
     const activeIdentity = activePr
       ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
       : null;
@@ -317,7 +340,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">↗</span><span>GitHub</span>
                 </a>
               )}
-              {!cleanupBlockedByAmbiguity && associatedPrs.length > 1 && (
+              {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
                 <button type="button" className="mobile-pr-action mobile-pr-action--cleanup" disabled={isLoading} onClick={handleCleanUp}>
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
                 </button>
@@ -360,7 +383,7 @@ export function WorkControlBar({
             );
           })}
         </div>
-        {error && <div className="work-actions-error">{error}</div>}
+        {error && <div className="work-actions-error" role="alert">{error}</div>}
       </div>
     );
   }

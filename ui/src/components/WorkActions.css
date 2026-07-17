@@ -1,3 +1,28 @@
+.mobile-work-fallback {
+  min-height: 52px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mobile-work-fallback > button,
+.mobile-work-fallback > a {
+  min-height: 44px;
+  min-width: 0;
+  flex: 1 1 auto;
+  border-radius: 8px;
+  padding: 8px 10px;
+  justify-content: center;
+  font-size: 12px;
+}
+
+.mobile-work-fallback .work-actions-note {
+  flex: 1 1 auto;
+}
+
 .mobile-pr-dock {
   flex: 0 0 auto;
   border-top: 1px solid var(--border-color);

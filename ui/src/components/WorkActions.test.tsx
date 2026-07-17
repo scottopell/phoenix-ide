@@ -1187,8 +1187,40 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 3 new');
     expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Clean up' })).toHaveClass('mobile-pr-action--cleanup');
+    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--danger');
+  });
+
+  it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-no-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clean up' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
+  });
+
+  it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-open" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Abandon' })).toBeInTheDocument();
   });
 
   it('pins a different open PR through the shared handle', async () => {
@@ -1212,7 +1244,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#13 open/ }));
-    expect(await screen.findByText('Could not save selection')).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not save selection');
     expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
   });
 });

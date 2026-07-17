@@ -970,6 +970,14 @@ export function StateBar({
     prStatus && !prStatus.found
       ? unavailablePrHint(prStatus.unavailable_reason)
       : null;
+  const mobilePrRailOwnsSelection = Boolean(
+    isMobile
+    && (isWork || isBranchMode)
+    && ['idle', 'error', 'context_exhausted'].includes(convState.type)
+    && prStatusHandle?.activeSelection?.associated_prs.some(
+      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+    ),
+  );
 
   const cwdSummary = summarizePath(conversation?.cwd);
   const modeHelp = modeTitle(mode, isExplore, isWork, isBranchMode);
@@ -978,7 +986,7 @@ export function StateBar({
   const prStatusContent = (
     <>
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
-      {!isMobile && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
+      {!mobilePrRailOwnsSelection && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
       {prHint && !prLoading && (
         <span
           className="pr-hint"
