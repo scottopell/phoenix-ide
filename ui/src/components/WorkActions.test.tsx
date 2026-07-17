@@ -1305,6 +1305,61 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
   });
 
+  it('keeps stuck-phase Abandon as the mobile hero action', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-stuck" convModeLabel="Work" phaseType="error" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--hero');
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
+  });
+
+  it('keeps terminal cleanup primary in the mobile fallback', () => {
+    enableMobile();
+    const terminalSelection = selection({
+      associated_prs: [{ ...selection().associated_prs[0]!, state: 'MERGED', display_state: 'merged' }],
+    });
+    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: terminalSelection });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-merged" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
+  });
+
+  it('lets a pinned mobile selection resume automatic inference', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const pinnedSelection = twoOpenPrSelection();
+    pinnedSelection.active_pr = { ...pinnedSelection.active_pr!, provenance: 'pinned' };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: pinnedSelection,
+    }, { resumeInference });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-pinned" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+  });
+
   it('pins a different open PR through the shared handle', async () => {
     enableMobile();
     const pinActivePr = vi.fn().mockResolvedValue(undefined);

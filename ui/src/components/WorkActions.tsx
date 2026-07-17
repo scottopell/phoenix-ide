@@ -231,6 +231,17 @@ export function WorkControlBar({
     }
   };
 
+  const resumeMobilePrInference = async () => {
+    if (!prStatusHandle.resumeInference) return;
+    setError(null);
+    try {
+      await prStatusHandle.resumeInference();
+      setExpandedMobilePrIdentity(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resume automatic PR selection');
+    }
+  };
+
   const selectMobilePr = async (pr: (typeof associatedPrs)[number], selected: boolean) => {
     const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
     if (selected) {
@@ -303,7 +314,7 @@ export function WorkControlBar({
           {disposition.showCleanUp && !cleanupBlockedByAmbiguity && (
             <button
               type="button"
-              className="mobile-pr-action mobile-pr-action--cleanup"
+              className={`mobile-pr-action mobile-pr-action--cleanup${disposition.primary === 'clean_up' ? ' mobile-pr-action--hero' : ''}`}
               aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
               title={cleanUpHintText(isBranch)}
               disabled={isLoading}
@@ -315,7 +326,7 @@ export function WorkControlBar({
           {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
             <button
               type="button"
-              className="mobile-pr-action mobile-pr-action--danger"
+              className={`mobile-pr-action mobile-pr-action--danger${disposition.primary === 'abandon' ? ' mobile-pr-action--hero' : ''}`}
               aria-label={`Abandon. ${abandonHintText(isBranch)}`}
               title={abandonHintText(isBranch)}
               disabled={isLoading}
@@ -334,7 +345,25 @@ export function WorkControlBar({
       ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
       : null;
     const expanded = activeIdentity !== null && expandedMobilePrIdentity === activeIdentity;
-    const mobileHero = disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
+    const mobileHero = disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--cleanup"
+        disabled={isLoading}
+        onClick={handleCleanUp}
+      >
+        Clean up
+      </button>
+    ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
+        disabled={isLoading}
+        onClick={handleAbandon}
+      >
+        Abandon
+      </button>
+    ) : disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero"
@@ -345,19 +374,19 @@ export function WorkControlBar({
         <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
         <CoverageMarker marker={coverageMarker} />
       </button>
-    ) : disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
+    ) : disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
       <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-    ) : (
-      <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('active_pr')}>
-        Review {activePrLabel}
+    ) : disposition.primary === 'review' ? (
+      <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
+        Review workspace changes
       </button>
-    );
+    ) : null;
 
     return (
       <div className="mobile-pr-dock" data-testid="mobile-work-controls">
         {expanded && (
           <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
-            <div className="mobile-pr-actions-hero">{mobileHero}</div>
+            {mobileHero && <div className="mobile-pr-actions-hero">{mobileHero}</div>}
             <div className="mobile-pr-actions-secondary">
               <button type="button" className="mobile-pr-action mobile-pr-action--review" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>
                 <span className="mobile-pr-action-icon" aria-hidden="true">Δ</span><span>PR diff</span>
@@ -380,7 +409,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">↗</span><span>GitHub</span>
                 </a>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
+              {!cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--cleanup"
@@ -392,7 +421,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
                 </button>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
+              {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--danger"
@@ -402,6 +431,15 @@ export function WorkControlBar({
                   onClick={handleAbandon}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Abandon</span>
+                </button>
+              )}
+              {prStatusHandle.activeSelection?.active_pr?.provenance === 'pinned' && prStatusHandle.resumeInference && (
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--automatic"
+                  onClick={resumeMobilePrInference}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">↻</span><span>Auto</span>
                 </button>
               )}
             </div>

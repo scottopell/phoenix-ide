@@ -209,6 +209,12 @@
   color: #c4b5fd;
 }
 
+.mobile-pr-action--automatic {
+  border-color: rgb(45 212 191 / 25%);
+  background: rgb(20 184 166 / 6%);
+  color: #8edbd2;
+}
+
 .mobile-pr-action--cleanup {
   border-color: var(--border-color);
   background: var(--bg-tertiary);
@@ -219,6 +225,20 @@
   border-color: rgb(248 113 113 / 40%);
   background: rgb(239 68 68 / 10%);
   color: #fca5a5;
+}
+
+.mobile-work-fallback .mobile-pr-action--hero,
+.mobile-pr-actions-hero .mobile-pr-action--hero {
+  border-color: var(--accent-blue);
+  background: var(--accent-blue);
+  color: white;
+}
+
+.mobile-work-fallback .mobile-pr-action--hero.mobile-pr-action--danger,
+.mobile-pr-actions-hero .mobile-pr-action--hero.mobile-pr-action--danger {
+  border-color: var(--error-color);
+  background: var(--error-color);
+  color: white;
 }
 
 .mobile-pr-actions-context {
