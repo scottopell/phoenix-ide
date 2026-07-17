@@ -1173,6 +1173,7 @@ function MessageListImpl({
     if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
     if (match.kind === 'header-text') {
+      setPendingRevealRequest(null);
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
         const header = systemPromptRef.current;
         if (!header) return;
@@ -1183,6 +1184,7 @@ function MessageListImpl({
       return () => timers.forEach(clearTimeout);
     }
     const unitMatch = match;
+    if (!unitMatch.fragmentId) setPendingRevealRequest(null);
     if (unitMatch.fragmentId) {
       const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
       const revealTarget: ConversationFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };

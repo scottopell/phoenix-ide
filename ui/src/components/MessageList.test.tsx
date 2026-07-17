@@ -373,6 +373,34 @@ describe('MessageList', () => {
     expect(input).toBeInTheDocument();
   });
 
+  it('clears a pending reveal request when navigation moves to a header target', async () => {
+    agentMessageMockState.autoHandleReveal = false;
+    const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha row match' }] } as Message;
+    render(withConvContext(
+      <MessageList
+        messages={[message]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-header-clears-reveal"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-header-clears-reveal', generation: 1, transcriptGeneration: 1 } }}
+        systemPrompt="alpha header match"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect([...agentMessageProps].reverse().find((entry) => entry.revealRequest)?.revealRequest).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    await waitFor(() => expect(agentMessageProps.at(-1)?.revealRequest).toBeUndefined());
+    expect(document.querySelector('.system-prompt-content')).toHaveClass('viewer-find-row-match--active');
+  });
+
   it('steps from the normalized transcript match index after results shrink', async () => {
     const initialMessages: Message[] = [
       { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },

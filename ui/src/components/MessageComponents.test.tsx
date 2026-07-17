@@ -1221,6 +1221,26 @@ describe('message copy affordances', () => {
   });
 });
 
+describe('agent Markdown find activation', () => {
+  it('maps rendered-text offsets back to raw Markdown source before highlighting', () => {
+    const sourceText = 'Read **bold docs** at [the guide](https://example.test/hidden).';
+    const renderedText = 'Read bold docs at the guide.';
+    const start = renderedText.indexOf('guide');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end: start + 'guide'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')?.textContent).toBe('guide');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')?.textContent).toContain('[the guide](https://example.test/hidden)');
+  });
+});
+
 describe('ordinary message find highlighting', () => {
   it('marks the exact active occurrence in a user message fragment', () => {
     const message = { ...agentMessage('user-find', []), message_type: 'user', content: { text: 'visible alpha message' } } as Message;

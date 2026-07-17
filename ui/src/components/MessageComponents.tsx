@@ -36,7 +36,7 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
-import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkdownDisplayBlocks, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
 import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
@@ -483,6 +483,32 @@ function QueuedUserMessageImpl({
 // Compact-density helpers
 // ============================================================================
 
+function mapRenderedHighlightToSource(
+  sourceText: string,
+  renderedText: string,
+  start: number,
+  end: number,
+): { start: number; end: number } | null {
+  const needle = renderedText.slice(start, end);
+  if (!needle) return null;
+  const renderedPrefix = renderedText.slice(0, start).toLocaleLowerCase();
+  const normalizedNeedle = needle.toLocaleLowerCase();
+  let occurrence = 0;
+  let renderedCursor = 0;
+  while ((renderedCursor = renderedPrefix.indexOf(normalizedNeedle, renderedCursor)) !== -1) {
+    occurrence += 1;
+    renderedCursor += normalizedNeedle.length;
+  }
+  const normalizedSource = sourceText.toLocaleLowerCase();
+  let sourceCursor = 0;
+  for (let index = 0; index <= occurrence; index += 1) {
+    sourceCursor = normalizedSource.indexOf(normalizedNeedle, sourceCursor);
+    if (sourceCursor === -1) return null;
+    if (index < occurrence) sourceCursor += normalizedNeedle.length;
+  }
+  return { start: sourceCursor, end: sourceCursor + needle.length };
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
   if (start < 0 || end <= start || start >= text.length) return text;
@@ -808,6 +834,12 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
       ? activeHighlight
       : null;
+    const highlightedSemanticText = highlight
+      ? buildMarkdownDisplayBlocks(fragment.display.sourceText).map((block) => block.searchableText).join('\n') || fragment.display.sourceText
+      : fragment.semanticText;
+    const sourceHighlight = highlight
+      ? mapRenderedHighlightToSource(fragment.display.sourceText, highlightedSemanticText, highlight.start, highlight.end)
+      : null;
     if (!expanded) {
       return (
         <CollapsibleText
@@ -822,9 +854,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
         <div className="agent-text-block">
-          {highlight ? (
+          {highlight && sourceHighlight ? (
             <div className="viewer-find-inline-highlight" data-active-fragment-highlight>
-              {renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)}
+              {renderHighlightedText(fragment.display.sourceText, sourceHighlight.start, sourceHighlight.end)}
             </div>
           ) : (
             <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
