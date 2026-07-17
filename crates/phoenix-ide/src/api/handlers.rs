@@ -3466,6 +3466,7 @@ async fn send_chat(
             images: req.images,
             files: req.files,
             user_agent: req.user_agent,
+            expansion_policy: crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
         })
         .await
         .map_err(|error| match error {

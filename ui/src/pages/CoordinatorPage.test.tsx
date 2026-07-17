@@ -138,6 +138,27 @@ describe('CoordinatorPage', () => {
     expect(screen.getByDisplayValue('auth')).toBeInTheDocument();
   });
 
+  it('treats approval and recovery signals as attention and links to the owning conversation', async () => {
+    const data = openWork();
+    data.groups[0].items[0] = {
+      ...data.groups[0].items[0],
+      source: 'chain',
+      href: '/chains/root-1',
+      current_conversation_slug: 'latest-owner',
+      state: 'awaiting_task_approval',
+      signals: ['task approval pending', 'recovery needed'],
+    };
+    apiMock.getGlobalOpenWork.mockResolvedValue(data);
+
+    renderPage();
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+
+    expect(screen.getByRole('heading', { name: '1 conversation need attention' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Fix coordinator page/ })).toHaveAttribute('href', '/c/latest-owner');
+    expect(screen.getByText('awaiting_task_approval')).toHaveClass('coordinator-state-pill--urgent');
+  });
+
   it('loads the coordinator contract and renders attention-first work', async () => {
     renderPage();
 

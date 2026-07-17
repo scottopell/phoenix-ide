@@ -328,7 +328,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
                 </div>
                 <div className="coordinator-items">
                   {group.items.map((item) => (
-                    <Link className="coordinator-item" key={item.reference} to={item.href}>
+                    <Link className="coordinator-item" key={item.reference} to={owningConversationHref(item)}>
                       <div className="coordinator-item-topline">
                         <span className={`coordinator-state-pill coordinator-state-pill--${attentionTone(item)}`}>{item.state}</span>
                         <span>{formatUpdatedAt(item.updated_at)}</span>
@@ -385,7 +385,7 @@ function summarizeAttention(openWork: GlobalOpenWorkResponse | null): { title: s
     return { title: 'Nothing is asking for attention', detail: 'No open work is currently visible in the shared work snapshot.' };
   }
 
-  const needsAction = items.filter((item) => item.state === 'needs_action' || item.signals.some((signal) => /needs action|awaiting user|blocked/i.test(signal)));
+  const needsAction = items.filter(needsAttention);
   if (needsAction.length > 0) {
     return {
       title: `${needsAction.length} conversation${needsAction.length === 1 ? '' : 's'} need attention`,
@@ -424,8 +424,18 @@ function formatUpdatedAt(timestamp: string): string {
   return new Date(timestamp).toLocaleString();
 }
 
+function needsAttention(item: GlobalOpenWorkResponse['groups'][number]['items'][number]): boolean {
+  return /needs_action|awaiting.*(?:user|approval|response)|approval|question|recovery|context_exhausted/i.test(item.state)
+    || item.signals.some((signal) => /needs action|awaiting user|approval pending|question|blocked|recovery needed/i.test(signal));
+}
+
+function owningConversationHref(item: GlobalOpenWorkResponse['groups'][number]['items'][number]): string {
+  const target = item.current_conversation_slug || item.current_conversation_id;
+  return `/c/${encodeURIComponent(target)}`;
+}
+
 function attentionTone(item: GlobalOpenWorkResponse['groups'][number]['items'][number]): 'urgent' | 'warning' | 'working' | 'idle' {
-  if (item.state === 'needs_action' || item.signals.some((signal) => /needs action|awaiting user|blocked/i.test(signal))) return 'urgent';
+  if (needsAttention(item)) return 'urgent';
   if (item.state === 'error' || item.signals.some((signal) => /error|failed/i.test(signal))) return 'warning';
   if (item.state === 'working' || item.signals.some((signal) => /active|running/i.test(signal))) return 'working';
   return 'idle';

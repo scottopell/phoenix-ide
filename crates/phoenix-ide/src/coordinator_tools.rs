@@ -210,6 +210,7 @@ impl Tool for SendConversationMessage {
             images: Vec::new(),
             files: Vec::new(),
             user_agent: None,
+            expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
         };
         let output = match self.send_chat.send(request).await {
             Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {

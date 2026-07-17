@@ -17,7 +17,7 @@
   gap: 16px;
   padding: 16px;
   box-sizing: border-box;
-  color: var(--text);
+  color: var(--text-primary);
 }
 
 .coordinator-header,
@@ -29,8 +29,8 @@
 .coordinator-item,
 .coordinator-error,
 .coordinator-muted {
-  border: 1px solid var(--border);
-  background: var(--panel);
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
   border-radius: 14px;
 }
 
@@ -49,10 +49,10 @@
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  color: var(--text);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
   text-decoration: none;
-  background: var(--bg);
+  background: var(--bg-primary);
 }
 
 .coordinator-heading {
@@ -85,9 +85,9 @@
   display: inline-flex;
   gap: 6px;
   padding: 4px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-color);
   border-radius: 999px;
-  background: var(--bg);
+  background: var(--bg-primary);
 }
 
 .coordinator-view-tab,
@@ -95,17 +95,17 @@
 .coordinator-query-form button,
 .coordinator-work-error button,
 .coordinator-find-work > button {
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
   border-radius: 10px;
   padding: 8px 12px;
   cursor: pointer;
 }
 
 .coordinator-view-tab[aria-selected='true'] {
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--accent-blue) 12%, var(--bg-primary));
+  border-color: var(--accent-blue);
 }
 
 .coordinator-view-count {
@@ -173,9 +173,9 @@
 .coordinator-query-field input {
   width: 100%;
   box-sizing: border-box;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
   border-radius: 10px;
   padding: 10px 12px;
 }
@@ -202,7 +202,7 @@
 }
 
 .coordinator-item:hover {
-  border-color: var(--accent-border);
+  border-color: var(--accent-blue);
   transform: translateY(-1px);
 }
 
@@ -221,25 +221,25 @@
 .coordinator-state-pill,
 .coordinator-item-signals span,
 .coordinator-item-meta span {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-color);
   border-radius: 999px;
   padding: 2px 8px;
   font-size: 0.75rem;
 }
 
 .coordinator-state-pill--urgent {
-  border-color: var(--warning-border);
-  color: var(--warning-text);
+  border-color: var(--accent-yellow);
+  color: var(--accent-yellow);
 }
 
 .coordinator-state-pill--warning {
-  border-color: #b85c5c;
-  color: #ff9b9b;
+  border-color: var(--accent-red);
+  color: var(--accent-red);
 }
 
 .coordinator-state-pill--working {
-  border-color: var(--accent-border);
-  color: var(--accent-text);
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
 }
 
 .coordinator-state-pill--idle {

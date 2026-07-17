@@ -8,6 +8,12 @@ use phoenix_core::domain::skill_invocation::SkillInvocation;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageExpansionPolicy {
+    ExpandReferences,
+    LiteralText,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
@@ -16,6 +22,7 @@ pub(crate) struct SendChatRequest {
     pub images: Vec<ImageAttachment>,
     pub files: Vec<FileAttachment>,
     pub user_agent: Option<String>,
+    pub expansion_policy: MessageExpansionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,16 +70,17 @@ impl SendChatApplicationService {
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let request_fingerprint = request_fingerprint(&req)?;
         let mut receipts = self.runtime.lock_chat_acceptance().await;
-        if let Some(receipt) = receipts.get(&req.message_id) {
-            return replay_receipt(receipt, &req, &request_fingerprint);
-        }
         if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
             if message.conversation_id != req.conversation_id
                 || !persisted_message_matches(&message.content, &req)
             {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
+            receipts.remove(&req.message_id);
             return Ok(SendChatOutcome::Delivered);
+        }
+        if let Some(receipt) = receipts.get(&req.message_id) {
+            return replay_receipt(receipt, &req, &request_fingerprint);
         }
 
         let conversation = self
@@ -93,27 +101,27 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
+        let validated_files = validate_submitted_attachments(&req.conversation_id, &req.files)
+            .await
+            .map_err(|e| SendChatServiceError::AttachmentValidation(format!("{e:?}")))?;
+        let expanded = expand_message(
+            &self.db,
+            &conversation.id,
+            &conversation.cwd,
+            &req.text,
+            req.expansion_policy,
+        )
+        .await?;
         if let Some(entry) = steering_queue
             .iter()
             .find(|entry| entry.message_id == req.message_id)
         {
-            if conversation.id != req.conversation_id || entry.text != req.text {
+            if !queued_entry_matches(entry, &req, &expanded, &validated_files) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-            receipts.insert(
-                req.message_id.clone(),
-                ChatAcceptanceReceipt {
-                    conversation_id: req.conversation_id.clone(),
-                    request_fingerprint,
-                    steering: true,
-                },
-            );
+            receipts.remove(&req.message_id);
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
-
-        let validated_files = validate_submitted_attachments(&req.conversation_id, &req.files)
-            .await
-            .map_err(|e| SendChatServiceError::AttachmentValidation(format!("{e:?}")))?;
 
         let effective_state = self
             .effective_state(&conversation.id, &conversation.state)
@@ -132,9 +140,6 @@ impl SendChatApplicationService {
                         code: "steering_queue_full",
                     });
                 }
-                let expanded =
-                    expand_message(&self.db, &conversation.id, &conversation.cwd, &req.text)
-                        .await?;
                 let event = Event::SteerMessage {
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text,
@@ -148,7 +153,8 @@ impl SendChatApplicationService {
                     .enqueue_steer_message(&conversation.id, event)
                     .await
                     .map_err(SendChatServiceError::Dispatch)?;
-                receipts.insert(
+                insert_bounded_receipt(
+                    &mut receipts,
                     req.message_id.clone(),
                     ChatAcceptanceReceipt {
                         conversation_id: conversation.id.clone(),
@@ -171,8 +177,6 @@ impl SendChatApplicationService {
             });
         }
 
-        let expanded =
-            expand_message(&self.db, &conversation.id, &conversation.cwd, &req.text).await?;
         let event = Event::UserMessage {
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text,
@@ -186,7 +190,8 @@ impl SendChatApplicationService {
             .send_event(&conversation.id, event)
             .await
             .map_err(SendChatServiceError::Dispatch)?;
-        receipts.insert(
+        insert_bounded_receipt(
+            &mut receipts,
             req.message_id.clone(),
             ChatAcceptanceReceipt {
                 conversation_id: conversation.id.clone(),
@@ -247,12 +252,14 @@ async fn expand_message(
     conversation_id: &str,
     cwd: &str,
     text: &str,
+    policy: MessageExpansionPolicy,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
-    let expanded = if db
-        .is_coordinator_conversation(conversation_id)
-        .await
-        .map_err(|e| SendChatServiceError::Internal(e.to_string()))?
+    let expanded = if policy == MessageExpansionPolicy::LiteralText
+        || db
+            .is_coordinator_conversation(conversation_id)
+            .await
+            .map_err(|e| SendChatServiceError::Internal(e.to_string()))?
     {
         crate::message_expander::ExpandedMessage {
             display_text: text.to_string(),
@@ -274,6 +281,41 @@ async fn expand_message(
         llm_text,
         skill_invocation: expanded.skill_invocation,
     })
+}
+
+fn insert_bounded_receipt(
+    receipts: &mut std::collections::HashMap<String, ChatAcceptanceReceipt>,
+    message_id: String,
+    receipt: ChatAcceptanceReceipt,
+) {
+    const MAX_TRANSIENT_RECEIPTS: usize = 1_024;
+    if receipts.len() >= MAX_TRANSIENT_RECEIPTS {
+        if let Some(expired_id) = receipts.keys().next().cloned() {
+            receipts.remove(&expired_id);
+        }
+    }
+    receipts.insert(message_id, receipt);
+}
+
+fn queued_entry_matches(
+    entry: &phoenix_core::domain::sm_event::SteerEntry,
+    req: &SendChatRequest,
+    expanded: &ExpandedDispatchMessage,
+    validated_files: &[phoenix_core::domain::db_schema::FileAttachment],
+) -> bool {
+    entry.text == expanded.display_text
+        && entry.llm_text == expanded.llm_text
+        && entry.images.len() == req.images.len()
+        && entry
+            .images
+            .iter()
+            .zip(&req.images)
+            .all(|(stored, requested)| {
+                stored.data == requested.data && stored.media_type == requested.media_type
+            })
+        && entry.files == validated_files
+        && entry.user_agent == req.user_agent
+        && entry.skill_invocation == expanded.skill_invocation
 }
 
 fn persisted_message_matches(
@@ -317,6 +359,10 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
         })).collect::<Vec<_>>(),
         "files": req.files,
         "user_agent": req.user_agent,
+        "expansion_policy": match req.expansion_policy {
+            MessageExpansionPolicy::ExpandReferences => "expand_references",
+            MessageExpansionPolicy::LiteralText => "literal_text",
+        },
     }))
     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
     Ok(sha2::Sha256::digest(canonical).iter().fold(
