@@ -51,6 +51,17 @@ describe('TaskApprovalReader markdown rendering', () => {
     expect(container.querySelector('.language-mermaid')).toBeInTheDocument();
     expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeInTheDocument();
   });
+
+
+  it('preserves inline Markdown elements while marking a paragraph match', async () => {
+    const { container } = renderTaskApprovalReader('Use `alpha` and [alpha](https://example.test) safely.');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(container.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha'));
+    expect(container.querySelector('code')).toHaveTextContent('alpha');
+    expect(container.querySelector('a')).toHaveAttribute('href', 'https://example.test');
+  });
 });
 
 describe('TaskApprovalReader feedback action emphasis', () => {

@@ -469,7 +469,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps rendered Markdown and HTML preview ineligible while allowing HTML source find', () => {
+  it('keeps HTML preview ineligible while allowing HTML source and rendered Markdown find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -498,7 +498,19 @@ describe('MetaViewer payload routing', () => {
         <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
       </ReviewNotesProvider>,
     );
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('keeps source-style Markdown fallbacks searchable', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('[data-find-occurrence="0"]')).toHaveTextContent('alpha');
   });
 
   it('closes file find when switching HTML source to preview', async () => {

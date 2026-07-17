@@ -349,6 +349,32 @@ describe('ReadFileResultView', () => {
     expect(container.querySelector('[data-fragment-id="read-file-path"] .viewer-find-inline-match--active')?.textContent).toBe('src/foo.ts');
   });
 
+  it('keeps a capped preview when the active match is the path', () => {
+    const manyLines = Array.from({ length: 25 }, (_, index) => `${String(index + 1).padStart(6)}\tline ${index + 1}`).join('\n');
+    const projection = buildReadFileOutputProjection(manyLines, { path: 'src/large.ts' }, { toolUseId: 'read-large' });
+    const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path')!;
+    render(
+      <ReadFileResultView
+        rawText={manyLines}
+        input={{ path: 'src/large.ts' }}
+        onOpenFile={undefined}
+        toolUseId="read-large"
+        metadata={{
+          type: 'read_file', path: 'src/large.ts',
+          total_line_count: 25, returned_start_line: 1, returned_end_line: 25,
+          returned_line_count: 25, remaining_line_count: 0, requested_offset: 1,
+          requested_limit: 25, viewer_available: false,
+        }}
+        showPath
+        activeHighlight={{ fragmentId: pathFragment.fragmentId, start: 0, end: 'src/large.ts'.length }}
+      />,
+    );
+
+    expect(screen.getByText('line 20')).toBeInTheDocument();
+    expect(screen.queryByText('line 21')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show all returned lines' })).toBeInTheDocument();
+  });
+
   it('highlights the exact active occurrence without duplicating content', () => {
     const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
     const targetFragment = projection.fragments.find((fragment) => fragment.kind === 'line'

@@ -12,7 +12,7 @@
  * for the rationale. Plan content comes from ConversationState, not from disk.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Children, cloneElement, isValidElement, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -239,6 +239,31 @@ function renderFindFragments(
   });
   if (cursor < text.length) fragments.push(text.slice(cursor));
   return fragments;
+}
+
+function decorateFindChildren(
+  children: React.ReactNode,
+  matches: readonly { start: number; end: number; occurrenceIndex: number }[],
+  activeOccurrence: number,
+): React.ReactNode {
+  let cursor = 0;
+  const decorate = (node: React.ReactNode): React.ReactNode => Children.map(node, (child) => {
+    if (typeof child === 'string') {
+      const start = cursor;
+      cursor += child.length;
+      const localMatches = matches
+        .filter((match) => match.start < cursor && match.end > start)
+        .map((match) => ({
+          ...match,
+          start: Math.max(0, match.start - start),
+          end: Math.min(child.length, match.end - start),
+        }));
+      return localMatches.length > 0 ? renderFindFragments(child, localMatches, activeOccurrence) : child;
+    }
+    if (!isValidElement<{ children?: React.ReactNode }>(child)) return child;
+    return cloneElement(child, {}, decorate(child.props.children));
+  });
+  return decorate(children);
 }
 
 export function TaskApprovalReader({
@@ -529,10 +554,7 @@ export function TaskApprovalReader({
           .slice(startLine, endLine + 1)
           .join(' ')
           .slice(0, 200);
-        const lineText = rawLines[ln - 1] ?? '';
         const blockId = claimDisplayBlock(ln, node?.position?.start?.offset, kind);
-        const displayBlock = markdownDisplayBlocks.find((block) => block.id === blockId);
-        const blockText = displayBlock?.searchableText ?? lineText;
         const blockMatches = matchesByBlockId.get(blockId) ?? [];
         const shouldDecorateChildren = decorateChildren && blockMatches.length > 0;
         return (
@@ -555,7 +577,7 @@ export function TaskApprovalReader({
             {...props}
           >
             {shouldDecorateChildren
-              ? renderFindFragments(blockText, blockMatches, activeFindIndex)
+              ? decorateFindChildren(children, blockMatches, activeFindIndex)
               : children}
           </AnnotatableBlock>
         );

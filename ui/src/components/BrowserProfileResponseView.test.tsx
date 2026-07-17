@@ -41,6 +41,19 @@ describe('BrowserProfileResponseView find highlighting', () => {
     expect(text).toContain('Nodes 1,234');
     expect(text).not.toContain('JSHeapUsedSize 1048576');
   });
+  it('projects visible trace totals and per-task durations', () => {
+    const text = buildBrowserProfileVisibleText('trace_stop', {
+      trace: {
+        event_count: 1234, long_task_count: 2, long_task_total_ms: 45.64,
+        path: '/tmp/trace.json', long_tasks: [{ name: 'RunTask', ms: 123.44 }],
+      },
+    }, 'opaque');
+
+    expect(text).toContain('1,234 events');
+    expect(text).toContain('2 long tasks (45.6 ms total)');
+    expect(text).toContain('123.4ms\nRunTask');
+  });
+
   it('marks an active occurrence in the visible scenario summary', () => {
     const displayData = {
       outcome: 'completed', requested_runs: 2, warmup: 1,

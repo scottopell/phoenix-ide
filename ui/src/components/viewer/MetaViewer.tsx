@@ -21,6 +21,7 @@ import {
   FindBar,
   activeSessionMatchIndex,
   buildFileSearchProjection,
+  buildMarkdownDisplayBlocks,
   createSurfaceKey,
   projectionMatchesToSessionMatches,
   useFindSession,
@@ -250,9 +251,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // rather than being stranded on the raw <pre>.
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
-  const renderedMarkdown = payload.kind === 'markdown' && !rangeSource;
-  const findEligible = !renderedMarkdown && ((textLike && !htmlPreview) || largeFallback);
-  const findSourceText = findEligible ? content : '';
+  const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
+  const findEligible = (textLike && !htmlPreview) || largeFallback;
+  const renderedMarkdownFindText = useMemo(
+    () => renderedMarkdown ? buildMarkdownDisplayBlocks(content).map((block) => block.searchableText).join('\n') : '',
+    [content, renderedMarkdown],
+  );
+  const findSourceText = findEligible ? (renderedMarkdown ? renderedMarkdownFindText : content) : '';
   const restoreFindFocus = useCallback((focusOrigin: HTMLElement | null) => {
     queueMicrotask(() => (focusOrigin ?? findButtonRef.current)?.focus());
   }, []);

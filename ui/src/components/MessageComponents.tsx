@@ -1696,7 +1696,12 @@ export function ReadFileResultView({
   const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
   const hasMore = preview.truncated;
   const canExpandReturnedOutput = hasMore;
-  const visibleLines = showAllReturnedLines || activeHighlight ? parsed.lines : preview.lines;
+  const activeLineNumber = activeHighlight
+    ? projection.fragments.find((fragment) => fragment.fragmentId === activeHighlight.fragmentId)?.revealTarget.lineNumber
+    : undefined;
+  const activeLineNeedsReveal = activeLineNumber !== undefined
+    && !preview.lines.some((line) => line.lineNumber === activeLineNumber);
+  const visibleLines = showAllReturnedLines || activeLineNeedsReveal ? parsed.lines : preview.lines;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
   const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path') ?? null;

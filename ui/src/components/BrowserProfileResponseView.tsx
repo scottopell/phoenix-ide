@@ -114,7 +114,18 @@ export function buildBrowserProfileVisibleText(
     case 'trace_stop': {
       const trace = data['trace'] as Record<string, unknown> | undefined;
       if (!trace) return `trace_stop\n${fallbackText}`;
-      return ['trace', typeof trace['event_count'] === 'number' ? `${trace['event_count']} events` : '', typeof trace['long_task_count'] === 'number' ? `${trace['long_task_count']} long tasks` : '', trace['timed_out'] === true ? 'timed out — partial trace' : '', typeof trace['path'] === 'string' ? trace['path'] : '', ...(Array.isArray(trace['long_tasks']) ? trace['long_tasks'].flatMap((entry) => entry && typeof entry === 'object' && typeof (entry as Record<string, unknown>)['name'] === 'string' ? [String((entry as Record<string, unknown>)['name'])] : []) : [])].filter(Boolean).join('\n');
+      const longTasks = sanitizeLongTasks(trace['long_tasks']);
+      return [
+        'trace',
+        typeof trace['event_count'] === 'number' ? `${trace['event_count'].toLocaleString()} events` : '',
+        typeof trace['long_task_count'] === 'number'
+          ? `${trace['long_task_count']} long task${trace['long_task_count'] !== 1 ? 's' : ''}${typeof trace['long_task_total_ms'] === 'number' ? ` (${trace['long_task_total_ms'].toFixed(1)} ms total)` : ''}`
+          : '',
+        trace['timed_out'] === true ? 'timed out — partial trace' : '',
+        typeof trace['path'] === 'string' ? trace['path'] : '',
+        ...longTasks.map((entry) => `${entry.ms.toFixed(1)}ms\n${entry.name}`),
+        longTasks.length === 0 ? 'No long tasks (>50ms) recorded.' : '',
+      ].filter(Boolean).join('\n');
     }
     default:
       return `${action}\n${fallbackText}`;
