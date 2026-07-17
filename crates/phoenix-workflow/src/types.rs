@@ -22,16 +22,19 @@ pub struct ObservationId(pub u64);
 pub struct ReceiptId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReducerInboxId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OwedAcceptanceId(pub u64);
+pub struct DeliveryId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManualResolutionId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ShadowDivergenceId(pub u64);
+pub struct ScheduleId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessIncarnation(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StableCommandId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(pub u64);
@@ -79,8 +82,8 @@ impl LeaseExpiry {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProfileRef {
-    pub profile_id: &'static str,
-    pub protocol_version: u32,
+    pub profile_kind: &'static str,
+    pub profile_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,16 +109,16 @@ impl SupportedCodecRegistry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SemanticAuthority {
-    LegacyProtocol,
-    EngineProtocol,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulePolicy {
+    CoalesceLatest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Authoritative,
-    Shadow,
+pub enum ScheduleStatus {
+    Idle,
+    Due,
+    Active,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +149,7 @@ pub enum ReceiptFamily {
 pub enum EffectStatus {
     Blocked,
     Eligible,
-    Claimed,
+    Executing,
     RetryWait,
     AmbiguityWait,
     Receipted,
@@ -167,6 +170,8 @@ pub enum ReceiptOrigin {
     Adoption,
     Reconciliation,
     Manual,
+    CancellationArbitration,
+    ScheduleCollapse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,16 +183,17 @@ pub enum BarrierStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed,
-    AlreadyCommitted,
     VersionConflict,
     InvalidPlan,
+    UnsupportedCodec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutcome {
-    Claimed,
+    Started,
     Ineligible,
     AuthorityConflict,
+    UnsupportedCodec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,25 +205,18 @@ pub enum AuthorityOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewalResult {
     pub outcome: AuthorityOutcome,
-    pub authority: Option<ClaimAuthority>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReducerInboxKind {
-    ReceiptAccepted,
-    BarrierSatisfied,
-    ManualResolutionRequired,
+    pub authority: Option<AttemptAuthority>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
     Pending,
-    Consumed,
-    Suppressed { reason: SuppressionReason },
+    Accepted,
+    Suppressed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcceptanceStatus {
+pub enum RuntimeAcceptanceStatus {
     Owed,
     Accepted,
     Suppressed,
@@ -228,70 +227,21 @@ pub enum SuppressionReason {
     Cancelled,
     Superseded,
     LifecycleTerminal,
-    OperatorRejected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OwedAcceptanceDisposition {
-    Owed,
-    Accepted {
-        transition: TransitionId,
-    },
-    Suppressed {
-        transition: TransitionId,
-        reason: SuppressionReason,
-    },
+    ReducerTerminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionStatus {
     Required,
     Resolved,
-    Suppressed {
-        transition: TransitionId,
-        reason: SuppressionReason,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualChoiceKind {
-    Adopt,
     Retry,
     Compensate,
-    Fail,
     Suppress,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DivergenceSeverity {
-    Blocking,
-    Actionable,
-    Informational,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DivergenceAction {
-    HaltAcceptance,
-    RetainAuthorityAndInvestigate,
-    RecordOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DivergenceResolutionAction {
-    Rollback,
-    Reauthorize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShadowDivergenceKind {
-    Snapshot,
-    Transition,
-    EffectPlan,
-    Observation,
-    Receipt,
-    ReducerEvent,
-    Capability,
-    UserProjection,
+    AcceptAsTerminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,23 +256,21 @@ pub enum ReconciliationDecision {
     StopAuthorityLost,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectAmbiguity {
-    ObservableReconciliation,
-    ExternalIdempotency,
-    SafeRepeatability,
-    ManualResolution,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionCapability {
+    ReclaimableObservation,
+    IdempotentSubmission { stable_command_id: StableCommandId },
+    ObservableSubmission { stable_command_id: StableCommandId },
+    SafelyRepeatable,
+    ManualOnAmbiguity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProtocolSelection {
+pub struct AcceptanceProfile {
     pub profile: ProfileRef,
     pub supported_codecs: SupportedCodecRegistry,
-    pub authority: SemanticAuthority,
-    pub accepting: bool,
     pub runtime_acceptance_enabled: bool,
     pub external_acceptance_enabled: bool,
-    pub selector: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -342,23 +290,6 @@ impl NonEmptyExternalKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ProtocolSelectionIdentity {
-    pub selector: &'static str,
-    pub authority: SemanticAuthority,
-    pub profile: ProfileRef,
-}
-
-impl From<&ProtocolSelection> for ProtocolSelectionIdentity {
-    fn from(selection: &ProtocolSelection) -> Self {
-        Self {
-            selector: selection.selector,
-            authority: selection.authority,
-            profile: selection.profile.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalAcceptanceKey {
     pub profile: ProfileRef,
     pub authority_scope: NonEmptyExternalKey,
@@ -374,7 +305,9 @@ pub struct ExternalAcceptanceReceipt<H> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAcceptanceBinding<H> {
-    pub accepted_protocol: ProtocolSelectionIdentity,
+    pub profile: ProfileRef,
+    pub authority_scope: NonEmptyExternalKey,
+    pub idempotency_key: NonEmptyExternalKey,
     pub intent_fingerprint: String,
     pub receipt: ExternalAcceptanceReceipt<H>,
 }
@@ -388,57 +321,10 @@ pub enum ExternalAcceptanceOutcome<H> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthoritativeWorkflow {
+pub struct WorkflowBinding {
     pub workflow_id: WorkflowId,
     pub profile: ProfileRef,
-    pub accepted_protocol: ProtocolSelection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowWorkflow {
-    pub workflow_id: WorkflowId,
-    pub authoritative_workflow_id: WorkflowId,
-    pub profile: ProfileRef,
-    pub accepted_protocol: ProtocolSelection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkflowBinding {
-    Authoritative(AuthoritativeWorkflow),
-    Shadow(ShadowWorkflow),
-}
-
-impl WorkflowBinding {
-    #[must_use]
-    pub fn execution_mode(&self) -> ExecutionMode {
-        match self {
-            Self::Authoritative(_) => ExecutionMode::Authoritative,
-            Self::Shadow(_) => ExecutionMode::Shadow,
-        }
-    }
-
-    #[must_use]
-    pub fn workflow_id(&self) -> WorkflowId {
-        match self {
-            Self::Authoritative(workflow) => workflow.workflow_id,
-            Self::Shadow(workflow) => workflow.workflow_id,
-        }
-    }
-
-    #[must_use]
-    pub fn accepted_protocol(&self) -> &ProtocolSelection {
-        match self {
-            Self::Authoritative(workflow) => &workflow.accepted_protocol,
-            Self::Shadow(workflow) => &workflow.accepted_protocol,
-        }
-    }
-}
-
-impl EffectAmbiguity {
-    #[must_use]
-    pub const fn is_manual_only(self) -> bool {
-        matches!(self, Self::ManualResolution)
-    }
+    pub acceptance: AcceptanceProfile,
 }
 
 pub trait WorkflowProfile {
@@ -449,40 +335,33 @@ pub trait WorkflowProfile {
     type Receipt: Clone + Eq + std::fmt::Debug;
     type ReceiptReducerEvent: Clone + Eq + std::fmt::Debug;
     type BarrierEvent: Clone + Eq + std::fmt::Debug;
-    type OwedAcceptanceEvent: Clone + Eq + std::fmt::Debug;
     type ManualPayload: Clone + Eq + std::fmt::Debug;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool;
 
     fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool;
 
-    fn decision_handles_inbox(
-        event: &ReducerInboxPayload<Self>,
+    fn decision_handles_delivery(item: &DeliveryItem<Self>, decision_event: &Self::Event) -> bool
+    where
+        Self: Sized;
+
+    fn decision_handles_runtime_acceptance(
+        item: &DeliveryItem<Self>,
         decision_event: &Self::Event,
     ) -> bool
     where
         Self: Sized;
 
-    fn owed_acceptance_matches_inbox(
-        event: &Self::OwedAcceptanceEvent,
-        inbox_payload: &ReducerInboxPayload<Self>,
+    fn decision_handles_runtime_suppression(
+        item: &DeliveryItem<Self>,
+        decision_event: &Self::Event,
     ) -> bool
     where
         Self: Sized;
-
-    fn decision_handles_owed_acceptance(
-        event: &Self::OwedAcceptanceEvent,
-        decision_event: &Self::Event,
-    ) -> bool;
-
-    fn decision_handles_owed_acceptance_suppression(
-        event: &Self::OwedAcceptanceEvent,
-        decision_event: &Self::Event,
-    ) -> bool;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReducerInboxPayload<P: WorkflowProfile> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeliveryPayload<P: WorkflowProfile> {
     Receipt(P::ReceiptReducerEvent),
     Barrier(P::BarrierEvent),
 }
@@ -495,7 +374,7 @@ pub struct EffectDecl<I> {
     pub codec: CodecRef,
     pub generation: Generation,
     pub role: EffectRole,
-    pub ambiguity: EffectAmbiguity,
+    pub capability: ExecutionCapability,
     pub intent: I,
     pub next_eligible_at: Option<Timestamp>,
     pub destructive_resource: Option<&'static str>,
@@ -525,15 +404,25 @@ pub struct EffectInvalidationDecl {
     pub effect_id: EffectId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwedAcceptanceDecl<E> {
-    pub reducer_inbox_id: ReducerInboxId,
-    pub source_kind: &'static str,
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveryDecl<P: WorkflowProfile> {
+    pub effect_id: Option<EffectId>,
+    pub barrier_id: Option<BarrierId>,
+    pub consumer_kind: &'static str,
     pub event_codec: CodecRef,
-    pub event: E,
+    pub requires_runtime_acceptance: bool,
+    pub payload: DeliveryPayload<P>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleDecl {
+    pub schedule_id: ScheduleId,
+    pub policy: SchedulePolicy,
+    pub next_eligible_at: Timestamp,
+    pub key: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct TransitionPlan<P: WorkflowProfile> {
     pub next_status: WorkflowStatus,
     pub snapshot: P::Snapshot,
@@ -545,28 +434,23 @@ pub struct TransitionPlan<P: WorkflowProfile> {
     pub barriers: Vec<BarrierDecl>,
     pub barrier_members: Vec<BarrierMemberDecl>,
     pub invalidations: Vec<EffectInvalidationDecl>,
-    pub owed_acceptances: Option<Vec<OwedAcceptanceDecl<P::OwedAcceptanceEvent>>>,
+    pub deliveries: Vec<DeliveryDecl<P>>,
+    pub schedules: Vec<ScheduleDecl>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ReducerDecision<P: WorkflowProfile> {
     pub expected_workflow_version: Version,
     pub plan: TransitionPlan<P>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InboxDecisionBinding<P: WorkflowProfile> {
-    pub inbox: Vec<ReducerInboxEvent<P>>,
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveryDecisionBinding<P: WorkflowProfile> {
+    pub items: Vec<DeliveryItem<P>>,
     pub decision: ReducerDecision<P>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwedAcceptanceDecisionBinding<P: WorkflowProfile> {
-    pub owed: OwedAcceptanceRecord<P::OwedAcceptanceEvent>,
-    pub decision: ReducerDecision<P>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CancellationReceiptDecl<P: WorkflowProfile> {
     pub effect_id: EffectId,
     pub receipt_codec: CodecRef,
@@ -575,7 +459,7 @@ pub struct CancellationReceiptDecl<P: WorkflowProfile> {
     pub event: P::ReceiptReducerEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CancellationRequest<P: WorkflowProfile> {
     pub expected_workflow_version: Version,
     pub next_snapshot: P::Snapshot,
@@ -587,33 +471,35 @@ pub struct CancellationRequest<P: WorkflowProfile> {
     pub compensation_plan: TransitionPlan<P>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReducerInboxDecl<P: WorkflowProfile> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveryDeclCompat<P: WorkflowProfile> {
     pub effect_id: Option<EffectId>,
     pub barrier_id: Option<BarrierId>,
-    pub kind: ReducerInboxKind,
+    pub consumer_kind: &'static str,
     pub event_codec: CodecRef,
     pub requires_runtime_acceptance: bool,
-    pub payload: ReducerInboxPayload<P>,
+    pub payload: DeliveryPayload<P>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimAuthority {
+pub struct AttemptAuthority {
     pub workflow_id: WorkflowId,
     pub declared_workflow_version: Version,
     pub generation: Generation,
     pub effect_id: EffectId,
-    pub claim_token: u64,
-    pub worker_id: &'static str,
+    pub attempt_id: AttemptId,
+    pub process_incarnation: ProcessIncarnation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimableLease {
+    pub attempt_id: AttemptId,
     pub lease_until: LeaseExpiry,
-    pub resource_lock: Option<ResourceLockGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLockGrant {
     pub resource: &'static str,
-    pub worker_id: &'static str,
-    pub claim_token: u64,
     pub generation: Generation,
     pub lease_until: LeaseExpiry,
 }
@@ -622,14 +508,15 @@ pub struct ResourceLockGrant {
 pub struct AttemptRecord {
     pub id: AttemptId,
     pub ordinal: u32,
-    pub authority: ClaimAuthority,
+    pub authority: AttemptAuthority,
     pub status: AttemptStatus,
+    pub lease: Option<ReclaimableLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationRecord<O> {
     pub id: ObservationId,
-    pub authority: ClaimAuthority,
+    pub authority: AttemptAuthority,
     pub attempt_id: AttemptId,
     pub observation_codec: CodecRef,
     pub observation: O,
@@ -641,7 +528,7 @@ pub struct ObservationRecord<O> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleObservationRecord<O> {
     pub id: ObservationId,
-    pub authority: ClaimAuthority,
+    pub authority: AttemptAuthority,
     pub attempt_id: AttemptId,
     pub observation_codec: CodecRef,
     pub observed_at: Timestamp,
@@ -652,7 +539,7 @@ pub struct StaleObservationRecord<O> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptRecord<R> {
     pub id: ReceiptId,
-    pub authority: ClaimAuthority,
+    pub authority: AttemptAuthority,
     pub attempt_id: Option<AttemptId>,
     pub origin: ReceiptOrigin,
     pub receipt_codec: CodecRef,
@@ -660,17 +547,19 @@ pub struct ReceiptRecord<R> {
     pub generation: Generation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReducerInboxEvent<P: WorkflowProfile> {
-    pub id: ReducerInboxId,
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveryItem<P: WorkflowProfile> {
+    pub id: DeliveryId,
     pub effect_id: Option<EffectId>,
     pub barrier_id: Option<BarrierId>,
-    pub kind: ReducerInboxKind,
+    pub consumer_kind: &'static str,
     pub event_codec: CodecRef,
     pub requires_runtime_acceptance: bool,
-    pub payload: ReducerInboxPayload<P>,
-    pub delivery_status: DeliveryStatus,
-    pub consumed_by: Option<TransitionId>,
+    pub payload: DeliveryPayload<P>,
+    pub status: DeliveryStatus,
+    pub runtime_acceptance_status: Option<RuntimeAcceptanceStatus>,
+    pub suppression_reason: Option<SuppressionReason>,
+    pub accepted_by: Option<TransitionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,50 +572,50 @@ pub struct WorkflowTransition<E> {
     pub event_codec: CodecRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CommitResult<P: WorkflowProfile> {
     pub outcome: CommitOutcome,
     pub transition: Option<WorkflowTransition<P::Event>>,
-    pub reducer_events: Vec<ReducerInboxEvent<P>>,
+    pub deliveries: Vec<DeliveryItem<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AtomicInboxConsumeResult<P: WorkflowProfile> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeliveryConsumeResult<P: WorkflowProfile> {
     pub outcome: CommitOutcome,
     pub transition: Option<WorkflowTransition<P::Event>>,
-    pub consumed_inbox_ids: Vec<ReducerInboxId>,
-    pub reducer_events: Vec<ReducerInboxEvent<P>>,
+    pub consumed_delivery_ids: Vec<DeliveryId>,
+    pub deliveries: Vec<DeliveryItem<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeAcceptanceResult<P: WorkflowProfile> {
     pub outcome: CommitOutcome,
     pub transition: Option<WorkflowTransition<P::Event>>,
-    pub owed_acceptance: Option<OwedAcceptanceRecord<P::OwedAcceptanceEvent>>,
+    pub delivery: Option<DeliveryItem<P>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimResult {
     pub outcome: ClaimOutcome,
-    pub authority: Option<ClaimAuthority>,
+    pub authority: Option<AttemptAuthority>,
     pub attempt: Option<AttemptRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ReceiptAcceptance<P: WorkflowProfile> {
     pub outcome: AuthorityOutcome,
     pub receipt: Option<ReceiptRecord<P::Receipt>>,
-    pub receipt_inbox_ids: Vec<ReducerInboxId>,
-    pub reducer_events: Vec<ReducerInboxEvent<P>>,
+    pub delivery_ids: Vec<DeliveryId>,
+    pub deliveries: Vec<DeliveryItem<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BarrierEvaluation<P: WorkflowProfile> {
     pub newly_satisfied: Vec<BarrierId>,
-    pub reducer_events: Vec<ReducerInboxEvent<P>>,
+    pub deliveries: Vec<DeliveryItem<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManualChoice<P: WorkflowProfile>
 where
     P::ManualPayload: Clone + Eq,
@@ -740,7 +629,7 @@ where
     pub receipt_event: P::ReceiptReducerEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManualResolutionRecord<P: WorkflowProfile>
 where
     P::Observation: Clone + Eq,
@@ -756,7 +645,7 @@ where
     pub resolved_by: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_codec: CodecRef,
     pub transition_event: P::Event,
@@ -772,11 +661,11 @@ pub struct CancellationOutcome {
     pub preserved_winner: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ManualEffectOutcome<P: WorkflowProfile> {
     Receipt {
         receipt: Box<ReceiptRecord<P::Receipt>>,
-        reducer_event: Box<ReducerInboxEvent<P>>,
+        reducer_event: Box<DeliveryItem<P>>,
     },
     Retry,
     Compensate,
@@ -784,7 +673,7 @@ pub enum ManualEffectOutcome<P: WorkflowProfile> {
     Suppressed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManualResolutionOutcome<P: WorkflowProfile>
 where
     P::Observation: Clone + Eq,
@@ -797,7 +686,7 @@ where
     pub effect_outcome: Option<ManualEffectOutcome<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ReconciliationOutcome<P: WorkflowProfile>
 where
     P::Observation: Clone + Eq,
@@ -808,67 +697,19 @@ where
     pub manual_resolution: Option<ManualResolutionRecord<P>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwedAcceptanceRecord<E> {
-    pub id: OwedAcceptanceId,
-    pub reducer_inbox_id: ReducerInboxId,
-    pub source_kind: &'static str,
-    pub event_codec: CodecRef,
-    pub event: E,
-    pub disposition: OwedAcceptanceDisposition,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMigrationOutcome {
+    UpToDate,
+    Migrated,
+    Incompatible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DrainCategoryEvidence {
-    pub count: usize,
-    pub identities: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DrainProof {
-    pub profile: ProfileRef,
-    pub protocol: ProtocolSelection,
-    pub selector: &'static str,
-    pub query_identity: &'static str,
-    pub query_version: u32,
-    pub authority: Option<SemanticAuthority>,
-    pub complete: bool,
-    pub categories: BTreeMap<&'static str, DrainCategoryEvidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowComparisonEvidence {
-    pub profile_detail_kind: String,
-    pub expected_codec: Option<CodecRef>,
-    pub expected_payload: Option<String>,
-    pub actual_codec: Option<CodecRef>,
-    pub actual_payload: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowDivergenceRecord {
-    pub id: ShadowDivergenceId,
-    pub shadow_workflow_id: WorkflowId,
-    pub authoritative_workflow_id: WorkflowId,
-    pub kind: ShadowDivergenceKind,
-    pub severity: DivergenceSeverity,
-    pub action: DivergenceAction,
-    pub resolution: ShadowDivergenceResolution,
-    pub evidence_identity: String,
-    pub profile_detail_kind: String,
-    pub expected_codec: Option<CodecRef>,
-    pub expected_payload: Option<String>,
-    pub actual_codec: Option<CodecRef>,
-    pub actual_payload: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShadowDivergenceResolution {
-    Unresolved,
-    Resolved {
-        action: DivergenceResolutionAction,
-        resolved_by: &'static str,
-    },
+pub struct IncompatibleWorkflow {
+    pub workflow_id: WorkflowId,
+    pub stored_profile: ProfileRef,
+    pub detected_at: Timestamp,
+    pub disposition: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -877,7 +718,8 @@ pub struct EffectState<P: WorkflowProfile> {
     pub declared_workflow_version: Version,
     pub status: EffectStatus,
     pub dependencies: BTreeSet<EffectId>,
-    pub claim: Option<ClaimAuthority>,
+    pub authority: Option<AttemptAuthority>,
+    pub reclaimable_lease: Option<ReclaimableLease>,
     pub attempts: Vec<AttemptRecord>,
     pub observations: Vec<ObservationRecord<P::Observation>>,
     pub stale_observations: Vec<StaleObservationRecord<P::Observation>>,
@@ -895,6 +737,16 @@ pub struct BarrierState<P: WorkflowProfile> {
     pub reducer_event: P::BarrierEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleState {
+    pub schedule_id: ScheduleId,
+    pub policy: SchedulePolicy,
+    pub key: &'static str,
+    pub status: ScheduleStatus,
+    pub next_eligible_at: Timestamp,
+    pub active_effect_id: Option<EffectId>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct WorkflowState<P: WorkflowProfile> {
     pub binding: WorkflowBinding,
@@ -905,21 +757,19 @@ pub struct WorkflowState<P: WorkflowProfile> {
     pub snapshot_codec: CodecRef,
     pub effects: BTreeMap<EffectId, EffectState<P>>,
     pub barriers: BTreeMap<BarrierId, BarrierState<P>>,
-    pub reducer_inbox: BTreeMap<ReducerInboxId, ReducerInboxEvent<P>>,
-    pub owed_acceptances: BTreeMap<OwedAcceptanceId, OwedAcceptanceRecord<P::OwedAcceptanceEvent>>,
+    pub deliveries: BTreeMap<DeliveryId, DeliveryItem<P>>,
+    pub schedules: BTreeMap<ScheduleId, ScheduleState>,
     pub manual_resolutions: BTreeMap<ManualResolutionId, ManualResolutionRecord<P>>,
     pub transition_log: Vec<WorkflowTransition<P::Event>>,
-    pub shadow_divergences: Vec<ShadowDivergenceRecord>,
+    pub process_incarnation: ProcessIncarnation,
+    pub incompatible: Option<IncompatibleWorkflow>,
     pub crashed_workers: BTreeSet<&'static str>,
     pub(crate) next_transition_id: u64,
     pub(crate) next_attempt_id: u64,
     pub(crate) next_observation_id: u64,
     pub(crate) next_receipt_id: u64,
-    pub(crate) next_inbox_id: u64,
-    pub(crate) next_owed_acceptance_id: u64,
+    pub(crate) next_delivery_id: u64,
     pub(crate) next_manual_resolution_id: u64,
-    pub(crate) next_shadow_divergence_id: u64,
-    pub(crate) next_claim_token: u64,
 }
 
 impl<P: WorkflowProfile> Clone for WorkflowState<P> {
@@ -941,12 +791,12 @@ impl<P: WorkflowProfile> Clone for WorkflowState<P> {
                 .iter()
                 .map(|(barrier_id, barrier)| (*barrier_id, clone_barrier_state(barrier)))
                 .collect(),
-            reducer_inbox: self
-                .reducer_inbox
+            deliveries: self
+                .deliveries
                 .iter()
-                .map(|(inbox_id, event)| (*inbox_id, clone_reducer_inbox_event(event)))
+                .map(|(delivery_id, item)| (*delivery_id, clone_delivery_item(item)))
                 .collect(),
-            owed_acceptances: self.owed_acceptances.clone(),
+            schedules: self.schedules.clone(),
             manual_resolutions: self
                 .manual_resolutions
                 .iter()
@@ -955,37 +805,35 @@ impl<P: WorkflowProfile> Clone for WorkflowState<P> {
                 })
                 .collect(),
             transition_log: self.transition_log.clone(),
-            shadow_divergences: self.shadow_divergences.clone(),
+            process_incarnation: self.process_incarnation,
+            incompatible: self.incompatible.clone(),
             crashed_workers: self.crashed_workers.clone(),
             next_transition_id: self.next_transition_id,
             next_attempt_id: self.next_attempt_id,
             next_observation_id: self.next_observation_id,
             next_receipt_id: self.next_receipt_id,
-            next_inbox_id: self.next_inbox_id,
-            next_owed_acceptance_id: self.next_owed_acceptance_id,
+            next_delivery_id: self.next_delivery_id,
             next_manual_resolution_id: self.next_manual_resolution_id,
-            next_shadow_divergence_id: self.next_shadow_divergence_id,
-            next_claim_token: self.next_claim_token,
         }
     }
 }
 
-fn clone_reducer_inbox_event<P: WorkflowProfile>(
-    event: &ReducerInboxEvent<P>,
-) -> ReducerInboxEvent<P> {
-    ReducerInboxEvent {
-        id: event.id,
-        effect_id: event.effect_id,
-        barrier_id: event.barrier_id,
-        kind: event.kind,
-        event_codec: event.event_codec.clone(),
-        requires_runtime_acceptance: event.requires_runtime_acceptance,
-        payload: match &event.payload {
-            ReducerInboxPayload::Receipt(payload) => ReducerInboxPayload::Receipt(payload.clone()),
-            ReducerInboxPayload::Barrier(payload) => ReducerInboxPayload::Barrier(payload.clone()),
+fn clone_delivery_item<P: WorkflowProfile>(item: &DeliveryItem<P>) -> DeliveryItem<P> {
+    DeliveryItem {
+        id: item.id,
+        effect_id: item.effect_id,
+        barrier_id: item.barrier_id,
+        consumer_kind: item.consumer_kind,
+        event_codec: item.event_codec.clone(),
+        requires_runtime_acceptance: item.requires_runtime_acceptance,
+        payload: match &item.payload {
+            DeliveryPayload::Receipt(payload) => DeliveryPayload::Receipt(payload.clone()),
+            DeliveryPayload::Barrier(payload) => DeliveryPayload::Barrier(payload.clone()),
         },
-        delivery_status: event.delivery_status,
-        consumed_by: event.consumed_by,
+        status: item.status,
+        runtime_acceptance_status: item.runtime_acceptance_status,
+        suppression_reason: item.suppression_reason,
+        accepted_by: item.accepted_by,
     }
 }
 
@@ -1026,7 +874,8 @@ fn clone_effect_state<P: WorkflowProfile>(effect: &EffectState<P>) -> EffectStat
         declared_workflow_version: effect.declared_workflow_version,
         status: effect.status,
         dependencies: effect.dependencies.clone(),
-        claim: effect.claim.clone(),
+        authority: effect.authority.clone(),
+        reclaimable_lease: effect.reclaimable_lease.clone(),
         attempts: effect.attempts.clone(),
         observations: effect.observations.clone(),
         stale_observations: effect.stale_observations.clone(),
@@ -1043,5 +892,241 @@ fn clone_barrier_state<P: WorkflowProfile>(barrier: &BarrierState<P>) -> Barrier
         required_members: barrier.required_members.clone(),
         reducer_event_codec: barrier.reducer_event_codec.clone(),
         reducer_event: barrier.reducer_event.clone(),
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryPayload<P> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Receipt(event) => Self::Receipt(event.clone()),
+            Self::Barrier(event) => Self::Barrier(event.clone()),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for TransitionPlan<P> {
+    fn clone(&self) -> Self {
+        Self {
+            next_status: self.next_status,
+            snapshot: self.snapshot.clone(),
+            snapshot_codec: self.snapshot_codec.clone(),
+            event: self.event.clone(),
+            event_codec: self.event_codec.clone(),
+            effects: self.effects.clone(),
+            dependencies: self.dependencies.clone(),
+            barriers: self.barriers.clone(),
+            barrier_members: self.barrier_members.clone(),
+            invalidations: self.invalidations.clone(),
+            deliveries: self.deliveries.clone(),
+            schedules: self.schedules.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ReducerDecision<P> {
+    fn clone(&self) -> Self {
+        Self {
+            expected_workflow_version: self.expected_workflow_version,
+            plan: self.plan.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryDecisionBinding<P> {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.iter().map(clone_delivery_item).collect(),
+            decision: self.decision.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for CancellationRequest<P> {
+    fn clone(&self) -> Self {
+        Self {
+            expected_workflow_version: self.expected_workflow_version,
+            next_snapshot: self.next_snapshot.clone(),
+            next_snapshot_codec: self.next_snapshot_codec.clone(),
+            event: self.event.clone(),
+            event_codec: self.event_codec.clone(),
+            invalidations: self.invalidations.clone(),
+            terminal_receipt: self.terminal_receipt.clone(),
+            compensation_plan: self.compensation_plan.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryDeclCompat<P> {
+    fn clone(&self) -> Self {
+        Self {
+            effect_id: self.effect_id,
+            barrier_id: self.barrier_id,
+            consumer_kind: self.consumer_kind,
+            event_codec: self.event_codec.clone(),
+            requires_runtime_acceptance: self.requires_runtime_acceptance,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryItem<P> {
+    fn clone(&self) -> Self {
+        clone_delivery_item(self)
+    }
+}
+
+impl<P: WorkflowProfile> Clone for CommitResult<P> {
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            transition: self.transition.clone(),
+            deliveries: self.deliveries.iter().map(clone_delivery_item).collect(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryConsumeResult<P> {
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            transition: self.transition.clone(),
+            consumed_delivery_ids: self.consumed_delivery_ids.clone(),
+            deliveries: self.deliveries.iter().map(clone_delivery_item).collect(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for RuntimeAcceptanceResult<P> {
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            transition: self.transition.clone(),
+            delivery: self.delivery.as_ref().map(clone_delivery_item),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ReceiptAcceptance<P> {
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            receipt: self.receipt.clone(),
+            delivery_ids: self.delivery_ids.clone(),
+            deliveries: self.deliveries.iter().map(clone_delivery_item).collect(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for BarrierEvaluation<P> {
+    fn clone(&self) -> Self {
+        Self {
+            newly_satisfied: self.newly_satisfied.clone(),
+            deliveries: self.deliveries.iter().map(clone_delivery_item).collect(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ManualResolutionRecord<P>
+where
+    P::Observation: Clone + Eq,
+    P::ManualPayload: Clone + Eq,
+{
+    fn clone(&self) -> Self {
+        clone_manual_resolution(self)
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ManualResolutionCommit<P> {
+    fn clone(&self) -> Self {
+        Self {
+            transition_codec: self.transition_codec.clone(),
+            transition_event: self.transition_event.clone(),
+            next_status: self.next_status,
+            retry_at: self.retry_at,
+            compensation_effects: self.compensation_effects.clone(),
+            compensation_dependencies: self.compensation_dependencies.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ManualEffectOutcome<P> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Receipt {
+                receipt,
+                reducer_event,
+            } => Self::Receipt {
+                receipt: Box::new((**receipt).clone()),
+                reducer_event: Box::new(clone_delivery_item(reducer_event)),
+            },
+            Self::Retry => Self::Retry,
+            Self::Compensate => Self::Compensate,
+            Self::Failed => Self::Failed,
+            Self::Suppressed => Self::Suppressed,
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ManualResolutionOutcome<P>
+where
+    P::Observation: Clone + Eq,
+    P::ManualPayload: Clone + Eq,
+    P::Receipt: Clone + Eq,
+    P::BarrierEvent: Clone + Eq,
+{
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            resolution: self.resolution.as_ref().map(clone_manual_resolution),
+            effect_outcome: self.effect_outcome.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ReconciliationOutcome<P>
+where
+    P::Observation: Clone + Eq,
+    P::ManualPayload: Clone + Eq,
+{
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome,
+            decision: self.decision,
+            manual_resolution: self.manual_resolution.as_ref().map(clone_manual_resolution),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for DeliveryDecl<P> {
+    fn clone(&self) -> Self {
+        Self {
+            effect_id: self.effect_id,
+            barrier_id: self.barrier_id,
+            consumer_kind: self.consumer_kind,
+            event_codec: self.event_codec.clone(),
+            requires_runtime_acceptance: self.requires_runtime_acceptance,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for CancellationReceiptDecl<P> {
+    fn clone(&self) -> Self {
+        Self {
+            effect_id: self.effect_id,
+            receipt_codec: self.receipt_codec.clone(),
+            receipt: self.receipt.clone(),
+            event_codec: self.event_codec.clone(),
+            event: self.event.clone(),
+        }
+    }
+}
+
+impl<P: WorkflowProfile> Clone for ManualChoice<P>
+where
+    P::ManualPayload: Clone + Eq,
+{
+    fn clone(&self) -> Self {
+        clone_manual_choice(self)
     }
 }

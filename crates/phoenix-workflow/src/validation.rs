@@ -69,6 +69,8 @@ pub enum EngineError {
     InvalidInbox,
     #[error("attempt count exceeds u32")]
     AttemptOrdinalOverflow,
+    #[error("unsupported codec: {0:?}")]
+    UnsupportedCodec(CodecRef),
 }
 
 #[must_use]
@@ -179,13 +181,6 @@ fn validate_plan_codecs<P: WorkflowProfile>(
             return Err(PlanError::MissingCodec("barrier"));
         }
     }
-    if let Some(owed_acceptances) = &plan.owed_acceptances {
-        for owed in owed_acceptances {
-            if owed.event_codec.family.is_empty() {
-                return Err(PlanError::MissingCodec("owed_acceptance"));
-            }
-        }
-    }
     for codec in std::iter::once(&plan.snapshot_codec)
         .chain(std::iter::once(&plan.event_codec))
         .chain(plan.effects.iter().map(|effect| &effect.codec))
@@ -194,12 +189,7 @@ fn validate_plan_codecs<P: WorkflowProfile>(
                 .iter()
                 .map(|barrier| &barrier.reducer_event_codec),
         )
-        .chain(
-            plan.owed_acceptances
-                .iter()
-                .flatten()
-                .map(|owed| &owed.event_codec),
-        )
+        .chain(plan.deliveries.iter().map(|delivery| &delivery.event_codec))
     {
         if !supported_codecs.supports(codec) {
             return Err(PlanError::UnsupportedCodec(codec.clone()));

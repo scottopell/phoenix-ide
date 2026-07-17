@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    AttemptId, BarrierId, CancellationRequest, ClaimAuthority, CodecRef, EffectId, LeaseExpiry,
+    AttemptAuthority, AttemptId, BarrierId, CancellationRequest, CodecRef, EffectId, LeaseExpiry,
     ReducerDecision, Timestamp, WorkflowProfile, WorkflowState,
 };
 
@@ -21,19 +21,17 @@ pub enum SimOp<P: WorkflowProfile> {
         lease_until: LeaseExpiry,
     },
     Renew {
-        authority: ClaimAuthority,
-        worker_id: &'static str,
+        authority: AttemptAuthority,
         lease_until: LeaseExpiry,
     },
     Observe {
-        authority: ClaimAuthority,
+        authority: AttemptAuthority,
         attempt_id: AttemptId,
         observation_codec: CodecRef,
         observation: P::Observation,
     },
     Retry {
-        authority: ClaimAuthority,
-        worker_id: &'static str,
+        authority: AttemptAuthority,
         retry_at: Timestamp,
     },
     AdvanceTime(Timestamp),
@@ -76,21 +74,18 @@ impl<P: WorkflowProfile> Simulator<P> {
             }
             SimOp::Claim {
                 effect_id,
-                worker_id,
+                worker_id: _,
                 lease_until,
             } => {
                 let _ = self
                     .workflow
-                    .claim_effect(effect_id, worker_id, self.now, lease_until);
+                    .claim_effect(effect_id, self.now, Some(lease_until));
             }
             SimOp::Renew {
                 authority,
-                worker_id,
                 lease_until,
             } => {
-                let _ = self
-                    .workflow
-                    .renew_claim(&authority, worker_id, self.now, lease_until);
+                let _ = self.workflow.renew_lease(&authority, self.now, lease_until);
             }
             SimOp::Observe {
                 authority,
@@ -109,12 +104,9 @@ impl<P: WorkflowProfile> Simulator<P> {
             }
             SimOp::Retry {
                 authority,
-                worker_id,
                 retry_at,
             } => {
-                let _ = self
-                    .workflow
-                    .schedule_retry(&authority, worker_id, self.now, retry_at);
+                let _ = self.workflow.schedule_retry(&authority, self.now, retry_at);
             }
             SimOp::AdvanceTime(now) => {
                 self.now = now;
