@@ -93,7 +93,7 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 2 new');
     expect(screen.getByRole('button', { name: 'PR #423 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Clean up' })).toHaveClass('mobile-pr-action--cleanup');
+    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--danger');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
