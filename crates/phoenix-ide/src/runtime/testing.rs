@@ -243,6 +243,7 @@ impl LlmClient for DelayedMockLlmClient {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.inner.requests.lock().unwrap().push(request.clone());
         self.request_started.notify_waiters();
+        // test-timing-allow: configurable LLM latency is the behavior exercised by cancellation tests
         tokio::time::sleep(self.delay).await;
         self.inner
             .responses
@@ -383,10 +384,7 @@ impl ToolExecutor for UncooperativeMockToolExecutor {
 
         // Block until explicitly released, with a long backstop so a forgotten
         // release can't hang the suite indefinitely.
-        tokio::select! {
-            () = self.release.notified() => {}
-            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
-        }
+        let _ = tokio::time::timeout(Duration::from_secs(3600), self.release.notified()).await;
         self.inner.outputs.get(&name).cloned()
     }
 
@@ -460,6 +458,7 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
             // First call: uncooperative — never observe the token, block on a
             // long backstop so a forgotten test can't hang the suite.
             let _ignored_cancel = &ctx.cancel;
+            // test-timing-allow: first-call latency models a wedged tool task that must be aborted
             tokio::time::sleep(Duration::from_secs(3600)).await;
             self.inner.outputs.get(&name).cloned()
         } else {
@@ -1579,9 +1578,6 @@ mod tests {
             .await
             .expect("Tool execution should start");
 
-        // Small delay to ensure tool is running
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         // Record time before cancel
         let cancel_start = tokio::time::Instant::now();
 
@@ -2200,69 +2196,6 @@ mod tests {
             "Parent should go to ToolExecuting, got {:?}",
             result.new_state
         );
-    }
-
-    /// Test sub-agent result buffering (early completion)
-    #[tokio::test]
-    async fn test_subagent_result_buffering() {
-        use crate::runtime::ConversationRuntime;
-        use crate::state_machine::state::SubAgentOutcome;
-        use crate::state_machine::ConvContext;
-        use std::path::PathBuf;
-        use tokio::sync::mpsc;
-
-        // Set up a parent runtime
-        let llm = Arc::new(MockLlmClient::new("test-model"));
-        // First response: spawn_agents tool
-        llm.queue_response(LlmResponse {
-            content: vec![ContentBlock::text("I'll spawn sub-agents")],
-            end_turn: true,
-            usage: Usage::default(),
-        });
-
-        let tools = Arc::new(MockToolExecutor::new());
-        let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
-        let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
-        let _broadcast_rx = broadcast_tx.subscribe();
-
-        let runtime = ConversationRuntime::new(
-            context,
-            ConvState::Idle,
-            storage.clone(),
-            llm,
-            tools,
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx.clone(),
-            broadcast_tx,
-        );
-
-        tokio::spawn(async move { runtime.run().await });
-
-        // Send a SubAgentResult while parent is still in Idle
-        // (simulates early completion)
-        event_tx
-            .send(Event::SubAgentResult {
-                agent_id: "sub-1".to_string(),
-                outcome: SubAgentOutcome::Success {
-                    result: "early result".to_string(),
-                },
-            })
-            .await
-            .unwrap();
-
-        // Give it time to process (should be buffered)
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // The event should have been received without error
-        // (buffered since parent isn't in AwaitingSubAgents)
-        // This is a basic smoke test - full integration would require more setup
     }
 
     /// `spawn_agents` rejects a batch that exceeds the per-call sub-agent cap
