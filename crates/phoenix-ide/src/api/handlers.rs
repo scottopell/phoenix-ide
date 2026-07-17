@@ -3719,6 +3719,7 @@ async fn send_chat(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3736,6 +3737,12 @@ async fn cancel_conversation(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conversation.state.clone());
 
     if matches!(conversation.state, ConvState::Provisioning { .. }) {
         state
@@ -3770,10 +3777,32 @@ async fn cancel_conversation(
         }));
     }
 
-    if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
+    if matches!(
+        effective_state,
+        ConvState::Idle
+            | ConvState::Error { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::AwaitingSubAgents { .. }
+    ) {
+        let repository =
+            phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+        let cancelled = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+            .cancel_pending_for_conversation(&id, chrono::Utc::now())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if cancelled > 0 {
+            state.runtime.kick_wake_worker();
+            return Ok(Json(CancelResponse {
+                ok: true,
+                no_op: false,
+            }));
+        }
+    }
+
+    if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         tracing::debug!(
             conv_id = %id,
-            state = conversation.state.variant_name(),
+            state = effective_state.variant_name(),
             "cancel no-op: conversation has nothing in flight"
         );
         return Ok(Json(CancelResponse {
@@ -3782,11 +3811,11 @@ async fn cancel_conversation(
         }));
     }
 
-    if !conversation.state.allows_user_cancel() {
+    if !effective_state.allows_user_cancel() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             format!(
                 "Conversation cannot be cancelled while in {} state",
-                conversation.state.variant_name()
+                effective_state.variant_name()
             ),
             "cannot_cancel_state",
         ))));
@@ -3959,6 +3988,12 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
+            let repository =
+                phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+            phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+                .transfer_conversation_owner(&id, &new_conv.id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             tracing::info!(
                 parent_id = %id,
                 continuation_id = %new_conv.id,
@@ -4197,10 +4232,15 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if conv.state.is_busy() {
+    let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+        .has_pending_for_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if conv.state.is_busy() || has_pending_wake {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot archive a busy conversation. Cancel the in-flight \
-             operation first, then retry.",
+             operation or pending wait first, then retry.",
             "cancel_first",
         ))));
     }
@@ -4495,10 +4535,15 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Ok(());
     }
 
-    if conv.state.is_busy() {
+    let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+        .has_pending_for_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if conv.state.is_busy() || has_pending_wake {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
-             operation first, then retry.",
+             operation or pending wait first, then retry.",
             "cancel_first",
         ))));
     }

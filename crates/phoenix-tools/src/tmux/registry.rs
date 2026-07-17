@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::WorkScope;
@@ -71,6 +71,9 @@ pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
 /// left untouched.
 const COMPANION_ENV_VERSION: &str = "1";
 const COMPANION_VERSION_VAR: &str = "PHOENIX_COMPANION_VERSION";
+const SERVER_GENERATION_VAR: &str = "PHOENIX_TMUX_SERVER_GENERATION";
+const KILLED_WINDOW_ENV_PREFIX: &str = "PHOENIX_TMUX_KILLED_";
+const TERMINAL_CAPTURE_START: &str = "-2000";
 
 /// Errors surfaced by the tmux registry. The tmux tool translates these
 /// into the stable error envelope on the agent's response.
@@ -125,6 +128,40 @@ pub enum ServerStatus {
 /// invariant). For `WorkScope::Worktree(path)` the path is keyed to the
 /// worktree; for `WorkScope::Conversation(id)` it falls back to the
 /// conversation id (task 03001 / REQ-TMUX-WS-001).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TmuxWindowIdentity {
+    pub work_scope: WorkScope,
+    pub server_generation: String,
+    pub window_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredWindowState {
+    Live {
+        wait_targetable: bool,
+    },
+    Terminal(TmuxTerminalInspection),
+    Killed {
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxTerminalInspection {
+    Live,
+    WindowKilled {
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    },
+    Terminal {
+        exit_code: i32,
+        occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+        duration_ms: Option<u64>,
+        final_tail: Vec<String>,
+    },
+    Missing,
+    Unavailable,
+}
+
 #[derive(Debug)]
 pub struct TmuxServer {
     /// The scope this server belongs to. Diagnostic field — the
@@ -137,6 +174,7 @@ pub struct TmuxServer {
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
     pub status: ServerStatus,
+    pub server_generation: Option<String>,
 }
 
 impl TmuxServer {
@@ -145,6 +183,7 @@ impl TmuxServer {
             work_scope,
             socket_path,
             status: ServerStatus::NotProbed,
+            server_generation: None,
         }
     }
 }
@@ -217,6 +256,7 @@ pub struct TmuxRegistry {
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
+    registered_windows: RwLock<HashMap<TmuxWindowIdentity, RegisteredWindowState>>,
     socket_dir: PathBuf,
     binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
@@ -251,6 +291,7 @@ impl TmuxRegistry {
         let binary_available = which::which("tmux").is_ok();
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -300,6 +341,7 @@ impl TmuxRegistry {
     pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -320,6 +362,7 @@ impl TmuxRegistry {
     ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            registered_windows: RwLock::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -483,11 +526,22 @@ impl TmuxRegistry {
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
+                let generation = ensure_server_generation(&server.socket_path).await?;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = new_server_generation();
+                spawn_session_with_generation(
+                    &server.socket_path,
+                    &self.config_path(),
+                    cwd,
+                    &generation,
+                )
+                .await?;
+                verify_server_generation(&server.socket_path, &generation).await?;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -499,7 +553,16 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = new_server_generation();
+                spawn_session_with_generation(
+                    &server.socket_path,
+                    &self.config_path(),
+                    cwd,
+                    &generation,
+                )
+                .await?;
+                verify_server_generation(&server.socket_path, &generation).await?;
+                server.server_generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
         }
@@ -607,6 +670,20 @@ impl TmuxRegistry {
         };
         entry.write().await.work_scope = new.clone();
         map.insert(new_key, entry);
+        drop(map);
+
+        let mut windows = self.registered_windows.write().await;
+        let rekeyed = windows
+            .iter()
+            .filter(|(identity, _)| identity.work_scope == *old)
+            .map(|(identity, state)| {
+                let mut identity = identity.clone();
+                identity.work_scope = new.clone();
+                (identity, state.clone())
+            })
+            .collect::<Vec<_>>();
+        windows.retain(|identity, _| identity.work_scope != *old);
+        windows.extend(rekeyed);
         true
     }
 
@@ -621,6 +698,195 @@ impl TmuxRegistry {
     pub async fn get_existing(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<TmuxServer>>> {
         let key = work_scope.stable_key();
         self.inner.read().await.get(&key).cloned()
+    }
+
+    pub async fn register_window(&self, identity: TmuxWindowIdentity, wait_targetable: bool) {
+        self.registered_windows
+            .write()
+            .await
+            .insert(identity, RegisteredWindowState::Live { wait_targetable });
+    }
+
+    pub async fn has_registered_window(&self, identity: &TmuxWindowIdentity) -> bool {
+        self.registered_windows.read().await.contains_key(identity)
+    }
+
+    pub async fn is_wait_targetable_window(&self, identity: &TmuxWindowIdentity) -> bool {
+        matches!(
+            self.registered_windows.read().await.get(identity),
+            Some(
+                RegisteredWindowState::Live {
+                    wait_targetable: true,
+                } | RegisteredWindowState::Terminal(_)
+            )
+        )
+    }
+
+    pub async fn registered_window_identities(
+        &self,
+        work_scope: &WorkScope,
+        server_generation: &str,
+    ) -> Vec<TmuxWindowIdentity> {
+        self.registered_windows
+            .read()
+            .await
+            .keys()
+            .filter(|identity| {
+                identity.work_scope == *work_scope
+                    && identity.server_generation == server_generation
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn preserve_terminal_before_kill(&self, identity: &TmuxWindowIdentity) {
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
+        };
+        let inspection = inspect_tmux_window(&socket_path, &identity.window_id).await;
+        if matches!(inspection, TmuxTerminalInspection::Terminal { .. }) {
+            if let Some(state) = self.registered_windows.write().await.get_mut(identity) {
+                *state = RegisteredWindowState::Terminal(inspection);
+            }
+        }
+    }
+
+    pub async fn mark_window_killed(&self, identity: &TmuxWindowIdentity) -> bool {
+        let occurred_at = chrono::Utc::now();
+        let mut windows = self.registered_windows.write().await;
+        let Some(state) = windows.get_mut(identity) else {
+            return false;
+        };
+        if matches!(state, RegisteredWindowState::Terminal(_)) {
+            return true;
+        }
+        *state = RegisteredWindowState::Killed { occurred_at };
+        drop(windows);
+
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
+        };
+        if !persist_killed_window(&socket_path, identity, occurred_at).await {
+            tracing::warn!(window_id = %identity.window_id, "tmux: failed to persist killed-window tombstone");
+        }
+        true
+    }
+
+    pub async fn clear_window_killed(&self, identity: &TmuxWindowIdentity) {
+        if let Some(state) = self.registered_windows.write().await.get_mut(identity) {
+            *state = RegisteredWindowState::Live {
+                wait_targetable: true,
+            };
+        }
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => self.derived_socket_path(&identity.work_scope),
+        };
+        clear_killed_window(&socket_path, identity).await;
+    }
+
+    pub async fn recover_wait_target(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Option<TmuxWindowIdentity> {
+        if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
+            return None;
+        }
+        let socket_path = self.derived_socket_path(work_scope);
+        if !matches!(probe(&socket_path).await, Ok(ProbeResult::Live)) {
+            return None;
+        }
+        if tmux_window_option(&socket_path, window_id, "@phoenix_wait_targetable").await
+            != Some("1".to_owned())
+        {
+            return None;
+        }
+        let generation = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await?;
+        let identity = TmuxWindowIdentity {
+            work_scope: work_scope.clone(),
+            server_generation: generation,
+            window_id: window_id.to_owned(),
+        };
+        if matches!(
+            inspect_tmux_window(&socket_path, window_id).await,
+            TmuxTerminalInspection::Missing | TmuxTerminalInspection::Unavailable
+        ) {
+            return None;
+        }
+        Some(identity)
+    }
+
+    pub async fn inspect_window(&self, identity: &TmuxWindowIdentity) -> TmuxTerminalInspection {
+        match self.registered_windows.read().await.get(identity) {
+            Some(RegisteredWindowState::Terminal(inspection)) => return inspection.clone(),
+            Some(RegisteredWindowState::Killed { occurred_at }) => {
+                return TmuxTerminalInspection::WindowKilled {
+                    occurred_at: *occurred_at,
+                };
+            }
+            Some(RegisteredWindowState::Live { .. }) | None => {}
+        }
+        if !self.binary_available || self.ensure_runtime_assets().await.is_err() {
+            return TmuxTerminalInspection::Unavailable;
+        }
+
+        // A scope rekey moves the registry entry but deliberately preserves its
+        // running server's original socket. Prefer that durable in-memory path;
+        // only derive when recovering after a Phoenix restart. This lookup is
+        // read-only and never materializes a missing inventory entry.
+        let socket_path = match self.get_existing(&identity.work_scope).await {
+            Some(entry) => entry.read().await.socket_path.clone(),
+            None => match self
+                .socket_path_for_generation(&identity.server_generation)
+                .await
+            {
+                Some(path) => path,
+                None => self.derived_socket_path(&identity.work_scope),
+            },
+        };
+        match probe(&socket_path).await {
+            Ok(ProbeResult::Live) => {}
+            Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket) => {
+                return TmuxTerminalInspection::Missing;
+            }
+            Err(_) => return TmuxTerminalInspection::Unavailable,
+        }
+        let Some(observed_generation) = tmux_global_env(&socket_path, SERVER_GENERATION_VAR).await
+        else {
+            return TmuxTerminalInspection::Missing;
+        };
+
+        if observed_generation != identity.server_generation {
+            return TmuxTerminalInspection::Missing;
+        }
+
+        if let Some(occurred_at) = load_killed_window(&socket_path, identity).await {
+            return TmuxTerminalInspection::WindowKilled { occurred_at };
+        }
+
+        inspect_tmux_window(&socket_path, &identity.window_id).await
+    }
+
+    async fn socket_path_for_generation(&self, generation: &str) -> Option<PathBuf> {
+        let mut entries = tokio::fs::read_dir(&self.socket_dir).await.ok()?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("sock") {
+                continue;
+            }
+            if matches!(probe(&path).await, Ok(ProbeResult::Live))
+                && tmux_global_env(&path, SERVER_GENERATION_VAR)
+                    .await
+                    .as_deref()
+                    == Some(generation)
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Deterministic socket path for a `WorkScope`, derived the same way
@@ -812,13 +1078,14 @@ pub async fn cascade_tmux_on_delete(
 /// the Phoenix process environment, which would leak server secrets (LLM API
 /// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
 /// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+fn set_tmux_server_env(cmd: &mut tokio::process::Command, generation: &str) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     cmd.env_clear();
     cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
+    cmd.env(SERVER_GENERATION_VAR, generation);
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -841,6 +1108,23 @@ async fn run_tmux_quiet(socket_path: &Path, args: &[&str]) {
 /// Read one variable from a server's global environment, or `None` if unset.
 /// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
 /// not.
+async fn tmux_window_option(socket_path: &Path, window_id: &str, option: &str) -> Option<String> {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let out = tokio::process::Command::new("tmux")
+        .args(["-S", &sock, "show-option", "-wqv", "-t", window_id, option])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
 async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
     let sock = socket_path.to_string_lossy().into_owned();
     let out = tokio::process::Command::new("tmux")
@@ -942,6 +1226,242 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
     .await;
 }
 
+fn new_server_generation() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("srv-{nanos}-{}", uuid::Uuid::new_v4())
+}
+
+async fn ensure_server_generation(socket_path: &Path) -> Result<String, TmuxError> {
+    if let Some(generation) = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await {
+        return Ok(generation);
+    }
+    let generation = new_server_generation();
+    let sock = socket_path.to_string_lossy().into_owned();
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "set-environment",
+            "-g",
+            SERVER_GENERATION_VAR,
+            generation.as_str(),
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to install server generation: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!(
+                "tmux set-environment for server generation exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    verify_server_generation(socket_path, &generation).await?;
+    Ok(generation)
+}
+
+async fn verify_server_generation(socket_path: &Path, expected: &str) -> Result<(), TmuxError> {
+    let observed = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await;
+    if observed.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    Err(TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: format!(
+            "tmux server generation readback mismatch: expected {expected:?}, observed {observed:?}"
+        ),
+    })
+}
+
+fn killed_window_env_name(window_id: &str) -> String {
+    use std::fmt::Write as _;
+
+    window_id
+        .as_bytes()
+        .iter()
+        .fold(KILLED_WINDOW_ENV_PREFIX.to_owned(), |mut encoded, byte| {
+            write!(encoded, "{byte:02X}").expect("writing to String cannot fail");
+            encoded
+        })
+}
+
+async fn persist_killed_window(
+    socket_path: &Path,
+    identity: &TmuxWindowIdentity,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let value = format!(
+        "{}|{}",
+        identity.server_generation,
+        occurred_at.to_rfc3339()
+    );
+    let sock = socket_path.to_string_lossy().into_owned();
+    tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "set-environment",
+            "-g",
+            &killed_window_env_name(&identity.window_id),
+            &value,
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+async fn clear_killed_window(socket_path: &Path, identity: &TmuxWindowIdentity) {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let _ = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "set-environment",
+            "-gu",
+            &killed_window_env_name(&identity.window_id),
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+async fn load_killed_window(
+    socket_path: &Path,
+    identity: &TmuxWindowIdentity,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = tmux_global_env(socket_path, &killed_window_env_name(&identity.window_id)).await?;
+    let (generation, occurred_at) = value.split_once('|')?;
+    if generation != identity.server_generation {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(occurred_at)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+async fn inspect_tmux_window(socket_path: &Path, window_id: &str) -> TmuxTerminalInspection {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "capture-pane",
+            "-p",
+            "-t",
+            window_id,
+            "-S",
+            TERMINAL_CAPTURE_START,
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return TmuxTerminalInspection::Unavailable;
+    };
+    if !output.status.success() {
+        return TmuxTerminalInspection::Missing;
+    }
+    let pane_state = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &sock,
+            "display-message",
+            "-p",
+            "-t",
+            window_id,
+            "#{pane_dead}|#{pane_pid}",
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    let Ok(pane_state) = pane_state else {
+        return TmuxTerminalInspection::Unavailable;
+    };
+    if !pane_state.status.success() {
+        return TmuxTerminalInspection::Missing;
+    }
+    let pane_state = String::from_utf8_lossy(&pane_state.stdout);
+    let pane_is_dead = pane_state
+        .trim()
+        .split_once('|')
+        .is_some_and(|(dead, pid)| dead == "1" && !pid.is_empty());
+    let captured = String::from_utf8_lossy(&output.stdout);
+    if pane_is_dead {
+        if let Some(exit_code) = parse_exit_marker(&captured) {
+            return TmuxTerminalInspection::Terminal {
+                exit_code,
+                occurred_at: parse_occurred_at_marker(&captured),
+                duration_ms: parse_duration_ms(&captured),
+                final_tail: terminal_tail(&captured),
+            };
+        }
+    }
+    TmuxTerminalInspection::Live
+}
+
+fn terminal_tail(output: &str) -> Vec<String> {
+    let lines: Vec<_> = output.lines().collect();
+    lines[lines.len().saturating_sub(20)..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
+}
+
+fn parse_occurred_at_marker(output: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_time_marker(output, "[phoenix] process exited at unix seconds ")
+}
+
+fn parse_duration_ms(output: &str) -> Option<u64> {
+    let started = parse_time_marker(output, "[phoenix] process started at unix seconds ")?;
+    let finished = parse_occurred_at_marker(output)?;
+    (finished - started).num_milliseconds().try_into().ok()
+}
+
+fn parse_time_marker(output: &str, prefix: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    output.lines().rev().find_map(|line| {
+        let value = line.trim().strip_prefix(prefix)?;
+        let (seconds, fraction) = value.split_once('.').unwrap_or((value, "0"));
+        let seconds = seconds.parse::<i64>().ok()?;
+        let nanos = format!("{fraction:0<9}").get(..9)?.parse::<u32>().ok()?;
+        chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)
+    })
+}
+
+fn parse_exit_marker(output: &str) -> Option<i32> {
+    const PREFIX: &str = "[phoenix] process exited with code ";
+    output.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(PREFIX)
+            .and_then(|code| code.parse::<i32>().ok())
+    })
+}
+
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` with `cwd` as the pane's start directory
 /// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
@@ -963,6 +1483,16 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
+    let generation = new_server_generation();
+    spawn_session_with_generation(socket_path, config_path, cwd, &generation).await
+}
+
+async fn spawn_session_with_generation(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    generation: &str,
+) -> Result<(), TmuxError> {
     let mut cmd = tokio::process::Command::new("tmux");
     cmd.args([
         "-f",
@@ -981,7 +1511,7 @@ pub async fn spawn_session(
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd);
+    set_tmux_server_env(&mut cmd, generation);
     let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1067,6 +1597,110 @@ fn default_socket_dir() -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn killed_window_environment_key_is_exact_and_tmux_safe() {
+        assert_eq!(killed_window_env_name("@12"), "PHOENIX_TMUX_KILLED_403132");
+        assert_ne!(killed_window_env_name("@12"), killed_window_env_name("@21"));
+    }
+
+    #[tokio::test]
+    async fn killed_window_tombstone_is_exact_and_survives_for_worker_inspection() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let identity = TmuxWindowIdentity {
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            server_generation: "generation-1".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        registry.register_window(identity.clone(), true).await;
+        assert!(registry.mark_window_killed(&identity).await);
+        assert!(matches!(
+            registry.inspect_window(&identity).await,
+            TmuxTerminalInspection::WindowKilled { .. }
+        ));
+        let wrong_generation = TmuxWindowIdentity {
+            server_generation: "generation-2".to_owned(),
+            ..identity.clone()
+        };
+        let wrong_window = TmuxWindowIdentity {
+            window_id: "@2".to_owned(),
+            ..identity
+        };
+        assert_eq!(
+            registry.inspect_window(&wrong_generation).await,
+            TmuxTerminalInspection::Unavailable
+        );
+        assert_eq!(
+            registry.inspect_window(&wrong_window).await,
+            TmuxTerminalInspection::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_windows_are_not_wait_targetable() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let identity = TmuxWindowIdentity {
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            server_generation: "generation-1".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        registry.register_window(identity.clone(), false).await;
+        assert!(registry.has_registered_window(&identity).await);
+        assert!(!registry.is_wait_targetable_window(&identity).await);
+    }
+
+    #[tokio::test]
+    async fn terminal_marker_state_outranks_later_kill_tombstone() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let identity = TmuxWindowIdentity {
+            work_scope: WorkScope::Conversation("conv".to_owned()),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        let terminal = TmuxTerminalInspection::Terminal {
+            exit_code: 0,
+            occurred_at: Some(chrono::Utc::now()),
+            duration_ms: None,
+            final_tail: vec!["done".to_owned()],
+        };
+        registry.registered_windows.write().await.insert(
+            identity.clone(),
+            RegisteredWindowState::Terminal(terminal.clone()),
+        );
+        assert!(registry.mark_window_killed(&identity).await);
+        assert_eq!(registry.inspect_window(&identity).await, terminal);
+    }
+
+    #[test]
+    fn terminal_tail_preserves_three_line_chronology() {
+        assert_eq!(
+            terminal_tail("first\nsecond\nthird\n"),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn terminal_markers_parse_subsecond_precision_and_exact_duration() {
+        let output = "[phoenix] process started at unix seconds 1783936800.123456789\n\
+                      [phoenix] process exited with code 0\n\
+                      [phoenix] process exited at unix seconds 1783936801.357456789\n";
+        assert_eq!(
+            parse_occurred_at_marker(output),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_783_936_801, 357_456_789)
+        );
+        assert_eq!(parse_duration_ms(output), Some(1_234));
+    }
+
+    #[test]
+    fn terminal_duration_requires_both_durable_markers() {
+        assert_eq!(
+            parse_duration_ms("[phoenix] process exited at unix seconds 1783936801.357456789\n"),
+            None
+        );
+    }
 
     #[test]
     fn socket_path_for_worktree_is_deterministic() {
@@ -1286,6 +1920,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_installation_failure_is_fatal() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let missing_socket = tmp.path().join("missing.sock");
+        assert!(matches!(
+            ensure_server_generation(&missing_socket).await,
+            Err(TmuxError::SpawnFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn binary_unavailable_short_circuits_ensure_live() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
@@ -1424,6 +2071,31 @@ mod tests {
             server.work_scope, new,
             "work_scope diagnostic must follow the new scope"
         );
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_moves_registered_window_identity() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("conv-explore".to_owned());
+        let new = WorkScope::Worktree("/tmp/wt-approved".to_owned());
+        reg.get_or_insert(&old, socket_path_for(tmp.path(), "conv-explore"))
+            .await;
+        let old_identity = TmuxWindowIdentity {
+            work_scope: old.clone(),
+            server_generation: "generation".to_owned(),
+            window_id: "@1".to_owned(),
+        };
+        reg.register_window(old_identity.clone(), true).await;
+
+        assert!(reg.rekey_scope(&old, &new).await);
+        let new_identity = TmuxWindowIdentity {
+            work_scope: new,
+            ..old_identity.clone()
+        };
+        assert!(!reg.has_registered_window(&old_identity).await);
+        assert!(reg.has_registered_window(&new_identity).await);
+        assert!(reg.mark_window_killed(&new_identity).await);
     }
 
     #[tokio::test]

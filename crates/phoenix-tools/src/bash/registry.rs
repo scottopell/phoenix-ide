@@ -177,6 +177,27 @@ impl WorkScopeHandles {
     }
 }
 
+/// Read-only terminal evidence for a scope-owned bash handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashTerminalInspection {
+    Unknown,
+    Live,
+    KillPendingKernel {
+        observed_at: chrono::DateTime<chrono::Utc>,
+    },
+    Terminal {
+        observed_at: chrono::DateTime<chrono::Utc>,
+        exit_code: Option<i32>,
+        signal_number: Option<i32>,
+        duration_ms: u64,
+        kill_signal_sent: Option<phoenix_core::domain::kill_signal::KillSignal>,
+        tail_start_offset: u64,
+        tail_end_offset: u64,
+        tail_truncated_before: bool,
+        tails: Vec<super::ring::RingLine>,
+    },
+}
+
 /// Signal published when a bash handle in a `WorkScope` changes state
 /// (spawned, transitioned to terminal, or killed). Mirrors the browser
 /// `BrowserSessionLifecycleEvent` shape: it carries only the affected
@@ -331,6 +352,47 @@ impl BashHandleRegistry {
         let entry = Arc::new(RwLock::new(WorkScopeHandles::new()));
         map.insert(work_scope.clone(), entry.clone());
         entry
+    }
+
+    /// Inspect a handle without creating a missing scope table.
+    pub async fn inspect_terminal(
+        &self,
+        work_scope: &WorkScope,
+        handle_id: &str,
+    ) -> BashTerminalInspection {
+        let Some(table) = self.get_existing(work_scope).await else {
+            return BashTerminalInspection::Unknown;
+        };
+        let table = table.read().await;
+        let Some(handle) = table.get(&HandleId::new(handle_id)) else {
+            return BashTerminalInspection::Unknown;
+        };
+        let state = handle.state().await;
+        match state.as_ref() {
+            super::handle::HandleState::Live(_) => {
+                if handle.is_kill_pending_kernel().await {
+                    BashTerminalInspection::KillPendingKernel {
+                        observed_at: chrono::Utc::now(),
+                    }
+                } else {
+                    BashTerminalInspection::Live
+                }
+            }
+            super::handle::HandleState::Tombstoned(tomb) => BashTerminalInspection::Terminal {
+                observed_at: chrono::DateTime::<chrono::Utc>::from(tomb.finished_at),
+                exit_code: tomb.exit_code,
+                signal_number: tomb.signal_number,
+                duration_ms: tomb.duration_ms,
+                kill_signal_sent: tomb.kill_signal_sent,
+                tail_start_offset: tomb
+                    .final_tail
+                    .first()
+                    .map_or(tomb.next_offset_at_exit, |line| line.offset),
+                tail_end_offset: tomb.next_offset_at_exit,
+                tail_truncated_before: tomb.final_tail.first().is_some_and(|line| line.offset > 0),
+                tails: tomb.final_tail.clone(),
+            },
+        }
     }
 
     /// Move a `WorkScope`'s handle table from `old` to `new`.
@@ -812,6 +874,42 @@ mod tests {
         let _ = registry.get_or_create(&s).await;
         assert!(!registry.rekey_scope(&s, &s).await);
         assert!(registry.get_existing(&s).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_inspection_is_read_only_and_preserves_terminal_evidence() {
+        let registry = BashHandleRegistry::new();
+        let s = scope("inspect");
+        assert_eq!(
+            registry.inspect_terminal(&s, "b-1").await,
+            BashTerminalInspection::Unknown
+        );
+        assert_eq!(registry.scope_count().await, 0);
+
+        let table = registry.get_or_create(&s).await;
+        let handle = {
+            let mut handles = table.write().await;
+            handles.insert(make_handle("inspect", "b-1", RING_BUFFER_BYTES))
+        };
+        assert_eq!(
+            registry.inspect_terminal(&s, "b-1").await,
+            BashTerminalInspection::Live
+        );
+        handle
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(7) },
+                std::time::Duration::from_millis(12),
+                crate::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+        assert!(matches!(
+            registry.inspect_terminal(&s, "b-1").await,
+            BashTerminalInspection::Terminal {
+                exit_code: Some(7),
+                duration_ms: 12,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

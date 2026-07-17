@@ -130,6 +130,7 @@ impl AppState {
         runtime.start_work_scope_bridge().await;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
+        runtime.start_wake_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and

@@ -2898,6 +2898,7 @@ mod tests {
         use crate::state_machine::state::{PendingSubAgent, SubAgentMode};
 
         let two = ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![
                 PendingSubAgent {
                     agent_id: "a".to_string(),
@@ -2914,6 +2915,7 @@ mod tests {
             spawn_tool_id: None,
         };
         let one = ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![PendingSubAgent {
                 agent_id: "b".to_string(),
                 task: "tb".to_string(),

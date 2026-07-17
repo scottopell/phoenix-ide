@@ -1647,6 +1647,8 @@ where
     bash_handles: Arc<crate::tools::BashHandleRegistry>,
     /// Tmux server registry for `ToolContext` (REQ-TMUX-013).
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
+    /// Durable wake registration capability for `wait_until`.
+    wake_registrar: Option<Arc<dyn phoenix_tools::WakeRegistrar>>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
@@ -1903,6 +1905,7 @@ where
             bash_handles,
             tmux_registry,
             llm_registry,
+            wake_registrar: None,
             terminals,
             event_rx,
             event_tx,
@@ -1967,6 +1970,14 @@ where
     /// Attach a watch sender so the runtime publishes its current `ConvState`
     /// on every transition. The paired receiver lives in `ConversationHandle`
     /// and lets HTTP handlers read live state without consulting the DB.
+    pub(crate) fn with_wake_registrar(
+        mut self,
+        registrar: Arc<dyn phoenix_tools::WakeRegistrar>,
+    ) -> Self {
+        self.wake_registrar = Some(registrar);
+        self
+    }
+
     pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
         self.state_watcher = Some(tx);
         self
@@ -3830,6 +3841,21 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
+            Effect::AcceptWakeObservations { inbox_ids } => {
+                if self
+                    .storage
+                    .accept_owed_wakes(&self.context.conversation_id, &inbox_ids)
+                    .await?
+                {
+                    Ok(None)
+                } else {
+                    Err(
+                        "wake observation acceptance was lost to a concurrent lifecycle action"
+                            .to_owned(),
+                    )
+                }
+            }
+
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
             Effect::CompleteCreation { job_id, claim } => {
@@ -4790,6 +4816,11 @@ where
             scope_worktree,
         )
         .with_root_conversation_id(self.context.root_conversation_id.clone());
+        let tool_ctx = if let Some(registrar) = &self.wake_registrar {
+            tool_ctx.with_wake_capability(tool.id.clone(), registrar.clone())
+        } else {
+            tool_ctx
+        };
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -5540,6 +5571,17 @@ where
                     self.context.conversation_id.clone(),
                     self.context.work_scope_worktree.as_deref(),
                 );
+                let old_durable_scope = super::wake::durable_scope_identity(&old_scope)
+                    .map_err(|error| error.to_string())?;
+                let new_durable_scope = super::wake::durable_scope_identity(&new_scope)
+                    .map_err(|error| error.to_string())?;
+                self.storage
+                    .rekey_pending_wake_scope(
+                        &self.context.conversation_id,
+                        &old_durable_scope,
+                        &new_durable_scope,
+                    )
+                    .await?;
 
                 // Migrate WorkScope-keyed resources opened before approval from
                 // the conversation scope to the worktree scope. Each rekey moves
@@ -9548,6 +9590,7 @@ mod steer_drain_detector_tests {
 
     fn mk_awaiting_sub_agents() -> ConvState {
         ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![PendingSubAgent {
                 agent_id: "sub-1".to_string(),
                 task: "do thing".to_string(),
@@ -9941,6 +9984,7 @@ mod steer_drain_detector_tests {
     /// given `agent_id` (for cross-round drain tests).
     fn mk_awaiting_with_pending(agent_id: &str) -> ConvState {
         ConvState::AwaitingSubAgents {
+            completion: phoenix_core::domain::sm_state::SubAgentCompletionDisposition::ResumeParent,
             pending: vec![PendingSubAgent {
                 agent_id: agent_id.to_string(),
                 task: "do thing".to_string(),

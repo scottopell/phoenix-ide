@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
+use super::registry::TmuxWindowIdentity;
 use super::TmuxError;
 use crate::{Tool, ToolContext, ToolOutput};
 
@@ -163,10 +164,11 @@ impl Tool for TmuxRunTool {
         };
 
         let cwd = effective_file_root(&ctx);
-        let (config_path, socket_path) = match resolve_tmux_paths(&ctx, &cwd).await {
-            Ok(paths) => paths,
-            Err(out) => return out,
-        };
+        let (config_path, socket_path, server_generation) =
+            match resolve_tmux_paths(&ctx, &cwd).await {
+                Ok(paths) => paths,
+                Err(out) => return out,
+            };
         let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
         let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
         let target = match start_tmux_window(
@@ -176,12 +178,22 @@ impl Tool for TmuxRunTool {
             &requested_name,
             cmd,
             keep_open_for_observation,
+            parsed.keep_open_on_exit,
         )
         .await
         {
             Ok(name) => name,
             Err(out) => return out,
         };
+
+        let identity = TmuxWindowIdentity {
+            work_scope: ctx.work_scope.clone(),
+            server_generation: server_generation.clone(),
+            window_id: target.window_id.clone(),
+        };
+        ctx.tmux_registry()
+            .register_window(identity.clone(), parsed.keep_open_on_exit)
+            .await;
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
@@ -198,6 +210,7 @@ impl Tool for TmuxRunTool {
                     &text,
                     timeout,
                     !parsed.keep_open_on_exit,
+                    &identity,
                 )
                 .await
             }
@@ -253,7 +266,7 @@ fn effective_file_root(ctx: &ToolContext) -> PathBuf {
 async fn resolve_tmux_paths(
     ctx: &ToolContext,
     cwd: &Path,
-) -> Result<(PathBuf, PathBuf), ToolOutput> {
+) -> Result<(PathBuf, PathBuf, String), ToolOutput> {
     let server_arc = match ctx.tmux_registry().ensure_live(&ctx.work_scope, cwd).await {
         Ok(arc) => arc,
         Err(TmuxError::BinaryUnavailable) => {
@@ -264,11 +277,26 @@ async fn resolve_tmux_paths(
         }
         Err(e) => return Err(error_envelope("tmux_server_unavailable", &e.to_string())),
     };
-    let socket_path = {
+    let (socket_path, server_generation) = {
         let server = server_arc.read().await;
-        server.socket_path.clone()
+        (
+            server.socket_path.clone(),
+            match server.server_generation.clone() {
+                Some(generation) => generation,
+                None => {
+                    return Err(error_envelope(
+                        "tmux_server_unavailable",
+                        "live tmux server has no durable generation",
+                    ));
+                }
+            },
+        )
     };
-    Ok((ctx.tmux_registry().config_path(), socket_path))
+    Ok((
+        ctx.tmux_registry().config_path(),
+        socket_path,
+        server_generation,
+    ))
 }
 
 async fn start_tmux_window(
@@ -278,6 +306,7 @@ async fn start_tmux_window(
     requested_name: &str,
     cmd: &str,
     keep_open_on_exit: bool,
+    wait_targetable: bool,
 ) -> Result<TmuxRunTarget, ToolOutput> {
     let wrapper = shell_wrapper(cmd, keep_open_on_exit);
     let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
@@ -338,6 +367,28 @@ async fn start_tmux_window(
         .filter(|s| !s.is_empty())
         .unwrap_or(requested_name)
         .to_string();
+    if wait_targetable {
+        let ownership = run_tmux_cli(
+            config_path,
+            socket_path,
+            &[
+                "set-option".to_owned(),
+                "-w".to_owned(),
+                "-t".to_owned(),
+                window_id.clone(),
+                "@phoenix_wait_targetable".to_owned(),
+                "1".to_owned(),
+            ],
+        )
+        .await
+        .map_err(|error| error_envelope("tmux_run_start_failed", &error))?;
+        if !ownership.status.success() {
+            return Err(error_envelope(
+                "tmux_run_start_failed",
+                "failed to persist tmux_run ownership marker",
+            ));
+        }
+    }
     Ok(TmuxRunTarget {
         window_name,
         window_id,
@@ -389,6 +440,7 @@ async fn wait_for_text_response(
     text: &str,
     timeout: Duration,
     close_after_completion: bool,
+    identity: &TmuxWindowIdentity,
 ) -> ToolOutput {
     let deadline = Instant::now() + timeout;
     loop {
@@ -414,6 +466,9 @@ async fn wait_for_text_response(
             None
         };
         if let Some(status) = status {
+            if close_after_completion && !exited {
+                disable_remain_on_exit(config_path, socket_path, &target.window_id).await;
+            }
             let response = structured_response(
                 status,
                 target,
@@ -424,7 +479,14 @@ async fn wait_for_text_response(
                 true,
             );
             if close_after_completion && observation.exit_code.is_some() {
-                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                let marked = ctx.tmux_registry().mark_window_killed(identity).await;
+                if kill_window(config_path, socket_path, &target.window_id)
+                    .await
+                    .is_err()
+                    && marked
+                {
+                    ctx.tmux_registry().clear_window_killed(identity).await;
+                }
             }
             return response;
         }
@@ -434,6 +496,25 @@ async fn wait_for_text_response(
             }
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
+    }
+}
+
+async fn disable_remain_on_exit(config_path: &Path, socket_path: &Path, window_id: &str) {
+    if let Err(error) = run_tmux_cli(
+        config_path,
+        socket_path,
+        &[
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            window_id.to_owned(),
+            "remain-on-exit".to_owned(),
+            "off".to_owned(),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(%error, %window_id, "tmux_run: failed to restore remain-on-exit after readiness");
     }
 }
 
@@ -469,12 +550,16 @@ fn derived_window_name(cmd: &str) -> String {
 }
 
 fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
-    let after_exit = if keep_open_on_exit {
-        "exec ${SHELL:-/bin/bash} -i"
+    let retain_dead_pane = if keep_open_on_exit {
+        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on >/dev/null 2>&1 || exit 125;"
     } else {
-        "exit $code"
+        ""
     };
-    format!("(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}")
+    let timestamp =
+        r#"if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "$EPOCHREALTIME"; else date +%s; fi"#;
+    format!(
+        "{retain_dead_pane} echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; exit $code"
+    )
 }
 
 fn shell_quote(s: &str) -> String {
@@ -627,7 +712,9 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::registry::socket_path_for_worktree;
+    use crate::tmux::registry::{
+        socket_path_for_worktree, TmuxTerminalInspection, TmuxWindowIdentity,
+    };
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -669,6 +756,16 @@ mod tests {
             .env_remove("TMUX")
             .status()
             .await;
+    }
+
+    #[test]
+    fn wrapper_records_portable_subsecond_start_and_finish_markers() {
+        let wrapper = shell_wrapper("true", false);
+        assert!(wrapper.contains("[phoenix] process started at unix seconds"));
+        assert!(wrapper.contains("[phoenix] process exited at unix seconds"));
+        assert!(wrapper.contains("EPOCHREALTIME"));
+        assert!(wrapper.contains("date +%s"));
+        assert!(!wrapper.contains("python"));
     }
 
     #[tokio::test]
@@ -756,6 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn quick_failure_leaves_inspectable_output_and_exit_marker() {
         if skip_unless_tmux() {
             return;
@@ -768,7 +866,7 @@ mod tests {
         let ctx = ctx(
             "tmux-run-quick-failure",
             cwd_tmp.path().canonicalize().unwrap(),
-            registry,
+            registry.clone(),
             None,
         );
 
@@ -801,6 +899,69 @@ mod tests {
             "pane output: {pane}"
         );
         assert_eq!(v["captured_output"]["truncated"], false);
+
+        let scope =
+            phoenix_core::work_scope::WorkScope::Conversation("tmux-run-quick-failure".to_string());
+        let server_generation = registry
+            .get_existing(&scope)
+            .await
+            .expect("server registered")
+            .read()
+            .await
+            .server_generation
+            .clone()
+            .expect("generation installed");
+        let identity = TmuxWindowIdentity {
+            work_scope: scope,
+            server_generation,
+            window_id: v["window_id"].as_str().unwrap().to_string(),
+        };
+        assert!(
+            registry.has_registered_window(&identity).await,
+            "tmux_run must register the exact window identity"
+        );
+        let inspection = registry.inspect_window(&identity).await;
+        assert!(
+            matches!(
+                inspection,
+                TmuxTerminalInspection::Terminal {
+                    exit_code: 7,
+                    duration_ms: Some(_),
+                    ..
+                }
+            ),
+            "inspection: {inspection:?}; pane: {pane}"
+        );
+        let rekeyed_scope = phoenix_core::work_scope::WorkScope::Worktree(
+            cwd_tmp
+                .path()
+                .join("approved-worktree")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(
+            registry
+                .rekey_scope(&identity.work_scope, &rekeyed_scope)
+                .await
+        );
+        let rekeyed_identity = TmuxWindowIdentity {
+            work_scope: rekeyed_scope.clone(),
+            ..identity
+        };
+        assert!(matches!(
+            registry.inspect_window(&rekeyed_identity).await,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 7,
+                duration_ms: Some(_),
+                ..
+            }
+        ));
+        assert!(registry.get_existing(&rekeyed_scope).await.is_some());
+        assert_eq!(
+            registry.conversation_count().await,
+            1,
+            "inspection after rekey must use the preserved entry without materializing another"
+        );
 
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
@@ -961,6 +1122,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keep_closed_after_readiness_does_not_retain_later_exit() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-long-after-ready",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo READY; sleep 0.2",
+                    "name": "tmux-run-long-after-ready",
+                    "keep_open_on_exit": false,
+                    "readiness": {"mode":"wait_for_text","text":"READY","timeout_seconds":5}
+                }),
+                ctx,
+            )
+            .await;
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "ready");
+        assert_eq!(v["exit_code"], Value::Null);
+        let window_id = v["window_id"].as_str().unwrap();
+        let sock = socket_tmp
+            .path()
+            .join("conv-tmux-run-long-after-ready.sock");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let status = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &sock.to_string_lossy(),
+                "has-session",
+                "-t",
+                window_id,
+            ])
+            .env_remove("TMUX")
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !status.success(),
+            "window must disappear when the command later exits"
+        );
+        kill_socket(&sock).await;
+    }
+
+    #[tokio::test]
     async fn tmux_run_targets_main_session() {
         if skip_unless_tmux() {
             return;
@@ -1029,6 +1244,88 @@ mod tests {
         .unwrap();
         assert_eq!(String::from_utf8_lossy(&display.stdout).trim(), "main");
         kill_socket(&socket_path).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_inspection_rejects_stale_generation_and_recovers_after_restart() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-restart-inspect",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry.clone(),
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo restart-inspect; exit 3",
+                    "name": "tmux-run-restart-inspect",
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": EXIT_MARKER_PREFIX,
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        let scope = phoenix_core::work_scope::WorkScope::Conversation(
+            "tmux-run-restart-inspect".to_string(),
+        );
+        let generation = registry
+            .get_existing(&scope)
+            .await
+            .expect("server")
+            .read()
+            .await
+            .server_generation
+            .clone()
+            .expect("generation");
+        let identity = TmuxWindowIdentity {
+            work_scope: scope.clone(),
+            server_generation: generation.clone(),
+            window_id: v["window_id"].as_str().unwrap().to_string(),
+        };
+        let stale = TmuxWindowIdentity {
+            server_generation: "stale-generation".to_string(),
+            ..identity.clone()
+        };
+        assert_eq!(
+            registry.inspect_window(&stale).await,
+            TmuxTerminalInspection::Missing
+        );
+
+        let restarted = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        assert!(
+            restarted.get_existing(&scope).await.is_none(),
+            "new registry simulates Phoenix restart"
+        );
+        assert!(matches!(
+            restarted.inspect_window(&identity).await,
+            TmuxTerminalInspection::Terminal {
+                exit_code: 3,
+                duration_ms: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            restarted.get_existing(&scope).await.is_none(),
+            "read-only inspection must not materialize registry inventory"
+        );
+
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-restart-inspect.sock")).await;
     }
 
     #[tokio::test]

@@ -25,6 +25,15 @@ use crate::domain::sm_state::{
 };
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WakeObservationResult {
+    pub inbox_id: String,
+    pub registering_tool_use_id: String,
+    pub message_id: String,
+    pub content: String,
+    pub resume_llm: bool,
+}
+
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -134,6 +143,10 @@ pub enum Event {
     },
     /// User manually triggered continuation (REQ-BED-023)
     UserTriggerContinuation,
+    /// Durable wake evidence is ready for runtime acceptance.
+    WakeObservationReady {
+        results: Vec<WakeObservationResult>,
+    },
 
     // Task approval events (REQ-BED-028)
     /// User responded to a proposed task plan.
@@ -263,6 +276,7 @@ impl Event {
             Event::ContinuationResponse { .. } => "ContinuationResponse",
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::UserTriggerContinuation => "UserTriggerContinuation",
+            Event::WakeObservationReady { .. } => "WakeObservationReady",
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::CommissionReviewApprovalDecided { .. } => "CommissionReviewApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
@@ -354,6 +368,9 @@ pub enum CoreEvent {
         error: String,
     },
     UserTriggerContinuation,
+    WakeObservationReady {
+        results: Vec<WakeObservationResult>,
+    },
     /// Drained steering entries to be persisted as `UserMessage`s mid-conversation.
     /// Fired by the executor when transitioning into a state that is about to ask
     /// the LLM (entering `Idle`, or entering `LlmRequesting` from a tool round).
@@ -540,6 +557,11 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserTriggerContinuation => {
                 Ok(ParentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
+            Event::WakeObservationReady { results } => {
+                Ok(ParentEvent::Core(CoreEvent::WakeObservationReady {
+                    results,
+                }))
+            }
             Event::SteerDrainedUserMessages { entries } => {
                 Ok(ParentEvent::Core(CoreEvent::SteerDrainedUserMessages {
                     entries,
@@ -697,6 +719,11 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::UserTriggerContinuation => {
                 Ok(SubAgentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
+            Event::WakeObservationReady { results } => {
+                Ok(SubAgentEvent::Core(CoreEvent::WakeObservationReady {
+                    results,
+                }))
+            }
             // Sub-agent-only events
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
@@ -744,6 +771,7 @@ impl CoreEvent {
             CoreEvent::ContinuationResponse { .. } => "ContinuationResponse",
             CoreEvent::ContinuationFailed { .. } => "ContinuationFailed",
             CoreEvent::UserTriggerContinuation => "UserTriggerContinuation",
+            CoreEvent::WakeObservationReady { .. } => "WakeObservationReady",
             CoreEvent::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
         }
     }

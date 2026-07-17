@@ -110,6 +110,9 @@ pub enum Effect {
 
     /// Persist the new state
     PersistState,
+    AcceptWakeObservations {
+        inbox_ids: Vec<String>,
+    },
 
     /// Make an LLM request
     RequestLlm,
@@ -121,7 +124,9 @@ pub enum Effect {
     },
 
     /// Execute a tool (spawns as background task)
-    ExecuteTool { tool: ToolCall },
+    ExecuteTool {
+        tool: ToolCall,
+    },
 
     /// Eagerly broadcast the assistant message to SSE clients before tools run,
     /// so the UI can render the in-flight `tool_use` blocks during execution.
@@ -130,19 +135,27 @@ pub enum Effect {
     /// Broadcast-only on purpose: persisting eagerly would create half-written
     /// history (`tool_use` without `tool_result`) that the LLM history builder
     /// and crash recovery do not expect.
-    BroadcastAssistantMessage { message: AssistantMessage },
+    BroadcastAssistantMessage {
+        message: AssistantMessage,
+    },
 
     /// Abort the currently running tool
-    AbortTool { tool_use_id: String },
+    AbortTool {
+        tool_use_id: String,
+    },
 
     /// Abort the currently running LLM request
     AbortLlm,
 
     /// Cancel all pending sub-agents
-    CancelSubAgents { ids: Vec<String> },
+    CancelSubAgents {
+        ids: Vec<String>,
+    },
 
     /// Notify parent of sub-agent completion (sub-agent only)
-    NotifyParent { outcome: SubAgentOutcome },
+    NotifyParent {
+        outcome: SubAgentOutcome,
+    },
 
     /// Notify connected clients that conversation state changed. The executor
     /// reconstructs the wire payload from the authoritative `self.state`, so
@@ -167,12 +180,16 @@ pub enum Effect {
     },
 
     /// Atomically persist a complete checkpoint (REQ-BED-007, FM-2 Prevention)
-    PersistCheckpoint { data: CheckpointData },
+    PersistCheckpoint {
+        data: CheckpointData,
+    },
 
     /// Persist multiple tool results at once.
     /// Retained for sub-agent result persistence; normal tool rounds use `PersistCheckpoint`.
     #[allow(dead_code)]
-    PersistToolResults { results: Vec<ToolResult> },
+    PersistToolResults {
+        results: Vec<ToolResult>,
+    },
 
     /// Persist a UI-hidden system marker.
     ///
@@ -192,10 +209,14 @@ pub enum Effect {
     },
 
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
-    RequestContinuation { request: ContinuationSummaryRequest },
+    RequestContinuation {
+        request: ContinuationSummaryRequest,
+    },
 
     /// Notify client of context exhaustion - REQ-BED-021
-    NotifyContextExhausted { summary: String },
+    NotifyContextExhausted {
+        summary: String,
+    },
 
     /// Execute git operations for task approval (REQ-BED-028).
     ///
@@ -248,7 +269,9 @@ pub enum Effect {
     /// persist guards against double-delivery). Removing only the drained ids
     /// (rather than overwriting with empty) preserves concurrently-enqueued
     /// steers that arrived during the drain window.
-    ClearSteeringQueueEntries { message_ids: Vec<String> },
+    ClearSteeringQueueEntries {
+        message_ids: Vec<String>,
+    },
 }
 
 impl Effect {

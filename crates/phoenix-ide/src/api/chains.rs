@@ -378,11 +378,16 @@ pub async fn archive_chain_handler(
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if conv.state.is_busy() {
+        let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+        let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+            .has_pending_for_conversation(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if conv.state.is_busy() || has_pending_wake {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 format!(
                     "Cannot archive chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
+                     operation or pending wait first, then retry.",
                 ),
                 "cancel_first",
             ))));
@@ -424,11 +429,16 @@ pub async fn delete_chain_handler(
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if conv.state.is_busy() {
+        let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+        let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
+            .has_pending_for_conversation(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if conv.state.is_busy() || has_pending_wake {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 format!(
                     "Cannot delete chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
+                     operation or pending wait first, then retry.",
                 ),
                 "cancel_first",
             ))));

@@ -11,6 +11,8 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
+use phoenix_core::domain::db_schema::{MessageContent, ToolOutcome};
+
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{
     CancelCause, CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent,
@@ -19,8 +21,8 @@ use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, 
 use super::state::{
     AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
-    RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    RecoveryKind, RecoveryResumeTarget, SubAgentCompletionDisposition, SubAgentOutcome,
+    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -754,6 +756,45 @@ pub fn transition_core(
             handle_core_sub_agents(state, event)
         }
 
+        (_, CoreEvent::WakeObservationReady { .. }) if !matches!(state, CoreState::Idle) => {
+            Ok(CoreTransitionResult::new(state.clone()))
+        }
+
+        (CoreState::Idle, CoreEvent::WakeObservationReady { results }) => {
+            let resume_llm = results.iter().any(|result| result.resume_llm);
+            let inbox_ids = results
+                .iter()
+                .map(|result| result.inbox_id.clone())
+                .collect();
+            let mut transition = if resume_llm {
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+            } else {
+                CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
+            };
+            for wake_result in results {
+                transition = transition.with_effect(Effect::PersistMessage {
+                    content: MessageContent::tool(
+                        &wake_result.registering_tool_use_id,
+                        &wake_result.content,
+                        false,
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: wake_result.message_id.clone(),
+                    idempotent: true,
+                });
+            }
+            transition = transition
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::AcceptWakeObservations { inbox_ids });
+            if resume_llm {
+                transition = transition
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm);
+            }
+            Ok(transition)
+        }
+
         // Context Continuation (REQ-BED-019 through REQ-BED-024)
         (CoreState::AwaitingContinuation { .. }, CoreEvent::LlmError { .. })
         | (CoreState::AwaitingContinuation { .. }, CoreEvent::RetryTimeout { .. })
@@ -949,6 +990,44 @@ fn handle_core_tool_complete(
     };
 
     match event {
+        CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        } if tool_use_id == current_tool.id
+            && matches!(current_tool.input, ToolInput::WaitUntil(_))
+            && matches!(result.outcome, ToolOutcome::Success { .. }) =>
+        {
+            let mut new_results = completed_results.clone();
+            new_results.push(result);
+            if let Some((next_tool, rest)) = remaining_tools.split_first() {
+                return Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
+                    current_tool: next_tool.clone(),
+                    remaining_tools: rest.to_vec(),
+                    completed_results: new_results,
+                    pending_sub_agents: pending_sub_agents.clone(),
+                    assistant_message: assistant_message.clone(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::execute_tool(next_tool.clone())));
+            }
+            let checkpoint = CheckpointData::tool_round(assistant_message.clone(), new_results)
+                .expect("tool_use/tool_result count mismatch in wait-until transition");
+            let next = if pending_sub_agents.is_empty() {
+                CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
+            } else {
+                CoreTransitionResult::new(CoreState::AwaitingSubAgents {
+                    pending: pending_sub_agents.clone(),
+                    completed_results: vec![],
+                    spawn_tool_id: None,
+                    completion: SubAgentCompletionDisposition::SuspendParent,
+                })
+            };
+            Ok(next
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()))
+        }
+
         // ToolComplete (more tools remaining) -> next tool
         CoreEvent::ToolComplete {
             tool_use_id,
@@ -1015,6 +1094,7 @@ fn handle_core_tool_complete(
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
                 spawn_tool_id: None,
+                completion: SubAgentCompletionDisposition::ResumeParent,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -1068,6 +1148,7 @@ fn handle_core_tool_complete(
                 pending: all_pending.clone(),
                 completed_results: vec![],
                 spawn_tool_id: Some(spawn_id),
+                completion: SubAgentCompletionDisposition::ResumeParent,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -1087,6 +1168,7 @@ fn handle_core_tool_complete(
         | CoreEvent::ContinuationResponse { .. }
         | CoreEvent::ContinuationFailed { .. }
         | CoreEvent::UserTriggerContinuation
+        | CoreEvent::WakeObservationReady { .. }
         | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -1108,6 +1190,7 @@ fn handle_core_cancellation(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                ..
             },
             CoreEvent::UserCancel { cause, .. },
         ) => {
@@ -1329,6 +1412,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1355,6 +1439,7 @@ fn handle_core_sub_agents(
                 pending: new_pending,
                 completed_results: new_results,
                 spawn_tool_id: spawn_tool_id.clone(),
+                completion: *completion,
             })
             .with_effect(Effect::PersistState)
             .with_effect(notify))
@@ -1366,6 +1451,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                completion,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -1381,16 +1467,23 @@ fn handle_core_sub_agents(
                 outcome,
             });
 
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistSubAgentResults {
-                        results: new_results,
-                        spawn_tool_id: spawn_tool_id.clone(),
-                    })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
+            let next = match completion {
+                SubAgentCompletionDisposition::ResumeParent => {
+                    CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                        .with_effect(Effect::RequestLlm)
+                }
+                SubAgentCompletionDisposition::SuspendParent => {
+                    CoreTransitionResult::new(CoreState::Idle)
+                        .with_effect(Effect::notify_agent_done())
+                }
+            };
+            Ok(next
+                .with_effect(Effect::PersistSubAgentResults {
+                    results: new_results,
+                    spawn_tool_id: spawn_tool_id.clone(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()))
         }
 
         // CancellingSubAgents + SubAgentResult (more pending)
@@ -2192,6 +2285,7 @@ pub fn transition_parent(
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2441,6 +2535,7 @@ pub fn transition_parent(
                 | ToolInput::ProposeTask(_)
                 | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2604,6 +2699,7 @@ pub fn transition_parent(
                 | ToolInput::ProposeTask(_)
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -3221,6 +3317,7 @@ pub fn transition_sub_agent(
                     | ToolInput::CommissionReview(_)
                     | ToolInput::ApprovedCommissionReview(_)
                     | ToolInput::AskUserQuestion(_)
+                    | ToolInput::WaitUntil(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
                         unreachable!("is_terminal_tool returned true for non-terminal tool")
@@ -4392,6 +4489,130 @@ mod tests {
     }
 
     #[test]
+    fn wait_until_completion_suspends_without_requesting_llm() {
+        use crate::state::{
+            AssistantMessage, ToolCall, ToolInput, WaitUntilInput, WaitUntilTargetInput,
+        };
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let assistant_message = AssistantMessage::new(
+            "assistant-wait".to_owned(),
+            vec![ContentBlock::tool_use(
+                "wait-1",
+                "wait_until",
+                serde_json::json!({"target":{"kind":"bash","handle_id":"b-1"},"max_wait_seconds":60}),
+            )],
+            None,
+            None,
+        );
+        let result = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "wait-1",
+                    ToolInput::WaitUntil(WaitUntilInput {
+                        target: WaitUntilTargetInput::Bash {
+                            handle_id: "b-1".to_owned(),
+                        },
+                        max_wait_seconds: 60,
+                    }),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message,
+            },
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "wait-1".to_owned(),
+                result: ToolResult::success("wait-1".to_owned(), "registered".to_owned()),
+            },
+        )
+        .expect("wait completion");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn wait_until_with_running_subagent_suspends_after_child_completion() {
+        use crate::state::{
+            AssistantMessage, PendingSubAgent, ToolCall, ToolInput, WaitUntilInput,
+            WaitUntilTargetInput,
+        };
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let assistant_message = AssistantMessage::new(
+            "assistant-wait-child".to_owned(),
+            vec![ContentBlock::tool_use(
+                "wait-child",
+                "wait_until",
+                serde_json::json!({"target":{"kind":"bash","handle_id":"b-1"},"max_wait_seconds":60}),
+            )],
+            None,
+            None,
+        );
+        let waiting = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "wait-child",
+                    ToolInput::WaitUntil(WaitUntilInput {
+                        target: WaitUntilTargetInput::Bash {
+                            handle_id: "b-1".to_owned(),
+                        },
+                        max_wait_seconds: 60,
+                    }),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![PendingSubAgent {
+                    agent_id: "child-1".to_owned(),
+                    task: "inspect".to_owned(),
+                    mode: crate::state::SubAgentMode::Explore,
+                }],
+                assistant_message,
+            },
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "wait-child".to_owned(),
+                result: ToolResult::success("wait-child".to_owned(), "registered".to_owned()),
+            },
+        )
+        .expect("wait completion");
+
+        assert!(matches!(
+            waiting.new_state,
+            ConvState::AwaitingSubAgents {
+                completion: SubAgentCompletionDisposition::SuspendParent,
+                ..
+            }
+        ));
+        assert!(!waiting
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+
+        let completed = transition(
+            &waiting.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "child-1".to_owned(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".to_owned(),
+                },
+            },
+        )
+        .expect("child completion");
+        assert!(matches!(completed.new_state, ConvState::Idle));
+        assert!(!completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
     fn test_cancellation_produces_synthetic_results() {
         use crate::state::{AssistantMessage, ToolCall, ToolInput};
         use phoenix_core::domain::llm_types::ContentBlock;
@@ -5179,7 +5400,6 @@ mod tests {
     #[test]
     fn test_subagent_sole_propose_task_rejected_not_stalled() {
         use crate::state::{ContextExhaustionBehavior, ProposeTaskInput, ToolInput};
-        use phoenix_core::domain::db_schema::ToolOutcome;
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let subagent_ctx = ConvContext {
@@ -6649,6 +6869,7 @@ mod tests {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
                 | Effect::PersistState
+                | Effect::AcceptWakeObservations { .. }
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }
@@ -6697,6 +6918,7 @@ mod tests {
                 | ToolInput::CommissionReview(_)
                 | ToolInput::ProposeTask(_)
                 | ToolInput::AskUserQuestion(_)
+                | ToolInput::WaitUntil(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. }) => {
                     panic!("expected approved commission review input, got {other:?}")
@@ -7236,7 +7458,9 @@ mod teardown_tests {
 
     use super::{transition, ConvState, Effect, Event};
     use crate::event::CancelCause;
-    use crate::state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+    use crate::state::{
+        PendingSubAgent, SubAgentCompletionDisposition, SubAgentMode, SubAgentOutcome,
+    };
     use phoenix_core::domain::db_schema::ErrorKind;
     use std::path::PathBuf;
 
@@ -7447,6 +7671,7 @@ mod teardown_tests {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
             spawn_tool_id: None,
+            completion: SubAgentCompletionDisposition::ResumeParent,
         };
         let result = transition(
             &state,
@@ -7509,6 +7734,7 @@ mod teardown_tests {
             pending: vec![pending("a")],
             completed_results: vec![],
             spawn_tool_id: None,
+            completion: SubAgentCompletionDisposition::ResumeParent,
         };
         let cancelling = transition(
             &awaiting,
