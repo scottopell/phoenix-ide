@@ -11,7 +11,8 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use phoenix_core::domain::db_schema::{MessageContent, ToolOutcome};
+use phoenix_core::domain::db_schema::ToolOutcome;
+use phoenix_core::domain::llm_types::ContentBlock;
 
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{
@@ -772,16 +773,9 @@ pub fn transition_core(
                 CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
             };
             for wake_result in results {
-                transition = transition.with_effect(Effect::PersistMessage {
-                    content: MessageContent::tool(
-                        &wake_result.registering_tool_use_id,
-                        &wake_result.content,
-                        false,
-                    ),
-                    display_data: None,
-                    usage_data: None,
-                    message_id: wake_result.message_id.clone(),
-                    idempotent: true,
+                transition = transition.with_effect(Effect::UpdateToolMessageContent {
+                    tool_use_id: wake_result.registering_tool_use_id.clone(),
+                    content: wake_result.content.clone(),
                 });
             }
             transition = transition
@@ -972,6 +966,20 @@ fn handle_core_llm_response(
     .with_effect(Effect::execute_tool(first)))
 }
 
+fn has_successful_wait_until(assistant_message: &AssistantMessage, results: &[ToolResult]) -> bool {
+    assistant_message.tool_uses().iter().any(|tool_use| {
+        matches!(
+            tool_use,
+            ContentBlock::ToolUse { id, name, .. }
+                if name == "wait_until"
+                    && results.iter().any(|result| {
+                        result.tool_use_id == *id
+                            && matches!(result.outcome, ToolOutcome::Success { .. })
+                    })
+        )
+    })
+}
+
 /// Handles `ToolComplete` and `SpawnAgentsComplete` events during `ToolExecuting` state.
 #[allow(clippy::too_many_lines)]
 fn handle_core_tool_complete(
@@ -1062,16 +1070,23 @@ fn handle_core_tool_complete(
             let mut all_results = completed_results.clone();
             all_results.push(result);
 
+            let wake_suspended = has_successful_wait_until(assistant_message, &all_results);
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in last-tool transition");
 
-            Ok(
+            let next = if wake_suspended {
+                CoreTransitionResult::new(CoreState::Idle).with_effect(Effect::notify_agent_done())
+            } else {
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
+            }
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change());
+            Ok(if wake_suspended {
+                next
+            } else {
+                next.with_effect(Effect::RequestLlm)
+            })
         }
 
         // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
@@ -1085,16 +1100,22 @@ fn handle_core_tool_complete(
             let mut all_results = completed_results.clone();
             all_results.push(result);
 
+            let wake_suspended = has_successful_wait_until(assistant_message, &all_results);
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect(
                     "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
                 );
 
+            let completion = if wake_suspended {
+                SubAgentCompletionDisposition::SuspendParent
+            } else {
+                SubAgentCompletionDisposition::ResumeParent
+            };
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
                 spawn_tool_id: None,
-                completion: SubAgentCompletionDisposition::ResumeParent,
+                completion,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -1141,14 +1162,20 @@ fn handle_core_tool_complete(
             let spawn_id = result.tool_use_id.clone();
             all_results.push(result);
 
+            let wake_suspended = has_successful_wait_until(assistant_message, &all_results);
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
 
+            let completion = if wake_suspended {
+                SubAgentCompletionDisposition::SuspendParent
+            } else {
+                SubAgentCompletionDisposition::ResumeParent
+            };
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
                 completed_results: vec![],
                 spawn_tool_id: Some(spawn_id),
-                completion: SubAgentCompletionDisposition::ResumeParent,
+                completion,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -4536,6 +4563,98 @@ mod tests {
     }
 
     #[test]
+    fn wait_until_suspension_survives_later_tool_completion() {
+        use crate::state::{
+            AssistantMessage, ToolCall, ToolInput, WaitUntilInput, WaitUntilTargetInput,
+        };
+
+        let assistant_message = AssistantMessage::new(
+            "assistant-wait-then-tool".to_owned(),
+            vec![
+                ContentBlock::tool_use(
+                    "wait-1",
+                    "wait_until",
+                    serde_json::json!({"target":{"kind":"bash","handle_id":"b-1"},"max_wait_seconds":60}),
+                ),
+                ContentBlock::tool_use(
+                    "bash-2",
+                    "bash",
+                    serde_json::json!({"op":"run","cmd":"true"}),
+                ),
+            ],
+            None,
+            None,
+        );
+        let after_wait = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "wait-1",
+                    ToolInput::WaitUntil(WaitUntilInput {
+                        target: WaitUntilTargetInput::Bash {
+                            handle_id: "b-1".to_owned(),
+                        },
+                        max_wait_seconds: 60,
+                    }),
+                ),
+                remaining_tools: vec![ToolCall::new(
+                    "bash-2",
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("true")),
+                )],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message,
+            },
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "wait-1".to_owned(),
+                result: ToolResult::success("wait-1".to_owned(), "registered".to_owned()),
+            },
+        )
+        .expect("wait completion");
+        let completed = transition(
+            &after_wait.new_state,
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "bash-2".to_owned(),
+                result: ToolResult::success("bash-2".to_owned(), "done".to_owned()),
+            },
+        )
+        .expect("later tool completion");
+        assert!(matches!(completed.new_state, ConvState::Idle));
+        assert!(!completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn wake_delivery_updates_the_registration_result() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::WakeObservationReady {
+                results: vec![phoenix_core::domain::sm_event::WakeObservationResult {
+                    inbox_id: "inbox-1".to_owned(),
+                    registering_tool_use_id: "wait-1".to_owned(),
+                    content: "terminal".to_owned(),
+                    message_id: "wake-message".to_owned(),
+                    resume_llm: true,
+                }],
+            },
+        )
+        .expect("wake delivery");
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::UpdateToolMessageContent { tool_use_id, content }
+                if tool_use_id == "wait-1" && content == "terminal"
+        )));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+    }
+
+    #[test]
     fn wait_until_with_running_subagent_suspends_after_child_completion() {
         use crate::state::{
             AssistantMessage, PendingSubAgent, ToolCall, ToolInput, WaitUntilInput,
@@ -6867,6 +6986,7 @@ mod tests {
             let execute_effect = result.effects.iter().find_map(|effect| match effect {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
+                | Effect::UpdateToolMessageContent { .. }
                 | Effect::PersistState
                 | Effect::AcceptWakeObservations { .. }
                 | Effect::RequestLlm

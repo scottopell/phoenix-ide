@@ -684,28 +684,6 @@ async fn inspect_binding(
                     });
                     fired(binding, evidence, now)
                 }
-                BashTerminalInspection::KillPendingKernel { observed_at }
-                    if observed_at < binding.expires_at =>
-                {
-                    fired(
-                        binding,
-                        WakeTerminalEvidence::Bash(BashTerminalEvidence {
-                            identity: identity.clone(),
-                            status: BashTerminalStatus::KillPendingKernel,
-                            occurred_at: timestamp(observed_at)?,
-                            exit_code: None,
-                            duration_ms: Some(0),
-                            signal_number: None,
-                            kill_signal_sent: None,
-                            tail_start_offset: 0,
-                            tail_end_offset: 0,
-                            tail_truncated_before: false,
-                            tail_offsets: Vec::new(),
-                            final_tail: Vec::new(),
-                        }),
-                        now,
-                    )
-                }
                 BashTerminalInspection::Unknown => {
                     forgotten(binding, WakeForgottenReason::PhoenixRestart, now)
                 }

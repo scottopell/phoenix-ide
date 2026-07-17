@@ -107,6 +107,11 @@ pub enum Effect {
         /// extra `message_exists` query.
         idempotent: bool,
     },
+    /// Replace the provisional output of a deferred tool with its terminal result.
+    UpdateToolMessageContent {
+        tool_use_id: String,
+        content: String,
+    },
 
     /// Persist the new state
     PersistState,

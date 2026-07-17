@@ -393,6 +393,47 @@ impl<'a> WakeWorkflowAdapter<'a> {
         Ok(cancelled)
     }
 
+    /// Atomically reject pending wake work or close registration admission before teardown.
+    pub async fn close_lifecycle_fence_if_clear(
+        &self,
+        conversation_id: &str,
+    ) -> WorkflowRepositoryResult<bool> {
+        let mut tx = self.repository.pool().begin().await?;
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM wake_workflow_bindings b \
+                 JOIN workflows w ON w.id = b.workflow_id \
+                 LEFT JOIN wake_runtime_obligations o ON o.conversation_id = b.conversation_id \
+                 WHERE b.conversation_id = ?1 \
+                   AND (w.status = 'active' OR o.status = 'owed')\
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending != 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO wake_registration_fences (conversation_id, version, status) \
+             VALUES (?1, 0, 'closed') \
+             ON CONFLICT(conversation_id) DO UPDATE SET status = 'closed'",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_workflow_bindings SET lifecycle_fence_status = 'closed' \
+             WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn transfer_conversation_owner(
         &self,
         predecessor_id: &str,

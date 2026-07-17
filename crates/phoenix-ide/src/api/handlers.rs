@@ -3729,7 +3729,9 @@ enum WakeCancellationAction {
 fn wake_cancellation_action(state: &ConvState) -> WakeCancellationAction {
     match state {
         ConvState::Idle => WakeCancellationAction::ReturnAfterCancellation,
-        ConvState::AwaitingSubAgents { .. } => WakeCancellationAction::ContinueRuntimeCancellation,
+        ConvState::AwaitingSubAgents { .. } | ConvState::ToolExecuting { .. } => {
+            WakeCancellationAction::ContinueRuntimeCancellation
+        }
         _ => WakeCancellationAction::None,
     }
 }
@@ -4242,6 +4244,14 @@ async fn archive_conversation(
 /// hard-delete — cleanup would race in-flight tool execution otherwise.
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
+async fn close_wake_lifecycle_fence(state: &AppState, id: &str) -> Result<bool, AppError> {
+    let repository = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+        .close_lifecycle_fence_if_clear(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     let conv = state
         .runtime
@@ -4250,12 +4260,15 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
-    let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
-        .has_pending_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    if conv.state.is_busy() || has_pending_wake {
+    if conv.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive a busy conversation. Cancel the in-flight \
+             operation or pending wait first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    let wake_admitted = close_wake_lifecycle_fence(state, id).await?;
+    if !wake_admitted {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot archive a busy conversation. Cancel the in-flight \
              operation or pending wait first, then retry.",
@@ -4553,12 +4566,15 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Ok(());
     }
 
-    let wake_repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
-    let has_pending_wake = phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&wake_repo)
-        .has_pending_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    if conv.state.is_busy() || has_pending_wake {
+    if conv.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete a busy conversation. Cancel the in-flight \
+             operation or pending wait first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    let wake_admitted = close_wake_lifecycle_fence(state, id).await?;
+    if !wake_admitted {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
              operation or pending wait first, then retry.",

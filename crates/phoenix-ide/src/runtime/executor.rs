@@ -3839,6 +3839,27 @@ where
                 Ok(None)
             }
 
+            Effect::UpdateToolMessageContent {
+                tool_use_id,
+                content,
+            } => {
+                let message_id = tool_result_message_id(&tool_use_id);
+                let transcript_generation = self
+                    .storage
+                    .update_tool_message_content(&message_id, &content)
+                    .await?;
+                let updated_content =
+                    crate::db::MessageContent::tool(&tool_use_id, &content, false);
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+                    sequence_id: seq,
+                    message_id,
+                    transcript_generation: Some(transcript_generation),
+                    display_data: None,
+                    content: Some(updated_content),
+                    duration_ms: None,
+                });
+                Ok(None)
+            }
             Effect::PersistState => self.persist_state_effect(true).await,
 
             Effect::AcceptWakeObservations { inbox_ids } => {

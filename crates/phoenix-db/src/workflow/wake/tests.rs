@@ -360,6 +360,35 @@ async fn fired_evidence_after_expiry_is_rejected_in_atomic_and_direct_receipt_pa
 }
 
 #[tokio::test]
+async fn lifecycle_fence_close_serializes_against_registration() {
+    let (pool, repo) = registered(bash()).await;
+    let adapter = WakeWorkflowAdapter::new(&repo);
+    assert!(!adapter
+        .close_lifecycle_fence_if_clear("conv-wake")
+        .await
+        .unwrap());
+
+    sqlx::query("UPDATE workflows SET status = 'completed' WHERE id = 'wake-workflow'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(adapter
+        .close_lifecycle_fence_if_clear("conv-wake")
+        .await
+        .unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM wake_registration_fences WHERE conversation_id = 'conv-wake'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "closed"
+    );
+    assert!(adapter.register(&registration(bash())).await.is_err());
+}
+
+#[tokio::test]
 async fn continuation_owner_transfer_requires_the_persisted_edge_and_replays() {
     let (pool, repo) = registered(bash()).await;
     sqlx::query("INSERT INTO conversations (id, slug) VALUES ('successor', 'successor'), ('unrelated', 'unrelated')")

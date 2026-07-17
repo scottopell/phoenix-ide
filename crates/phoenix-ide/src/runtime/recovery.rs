@@ -25,6 +25,7 @@ pub enum RecoveryReason {
     EmptyConversation,
     /// Last message is not a tool result
     LastMessageNotTool,
+    WakeSuspended,
     /// No agent message found in conversation
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
@@ -66,6 +67,37 @@ impl RecoveryDecision {
     }
 }
 
+fn is_registered_wait_result(messages: &[Message]) -> bool {
+    let Some(MessageContent::Tool(tool)) = messages.last().map(|message| &message.content) else {
+        return false;
+    };
+    if tool.is_error
+        || serde_json::from_str::<serde_json::Value>(&tool.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            != Some("registered")
+    {
+        return false;
+    }
+    messages.iter().rev().any(|message| {
+        matches!(
+            &message.content,
+            MessageContent::Agent(blocks)
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { id, name, .. }
+                        if id == &tool.tool_use_id && name == "wait_until"
+                ))
+        )
+    })
+}
+
 /// Analyze messages to determine if a conversation needs auto-continuation.
 ///
 /// A conversation needs auto-continuation when:
@@ -91,6 +123,10 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
         return RecoveryDecision::idle(RecoveryReason::LastMessageNotTool);
+    }
+
+    if is_registered_wait_result(messages) {
+        return RecoveryDecision::idle(RecoveryReason::WakeSuspended);
     }
 
     // Find the last agent message
@@ -445,6 +481,18 @@ mod tests {
         let decision = should_auto_continue(&messages);
         // Empty blocks = no text, should auto-continue
         assert!(decision.needs_auto_continue);
+    }
+
+    #[test]
+    fn registered_wait_result_stays_suspended_after_restart() {
+        let messages = vec![
+            user_msg(1, "Wait"),
+            agent_tool_use_only(2, &["wait_until"]),
+            tool_result(3, "tool-2-0", r#"{"status":"registered"}"#),
+        ];
+        let decision = should_auto_continue(&messages);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::WakeSuspended);
     }
 
     #[test]
@@ -880,6 +928,12 @@ mod proptests {
                 }
                 RecoveryReason::LastMessageNotTool => {
                     prop_assert!(!matches!(
+                        messages.last().unwrap().message_type,
+                        MessageType::Tool
+                    ));
+                }
+                RecoveryReason::WakeSuspended => {
+                    prop_assert!(matches!(
                         messages.last().unwrap().message_type,
                         MessageType::Tool
                     ));
