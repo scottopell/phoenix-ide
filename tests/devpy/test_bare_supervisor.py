@@ -318,6 +318,35 @@ class BareTransactionTests(unittest.TestCase):
         supervisor.send_response(connection, {"ok": True})
         connection.sendall.assert_called_once()
 
+    def test_socket_is_bound_before_reconciliation(self):
+        owner = supervisor.Supervisor(self.layout)
+        events = []
+
+        class FakeSocket:
+            def bind(self, path):
+                events.append(("bind", path))
+
+            def listen(self, _backlog):
+                events.append(("listen",))
+
+            def settimeout(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
+        def reconcile():
+            events.append(("reconcile",))
+            owner.running = False
+
+        owner.prepare_layout = mock.Mock()
+        owner.reconcile = mock.Mock(side_effect=reconcile)
+        owner.stop_child = mock.Mock()
+        with mock.patch.object(supervisor.socket, "socket", return_value=FakeSocket()), \
+             mock.patch.object(supervisor.os, "chmod"):
+            owner.serve()
+        self.assertEqual(["bind", "listen", "reconcile"], [event[0] for event in events])
+
     def test_manifest_hash_mismatch_is_rejected_before_claim(self):
         self.manifest()
         owner = supervisor.Supervisor(self.layout)

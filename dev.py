@@ -6724,18 +6724,11 @@ def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_sour
                 )
             if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
                 return
-            stopped = subprocess.run(
-                [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "shutdown-supervisor"],
-                capture_output=True,
-                text=True,
+            raise SystemExit(
+                "running bare supervisor differs from the selected deployment source; production was left running. "
+                "Stop the supervisor from an external shell with "
+                "`python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
             )
-            if stopped.returncode != 0:
-                raise SystemExit(f"failed to refresh bare supervisor: {(stopped.stderr or stopped.stdout).strip()}")
-            deadline = time.monotonic() + 10
-            while layout["socket"].exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if layout["socket"].exists():
-                raise SystemExit("old bare supervisor did not stop during refresh")
         layout["socket"].unlink(missing_ok=True)
     layout["supervisor"].parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected_source, layout["supervisor"])
@@ -6808,6 +6801,7 @@ def prod_daemon_deploy(release: str | None = None):
     env_snapshot: dict[str, str] = {}
     _load_env_file(env_snapshot)
     env_snapshot.setdefault("HOME", str(Path.home()))
+    env_snapshot.setdefault("PATH", os.environ.get("PATH", os.defpath))
     env_snapshot.setdefault("PHOENIX_PORT", str(PROD_PORT))
     env_snapshot.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
     env_snapshot.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))

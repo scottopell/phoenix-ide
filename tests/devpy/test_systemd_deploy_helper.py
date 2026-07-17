@@ -246,6 +246,8 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
 class FakeSystemctl:
     def __init__(self, manifest, previous_state, *, start_failure=None):
         self.manifest = manifest
+        self.service = f"{manifest.unit_name}.service"
+        self.socket = f"{manifest.unit_name}.socket"
         self.previous_state = previous_state
         self.disruption_started = False
         self.start_failure = start_failure
@@ -261,6 +263,10 @@ class FakeSystemctl:
     def stop(self):
         self.events.append("stop")
         self.disruption_started = True
+
+    def command(self, *args, check=True):
+        self.events.append(("command", args, check))
+        return subprocess.CompletedProcess(args, 0, "", "")
 
     def daemon_reload(self):
         self.events.append("reload")
@@ -280,7 +286,7 @@ class SystemdActivationTests(SystemdManifestValidationTests):
     def install_previous(self):
         for target, content in (
             (self.targets.binary, "old binary"),
-            (self.targets.service, "old service"),
+            (self.targets.service, f"[Service]\nUser={pwd.getpwuid(os.getuid()).pw_name}\n"),
             (self.targets.socket, "old socket"),
             (self.targets.environment, "OLD=value"),
         ):
@@ -358,7 +364,10 @@ class SystemdActivationTests(SystemdManifestValidationTests):
             state = helper.activate(manifest, controller)
         self.assertEqual("activation_failed_rolled_back", state)
         self.assertEqual("old binary", Path(self.targets.binary).read_text())
-        self.assertEqual("old service", Path(self.targets.service).read_text())
+        self.assertEqual(
+            f"[Service]\nUser={pwd.getpwuid(os.getuid()).pw_name}\n",
+            Path(self.targets.service).read_text(),
+        )
         self.assertEqual("old socket", Path(self.targets.socket).read_text())
         self.assertEqual("OLD=value", Path(self.targets.environment).read_text())
         self.assertEqual("a" * 40, Path(self.targets.deployed_sha).read_text().strip())
@@ -366,6 +375,49 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual("activation_failed_rolled_back", status["state"])
         self.assertEqual("wrong identity", status["failure"])
         self.assertIn(("restore_state", previous_state), controller.events)
+
+    def test_rollback_restores_previous_data_directory_owner(self):
+        self.install_previous()
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(True, False, True, True, 41))
+        calls = iter([helper.ActivationError("wrong identity"), None])
+
+        def verify(*_args):
+            outcome = next(calls)
+            if outcome:
+                raise outcome
+
+        with mock.patch.object(helper, "wait_for_identity", side_effect=verify), \
+             mock.patch.object(helper, "prepare_data_directory") as ownership:
+            helper.activate(manifest, controller)
+        ownership.assert_called_once_with(
+            pwd.getpwuid(os.getuid()).pw_name,
+            manifest.targets.deployed_sha,
+        )
+
+    def test_stopped_previous_service_skips_rollback_health_probe(self):
+        self.install_previous()
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
+        with mock.patch.object(
+            helper,
+            "wait_for_identity",
+            side_effect=[helper.ActivationError("candidate failed")],
+        ) as verify, mock.patch.object(helper, "prepare_data_directory"):
+            state = helper.activate(manifest, controller)
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertEqual(1, verify.call_count)
+
+    def test_first_install_rollback_disables_candidate_units(self):
+        manifest = self.manifest()
+        controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
+        with mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")):
+            state = helper.activate(manifest, controller)
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertIn(
+            ("command", ("disable", controller.socket, controller.service), False),
+            controller.events,
+        )
 
     def test_rollback_failure_preserves_claim_and_both_failures(self):
         self.install_previous()
@@ -387,6 +439,20 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
         self.assertTrue(helper.status_is_durable_terminal(manifest))
         self.assertFalse(helper.release_claim(manifest))
+
+    def test_manifest_validation_failure_finalizes_status_and_releases_claim(self):
+        manifest = self.manifest()
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
+        helper.write_policy_status(manifest, self.policy, "prepared")
+        with mock.patch.object(sys, "argv", ["helper", "activate", "--manifest", str(self.manifest_path)]), \
+             mock.patch.object(os, "geteuid", return_value=0), \
+             mock.patch.object(helper.ValidationPolicy, "production", return_value=self.policy), \
+             mock.patch.object(helper, "validate_manifest", side_effect=helper.ValidationError("invalid rollback URL")):
+            self.assertEqual(1, helper.main())
+        status = json.loads(self.policy.status_path.read_text())
+        self.assertEqual("precondition_failed", status["state"])
+        self.assertEqual("invalid rollback URL", status["failure"])
+        self.assertFalse(self.policy.active_path.exists())
 
     def test_preparation_failure_does_not_stop_service(self):
         manifest = self.manifest()

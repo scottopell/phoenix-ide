@@ -68,7 +68,7 @@ class BareDeployCommandTests(unittest.TestCase):
             self.dev._bare_api_health_url({"PHOENIX_BIND_ADDR": "2001:db8::10", "PHOENIX_TLS": "auto"}),
         )
 
-    def test_same_protocol_supervisor_refreshes_when_selected_source_changes(self):
+    def test_changed_same_protocol_supervisor_refuses_without_stopping_production(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             socket = root / "run/supervisor.sock"
@@ -81,24 +81,17 @@ class BareDeployCommandTests(unittest.TestCase):
             selected.write_text("new supervisor")
             layout = {"root": root, "socket": socket, "supervisor": installed}
 
-            def run(command, **_kwargs):
-                if "status" in command:
-                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1}), "")
-                if "shutdown-supervisor" in command:
-                    socket.unlink()
-                    return subprocess.CompletedProcess(command, 0, "{}", "")
-                raise AssertionError(command)
+            with mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1}), ""),
+            ) as run, mock.patch.object(self.dev.subprocess, "Popen") as started:
+                with self.assertRaisesRegex(SystemExit, "production was left running"):
+                    self.dev._start_bare_supervisor(layout, "1", selected)
 
-            def popen(*_args, **_kwargs):
-                socket.touch()
-                return mock.Mock()
-
-            with mock.patch.object(self.dev.subprocess, "run", side_effect=run), \
-                 mock.patch.object(self.dev.subprocess, "Popen", side_effect=popen) as started:
-                self.dev._start_bare_supervisor(layout, "1", selected)
-
-            self.assertEqual("new supervisor", installed.read_text())
-            started.assert_called_once()
+            self.assertEqual("old supervisor", installed.read_text())
+            self.assertEqual(1, run.call_count)
+            started.assert_not_called()
             self.assertTrue(socket.exists())
 
     def test_reboot_persistence_installs_idempotent_owner_crontab_entry(self):
@@ -225,6 +218,7 @@ class BareDeployCommandTests(unittest.TestCase):
             self.assertEqual(candidate.identity.as_dict(), manifest["expected"])
             installed_env = (layout["transactions"] / ("d" * 32) / "candidate.env").read_text()
             self.assertIn(f"HOME={Path.home()}", installed_env)
+            self.assertIn(f"PATH={self.dev.os.environ.get('PATH', self.dev.os.defpath)}", installed_env)
 
 
 if __name__ == "__main__":

@@ -474,10 +474,16 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
 
-def write_prepared_status(manifest: Manifest, policy: ValidationPolicy) -> None:
+def write_policy_status(
+    manifest: Manifest,
+    policy: ValidationPolicy,
+    state: str,
+    *,
+    failure: Optional[str] = None,
+) -> None:
     status = {
         "transaction_id": manifest.transaction_id,
-        "state": "prepared",
+        "state": state,
         "source_kind": manifest.source_kind,
         "source_commit": manifest.source_commit,
         "release_tag": manifest.release_tag,
@@ -486,12 +492,25 @@ def write_prepared_status(manifest: Manifest, policy: ValidationPolicy) -> None:
         "expected_git_sha": manifest.expected.git_sha,
         "created_at": manifest.created_at,
         "updated_at": utc_now(),
-        "failure": None,
+        "failure": failure,
         "rollback_failure": None,
     }
     with policy.claim_lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         atomic_write(policy.status_path, (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
+def release_policy_claim(transaction_id: str, policy: ValidationPolicy) -> bool:
+    with policy.claim_lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if policy.active_path.read_text().strip() != transaction_id:
+                return False
+            policy.active_path.unlink()
+            fsync_dir(policy.active_path.parent)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 def status_is_durable_terminal(manifest: Manifest) -> bool:
@@ -655,6 +674,18 @@ def service_group_id(service_user: str) -> int:
     return pwd.getpwnam(service_user).pw_gid
 
 
+def service_user_from_unit(path: Path) -> str:
+    users = [
+        line.partition("=")[2].strip()
+        for line in path.read_text().splitlines()
+        if line.strip().startswith("User=")
+    ]
+    if len(users) != 1 or not users[0]:
+        raise ActivationError("rollback service unit must declare exactly one User")
+    validate_service_user(users[0])
+    return users[0]
+
+
 def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstalls:
     candidate_service = Path(manifest.candidate.service.path)
     candidate_socket = Path(manifest.candidate.socket.path)
@@ -725,6 +756,7 @@ def restore_deployed_sha(manifest: Manifest) -> None:
 def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState, prepared: PreparedInstalls) -> None:
     systemctl.stop()
     if manifest.previous is None:
+        systemctl.command("disable", systemctl.socket, systemctl.service, check=False)
         for target in dataclasses.astuple(manifest.targets)[:4]:
             remove_target(Path(target))
         systemctl.daemon_reload()
@@ -738,11 +770,14 @@ def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState,
         remove_target(Path(manifest.targets.environment))
     else:
         commit_atomic_install(prepared.rollback_environment, Path(manifest.targets.environment))
+    previous_user = service_user_from_unit(Path(manifest.rollback.service.path))
+    prepare_data_directory(previous_user, manifest.targets.deployed_sha)
     systemctl.daemon_reload()
     systemctl.restore_state(previous_state)
-    if manifest.previous_health_url is None:
-        raise ActivationError("previous health endpoint is unavailable")
-    wait_for_identity(manifest, manifest.previous, manifest.previous_health_url)
+    if previous_state.service_active:
+        if manifest.previous_health_url is None:
+            raise ActivationError("previous health endpoint is unavailable")
+        wait_for_identity(manifest, manifest.previous, manifest.previous_health_url)
     restore_deployed_sha(manifest)
 
 
@@ -882,9 +917,9 @@ def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path:
     atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
 
 
-def prepare_data_directory(service_user: str, policy: ValidationPolicy) -> None:
+def prepare_data_directory(service_user: str, deployed_sha_target: str) -> None:
     account = pwd.getpwnam(service_user)
-    data_dir = Path(policy.targets.deployed_sha).parent
+    data_dir = Path(deployed_sha_target).parent
     data_dir.mkdir(parents=True, mode=0o750, exist_ok=True)
     os.chown(data_dir, account.pw_uid, account.pw_gid)
     os.chmod(data_dir, 0o750)
@@ -927,10 +962,10 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
             copy_handoff_file(Path(item["source"]), transaction / name, item["sha256"], source_uid, allowed[name])
         manifest_path = transaction / "manifest.json"
         manifest = Manifest.load(manifest_path)
-        prepare_data_directory(manifest.service_user, policy)
+        prepare_data_directory(manifest.service_user, policy.targets.deployed_sha)
         capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
-        write_prepared_status(manifest, policy)
+        write_policy_status(manifest, policy, "prepared")
         return transaction / "manifest.json"
     except BaseException:
         shutil.rmtree(transaction, ignore_errors=True)
@@ -980,9 +1015,10 @@ def main() -> int:
     if args.action != "activate" or args.manifest is None:
         parser.error("activation requires activate --manifest PATH")
     manifest = None
+    policy = ValidationPolicy.production()
     try:
         manifest = Manifest.load(args.manifest)
-        validate_manifest(args.manifest, manifest, ValidationPolicy.production())
+        validate_manifest(args.manifest, manifest, policy)
         state = activate(manifest)
         if state in CLAIM_RELEASABLE_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
@@ -992,8 +1028,17 @@ def main() -> int:
         print(f"systemd activation helper failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        if manifest is not None and status_is_durable_terminal(manifest):
-            release_claim(manifest)
+        if manifest is not None:
+            try:
+                staged_transaction_id = args.manifest.parent.name
+                expected_manifest_path = policy.transaction_root / staged_transaction_id / "manifest.json"
+                if args.manifest != expected_manifest_path or manifest.transaction_id != staged_transaction_id:
+                    raise ValidationError("staged transaction identity does not match manifest path")
+                write_policy_status(manifest, policy, "precondition_failed", failure=str(exc))
+                release_policy_claim(manifest.transaction_id, policy)
+            except Exception:
+                if status_is_durable_terminal(manifest):
+                    release_claim(manifest)
         print(f"systemd activation helper failed: {exc}", file=sys.stderr)
         return 1
 

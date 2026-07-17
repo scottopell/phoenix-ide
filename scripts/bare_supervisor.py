@@ -707,13 +707,13 @@ class Supervisor:
 
     def serve(self) -> None:
         self.prepare_layout()
-        self.reconcile()
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(self.layout.socket))
             os.chmod(self.layout.socket, 0o600)
             server.listen(8)
             server.settimeout(0.25)
+            self.reconcile()
             while self.running:
                 if self.child is not None and self.child.poll() is not None:
                     self.child = None
