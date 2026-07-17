@@ -325,7 +325,20 @@ rule ReplayCreationAcceptanceFromStableBinding {
     )
     requires: acceptance_binding != null
     requires: acceptance_binding.intent_fingerprint = creation_request_fingerprint(raw_intent)
+    requires: acceptance_binding.receipt != null
     ensures: CreationProfileAcceptanceReplay(acceptance_binding.receipt)
+    ensures: not CreationWorkflowBinding.created(workflow: acceptance_binding.workflow)
+}
+
+rule ReplayRejectedCreationAcceptance {
+    when: ConversationCreationRequested(requester, raw_intent)
+    let acceptance_binding = existing_external_creation_acceptance_binding(
+        creation_acceptance_scope(raw_intent), creation_acceptance_key(raw_intent)
+    )
+    requires: acceptance_binding != null
+    requires: acceptance_binding.intent_fingerprint = creation_request_fingerprint(raw_intent)
+    requires: acceptance_binding.receipt = null
+    ensures: CreationProfileAcceptanceRejected(invalid_creation_intent)
     ensures: not CreationWorkflowBinding.created(workflow: acceptance_binding.workflow)
 }
 
@@ -722,6 +735,8 @@ rule StaleCreationReadinessEvaluationCannotOverwriteLifecycleOutcome {
 
 rule CancellationBumpsGenerationAndDeclaresCompensationDag {
     when: CreationCancellationRequested(manager, binding)
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     requires: binding.outcome in {provisioning, manual_resolution}
     let plan = cancellation_plan(binding)
     ensures: CreationCancellationGenerationTransitionRequested(binding, plan)
@@ -737,6 +752,8 @@ rule CancellationBumpsGenerationAndDeclaresCompensationDag {
 
 rule DeletionBumpsGenerationHidesShellAndDeclaresCompensationDag {
     when: CreationDeletionRequested(manager, binding)
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     requires: binding.outcome in {provisioning, manual_resolution, cancelled, failed}
     let plan = deletion_plan(binding)
     ensures: CreationHiddenFromNormalSurfaces(binding.conversation_id)

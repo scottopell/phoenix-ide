@@ -871,6 +871,7 @@ rule RejectStaleClaimRenewal {
     when: ClaimRenewalRequested(worker, effect, authority, new_lease_until)
     requires: not live_matching_authority(effect, authority)
         or authority.worker_id != worker
+        or new_lease_until <= authority.lease_until
     ensures: ClaimRenewalOutcome(stale_authority)
 }
 
@@ -989,6 +990,8 @@ rule RejectUnsupportedTerminalReceiptCodec {
 
 rule RejectUnavailableOrClosedTerminalReceipt {
     when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: attempt.effect != effect
         or attempt.claim != Claim{effect: effect}
         or not claim_row_matches_authority(effect, authority)
@@ -1222,6 +1225,7 @@ rule RejectUnpermittedManualResolutionChoice {
 
 rule RejectStaleManualResolution {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
     requires: expected_workflow_version != resolution.workflow.version
         or resolution.effect.generation != resolution.workflow.generation
     ensures: ManualResolutionOutcome(version_conflict)

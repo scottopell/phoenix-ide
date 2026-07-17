@@ -343,6 +343,11 @@ rule AgentRegistersWakeContract {
         registering_tool_use_id:  tool_use_id,
         status:                   pending
     )
+    ensures: AgentReceivesRegistrationReceipt(
+        contract_id: c_id,
+        tool_use_id: tool_use_id,
+        expires_at: now() + max_wait_seconds
+    )
     ensures: SseEmitted(WakeContractRegistered, c_id)
 
     @guidance
@@ -357,11 +362,10 @@ rule AgentRegistersWakeContract {
         -- waiting"; is_busy() derives from the contract table
         -- (REQ-WAKE-004), not from conv state.
         --
-        -- The tool invocation MUST NOT return a synchronous payload
-        -- to the LLM. The LLM's next invocation is when the contract
-        -- fires (or expires / is cancelled / is forgotten). Returning
-        -- a payload here would create a parallel "I waited then
-        -- resumed" path that defeats the zero-turn-cost guarantee.
+        -- The tool invocation returns a provider-valid registration receipt.
+        -- The receipt confirms durable registration but does not request an LLM
+        -- invocation. The next invocation is terminal delivery after a contract
+        -- fires, expires, is cancelled, or is forgotten.
 }
 
 -- REQ-WAKE-001: registration rejected because the agent does not own
@@ -411,11 +415,13 @@ rule WakeRouterFiresOnConditionHold {
     let payload = evaluator_payload(contract.condition)
 
     ensures: ContractTransitionsToTerminal(contract, fired, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   contract.conversation,
-        tool_use_id:    contract.registering_tool_use_id,
-        payload:        payload
+    ensures: WakeTerminalObservationQueued(
+        conversation: contract.conversation,
+        contract: contract,
+        tool_use_id: contract.registering_tool_use_id,
+        payload: payload
     )
+    ensures: PendingWakeObservationsDeliveredAsBoundedCommittedOrderBatch(contract.conversation)
     ensures: WakeTerminalDeliveryPersistedThroughReducerAcceptance(contract.conversation)
     ensures: SseEmitted(WakeContractFired, contract.id)
 
@@ -433,11 +439,10 @@ rule WakeRouterFiresOnConditionHold {
         -- implicit completion, runtime failure, or context exhaustion. A missing
         -- child handle is not a condition-held fire; it follows
         -- WakeRouterForgetsMissingSubAgentHandle and resolves with cause = forgotten.
-        -- The synthetic tool result is appended to the conv message
-        -- log via the same path as a normal tool result completion.
-        -- The conv's next-LLM-turn trigger is the same path as
-        -- "user just sent a message" or "previous tool just
-        -- returned." No new dispatcher state needed.
+        -- Each terminal observation is durable independently. Observations that
+        -- commit before the next runtime acceptance are delivered as one bounded,
+        -- committed-order batch of normal tool results. Siblings remain pending
+        -- unless they independently terminalize or are explicitly cancelled.
 }
 
 -- REQ-WAKE-011 + REQ-WAKE-017: a missing sub-agent child is forgotten, not a

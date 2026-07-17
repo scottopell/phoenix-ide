@@ -222,7 +222,7 @@ entity WakeObservationInboxItem {
 entity WakeRuntimeObligation {
     id: String
     conversation: bedrock/Conversation
-    payload: WakeAcceptancePayload
+    payload_inbox: dwf/ReducerInbox
     owed_acceptance: dwf/OwedAcceptance
     created_at: Timestamp
 }
@@ -573,7 +573,7 @@ rule IdleScheduleCreatesBoundedCoalescedObligation {
     )
     ensures: WakeRuntimeObligation.created(
         id: obligation_id, conversation: conversation,
-        payload: exact_acceptance_payload(conversation_wake_workflow(conversation), batch, upper_bound),
+        payload_inbox: dwf/ReducerInbox{id: inbox_id},
         owed_acceptance: dwf/OwedAcceptance{id: obligation_id}, created_at: now()
     )
     ensures: wake_obligation_and_core_owed_acceptance_commit_atomically(conversation_wake_workflow(conversation), obligation_id)
@@ -606,12 +606,16 @@ rule RuntimeAcceptanceScheduleIsAtomic {
     requires: obligation.owed_acceptance.status = owed
     requires: conversation_runtime_idle(obligation.conversation)
     requires: obligation.owed_acceptance.reducer_inbox = obligation_payload_inbox(obligation)
-    ensures: accepting_llm_requesting_persisted_atomically(obligation)
-    ensures: obligation.owed_acceptance.status = accepted
-    ensures: obligation.owed_acceptance.reducer_inbox.delivery_status = consumed
-    ensures: WakeObservationInboxItemsConsumedExactly(obligation.payload.items)
+    ensures: dwf/RuntimeAcceptanceRequested(
+        obligation.owed_acceptance,
+        obligation.owed_acceptance.reducer_inbox.workflow.version,
+        runtime_acceptance_plan(obligation)
+    )
+    ensures: WakeObservationInboxItemsConsumedExactly(
+        decode_acceptance_items(obligation.payload_inbox.event_payload)
+    )
     ensures: later_items_excluded_from(obligation)
-    ensures: LlmInvocationPermittedAfterCommit(obligation.conversation)
+    ensures: LlmInvocationPermittedAfterCoreAcceptance(obligation.conversation)
 }
 
 rule DuplicateRuntimeAcceptanceStartsNothing {
