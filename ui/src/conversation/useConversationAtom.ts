@@ -258,6 +258,21 @@ export function useConversationSnapshot(slug: string | null): Conversation | nul
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
+export function useConversationPhase(slug: string | null): ConversationAtom['phase'] | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => (slug ? store.getSnapshot(slug).phase : null),
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 /**
  * Subscribes to just the work-scope inventory (`workScope`) for `slug`
  * (REQ-WSUI-010). Consumed by the `WorkScopeSection` in the left panel so a

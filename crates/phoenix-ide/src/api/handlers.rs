@@ -3503,6 +3503,11 @@ async fn send_chat(
             steering: false,
             already_persisted: false,
         },
+        crate::send_chat_service::SendChatOutcome::AlreadyPersisted => ChatResponse {
+            queued: true,
+            steering: false,
+            already_persisted: true,
+        },
         crate::send_chat_service::SendChatOutcome::QueuedAsSteering => ChatResponse {
             queued: true,
             steering: true,

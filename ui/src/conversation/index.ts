@@ -9,6 +9,7 @@ export {
   useLastSseEventAt,
   useLastSseEventAtRef,
   useConversationSnapshot,
+  useConversationPhase,
   useConversationsList,
   useConversationSelectors,
   useWorkScope,

@@ -28,6 +28,7 @@ pub(crate) struct SendChatRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendChatOutcome {
     Delivered,
+    AlreadyPersisted,
     QueuedAsSteering,
     Rejected { message: String, code: &'static str },
 }
@@ -77,7 +78,7 @@ impl SendChatApplicationService {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             receipts.remove(&req.message_id);
-            return Ok(SendChatOutcome::Delivered);
+            return Ok(SendChatOutcome::AlreadyPersisted);
         }
         if let Some(receipt) = receipts.get(&req.message_id) {
             return replay_receipt(receipt, &req, &request_fingerprint);
@@ -101,21 +102,12 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
-        let validated_files = validate_submitted_attachments(&req.conversation_id, &req.files)
-            .await
-            .map_err(|e| SendChatServiceError::AttachmentValidation(format!("{e:?}")))?;
-        let expanded = expand_message(
-            &self.db,
-            &conversation.id,
-            &conversation.cwd,
-            &req.text,
-            req.expansion_policy,
-        )
-        .await?;
         if let Some(entry) = steering_queue
             .iter()
             .find(|entry| entry.message_id == req.message_id)
         {
+            let validated_files = validate_files(&req).await?;
+            let expanded = expand_request(&self.db, &conversation, &req).await?;
             if !queued_entry_matches(entry, &req, &expanded, &validated_files) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
@@ -140,6 +132,8 @@ impl SendChatApplicationService {
                         code: "steering_queue_full",
                     });
                 }
+                let validated_files = validate_files(&req).await?;
+                let expanded = expand_request(&self.db, &conversation, &req).await?;
                 let event = Event::SteerMessage {
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text,
@@ -177,6 +171,8 @@ impl SendChatApplicationService {
             });
         }
 
+        let validated_files = validate_files(&req).await?;
+        let expanded = expand_request(&self.db, &conversation, &req).await?;
         let event = Event::UserMessage {
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text,
@@ -245,6 +241,29 @@ struct ExpandedDispatchMessage {
     display_text: String,
     llm_text: Option<String>,
     skill_invocation: Option<SkillInvocation>,
+}
+
+async fn validate_files(
+    req: &SendChatRequest,
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, SendChatServiceError> {
+    validate_submitted_attachments(&req.conversation_id, &req.files)
+        .await
+        .map_err(|error| SendChatServiceError::AttachmentValidation(format!("{error:?}")))
+}
+
+async fn expand_request(
+    db: &crate::db::Database,
+    conversation: &crate::db::Conversation,
+    req: &SendChatRequest,
+) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
+    expand_message(
+        db,
+        &conversation.id,
+        &conversation.cwd,
+        &req.text,
+        req.expansion_policy,
+    )
+    .await
 }
 
 async fn expand_message(

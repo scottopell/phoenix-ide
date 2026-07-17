@@ -213,13 +213,14 @@ impl Tool for SendConversationMessage {
             expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
         };
         let output = match self.send_chat.send(request).await {
-            Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {
-                SendConversationMessageOutput::Delivered {
-                    target: parsed.target,
-                    conversation_id: conversation_id.clone(),
-                    message_id: parsed.message_id.clone(),
-                }
-            }
+            Ok(
+                crate::send_chat_service::SendChatOutcome::Delivered
+                | crate::send_chat_service::SendChatOutcome::AlreadyPersisted,
+            ) => SendConversationMessageOutput::Delivered {
+                target: parsed.target,
+                conversation_id: conversation_id.clone(),
+                message_id: parsed.message_id.clone(),
+            },
             Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => {
                 SendConversationMessageOutput::QueuedAsSteering {
                     target: parsed.target,

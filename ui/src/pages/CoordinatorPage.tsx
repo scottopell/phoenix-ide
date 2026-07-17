@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api, type ConversationState, type GlobalOpenWorkResponse } from '../api';
 import { useMediaQuery } from '../hooks';
-import { useConversationSnapshot } from '../conversation';
+import { useConversationPhase } from '../conversation';
 import './CoordinatorPage.css';
 
 const ConversationPage = lazy(() =>
@@ -54,8 +54,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
     appliedQuery: '',
     refreshedAt: fixtureData?.openWork.generated_at ?? null,
   });
-  const coordinatorConversation = useConversationSnapshot(slug ?? null);
-  const previousCoordinatorState = useRef<ConversationState['type'] | null>(coordinatorConversation?.state?.type ?? null);
+  const coordinatorPhase = useConversationPhase(slug ?? null);
+  const previousCoordinatorState = useRef<ConversationState['type'] | null>(coordinatorPhase?.type ?? null);
   const appliedQueryRef = useRef('');
   const datasetGenerationRef = useRef(0);
   const latestRequestRef = useRef(0);
@@ -171,12 +171,12 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   useEffect(() => {
     if (fixtureData) return;
     const previous = previousCoordinatorState.current;
-    const current = coordinatorConversation?.state?.type ?? null;
+    const current = coordinatorPhase?.type ?? null;
     previousCoordinatorState.current = current;
     if (previous && current && WORKING_STATE_TYPES.has(previous) && !WORKING_STATE_TYPES.has(current)) {
       void refreshOpenWork();
     }
-  }, [coordinatorConversation?.state?.type, fixtureData, refreshOpenWork]);
+  }, [coordinatorPhase?.type, fixtureData, refreshOpenWork]);
 
   const itemCount = useMemo(
     () => openWork.data?.groups.reduce((sum, group) => sum + group.items.length, 0) ?? 0,

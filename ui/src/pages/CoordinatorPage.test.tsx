@@ -4,13 +4,14 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { CoordinatorPage } from './CoordinatorPage';
 import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
-const { apiMock, conversationSnapshotMock } = vi.hoisted(() => ({
+const { apiMock, conversationSnapshotMock, conversationPhaseMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
     getGlobalOpenWork: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
   },
   conversationSnapshotMock: vi.fn(),
+  conversationPhaseMock: vi.fn(),
 }));
 
 vi.mock('../api', async () => {
@@ -31,6 +32,7 @@ vi.mock('../hooks', async () => {
 
 vi.mock('../conversation', () => ({
   useConversationSnapshot: (slug: string | null) => conversationSnapshotMock(slug),
+  useConversationPhase: (slug: string | null) => conversationPhaseMock(slug),
 }));
 
 vi.mock('./ConversationPage', () => ({
@@ -117,6 +119,7 @@ describe('CoordinatorPage', () => {
     apiMock.getGlobalOpenWork.mockResolvedValue(openWork());
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
     conversationSnapshotMock.mockReturnValue({ state: { type: 'idle' } });
+    conversationPhaseMock.mockReturnValue({ type: 'idle' });
     Object.defineProperty(document, 'visibilityState', {
       configurable: true,
       value: 'visible',
@@ -140,8 +143,12 @@ describe('CoordinatorPage', () => {
 
   it('treats approval and recovery signals as attention and links to the owning conversation', async () => {
     const data = openWork();
-    data.groups[0].items[0] = {
-      ...data.groups[0].items[0],
+    const group = data.groups[0];
+    if (!group) throw new Error('fixture group missing');
+    const item = group.items[0];
+    if (!item) throw new Error('fixture item missing');
+    group.items[0] = {
+      ...item,
       source: 'chain',
       href: '/chains/root-1',
       current_conversation_slug: 'latest-owner',
@@ -231,8 +238,8 @@ describe('CoordinatorPage', () => {
   });
 
   it('refreshes open work when the coordinator turn completes', async () => {
-    let snapshotState: { state: { type: 'llm_requesting'; attempt: number } | { type: 'idle' } } = { state: { type: 'llm_requesting', attempt: 1 } };
-    conversationSnapshotMock.mockImplementation(() => snapshotState);
+    let phase: { type: 'llm_requesting'; attempt: number } | { type: 'idle' } = { type: 'llm_requesting', attempt: 1 };
+    conversationPhaseMock.mockImplementation(() => phase);
 
     const { rerender } = render(
       <MemoryRouter initialEntries={['/global/conv-coordinator']}>
@@ -242,7 +249,7 @@ describe('CoordinatorPage', () => {
     await screen.findByText('Shared conversation runtime /global');
     expect(apiMock.getGlobalOpenWork).toHaveBeenCalledTimes(1);
 
-    snapshotState = { state: { type: 'idle' } };
+    phase = { type: 'idle' };
     rerender(
       <MemoryRouter initialEntries={['/global/conv-coordinator']}>
         <Routes><Route path="/global/:slug" element={<CoordinatorPage />} /></Routes>
