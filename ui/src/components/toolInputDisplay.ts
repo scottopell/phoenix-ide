@@ -104,6 +104,12 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
   }
 }
 
+export function skillCommandFromInput(input: Record<string, unknown>): string {
+  const skillName = String(input['skill_name'] || 'skill').replace(/^\/+/, '');
+  const args = String(input['args'] || '').trim();
+  return args ? `/${skillName} ${args}` : `/${skillName}`;
+}
+
 export interface ToolInputDisplay {
   display: string;
   isMultiline: boolean;
@@ -112,6 +118,10 @@ export interface ToolInputDisplay {
 export function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): ToolInputDisplay {
   if (name === 'commission_review') return formatCommissionReviewInput(input);
   switch (name) {
+    case 'skill': {
+      const display = skillCommandFromInput(input);
+      return { display, isMultiline: false };
+    }
     case 'bash': {
       if (isBashToolInput(input)) return formatModernBashInput(input, displayOverride);
       const legacyCommand = input['op'] === undefined ? String(input['command'] || input['cmd'] || '') : '';

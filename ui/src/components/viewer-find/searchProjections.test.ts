@@ -548,6 +548,20 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
+  it('indexes the slash-style visible skill command instead of generic JSON', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn', key: 'skill-input', isFirstInTurn: true,
+      agent: agentMsg('skill-input', [{ type: 'tool_use', id: 'skill-tool', name: 'skill', input: { skill_name: 'agent-browser', args: 'http://localhost:8042' } }]),
+      toolResultsByUseId: new Map(),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'agent-browser', { density: 'full' });
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.sources.find((source) => source.fragmentId === 'tool-use-input')?.text)
+      .toBe('/agent-browser http://localhost:8042');
+    expect(buildConversationSearchProjection(units, 'skill_name', { density: 'full' }).matches).toHaveLength(0);
+  });
+
   it('indexes visible inputs for completed tools with the same owned target', () => {
     const units: RenderUnit[] = [{
       kind: 'agent_turn',

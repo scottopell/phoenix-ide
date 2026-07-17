@@ -37,7 +37,7 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
-import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, truncateToolInputValue as truncateValue } from './toolInputDisplay';
+import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
@@ -250,12 +250,6 @@ function extractSkillResultDetails(resultText: string): { source?: string | unde
   };
 }
 
-function skillCommandFromInput(input: Record<string, unknown>): string {
-  const skillName = String(input['skill_name'] || 'skill').replace(/^\/+/, '');
-  const args = String(input['args'] || '').trim();
-  return args ? `/${skillName} ${args}` : `/${skillName}`;
-}
-
 function SkillToolBlock({
   input,
   resultText,
@@ -267,6 +261,7 @@ function SkillToolBlock({
   onOpenFile,
   toolId,
   activeHighlight,
+  inputActiveHighlight,
 }: {
   input: Record<string, unknown>;
   resultText: string;
@@ -278,12 +273,14 @@ function SkillToolBlock({
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   toolId: string;
   activeHighlight?: AgentTextHighlight | null;
+  inputActiveHighlight?: AgentTextHighlight | null;
 }) {
-
   const details = extractSkillResultDetails(resultText);
   const sourcePath = details.source ? `${details.source}/SKILL.md` : undefined;
   const status = result == null ? 'loading' : isError ? 'failed' : 'loaded';
   const statusClass = result == null ? 'pending' : isError ? 'error' : 'success';
+
+  const inputText = skillCommandFromInput(input);
 
   if (activeHighlight) {
     return (
@@ -298,11 +295,11 @@ function SkillToolBlock({
   return (
     <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
       <div className="skill-tool-status-row">
-        <SkillCommandText
-          text={skillCommandFromInput(input)}
-          source={sourcePath}
-          snippet={details.snippet}
-        />
+        <span data-fragment-id="tool-use-input">
+          {inputActiveHighlight
+            ? renderHighlightedText(inputText, inputActiveHighlight.start, inputActiveHighlight.end)
+            : <SkillCommandText text={inputText} source={sourcePath} snippet={details.snippet} />}
+        </span>
         <span className={`skill-tool-status ${statusClass}`}>
           {status}
           {durationMs !== undefined && <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>}
@@ -2350,6 +2347,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
         onOpenFile={onOpenFile}
         toolId={toolId}
         activeHighlight={toolActiveHighlight}
+        inputActiveHighlight={inputActiveHighlight}
       />
     );
   }

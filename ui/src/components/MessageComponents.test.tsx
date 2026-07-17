@@ -1275,6 +1275,25 @@ describe('skill command rendering', () => {
     expect(screen.getByText('Browser Automation with agent-browser')).toHaveClass('skill-tool-snippet');
   });
 
+  it('marks active skill input text through the skill renderer', () => {
+    const inputText = '/agent-browser http://localhost:8042';
+    const start = inputText.indexOf('agent-browser');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-skill-input-find', [{
+            type: 'tool_use', id: 'tool-skill-input-find', name: 'skill', input: { skill_name: 'agent-browser', args: 'http://localhost:8042' },
+          }])}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+          activeHighlight={{ owner: 'tool-input', toolUseId: 'tool-skill-input-find', fragmentId: 'tool-use-input', start, end: start + 'agent-browser'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent).toBe('agent-browser');
+  });
+
   it('marks active skill result text through the skill renderer', () => {
     const resultText = 'Base directory for this skill: /tmp/skill\n# Unique skill token';
     const fragmentId = 'terminal-result:opaque';
