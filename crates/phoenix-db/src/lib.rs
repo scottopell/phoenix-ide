@@ -10819,7 +10819,6 @@ mod tests {
         assert_eq!(first[0].first_observed_head_oid, "aaaa");
         assert_eq!(first[0].last_observed_head_oid, "aaaa");
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         db.upsert_work_scope_observed_branch(
             &scope,
             &WorkScopeObservedBranchUpsert {
@@ -13951,10 +13950,6 @@ mod tests {
 
         let before = db.get_conversation("rc").await.unwrap();
         assert_eq!(before.slug.as_deref(), Some("slug-rc-old"));
-
-        // Ensure a measurable gap so updated_at strictly advances even on
-        // fast machines (timestamps are RFC3339, sub-millisecond granular).
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         db.rename_conversation("rc", "slug-rc-new").await.unwrap();
 

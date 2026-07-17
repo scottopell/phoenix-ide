@@ -236,20 +236,12 @@ mod tests {
     fn extract_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         extract_to(tmp.path()).unwrap();
-        let mtime_first = std::fs::metadata(tmp.path().join("spears/SKILL.md"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        extract_to(tmp.path()).unwrap();
-        let mtime_second = std::fs::metadata(tmp.path().join("spears/SKILL.md"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        assert_eq!(
-            mtime_first, mtime_second,
-            "second extract should not rewrite unchanged file"
-        );
+        let target = tmp.path().join("spears/SKILL.md");
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&target, permissions).unwrap();
+
+        extract_to(tmp.path()).expect("unchanged read-only file should not be rewritten");
     }
 
     #[test]
