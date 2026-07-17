@@ -1250,6 +1250,21 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByText('feedback approved (thumbs-up reaction)')).toHaveClass('pr-review-state-label');
   });
 
+  it('renders legacy cached PR identity as status when no selector can open', () => {
+    const handle = prStatusHandle(
+      { found: true, number: 12, display_state: 'open', feedback_status: 'approved' },
+      { activeSelection: null, activePrSummary: null, ambiguous: false },
+    );
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-legacy-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    const identity = screen.getByTestId('desktop-work-actions-identity');
+    expect(identity.tagName).toBe('SPAN');
+    expect(identity).toHaveTextContent('#12open👍');
+    expect(identity).not.toHaveAttribute('tabindex');
+  });
+
   it('uses the active summary for compact chip state and review status', () => {
     const handle = prStatusHandle({
       found: true,

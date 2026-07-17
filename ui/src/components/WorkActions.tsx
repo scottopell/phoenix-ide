@@ -137,6 +137,11 @@ export function WorkControlBar({
     ? (prStatus.number ?? prStatus.pr?.number ?? null)
     : null;
   const activePrNumber = activePr?.pr_number ?? legacyActivePrNumber;
+  const canOpenActivePrSelector = activePr !== null
+    || (prStatusHandle.activeSelection?.associated_prs.some(
+      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+    ) ?? false)
+    || prStatusHandle.ambiguous;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
   const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
@@ -487,7 +492,7 @@ export function WorkControlBar({
   return (
     <div className="desktop-work-actions-compact" data-testid="desktop-work-controls">
       <div className="desktop-work-actions-rail" aria-label="Work actions">
-        {activePrNumber ? (
+        {activePrNumber && canOpenActivePrSelector ? (
           <button
             type="button"
             className="mobile-pr-chip desktop-work-actions-identity"
@@ -502,8 +507,11 @@ export function WorkControlBar({
         ) : (
           <span className="mobile-pr-chip desktop-work-actions-identity" data-testid="desktop-work-actions-identity">
             <span className={`mobile-pr-status-dot${prLoading ? ' mobile-pr-status-dot--loading' : ''}`} aria-hidden="true" />
-            <span className="mobile-pr-chip-number">Workspace</span>
-            <span className="mobile-pr-chip-state">{prLoading ? 'Checking PR…' : 'actions'}</span>
+            <span className="mobile-pr-chip-number">{activePrNumber ? `#${activePrNumber}` : 'Workspace'}</span>
+            <span className="mobile-pr-chip-state">
+              {activePrNumber ? prStatus?.display_state ?? 'actions' : prLoading ? 'Checking PR…' : 'actions'}
+            </span>
+            {activePrNumber && <PrReviewStateIndicator feedbackStatus={prStatus?.feedback_status ?? null} />}
           </span>
         )}
         <button
