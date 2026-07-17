@@ -65,6 +65,18 @@ class ProductionGuardTests(unittest.TestCase):
                 "/opt/phoenix-ide/test",
             )
 
+    def test_committed_reboot_journey_checks_identity_pid_and_status(self):
+        import inspect
+
+        source = inspect.getsource(harness.committed_reboot_journey)
+        self.assertIn('run(["limactl", "restart"', source)
+        self.assertIn("reboot unit diagnostics", source)
+        self.assertIn("/api/version", source)
+        self.assertIn("bbbbbbbbbbbb", source)
+        self.assertIn("new_pid == previous_pid", source)
+        self.assertIn('state != "committed"', source)
+
+
 
 if __name__ == "__main__":
     unittest.main()

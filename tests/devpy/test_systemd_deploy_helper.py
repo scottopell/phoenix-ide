@@ -343,6 +343,25 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual("wrong identity", status["failure"])
         self.assertIn(("restore_state", previous_state), controller.events)
 
+    def test_rollback_failure_preserves_claim_and_both_failures(self):
+        self.install_previous()
+        manifest = self.manifest()
+        self.policy.active_path.write_text(manifest.transaction_id + "\n")
+        previous_state = helper.UnitState(True, False, True, True, 41)
+        controller = FakeSystemctl(manifest, previous_state)
+        controller.restore_state = mock.Mock(side_effect=helper.ActivationError("rollback start failed"))
+        with mock.patch.object(
+            helper,
+            "wait_for_identity",
+            side_effect=helper.ActivationError("candidate crashed"),
+        ):
+            state = helper.activate(manifest, controller)
+        self.assertEqual("activation_failed_rollback_failed", state)
+        status = json.loads(self.policy.status_path.read_text())
+        self.assertEqual("candidate crashed", status["failure"])
+        self.assertEqual("rollback start failed", status["rollback_failure"])
+        self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
+
     def test_preparation_failure_does_not_stop_service(self):
         manifest = self.manifest()
         controller = FakeSystemctl(manifest, helper.UnitState(True, True, True, True, 41))

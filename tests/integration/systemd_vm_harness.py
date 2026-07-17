@@ -249,7 +249,50 @@ def transaction_journey(instance, guest_root, unit, port, mode, helper, fixture,
         f"sudo -n python3 {scenario} verify --helper {helper} --root {guest_root} "
         f"--unit {unit} --port {port} --mode {mode} --old-pid {old_pid}",
     )
+    result = __import__("json").loads(verified.stdout.strip())
     print(f"PASS: systemd {mode} journey {verified.stdout.strip()}")
+    return result
+
+
+def committed_reboot_journey(instance, guest_root, unit, port, previous_pid):
+    refuse_production_resources(instance, unit, guest_root, port)
+    run(["limactl", "restart", instance], timeout=660)
+    wait_until(
+        "systemd ready after VM reboot",
+        lambda: lima_shell(instance, "systemctl is-system-running", check=False).stdout.strip()
+        in {"running", "degraded"},
+        90,
+    )
+    try:
+        wait_until(
+            "committed service exact identity after VM reboot",
+            lambda: lima_shell(
+                instance,
+                f"python3 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen(\"http://127.0.0.1:{port}/api/version\", timeout=2))[\"git_sha\"])'",
+                check=False,
+            ).stdout.strip() == "bbbbbbbbbbbb",
+            45,
+        )
+    except RuntimeError as exc:
+        unit_state = lima_shell(
+            instance,
+            f"sudo -n systemctl is-enabled {unit}.socket {unit}.service; "
+            f"sudo -n systemctl status {unit}.socket {unit}.service --no-pager; "
+            f"sudo -n journalctl -b -u {unit}.socket -u {unit}.service -n 80 --no-pager",
+            check=False,
+        )
+        raise RuntimeError(f"{exc}\nreboot unit diagnostics:\n{unit_state.stdout}\n{unit_state.stderr}") from exc
+    new_pid = int(lima_shell(
+        instance,
+        f"sudo -n systemctl show {unit}.service --property=MainPID --value",
+    ).stdout.strip())
+    state = lima_shell(
+        instance,
+        f"sudo -n python3 -c 'import json; print(json.load(open(\"{guest_root}/status.json\"))[\"state\"])'",
+    ).stdout.strip()
+    if new_pid <= 0 or new_pid == previous_pid or state != "committed":
+        raise RuntimeError(f"committed reboot recovery failed: pid={new_pid}, state={state!r}")
+    print(f"PASS: systemd committed reboot recovery PID {previous_pid} -> {new_pid}")
 
 
 def parse_args():
@@ -293,9 +336,18 @@ def main():
             helper, fixture, scenario = copy_bundle(instance, guest_root)
             bare_supervisor_journey(instance, fixture)
             success_root = f"{guest_root}-success"
-            transaction_journey(instance, success_root, f"{NAME_PREFIX}service-{suffix}", 49152, "success", helper, fixture, scenario)
+            success_unit = f"{NAME_PREFIX}service-{suffix}"
+            success = transaction_journey(
+                instance, success_root, success_unit, 49152, "success", helper, fixture, scenario
+            )
             rollback_root = f"{guest_root}-rollback"
-            transaction_journey(instance, rollback_root, f"{NAME_PREFIX}rollback-{suffix}", 49153, "rollback", helper, fixture, scenario)
+            transaction_journey(
+                instance, rollback_root, f"{NAME_PREFIX}rollback-{suffix}",
+                49153, "rollback", helper, fixture, scenario,
+            )
+            committed_reboot_journey(
+                instance, success_root, success_unit, 49152, success["main_pid"]
+            )
         return 0
     finally:
         if started:
