@@ -233,48 +233,53 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 44,
-        name: "create_workflow_protocol_registry_tables",
+        name: "replace_global_recall_with_coordinator",
         sql: MIGRATION_044,
     },
     Migration {
         version: 45,
-        name: "create_durable_workflow_core_tables",
+        name: "create_workflow_protocol_registry_tables",
         sql: MIGRATION_045,
     },
     Migration {
         version: 46,
-        name: "create_wake_profile_tables",
+        name: "create_durable_workflow_core_tables",
         sql: MIGRATION_046,
     },
     Migration {
         version: 47,
-        name: "create_creation_shadow_tables",
+        name: "create_wake_profile_tables",
         sql: MIGRATION_047,
     },
     Migration {
         version: 48,
-        name: "fence_and_archive_creation_shadow_projections",
+        name: "create_creation_shadow_tables",
         sql: MIGRATION_048,
     },
     Migration {
         version: 49,
-        name: "preserve_creation_shadow_acceptance_evidence",
+        name: "fence_and_archive_creation_shadow_projections",
         sql: MIGRATION_049,
     },
     Migration {
         version: 50,
-        name: "fence_creation_shadow_reservation_updates",
+        name: "preserve_creation_shadow_acceptance_evidence",
         sql: MIGRATION_050,
     },
     Migration {
         version: 51,
-        name: "align_creation_shadow_divergence_actions",
+        name: "fence_creation_shadow_reservation_updates",
         sql: MIGRATION_051,
     },
     Migration {
         version: 52,
-        name: "persist_creation_shadow_execution_mode",
+        name: "align_creation_shadow_divergence_actions",
         sql: MIGRATION_052,
+    },
+    Migration {
+        version: 53,
+        name: "persist_creation_shadow_execution_mode",
+        sql: MIGRATION_053,
     },
 ];
 
@@ -1321,6 +1326,16 @@ CREATE INDEX idx_creation_cleanup_due
 ";
 
 const MIGRATION_044: &str = r"
+CREATE TABLE coordinator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE RESTRICT
+);
+DROP TABLE IF EXISTS global_recall_messages;
+DROP TABLE IF EXISTS global_recall_sessions;
+";
+
+const MIGRATION_045: &str = r"
 CREATE TABLE IF NOT EXISTS workflow_protocol_selections (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
@@ -1362,7 +1377,7 @@ CREATE TABLE IF NOT EXISTS workflow_profile_executors (
 );
 ";
 
-const MIGRATION_045: &str = r"
+const MIGRATION_046: &str = r"
 CREATE TABLE IF NOT EXISTS external_acceptance_bindings (
     id TEXT PRIMARY KEY,
     selection_id TEXT NOT NULL,
@@ -1776,7 +1791,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_shadow_divergence_one_active
     WHERE resolved_at IS NULL;
 ";
 
-const MIGRATION_046: &str = r"
+const MIGRATION_047: &str = r"
 CREATE TABLE IF NOT EXISTS wake_registration_fences (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
@@ -2102,7 +2117,7 @@ CREATE TABLE IF NOT EXISTS wake_shadow_parity (
 
 ";
 
-const MIGRATION_047: &str = r"
+const MIGRATION_048: &str = r"
 CREATE TABLE IF NOT EXISTS creation_shadow_bindings (
     shadow_workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE CASCADE,
     authoritative_workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id) ON DELETE CASCADE,
@@ -2186,7 +2201,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_048: &str = r"
+const MIGRATION_049: &str = r"
 ALTER TABLE conversation_creation_jobs
     ADD COLUMN shadow_projection_revision INTEGER NOT NULL DEFAULT 0
     CHECK (shadow_projection_revision >= 0);
@@ -2246,7 +2261,7 @@ CREATE TABLE creation_shadow_archives (
 );
 ";
 
-const MIGRATION_049: &str = r"
+const MIGRATION_050: &str = r"
 CREATE TABLE creation_shadow_creation_evidence (
     creation_job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
     cwd TEXT NOT NULL,
@@ -2272,7 +2287,7 @@ FROM conversation_creation_jobs j
 JOIN conversations c ON c.id = j.conversation_id;
 ";
 
-const MIGRATION_050: &str = r"
+const MIGRATION_051: &str = r"
 CREATE TRIGGER creation_reservation_shadow_revision_after_status_update
 AFTER UPDATE OF status ON conversation_creation_resource_reservations
 FOR EACH ROW
@@ -2284,7 +2299,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_051: &str = r"
+const MIGRATION_052: &str = r"
 ALTER TABLE creation_shadow_divergences RENAME TO creation_shadow_divergences_legacy;
 
 CREATE TABLE creation_shadow_divergences (
@@ -2320,7 +2335,7 @@ CREATE UNIQUE INDEX idx_creation_shadow_one_active_divergence
     WHERE resolved_at IS NULL;
 ";
 
-const MIGRATION_052: &str = r"
+const MIGRATION_053: &str = r"
 ALTER TABLE creation_shadow_creation_evidence
     ADD COLUMN uses_worktree INTEGER CHECK (uses_worktree IS NULL OR uses_worktree IN (0, 1));
 ALTER TABLE creation_shadow_creation_evidence
@@ -2548,7 +2563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_047_replays_creation_shadow_schema() {
+    async fn migration_048_replays_creation_shadow_schema() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         run_pending_migrations(&pool).await.unwrap();
@@ -2561,7 +2576,7 @@ mod tests {
              DROP TABLE creation_shadow_readiness_effects;
              DROP TABLE creation_shadow_projections;
              DROP TABLE creation_shadow_bindings;
-             DELETE FROM _migrations WHERE version = 47;",
+             DELETE FROM _migrations WHERE version = 48;",
         )
         .execute(&pool)
         .await
