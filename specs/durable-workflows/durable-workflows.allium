@@ -708,7 +708,8 @@ rule RejectUnavailableExternalAcceptance {
     when: ExternalWorkflowAcceptanceRequested(client, request)
     let selection = accepting_selection_for(request.profile)
     requires: external_acceptance_binding(ProfileIdentity{profile_id: request.profile.profile_id}, request.authority_scope, request.idempotency_key) = null
-    requires: selection.accepting != true
+    requires: selection = null
+        or selection.accepting != true
         or selection.external_acceptance_enabled != true
         or not profile_executor_available(request.profile)
     ensures: ExternalAcceptanceOutcome(closed_or_unavailable)
@@ -926,6 +927,7 @@ rule RetainStaleObservationAsDiagnostic {
 rule RejectUnsupportedObservationCodec {
     when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
     requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
     requires: attempt.effect = effect
     requires: attempt.claim = Claim{effect: effect}
     requires: claim_row_matches_authority(effect, authority)
@@ -1210,6 +1212,8 @@ rule RejectUnavailableControlOnlyManualResolutionChoice {
 rule RejectUnpermittedManualResolutionChoice {
     when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
     requires: resolution.status = required
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
     requires: not manual_choice_permitted(resolution, choice)
     ensures: ManualResolutionOutcome(rejected)
     ensures: resolution.status = required

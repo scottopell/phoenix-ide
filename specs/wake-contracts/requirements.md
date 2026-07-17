@@ -369,15 +369,15 @@ A conversation MAY hold multiple pending contracts (e.g., agent
 registered two waits in parallel via two `wait_until` calls in one
 turn)
 
-WHEN the first contract fires
-THE SYSTEM SHALL deliver only that contract's payload as the next
-synthetic tool result, and the other pending contracts SHALL continue
-to be evaluated normally (no auto-cancellation of siblings)
+WHEN one or more contracts fire before the next runtime acceptance
+THE SYSTEM SHALL deliver the committed contract payloads as one bounded,
+ordered batch of synthetic tool results, and the other pending contracts
+SHALL continue to be evaluated normally (no auto-cancellation of siblings)
 
 **Rationale:** Independent contracts represent independent things the
 LLM cares about. There is no reason to cancel a still-relevant
 `cargo build` watch just because an unrelated `subagent` finished
-first. The LLM consumes the first fire, makes whatever decisions, and
+first. The LLM consumes each accepted batch, makes whatever decisions, and
 either lets the other contracts continue to fire on their own
 schedule or cancels them explicitly via the cancel endpoint. The
 rejected "first-fire-wins-cancel-siblings" semantics only makes sense

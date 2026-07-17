@@ -128,8 +128,6 @@ entity CreationWorkflowBinding {
     workflow: dwf/Workflow
     intent: CreationIntent
     profile_binding: CreationProfileBinding
-    authority: dwf/SemanticAuthority
-    execution_mode: dwf/ExecutionMode
     protocol_selection: dwf/ProfileProtocolSelection
     outcome: CreationOutcome
     conversation: bedrock/Conversation?
@@ -261,16 +259,26 @@ rule ShellFirstDurableAcceptance {
 
     let intent = normalized_intent(raw_intent)
     let profile_binding = profile_binding_for(engine_protocol, authoritative)
-    let binding = CreationWorkflowBinding{conversation_id: intent.conversation_id}
+    let workflow = dwf/Workflow{
+        profile: creation_profile(),
+        authority: engine_protocol,
+        execution_mode: authoritative
+    }
+    let readiness_barrier = creation_readiness_barrier(workflow)
+    let binding = CreationWorkflowBinding{
+        conversation_id: intent.conversation_id,
+        workflow: workflow,
+        readiness_barrier: readiness_barrier
+    }
     let acceptance = CreationAcceptanceRecord{conversation_id: intent.conversation_id}
 
     ensures: CreationWorkflowBinding.created(
         conversation_id: intent.conversation_id,
         intent: intent,
+        workflow: workflow,
         profile_binding: profile_binding,
-        authority: engine_protocol,
-        execution_mode: authoritative,
         protocol_selection: creation_protocol_selection(),
+        readiness_barrier: readiness_barrier,
         outcome: provisioning,
         accepted_at: now()
     )
@@ -609,8 +617,8 @@ rule RetryBudgetOrDeadlineFailsProvisioning {
     }
     requires: attempt_count(effect) >= config.max_attempts
         or now() >= effect_deadline(binding, creation_effect_kind(effect))
-    ensures: binding.outcome = failed
-    ensures: CreationFailureProjected(binding, retry_exhausted)
+    ensures: CreationFailureReceiptQueued(binding, effect, evidence, retry_exhausted)
+    ensures: CoreReducerEventRequested(binding.workflow, creation_failure_event(effect, evidence, retry_exhausted))
 }
 
 rule PermanentFailureFailsWithoutRetry {
@@ -623,8 +631,8 @@ rule PermanentFailureFailsWithoutRetry {
         finalize_attachments, commit_metadata, expand_initial_message,
         bootstrap_runtime, dispatch_first_llm
     }
-    ensures: binding.outcome = failed
-    ensures: CreationFailureProjected(binding, permanent_effect_failure)
+    ensures: CreationFailureReceiptQueued(binding, effect, evidence, permanent_effect_failure)
+    ensures: CoreReducerEventRequested(binding.workflow, creation_failure_event(effect, evidence, permanent_effect_failure))
     ensures: not CreationRetryScheduled(effect, retry_deadline(effect))
 }
 
@@ -634,6 +642,8 @@ rule PermanentFailureFailsWithoutRetry {
 
 rule MetadataReceiptMaterializesConversationAtomically {
     when: CreationMetadataReceiptAccepted(reducer, binding, receipt)
+    requires: binding.workflow.execution_mode = authoritative
+    requires: binding.workflow.authority = engine_protocol
     requires: receipt.effect = effect_of(binding, commit_metadata)
     ensures: metadata_receipt_materializes_conversation(binding, receipt)
     ensures: binding.conversation != null
@@ -643,8 +653,8 @@ rule MetadataReceiptMaterializesConversationAtomically {
 
 rule RuntimeBootstrapFollowsExpandedMessage {
     when: RuntimeBootstrapReceiptAccepted(reducer, binding, receipt)
-    requires: binding.execution_mode = authoritative
-    requires: binding.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
+    requires: binding.workflow.authority = engine_protocol
     requires: receipt.effect = effect_of(binding, bootstrap_runtime)
     ensures: runtime_acceptance_committed_atomically(binding)
     ensures: runtime_bootstrap_projects_busy_until_dispatch(binding)
@@ -655,8 +665,8 @@ rule RuntimeBootstrapFollowsExpandedMessage {
 
 rule FirstDispatchFollowsCommittedRuntimeBootstrap {
     when: FirstLlmDispatchReceiptAccepted(reducer, binding, receipt)
-    requires: binding.execution_mode = authoritative
-    requires: binding.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
+    requires: binding.workflow.authority = engine_protocol
     requires: receipt.effect = effect_of(binding, dispatch_first_llm)
     ensures: first_dispatch_after_runtime_commit(binding)
     ensures: binding.conversation.core_status = llm_requesting
@@ -804,8 +814,8 @@ rule LegacyAuthorityRemainsExclusive {
 
 rule EngineAuthorityRemainsExclusive {
     when: EngineCreationFactCommitted(mirror, binding)
-    requires: binding.authority = engine_protocol
-    requires: binding.execution_mode = authoritative
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     ensures: EngineCreationProtocolActsAuthoritatively(binding.conversation_id)
     ensures: LegacyCreationProtocolDoesNotActAuthoritatively(binding.conversation_id)
     ensures: authority_is_immutable(binding)
@@ -813,7 +823,7 @@ rule EngineAuthorityRemainsExclusive {
 
 rule ShadowCreationProjectsParityWithoutExternalEffects {
     when: CreationShadowComparisonRequested(mirror, binding, authoritative_conversation_id, kind)
-    requires: binding.execution_mode = shadow
+    requires: binding.workflow.execution_mode = shadow
     let expected = legacy_projection(authoritative_conversation_id)
     let actual = engine_projection(binding)
     ensures: CreationShadowParity.created(

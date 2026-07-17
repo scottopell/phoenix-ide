@@ -425,6 +425,7 @@ rule EvidenceScheduleRecordsReconciliationObservation {
 
 rule EvidenceBeforeDeadlineWins {
     when: WakeTerminalEvidenceObserved(adapter, binding, evidence)
+    requires: live_matching_authority(binding.observe_effect, adapter.authority)
     requires: evidence_matches_resource(evidence, binding.resource)
     requires: evidence_occurrence_time(evidence) <= binding.expires_at
     requires: terminal_winner(binding) = evidence
@@ -672,8 +673,8 @@ rule LegacyProtocolRemainsAuthoritativeForStampedContract {
 
 rule EngineProtocolRemainsAuthoritativeForStampedWorkflow {
     when: EngineWakeFactCommitted(mirror, binding)
-    requires: binding.authority = engine_protocol
-    requires: binding.execution_mode = authoritative
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     ensures: EngineWakeProtocolActsAuthoritatively(binding.contract_id)
     ensures: LegacyWakeProtocolDoesNotActAuthoritatively(binding.contract_id)
     ensures: authority_is_immutable(binding)
@@ -681,7 +682,7 @@ rule EngineProtocolRemainsAuthoritativeForStampedWorkflow {
 
 rule ShadowScheduleComparesWithoutAuthority {
     when: WakeShadowComparisonRequested(mirror, binding, authoritative_contract_id, kind)
-    requires: binding.execution_mode = shadow
+    requires: binding.workflow.execution_mode = shadow
     let expected = legacy_projection(authoritative_contract_id)
     let actual = engine_projection(binding)
     ensures: WakeShadowParity.created(
