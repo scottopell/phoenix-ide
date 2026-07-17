@@ -874,7 +874,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::RwLock;
+    use tokio::sync::{watch, RwLock};
 
     // -----------------------------------------------------------------------
     // Minimal scripted HTTP/1.1 server: records requests, replays canned
@@ -1011,6 +1011,7 @@ mod tests {
         /// a GET gets 405 (the spec's "no stream offered"), which parks the
         /// stream task without disturbing a POST-only test.
         get_requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        request_count: watch::Sender<usize>,
         get_responses: Arc<Mutex<VecDeque<CannedResponse>>>,
         accept_task: tokio::task::JoinHandle<()>,
     }
@@ -1030,6 +1031,7 @@ mod tests {
                 Arc::new(Mutex::new(responses.into()));
             let routes: RouteMap = Arc::default();
             let get_requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+            let (request_count, _) = watch::channel(0);
             let get_responses: Arc<Mutex<VecDeque<CannedResponse>>> = Arc::default();
 
             let req_log = Arc::clone(&requests);
@@ -1037,6 +1039,7 @@ mod tests {
             let route_map = Arc::clone(&routes);
             let get_req_log = Arc::clone(&get_requests);
             let get_resp_queue = Arc::clone(&get_responses);
+            let request_count_for_task = request_count.clone();
             let accept_task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -1048,6 +1051,7 @@ mod tests {
                         Arc::clone(&resp_queue),
                         Arc::clone(&route_map),
                         Arc::clone(&get_req_log),
+                        request_count_for_task.clone(),
                         Arc::clone(&get_resp_queue),
                     ));
                 }
@@ -1059,6 +1063,7 @@ mod tests {
                 responses,
                 routes,
                 get_requests,
+                request_count,
                 get_responses,
                 accept_task,
             }
@@ -1115,6 +1120,17 @@ mod tests {
             *self.get_responses.lock().unwrap() = responses.into();
         }
 
+        async fn wait_for_requests(&self, count: usize) {
+            let mut receiver = self.request_count.subscribe();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while *receiver.borrow_and_update() < count {
+                    receiver.changed().await.expect("test server still running");
+                }
+            })
+            .await
+            .expect("expected request count reached");
+        }
+
         /// The GET stream requests recorded so far.
         fn get_recorded(&self) -> Vec<RecordedRequest> {
             std::mem::take(&mut *self.get_requests.lock().unwrap())
@@ -1139,8 +1155,10 @@ mod tests {
         responses: &Mutex<VecDeque<CannedResponse>>,
         routes: &RouteMap,
         get_requests: &Mutex<Vec<RecordedRequest>>,
+        request_count: &watch::Sender<usize>,
         get_responses: &Mutex<VecDeque<CannedResponse>>,
     ) -> CannedResponse {
+        request_count.send_modify(|count| *count += 1);
         if method == "GET" && !path.starts_with("/.well-known") {
             get_requests.lock().unwrap().push(recorded);
             let mut queue = get_responses.lock().unwrap();
@@ -1181,6 +1199,7 @@ mod tests {
         responses: Arc<Mutex<VecDeque<CannedResponse>>>,
         routes: RouteMap,
         get_requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        request_count: watch::Sender<usize>,
         get_responses: Arc<Mutex<VecDeque<CannedResponse>>>,
     ) {
         let mut buf: Vec<u8> = Vec::new();
@@ -1247,6 +1266,7 @@ mod tests {
                 &responses,
                 &routes,
                 &get_requests,
+                &request_count,
                 &get_responses,
             );
             if response.delay_ms > 0 {
@@ -1684,18 +1704,6 @@ mod tests {
         );
     }
 
-    /// Poll `cond` until it holds, failing the test if it never does. Used to
-    /// await the detached server-initiated stream task's side effects.
-    async fn wait_for(label: &str, cond: impl Fn() -> bool) {
-        for _ in 0..200 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("condition '{label}' not met within timeout");
-    }
-
     #[tokio::test]
     async fn server_initiated_stream_delivers_list_changed_and_resumes() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
@@ -1715,18 +1723,10 @@ mod tests {
             .await
             .expect("connect");
 
-        // The notification arriving on the GET stream flips the shared flag
-        // from the detached task, with no request in flight (REQ-MCP-006).
-        wait_for("tools_changed set from GET stream", || {
-            mcp.tools_changed.load(Ordering::Acquire)
-        })
-        .await;
-
-        // The initial open and the resume both landed.
-        wait_for("two GET stream requests", || {
-            server.get_requests.lock().unwrap().len() >= 2
-        })
-        .await;
+        // The second GET proves the first stream response was consumed and its
+        // event cursor triggered a resume.
+        server.wait_for_requests(5).await;
+        assert!(mcp.tools_changed.load(Ordering::Acquire));
         let gets = server.get_recorded();
         assert_eq!(gets.len(), 2, "open then resume");
         assert_eq!(gets[0].http_method(), "GET");
@@ -1758,10 +1758,7 @@ mod tests {
             .await
             .expect("connect");
 
-        wait_for("a GET stream request", || {
-            !server.get_requests.lock().unwrap().is_empty()
-        })
-        .await;
+        server.wait_for_requests(4).await;
         // Past one local backoff interval a buggy poll loop would have issued a
         // second GET; a stopped stream stays at one.
         // test-timing-allow: crossing the retry interval proves a terminal response stops polling
@@ -1784,10 +1781,14 @@ mod tests {
             .await
             .expect("connect");
 
-        wait_for("session-reset flag set from a GET-stream 404", || {
-            mcp.tools_changed.load(Ordering::Acquire)
+        server.wait_for_requests(4).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !mcp.tools_changed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
         })
-        .await;
+        .await
+        .expect("session-reset flag set from a GET-stream 404");
 
         // The GET carried the negotiated session, and the stream stopped rather
         // than re-GETting a dead session in a loop.
@@ -1813,11 +1814,8 @@ mod tests {
             .await
             .expect("connect");
 
-        wait_for(
-            "tools_changed set from a batched GET-stream notification",
-            || mcp.tools_changed.load(Ordering::Acquire),
-        )
-        .await;
+        server.wait_for_requests(5).await;
+        assert!(mcp.tools_changed.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1843,10 +1841,7 @@ mod tests {
             .await
             .expect("connect");
 
-        wait_for("a GET stream request", || {
-            !server.get_requests.lock().unwrap().is_empty()
-        })
-        .await;
+        server.wait_for_requests(4).await;
         let gets = server.get_recorded();
         assert_eq!(gets[0].header("authorization"), Some("Bearer at-live"));
     }
@@ -1925,26 +1920,22 @@ mod tests {
             .await
             .remove("remote")
             .expect("server present");
-        let holder = Arc::clone(&manager);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            holder
-                .servers
-                .write()
-                .await
-                .insert("remote".to_string(), held);
-            holder.recovering_map().remove("remote");
-        });
-
         // Reload with the identical config must settle the hold and report
         // unchanged -- not misread the held server as newly added and start
         // a duplicate connection.
-        let result = manager
-            .reload_from_configs(vec![(
-                "remote".to_string(),
-                http_config(&server.url, HttpAuth::None),
-            )])
-            .await;
+        let reload = manager.reload_from_configs(vec![(
+            "remote".to_string(),
+            http_config(&server.url, HttpAuth::None),
+        )]);
+        tokio::pin!(reload);
+        assert!(futures::poll!(&mut reload).is_pending());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), held);
+        manager.recovering_map().remove("remote");
+        let result = reload.await;
 
         assert_eq!(result.unchanged, vec!["remote"]);
         assert!(result.added.is_empty());
@@ -1983,19 +1974,17 @@ mod tests {
             .await
             .remove("remote")
             .expect("server present");
-        let holder = Arc::clone(&manager);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            holder
-                .servers
-                .write()
-                .await
-                .insert("remote".to_string(), held);
-            holder.recovering_map().remove("remote");
-        });
-
         server.push_responses(vec![delete_ack()]);
-        let result = manager.reload_from_configs(Vec::new()).await;
+        let reload = manager.reload_from_configs(Vec::new());
+        tokio::pin!(reload);
+        assert!(futures::poll!(&mut reload).is_pending());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), held);
+        manager.recovering_map().remove("remote");
+        let result = reload.await;
 
         assert_eq!(result.removed, vec!["remote"]);
         assert!(manager.servers.read().await.is_empty());
@@ -2068,31 +2057,28 @@ mod tests {
             .await
             .remove("remote")
             .expect("server present");
-        let holder = Arc::clone(&manager);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            // Replacing the entry drops claim 1 (waking waiters) with claim 2
-            // already parked, atomically under the map lock.
-            let (second_claim, _) = tokio::sync::watch::channel(());
-            holder
-                .recovering_map()
-                .insert("remote".to_string(), second_claim);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            holder
-                .servers
-                .write()
-                .await
-                .insert("remote".to_string(), held);
-            holder.recovering_map().remove("remote");
-        });
-
         let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
         server.push_responses(vec![echo_id_response(&call_result)]);
 
-        let output = manager
-            .call_tool("remote", "report", serde_json::json!({}))
+        let call = manager.call_tool("remote", "report", serde_json::json!({}));
+        tokio::pin!(call);
+        assert!(futures::poll!(&mut call).is_pending());
+
+        // Replacing the entry drops claim 1 (waking the call) with claim 2
+        // already parked. Polling again proves the call joins claim 2.
+        let (second_claim, _) = tokio::sync::watch::channel(());
+        manager
+            .recovering_map()
+            .insert("remote".to_string(), second_claim);
+        assert!(futures::poll!(&mut call).is_pending());
+
+        manager
+            .servers
+            .write()
             .await
-            .expect("call must survive consecutive claims");
+            .insert("remote".to_string(), held);
+        manager.recovering_map().remove("remote");
+        let output = call.await.expect("call must survive consecutive claims");
         assert_eq!(output, "ok");
     }
 
@@ -2130,7 +2116,7 @@ mod tests {
                 .reload_from_configs(vec![("remote".to_string(), changed)])
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.wait_for_requests(6).await;
         let second = manager.reload_from_configs(Vec::new()).await;
 
         let first = first_reload.await.expect("first reload");
@@ -2232,14 +2218,10 @@ mod tests {
 
         // The dead attempt must consume its ticket, or a later same-config
         // reload would mistake it for an in-flight connect and never retry.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if manager.connect_tickets.lock().unwrap().is_empty() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("failed connect left its ticket parked");
+        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
+            .await
+            .expect("failed connect completed");
+        assert!(manager.connect_tickets.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2267,17 +2249,6 @@ mod tests {
             .await
             .remove("remote")
             .expect("server present");
-        let holder = Arc::clone(&manager);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            holder
-                .servers
-                .write()
-                .await
-                .insert("remote".to_string(), held);
-            holder.recovering_map().remove("remote");
-        });
-
         server.push_responses(vec![delete_ack()]); // old server's terminate
         server.push_responses(handshake_responses("sess-2"));
 
@@ -2285,9 +2256,16 @@ mod tests {
             &server.url,
             HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
         );
-        let result = manager
-            .reload_from_configs(vec![("remote".to_string(), changed.clone())])
-            .await;
+        let reload = manager.reload_from_configs(vec![("remote".to_string(), changed.clone())]);
+        tokio::pin!(reload);
+        assert!(futures::poll!(&mut reload).is_pending());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), held);
+        manager.recovering_map().remove("remote");
+        let result = reload.await;
 
         assert_eq!(result.restarted, vec!["remote"]);
         assert!(result.unchanged.is_empty());
@@ -2755,33 +2733,25 @@ mod tests {
         .await
     }
 
-    /// Poll `f` until it yields Some, panicking after a deadline. The OAuth
-    /// completion path reconnects in a background task, so tests observe it
-    /// through the manager's published state.
-    async fn poll_until<T, F, Fut>(what: &str, mut f: F) -> T
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Option<T>>,
-    {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(value) = f().await {
-                return value;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     async fn pending_auth_url(manager: &McpClientManager) -> Option<String> {
         manager
             .status()
             .await
             .into_iter()
             .find_map(|s| s.pending_oauth_url)
+    }
+
+    async fn next_pending_auth_url(
+        manager: &McpClientManager,
+        publications: &mut watch::Receiver<u64>,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(10), publications.changed())
+            .await
+            .expect("OAuth URL published in time")
+            .expect("OAuth runtime still active");
+        pending_auth_url(manager)
+            .await
+            .expect("published OAuth URL")
     }
 
     fn query_params(url: &str) -> HashMap<String, String> {
@@ -2899,14 +2869,10 @@ mod tests {
             .expect("authorization completes");
         assert_eq!(name, "remote");
 
-        poll_until("server to connect", || async {
-            manager
-                .status()
-                .await
-                .into_iter()
-                .find(|s| s.tool_count == 1)
-        })
-        .await;
+        tokio::time::timeout(Duration::from_secs(10), manager.await_background_tasks())
+            .await
+            .expect("server connected in background");
+        assert!(manager.status().await.iter().any(|s| s.tool_count == 1));
 
         // The token request was a PKCE code exchange bound to the resource.
         let token_requests = server.recorded_for_path("/token");
@@ -3476,6 +3442,7 @@ mod tests {
 
         // The triggering call parks on the step-up claim and replays once the
         // operator re-authorizes (deferred ReAuthCallRetry).
+        let mut publications = manager.oauth.pending_publications.subscribe();
         let caller = Arc::clone(&manager);
         let held_call = tokio::spawn(async move {
             caller
@@ -3483,10 +3450,7 @@ mod tests {
                 .await
         });
 
-        let auth_url = poll_until("step-up auth url", || async {
-            pending_auth_url(&manager).await
-        })
-        .await;
+        let auth_url = next_pending_auth_url(&manager, &mut publications).await;
         let params = query_params(&auth_url);
         let scopes: Vec<&str> = params
             .get("scope")
@@ -4061,14 +4025,12 @@ mod tests {
             headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
             auth: HttpAuth::None,
         };
+        let mut publications = manager.oauth.pending_publications.subscribe();
         manager
             .reload_from_configs(vec![("remote".to_string(), changed)])
             .await;
 
-        let new_url = poll_until("re-surfaced auth url", || async {
-            pending_auth_url(&manager).await
-        })
-        .await;
+        let new_url = next_pending_auth_url(&manager, &mut publications).await;
         let new_state = query_params(&new_url).get("state").unwrap().clone();
         assert_ne!(old_state, new_state, "the nonce must rotate");
 

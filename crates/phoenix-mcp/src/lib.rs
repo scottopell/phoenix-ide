@@ -1026,6 +1026,8 @@ struct OAuthRuntime {
     /// on a remote-reachable bind, REQ-MCP-020), so the operator sees why the
     /// authorize link will fail before opening it.
     redirect_warning: std::sync::Mutex<Option<String>>,
+    #[cfg(test)]
+    pending_publications: tokio::sync::watch::Sender<u64>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
     /// Loopback callback listeners, keyed by server name. A server whose
     /// pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
@@ -1043,6 +1045,8 @@ impl Default for OAuthRuntime {
             store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
             redirect_base: std::sync::Mutex::new(None),
             redirect_warning: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pending_publications: tokio::sync::watch::channel(0).0,
             pending: std::sync::Mutex::new(HashMap::new()),
             loopback_listeners: std::sync::Mutex::new(HashMap::new()),
         }
@@ -1551,6 +1555,10 @@ async fn begin_oauth_flow(
         .write()
         .await
         .insert(name.to_string(), auth_url.clone());
+    #[cfg(test)]
+    oauth_rt
+        .pending_publications
+        .send_modify(|version| *version += 1);
     tracing::info!(
         server = %name,
         url = %auth_url,
@@ -1652,6 +1660,8 @@ pub struct McpClientManager {
     /// dropping them silently (REQ-MCP-018). Cleared on a successful (re)connect
     /// and on config removal.
     failed_servers: Arc<RwLock<HashMap<String, FailureRecord>>>,
+    #[cfg(test)]
+    background_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// OAuth lifecycle state: the token/registration store, the local
     /// callback's base URL, and the pending authorization flows
     /// (REQ-MCP-009..012).
@@ -1680,7 +1690,36 @@ impl McpClientManager {
             reload_serial: tokio::sync::Mutex::new(()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             failed_servers: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            background_tasks: std::sync::Mutex::new(Vec::new()),
             oauth: Arc::new(OAuthRuntime::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.background_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(future));
+    }
+
+    #[allow(clippy::unused_self)]
+    #[cfg(not(test))]
+    fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        std::mem::drop(tokio::spawn(future));
+    }
+
+    #[cfg(test)]
+    async fn await_background_tasks(&self) {
+        loop {
+            let tasks = std::mem::take(&mut *self.background_tasks.lock().unwrap());
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                task.await.expect("background MCP task");
+            }
         }
     }
 
@@ -1894,7 +1933,7 @@ impl McpClientManager {
         // re-authorized server (deferred ReAuthCallRetry).
         let manager = Arc::clone(self);
         let reconnect_name = name.clone();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let ticket = manager.issue_connect_ticket(&reconnect_name, &config);
             let result = Self::connect_one(
                 &reconnect_name,
@@ -3373,7 +3412,7 @@ impl McpClientManager {
                         );
                         stale.terminate().await;
                     }
-                    tokio::spawn(async move {
+                    self.spawn_background(async move {
                         let result =
                             Self::connect_one(&name, &entry, Arc::clone(&oauth), oauth_rt).await;
                         match result {
@@ -4034,6 +4073,7 @@ mod tests {
         result: Result<Value, TransportError>,
         /// Sleep before responding -- lets a test order concurrent exchanges.
         delay: Duration,
+        started: Option<tokio::sync::oneshot::Sender<String>>,
     }
 
     fn exchange(result: Result<Value, TransportError>) -> ScriptedExchange {
@@ -4041,6 +4081,7 @@ mod tests {
             server_messages: Vec::new(),
             result,
             delay: Duration::ZERO,
+            started: None,
         }
     }
 
@@ -4049,7 +4090,18 @@ mod tests {
             server_messages: Vec::new(),
             result,
             delay: Duration::from_millis(delay_ms),
+            started: None,
         }
+    }
+
+    fn witnessed_delayed_exchange(
+        result: Result<Value, TransportError>,
+        delay_ms: u64,
+    ) -> (ScriptedExchange, tokio::sync::oneshot::Receiver<String>) {
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        let mut exchange = delayed_exchange(result, delay_ms);
+        exchange.started = Some(started);
+        (exchange, receiver)
     }
 
     struct FakeTransport {
@@ -4071,12 +4123,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((method.to_string(), params));
-            let exchange = self
+            let mut exchange = self
                 .script
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("unscripted request");
+            if let Some(started) = exchange.started.take() {
+                let _ = started.send(method.to_string());
+            }
             if exchange.delay > Duration::ZERO {
                 // test-timing-allow: scripted transport latency is the behavior exercised by timeout tests
                 tokio::time::sleep(exchange.delay).await;
@@ -4216,6 +4271,7 @@ mod tests {
                 "method": "notifications/tools/list_changed",
             })],
             result: Ok(serde_json::json!({"content": []})),
+            started: None,
             delay: Duration::ZERO,
         }]);
 
@@ -4458,8 +4514,10 @@ mod tests {
     #[tokio::test]
     async fn stale_recoverable_error_retries_on_the_replacement_server() {
         let manager = Arc::new(McpClientManager::new());
+        let (serving_exchange, serving_started) =
+            witnessed_delayed_exchange(Err(TransportError::SessionExpired), 200);
         let (serving, _, _) = fake_server_with_config(
-            vec![delayed_exchange(Err(TransportError::SessionExpired), 200)],
+            vec![serving_exchange],
             McpServerConfig::Http {
                 url: "http://127.0.0.1:1/mcp".to_string(),
                 headers: HashMap::new(),
@@ -4480,9 +4538,11 @@ mod tests {
         );
         let swapper = Arc::clone(&manager);
         let swap = tokio::spawn(async move {
-            // Queued behind the in-flight call's read lock; lands as soon as
-            // the failing call releases it, before the recovery write lock.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let method = tokio::time::timeout(Duration::from_secs(5), serving_started)
+                .await
+                .expect("serving request started in time")
+                .expect("serving transport retained its witness");
+            assert_eq!(method, "tools/call");
             swapper
                 .servers
                 .write()
@@ -4509,15 +4569,14 @@ mod tests {
     #[tokio::test]
     async fn stale_nonrecoverable_error_surfaces_without_retry() {
         let manager = Arc::new(McpClientManager::new());
-        let (serving, _, _) = fake_server_with_config(
-            vec![delayed_exchange(
-                Err(TransportError::Timeout(
-                    "timed out reading response for 'tools/call'".to_string(),
-                )),
-                200,
-            )],
-            stdio_test_config("serving"),
+        let (serving_exchange, serving_started) = witnessed_delayed_exchange(
+            Err(TransportError::Timeout(
+                "timed out reading response for 'tools/call'".to_string(),
+            )),
+            200,
         );
+        let (serving, _, _) =
+            fake_server_with_config(vec![serving_exchange], stdio_test_config("serving"));
         manager
             .servers
             .write()
@@ -4528,7 +4587,11 @@ mod tests {
             fake_server_with_config(Vec::new(), stdio_test_config("replacement"));
         let swapper = Arc::clone(&manager);
         let swap = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let method = tokio::time::timeout(Duration::from_secs(5), serving_started)
+                .await
+                .expect("serving request started in time")
+                .expect("serving transport retained its witness");
+            assert_eq!(method, "tools/call");
             swapper
                 .servers
                 .write()
@@ -4811,21 +4874,14 @@ for line in sys.stdin:
             .await;
 
         assert_eq!(result.added, vec!["fixture"]);
-        let mut connected = false;
-        let mut timed_out = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if !manager.status().await.is_empty() {
-                connected = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        if !connected {
-            timed_out = true;
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.await_background_tasks(),
+        )
+        .await
+        .expect("fixture connected in background");
+        assert_eq!(manager.status().await.len(), 1);
         manager.shutdown().await;
-        assert!(!timed_out, "fixture did not connect in background");
     }
 
     #[tokio::test]
