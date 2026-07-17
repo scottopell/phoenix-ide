@@ -54,6 +54,40 @@ class BareDeployCommandTests(unittest.TestCase):
             self.assertIn("stop", command)
             self.assertNotIn("prod.pid", " ".join(command))
 
+    def test_reboot_persistence_installs_idempotent_owner_crontab_entry(self):
+        root = Path("/tmp/phoenix owner")
+        layout = {"root": root, "supervisor": root / "bin/phoenix-supervisor.py"}
+        existing = "MAILTO=user@example.test\n@reboot old-command # phoenix-ide persistent supervisor\n"
+        calls = [
+            subprocess.CompletedProcess([], 0, existing, ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/crontab"), \
+             mock.patch.object(self.dev.subprocess, "run", side_effect=calls) as run:
+            configured = self.dev._configure_bare_reboot_persistence(layout)
+
+        self.assertTrue(configured)
+        installed = run.call_args_list[1].kwargs["input"]
+        self.assertEqual(1, installed.count("# phoenix-ide persistent supervisor"))
+        self.assertIn("MAILTO=user@example.test", installed)
+        self.assertIn("@reboot", installed)
+        self.assertIn("phoenix-supervisor.py", installed)
+
+    def test_reboot_persistence_prints_exact_rc_guidance_without_crontab(self):
+        root = Path("/tmp/phoenix owner")
+        layout = {"root": root, "supervisor": root / "bin/phoenix-supervisor.py"}
+        with mock.patch.object(self.dev.shutil, "which", return_value=None), \
+             mock.patch("builtins.print") as output:
+            configured = self.dev._configure_bare_reboot_persistence(layout)
+
+        self.assertFalse(configured)
+        text = "\n".join(" ".join(str(value) for value in call.args) for call in output.call_args_list)
+        self.assertIn("Reboot persistence: not configured", text)
+        self.assertIn("same-user boot/rc mechanism", text)
+        self.assertIn("phoenix-supervisor.py", text)
+        self.assertIn("--root", text)
+        self.assertIn("run", text)
+
     def test_deploy_stages_only_transaction_reference_to_supervisor(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "phoenix"
@@ -97,6 +131,7 @@ class BareDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_prepare_release_candidate", return_value=candidate), \
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                  mock.patch.object(self.dev, "_start_bare_supervisor"), \
+                 mock.patch.object(self.dev, "_configure_bare_reboot_persistence"), \
                  mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
                  mock.patch.object(self.dev.subprocess, "run", side_effect=run), \
                  mock.patch("uuid.uuid4", return_value=mock.Mock(hex="d" * 32)):

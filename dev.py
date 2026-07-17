@@ -6710,7 +6710,7 @@ def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_sour
     layout["supervisor"].chmod(0o700)
     with (layout["root"] / "supervisor.log").open("ab") as log:
         subprocess.Popen(
-            [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "run"],
+            _bare_supervisor_command(layout),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -6723,6 +6723,40 @@ def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_sour
             return
         time.sleep(0.05)
     raise SystemExit("bare Linux supervisor did not become ready")
+
+
+def _bare_supervisor_command(layout: dict[str, Path]) -> list[str]:
+    return [
+        sys.executable,
+        str(layout["supervisor"]),
+        "--root",
+        str(layout["root"]),
+        "run",
+    ]
+
+
+def _configure_bare_reboot_persistence(layout: dict[str, Path]) -> bool:
+    import shlex
+
+    command = " ".join(shlex.quote(part) for part in _bare_supervisor_command(layout))
+    marker = "# phoenix-ide persistent supervisor"
+    crontab = shutil.which("crontab")
+    if crontab is not None:
+        current = subprocess.run([crontab, "-l"], capture_output=True, text=True)
+        if current.returncode in {0, 1}:
+            lines = [line for line in current.stdout.splitlines() if marker not in line]
+            lines.extend([
+                f"@reboot {command} >> {shlex.quote(str(layout['root'] / 'supervisor.log'))} 2>&1 {marker}",
+                "",
+            ])
+            installed = subprocess.run([crontab, "-"], input="\n".join(lines), text=True, capture_output=True)
+            if installed.returncode == 0:
+                print("  Reboot persistence: owner crontab @reboot entry installed")
+                return True
+    print("  Reboot persistence: not configured (compatible owner crontab unavailable)")
+    print("  Add this command to the host's same-user boot/rc mechanism:")
+    print(f"    {command}")
+    return False
 
 
 def prod_daemon_deploy(release: str | None = None):
@@ -6761,6 +6795,7 @@ def prod_daemon_deploy(release: str | None = None):
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
         _start_bare_supervisor(layout, protocol, supervisor_source)
+        _configure_bare_reboot_persistence(layout)
 
         transaction = layout["transactions"] / transaction_id
         transaction.mkdir(parents=True, mode=0o700)

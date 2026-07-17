@@ -168,6 +168,137 @@ class BareTransactionTests(unittest.TestCase):
         self.assertEqual("candidate wrong", status["failure"])
         self.assertEqual("rollback failed", status["rollback_failure"])
 
+    def reset_transaction(self):
+        if self.transaction.exists():
+            self.transaction.chmod(0o700)
+            for artifact in self.transaction.iterdir():
+                artifact.chmod(0o600)
+                artifact.unlink()
+        else:
+            self.transaction.mkdir(mode=0o700)
+        self.layout.status_file.unlink(missing_ok=True)
+        self.layout.active_file.unlink(missing_ok=True)
+
+    def install_previous(self):
+        self.layout.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.layout.binary.write_text("old binary")
+        self.layout.environment.parent.mkdir(parents=True, exist_ok=True)
+        self.layout.environment.write_text("MODE=old\n")
+        self.layout.deployed_sha.write_text("a" * 40 + "\n")
+
+    def test_restart_reconciles_preinstall_and_rollback_phases_to_previous(self):
+        for phase in ("prepared", "activating", "rolling_back"):
+            with self.subTest(phase=phase):
+                self.reset_transaction()
+                self.install_previous()
+                path = self.manifest(previous=True)
+                manifest_hash = supervisor.sha256(path)
+                owner = supervisor.Supervisor(self.layout)
+                manifest, *_ = owner.validated_transaction(self.transaction_id, manifest_hash)
+                supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+                if phase != "prepared":
+                    owner.transaction_status(
+                        manifest,
+                        manifest_hash,
+                        "activating",
+                        "interrupted activation" if phase == "rolling_back" else None,
+                        phase=phase,
+                    )
+                owner.stop_recorded_orphan = mock.Mock()
+                owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
+                    43, 101, supervisor.RuntimeIdentity("1.0.0", "a" * 12)
+                ))
+
+                owner.reconcile()
+
+                status = __import__("json").loads(self.layout.status_file.read_text())
+                self.assertEqual("activation_failed_rolled_back", status["state"])
+                self.assertEqual("old binary", self.layout.binary.read_text())
+                self.assertEqual("MODE=old\n", self.layout.environment.read_text())
+                self.assertEqual("a" * 40, self.layout.deployed_sha.read_text().strip())
+                self.assertFalse(self.layout.active_file.exists())
+                self.transaction.chmod(0o700)
+
+    def test_restart_reverifies_installed_candidate_before_commit(self):
+        for phase in ("candidate_installed", "candidate_started"):
+            with self.subTest(phase=phase):
+                self.reset_transaction()
+                self.install_previous()
+                path = self.manifest(previous=True)
+                manifest_hash = supervisor.sha256(path)
+                owner = supervisor.Supervisor(self.layout)
+                manifest, candidate_binary, candidate_environment, *_ = owner.validated_transaction(
+                    self.transaction_id, manifest_hash
+                )
+                self.layout.binary.write_bytes(candidate_binary.read_bytes())
+                self.layout.environment.write_bytes(candidate_environment.read_bytes())
+                supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+                owner.transaction_status(manifest, manifest_hash, "activating", phase=phase)
+                owner.stop_recorded_orphan = mock.Mock()
+                owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
+                    44, 102, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+                ))
+
+                owner.reconcile()
+
+                status = __import__("json").loads(self.layout.status_file.read_text())
+                self.assertEqual("committed", status["state"])
+                self.assertEqual("new binary", self.layout.binary.read_text())
+                self.assertEqual("MODE=new\n", self.layout.environment.read_text())
+                self.assertEqual("b" * 40, self.layout.deployed_sha.read_text().strip())
+                self.assertFalse(self.layout.active_file.exists())
+                owner.start_child.assert_called_once()
+                self.transaction.chmod(0o700)
+
+    def test_reboot_restarts_and_verifies_committed_runtime(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, candidate_binary, candidate_environment, *_ = owner.validated_transaction(
+            self.transaction_id, manifest_hash
+        )
+        self.layout.binary.write_bytes(candidate_binary.read_bytes())
+        self.layout.environment.write_bytes(candidate_environment.read_bytes())
+        owner.transaction_status(manifest, manifest_hash, "committed")
+        owner.stop_recorded_orphan = mock.Mock()
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
+            45, 103, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+        ))
+
+        owner.reconcile()
+
+        owner.start_child.assert_called_once_with(
+            [str(self.layout.binary)],
+            mock.ANY,
+            supervisor.RuntimeIdentity("2.0.0", "b" * 12),
+            "http://127.0.0.1:49155/api/version",
+            1,
+        )
+        self.assertEqual("committed", __import__("json").loads(self.layout.status_file.read_text())["state"])
+
+    def test_restart_releases_claim_after_terminal_status_was_persisted(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, candidate_binary, candidate_environment, *_ = owner.validated_transaction(
+            self.transaction_id, manifest_hash
+        )
+        self.layout.binary.write_bytes(candidate_binary.read_bytes())
+        self.layout.environment.write_bytes(candidate_environment.read_bytes())
+        supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+        owner.transaction_status(manifest, manifest_hash, "committed")
+        owner.stop_recorded_orphan = mock.Mock()
+        owner.start_child = mock.Mock(return_value=supervisor.ChildIdentity(
+            46, 104, supervisor.RuntimeIdentity("2.0.0", "b" * 12)
+        ))
+
+        owner.reconcile()
+
+        self.assertFalse(self.layout.active_file.exists())
+        owner.start_child.assert_called_once()
+
     def test_manifest_hash_mismatch_is_rejected_before_claim(self):
         self.manifest()
         owner = supervisor.Supervisor(self.layout)

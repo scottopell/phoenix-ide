@@ -323,10 +323,7 @@ class Supervisor:
         return {"protocol_version": PROTOCOL_VERSION, "supervisor_pid": os.getpid(), "child": None}
 
     def stop_child(self, timeout: float = 10) -> None:
-        if self.child is None:
-            self.child_identity = None
-            return
-        if self.child.poll() is None:
+        if self.child is not None and self.child.poll() is None:
             self.child.terminate()
             try:
                 self.child.wait(timeout=timeout)
@@ -335,6 +332,38 @@ class Supervisor:
                 self.child.wait(timeout=5)
         self.child = None
         self.child_identity = None
+        write_json_atomic(self.layout.state, self.status())
+
+    def stop_recorded_orphan(self, timeout: float = 10) -> None:
+        if not self.layout.state.exists():
+            return
+        try:
+            child = json.loads(self.layout.state.read_text()).get("child")
+            if child is None:
+                return
+            pid = int(child["pid"])
+            recorded_start = int(child["proc_start_time"])
+            process = Path("/proc") / str(pid)
+            if process.stat().st_uid != self.owner_uid or proc_start_time(pid) != recorded_start:
+                return
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, SupervisorError):
+            return
+        os.kill(pid, 15)
+        deadline = time.monotonic() + timeout
+        while process.exists() and time.monotonic() < deadline:
+            try:
+                if proc_start_time(pid) != recorded_start:
+                    break
+            except SupervisorError:
+                break
+            time.sleep(0.05)
+        else:
+            if process.exists():
+                try:
+                    if proc_start_time(pid) == recorded_start:
+                        os.kill(pid, 9)
+                except SupervisorError:
+                    pass
         write_json_atomic(self.layout.state, self.status())
 
     def start_child(self, command: list[str], env: dict[str, str], expected: RuntimeIdentity, health_url: str, timeout: float) -> ChildIdentity:
@@ -370,10 +399,20 @@ class Supervisor:
             return {"ok": True, "state": self.activate(transaction_id, manifest_hash)}
         raise SupervisorError("unsupported supervisor action")
 
-    def transaction_status(self, manifest: TransactionManifest, state: str, failure: Optional[str] = None, rollback_failure: Optional[str] = None) -> None:
+    def transaction_status(
+        self,
+        manifest: TransactionManifest,
+        manifest_hash: str,
+        state: str,
+        failure: Optional[str] = None,
+        rollback_failure: Optional[str] = None,
+        phase: Optional[str] = None,
+    ) -> None:
         write_json_atomic(self.layout.status_file, {
             "transaction_id": manifest.transaction_id,
+            "manifest_sha256": manifest_hash,
             "state": state,
+            "phase": phase,
             "source_commit": manifest.source_commit,
             "expected_version": manifest.expected.version,
             "expected_git_sha": manifest.expected.git_sha,
@@ -382,7 +421,9 @@ class Supervisor:
             "updated_at": time.time(),
         })
 
-    def activate(self, transaction_id: str, manifest_hash: str) -> str:
+    def validated_transaction(
+        self, transaction_id: str, manifest_hash: str
+    ) -> tuple[TransactionManifest, Path, Path, Optional[Path], Optional[Path]]:
         if not TRANSACTION_RE.fullmatch(transaction_id) or not SHA256_RE.fullmatch(manifest_hash):
             raise SupervisorError("malformed immutable transaction reference")
         transaction = self.layout.transactions / transaction_id
@@ -410,6 +451,53 @@ class Supervisor:
         rollback_environment = validate_artifact(transaction, manifest.rollback_environment) if manifest.rollback_environment else None
         if manifest.previous is not None and (rollback_binary is None or rollback_environment is None):
             raise SupervisorError("existing runtime has incomplete rollback inputs")
+        return manifest, candidate_binary, candidate_environment, rollback_binary, rollback_environment
+
+    def restore_previous(
+        self,
+        manifest: TransactionManifest,
+        manifest_hash: str,
+        failure: str,
+        rollback_binary: Optional[Path],
+        rollback_environment: Optional[Path],
+    ) -> str:
+        self.transaction_status(manifest, manifest_hash, "activating", failure, phase="rolling_back")
+        self.stop_child()
+        self.stop_recorded_orphan()
+        if manifest.previous is None:
+            self.layout.binary.unlink(missing_ok=True)
+            self.layout.environment.unlink(missing_ok=True)
+            self.layout.deployed_sha.unlink(missing_ok=True)
+        else:
+            if rollback_binary is None or rollback_environment is None or manifest.previous_health_url is None:
+                raise SupervisorError("existing runtime has incomplete rollback inputs")
+            prepared_binary = reserve_install(rollback_binary, self.layout.binary, 0o700)
+            prepared_environment = reserve_install(rollback_environment, self.layout.environment, 0o600)
+            try:
+                commit_install(prepared_binary, self.layout.binary)
+                commit_install(prepared_environment, self.layout.environment)
+            finally:
+                prepared_binary.unlink(missing_ok=True)
+                prepared_environment.unlink(missing_ok=True)
+            self.start_child(
+                [str(self.layout.binary)],
+                parse_environment(self.layout.environment),
+                manifest.previous,
+                manifest.previous_health_url,
+                manifest.health_timeout_secs,
+            )
+            if manifest.previous_deployed_sha is None:
+                self.layout.deployed_sha.unlink(missing_ok=True)
+            else:
+                write_text_atomic(self.layout.deployed_sha, manifest.previous_deployed_sha)
+        self.transaction_status(manifest, manifest_hash, "activation_failed_rolled_back", failure)
+        self.layout.active_file.unlink(missing_ok=True)
+        return "activation_failed_rolled_back"
+
+    def activate(self, transaction_id: str, manifest_hash: str) -> str:
+        manifest, candidate_binary, candidate_environment, rollback_binary, rollback_environment = self.validated_transaction(
+            transaction_id, manifest_hash
+        )
 
         self.layout.deploy_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.layout.deploy_dir, 0o700)
@@ -444,17 +532,18 @@ class Supervisor:
             except BaseException as exc:
                 for path in reserved:
                     path.unlink(missing_ok=True)
-                self.transaction_status(manifest, "precondition_failed", str(exc))
+                self.transaction_status(manifest, manifest_hash, "precondition_failed", str(exc))
                 if self.layout.active_file.read_text().strip() == transaction_id:
                     self.layout.active_file.unlink()
                 raise
 
-            self.transaction_status(manifest, "activating")
+            self.transaction_status(manifest, manifest_hash, "activating", phase="activating")
             try:
                 self.stop_child()
                 commit_install(candidate_binary_install, self.layout.binary)
                 commit_install(candidate_environment_install, self.layout.environment)
                 reserved = [path for path in reserved if path.exists()]
+                self.transaction_status(manifest, manifest_hash, "activating", phase="candidate_installed")
                 self.start_child(
                     [str(self.layout.binary)],
                     parse_environment(self.layout.environment),
@@ -462,38 +551,24 @@ class Supervisor:
                     manifest.expected_health_url,
                     manifest.health_timeout_secs,
                 )
+                self.transaction_status(manifest, manifest_hash, "activating", phase="candidate_started")
                 write_text_atomic(self.layout.deployed_sha, manifest.source_commit)
-                self.transaction_status(manifest, "committed")
+                self.transaction_status(manifest, manifest_hash, "committed")
                 self.layout.active_file.unlink(missing_ok=True)
                 return "committed"
             except Exception as activation_error:
                 try:
-                    self.stop_child()
-                    if manifest.previous is None:
-                        self.layout.binary.unlink(missing_ok=True)
-                        self.layout.environment.unlink(missing_ok=True)
-                        self.layout.deployed_sha.unlink(missing_ok=True)
-                    else:
-                        assert rollback_binary_install and rollback_environment_install and manifest.previous_health_url
-                        commit_install(rollback_binary_install, self.layout.binary)
-                        commit_install(rollback_environment_install, self.layout.environment)
-                        self.start_child(
-                            [str(self.layout.binary)],
-                            parse_environment(self.layout.environment),
-                            manifest.previous,
-                            manifest.previous_health_url,
-                            manifest.health_timeout_secs,
-                        )
-                        if manifest.previous_deployed_sha is None:
-                            self.layout.deployed_sha.unlink(missing_ok=True)
-                        else:
-                            write_text_atomic(self.layout.deployed_sha, manifest.previous_deployed_sha)
-                    self.transaction_status(manifest, "activation_failed_rolled_back", str(activation_error))
-                    self.layout.active_file.unlink(missing_ok=True)
-                    return "activation_failed_rolled_back"
+                    return self.restore_previous(
+                        manifest,
+                        manifest_hash,
+                        str(activation_error),
+                        rollback_binary,
+                        rollback_environment,
+                    )
                 except Exception as rollback_error:
                     self.transaction_status(
                         manifest,
+                        manifest_hash,
                         "activation_failed_rollback_failed",
                         str(activation_error),
                         str(rollback_error),
@@ -503,8 +578,120 @@ class Supervisor:
                 for path in reserved:
                     path.unlink(missing_ok=True)
 
+    def restart_installed(
+        self,
+        identity: Optional[RuntimeIdentity],
+        health_url: Optional[str],
+        timeout: float,
+    ) -> None:
+        self.stop_recorded_orphan()
+        if identity is None:
+            self.stop_child()
+            return
+        if health_url is None:
+            raise SupervisorError("durable runtime has no health endpoint")
+        self.start_child(
+            [str(self.layout.binary)],
+            parse_environment(self.layout.environment),
+            identity,
+            health_url,
+            timeout,
+        )
+
+    def terminal_runtime(
+        self, manifest: TransactionManifest, state: str
+    ) -> tuple[Optional[RuntimeIdentity], Optional[str]]:
+        if state == "committed":
+            return manifest.expected, manifest.expected_health_url
+        if state in {"activation_failed_rolled_back", "precondition_failed"}:
+            return manifest.previous, manifest.previous_health_url
+        raise SupervisorError(f"durable state {state!r} has no verified runtime")
+
+    def reconcile(self) -> None:
+        try:
+            status = json.loads(self.layout.status_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            status = {}
+        active = self.layout.active_file.exists()
+        transaction_id = self.layout.active_file.read_text().strip() if active else status.get("transaction_id")
+        if not isinstance(transaction_id, str):
+            return
+        try:
+            manifest_path = self.layout.transactions / transaction_id / "manifest.json"
+            manifest_hash = sha256(manifest_path)
+            manifest, _candidate_binary, _candidate_environment, rollback_binary, rollback_environment = self.validated_transaction(
+                transaction_id, manifest_hash
+            )
+            if not active:
+                if status.get("manifest_sha256") != manifest_hash:
+                    raise SupervisorError("durable transaction manifest identity changed")
+                identity, health_url = self.terminal_runtime(manifest, str(status.get("state")))
+                self.restart_installed(identity, health_url, manifest.health_timeout_secs)
+                return
+            if status.get("transaction_id") != transaction_id:
+                state = "activating"
+                phase = "prepared"
+            else:
+                if status.get("manifest_sha256") != manifest_hash:
+                    raise SupervisorError("interrupted transaction manifest identity changed")
+                state = status.get("state")
+                phase = status.get("phase")
+            if state in {"committed", "activation_failed_rolled_back", "precondition_failed"}:
+                identity, health_url = self.terminal_runtime(manifest, str(state))
+                self.restart_installed(identity, health_url, manifest.health_timeout_secs)
+                self.layout.active_file.unlink(missing_ok=True)
+                return
+            if state != "activating":
+                raise SupervisorError(f"active claim has unrecoverable durable state {state!r}")
+            if phase in {"candidate_installed", "candidate_started"}:
+                self.stop_recorded_orphan()
+                try:
+                    self.start_child(
+                        [str(self.layout.binary)],
+                        parse_environment(self.layout.environment),
+                        manifest.expected,
+                        manifest.expected_health_url,
+                        manifest.health_timeout_secs,
+                    )
+                    self.transaction_status(manifest, manifest_hash, "activating", phase="candidate_started")
+                    write_text_atomic(self.layout.deployed_sha, manifest.source_commit)
+                    self.transaction_status(manifest, manifest_hash, "committed")
+                    self.layout.active_file.unlink(missing_ok=True)
+                    return
+                except Exception as activation_error:
+                    failure = f"restart reconciliation candidate verification failed: {activation_error}"
+            elif phase in {"prepared", "activating", "rolling_back"}:
+                failure = status.get("failure") or f"restart reconciliation resumed from {phase}"
+            else:
+                raise SupervisorError(f"active claim has unrecoverable durable phase {phase!r}")
+            self.restore_previous(
+                manifest,
+                manifest_hash,
+                str(failure),
+                rollback_binary,
+                rollback_environment,
+            )
+        except Exception as reconciliation_error:
+            if not active:
+                raise
+            try:
+                status = json.loads(self.layout.status_file.read_text())
+                manifest_hash = status.get("manifest_sha256")
+                if isinstance(manifest_hash, str):
+                    manifest, *_ = self.validated_transaction(transaction_id, manifest_hash)
+                    self.transaction_status(
+                        manifest,
+                        manifest_hash,
+                        "activation_failed_rollback_failed",
+                        str(status.get("failure") or "supervisor interrupted during activation"),
+                        str(reconciliation_error),
+                    )
+            except Exception:
+                pass
+
     def serve(self) -> None:
         self.prepare_layout()
+        self.reconcile()
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(self.layout.socket))
