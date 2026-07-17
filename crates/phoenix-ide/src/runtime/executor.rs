@@ -5158,12 +5158,14 @@ where
     }
 
     /// Request continuation summary from LLM (REQ-BED-020)
-    #[allow(clippy::needless_pass_by_value)] // Consistent with Effect signature
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
     fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>) {
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
+        let root_conv_id = self.context.root_conversation_id.clone();
+        let request_id = uuid::Uuid::new_v4().to_string();
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
 
@@ -5244,7 +5246,12 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
-                telemetry: None,
+                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                    conversation_id: conv_id.clone(),
+                    root_conversation_id: root_conv_id,
+                    request_id,
+                    retry_attempt: 1,
+                }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.
