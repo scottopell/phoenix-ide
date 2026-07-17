@@ -1741,7 +1741,19 @@ fn evidence_json(evidence: &WakeTerminalEvidence) -> Value {
             json!({"type":"tmux_window","identity":resource_json(&WakeResourceIdentity::TmuxWindow(value.identity.clone())),"status":tmux_status(value.status),"occurred_at":value.occurred_at.0,"exit_code":value.exit_code,"duration_ms":value.duration_ms,"final_tail":value.final_tail})
         }
         WakeTerminalEvidence::Subagent(value) => {
-            json!({"type":"subagent","identity":resource_json(&WakeResourceIdentity::Subagent(value.identity.clone())),"status":format!("{:?}", value.status),"occurred_at":value.occurred_at.0,"result":value.result})
+            let outcome = match &value.outcome {
+                phoenix_workflow::wake_profile::SubagentTerminalOutcome::SubmitResult { result } =>
+                    json!({"type":"submit_result","result":result}),
+                phoenix_workflow::wake_profile::SubagentTerminalOutcome::SubmitError { error } =>
+                    json!({"type":"submit_error","error":error}),
+                phoenix_workflow::wake_profile::SubagentTerminalOutcome::ImplicitTextCompletion { result } =>
+                    json!({"type":"implicit_text_completion","result":result}),
+                phoenix_workflow::wake_profile::SubagentTerminalOutcome::RuntimeFailure { kind, error } =>
+                    json!({"type":"runtime_failure","kind":kind,"error":error}),
+                phoenix_workflow::wake_profile::SubagentTerminalOutcome::ContextExhausted =>
+                    json!({"type":"context_exhausted"}),
+            };
+            json!({"type":"subagent","identity":resource_json(&WakeResourceIdentity::Subagent(value.identity.clone())),"occurred_at":value.occurred_at.0,"outcome":outcome})
         }
     }
 }
