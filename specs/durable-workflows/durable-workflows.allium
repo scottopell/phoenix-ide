@@ -6,6 +6,9 @@
 -- and reducer mapping.
 --
 -- Requirement traceability: REQ-DWF-001 through REQ-DWF-018, REQ-DWF-029 through REQ-DWF-042.
+-- Profile imports extend this core with REQ-DWF-CHAT-001 through REQ-DWF-CHAT-011,
+-- REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and
+-- REQ-DWF-CREATE-001 through REQ-DWF-CREATE-005.
 
 ------------------------------------------------------------
 -- Types

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-18
-- **Affects:** REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042, REQ-DWF-WAKE-002 through REQ-DWF-WAKE-005, REQ-DWF-CREATE-001 through REQ-DWF-CREATE-004
+- **Affects:** REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042, REQ-DWF-CHAT-001 through REQ-DWF-CHAT-011, REQ-DWF-WAKE-002 through REQ-DWF-WAKE-005, REQ-DWF-CREATE-001 through REQ-DWF-CREATE-004
 
 ## Context
 
@@ -26,9 +26,14 @@ incompatible active work explicitly rather than keep an indefinite multi-version
 deployment platform inside the steady-state engine.
 
 The durable-workflow contract still needs to cover wake, creation, direct turns,
-future coordinator loops, and long-running remote executors. The question is not
-whether Phoenix keeps a shared durable-workflow engine. The question is which
-facts the permanent engine must represent structurally.
+future coordinator loops, and long-running remote executors. Direct turns in
+particular need stable resolved-target message identity, immutable prepared
+payloads that resolve file and skill inputs before acceptance, typed committed
+and replay outcomes, target-local runtime arbitration, exact runtime
+reconciliation, and independent per-target fan-out without letting secondary
+consumers redefine acceptance.
+The question is not whether Phoenix keeps a shared durable-workflow engine. The
+question is which facts the permanent engine must represent structurally.
 
 ## Options considered
 
@@ -64,6 +69,10 @@ profile actually needs in the chosen topology:
   ambiguity handling;
 - one canonical durable delivery lifecycle plus optional runtime-acceptance
   bookkeeping where the profile needs a later runtime start;
+- direct-turn identities bound to resolved targets with immutable prepared
+  payloads, typed committed and replay outcomes, target-local runtime
+  arbitration, exact-ID runtime reconciliation, and independent per-target
+  fan-out plus separate additional-consumer cursors;
 - typed profile kind/version plus migrations or explicit incompatible-work
   preservation;
 - durable submit, durable handle receipt when available, and reclaimable observe

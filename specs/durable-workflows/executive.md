@@ -34,6 +34,7 @@ The current normative package comprises:
 
 - `requirements.md`
 - `durable-workflows.allium`
+- `direct-chat-profile.allium`
 - `wake-profile.allium`
 - `creation-profile.allium`
 - ADR-013 through ADR-016 and ADR-019 in `specs/adrs/`
@@ -43,16 +44,19 @@ These artifacts now state:
 1. one scheduler authority per SQLite database;
 2. durable acknowledgement as the workflow-adoption boundary;
 3. stable externally retryable acceptance and direct-turn acceptance keyed by
-   durable identities;
-4. universal attempt fencing plus optional reclaimable leases only where the
+   resolved target-bound durable identities;
+4. a direct-chat profile with immutable prepared payloads, typed outcome and
+   replay variants, target-local runtime arbitration, exact-ID reconciliation,
+   and independent per-target fan-out;
+5. universal attempt fencing plus optional reclaimable leases only where the
    phase is reclaimable;
-5. structural execution capability classes and recovery policies;
-6. one canonical durable delivery lifecycle;
-7. submit-then-observe for long-running remote work;
-8. typed profile versioning and migration with explicit incompatible-work
+6. structural execution capability classes and recovery policies;
+7. one canonical durable delivery lifecycle;
+8. submit-then-observe for long-running remote work;
+9. typed profile versioning and migration with explicit incompatible-work
    handling;
-9. `CoalesceLatest` as the first explicit schedule policy;
-10. migration safety without permanent parallel authority.
+10. `CoalesceLatest` as the first explicit schedule policy;
+11. migration safety without permanent parallel authority.
 
 ## Implementation Status
 
@@ -62,6 +66,7 @@ These artifacts now state:
 | REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Specified, not implemented to new shape | Current implementation still assumes universal claimed-step leasing. |
 | REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Specified, not implemented to new shape | Existing code still reflects the superseded selector/shadow/drain worldview in adjacent spec and implementation history. |
 | REQ-DWF-029–042 externally retryable acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Specified only | These are normative requirements without matching implementation on this branch. |
+| REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | New normative profile for target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out; no matching implementation on this branch. |
 | REQ-DWF-WAKE-001–005 wake profile | Partially implemented under superseded architecture | Wake code exists, but not yet under the narrowed canonical-delivery and optional-lease contract. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only under new architecture | Earlier shadow and cutover machinery is superseded normatively; implementation has not been rewritten. |
 
@@ -82,6 +87,9 @@ implementation work still owes:
 - repository reshaping to one canonical delivery lifecycle;
 - typed migration and incompatible-work handling in place of permanent selector
   and drain machinery;
+- direct-chat acceptance/replay/conflict implementation against the new target-
+  bound exact-ID, immutable prepared-payload, and target-local runtime
+  arbitration contract;
 - wake vertical-slice repairs under the new contract;
 - creation-profile implementation against the new contract;
 - Allium, spec-shape, and timeless-language validation on every further spec

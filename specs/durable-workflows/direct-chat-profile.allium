@@ -1,0 +1,424 @@
+-- allium: 3
+-- Engine-backed direct-chat profile.
+--
+-- Core owns durable acknowledgement, workflow identity, canonical delivery,
+-- runtime-acceptance bookkeeping, and independent consumer cursors. This
+-- profile owns resolved-target message identity, immutable prepared payloads,
+-- typed acceptance or replay dispositions, target-local runtime-slot
+-- arbitration, steering, and exact-ID reconciliation.
+--
+-- Requirement traceability: REQ-DWF-038, REQ-DWF-CHAT-001 through
+-- REQ-DWF-CHAT-011.
+
+use "./durable-workflows.allium" as dwf
+
+------------------------------------------------------------
+-- Types
+------------------------------------------------------------
+
+enum DirectChatRejectReason {
+    malformed_request
+    | target_unavailable
+    | capability_closed
+}
+
+enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation }
+enum RuntimeSlotStatus { idle | accepted }
+enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
+enum CommittedOutcomeKind { RuntimeAccepted | QueuedSteering }
+enum DirectChatOutcomeKind {
+    RetryableUnaccepted
+    | RuntimeAccepted
+    | QueuedSteering
+    | ReplayRuntimeAccepted
+    | ReplayQueuedSteering
+    | ConflictingKeyReuse
+    | TerminalRejected
+}
+
+value ResolvedTarget {
+    conversation_id: String
+    successor_conversation_id: String?
+}
+
+value PreparedPayloadPart {
+    kind: PayloadSourceKind
+    source_fingerprint: String
+    resolved_content_fingerprint: String
+}
+
+value PreparedDirectChatPayload {
+    user_message_id: String
+    user_text_fingerprint: String
+    parts: List<PreparedPayloadPart>
+    full_payload_fingerprint: String
+}
+
+value TargetBoundTurnKey {
+    resolved_target_key: String
+    client_message_id: String
+}
+
+value PreparedTurnFingerprint {
+    resolved_target_key: String
+    payload_fingerprint: String
+}
+
+value AcceptedTurnRef {
+    workflow_id: String
+    canonical_delivery_id: String?
+}
+
+value CommittedOutcome {
+    kind: CommittedOutcomeKind
+    runtime_accepted: AcceptedTurnRef? when kind = RuntimeAccepted
+    queued_steering: AcceptedTurnRef? when kind = QueuedSteering
+}
+
+value DirectChatOutcome {
+    kind: DirectChatOutcomeKind
+    retryable_unaccepted: TargetBoundTurnKey? when kind = RetryableUnaccepted
+    runtime_accepted: AcceptedTurnRef? when kind = RuntimeAccepted
+    queued_steering: AcceptedTurnRef? when kind = QueuedSteering
+    replay_runtime_accepted: AcceptedTurnRef? when kind = ReplayRuntimeAccepted
+    replay_queued_steering: AcceptedTurnRef? when kind = ReplayQueuedSteering
+    conflicting_key_reuse: PreparedTurnFingerprint? when kind = ConflictingKeyReuse
+    terminal_rejected: DirectChatRejectReason? when kind = TerminalRejected
+}
+
+------------------------------------------------------------
+-- Actors and profile-owned entities
+------------------------------------------------------------
+
+actor DirectChatClient {}
+actor DirectChatAdapter {}
+actor DirectChatCoordinator {}
+actor DirectChatRuntime {}
+
+entity DirectChatAcceptance {
+    turn_key: TargetBoundTurnKey
+    resolved_target: ResolvedTarget
+    prepared_payload: PreparedDirectChatPayload
+    prepared_fingerprint: PreparedTurnFingerprint
+    accepted_turn: AcceptedTurnRef
+    committed_outcome: CommittedOutcome?
+    runtime_delivery: dwf/Delivery?
+    runtime_acceptance: dwf/RuntimeAcceptance?
+    accepted_at: Timestamp
+}
+
+entity RuntimeTargetSlot {
+    resolved_target_key: String
+    accepted_turn: AcceptedTurnRef
+    status: RuntimeSlotStatus
+
+    transitions status {
+        idle -> accepted
+        terminal: accepted
+    }
+}
+
+entity DirectChatConsumerCursor {
+    accepted_turn: AcceptedTurnRef
+    consumer_kind: String
+    status: ConsumerProgressStatus
+    last_error: String?
+
+    transitions status {
+        owed -> in_progress
+        owed -> delivered
+        owed -> failed
+        owed -> suppressed
+        in_progress -> delivered
+        in_progress -> failed
+        in_progress -> suppressed
+        failed -> in_progress
+        failed -> delivered
+        terminal: delivered, suppressed
+    }
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- profile_ref(), next_workflow_id(), target_bound_key(resolved_target, client_message_id), resolved_target_key(resolved_target)
+-- resolved_target_for(request), target_resolution_is_adapter_only(request), target_resolution_preserves_permissions(request)
+-- rejection_reason_for(request), prepared_parts_for(request), parts_are_fully_resolved(parts)
+-- prepared_payload_for(request, resolved_target), prepared_fingerprint_for(resolved_target, payload)
+-- immutable_after_acceptance(payload), immutable_after_acceptance(fingerprint)
+-- same_key_existing_acceptance(turn_key), fingerprints_match(left, right)
+-- conflicting_fingerprint(existing_acceptance), runtime_slot_for(resolved_target), slot_is_available(slot)
+-- canonical_delivery_for(acceptance), runtime_acceptance_for(delivery), runtime_identity_matches_acceptance(acceptance, runtime_acceptance)
+-- committed_outcome_for(acceptance), replay_of(outcome), steering_target_matches_successor(acceptance)
+-- target_can_accept_runtime(resolved_target), queued_steering_ref(acceptance), runtime_accepted_ref(acceptance)
+-- consumer_cursor_for(acceptance, consumer_kind), cursor_progress_is_secondary_only(cursor)
+-- exact_acceptance_lookup(turn_key), transcript_window_lookup_is_non_authoritative(turn_key)
+-- coordinator_targets_for(request), target_preparations_are_independent(request)
+-- runtime_admission_is_per_target(resolved_target), no_atomic_batch_across_targets(targets)
+-- crash_cut_preserves_acceptance(turn_key), mutable_sources_can_change_after_request(request)
+-- prepared_payload_ignores_later_source_mutation(acceptance), replay_finds_exact_turn(turn_key)
+-- same_key_race_converges_or_conflicts(turn_key), different_key_race_is_target_local(resolved_target)
+-- restart_preserves_committed_outcome(turn_key), runtime_steering_is_monotonic(acceptance)
+-- terminal_rejected_outcome(request), prepared_event_emitted(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+-- retryable_unaccepted_outcome(turn_key), conflicting_key_reuse_outcome(prepared_fingerprint)
+-- runtime_accepted_outcome(accepted_turn), queued_steering_outcome(accepted_turn)
+-- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
+-- independent_prepared_events_emitted(request, targets)
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant PreparedPayloadIsResolvedAndImmutable {
+    -- Every accepted direct-chat payload is fully resolved before durable
+    -- acceptance, including inline file references and skill invocation content,
+    -- and later caller-visible mutation cannot rewrite the prepared payload or
+    -- prepared fingerprint.
+    true
+}
+
+invariant AcceptedTurnIdentityIsTargetBound {
+    -- A direct-chat acceptance key is the pair of resolved target identity and
+    -- client message identity. That same resolved target key also scopes the
+    -- prepared fingerprint and runtime reconciliation identity.
+    true
+}
+
+invariant SameKeyConvergesOrConflicts {
+    -- Reusing one target-bound key either converges to the same accepted turn
+    -- when fingerprints match or yields ConflictingKeyReuse when they differ;
+    -- the profile never creates two distinct accepted turns for one key.
+    true
+}
+
+invariant RuntimeAcceptanceIsSingleWinnerPerTarget {
+    -- For one resolved target and one runtime-admission opportunity, at most one
+    -- accepted turn commits RuntimeAccepted. Concurrent different-key turns may
+    -- both be durably accepted, but reducer/runtime arbitration may leave the
+    -- non-winning turn durably QueuedSteering instead.
+    true
+}
+
+invariant RuntimeAcceptanceMatchesExactAcceptedTurn {
+    -- Runtime acceptance, when present, always references the exact accepted turn
+    -- identity rather than a transcript offset, pagination window, or latest-
+    -- message guess.
+    true
+}
+
+invariant SecondaryEffectsDoNotRewriteAcceptance {
+    -- Runtime delivery, notification, indexing, audit export, and other
+    -- secondary consumer progress are monotonic views over an already accepted
+    -- turn and cannot revoke or replace that turn's acceptance identity.
+    true
+}
+
+invariant TranscriptWindowsAreNotIdentityAuthority {
+    -- A missing message in a loaded transcript slice cannot justify a new direct-
+    -- chat acceptance; exact-ID lookup and replay remain authoritative.
+    true
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RejectBeforeDurableAcceptance {
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) != null
+
+    ensures: terminal_rejected_outcome(request)
+}
+
+rule ResolveTargetAndPrepareImmutablePayloadBeforeAcceptance {
+    when: DirectChatRequested(client, request)
+    requires: profile_ref() = profile_ref()
+    requires: rejection_reason_for(request) = null
+    requires: target_resolution_is_adapter_only(request)
+    requires: target_resolution_preserves_permissions(request)
+
+    let resolved_target = resolved_target_for(request)
+    let prepared_payload = prepared_payload_for(request, resolved_target)
+    let prepared_fingerprint = prepared_fingerprint_for(resolved_target, prepared_payload)
+    let turn_key = target_bound_key(resolved_target, prepared_payload.user_message_id)
+
+    ensures: parts_are_fully_resolved(prepared_payload.parts)
+    ensures: prepared_fingerprint.resolved_target_key = resolved_target_key(resolved_target)
+    ensures: prepared_event_emitted(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+}
+
+rule NewAcceptanceBeginsRetryableUntilCommittedOutcomeExists {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) = null
+
+    ensures: DirectChatAcceptance.created(
+        turn_key: turn_key,
+        resolved_target: resolved_target,
+        prepared_payload: prepared_payload,
+        prepared_fingerprint: prepared_fingerprint,
+        accepted_turn: AcceptedTurnRef{workflow_id: next_workflow_id(), canonical_delivery_id: null},
+        committed_outcome: null,
+        runtime_delivery: null,
+        runtime_acceptance: null,
+        accepted_at: now()
+    )
+    ensures: retryable_unaccepted_outcome(turn_key)
+}
+
+rule SameKeyReplayReturnsExistingCommittedOutcome {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key).committed_outcome != null
+
+    let acceptance = same_key_existing_acceptance(turn_key)
+    let outcome = committed_outcome_for(acceptance)
+
+    ensures: replay_of(outcome)
+}
+
+rule SameKeyConflictRejectsDifferentPreparedFingerprint {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: not fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+
+    ensures: conflicting_key_reuse_outcome(conflicting_fingerprint(same_key_existing_acceptance(turn_key)))
+}
+
+rule RuntimeAcceptanceWinsThePerTargetSlot {
+    when: RuntimeAdmissionRequested(acceptance)
+    requires: acceptance.committed_outcome = null
+    requires: runtime_admission_is_per_target(acceptance.resolved_target)
+    requires: runtime_slot_for(acceptance.resolved_target) = null or slot_is_available(runtime_slot_for(acceptance.resolved_target))
+
+    let delivery = canonical_delivery_for(acceptance)
+    let runtime_acceptance = runtime_acceptance_for(delivery)
+
+    ensures: RuntimeTargetSlot.created(
+        resolved_target_key: acceptance.turn_key.resolved_target_key,
+        accepted_turn: acceptance.accepted_turn,
+        status: accepted
+    )
+    ensures: acceptance.runtime_delivery = delivery
+    ensures: acceptance.runtime_acceptance = runtime_acceptance
+    ensures: acceptance.committed_outcome = CommittedOutcome{kind: RuntimeAccepted, runtime_accepted: runtime_accepted_ref(acceptance)}
+    ensures: runtime_accepted_outcome(runtime_accepted_ref(acceptance))
+}
+
+rule RuntimeContentionQueuesSteeringWithoutRevokingAcceptance {
+    when: RuntimeAdmissionRequested(acceptance)
+    requires: acceptance.committed_outcome = null
+    requires: runtime_admission_is_per_target(acceptance.resolved_target)
+    requires: runtime_slot_for(acceptance.resolved_target) != null
+    requires: not slot_is_available(runtime_slot_for(acceptance.resolved_target))
+
+    ensures: acceptance.committed_outcome = CommittedOutcome{kind: QueuedSteering, queued_steering: queued_steering_ref(acceptance)}
+    ensures: queued_steering_outcome(queued_steering_ref(acceptance))
+}
+
+rule ReplayReturnsQueuedSteeringAfterCommittedQueueOutcome {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = QueuedSteering
+
+    ensures: replay_queued_steering_outcome(queued_steering_ref(same_key_existing_acceptance(turn_key)))
+}
+
+rule ReplayReturnsRuntimeAcceptedAfterCommittedRuntimeOutcome {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = RuntimeAccepted
+
+    ensures: replay_runtime_accepted_outcome(runtime_accepted_ref(same_key_existing_acceptance(turn_key)))
+}
+
+rule SteeringConversionPreservesAcceptedIdentity {
+    when: RuntimeSteeringConverted(acceptance)
+    requires: acceptance.committed_outcome.kind = QueuedSteering
+    requires: steering_target_matches_successor(acceptance)
+
+    ensures: runtime_steering_is_monotonic(acceptance)
+    ensures: acceptance.accepted_turn = acceptance.accepted_turn
+}
+
+rule ExactIdLookupReconcilesOutsideTranscriptWindows {
+    when: DirectChatReconciliationRequested(turn_key)
+    requires: exact_acceptance_lookup(turn_key) != null
+
+    ensures: replay_finds_exact_turn(turn_key)
+}
+
+rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
+    when: SecondaryConsumerProgressed(acceptance, consumer_kind)
+    requires: acceptance.committed_outcome != null
+
+    ensures: consumer_cursor_for(acceptance, consumer_kind)
+    ensures: acceptance.accepted_turn = acceptance.accepted_turn
+}
+
+rule CoordinatorMultiTargetFanOutCreatesIndependentOrdinaryAcceptances {
+    when: CoordinatorDirectChatRequested(coordinator, request)
+    requires: target_preparations_are_independent(request)
+
+    let targets = coordinator_targets_for(request)
+
+    ensures: no_atomic_batch_across_targets(targets)
+    ensures: independent_prepared_events_emitted(request, targets)
+}
+
+------------------------------------------------------------
+-- Verification surfaces
+------------------------------------------------------------
+
+surface DirectChatDispositionSurface {
+    facing turn_key: TargetBoundTurnKey
+
+    exposes:
+        exact_acceptance_lookup(turn_key)
+        DirectChatOutcome
+
+    @guarantee TypedOutcomeFamily
+        -- A lookup or replay yields exactly one typed outcome from the closed
+        -- family RetryableUnaccepted, RuntimeAccepted, QueuedSteering,
+        -- ReplayRuntimeAccepted, ReplayQueuedSteering, ConflictingKeyReuse, or
+        -- TerminalRejected.
+
+    @guarantee ExactIdAuthority
+        -- Lookup is keyed by the target-bound message identity. Transcript window
+        -- position is never authoritative for replay or conflict decisions.
+}
+
+surface DirectChatCrashAndRaceVerification {
+    facing turn_key: TargetBoundTurnKey
+    facing resolved_target: ResolvedTarget
+
+    demonstrates:
+        crash_cut_preserves_acceptance(turn_key)
+        same_key_race_converges_or_conflicts(turn_key)
+        different_key_race_is_target_local(resolved_target)
+        restart_preserves_committed_outcome(turn_key)
+
+    @guarantee RuntimeBoundaryCoverage
+        -- Verification covers crash after observation, crash after durable
+        -- acceptance, and crash before and after runtime acceptance.
+
+    @guarantee SteeringCoverage
+        -- Verification covers queued-steering commitment, steering conversion,
+        -- and replay of either committed outcome.
+}
+
+surface DirectChatMutableInputVerification {
+    facing acceptance: DirectChatAcceptance
+    facing request: String
+
+    demonstrates:
+        mutable_sources_can_change_after_request(request)
+        prepared_payload_ignores_later_source_mutation(acceptance)
+
+    @guarantee MutableReferenceCoverage
+        -- Verification covers later mutation of caller-owned buffers, file
+        -- contents, and skill invocation definitions after durable acceptance.
+}

@@ -303,12 +303,154 @@ class.
 
 WHEN Phoenix accepts a direct turn whose outcome may span a crash boundary before
 terminal user-visible completion
-THE SYSTEM SHALL durably bind the client message identity to exactly one accepted
-workflow or equivalent durable turn obligation before returning accepted.
+THE SYSTEM SHALL durably bind the resolved target and client message identity to
+exactly one accepted workflow or equivalent durable turn obligation before
+returning accepted.
 
-A replay of the same client message identity SHALL return the same durable
-acceptance result or terminal outcome. A conflicting replay under the same client
-message identity SHALL be rejected rather than start another direct turn.
+The durable binding SHALL be keyed by the same resolved target identity Phoenix
+uses for runtime delivery and transcript reconciliation, not by incidental request
+metadata or a later-derived projection. A replay of the same direct-turn request
+under the same resolved target and client message identity SHALL return the same
+durable acceptance result or terminal outcome. A conflicting replay under that
+same resolved target and client message identity SHALL be rejected rather than
+start another direct turn.
+
+### Direct-Chat Profile
+
+### REQ-DWF-CHAT-001: Resolved Target-Bound Message Identity
+
+WHEN Phoenix accepts or replays a direct-chat turn
+THE direct-chat profile SHALL resolve the target conversation or successor before
+durable acceptance and SHALL bind the user message identity to that resolved
+runtime target.
+
+The same client-supplied message identifier reused against a different resolved
+target SHALL be a different identity domain. Within one resolved target, the
+profile SHALL treat that message identifier as a stable exact identifier for
+acceptance replay, runtime reconciliation, and transcript correlation.
+
+### REQ-DWF-CHAT-002: Prepared Immutable Payload Before Durable Acceptance
+
+WHEN a direct-chat turn crosses the durable acknowledgement boundary
+THE direct-chat profile SHALL first prepare an immutable accepted payload and a
+stable fingerprint derived from the exact user-visible message content, resolved
+target, and other semantics that affect runtime behavior.
+
+Preparation SHALL resolve inline file references and skill invocation content
+into the immutable accepted payload before durable acceptance. After durable
+acceptance, later mutation of caller-owned input buffers, request objects,
+transcript windows, file contents, skill definitions, or adapter-local
+presentation state SHALL NOT change the accepted payload, fingerprint, or
+conflict decision for that accepted turn.
+
+
+### REQ-DWF-CHAT-003: Typed Direct-Turn Disposition
+
+EVERY durable direct-chat acceptance lookup, replay, reconciliation, or conflict
+resolution SHALL produce one typed disposition.
+
+The disposition family SHALL distinguish at least RetryableUnaccepted,
+QueuedSteering, RuntimeAccepted, ReplayQueuedSteering,
+ReplayRuntimeAccepted, ConflictingKeyReuse, and TerminalRejected. The profile
+SHALL NOT encode these cases as ambiguous booleans or by omitting fields whose
+absence could mean either replay, steering, conflict, runtime acceptance,
+conflict, or rejection.
+
+### REQ-DWF-CHAT-004: Same-Key Convergence and Conflict
+
+WHEN two submissions present the same resolved target and client message identity
+THE direct-chat profile SHALL compare the prepared immutable fingerprint before a
+second durable acceptance is permitted.
+
+Equal fingerprints SHALL converge to the same accepted durable turn identity and
+typed replay disposition. Different fingerprints under that same key SHALL produce
+a durable same-key conflict disposition and SHALL NOT start another turn.
+
+### REQ-DWF-CHAT-005: Different-Key Direct-Turn Concurrency
+
+WHEN two direct-chat submissions target the same resolved conversation but carry
+different client message identities
+THE SYSTEM MAY accept them concurrently as distinct durable turn obligations.
+
+Their concurrency SHALL be serialized only by the normal runtime and reducer
+contracts for that target conversation. Different message identities racing on
+one resolved target SHALL NOT both become durably RuntimeAccepted for the same
+runtime-admission opportunity; reducer or runtime arbitration MAY leave one as a
+distinct accepted turn whose committed outcome is durably QueuedSteering.
+Acceptance replay or conflict for one key SHALL NOT consume, suppress, or
+redefine acceptance for a different key.
+
+### REQ-DWF-CHAT-006: Durable Exact Runtime Acceptance
+
+WHEN a direct-chat turn progresses from durable acceptance into runtime work
+THE direct-chat profile SHALL durably record exact runtime acceptance of that same
+accepted turn identity.
+
+Runtime start, retry, wakeup, or reducer delivery SHALL reconcile against that
+exact accepted turn identity rather than an approximate transcript position,
+window-relative offset, or best-effort latest message guess.
+
+### REQ-DWF-CHAT-007: Secondary Effects Cannot Reverse Acceptance
+
+WHEN follow-on reducer delivery, runtime startup, wake observation, notification,
+or any other secondary effect fails, retries, races, or is suppressed
+THE accepted direct-chat turn SHALL remain accepted.
+
+Secondary effects MAY add typed owed work, typed failure, or typed suppression,
+but they SHALL NOT retroactively revoke, remap, or replace the already accepted
+turn identity or transform accepted into never-accepted.
+
+### REQ-DWF-CHAT-008: Exact-ID Reconciliation Independent of Transcript Window
+
+WHEN Phoenix reconciles a durable direct-chat turn with runtime or transcript
+state after crash, restart, pagination, continuation, or transcript compaction
+THE SYSTEM SHALL use the exact accepted turn identity rather than depend on the
+message still appearing inside an arbitrary transcript window.
+
+A missing message in the currently loaded transcript slice SHALL trigger lookup,
+replay, steering, or typed reconciliation by exact identifier rather than a new
+acceptance or a window-relative guess.
+
+### REQ-DWF-CHAT-009: Independent Non-Atomic Fan-Out
+
+WHEN a direct-chat request resolves to multiple target conversations
+THE SYSTEM SHALL treat that coordinator fan-out as one independent ordinary
+acceptance attempt per resolved target rather than one atomic multi-target
+acceptance.
+
+Failure, retry, duplication, or restart for one resolved target SHALL NOT imply
+that another resolved target was unaccepted, unobserved, or must be replayed
+under a new turn identity. This rule is about multi-target direct-chat fan-out;
+generic additional durable consumers of one already accepted item remain covered
+by REQ-DWF-041.
+
+### REQ-DWF-CHAT-010: Capability Isolation
+
+THE direct-chat profile SHALL derive acceptance, replay, steering, conflict,
+rejection, runtime-start, and secondary-consumer capabilities from typed durable
+state for that exact accepted turn.
+
+Target resolution SHALL be an adapter that maps the request onto an ordinary
+conversation target or successor without broadening the caller's ordinary
+conversation permissions. A notification, indexing, or audit consumer SHALL NOT
+gain authority to redefine direct acceptance, and transcript presentation state
+SHALL NOT gain authority to start or reject runtime work.
+
+### REQ-DWF-CHAT-011: Crash, Race, and Mutable-Input Verification
+
+WHEN the direct-chat profile is verified
+THE SYSTEM SHALL exercise deterministic cases covering crash after observation,
+crash after durable acceptance, crash before and after runtime acceptance,
+concurrent same-key submissions with equal and unequal fingerprints,
+different-key concurrent submissions, steering conversion and replay, mutable
+caller input after acceptance, mutable file contents or skill definitions after
+acceptance, restart, runtime acceptance racing transcript visibility, and
+exact-ID reconciliation when the accepted message lies outside the loaded
+transcript window.
+
+The verification SHALL prove that acceptance identity, typed disposition,
+fingerprint comparison, runtime reconciliation, target-local runtime arbitration,
+and independent multi-target fan-out remain stable under those schedules.
 
 ### REQ-DWF-039: Typed Profile Migrations Prevent Silent Loss
 
