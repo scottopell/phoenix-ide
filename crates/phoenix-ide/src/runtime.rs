@@ -1191,9 +1191,7 @@ pub(crate) fn conversation_owns_work_scope(conv: &crate::db::Conversation) -> bo
     }
 }
 
-pub(crate) fn deterministic_explore_branch_for_worktree(
-    worktree_path: &std::path::Path,
-) -> Option<String> {
+fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
     let owner_id = worktree_path.file_name()?.to_str()?;
     let id_prefix: String = owner_id.chars().take(8).collect();
     Some(format!("task-pending-{id_prefix}"))

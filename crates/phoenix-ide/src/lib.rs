@@ -1384,7 +1384,7 @@ async fn reclaim_unowned_worktrees(db: &Database) {
             continue;
         }
         let branch = if owners.is_empty() {
-            crate::runtime::deterministic_explore_branch_for_worktree(&worktree)
+            None
         } else {
             crate::runtime::cleanup_branch_for_unowned_work_scope(&worktree, &owners)
         };
@@ -2067,6 +2067,34 @@ mod reconcile_worktrees_tests {
             .into_owned();
         let branch = "task-pending-rowless";
         add_worktree(&repo_root, &wt_path, branch);
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("rowless-only"),
+            "keep branch commit",
+        )
+        .unwrap();
+        let status = phoenix_core::git::command()
+            .args(["add", "rowless-only"])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = phoenix_core::git::command()
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "unmerged rowless work",
+            ])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
 
         reconcile_worktrees(&db).await;
 
@@ -2082,7 +2110,10 @@ mod reconcile_worktrees_tests {
             .status()
             .unwrap()
             .success();
-        assert!(!branch_exists);
+        assert!(
+            branch_exists,
+            "rowless cleanup must preserve an unmerged branch"
+        );
     }
 
     #[tokio::test]
