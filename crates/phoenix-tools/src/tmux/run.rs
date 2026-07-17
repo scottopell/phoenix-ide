@@ -1155,19 +1155,28 @@ mod tests {
         let sock = socket_tmp
             .path()
             .join("conv-tmux-run-long-after-ready.sock");
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        let status = tokio::process::Command::new("tmux")
-            .args([
-                "-S",
-                &sock.to_string_lossy(),
-                "has-session",
-                "-t",
-                window_id,
-            ])
-            .env_remove("TMUX")
-            .status()
-            .await
-            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = tokio::process::Command::new("tmux")
+                    .args([
+                        "-S",
+                        &sock.to_string_lossy(),
+                        "has-session",
+                        "-t",
+                        window_id,
+                    ])
+                    .env_remove("TMUX")
+                    .status()
+                    .await
+                    .unwrap();
+                if !status.success() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("window disappears after command exits");
         assert!(
             !status.success(),
             "window must disappear when the command later exits"

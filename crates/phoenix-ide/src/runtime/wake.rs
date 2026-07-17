@@ -994,7 +994,19 @@ mod tests {
         .unwrap();
         assert_eq!(graph_counts, (1, 1, 1, 1));
 
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                if matches!(
+                    manager.bash_handles().inspect_terminal(&handle_id).await,
+                    phoenix_tools::bash::BashTerminalInspection::Terminal { .. }
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bash handle reaches an observable terminal state");
         drain_due(&manager, "test-worker", Utc::now).await.unwrap();
         let repository = WorkflowRepository::new(manager.db().pool().clone());
         assert!(WakeWorkflowAdapter::new(&repository)

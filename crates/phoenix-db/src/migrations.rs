@@ -233,18 +233,23 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 44,
-        name: "create_workflow_protocol_registry_tables",
+        name: "replace_global_recall_with_coordinator",
         sql: MIGRATION_044,
     },
     Migration {
         version: 45,
-        name: "create_durable_workflow_core_tables",
+        name: "create_workflow_protocol_registry_tables",
         sql: MIGRATION_045,
     },
     Migration {
         version: 46,
-        name: "create_wake_profile_tables",
+        name: "create_durable_workflow_core_tables",
         sql: MIGRATION_046,
+    },
+    Migration {
+        version: 47,
+        name: "create_wake_profile_tables",
+        sql: MIGRATION_047,
     },
 ];
 
@@ -1291,6 +1296,16 @@ CREATE INDEX idx_creation_cleanup_due
 ";
 
 const MIGRATION_044: &str = r"
+CREATE TABLE coordinator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE RESTRICT
+);
+DROP TABLE IF EXISTS global_recall_messages;
+DROP TABLE IF EXISTS global_recall_sessions;
+";
+
+const MIGRATION_045: &str = r"
 CREATE TABLE IF NOT EXISTS workflow_protocol_selections (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
@@ -1332,7 +1347,7 @@ CREATE TABLE IF NOT EXISTS workflow_profile_executors (
 );
 ";
 
-const MIGRATION_045: &str = r"
+const MIGRATION_046: &str = r"
 CREATE TABLE IF NOT EXISTS external_acceptance_bindings (
     id TEXT PRIMARY KEY,
     selection_id TEXT NOT NULL,
@@ -1746,7 +1761,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_shadow_divergence_one_active
     WHERE resolved_at IS NULL;
 ";
 
-const MIGRATION_046: &str = r"
+const MIGRATION_047: &str = r"
 CREATE TABLE IF NOT EXISTS wake_registration_fences (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
