@@ -37,9 +37,12 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
+import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
+import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
+import { parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
@@ -198,171 +201,6 @@ const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
  *   as a narration of its next action (observed on claude-haiku-4-5-20251001).
  *   The actual tool call happens separately via the JSON API; this is just text.
  */
-function cleanThoughts(raw: string): string {
-  let text = raw.replace(/^\s*<thinking>\s*/i, '');
-  const closingIdx = text.search(/<\/thinking>/i);
-  if (closingIdx !== -1) {
-    text = text.slice(0, closingIdx);
-  }
-  return text.trim();
-}
-
-function isFiniteInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value);
-}
-
-function isBashToolInput(input: Record<string, unknown>): input is BashToolInput {
-  const op = input['op'];
-  if (op !== 'run' && op !== 'peek' && op !== 'wait' && op !== 'kill') return false;
-  for (const retiredKey of ['command', 'mode', 'peek', 'wait', 'kill']) {
-    if (input[retiredKey] !== undefined) return false;
-  }
-  if (input['cmd'] !== undefined && typeof input['cmd'] !== 'string') return false;
-  if (input['handle'] !== undefined && typeof input['handle'] !== 'string') return false;
-  if (input['label'] !== undefined && typeof input['label'] !== 'string') return false;
-  if (input['wait_seconds'] !== undefined && (!isFiniteInteger(input['wait_seconds']) || input['wait_seconds'] < 0)) return false;
-  if (input['signal'] !== undefined && input['signal'] !== 'TERM' && input['signal'] !== 'KILL') return false;
-  if (input['lines'] !== undefined && (!isFiniteInteger(input['lines']) || input['lines'] < 1)) return false;
-  if (input['since'] !== undefined && (!isFiniteInteger(input['since']) || input['since'] < 0)) return false;
-  return true;
-}
-
-function readWindowSuffix(input: Pick<BashToolInput, 'lines' | 'since'>): string {
-  if (typeof input.lines === 'number') return ` · last ${input.lines} lines`;
-  if (typeof input.since === 'number' && input.since > 0) return ` · since ${input.since}`;
-  return '';
-}
-
-function formatModernBashInput(input: BashToolInput, displayOverride?: string): { display: string; isMultiline: boolean } {
-  switch (input.op) {
-    case 'run': {
-      const cmd = input.cmd || '';
-      if (!cmd) return { display: 'bash run <missing cmd>', isMultiline: false };
-      const displayCmd = displayOverride || cmd;
-      const waitSuffix = typeof input.wait_seconds === 'number' ? ` · wait ${input.wait_seconds}s` : '';
-      return { display: `$ ${displayCmd}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: cmd.includes('\n') };
-    }
-    case 'peek': {
-      const handle = input.handle || '<missing handle>';
-      return { display: `peek ${handle}${readWindowSuffix(input)}`, isMultiline: false };
-    }
-    case 'wait': {
-      const handle = input.handle || '<missing handle>';
-      const waitSuffix = typeof input.wait_seconds === 'number' ? ` (up to ${input.wait_seconds}s)` : '';
-      return { display: `wait ${handle}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: false };
-    }
-    case 'kill': {
-      const handle = input.handle || '<missing handle>';
-      const signal = input.signal || 'TERM';
-      return { display: `kill ${handle} (${signal})`, isMultiline: false };
-    }
-  }
-}
-
-function bashInputCopyText(input: Record<string, unknown>): string {
-  if (isBashToolInput(input)) {
-    if (input.op === 'run') return input.cmd || JSON.stringify(input);
-    return JSON.stringify(input);
-  }
-  if (input['op'] === undefined) {
-    const legacyText = input['command'] || input['cmd'] || input['peek'] || input['wait'] || input['kill'];
-    if (legacyText) return String(legacyText);
-  }
-  return JSON.stringify(input, null, 2);
-}
-
-function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
-  switch (name) {
-    case 'bash': {
-      if (isBashToolInput(input)) {
-        return formatModernBashInput(input, displayOverride);
-      }
-      const legacyCommand = input['op'] === undefined ? String(input['command'] || input['cmd'] || '') : '';
-      if (legacyCommand) {
-        const displayCmd = displayOverride || legacyCommand;
-        return { display: `$ ${displayCmd}`, isMultiline: legacyCommand.includes('\n') };
-      }
-      const legacyJson = JSON.stringify(input);
-      return { display: `bash ${legacyJson}`, isMultiline: false };
-    }
-    case 'tmux': {
-      const args = (input['args'] as unknown[] | undefined) ?? [];
-      const argList = args.map((a) => String(a)).join(' ');
-      return { display: `tmux ${argList}`, isMultiline: false };
-    }
-    case 'think': {
-      const thoughts = cleanThoughts(String(input['thoughts'] || ''));
-      return { display: thoughts, isMultiline: thoughts.includes('\n') };
-    }
-    case 'patch': {
-      const path = String(input['path'] || '');
-      const patches = input['patches'] as Array<{ operation?: string }> | undefined;
-      const op = patches?.[0]?.operation || 'modify';
-      const count = patches?.length || 1;
-      const summary = count > 1 ? `${path}: ${count} patches` : `${path}: ${op}`;
-      return { display: summary, isMultiline: false };
-    }
-    case 'keyword_search': {
-      const query = String(input['query'] || '');
-      const terms = (input['search_terms'] as string[]) || [];
-      const termsStr = terms.length > 0 ? terms.slice(0, 3).join(', ') + (terms.length > 3 ? '...' : '') : '';
-      return { display: termsStr ? `"${query}" [${termsStr}]` : query, isMultiline: false };
-    }
-    case 'read_image': {
-      const path = String(input['path'] || '');
-      return { display: path, isMultiline: false };
-    }
-    case 'read_file': {
-      const path = String(input['path'] || '');
-      const offset = input['offset'] as number | undefined;
-      const limit = input['limit'] as number | undefined;
-      let display = path;
-      if (offset !== undefined || limit !== undefined) {
-        const start = offset ?? 1;
-        const end = limit !== undefined ? start + limit - 1 : undefined;
-        display = end !== undefined ? `${path}:${start}-${end}` : `${path}:${start}+`;
-      }
-      return { display, isMultiline: false };
-    }
-    case 'spawn_agents': {
-      const tasks = (input['tasks'] as Array<{ task?: string }>) || [];
-      const count = tasks.length;
-      return {
-        display: `${count} parallel task${count === 1 ? '' : 's'}`,
-        isMultiline: false,
-      };
-    }
-    case 'ask_user_question': {
-      const questions = (input['questions'] as Array<{ question?: string; options?: unknown[] }>) || [];
-      const first = questions[0];
-      const rawText = String(first?.question || '');
-      const flatText = rawText.replace(/\s+/g, ' ').trim();
-      const truncated = flatText.length > 80 ? flatText.slice(0, 80) + '…' : flatText;
-      const optionCount = Array.isArray(first?.options) ? first!.options!.length : 0;
-      const suffix = questions.length > 1
-        ? ` [+${questions.length - 1} more]`
-        : optionCount > 0 ? ` [${optionCount} options]` : '';
-      return { display: `"${truncated}"${suffix}`, isMultiline: false };
-    }
-    case 'search': {
-      const pattern = String(input['pattern'] || '');
-      const path = input['path'] ? String(input['path']) : '';
-      const include = input['include'] ? String(input['include']) : '';
-      let display = `"${pattern}"`;
-      if (path) display += ` in ${path}`;
-      if (include) display += ` (${include})`;
-      return { display, isMultiline: false };
-    }
-    default: {
-      if (name.startsWith('browser_')) {
-        const display = formatBrowserInput(name, input);
-        return { display, isMultiline: display.includes('\n') };
-      }
-      const str = JSON.stringify(input, null, 2);
-      return { display: str, isMultiline: str.includes('\n') };
-    }
-  }
-}
 
 function parseSlashCommand(text: string): { token: string; args: string } | null {
   const match = text.trim().match(/^(\/[A-Za-z0-9][\w:-]*)(?:\s+([\s\S]*))?$/);
@@ -492,95 +330,6 @@ function SkillToolBlock({
       )}
     </div>
   );
-}
-
-function truncateValue(s: string, max = 40): string {
-  return s.length > max ? s.slice(0, max) + '…' : s;
-}
-
-function formatBrowserInput(name: string, input: Record<string, unknown>): string {
-  switch (name) {
-    case 'browser_navigate': {
-      const url = String(input['url'] || '');
-      return `→ ${url}`;
-    }
-    case 'browser_eval': {
-      const expr = String(input['expression'] || '').replace(/\s+/g, ' ').trim();
-      return `eval: ${truncateValue(expr, 80)}`;
-    }
-    case 'browser_take_screenshot': {
-      const selector = input['selector'] ? String(input['selector']) : '';
-      return selector ? `screenshot of "${selector}"` : 'screenshot';
-    }
-    case 'browser_recent_console_logs': {
-      const limit = input['limit'] as number | undefined;
-      return limit !== undefined ? `console logs (${limit})` : 'console logs';
-    }
-    case 'browser_clear_console_logs': {
-      return 'clear console';
-    }
-    case 'browser_resize': {
-      const width = input['width'];
-      const height = input['height'];
-      return `resize ${width}x${height}`;
-    }
-    case 'browser_wait_for_selector': {
-      const selector = String(input['selector'] || '');
-      const visible = input['visible'] === true;
-      return visible ? `wait "${selector}" (visible)` : `wait "${selector}"`;
-    }
-    case 'browser_click': {
-      const selector = String(input['selector'] || '');
-      return `click "${selector}"`;
-    }
-    case 'browser_type': {
-      const selector = String(input['selector'] || '');
-      const text = String(input['text'] || '');
-      const clear = input['clear'] === true;
-      const verb = clear ? 'replace' : 'type';
-      return `${verb} "${selector}" = "${truncateValue(text)}"`;
-    }
-    case 'browser_key_press': {
-      const key = String(input['key'] || '');
-      const modifiers = (input['modifiers'] as string[]) || [];
-      const chord = modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key;
-      return `key: ${chord}`;
-    }
-    case 'browser_profile': {
-      const action = String(input['action'] || '');
-      switch (action) {
-        case 'run_scenario': {
-          const runs = input['runs'] ?? 1;
-          const warmup = input['warmup'] ?? 1;
-          const steps = Array.isArray(input['steps']) ? (input['steps'] as unknown[]).length : 0;
-          const tr = input['throttle_rate'];
-          const thr = tr !== undefined && tr !== null ? `, throttle ${String(tr)}x` : '';
-          const reset = input['reset'];
-          const resetStr =
-            reset === 'none'
-              ? ', reset:none'
-              : reset && typeof reset === 'object'
-                ? `, reset:${String((reset as Record<string, unknown>)['kind'] ?? '?')}`
-                : '';
-          const gcStr = input['gc_per_run'] === false ? ', gc:off' : '';
-          return `profile: scenario (${steps} steps × ${String(runs)} runs, ${String(warmup)} warmup${thr}${resetStr}${gcStr})`;
-        }
-        case 'throttle':
-          return `profile: throttle ${String(input['rate'] ?? '')}x`;
-        case 'trace_start': {
-          const cats = input['categories'] ? ` [${String(input['categories'])}]` : '';
-          return `profile: trace_start${cats}`;
-        }
-        case 'heap_snapshot':
-          return input['baseline'] ? 'profile: heap_snapshot (diff)' : 'profile: heap_snapshot';
-        default:
-          return action ? `profile: ${action}` : 'profile';
-      }
-    }
-    default: {
-      return JSON.stringify(input, null, 2);
-    }
-  }
 }
 
 // ============================================================================
@@ -854,6 +603,7 @@ export interface AgentTextHighlight {
 
 export type ConversationHighlight = AgentTextHighlight & (
   | { owner: 'agent-text' }
+  | { owner: 'tool-input'; toolUseId: string }
   | { owner: 'tool-result'; toolUseId: string }
 );
 
@@ -861,6 +611,7 @@ interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -885,7 +636,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -1198,6 +949,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                     block={block}
                     result={result}
                     onOpenFile={onOpenFile}
+                    onOpenCommissionReview={onOpenCommissionReview}
+                    requestSequenceId={message.sequence_id}
                     workScopeKey={workScopeKey}
                     knownResultIds={knownResultIds}
                     toolStartedAtMs={toolStartedAtMs}
@@ -1269,6 +1022,8 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
+  requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   revealRequest?: AgentTextRevealRequest | null;
@@ -2333,7 +2088,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
@@ -2451,6 +2206,11 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
       || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
     ? activeHighlight
     : null;
+  const inputActiveHighlight = activeHighlight?.owner === 'tool-input'
+    && activeHighlight.toolUseId === toolId
+    && activeHighlight.fragmentId === 'tool-use-input'
+    ? activeHighlight
+    : null;
 
   
   // Check if this is an image result.
@@ -2503,6 +2263,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
 
   useEffect(() => {
     if (!revealRequest) return;
+    if (revealRequest.revealTarget.kind === 'tool-use-input') {
+      if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
+      return;
+    }
     if (revealRequest.revealTarget.kind === 'tool-result-read-file') {
       if (revealRequest.revealTarget.toolUseId !== toolId) return;
       onRevealHandled?.(revealRequest);
@@ -2601,6 +2365,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     ? 'Copy operation'
     : 'Copy command';
 
+  const commissionReviewDisplayData = name === 'commission_review'
+    ? parseCommissionReviewResult(result?.display_data, resultText)
+    : null;
+  const commissionReviewInput = name === 'commission_review'
+    ? parseCommissionReviewInput(input as Record<string, unknown>)
+    : null;
+
   return (
     <div className="tool-block" data-tool-id={toolId}>
       {/* Tool header with name */}
@@ -2610,10 +2381,19 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
       </div>
 
       {/* Tool input - always visible */}
-      <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-        {inputDisplay}
-        <CopyButton text={rawInput} title={bashCopyTitle} />
-      </div>
+      {commissionReviewInput ? (
+        <CommissionReviewInputView input={commissionReviewInput} />
+      ) : (
+        <div
+          className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}
+          data-fragment-id="tool-use-input"
+        >
+          {inputActiveHighlight
+            ? renderHighlightedText(inputDisplay, inputActiveHighlight.start, inputActiveHighlight.end)
+            : inputDisplay}
+          <CopyButton text={rawInput} title={bashCopyTitle} />
+        </div>
+      )}
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
@@ -2676,6 +2456,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
               diff={toolActiveHighlight ? resultText : displayResult}
               toolUseId={toolId}
               activeHighlight={toolActiveHighlight}
+            />
+          ) : commissionReviewDisplayData ? (
+            <CommissionReviewSummaryCard
+              data={commissionReviewDisplayData}
+              formatDuration={formatToolDuration}
+              requestSequenceId={requestSequenceId}
+              onOpenFullReview={onOpenCommissionReview}
             />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse

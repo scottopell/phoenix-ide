@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DiffView } from './DiffView';
+import { __diffViewFindTestables, DiffView } from './DiffView';
 import * as searchProjectionModule from '../viewer-find/searchProjections';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -41,6 +41,31 @@ function addNoteViaGutter(body: string) {
   fireEvent.change(screen.getByPlaceholderText(/Add your note/), { target: { value: body } });
   fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
 }
+
+describe('DiffView find identities', () => {
+  it('bounds identities for arbitrarily long changed lines', () => {
+    const text = `token ${'x'.repeat(20_000)}`;
+    const id = __diffViewFindTestables.stableDiffMatchIds()({
+      sourceId: 'diff-line',
+      sourceText: text,
+      start: 0,
+      end: 5,
+      target: {
+        kind: 'diff-line',
+        section: 'committed',
+        filePath: 'src/min.js',
+        itemId: 'item-1',
+        side: 'additions',
+        lineNumber: 1,
+        startColumn: 0,
+        endColumn: 5,
+      },
+    });
+
+    expect(id).not.toContain(text);
+    expect(id.length).toBeLessThan(128);
+  });
+});
 
 describe('DiffView (Pierre CodeView wiring)', () => {
   beforeEach(() => resetCodeViewMock());

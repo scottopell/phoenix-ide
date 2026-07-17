@@ -10,6 +10,7 @@ import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierreDiffMapping';
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
+import { formatToolInput } from '../toolInputDisplay';
 
 export interface SearchableSourceMatch<TTarget> {
   sourceId: string;
@@ -201,6 +202,12 @@ export interface KeywordSearchRevealTarget {
   toolUseId: string;
 }
 
+export interface ToolUseInputRevealTarget {
+  kind: 'tool-use-input';
+  toolUseId: string;
+  fragmentId: string;
+}
+
 export interface ConversationTextFragmentRevealTarget {
   kind: 'agent-text';
   key: string;
@@ -208,6 +215,7 @@ export interface ConversationTextFragmentRevealTarget {
 
 export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
+  | ToolUseInputRevealTarget
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
   | ReadFileRevealTarget
@@ -1378,7 +1386,7 @@ export function buildKeywordSearchOutputProjection(
       path,
       explanation,
       fragment: {
-        fragmentId: `keyword-search-hit:${encodeURIComponent(semanticText)}:${duplicateIndex}`,
+        fragmentId: `keyword-search-hit:${encodeURIComponent(path)}:${boundedFragmentHash(semanticText)}:${duplicateIndex}`,
         semanticText,
         display: { title: path, body: explanation },
         revealTarget,
@@ -1470,7 +1478,20 @@ function agentTurnSources(
     }
     if (block.type === 'tool_use') {
       const toolResult = toolResultsByUseId.get(block.id ?? '');
-      if (!toolResult) return;
+      if (!toolResult) {
+        const toolUseId = block.id ?? '';
+        const inputText = formatToolInput(block.name || 'tool', block.input ?? {}, block.display).display;
+        if (inputText) {
+          const fragmentId = 'tool-use-input';
+          out.push({
+            role: `tool-use-input-${index}`,
+            text: inputText,
+            fragmentId,
+            revealTarget: { kind: 'tool-use-input', toolUseId, fragmentId },
+          });
+        }
+        return;
+      }
       const resultText = toolResultText(toolResult);
       const resultContent = toolResult.content as ToolResultContent | undefined;
       const isError = resultContent?.is_error === true || typeof resultContent?.error === 'string';

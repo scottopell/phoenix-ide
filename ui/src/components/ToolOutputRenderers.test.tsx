@@ -86,8 +86,8 @@ describe('buildKeywordSearchOutputProjection parity', () => {
       parsed.hits.map((hit) => ({ path: hit.path, explanation: hit.explanation }))
     );
     expect(built.fragments.map((fragment) => fragment.fragmentId)).toEqual([
-      'keyword-search-hit:%2Fabs%2Fpath%2Fto%2Ffoo.rs%3A%20implements%20the%20foo%20state%20machine%2C%20primary%20hit:0',
-      'keyword-search-hit:%2Fabs%2Fpath%2Fto%2Fbar.rs%3A%20helper%20utilities%20referenced%20from%20foo:0',
+      expect.stringMatching(/^keyword-search-hit:%2Fabs%2Fpath%2Fto%2Ffoo\.rs:[a-z0-9]+:0$/),
+      expect.stringMatching(/^keyword-search-hit:%2Fabs%2Fpath%2Fto%2Fbar\.rs:[a-z0-9]+:0$/),
     ]);
     expect(built.fragments.every((fragment) => fragment.revealTarget.kind === 'tool-result-keyword-search')).toBe(true);
     expect(built.fragments.every((fragment) => fragment.revealTarget.kind === 'tool-result-keyword-search'
@@ -127,7 +127,7 @@ describe('parseKeywordSearchOutput', () => {
       explanation: 'implements the foo state machine, primary hit',
     });
     expect(parsed.hits[0]?.fragment.fragmentId)
-      .toBe('keyword-search-hit:%2Fabs%2Fpath%2Fto%2Ffoo.rs%3A%20implements%20the%20foo%20state%20machine%2C%20primary%20hit:0');
+      .toMatch(/^keyword-search-hit:%2Fabs%2Fpath%2Fto%2Ffoo\.rs:[a-z0-9]+:0$/);
   });
 
   it('recognizes "No relevant files found" as empty', () => {
@@ -478,13 +478,14 @@ describe('KeywordSearchView', () => {
   ].join('\n');
 
   it('marks exact active fragment occurrence without duplicating explanation text', () => {
+    const fragmentId = buildKeywordSearchOutputProjection(llm, { toolUseId: 'tool-1' }).hits[1]!.fragment.fragmentId;
     const { container } = render(
       <KeywordSearchView
         rawText={llm}
         onOpenFile={undefined}
         toolUseId="tool-1"
         activeHighlight={{
-          fragmentId: 'keyword-search-hit:%2Fabs%2Fpath%2Fto%2Fbar.rs%3A%20helper%20utilities%20for%20foo:0',
+          fragmentId,
           start: 0,
           end: 19,
         }}

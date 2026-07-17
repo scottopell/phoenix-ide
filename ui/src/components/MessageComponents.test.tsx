@@ -1741,6 +1741,37 @@ describe('markdown table rendering', () => {
 });
 
 
+describe('in-flight tool input find highlighting', () => {
+  it('marks the active occurrence in the owned visible input', () => {
+    const message = agentMessage('agent-running-tool', [{
+      type: 'tool_use',
+      id: 'bash-running',
+      name: 'bash',
+      input: { op: 'run', cmd: 'pnpm test --filter alpha' },
+    }]);
+    const inputText = '$ pnpm test --filter alpha';
+    const start = inputText.indexOf('filter alpha');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={new Map()}
+          activeHighlight={{
+            owner: 'tool-input',
+            toolUseId: 'bash-running',
+            fragmentId: 'tool-use-input',
+            start,
+            end: start + 'filter alpha'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-tool-id="bash-running"] [data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent)
+      .toBe('filter alpha');
+  });
+});
+
 describe('finalized code fence highlighting', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

@@ -119,6 +119,7 @@ interface MessageListProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   systemPrompt?: string | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
@@ -175,6 +176,7 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
 }
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+type OnOpenCommissionReview = ((requestSequenceId: number) => void) | undefined;
 
 function activeToolUseIdFromState(convState: ConversationState): string | undefined {
   if (convState.type !== 'tool_executing' && convState.type !== 'cancelling_tool') return undefined;
@@ -185,6 +187,7 @@ function activeToolUseIdFromState(convState: ConversationState): string | undefi
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
+  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
@@ -232,6 +235,7 @@ function renderHistoricalUnit(
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
+          onOpenCommissionReview={onOpenCommissionReview}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
@@ -282,6 +286,7 @@ function renderUnit(
   unit: RenderUnit,
   slug: string | undefined,
   onOpenFile: OnOpenFile,
+  onOpenCommissionReview: OnOpenCommissionReview,
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
@@ -298,7 +303,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled);
+  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled);
 }
 
 interface SystemPromptHeaderProps {
@@ -361,6 +366,7 @@ function MessageListImpl({
   onRetry,
   onCancelSteering,
   onOpenFile,
+  onOpenCommissionReview,
   systemPrompt,
   conversationId,
   slug,
@@ -510,9 +516,11 @@ function MessageListImpl({
     };
     return activeFindRevealTarget.kind === 'agent-text'
       ? { ...range, owner: 'agent-text' }
-      : 'toolUseId' in activeFindRevealTarget
-        ? { ...range, owner: 'tool-result', toolUseId: activeFindRevealTarget.toolUseId }
-        : null;
+      : activeFindRevealTarget.kind === 'tool-use-input'
+        ? { ...range, owner: 'tool-input', toolUseId: activeFindRevealTarget.toolUseId }
+        : 'toolUseId' in activeFindRevealTarget
+          ? { ...range, owner: 'tool-result', toolUseId: activeFindRevealTarget.toolUseId }
+          : null;
   }, [activeFindMatch, activeFindRevealTarget]);
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
@@ -1238,6 +1246,7 @@ function MessageListImpl({
           unit,
           slug,
           onOpenFile,
+          onOpenCommissionReview,
           filePathRootDir,
           onRetry,
           onCancelSteering,
@@ -1248,6 +1257,7 @@ function MessageListImpl({
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (
                 activeFindRevealTarget?.kind === 'agent-text'
+                || activeFindRevealTarget?.kind === 'tool-use-input'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'
                 || activeFindRevealTarget?.kind === 'tool-result-patch'
                 || activeFindRevealTarget?.kind === 'tool-result-terminal'
@@ -1264,7 +1274,7 @@ function MessageListImpl({
         )}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
+    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

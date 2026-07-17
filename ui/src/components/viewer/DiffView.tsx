@@ -341,6 +341,15 @@ export function DiffView({
   );
 }
 
+function boundedDiffMatchHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function stableDiffMatchIds(): (match: {
   sourceId: string;
   sourceText: string;
@@ -351,7 +360,7 @@ function stableDiffMatchIds(): (match: {
   const duplicateOccurrences = new Map<string, number>();
   return (match) => {
     const target = match.target;
-    const semanticSignature = `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.sourceText}:${match.start}:${match.end}`;
+    const semanticSignature = `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.start}:${match.end}:${boundedDiffMatchHash(match.sourceText)}`;
     const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
     duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
     return `${semanticSignature}:${duplicateOccurrence}`;
@@ -513,3 +522,6 @@ function anchorDialogLabel(t: AnnotateTarget): string {
   if (t.oldLine !== undefined) return `${t.filePath}:-${t.oldLine}`;
   return t.filePath;
 }
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const __diffViewFindTestables = { stableDiffMatchIds };

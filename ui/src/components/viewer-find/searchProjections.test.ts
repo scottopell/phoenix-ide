@@ -4,6 +4,7 @@ import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import {
   buildAgentTextFragments,
+  buildKeywordSearchOutputProjection,
   buildPatchOutputProjection,
   buildReadFileOutputProjection,
   buildSearchOutputProjection,
@@ -405,6 +406,18 @@ describe('bounded search fragment identities', () => {
   });
 });
 
+describe('bounded keyword-search identities', () => {
+  it('does not embed arbitrarily long explanations in fragment ids', () => {
+    const explanation = `token ${'x'.repeat(20_000)}`;
+    const projection = buildKeywordSearchOutputProjection(`src/min.js: ${explanation}`, { toolUseId: 'keyword-long' });
+    const hit = projection.hits[0]?.fragment;
+
+    expect(hit?.semanticText).toContain(explanation);
+    expect(hit?.fragmentId).not.toContain(explanation);
+    expect(hit?.fragmentId.length).toBeLessThan(128);
+  });
+});
+
 describe('buildPatchOutputProjection', () => {
   it('keeps semantic identity stable while carrying the current canonical diff as display text', () => {
     const before = buildPatchOutputProjection('--- a/x\n+++ b/x\n-old\n+new', { toolUseId: 'patch-1' });
@@ -511,6 +524,28 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.sources.some((entry) => entry.fragmentId?.includes('search-hit:'))).toBe(true);
     const matchSource = projection.sources.find((entry) => entry.fragmentId === (target?.kind === 'unit-text' ? target.fragmentId : undefined));
     expect(matchSource?.revealTarget).toMatchObject({ kind: 'tool-result-search', key: 'search:search-1', path: 'src/hidden.ts', lineNumber: 42 });
+  });
+
+  it('indexes visible inputs for in-flight tools with an owned reveal target', () => {
+    const units: RenderUnit[] = [{
+      kind: 'agent_turn',
+      key: 'running-tool',
+      isFirstInTurn: true,
+      agent: agentMsg('running-tool', [
+        { type: 'tool_use', id: 'bash-running', name: 'bash', input: { op: 'run', cmd: 'pnpm test --filter alpha' } },
+      ]),
+      toolResultsByUseId: new Map(),
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'filter alpha', { density: 'full' });
+    expect(projection.matches).toHaveLength(1);
+    const source = projection.sources.find((candidate) => candidate.fragmentId === 'tool-use-input');
+    expect(source?.text).toBe('$ pnpm test --filter alpha');
+    expect(source?.revealTarget).toEqual({
+      kind: 'tool-use-input',
+      toolUseId: 'bash-running',
+      fragmentId: 'tool-use-input',
+    });
   });
 
   it('indexes tool results but excludes unowned tool header and input metadata', () => {
@@ -678,7 +713,7 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
-  it('does not synthesize result fragments before a tool result exists', () => {
+  it('indexes only the visible input before a tool result exists', () => {
     const units: RenderUnit[] = [{
       kind: 'agent_turn',
       key: 'pending-tool',
@@ -689,7 +724,7 @@ describe('buildConversationSearchProjection', () => {
       toolResultsByUseId: new Map(),
     }];
 
-    expect(buildConversationSearchProjection(units, 'pending.ts', { density: 'compact' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'pending.ts', { density: 'compact' }).matches).toHaveLength(1);
     expect(buildConversationSearchProjection(units, 'No matches found.', { density: 'compact' }).matches).toHaveLength(0);
   });
 
