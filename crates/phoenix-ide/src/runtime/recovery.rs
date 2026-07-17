@@ -25,6 +25,8 @@ pub enum RecoveryReason {
     EmptyConversation,
     /// Last message is not a tool result
     LastMessageNotTool,
+    /// A persisted user message has no subsequent turn output.
+    InterruptedAfterUserMessage,
     /// No agent message found in conversation
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
@@ -87,6 +89,17 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         // banner dismissed) persists a hidden marker as the last message.
         // Treat it as a settled Idle, never an interrupted tool turn.
         return RecoveryDecision::idle(reason);
+    }
+
+    if matches!(
+        last_msg.message_type,
+        MessageType::User | MessageType::Skill
+    ) {
+        return RecoveryDecision {
+            state: ConvState::LlmRequesting { attempt: 1 },
+            needs_auto_continue: true,
+            reason: RecoveryReason::InterruptedAfterUserMessage,
+        };
     }
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
@@ -298,9 +311,9 @@ mod tests {
     fn test_only_user_message() {
         let messages = vec![user_msg(1, "Hello")];
         let decision = should_auto_continue(&messages);
-        assert_eq!(decision.state, ConvState::Idle);
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
+        assert_eq!(decision.state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedAfterUserMessage);
     }
 
     #[test]
@@ -396,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_followed_by_user() {
-        // User interrupted while agent was working
+        // A persisted trailing user message is an interrupted next turn.
         let messages = vec![
             user_msg(1, "Do something"),
             agent_tool_use_only(2, &["bash"]),
@@ -404,8 +417,8 @@ mod tests {
             user_msg(4, "Actually, cancel that"),
         ];
         let decision = should_auto_continue(&messages);
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
+        assert!(decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::InterruptedAfterUserMessage);
     }
 
     // =========================================================================
@@ -769,7 +782,7 @@ mod proptests {
     }
 
     // =========================================================================
-    // Property: Auto-continue requires tool as last message
+    // Property: Auto-continue requires a resumable trailing message
     // =========================================================================
 
     proptest! {
@@ -798,13 +811,11 @@ mod proptests {
 
             let decision = should_auto_continue(&messages);
 
-            // If last message is NOT tool, cannot auto-continue
-            if !matches!(last_type, MessageType::Tool) {
-                prop_assert!(
-                    !decision.needs_auto_continue,
-                    "Auto-continued with last message type {:?}",
-                    last_type
-                );
+            if decision.needs_auto_continue {
+                prop_assert!(matches!(
+                    last_type,
+                    MessageType::Tool | MessageType::User | MessageType::Skill
+                ));
             }
         }
     }
@@ -877,6 +888,13 @@ mod proptests {
             match decision.reason {
                 RecoveryReason::EmptyConversation => {
                     prop_assert!(messages.is_empty());
+                }
+                RecoveryReason::InterruptedAfterUserMessage => {
+                    prop_assert!(matches!(
+                        messages.last().unwrap().message_type,
+                        MessageType::User | MessageType::Skill
+                    ));
+                    prop_assert!(decision.needs_auto_continue);
                 }
                 RecoveryReason::LastMessageNotTool => {
                     prop_assert!(!matches!(

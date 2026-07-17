@@ -453,6 +453,35 @@ describe('ConversationPage message delivery reconciliation', () => {
     await response.promise;
   });
 
+  it('reconciles accepted messages from a non-working error phase', async () => {
+    const acceptedId = 'accepted-error';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'accepted before error',
+      timestamp: 1,
+      status: 'accepted',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: acceptedId,
+        status: 'persisted',
+        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+      }],
+    });
+    const { store } = renderPage(makeConversation({
+      state: { type: 'error', message: 'retryable', error_kind: 'server_error' },
+    }));
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain(acceptedId);
+  });
+
   it('exact-ID reconciles an accepted direct message after its SSE echo is missed', async () => {
     const acceptedId = 'accepted-direct';
     localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{

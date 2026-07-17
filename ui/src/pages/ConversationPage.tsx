@@ -2,7 +2,12 @@ import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallba
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
+import {
+  canCancelConversationState,
+  isAgentWorking,
+  isCancellingState,
+  parseConversationState,
+} from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
@@ -657,7 +662,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     }
   }, [atom.phase.type, atom.phaseLastAppliedEventSeq]);
   useEffect(() => {
-    if (!conversationId || !isConnected || atom.phase.type !== 'idle') return;
+    if (!conversationId || !isConnected || isAgentWorking(atom.phase)) return;
     const accepted = queuedMessages.filter((message) => {
       if (message.status === 'accepted') return true;
       return message.status === 'steering_queued'
@@ -753,7 +758,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   }, [
     conversationId,
     isConnected,
-    atom.phase.type,
+    atom.phase,
     atom.phaseLastAppliedEventSeq,
     queuedMessages,
     markRecoverableInconsistency,

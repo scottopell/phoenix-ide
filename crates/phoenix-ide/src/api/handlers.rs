@@ -3468,6 +3468,11 @@ async fn send_chat(
             message_id = %req.message_id,
             "Duplicate message detected, returning success (idempotent)"
         );
+        state
+            .runtime
+            .resume_persisted_user_turn_if_unhandled(&id, &req.message_id)
+            .await
+            .map_err(AppError::Internal)?;
         return Ok(Json(ChatResponse {
             queued: true,
             steering: false,

@@ -2869,6 +2869,40 @@ impl RuntimeManager {
         }
     }
 
+    pub async fn resume_persisted_user_turn_if_unhandled(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        if self
+            .effective_conversation_state(conversation_id)
+            .await
+            .is_some_and(|state| state.is_busy())
+        {
+            return Ok(false);
+        }
+        let messages = self
+            .db
+            .get_latest_messages(conversation_id, 1)
+            .await
+            .map_err(|error| error.to_string())?;
+        let is_unhandled = messages.last().is_some_and(|message| {
+            message.message_id == message_id
+                && matches!(
+                    message.message_type,
+                    crate::db::MessageType::User | crate::db::MessageType::Skill
+                )
+        });
+        if !is_unhandled {
+            return Ok(false);
+        }
+
+        self.evict_runtime(conversation_id, EvictionReason::CreationProvisioned)
+            .await;
+        let _ = self.get_or_create(conversation_id).await?;
+        Ok(true)
+    }
+
     pub async fn persist_direct_user_message(
         self: &Arc<Self>,
         conversation_id: &str,
