@@ -2,7 +2,7 @@ export interface CoordinatorScenario {
   id: string;
   title: string;
   description: string;
-  initialView: 'conversation' | 'fleet';
+  initialView: 'conversation' | 'work';
   working: boolean;
   expanded: boolean;
   fleetError: boolean;

@@ -634,9 +634,10 @@ impl ToolRegistry {
         }
     }
 
-    /// Minimal read-only registry for the global Coordinator. The host supplies
-    /// the fleet/history tools so their global scope cannot be model-selected.
-    /// Filesystem, browser, shell, MCP, and lifecycle tools are absent.
+    /// Bounded registry for the global Coordinator. The host supplies global
+    /// read tools and the singular cross-conversation text-message action.
+    /// Filesystem, browser, shell, MCP, repository, task, project, creation,
+    /// approval, workspace, and other lifecycle tools are structurally absent.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];

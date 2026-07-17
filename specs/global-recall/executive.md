@@ -2,79 +2,59 @@
 
 ## Requirements Summary
 
-Phoenix Coordinator gives users a deliberate Phoenix-wide surface for
-orientation and cross-conversation analysis. The fleet view answers "what
-active work exists?" deterministically by grouping visible work by project and
-representing each open work item as either a continuation chain or standalone
-conversation. Each item carries metadata and explainable signals so the user can
-see why it appears.
+Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies deterministic current-work orientation on every Coordinator turn, while the Coordinator retains bounded global search, conversation reading, open-work querying, and stable reference resolution.
 
-The Coordinator itself is one durable conversation identity that uses the normal
-Phoenix conversation runtime and UI. It reuses the standard transcript,
-composer, streaming, persistence, and continuation behavior while being framed
-as a global read-only coordinator rather than ordinary project work. The
-Coordinator surface keeps the compact fleet snapshot visible so the user can
-triage and inspect work without leaving the page.
+The Coordinator has one mutation capability: a singular text-message action targeting an existing non-Coordinator conversation. That action reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
+
+The `/global` surface keeps the standard transcript and composer visually dominant. A smaller utility shows current attention and provides deterministic Find Work filtering. It stores no inbox history; selecting an item opens its owning conversation and leaves questions, approvals, retry, cancellation, and error handling to existing native controls.
 
 ## Technical Summary
 
-The fleet projection derives from persisted conversations, project rows,
-continuation links, conversation modes, runtime states, and task metadata when
-available. Continuation topology is reconstructed before visibility filtering,
-so archived historical members do not change a chain's durable root. Inclusion
-requires positive evidence: open task status or an active/attention state for
-Work mode, and active/attention state or activity within 14 days for Direct,
-Explore, and Branch modes.
+The open-work projection derives from persisted conversations, project rows, continuation links, conversation modes, runtime states, and task metadata. Continuation topology is reconstructed before visibility filtering, so archived historical members do not change a chain's durable root. Inclusion requires positive evidence: open task status or an active/attention state for Work mode, and active/attention state or activity within 14 days for Direct, Explore, and Branch modes.
 
-The UI consumes `/api/global/coordinator`, which resolves the singleton
-Coordinator conversation and lets the page compose that identity with the
-existing deterministic fleet data from `/api/global/open-work`. Desktop keeps
-conversation and fleet visible together. Compact viewports use an explicit
-Conversation/Fleet switch so the standard transcript owns a definite viewport
-while fleet triage remains one tap away; the mobile conversation list provides
-a direct Coordinator entry. The bespoke Global Recall session API/types/UI are
-retired from the frontend contract. The Coordinator keeps using app-local
-links, durable references, and bounded global read tooling for synthesis and
-citation workflows.
+Coordinator LLM requests keep the stable language-specific prompt as their cached prefix and append a bounded, turn-current work capsule. The capsule deterministically prioritizes attention/recovery, active, and recently idle work, provides aggregate counts, and identifies truncation. The complete paginated open-work tool remains available when the capsule is insufficient.
+
+A shared application service owns user-message acceptance and dispatch for both the ordinary HTTP chat adapter and the Coordinator tool. It preserves message and steering idempotency, live runtime authority, stored-state rejection, runtime materialization, acceptability checks, steering depth limits, persistence, broadcast behavior, and PR auto-fix baseline behavior. Typed semantic outcomes prevent normal delivery, steering acceptance, and rejection from being confused.
+
+The Coordinator registry is builtin-only. It contains bounded global read tools and the singular cross-conversation text-message tool, while ordinary conversations do not receive those capabilities. The Coordinator continues to exclude shell, filesystem, browser, MCP, repository, task, project, workspace, conversation creation, approval, and lifecycle mutation tools.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-GR-001:** View Active Work Without Model Inference | ✅ Complete | `/api/global/open-work` builds a deterministic projection; `/global` renders it without model calls |
+| **REQ-GR-001:** Present Deterministic Current Work | ✅ Complete | `/global` combines the deterministic projection with a chat-first attention/find-work utility |
 | **REQ-GR-002:** Collapse Continuation Chains Into One Work Item | ✅ Complete | Projection reconstructs durable `continued_in_conv_id` topology before visibility filtering |
-| **REQ-GR-003:** Explain Why Work Appears | ✅ Complete | Positive-evidence inclusion and closed-state suppression are covered by projection tests; items expose recency, mode, state, task, and chain signals |
-| **REQ-GR-004:** Surface Work Identity Metadata | ✅ Complete | Fleet items expose mode/task/branch/worktree/current/root/update metadata when present |
-| **REQ-GR-005:** Provide Stable References and App-Local Links | ✅ Complete | Open-work rows expose durable `@work:` handles; resolution reconstructs historical source/status after closure |
-| **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` is the frontend contract for resolving the singleton Coordinator conversation |
-| **REQ-GR-007:** Restrict Phoenix-wide Tools to the Coordinator | ✅ Complete | Global search/read/open-work/reference tools remain reserved for the Coordinator flow |
-| **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Coordinator synthesis is expected to cite app-local conversation/message sources and stable handles |
-| **REQ-GR-009:** Resolve Copied References | ✅ Complete | `/api/global/resolve` supports typed handles and app-local conversation/chain paths |
-| **REQ-GR-010:** Keep the Fleet Snapshot Visible on the Coordinator Surface | ✅ Complete | `/global` keeps a compact expandable fleet view in the Coordinator surface; compact viewports switch between a viewport-filling transcript and touch-friendly Fleet view without remounting the conversation |
+| **REQ-GR-003:** Explain Current Inclusion and Attention | ✅ Complete | Positive-evidence inclusion and attention classification derive from current states and signals |
+| **REQ-GR-004:** Provide Bounded Work Selection Data | ✅ Complete | Deterministic query filtering occurs before bounded pagination and compact rows expose selection data |
+| **REQ-GR-005:** Provide Stable References and App-Local Links | ✅ Complete | Open-work rows expose durable `@work:` handles and app-local destinations; resolution reconstructs historical source/status |
+| **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` resolves the singleton conversation through the standard runtime and UI |
+| **REQ-GR-007:** Bound Phoenix-Wide Coordinator Capabilities | ✅ Complete | The builtin-only Coordinator registry adds one text-message action while ordinary registries remain unchanged |
+| **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Global reads expose source metadata and the Coordinator prompt requires stable source citations |
+| **REQ-GR-009:** Resolve Durable Targets Without Guessing | ✅ Complete | Typed message resolution supports work/conversation handles, app-local conversation links, and ids with chain checks |
+| **REQ-GR-010:** Provide Current Attention and Find Work | ✅ Complete | The smaller utility provides attention, deterministic filtering, freshness, refresh, and owning-conversation navigation |
+| **REQ-GR-011:** Inject Bounded Current-Work Context | ✅ Complete | Coordinator requests append deterministic turn-current context after the cached stable prompt |
+| **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and the Coordinator action share typed acceptance and report delivery, steering, or stable rejection |
 
 ## Verification Summary
 
-Targeted component tests cover singleton route handling, compact-view switching,
-conversation mount preservation, direct mobile navigation, fleet expansion, and
-viewport ownership. Deterministic Ladle browser QA captures populated idle and
-working transcripts plus compact, expanded, and failed Fleet states at phone,
-small-phone, tablet, and desktop sizes. The capture workflow fails when the
-virtual transcript, a message row, or the composer has zero geometry, or when
-the document overflows horizontally.
+Existing coverage verifies durable Coordinator routing, normal transcript mounting, continuation-chain projection, positive-evidence open-work inclusion, stable references, bounded reads, and Coordinator-only global read tools.
+
+Required verification for the actionable console covers immediate delivery, busy steering, persisted and queued idempotent retries, stable rejection outcomes, continuation target resolution, Coordinator-chain rejection, independent multi-target calls, ordinary-conversation permission isolation, deterministic capsule ordering and truncation, filter-before-pagination, attention disappearance with state changes, current-conversation navigation, refresh triggers, and responsive utility switching.
 
 ## Scope
 
-The implemented scope covers a deterministic fleet projection and a durable
-Coordinator surface that centers the standard conversation experience while
-keeping fleet triage visible. The Coordinator remains read-only with respect to
-Phoenix-wide data access and does not expose filesystem mutation, workspace
-management, or task-approval actions.
+The scope is a deterministic current-work projection, one durable Coordinator conversation, bounded global reads, automatic turn-current orientation, one singular text-message action to existing non-Coordinator conversations, and a chat-first current-attention/find-work utility.
+
+The Coordinator runs only on user turns. It does not monitor work in the background, create conversations, manage a global objective, retain attention history, or infer recipient understanding from message acceptance.
 
 ## Out of Scope
 
-- Ambient Phoenix-wide history tools for ordinary coding agents.
-- Semantic/vector retrieval beyond the existing conversation-retrieval
-  substrate.
-- Managed workspaces, files, or task lifecycle actions from the Coordinator.
+- Ambient Phoenix-wide tools for ordinary coding agents.
+- Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
+- Batch-action transactions or atomic fan-out.
+- Conversation creation, task lifecycle, approval, repository, filesystem, project, or workspace mutation from the Coordinator.
+- Durable attention/outcome history, observation cursors, exact changes-since-last-turn context, and desktop notifications.
+- Semantic/vector retrieval, saved find-work views, LLM-powered utility filtering, or a utility cache.
+- Background monitoring or proactive intervention without a user turn.
 - Multiple user-created global analysis sessions.
-- A separate bespoke transcript/composer runtime for the Coordinator.
+- A separate transcript/composer runtime for the Coordinator.

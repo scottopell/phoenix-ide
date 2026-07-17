@@ -89,10 +89,71 @@ pub struct ResolveGlobalReferenceResponse {
     pub summary: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct OpenWorkPageQuery {
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct OpenWorkQuery {
     #[serde(default)]
     pub offset: usize,
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+pub type OpenWorkPageQuery = OpenWorkQuery;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalMessageTarget {
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GlobalMessageTargetError {
+    MissingId,
+    UnsupportedSyntax,
+    CoordinatorChainRejected,
+    ConversationNotFound(String),
+}
+
+impl GlobalMessageTargetError {
+    #[must_use]
+    pub(crate) fn stable_code(&self) -> &'static str {
+        match self {
+            Self::MissingId => "missing_target_id",
+            Self::UnsupportedSyntax => "unsupported_target_syntax",
+            Self::CoordinatorChainRejected => "coordinator_chain_rejected",
+            Self::ConversationNotFound(_) => "target_not_found",
+        }
+    }
+}
+
+impl std::fmt::Display for GlobalMessageTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingId => write!(f, "message target is missing an id"),
+            Self::UnsupportedSyntax => write!(f, "unsupported message target syntax"),
+            Self::CoordinatorChainRejected => write!(
+                f,
+                "Coordinator cannot message itself or its continuation chain"
+            ),
+            Self::ConversationNotFound(id) => write!(f, "conversation not found: {id}"),
+        }
+    }
+}
+
+impl std::error::Error for GlobalMessageTargetError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OpenWorkFilter {
+    pub query: Option<String>,
+}
+
+impl OpenWorkFilter {
+    pub(crate) fn from_query(query: Option<&str>) -> Self {
+        Self {
+            query: query
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -116,8 +177,20 @@ impl GlobalReadService {
         Self::new(state.db.clone(), state.message_retriever.clone())
     }
 
-    pub(crate) async fn open_work(&self) -> Result<GlobalOpenWorkResponse, AppError> {
-        build_open_work(self).await
+    pub(crate) async fn open_work(
+        &self,
+        filter: &OpenWorkFilter,
+    ) -> Result<GlobalOpenWorkResponse, AppError> {
+        build_open_work(self, filter).await
+    }
+
+    pub(crate) async fn current_work_capsule(&self) -> Result<String, String> {
+        let filter = OpenWorkFilter::default();
+        let view = self
+            .open_work(&filter)
+            .await
+            .map_err(|e| format!("open work projection failed: {e:?}"))?;
+        Ok(format_current_work_capsule(&view))
     }
 
     pub(crate) async fn search(&self, query: &str) -> Result<String, String> {
@@ -191,15 +264,26 @@ impl GlobalReadService {
         }
     }
 
-    pub(crate) async fn open_work_page(&self, offset: usize) -> Result<String, String> {
+    pub(crate) async fn open_work_page(
+        &self,
+        offset: usize,
+        filter: &OpenWorkFilter,
+    ) -> Result<String, String> {
         let view = self
-            .open_work()
+            .open_work(filter)
             .await
             .map_err(|e| format!("open work projection failed: {e:?}"))?;
         Ok(format_open_work_for_agent(
             &paginate_open_work(view, offset, OPEN_WORK_PAGE),
             offset,
         ))
+    }
+
+    pub(crate) async fn resolve_message_target(
+        &self,
+        target: &str,
+    ) -> Result<GlobalMessageTarget, GlobalMessageTargetError> {
+        resolve_global_message_target(self, target).await
     }
 
     pub(crate) async fn resolve_reference(
@@ -214,7 +298,10 @@ pub async fn open_work(
     State(state): State<AppState>,
     Query(page): Query<OpenWorkPageQuery>,
 ) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    let view = GlobalReadService::from_state(&state).open_work().await?;
+    let filter = OpenWorkFilter::from_query(page.query.as_deref());
+    let view = GlobalReadService::from_state(&state)
+        .open_work(&filter)
+        .await?;
     Ok(Json(paginate_open_work(view, page.offset, OPEN_WORK_PAGE)))
 }
 
@@ -229,7 +316,10 @@ pub async fn resolve_reference(
     ))
 }
 
-async fn build_open_work(service: &GlobalReadService) -> Result<GlobalOpenWorkResponse, AppError> {
+async fn build_open_work(
+    service: &GlobalReadService,
+    filter: &OpenWorkFilter,
+) -> Result<GlobalOpenWorkResponse, AppError> {
     let now = Utc::now();
     let conversations = service
         .db
@@ -278,6 +368,7 @@ async fn build_open_work(service: &GlobalReadService) -> Result<GlobalOpenWorkRe
     }
 
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let items = filter_open_work_items(items, filter);
 
     let mut grouped: HashMap<Option<String>, Vec<GlobalOpenWorkItem>> = HashMap::new();
     for item in items {
@@ -1034,6 +1125,236 @@ async fn resolve_reference_impl(
     Err(AppError::BadRequest(
         "unsupported reference syntax".to_string(),
     ))
+}
+
+fn filter_open_work_items(
+    items: Vec<GlobalOpenWorkItem>,
+    filter: &OpenWorkFilter,
+) -> Vec<GlobalOpenWorkItem> {
+    let Some(query) = filter.query.as_deref() else {
+        return items;
+    };
+    let needle = query.to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| open_work_item_matches(item, &needle))
+        .collect()
+}
+
+fn open_work_item_matches(item: &GlobalOpenWorkItem, needle: &str) -> bool {
+    let mut haystacks = vec![
+        item.id.as_str(),
+        item.title.as_str(),
+        item.current_conversation_id.as_str(),
+        item.root_conversation_id.as_str(),
+        item.mode.as_str(),
+        item.state.as_str(),
+        item.reference.as_str(),
+        item.href.as_str(),
+    ];
+    if let Some(value) = item.current_conversation_slug.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.root_conversation_slug.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.project_id.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.task_id.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.task_title.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.task_status.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.branch_name.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.base_branch.as_deref() {
+        haystacks.push(value);
+    }
+    if let Some(value) = item.worktree_path.as_deref() {
+        haystacks.push(value);
+    }
+    haystacks.extend(item.signals.iter().map(String::as_str));
+    haystacks
+        .into_iter()
+        .any(|value| value.to_ascii_lowercase().contains(needle))
+}
+
+fn format_current_work_capsule(view: &GlobalOpenWorkResponse) -> String {
+    const LIMIT: usize = 12;
+    let mut items = view
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .items
+                .iter()
+                .map(move |item| (group.project_name.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|(_, left), (_, right)| {
+        capsule_priority(left)
+            .cmp(&capsule_priority(right))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.reference.cmp(&right.reference))
+    });
+    let total = items.len();
+    let attention = items
+        .iter()
+        .filter(|(_, item)| capsule_priority(item) == 0)
+        .count();
+    let active = items
+        .iter()
+        .filter(|(_, item)| capsule_priority(item) == 1)
+        .count();
+    let mut out = format!(
+        "# Current work — deterministic turn-current projection\nThis is current state for orientation, not transcript evidence, complete history, or an exact delta. Inspect only relevant conversations; use list_open_work if this bounded capsule is insufficient.\ncounts: total={total}, attention={attention}, active={active}, recently_idle={}\n",
+        total.saturating_sub(attention + active),
+    );
+    for (project, item) in items.iter().take(LIMIT) {
+        let strongest_signals = item
+            .signals
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "- {} | project={} | title={} | state={} | mode={} | updated={} | signals={}",
+            item.reference,
+            project,
+            item.title,
+            item.state,
+            item.mode,
+            item.updated_at,
+            strongest_signals,
+        );
+    }
+    if total == 0 {
+        out.push_str("No open work.\n");
+    } else if total > LIMIT {
+        let _ = writeln!(out, "TRUNCATED: showing {LIMIT} of {total}; call list_open_work for the complete projection.");
+    }
+    out
+}
+
+fn capsule_priority(item: &GlobalOpenWorkItem) -> u8 {
+    let state = item.state.to_ascii_lowercase();
+    let attention = [
+        "awaiting",
+        "approval",
+        "question",
+        "error",
+        "failed",
+        "recovery",
+        "context_exhausted",
+    ]
+    .iter()
+    .any(|needle| state.contains(needle))
+        || item.signals.iter().any(|signal| {
+            let signal = signal.to_ascii_lowercase();
+            [
+                "attention",
+                "approval",
+                "question",
+                "error",
+                "recovery",
+                "blocked",
+            ]
+            .iter()
+            .any(|needle| signal.contains(needle))
+        });
+    if attention {
+        0
+    } else if !matches!(state.as_str(), "idle" | "completed") {
+        1
+    } else {
+        2
+    }
+}
+
+async fn resolve_global_message_target(
+    service: &GlobalReadService,
+    raw: &str,
+) -> Result<GlobalMessageTarget, GlobalMessageTargetError> {
+    let reference = raw.trim().trim_start_matches('#');
+    let candidate = if let Some(rest) = reference.strip_prefix("@conv:") {
+        let (id, _) = parse_conv_handle(rest);
+        if id.is_empty() {
+            return Err(GlobalMessageTargetError::MissingId);
+        }
+        id.to_string()
+    } else if let Some(rest) = reference.strip_prefix("@work:") {
+        let (id, _) = split_fragment(rest);
+        let root_id = first_token(id);
+        if root_id.is_empty() {
+            return Err(GlobalMessageTargetError::MissingId);
+        }
+        resolve_current_work_conversation_id(service, root_id).await?
+    } else if let Some(rest) = reference.strip_prefix("/c/") {
+        let (slug, _) = split_fragment(rest);
+        if slug.is_empty() {
+            return Err(GlobalMessageTargetError::MissingId);
+        }
+        load_conversation_by_slug_or_id(service, slug)
+            .await
+            .map_err(|_| GlobalMessageTargetError::ConversationNotFound(slug.to_string()))?
+            .id
+    } else if reference.starts_with('/') || reference.starts_with('@') || reference.is_empty() {
+        return Err(GlobalMessageTargetError::UnsupportedSyntax);
+    } else {
+        reference.to_string()
+    };
+
+    let conversation = service
+        .db
+        .get_conversation(&candidate)
+        .await
+        .map_err(|_| GlobalMessageTargetError::ConversationNotFound(candidate.clone()))?;
+    if service
+        .coordinator_chain_ids()
+        .await
+        .map_err(|_| GlobalMessageTargetError::CoordinatorChainRejected)?
+        .contains(&conversation.id)
+    {
+        return Err(GlobalMessageTargetError::CoordinatorChainRejected);
+    }
+    Ok(GlobalMessageTarget {
+        conversation_id: conversation.id,
+    })
+}
+
+async fn resolve_current_work_conversation_id(
+    service: &GlobalReadService,
+    root_id: &str,
+) -> Result<String, GlobalMessageTargetError> {
+    let root = service
+        .db
+        .get_conversation(root_id)
+        .await
+        .map_err(|_| GlobalMessageTargetError::ConversationNotFound(root_id.to_string()))?;
+    let actual_root = service
+        .db
+        .chain_root_of(root_id)
+        .await
+        .map_err(|_| GlobalMessageTargetError::ConversationNotFound(root_id.to_string()))?;
+    if actual_root.as_deref().is_some_and(|id| id != root_id) {
+        return Err(GlobalMessageTargetError::ConversationNotFound(
+            root_id.to_string(),
+        ));
+    }
+    let members = service
+        .db
+        .chain_members_forward(root_id)
+        .await
+        .map_err(|_| GlobalMessageTargetError::ConversationNotFound(root_id.to_string()))?;
+    Ok(members.last().cloned().unwrap_or(root.id))
 }
 
 fn split_fragment(s: &str) -> (&str, Option<&str>) {

@@ -11,8 +11,9 @@ use super::chains::{
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_pr_status, list_git_branches, pin_associated_pr,
-    record_pr_auto_fix_context_baseline, resume_associated_pr_inference,
+    resume_associated_pr_inference,
 };
+
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
@@ -43,7 +44,7 @@ use crate::git_ops::{
     GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::SseEvent;
-use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use crate::state_machine::{ConvState, Event};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -1409,7 +1410,7 @@ fn validate_attachment_file(name: &str, media_type: &str, size: usize) -> Result
     Ok(())
 }
 
-async fn validate_submitted_attachments(
+pub(crate) async fn validate_submitted_attachments(
     conversation_id: &str,
     files: &[crate::api::types::FileAttachment],
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
@@ -3448,274 +3449,67 @@ async fn upload_conversation_attachments(
     Ok(Json(AttachmentUploadResponse { files }))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn send_chat(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    // Idempotency check: if message_id already exists, return success without creating duplicate
-    if state
-        .db
-        .message_exists(&req.message_id)
+    let service = crate::send_chat_service::SendChatApplicationService::new(
+        state.db.clone(),
+        state.runtime.clone(),
+    );
+    let outcome = service
+        .send(crate::send_chat_service::SendChatRequest {
+            conversation_id: id,
+            text: req.text,
+            message_id: req.message_id,
+            images: req.images,
+            files: req.files,
+            user_agent: req.user_agent,
+        })
         .await
-        .unwrap_or(false)
-    {
-        tracing::info!(
-            conversation_id = %id,
-            message_id = %req.message_id,
-            "Duplicate message detected, returning success (idempotent)"
-        );
-        return Ok(Json(ChatResponse {
+        .map_err(|error| match error {
+            crate::send_chat_service::SendChatServiceError::NotFound(message) => {
+                AppError::NotFound(message)
+            }
+            crate::send_chat_service::SendChatServiceError::AttachmentValidation(message)
+            | crate::send_chat_service::SendChatServiceError::Dispatch(message) => {
+                AppError::BadRequest(message)
+            }
+            crate::send_chat_service::SendChatServiceError::Expansion {
+                message, error_type, reference,
+            } => AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: message,
+                error_type: error_type.to_string(),
+                reference,
+            }),
+            crate::send_chat_service::SendChatServiceError::IdempotencyConflict => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "message_id was already used for a different target or payload".to_string(),
+                    "idempotency_conflict",
+                )))
+            }
+            crate::send_chat_service::SendChatServiceError::Internal(message) => {
+                AppError::Internal(message)
+            }
+        })?;
+
+    Ok(Json(match outcome {
+        crate::send_chat_service::SendChatOutcome::Delivered => ChatResponse {
             queued: true,
             steering: false,
-            already_persisted: true,
-        }));
-    }
-
-    // Expand `@file` inline references before sending to the LLM (REQ-IR-001, REQ-IR-007)
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let steering_queue = state
-        .runtime
-        .db()
-        .get_steering_queue(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    // Steering queue idempotency: if message_id is already in the queue a
-    // retry returns the same accepted response without double-enqueuing.
-    if steering_queue
-        .iter()
-        .any(|e| e.message_id == req.message_id)
-    {
-        tracing::info!(
-            conversation_id = %id,
-            message_id = %req.message_id,
-            "Steering message retry matched durable queue entry"
-        );
-        return Ok(Json(ChatResponse {
+            already_persisted: false,
+        },
+        crate::send_chat_service::SendChatOutcome::QueuedAsSteering => ChatResponse {
             queued: true,
             steering: true,
             already_persisted: false,
-        }));
-    }
-
-    let validated_files = validate_submitted_attachments(&id, &req.files).await?;
-
-    // Route using live runtime state when a handle is present; fall back to
-    // the DB row for stable rejection states when no handle is active.
-    // See specs/bedrock/design.md FM-7 for the full authority rule.
-    let effective_state = if let Some(live_state) =
-        state.runtime.effective_conversation_state(&id).await
-    {
-        // Live handle present — its state_rx is authoritative.
-        live_state
-    } else {
-        // No live handle yet. Stable DB rejection states don't require a
-        // runtime to be created — their DB row is always current.
-        if let Err(stable_err) = check_user_message_acceptable(&conversation.state) {
-            if !matches!(
-                stable_err,
-                TransitionError::AgentBusy | TransitionError::CancellationInProgress
-            ) {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    stable_err.to_string(),
-                    match stable_err {
-                        TransitionError::ContextExhausted => "context_exhausted",
-                        TransitionError::ConversationTerminal => "conversation_terminal",
-                        TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
-                        TransitionError::AwaitingUserResponse => "awaiting_user_response",
-                        TransitionError::AgentBusy => "agent_busy",
-                        TransitionError::CancellationInProgress => "cancellation_in_progress",
-                        TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
-                    },
-                ))));
-            }
+        },
+        crate::send_chat_service::SendChatOutcome::Rejected { message, code } => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                message, code,
+            ))));
         }
-        // DB says Idle (or a transient-busy variant) — materialise the
-        // runtime so determine_resume_state derives the true initial state.
-        let _handle = state
-            .runtime
-            .get_or_create(&id)
-            .await
-            .map_err(AppError::BadRequest)?;
-        state
-            .runtime
-            .effective_conversation_state(&id)
-            .await
-            .unwrap_or_else(|| conversation.state.clone())
-    };
-    if let Err(err) = check_user_message_acceptable(&effective_state) {
-        // `AgentBusy` and `CancellationInProgress` states are transient — the
-        // conversation will reach `Idle` once the current operation completes.
-        // Instead of rejecting, queue the message as a steering directive so
-        // it is delivered automatically when `Idle` is next entered.
-        let steer = matches!(
-            err,
-            TransitionError::AgentBusy | TransitionError::CancellationInProgress
-        );
-        if steer {
-            // Enforce queue depth limit before accepting.
-            const MAX_STEER_QUEUE_DEPTH: usize = 5;
-            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Steering queue is full; try again once a queued message has been delivered."
-                        .to_string(),
-                    "steering_queue_full",
-                ))));
-            }
-
-            let resolution_root =
-                crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-            let expanded = if state
-                .db
-                .is_coordinator_conversation(&conversation.id)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-            {
-                crate::message_expander::ExpandedMessage {
-                    display_text: req.text.clone(),
-                    llm_text: req.text.clone(),
-                    skill_invocation: None,
-                }
-            } else {
-                crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-                    AppError::UnprocessableEntity(ExpansionErrorResponse {
-                        error: e.to_string(),
-                        error_type: e.error_type().to_string(),
-                        reference: e.reference(),
-                    })
-                })?
-            };
-            let images: Vec<ImageData> = req
-                .images
-                .into_iter()
-                .map(|img| ImageData {
-                    data: img.data,
-                    media_type: img.media_type,
-                })
-                .collect();
-            let files = validated_files.clone();
-            let chat_llm_text =
-                (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
-            let display_text = expanded.display_text;
-            let steering_message_id = req.message_id.clone();
-            let steer_event = Event::SteerMessage {
-                text: display_text.clone(),
-                llm_text: chat_llm_text,
-                images,
-                files,
-                message_id: req.message_id,
-                user_agent: req.user_agent,
-                skill_invocation: expanded.skill_invocation,
-            };
-            tracing::info!(
-                conversation_id = %id,
-                message_id = %steering_message_id,
-                state = effective_state.variant_name(),
-                "Accepting chat as durable steering message"
-            );
-            state
-                .runtime
-                .enqueue_steer_message(&id, steer_event)
-                .await
-                .map_err(AppError::BadRequest)?;
-            record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
-            return Ok(Json(ChatResponse {
-                queued: true,
-                steering: true,
-                already_persisted: false,
-            }));
-        }
-
-        let error_type = match err {
-            TransitionError::ContextExhausted => "context_exhausted",
-            TransitionError::ConversationTerminal => "conversation_terminal",
-            TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
-            TransitionError::AwaitingUserResponse => "awaiting_user_response",
-            TransitionError::AgentBusy => "agent_busy",
-            TransitionError::CancellationInProgress => "cancellation_in_progress",
-            TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
-        };
-        tracing::info!(
-            conv_id = %id,
-            state = effective_state.variant_name(),
-            error_type,
-            "Chat rejected: conversation state cannot accept UserMessage"
-        );
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            err.to_string(),
-            error_type,
-        ))));
-    }
-
-    let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-    let expanded = if state
-        .db
-        .is_coordinator_conversation(&conversation.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        crate::message_expander::ExpandedMessage {
-            display_text: req.text.clone(),
-            llm_text: req.text.clone(),
-            skill_invocation: None,
-        }
-    } else {
-        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-            AppError::UnprocessableEntity(ExpansionErrorResponse {
-                error: e.to_string(),
-                error_type: e.error_type().to_string(),
-                reference: e.reference(),
-            })
-        })?
-    };
-
-    // Convert images
-    let images: Vec<ImageData> = req
-        .images
-        .into_iter()
-        .map(|img| ImageData {
-            data: img.data,
-            media_type: img.media_type,
-        })
-        .collect();
-
-    let files = validated_files;
-
-    // Only set llm_text when expansion actually changed the text (REQ-IR-001)
-    let chat_llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
-
-    // Send event to runtime with message_id and user_agent.
-    // `text` carries the `display_text` (stored in DB, shown in history — REQ-IR-006).
-    // `llm_text` is the expanded form delivered to the model when present (REQ-IR-001).
-    let display_text = expanded.display_text;
-    let event = Event::UserMessage {
-        text: display_text.clone(),
-        llm_text: chat_llm_text,
-        images,
-        files,
-        message_id: req.message_id,
-        user_agent: req.user_agent,
-        skill_invocation: expanded.skill_invocation,
-    };
-
-    state
-        .runtime
-        .send_event(&id, event)
-        .await
-        .map_err(AppError::BadRequest)?;
-    record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
-
-    Ok(Json(ChatResponse {
-        queued: true,
-        steering: false,
-        already_persisted: false,
     }))
 }
 

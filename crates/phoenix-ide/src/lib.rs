@@ -19,6 +19,7 @@ mod phx_cli;
 mod project_opportunistic_build_warm;
 mod resolution_root;
 mod runtime;
+mod send_chat_service;
 mod suggest;
 mod system_prompt;
 mod task_listing;

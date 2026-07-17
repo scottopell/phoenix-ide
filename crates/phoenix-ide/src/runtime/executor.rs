@@ -1631,6 +1631,7 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
+    coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
     /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
     /// Static for the conversation's tool set, so it is computed once and only
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
@@ -1897,6 +1898,7 @@ where
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
+            coordinator_read_service: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             browser_sessions,
@@ -1973,6 +1975,14 @@ where
     }
 
     /// Set the credential helper for recovery settlement (REQ-BED-030).
+    pub(crate) fn with_coordinator_read_service(
+        mut self,
+        service: crate::api::global_read::GlobalReadService,
+    ) -> Self {
+        self.coordinator_read_service = Some(service);
+        self
+    }
+
     pub fn with_credential_helper(
         mut self,
         helper: Option<Arc<phoenix_llm::CredentialHelper>>,
@@ -4373,6 +4383,7 @@ where
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
+        let coordinator_read_service = self.coordinator_read_service.clone();
         let explore_bash = self.context.explore_bash;
 
         // Token streaming channel (REQ-BED-025).
@@ -4520,8 +4531,20 @@ where
                 tools.iter().map(|t| t.name.as_str()).collect();
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);
 
+            let mut system = vec![SystemContent::cached(&system_prompt)];
+            if is_coordinator {
+                let capsule = match coordinator_read_service {
+                    Some(service) => service.current_work_capsule().await.unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Failed to build Coordinator current-work capsule");
+                        format!("# Current work — projection unavailable\nPhoenix could not build the deterministic current-state projection for this turn: {error}\nUse list_open_work to retry. This is not transcript evidence or an exact delta.")
+                    }),
+                    None => "# Current work — projection unavailable\nThe deterministic current-state projection is unavailable for this turn. Use list_open_work to retry. This is not transcript evidence or an exact delta.".to_string(),
+                };
+                system.push(SystemContent::new(capsule));
+            }
+
             let request = LlmRequest {
-                system: vec![SystemContent::cached(&system_prompt)],
+                system,
                 messages,
                 tools,
                 max_tokens: Some(16_384),

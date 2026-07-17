@@ -29,7 +29,9 @@ pub(crate) mod wire;
 pub use deployment::{
     absolutize, DeploymentConfig, DiskCategory, DiskLocation, LogInfo, MeasureMode, TlsInfo,
 };
+pub(crate) use git_handlers::record_pr_auto_fix_context_baseline;
 pub use handlers::create_router;
+pub(crate) use handlers::validate_submitted_attachments;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
 

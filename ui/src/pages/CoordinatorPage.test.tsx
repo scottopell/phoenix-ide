@@ -132,6 +132,7 @@ describe('CoordinatorPage', () => {
     });
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
     expect(screen.getByRole('heading', { name: '1 conversation need attention' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Fix coordinator page/ })).toHaveAttribute('href', '/c/fix-coordinator');
     expect(screen.getByText('Showing all open work')).toBeInTheDocument();
@@ -141,7 +142,8 @@ describe('CoordinatorPage', () => {
     renderPage();
 
     const conversation = await screen.findByRole('region', { name: 'Coordinator conversation' });
-    const workPane = screen.getByRole('complementary', { name: 'Coordinator work' });
+    const workPane = document.querySelector('.coordinator-work-pane');
+    expect(workPane).not.toBeNull();
     const draft = screen.getByRole('textbox', { name: 'Coordinator draft' });
     fireEvent.change(draft, { target: { value: 'unsent follow-up' } });
 
@@ -175,7 +177,8 @@ describe('CoordinatorPage', () => {
 
     await screen.findByText('Shared conversation runtime /global');
     fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
-    const conversation = screen.getByRole('region', { name: 'Coordinator conversation' });
+    const conversation = document.querySelector('.coordinator-conversation');
+    expect(conversation).not.toBeNull();
     expect(conversation).toHaveAttribute('hidden');
 
     fireEvent.click(screen.getByRole('button', { name: 'Open citation' }));
