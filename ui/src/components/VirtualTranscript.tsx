@@ -1,8 +1,10 @@
 import {
   forwardRef,
   useCallback,
+  useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useReducer,
   useRef,
   type ReactNode,
@@ -79,7 +81,6 @@ interface PhysicalStore<T> {
   viewportExtent: number;
   overscan: number;
   activeAnchor: VirtualTranscriptAnchor | null;
-  duplicateKeySignature: string;
   scroller: HTMLDivElement | null;
   headerElement: HTMLDivElement | null;
   rowElements: Map<string, HTMLDivElement>;
@@ -156,30 +157,30 @@ function resolvePhysicalKeys<T>(
   items: readonly T[],
   getKey: (item: T, index: number) => string,
 ): ResolvedPhysicalKeys {
+  const semanticKeys = items.map(getKey);
+  const reservedKeys = new Set(semanticKeys);
+  const allocatedKeys = new Set<string>();
   const occurrences = new Map<string, number>();
   const duplicateKeys = new Set<string>();
-  const keys = items.map((item, index) => {
-    const semanticKey = getKey(item, index);
+  const keys = semanticKeys.map((semanticKey) => {
     const occurrence = occurrences.get(semanticKey) ?? 0;
     occurrences.set(semanticKey, occurrence + 1);
-    if (occurrence === 0) return semanticKey;
+    if (occurrence === 0) {
+      allocatedKeys.add(semanticKey);
+      return semanticKey;
+    }
+
     duplicateKeys.add(semanticKey);
-    return `${semanticKey}\u0000duplicate:${occurrence}`;
+    let discriminator = occurrence;
+    let physicalKey = `${semanticKey}\u0000duplicate:${discriminator}`;
+    while (reservedKeys.has(physicalKey) || allocatedKeys.has(physicalKey)) {
+      discriminator += 1;
+      physicalKey = `${semanticKey}\u0000duplicate:${discriminator}`;
+    }
+    allocatedKeys.add(physicalKey);
+    return physicalKey;
   });
   return { keys, duplicateKeys: [...duplicateKeys] };
-}
-
-function reportDuplicateKeys<T>(
-  store: PhysicalStore<T>,
-  duplicateKeys: readonly string[],
-): void {
-  const signature = duplicateKeys.join('\u0000');
-  if (signature === store.duplicateKeySignature) return;
-  store.duplicateKeySignature = signature;
-  if (duplicateKeys.length === 0) return;
-  console.error('[VirtualTranscript] duplicate semantic keys quarantined', {
-    duplicateKeys,
-  });
 }
 
 function estimatedExtentForKey<T>(store: PhysicalStore<T>) {
@@ -378,7 +379,6 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     viewportExtent: 0,
     overscan: clampNonNegative(props.overscan ?? 0),
     activeAnchor: null,
-    duplicateKeySignature: '',
     scroller: null,
     headerElement: null,
     rowElements: new Map(),
@@ -388,7 +388,6 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     revision: 0,
   };
   recompute(store);
-  reportDuplicateKeys(store, resolvedKeys.duplicateKeys);
   return store;
 }
 
@@ -416,6 +415,12 @@ function VirtualTranscriptInner<T>(
     storeRef.current = createStore(props);
   }
   const store = storeRef.current;
+  const resolvedPhysicalKeys = useMemo(
+    () => resolvePhysicalKeys(items, getKey),
+    [getKey, items],
+  );
+  const duplicateKeySignature = JSON.stringify(resolvedPhysicalKeys.duplicateKeys);
+  const lastReportedDuplicateKeySignature = useRef('[]');
   const [, publishRevision] = useReducer((revision: number) => revision + 1, 0);
 
   if (
@@ -428,9 +433,7 @@ function VirtualTranscriptInner<T>(
     const wasPinned = store.pinned;
     store.items = items;
     store.getKey = getKey;
-    const resolvedKeys = resolvePhysicalKeys(items, getKey);
-    reportDuplicateKeys(store, resolvedKeys.duplicateKeys);
-    store.keys = resolvedKeys.keys;
+    store.keys = resolvedPhysicalKeys.keys;
     store.estimatedExtent = estimatedExtent;
     store.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(store.keys);
@@ -443,6 +446,15 @@ function VirtualTranscriptInner<T>(
   const publish = useCallback(() => {
     publishRevision();
   }, []);
+
+  useEffect(() => {
+    if (duplicateKeySignature === lastReportedDuplicateKeySignature.current) return;
+    lastReportedDuplicateKeySignature.current = duplicateKeySignature;
+    if (resolvedPhysicalKeys.duplicateKeys.length === 0) return;
+    console.error('[VirtualTranscript] duplicate semantic keys quarantined', {
+      duplicateKeys: resolvedPhysicalKeys.duplicateKeys,
+    });
+  }, [duplicateKeySignature, resolvedPhysicalKeys]);
 
   const rowRefCallbacks = useRef(new Map<string, (element: HTMLDivElement | null) => void>());
 
@@ -519,9 +531,7 @@ function VirtualTranscriptInner<T>(
     const wasPinned = current.pinned;
     current.items = items;
     current.getKey = getKey;
-    const resolvedKeys = resolvePhysicalKeys(items, getKey);
-    reportDuplicateKeys(current, resolvedKeys.duplicateKeys);
-    current.keys = resolvedKeys.keys;
+    current.keys = resolvedPhysicalKeys.keys;
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(current.keys);
@@ -530,7 +540,7 @@ function VirtualTranscriptInner<T>(
     }
     applyPhysicalChange(current, anchor, wasPinned);
     publish();
-  }, [estimatedExtent, getKey, items, overscan, publish]);
+  }, [estimatedExtent, getKey, items, overscan, publish, resolvedPhysicalKeys]);
 
   useLayoutEffect(() => {
     const current = storeRef.current;

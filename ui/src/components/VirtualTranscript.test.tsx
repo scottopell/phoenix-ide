@@ -149,6 +149,7 @@ describe('VirtualTranscript', () => {
       { id: 'same', label: 'Item first', height: 20 },
       { id: 'same', label: 'Item second', height: 60 },
       { id: 'same', label: 'Item third', height: 30 },
+      { id: 'same\u0000duplicate:1', label: 'Reserved suffix', height: 20 },
       ...makeItems(10, 20),
     ];
 
@@ -165,18 +166,20 @@ describe('VirtualTranscript', () => {
       />,
     );
 
-    const duplicateRows = Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-index]')).slice(0, 3);
-    const physicalKeys = duplicateRows.map((row) => row.dataset['virtualKey']);
-    expect(new Set(physicalKeys).size).toBe(3);
+    const mountedRows = Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-index]'));
+    const duplicateRows = mountedRows.slice(0, 3);
+    const physicalKeys = mountedRows.slice(0, 4).map((row) => row.dataset['virtualKey']);
+    expect(new Set(physicalKeys).size).toBe(4);
     expect(physicalKeys[0]).toBe('same');
-    expect(physicalKeys[1]).toContain('duplicate:1');
-    expect(physicalKeys[2]).toContain('duplicate:2');
+    expect(physicalKeys[1]).toContain('duplicate:2');
+    expect(physicalKeys[2]).toContain('duplicate:3');
+    expect(physicalKeys[3]).toBe('same\u0000duplicate:1');
     expect(error).toHaveBeenCalledWith(
       '[VirtualTranscript] duplicate semantic keys quarantined',
       { duplicateKeys: ['same'] },
     );
 
-    act(() => ref.current?.scrollToIndex(3, 'start'));
+    act(() => ref.current?.scrollToIndex(4, 'start'));
     const anchoredTop = scrollTopOf(scroller);
     act(() => resizeObservers[0]!.triggerEntries([
       [duplicateRows[0]!, 25],
