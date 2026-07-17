@@ -1,9 +1,9 @@
 # Durable workflow grand-vision review
 
-**Reviewed stack:** PRs [#485](https://github.com/scottopell/phoenix-ide/pull/485), [#486](https://github.com/scottopell/phoenix-ide/pull/486), [#488](https://github.com/scottopell/phoenix-ide/pull/488), and [#489](https://github.com/scottopell/phoenix-ide/pull/489)  
-**Primary implementation under review:** `feat/workflow-persistence-engine-wake` at `0409841aa5`  
-**Deployment target:** one Phoenix API-server binary, one bundled SQLite database, one scheduler authority  
-**Decision status:** architecture review; no stack code or GitHub review comments changed  
+**Reviewed stack:** PRs [#485](https://github.com/scottopell/phoenix-ide/pull/485), [#486](https://github.com/scottopell/phoenix-ide/pull/486), [#488](https://github.com/scottopell/phoenix-ide/pull/488), and [#489](https://github.com/scottopell/phoenix-ide/pull/489)
+**Primary implementation under review:** `feat/workflow-persistence-engine-wake` at `0409841aa5`
+**Deployment target:** one Phoenix API-server binary, one bundled SQLite database, one scheduler authority
+**Decision status:** architecture review; no stack code or GitHub review comments changed
 **Evidence snapshot:** GitHub queried at `2026-07-17T21:13:00Z`; exact refs and counting method are recorded below
 
 ## Executive judgment
@@ -161,7 +161,7 @@ F1–F6 are architectural interpretations and recommendations based on the obser
 
 ### F1 — Permanent protocol lifecycle does not match the chosen upgrade contract
 
-**Severity:** high architectural cost  
+**Severity:** high architectural cost
 **Confidence:** high
 
 `REQ-DWF-014`, `REQ-DWF-016`, and `REQ-DWF-019`–`022` require accepted protocol executors to remain available, selector-controlled coexistence, shadow authority, divergence inventories, rollback, exact drain proof, and mixed-authority parity. The schema and repository implement protocol selections, codecs, executors, shadow divergences, and drain-related identity.
@@ -182,7 +182,7 @@ The settled product promise is different: persist typed profile kind/version and
 
 ### F2 — Universal leases conflate stale-result fencing, failure detection, and retry permission
 
-**Severity:** high semantic risk  
+**Severity:** high semantic risk
 **Confidence:** high
 
 `REQ-DWF-006`, task 47003, the pure engine, and `WorkflowRepository::{claim_effect, renew_claim, take_over_expired_claim}` put workflow version, generation, token, worker, and finite lease on every claimed external step.
@@ -207,7 +207,7 @@ In the current one-authority topology, process incarnation + attempt/generation 
 
 ### F3 — Parallel generic and wake delivery state creates contradiction surfaces
 
-**Severity:** high correctness risk  
+**Severity:** high correctness risk
 **Confidence:** high
 
 The design represents terminal delivery through generic observations/receipts/reducer inbox/owed acceptance and also through wake terminal receipts, wake observation inbox, runtime obligations, and obligation items. This is not merely normalized detail: multiple rows carry overlapping lifecycle/disposition facts and must advance together.
@@ -218,7 +218,7 @@ Current exact-head review threads repeatedly identify one side advancing without
 
 ### F4 — Correctness checks are duplicated appropriately in some places, but semantic state is duplicated in others
 
-**Severity:** medium architectural cost  
+**Severity:** medium architectural cost
 **Confidence:** high
 
 Valid duplication:
@@ -240,7 +240,7 @@ Invalid or costly duplication:
 
 ### F5 — The stack's review history is evidence of both rigor and complexity-induced defects
 
-**Severity:** medium program risk  
+**Severity:** medium program risk
 **Confidence:** high
 
 The four PRs contain 953 top-level inline review comments/findings in the cached corpus: 282 on #485, 308 on #486, 238 on #488, and 125 on #489. Automated review repeatedly revisited the same categories:
@@ -258,7 +258,7 @@ The correct response is not less testing. It is to reduce the number of independ
 
 ### F6 — The user-facing outcome remains the program's real completion gate
 
-**Severity:** high product risk  
+**Severity:** high product risk
 **Confidence:** high
 
 PR #485's central program log frames #485–#489 as infrastructure that does not deliver the intended user outcome independently. Its acceptance sentence is:
@@ -271,7 +271,7 @@ PR #488 intentionally has no complete public SSE/status/resume surface. Current 
 
 ### F7 — PR #488 is not merge-ready independently of the architecture decision
 
-**Judgment:** not merge-ready at the reviewed snapshot  
+**Judgment:** not merge-ready at the reviewed snapshot
 **Confidence:** high for thread status; individual comments require normal triage
 
 At `2026-07-17T21:13:00Z`, a paginated GitHub GraphQL `reviewThreads` query reported 242 review threads on #488, with 74 live unresolved and non-outdated. Several are duplicate rediscoveries, but current high-confidence themes include:
