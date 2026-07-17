@@ -6359,12 +6359,8 @@ def native_prod_deploy(release: str | None = None):
         candidate_socket.chmod(0o600)
 
         helper = staging / "helper.py"
-        _materialize_source_file(
-            prepared.source_commit,
-            "scripts/systemd_deploy_helper.py",
-            helper,
-            prepared.source_kind.value,
-        )
+        shutil.copy2(ROOT / "scripts/systemd_deploy_helper.py", helper)
+        helper.chmod(0o700)
         protocol = subprocess.run(
             [sys.executable, str(helper), "--protocol-version"],
             capture_output=True, text=True, check=True,
@@ -6816,13 +6812,9 @@ def prod_daemon_deploy(release: str | None = None):
             _prepare_release_candidate(release, staging)
             if release else _prepare_local_candidate(target=_linux_musl_target())
         )
-        supervisor_source = staging / "supervisor.py"
-        _materialize_source_file(
-            prepared.source_commit,
-            "scripts/bare_supervisor.py",
-            supervisor_source,
-            prepared.source_kind.value,
-        )
+        supervisor_source = staging / "bare-supervisor.py"
+        shutil.copy2(ROOT / "scripts/bare_supervisor.py", supervisor_source)
+        supervisor_source.chmod(0o700)
         protocol = subprocess.run(
             [sys.executable, str(supervisor_source), "--protocol-version"],
             capture_output=True, text=True, check=True,

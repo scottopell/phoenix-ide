@@ -1,8 +1,10 @@
+import dataclasses
 import hashlib
 import importlib.util
 import json
 import os
 import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -207,7 +209,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         source_manifest.write_text(json.dumps(self.raw))
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
         policy = self.staging_policy()
-        with mock.patch.object(helper, "prepare_data_directory"):
+        with mock.patch.object(helper, "prepare_data_directory", return_value=True):
             manifest = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
         self.assertEqual(policy.transaction_root / self.transaction_id / "manifest.json", manifest)
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
@@ -309,6 +311,16 @@ class SystemdActivationTests(SystemdManifestValidationTests):
     def manifest(self):
         return helper.Manifest.load(self.manifest_path)
 
+    def test_activation_creates_lock_parent_before_opening_lock(self):
+        manifest = self.manifest()
+        lock = Path(manifest.activation_lock_path)
+        shutil.rmtree(lock.parent)
+        controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
+        with mock.patch.object(helper, "prepare_installs", side_effect=helper.ActivationError("stop after lock")):
+            with self.assertRaisesRegex(helper.ActivationError, "stop after lock"):
+                helper.activate(manifest, controller)
+        self.assertTrue(lock.parent.is_dir())
+
     def test_unit_verification_uses_staged_candidate_executable(self):
         manifest = self.manifest()
         calls = []
@@ -408,6 +420,31 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual("activation_failed_rolled_back", state)
         self.assertEqual(1, verify.call_count)
 
+    def test_rollback_environment_uses_previous_service_group(self):
+        self.install_previous()
+        manifest = self.manifest()
+        previous_user = pwd.getpwuid(os.getuid()).pw_name
+        candidate_gid = 111
+        previous_gid = 222
+        owners = []
+
+        def group_id(user):
+            return previous_gid if user == previous_user else candidate_gid
+
+        def reserve(_staged, target, _mode, *, owner_uid=None, owner_gid=None):
+            owners.append((target, owner_gid))
+            reserved = target.with_name(f".{target.name}.reserved")
+            reserved.write_text("reserved")
+            return reserved
+
+        controller = FakeSystemctl(manifest, helper.UnitState(True, False, True, True, 41))
+        with mock.patch.object(helper, "service_group_id", side_effect=group_id), \
+             mock.patch.object(helper, "prepare_atomic_install", side_effect=reserve), \
+             mock.patch.object(controller, "verify_units"):
+            prepared = helper.prepare_installs(manifest, controller)
+        self.assertIsNotNone(prepared.rollback_environment)
+        self.assertIn((Path(manifest.targets.environment), previous_gid), owners)
+
     def test_first_install_rollback_disables_candidate_units(self):
         manifest = self.manifest()
         controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
@@ -418,6 +455,17 @@ class SystemdActivationTests(SystemdManifestValidationTests):
             ("command", ("disable", controller.socket, controller.service), False),
             controller.events,
         )
+
+    def test_first_install_rollback_removes_only_transaction_created_data_directory(self):
+        manifest = dataclasses.replace(self.manifest(), data_directory_preexisting=False)
+        data_dir = Path(manifest.targets.deployed_sha).parent
+        data_dir.mkdir(exist_ok=True)
+        (data_dir / "transaction-created").write_text("remove me")
+        controller = FakeSystemctl(manifest, helper.UnitState(False, False, False, False, 0))
+        with mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("candidate failed")):
+            state = helper.activate(manifest, controller)
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertFalse(data_dir.exists())
 
     def test_rollback_failure_preserves_claim_and_both_failures(self):
         self.install_previous()

@@ -114,6 +114,7 @@ class Manifest:
     created_at: str
     transition_timeout_secs: float = 30.0
     health_timeout_secs: float = 30.0
+    data_directory_preexisting: bool = True
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -691,6 +692,11 @@ def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstal
     candidate_socket = Path(manifest.candidate.socket.path)
     systemctl.verify_units(candidate_service, candidate_socket, Path(manifest.candidate.binary.path))
     service_gid = service_group_id(manifest.service_user)
+    rollback_gid = (
+        service_group_id(service_user_from_unit(Path(manifest.rollback.service.path)))
+        if manifest.previous is not None
+        else None
+    )
     reserved: list[Path] = []
 
     def reserve(staged: Path, target: Path, mode: int, *, owner_gid: Optional[int] = None) -> Path:
@@ -726,7 +732,7 @@ def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstal
                     Path(manifest.rollback.environment.path),
                     Path(manifest.targets.environment),
                     0o640,
-                    owner_gid=service_gid,
+                    owner_gid=rollback_gid,
                 )
         return prepared
     except BaseException:
@@ -753,7 +759,12 @@ def restore_deployed_sha(manifest: Manifest) -> None:
         atomic_write(target, (manifest.previous_deployed_sha + "\n").encode())
 
 
-def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState, prepared: PreparedInstalls) -> None:
+def restore(
+    manifest: Manifest,
+    systemctl: Systemctl,
+    previous_state: UnitState,
+    prepared: PreparedInstalls,
+) -> Optional[Path]:
     systemctl.stop()
     if manifest.previous is None:
         systemctl.command("disable", systemctl.socket, systemctl.service, check=False)
@@ -761,7 +772,7 @@ def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState,
             remove_target(Path(target))
         systemctl.daemon_reload()
         restore_deployed_sha(manifest)
-        return
+        return None if manifest.data_directory_preexisting else Path(manifest.targets.deployed_sha).parent
     assert prepared.rollback_binary and prepared.rollback_service and prepared.rollback_socket
     commit_atomic_install(prepared.rollback_binary, Path(manifest.targets.binary))
     commit_atomic_install(prepared.rollback_service, Path(manifest.targets.service))
@@ -779,10 +790,12 @@ def restore(manifest: Manifest, systemctl: Systemctl, previous_state: UnitState,
             raise ActivationError("previous health endpoint is unavailable")
         wait_for_identity(manifest, manifest.previous, manifest.previous_health_url)
     restore_deployed_sha(manifest)
+    return None
 
 
 def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
     lock_path = Path(manifest.activation_lock_path)
+    lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     with lock_path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -812,8 +825,11 @@ def activate(manifest: Manifest, systemctl: Optional[Systemctl] = None) -> str:
                 write_status(manifest, "precondition_failed", failure=failure)
                 raise
             try:
-                restore(manifest, controller, previous_state, prepared)
+                cleanup_data_dir = restore(manifest, controller, previous_state, prepared)
                 write_status(manifest, "activation_failed_rolled_back", failure=failure)
+                if cleanup_data_dir is not None:
+                    release_claim(manifest)
+                    shutil.rmtree(cleanup_data_dir)
                 return "activation_failed_rolled_back"
             except Exception as rollback_exc:
                 write_status(
@@ -917,9 +933,10 @@ def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path:
     atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
 
 
-def prepare_data_directory(service_user: str, deployed_sha_target: str) -> None:
+def prepare_data_directory(service_user: str, deployed_sha_target: str) -> bool:
     account = pwd.getpwnam(service_user)
     data_dir = Path(deployed_sha_target).parent
+    preexisting = data_dir.exists()
     data_dir.mkdir(parents=True, mode=0o750, exist_ok=True)
     os.chown(data_dir, account.pw_uid, account.pw_gid)
     os.chmod(data_dir, 0o750)
@@ -927,6 +944,7 @@ def prepare_data_directory(service_user: str, deployed_sha_target: str) -> None:
     for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
         if path.exists():
             os.chown(path, account.pw_uid, account.pw_gid)
+    return preexisting
 
 
 def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) -> Path:
@@ -962,7 +980,12 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
             copy_handoff_file(Path(item["source"]), transaction / name, item["sha256"], source_uid, allowed[name])
         manifest_path = transaction / "manifest.json"
         manifest = Manifest.load(manifest_path)
-        prepare_data_directory(manifest.service_user, policy.targets.deployed_sha)
+        data_directory_preexisting = prepare_data_directory(manifest.service_user, policy.targets.deployed_sha)
+        if not isinstance(data_directory_preexisting, bool):
+            raise ActivationError("data directory preparation did not return presence state")
+        manifest_raw = json.loads(manifest_path.read_text())
+        manifest_raw["data_directory_preexisting"] = data_directory_preexisting
+        atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
         capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
         write_policy_status(manifest, policy, "prepared")
