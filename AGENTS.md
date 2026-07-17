@@ -22,17 +22,30 @@ The core is a **state machine-driven conversation runtime**: messages flow throu
 
 ### Architecture
 
+The Rust workspace is split into focused crates under `crates/`:
+
 ```
-crates/phoenix-ide/src/
-  runtime/       # Conversation lifecycle, state machine executor
-  state_machine/ # Pure state transitions (Elm architecture)
-  tools/         # bash, patch, browser, keyword_search, think, tmux, etc.
-  llm/           # Provider abstraction (Anthropic, OpenAI, Fireworks)
-  api/           # HTTP handlers, SSE streaming
-  db/            # SQLite persistence
-  chain_runtime.rs / chain_qa/    # Phoenix Chains v1 (see specs/chains/)
-  terminal/      # In-app terminal + tmux-attach bridging
-crates/phoenix-tls/  # Terminal-line stream library (used by terminal/)
+phoenix-ide/           # Binary crate: wires everything together
+  src/runtime/         #   Conversation lifecycle, state machine executor
+  src/api/             #   HTTP handlers, SSE streaming
+  src/chain_runtime.rs / chain_qa/   # Phoenix Chains v1 (see specs/chains/)
+  src/discovery/       #   Git repo / project detection
+phoenix-state-machine/ # Pure state transitions + effects (Elm architecture)
+phoenix-core/          # Domain types (sm_state, llm_service), git, platform
+phoenix-llm/           # Provider abstraction (Anthropic, OpenAI/Codex, Fireworks)
+phoenix-tools/         # Tools: bash, patch, browser, keyword_search, think, tmux, …
+                       #   + the Tool-trait glue for phoenix-mcp / phoenix-browser
+phoenix-db/            # SQLite persistence (ddl, migrations, retrieval)
+phoenix-terminal/      # In-app terminal + tmux-attach bridging
+phoenix-tls/           # Terminal-line stream library (used by phoenix-terminal)
+phoenix-mcp/           # MCP client engine (JSON-RPC, stdio/HTTP transports, OAuth)
+phoenix-browser/       # Headless-browser (CDP) engine
+phoenix-agents/ phoenix-skills/       # Sub-agent + skill discovery/metadata
+phoenix-workflow/ phoenix-drive-turn/ # Durable-workflow core; one-shot turn driver
+phoenix-bash-display/  # Bash command display simplification (UI)
+```
+
+```
 ui/src/
   components/    # React components
   machines/      # XState state machines
@@ -210,15 +223,15 @@ Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.p
 
 ### Adding a New Tool
 
-See [`crates/phoenix-ide/src/tools/think.rs`](crates/phoenix-ide/src/tools/think.rs) as the simplest example.
+See [`crates/phoenix-tools/src/think.rs`](crates/phoenix-tools/src/think.rs) as the simplest example.
 
-1. Create `crates/phoenix-ide/src/tools/your_tool.rs` implementing the `Tool` trait:
+1. Create `crates/phoenix-tools/src/your_tool.rs` implementing the `Tool` trait:
    - `name()` — tool identifier
    - `description()` — shown to LLM
    - `input_schema()` — JSON schema for parameters
    - `run()` — async execution, returns `ToolOutput`
 
-2. Register in `crates/phoenix-ide/src/tools.rs` → `ToolRegistry::new_with_options()`
+2. Register in `crates/phoenix-tools/src/lib.rs` → `ToolRegistry::new_with_options()`
 
 3. Add spec in `specs/your-tool/executive.md` (see existing specs for format)
 
