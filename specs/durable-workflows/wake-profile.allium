@@ -371,6 +371,8 @@ rule RegistrationRejectsUnavailableSubagentResource {
     requires: subagent_resource_matches_child_conversation(resource)
     requires: conversation_is_terminal_or_archived(conversation)
         or wake_protocol_selection().accepting != true
+        or wake_protocol_selection().authority != engine_protocol
+        or not active_registration_fence(conversation)
     ensures: WakeRegistrationRejected("wake_unavailable_subagent")
     ensures: not WakeWorkflowBinding.created(conversation: conversation, resource: resource)
 }
@@ -479,6 +481,8 @@ rule StartupScheduleForgetsUnevaluableResourceImmediately {
 rule CancellationScheduleArbitratesAndCompensates {
     when: WakeCancellationRequested(agent, conversation, binding)
     requires: binding.conversation = conversation
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     requires: binding.observe_effect.status not in {receipted, invalidated}
     requires: cancellation_winner(binding) = explicit_cancel
     ensures: WakeCancellationGenerationTransitionCommitted(binding)
@@ -493,6 +497,8 @@ rule CancellationScheduleArbitratesAndCompensates {
 
 rule LosingCancellationIsIdempotent {
     when: WakeCancellationRequested(agent, conversation, binding)
+    requires: binding.workflow.authority = engine_protocol
+    requires: binding.workflow.execution_mode = authoritative
     requires: terminal_winner(binding) != explicit_cancel
     ensures: WakeCancellationOutcome(already_terminal)
     ensures: no_resume_scheduled_only_for_cancel(binding)

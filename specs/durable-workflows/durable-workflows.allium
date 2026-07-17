@@ -846,13 +846,23 @@ rule RejectIneligibleClaim {
     ensures: not Claim.created(effect: effect, issued_at: now())
 }
 
-rule RejectUnclaimableEligibleEffect {
+rule RejectInvalidClaimLease {
     when: EffectClaimRequested(worker, effect, lease_until)
     requires: effect.status = eligible
     requires: effect.generation = effect.workflow.generation
     requires: effect.workflow.authority = engine_protocol and effect.workflow.execution_mode = authoritative
     requires: lease_until <= now()
-        or not effect_family_policy_registered_exactly_once(effect)
+    ensures: EffectClaimOutcome(ineligible)
+    ensures: not Claim.created(effect: effect, issued_at: now())
+}
+
+rule RejectUnclaimableEligibleEffect {
+    when: EffectClaimRequested(worker, effect, lease_until)
+    requires: effect.status = eligible
+    requires: effect.generation = effect.workflow.generation
+    requires: effect.workflow.authority = engine_protocol and effect.workflow.execution_mode = authoritative
+    requires: lease_until > now()
+    requires: not effect_family_policy_registered_exactly_once(effect)
         or not profile_has_lossless_decoder(effect.workflow.profile, effect.codec)
     ensures: EffectClaimOutcome(unsupported_codec)
     ensures: not Claim.created(effect: effect, issued_at: now())
@@ -999,11 +1009,24 @@ rule RejectUnavailableOrClosedTerminalReceipt {
     ensures: accepted_receipt_count(effect) <= 1
 }
 
+rule ApplyProfileReconciliationDecision {
+    when: ReconciliationDecisionReported(worker, effect, authority, decision)
+    requires: decision in {perform, adopt, repair, compensate, durable_conflict, stop_authority_lost}
+    requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
+    requires: ambiguity_recovery_allowed(effect, decision)
+    ensures: ReconciliationDecisionPersisted(effect, decision)
+    ensures: ProfileReconciliationDecisionApplied(effect, decision)
+    ensures: ReconciliationDecisionOutcome(accepted, decision)
+}
+
 rule ScheduleRetryDurably {
     when: ReconciliationDecisionReported(worker, effect, authority, retry_infrastructure)
     requires: live_matching_authority(effect, authority)
     requires: authority.worker_id = worker
     requires: ambiguity_recovery_allowed(effect, retry_infrastructure)
+    ensures: ReconciliationDecisionPersisted(effect, retry_infrastructure)
+    ensures: ReconciliationDecisionOutcome(accepted, retry_infrastructure)
     ensures: effect.status = retry_wait
     ensures: effect.next_eligible_at = retry_deadline_for(effect, retry_infrastructure)
     ensures: DurableDeadlineScheduled(effect, effect.next_eligible_at)
@@ -1014,6 +1037,8 @@ rule RequireManualResolution {
     requires: live_matching_authority(effect, authority)
     requires: authority.worker_id = worker
     ensures: effect.status = ambiguity_wait
+    ensures: ReconciliationDecisionPersisted(effect, request_manual_resolution)
+    ensures: ReconciliationDecisionOutcome(accepted, request_manual_resolution)
     ensures: ManualResolution.created(
         id: next_manual_resolution_id(), workflow: effect.workflow,
         effect: effect, status: required,

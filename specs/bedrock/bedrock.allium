@@ -1252,7 +1252,7 @@ rule UserHardDeletesConversationRule {
     when: UserHardDeletesConversation(conversation)
 
     requires: not conversation.is_busy
-    requires: WakeLifecycleAdmissionGranted(conversation)
+    requires: DestructiveLifecycleMayProceed(conversation, hard_delete)
 
     ensures: BashHandlesCleanedUp(conversation)
         -- Direct call: cascade_bash_on_delete (REQ-BASH-006).
