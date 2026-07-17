@@ -24,6 +24,7 @@ import { getStateDescription, isAgentWorking } from "../utils";
 import { ContextIndicator } from "./ContextIndicator";
 import "./StateBar.css";
 import { setActivePrSelectorIntent, type ActivePrSelectorIntent } from './activePrSelectorIntent';
+import { derivePrRailAvailability } from './prRailAvailability';
 import {
   prBadgeClass,
   prBadgeLabel,
@@ -970,24 +971,13 @@ export function StateBar({
     prStatus && !prStatus.found
       ? unavailablePrHint(prStatus.unavailable_reason)
       : null;
-  const mobileActionablePrs = prStatusHandle?.activeSelection?.associated_prs.filter(
-    (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
-  ) ?? [];
-  const mobileActivePrIsActionable = Boolean(
-    prStatusHandle?.activePrSummary
-    && mobileActionablePrs.some(
-      (pr) => pr.repo_owner === prStatusHandle.activePrSummary?.repo_owner
-        && pr.repo_name === prStatusHandle.activePrSummary?.repo_name
-        && pr.pr_number === prStatusHandle.activePrSummary?.pr_number,
-    ),
-  );
-  const mobilePrRailCanRepresentSelection = mobileActionablePrs.length > 0
-    && (!prStatusHandle?.activePrSummary || mobileActivePrIsActionable);
-  const mobilePrRailOwnsSelection = Boolean(
-    isMobile
-    && (isWork || isBranchMode)
+  const prRailAvailability = prStatusHandle
+    ? derivePrRailAvailability(prStatusHandle, isMobile)
+    : null;
+  const workActionsPrRailOwnsSelection = Boolean(
+    (isWork || isBranchMode)
     && ['idle', 'error', 'context_exhausted'].includes(convState.type)
-    && mobilePrRailCanRepresentSelection
+    && prRailAvailability?.shouldRender
   );
 
   const cwdSummary = summarizePath(conversation?.cwd);
@@ -997,7 +987,7 @@ export function StateBar({
   const prStatusContent = (
     <>
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
-      {!mobilePrRailOwnsSelection && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
+      {!workActionsPrRailOwnsSelection && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
       {prHint && !prLoading && (
         <span
           className="pr-hint"

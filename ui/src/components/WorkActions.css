@@ -278,3 +278,80 @@
     opacity: 1;
   }
 }
+
+.desktop-pr-dock {
+  border-top: 0;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+}
+
+.desktop-pr-dock .mobile-pr-rail {
+  min-height: 44px;
+  padding: 6px 12px;
+  gap: 8px;
+}
+
+.desktop-pr-dock .mobile-pr-chip {
+  min-height: 32px;
+  max-width: min(420px, 42vw);
+  border-radius: 8px;
+  padding: 5px 9px;
+  gap: 7px;
+}
+
+.desktop-pr-chip-title {
+  min-width: 0;
+  max-width: 190px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.desktop-pr-chip-branch {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.desktop-pr-dock .mobile-pr-actions {
+  padding: 10px 12px;
+  grid-template-columns: minmax(240px, 1.35fr) minmax(420px, 2fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.desktop-pr-dock .mobile-pr-actions-hero,
+.desktop-pr-dock .mobile-pr-actions-secondary {
+  min-width: 0;
+}
+
+.desktop-pr-dock .mobile-pr-actions-secondary {
+  grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
+}
+
+.desktop-pr-dock .mobile-pr-actions-context {
+  max-width: 320px;
+  justify-content: flex-end;
+}
+
+.desktop-pr-dock .mobile-pr-dock-note {
+  padding-inline: 12px;
+}
+
+@media (769px <= width <= 1050px) {
+  .desktop-pr-dock .mobile-pr-actions {
+    grid-template-columns: 1fr 2fr;
+  }
+
+  .desktop-pr-dock .mobile-pr-actions-context {
+    grid-column: 1 / -1;
+    max-width: none;
+    justify-content: flex-start;
+  }
+}

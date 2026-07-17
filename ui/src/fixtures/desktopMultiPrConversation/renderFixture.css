@@ -1,0 +1,55 @@
+.desktop-multi-pr-conversation-fixture {
+  min-height: 100vh;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+}
+
+.desktop-multi-pr-conversation-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 48px clamp(32px, 8vw, 120px);
+  display: flex;
+  align-items: flex-end;
+}
+
+.desktop-multi-pr-conversation-transcript > div {
+  max-width: 44rem;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.desktop-multi-pr-conversation-transcript strong {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.desktop-multi-pr-conversation-transcript p {
+  margin: 6px 0 0;
+}
+
+.desktop-multi-pr-conversation-input {
+  min-height: 60px;
+  margin: 12px clamp(24px, 6vw, 96px) 16px;
+  padding: 10px 10px 10px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.desktop-multi-pr-conversation-input button {
+  min-width: 72px;
+  min-height: 38px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent-blue);
+  color: white;
+}

@@ -5,6 +5,7 @@ import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatu
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
+import { derivePrRailAvailability } from './prRailAvailability';
 import { useIsMobile } from '../hooks';
 import './WorkActions.css';
 
@@ -117,7 +118,7 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
-  const [expandedMobilePrIdentity, setExpandedMobilePrIdentity] = useState<string | null>(null);
+  const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const isMobile = useIsMobile();
   const isLoading = markingMerged || abandoning;
@@ -135,19 +136,10 @@ export function WorkControlBar({
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
   const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
   const associatedPrs = useMemo(() => selection?.associated_prs ?? [], [selection?.associated_prs]);
-  const actionablePrs = useMemo(
-    () => associatedPrs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft'),
-    [associatedPrs],
+  const { actionablePrs, canRepresentActiveSelection, shouldRender: shouldRenderPrRail } = derivePrRailAvailability(
+    prStatusHandle,
+    isMobile,
   );
-  const activePrIsActionable = Boolean(
-    activePr
-    && actionablePrs.some(
-      (pr) => pr.repo_owner === activePr.repo_owner
-        && pr.repo_name === activePr.repo_name
-        && pr.pr_number === activePr.pr_number,
-    ),
-  );
-  const mobileRailCanRepresentActiveSelection = actionablePrs.length > 0 && (!activePr || activePrIsActionable);
   const diffLabel = useMemo(
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
@@ -231,21 +223,21 @@ export function WorkControlBar({
     }
   };
 
-  const resumeMobilePrInference = async () => {
+  const resumePrInference = async () => {
     if (!prStatusHandle.resumeInference) return;
     setError(null);
     try {
       await prStatusHandle.resumeInference();
-      setExpandedMobilePrIdentity(null);
+      setExpandedPrIdentity(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to resume automatic PR selection');
     }
   };
 
-  const selectMobilePr = async (pr: (typeof associatedPrs)[number], selected: boolean) => {
+  const selectRailPr = async (pr: (typeof associatedPrs)[number], selected: boolean) => {
     const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
     if (selected) {
-      setExpandedMobilePrIdentity((current) => current === identity ? null : identity);
+      setExpandedPrIdentity((current) => current === identity ? null : identity);
       return;
     }
     if (!prStatusHandle.pinActivePr) return;
@@ -257,7 +249,7 @@ export function WorkControlBar({
         repo_name: pr.repo_name,
         pr_number: pr.pr_number,
       });
-      setExpandedMobilePrIdentity(identity);
+      setExpandedPrIdentity(identity);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to select active PR');
     } finally {
@@ -287,8 +279,7 @@ export function WorkControlBar({
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
 
-  if (isMobile) {
-    if (!mobileRailCanRepresentActiveSelection) {
+  if (isMobile && !canRepresentActiveSelection) {
       return (
         <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
@@ -339,12 +330,13 @@ export function WorkControlBar({
           {error && <div className="work-actions-error" role="alert">{error}</div>}
         </div>
       );
-    }
+  }
 
+  if (shouldRenderPrRail) {
     const activeIdentity = activePr
       ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
       : null;
-    const expanded = activeIdentity !== null && expandedMobilePrIdentity === activeIdentity;
+    const expanded = activeIdentity !== null && expandedPrIdentity === activeIdentity;
     const mobileHero = disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
       <button
         type="button"
@@ -383,7 +375,7 @@ export function WorkControlBar({
     ) : null;
 
     return (
-      <div className="mobile-pr-dock" data-testid="mobile-work-controls">
+      <div className={`mobile-pr-dock${isMobile ? '' : ' desktop-pr-dock'}`} data-testid={isMobile ? 'mobile-work-controls' : 'desktop-work-controls'}>
         {expanded && (
           <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
             {mobileHero && <div className="mobile-pr-actions-hero">{mobileHero}</div>}
@@ -437,7 +429,7 @@ export function WorkControlBar({
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--automatic"
-                  onClick={resumeMobilePrInference}
+                  onClick={resumePrInference}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">↻</span><span>Auto</span>
                 </button>
@@ -463,11 +455,13 @@ export function WorkControlBar({
                 aria-pressed={selected}
                 aria-expanded={isExpanded}
                 disabled={savingPrIdentity !== null}
-                onClick={() => selectMobilePr(pr, selected)}
+                onClick={() => selectRailPr(pr, selected)}
               >
                 <span className={`mobile-pr-status-dot mobile-pr-status-dot--${pr.display_state}`} aria-hidden="true" />
                 <span className="mobile-pr-chip-number">#{pr.pr_number}</span>
+                {!isMobile && <span className="desktop-pr-chip-title">{pr.title}</span>}
                 <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
+                {!isMobile && <span className="desktop-pr-chip-branch">{pr.head}</span>}
                 {selected && freshnessLabel && (
                   <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>{freshnessLabel.replace(' new', '')}</span>
                 )}

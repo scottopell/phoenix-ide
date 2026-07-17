@@ -318,7 +318,7 @@ describe('StateBar PR badge', () => {
     render(
       <MemoryRouter>
         <StateBar
-          conversation={makeConversation()}
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
           convState={{ type: 'idle' }}
           connectionState="connected"
           connectionAttempt={0}
@@ -348,7 +348,7 @@ describe('StateBar PR badge', () => {
     render(
       <MemoryRouter>
         <StateBar
-          conversation={makeConversation()}
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
           convState={{ type: 'idle' }}
           connectionState="connected"
           connectionAttempt={0}
@@ -378,7 +378,7 @@ describe('StateBar PR badge', () => {
     render(
       <MemoryRouter>
         <StateBar
-          conversation={makeConversation()}
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
           convState={{ type: 'idle' }}
           connectionState="connected"
           connectionAttempt={0}
@@ -412,7 +412,7 @@ describe('StateBar PR badge', () => {
       <MemoryRouter>
         <button type="button">Before</button>
         <StateBar
-          conversation={makeConversation()}
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
           convState={{ type: 'idle' }}
           connectionState="connected"
           connectionAttempt={0}
@@ -456,7 +456,7 @@ describe('StateBar PR badge', () => {
     render(
       <MemoryRouter>
         <StateBar
-          conversation={makeConversation()}
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
           convState={{ type: 'idle' }}
           connectionState="connected"
           connectionAttempt={0}
@@ -474,6 +474,65 @@ describe('StateBar PR badge', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Pin failed');
     fireEvent.click(screen.getByTestId('active-pr-resume-inference'));
     expect(screen.getByRole('status')).toHaveTextContent('Saving active PR…');
+  });
+
+  it('defers desktop multi-PR selection to Work Actions only while its rail is available', () => {
+    const selection = makeSelection({
+      associated_prs: [
+        ...makeSelection().associated_prs,
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123-pr-status', head: 'follow-up', feedback_status: 'open' },
+      ],
+    });
+    const handle = makePrStatusHandle(mockPrStatus({ found: true, number: 12, display_state: 'open' }), selection);
+    const props = {
+      conversation: makeConversation(),
+      connectionState: 'connected' as const,
+      connectionAttempt: 0,
+      nextRetryIn: null,
+      contextWindowUsed: 0,
+      modelContextWindow: 200_000,
+      prStatusHandle: handle,
+    };
+    const { rerender } = render(
+      <MemoryRouter>
+        <StateBar {...props} convState={{ type: 'idle' }} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar {...props} convState={{ type: 'llm_requesting', attempt: 1 }} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
+  });
+
+  it('keeps the selector when a terminal active PR cannot be represented by the desktop rail', () => {
+    const openPr = makeSelection().associated_prs[0]!;
+    const terminalPr = { ...openPr, pr_number: 34, title: 'Merged PR', display_state: 'merged' as const, state: 'CLOSED', url: 'https://github.com/o/r/pull/34' };
+    const selection = makeSelection({
+      associated_prs: [openPr, terminalPr],
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 34 }, provenance: 'pinned' },
+    });
+    const handle = makePrStatusHandle(mockPrStatus({ found: true, number: 34, display_state: 'merged' }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
   });
 });
 

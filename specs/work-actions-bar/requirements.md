@@ -79,11 +79,20 @@ THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin hori
 rail containing the actionable associated PRs and their current status.
 THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
 
+WHEN a desktop conversation has multiple actionable associated PRs and its active PR is either
+actionable or absent
+THE SYSTEM SHALL replace the persistent multi-zone action bar with a PR rail whose entries show the
+PR number, title, branch, open-or-draft status, and actionable feedback freshness.
+WHEN a desktop conversation has fewer than two actionable associated PRs, or its active PR cannot be
+represented by that rail
+THE SYSTEM SHALL preserve the three-zone presentation and the StateBar active-PR selector fallback.
+
 WHEN the user activates a PR in the rail
 THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
 region upward from the rail. The expanded region SHALL present the active PR's single hero action
-in one row and its supporting context actions in a separate row. Closing or switching the expanded
-region changes only presentation; it does not create a parallel active-PR selection.
+separately from its supporting context actions. Closing or switching the expanded region changes
+only presentation; it does not create a parallel active-PR selection. The StateBar active-PR selector
+SHALL be hidden only while the Work Actions rail can represent and owns that selection.
 
 ---
 
@@ -106,9 +115,9 @@ A RESOLVE disposition may additionally carry a single **secondary** link-out (th
 the primary and never glows; it exists only alongside an `address_feedback` primary. This does
 not violate the single-primary rule: there is still exactly one glowing button.
 
-On mobile, the expanded active-PR region SHALL emphasize exactly one hero action. Supporting
+In the active-PR rail, the expanded region SHALL emphasize exactly one hero action. Supporting
 review, link-out, cleanup, and abandon controls SHALL remain visually secondary. Cleanup SHALL
-never be inferred as the mobile hero action from repository structure alone; when legal, it remains
+never be inferred as the rail's hero action from repository structure alone; when legal, it remains
 available only among supporting context actions.
 
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
@@ -304,6 +313,23 @@ SHALL expose active-PR branch context and SHALL collapse when the active PR is a
 
 The rail SHALL NOT store a parallel active PR, infer by recency, show closed PRs as selectable, or
 reinterpret a compatibility primary-PR projection as authoritative.
+
+### REQ-WAB-012: Desktop Active-PR Rail
+
+WHEN at least two actionable associated PRs exist on desktop and the rail can represent the explicit
+active selection
+THE SYSTEM SHALL render a persistent PR rail whose entries identify each PR by number, title,
+branch, open-or-draft state, and targeted feedback freshness.
+
+WHEN the user activates the explicit active PR
+THE SYSTEM SHALL expand or collapse the active PR's hero and supporting action groups.
+WHEN the user activates another PR
+THE SYSTEM SHALL pin that PR through the shared `pr-association` selection authority before
+expanding it.
+
+The Work Actions rail and StateBar selector SHALL derive availability from the same rule. The
+StateBar selector SHALL remain available while Work Actions is hidden, while fewer than two desktop
+PRs are actionable, or when a terminal active PR cannot be represented by the rail.
 
 ---
 

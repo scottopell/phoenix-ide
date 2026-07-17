@@ -645,7 +645,7 @@ describe('WorkControlBar — View Diff (View Browser gone)', () => {
 });
 
 describe('WorkControlBar — active PR interactions', () => {
-  it('retargets ambiguity guidance to the selector and opens focus there', async () => {
+  it('resolves desktop ambiguity directly through the persistent PR rail', async () => {
     const handle = prStatusHandle(
       { found: false },
       {
@@ -686,8 +686,9 @@ describe('WorkControlBar — active PR interactions', () => {
       </>,
     );
 
-    fireEvent.click(screen.getByTestId('active-pr-ambiguity-note'));
-    expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /#12 Fix CI open task-123/ }));
+    await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 12 }));
   });
 
   it('commits a newly ambiguous safety refresh before opening the selector', async () => {
@@ -774,11 +775,11 @@ describe('WorkControlBar — active PR interactions', () => {
       />,
     );
 
-    expect(screen.getByTestId('view-diff-button')).toHaveTextContent('Workspace Diff');
-    expect(screen.getByTestId('active-pr-ambiguity-note')).toBeInTheDocument();
-    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 2 open/draft · 1 closed. Cleanup still applies only to this task branch.');
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#34 Follow-up open task-123-follow-up/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Clean up/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon/ })).not.toBeInTheDocument();
   });
 
   it('uses concise address-feedback copy and a full accessible target', () => {
@@ -829,7 +830,8 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
     expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
     expect(screen.queryByTestId('open-pr-link')).not.toBeInTheDocument();
-    expect(screen.getByTestId('active-pr-ambiguity-note')).toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
   });
 
   it('gates active PR diff behind ambiguity and otherwise uses PR-specific comparator context', () => {
@@ -1133,6 +1135,70 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         /Address PR #139 feedback/i,
       );
     });
+  });
+});
+
+describe('WorkControlBar — desktop multi-PR rail', () => {
+  it('replaces the wrapped action bar with rich PR chips when multiple PRs are actionable', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          ...selection().associated_prs,
+          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second desktop PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-multi" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#13 Second desktop PR open task-124/ })).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
+  });
+
+  it('expands the active desktop PR into hero and supporting actions', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_freshness: { state: 'new', count: 2 },
+      feedback_status: 'open',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          ...selection().associated_prs,
+          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second desktop PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-expand" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 Fix CI open task-123/ }));
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 2 new');
+    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
+  });
+
+  it('keeps the legacy desktop presentation for a single actionable PR', () => {
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,
+    );
+
+    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
+    expect(screen.getByText('Done?')).toBeInTheDocument();
   });
 });
 

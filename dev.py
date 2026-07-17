@@ -2586,6 +2586,16 @@ def cmd_qa_mobile_multi_pr_conversation() -> None:
     )
 
 
+def cmd_qa_desktop_multi_pr_conversation() -> None:
+    """Capture the desktop multi-PR conversation fixture."""
+    subprocess.run(
+        ["pnpm", "qa:desktop-multi-pr-conversation"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 def cmd_qa_new_conversation() -> None:
     """Capture the new-conversation page at desktop and mobile sizes."""
     subprocess.run(
@@ -8206,6 +8216,7 @@ def main():
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
+    qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
@@ -8330,6 +8341,8 @@ def main():
             cmd_qa_coordinator()
         elif args.qa_command == "mobile-multi-pr-conversation":
             cmd_qa_mobile_multi_pr_conversation()
+        elif args.qa_command == "desktop-multi-pr-conversation":
+            cmd_qa_desktop_multi_pr_conversation()
         elif args.qa_command == "new-conversation":
             cmd_qa_new_conversation()
         elif args.qa_command == "message-list":
