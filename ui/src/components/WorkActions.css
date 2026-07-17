@@ -310,6 +310,53 @@
   font-size: 11px;
 }
 
+.desktop-work-actions-terminal {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.desktop-work-actions-terminal .work-actions-info-hint {
+  position: relative;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.desktop-work-actions-terminal .work-actions-info-hint summary {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  cursor: help;
+  list-style: none;
+  display: grid;
+  place-items: center;
+}
+
+.desktop-work-actions-terminal .work-actions-info-hint summary::-webkit-details-marker {
+  display: none;
+}
+
+.desktop-work-actions-terminal .work-actions-info-hint summary:hover,
+.desktop-work-actions-terminal .work-actions-info-hint summary:focus-visible {
+  color: var(--text-secondary);
+  outline: 1px solid var(--border-color);
+}
+
+.desktop-work-actions-terminal .work-actions-info-hint [role="tooltip"] {
+  position: fixed;
+  z-index: var(--z-tooltip, 1000);
+  max-width: 360px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 35%);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .desktop-work-actions-identity {
   cursor: default;
 }
@@ -321,6 +368,11 @@
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.desktop-work-actions-error {
+  width: auto;
+  margin: 0 12px 6px;
 }
 
 .mobile-pr-status-dot--loading {

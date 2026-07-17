@@ -558,6 +558,8 @@ describe('WorkControlBar — checking / loading', () => {
     expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
     expect(screen.queryByText('Done?')).not.toBeInTheDocument();
     expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('WorkspaceChecking PR…');
+    expect(screen.getByTestId('desktop-work-actions-identity').tagName).toBe('SPAN');
+    expect(screen.getByTestId('desktop-work-actions-identity')).not.toHaveAttribute('tabindex');
   });
 });
 
@@ -722,7 +724,12 @@ describe('WorkControlBar — active PR interactions', () => {
 
     await waitFor(() => expect(handle.refresh).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
+    expect(screen.getAllByLabelText(/Mark as merged\. Deletes the worktree/)).toHaveLength(2);
+    expect(screen.getAllByText('ⓘ')).toHaveLength(2);
     expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
+    const alert = screen.getByRole('alert');
+    expect(alert.closest('.desktop-work-actions-rail')).toBeNull();
+    expect(alert.closest('.desktop-work-actions-compact')).toBeInTheDocument();
   });
 
   it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {

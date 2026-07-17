@@ -19,6 +19,15 @@ interface WorkControlBarProps {
   prStatusHandle: ConversationPrStatusHandle;
 }
 
+function InfoHint({ text }: { text: string }) {
+  return (
+    <details className="work-actions-info-hint">
+      <summary aria-label={text} title={text}>ⓘ</summary>
+      <span role="tooltip">{text}</span>
+    </details>
+  );
+}
+
 /** The orthogonal PR feedback coverage marker (e.g. "⚠ GitHub sign-in needed").
  *  Rendered on whichever RESOLVE verb shows, since a coverage gap is independent
  *  of which action the PR routes to (it never forces auto-fix routing). */
@@ -481,16 +490,24 @@ export function WorkControlBar({
   return (
     <div className="desktop-work-actions-compact" data-testid="desktop-work-controls">
       <div className="desktop-work-actions-rail" aria-label="Work actions">
-        <button
-          type="button"
-          className="mobile-pr-chip desktop-work-actions-identity"
-          data-testid="desktop-work-actions-identity"
-          onClick={activePrNumber ? requestActivePrSelectorOpen : undefined}
-        >
-          <span className={`mobile-pr-status-dot${prLoading ? ' mobile-pr-status-dot--loading' : ''}`} aria-hidden="true" />
-          <span className="mobile-pr-chip-number">{activePrNumber ? `#${activePrNumber}` : 'Workspace'}</span>
-          <span className="mobile-pr-chip-state">{prLoading ? 'Checking PR…' : prStatus?.display_state ?? 'actions'}</span>
-        </button>
+        {activePrNumber ? (
+          <button
+            type="button"
+            className="mobile-pr-chip desktop-work-actions-identity"
+            data-testid="desktop-work-actions-identity"
+            onClick={requestActivePrSelectorOpen}
+          >
+            <span className="mobile-pr-status-dot" aria-hidden="true" />
+            <span className="mobile-pr-chip-number">#{activePrNumber}</span>
+            <span className="mobile-pr-chip-state">{prStatus?.display_state ?? 'actions'}</span>
+          </button>
+        ) : (
+          <span className="mobile-pr-chip desktop-work-actions-identity" data-testid="desktop-work-actions-identity">
+            <span className={`mobile-pr-status-dot${prLoading ? ' mobile-pr-status-dot--loading' : ''}`} aria-hidden="true" />
+            <span className="mobile-pr-chip-number">Workspace</span>
+            <span className="mobile-pr-chip-state">{prLoading ? 'Checking PR…' : 'actions'}</span>
+          </span>
+        )}
         <button
           className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
@@ -529,28 +546,34 @@ export function WorkControlBar({
           <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
         )}
         {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
-          <button
-            className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
-            data-testid="clean-up-button"
-            aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
-            title={cleanUpHintText(isBranch)}
-            disabled={isLoading}
-            onClick={handleCleanUp}
-          >
-            {markingMerged ? 'Cleaning…' : 'Clean up'}
-          </button>
+          <div className="desktop-work-actions-terminal">
+            <button
+              className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
+              data-testid="clean-up-button"
+              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+              title={cleanUpHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleCleanUp}
+            >
+              {markingMerged ? 'Cleaning…' : 'Clean up'}
+            </button>
+            <InfoHint text={cleanUpHintText(isBranch)} />
+          </div>
         )}
         {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
-          <button
-            className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
-            data-testid="abandon-button"
-            aria-label={`Abandon. ${abandonHintText(isBranch)}`}
-            title={abandonHintText(isBranch)}
-            disabled={isLoading}
-            onClick={handleAbandon}
-          >
-            {abandoning ? 'Abandoning…' : 'Abandon'}
-          </button>
+          <div className="desktop-work-actions-terminal">
+            <button
+              className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
+              data-testid="abandon-button"
+              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+              title={abandonHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleAbandon}
+            >
+              {abandoning ? 'Abandoning…' : 'Abandon'}
+            </button>
+            <InfoHint text={abandonHintText(isBranch)} />
+          </div>
         )}
         {note && (
           <span className={`work-actions-note desktop-work-actions-note${note.kind === 'continued' ? ' work-actions-continuation-note' : ''}${note.kind === 'checking' ? ' work-actions-checking-note' : ''}${note.kind === 'gh_unavailable' ? ' work-actions-pr-note--warning' : ''}${note.kind === 'pr_closed' || note.kind === 'pr_open_stuck' || note.kind === 'no_pr_dirty' ? ' work-actions-pr-note' : ''}`}>
@@ -562,8 +585,8 @@ export function WorkControlBar({
             {mixedAssociatedStateSummary}
           </span>
         )}
-        {error && <div className="work-actions-error" role="alert">{error}</div>}
       </div>
+      {error && <div className="work-actions-error desktop-work-actions-error" role="alert">{error}</div>}
     </div>
   );
 }
