@@ -20,8 +20,11 @@ export function derivePrRailAvailability(
   const actionablePrs = handle.activeSelection?.associated_prs.filter(
     (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
   ) ?? [];
+  const activeSelection = handle.activeSelection?.active_pr;
   const activePr = handle.activePrSummary;
+  const hasUnresolvedActiveSelection = activeSelection !== undefined && activePr === null;
   const canRepresentActiveSelection = actionablePrs.length > 0
+    && !hasUnresolvedActiveSelection
     && (!activePr || actionablePrs.some((pr) => samePr(pr, activePr)));
 
   return {

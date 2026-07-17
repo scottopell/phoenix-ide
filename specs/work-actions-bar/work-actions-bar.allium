@@ -3,11 +3,11 @@
 --
 -- Phoenix Work Actions Bar: Behavioural Specification
 --
--- Scope: The `.work-actions-bar` row rendered on Work and Branch conversations
+-- Scope: The Work Actions surface rendered on Work and Branch conversations
 --        while the conversation is idle, errored, or context-exhausted.
---        Governs visibility, three-zone layout, the single-primary rule, the
---        WorkDisposition derivation, verb labels, tooltip copy, and the
---        no-disabled-as-status / no-two-step-toggle principles.
+--        Governs visibility, three-zone and active-PR rail presentation, the
+--        single-primary rule, WorkDisposition derivation, verb labels, tooltip
+--        copy, and the no-disabled-as-status / no-two-step-toggle principles.
 --
 -- This is a COMPOSITION spec. It re-derives nothing: PR status and the
 -- auto-fix affordance come from pr-association; terminal-action git semantics
@@ -61,7 +61,12 @@ value BarInputs {
     mode: ConvMode
     continued_in_conv_id: String?
     work_change: WorkChangeState
+    pr_status: pra/PrStatusView?
     auto_fix_affordance: pra/PrAutoFixAffordance
+    viewport: BarViewport
+    actionable_prs: List<RailPrEntry>
+    explicit_active_pr: pra/PrIdentity?
+    active_summary_resolved: Boolean
 }
 
 -- The primary selection and button-set for the bar, derived from BarInputs.
@@ -79,6 +84,9 @@ value BarPresentation {
     finish_zone: FinishZone
     primary: BarPrimary
     inline_note: InlineNote?
+    kind: BarPresentationKind
+    pr_rail: PrRailPresentation?
+    selection_owner: ActivePrSelectionOwner
 }
 
 -- The REVIEW zone is always the same: View Diff only. View Browser is NOT a
@@ -101,6 +109,16 @@ value FinishZone {
     show_abandon: Boolean
 }
 
+value RailPrEntry {
+    pr: pra/PrIdentity
+    feedback_signal: RailFeedbackSignal
+}
+
+value PrRailPresentation {
+    entries: List<RailPrEntry>
+    expanded_pr: pra/PrIdentity?
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -110,6 +128,28 @@ value FinishZone {
 -- those phases, so no eligible value can name them. The three members mirror
 -- bedrock's TaskResolved disposability (REQ-BED-029 for idle/error,
 -- REQ-BED-031 for context_exhausted).
+enum BarViewport {
+    mobile
+    | desktop
+}
+
+enum BarPresentationKind {
+    three_zone
+    | pr_rail
+}
+
+enum ActivePrSelectionOwner {
+    state_bar
+    | work_actions
+}
+
+enum RailFeedbackSignal {
+    none
+    | open
+    | in_progress
+    | fresh
+}
+
 enum BarPhase {
     idle
     | error
@@ -283,6 +323,28 @@ entity WorkActionsBar {
 --       Returns the GitHub compare/new-PR URL carried by a dirty_pr_ready work-change
 --       summary. Only valid when work_change = dirty_pr_ready.
 --
+--   derive_viewport(conv: bedrock/Conversation) -> BarViewport
+--       Returns mobile for a narrow viewport and desktop otherwise.
+--
+--   actionable_pr_entries(conv: bedrock/Conversation) -> List<RailPrEntry>
+--       Returns every open or draft associated PR with its own feedback signal.
+--       The active PR's fresh/edited count may refine its signal to fresh; inactive
+--       entries retain their association-owned open/in-progress signal.
+--
+--   explicit_active_pr(conv: bedrock/Conversation) -> pra/PrIdentity?
+--       Returns the explicit pinned or inferred active selection, if one exists.
+--
+--   active_summary_resolved(conv: bedrock/Conversation) -> Boolean
+--       False when an explicit selection exists but its PR is absent from the
+--       associated summaries. True when no selection exists or its summary exists.
+--
+--   should_present_pr_rail(inputs: BarInputs) -> Boolean
+--       True when the rail can represent selection and actionable entries exist,
+--       and either the viewport is mobile or at least two entries exist on desktop.
+--
+--   same_pr(left: pra/PrIdentity, right: pra/PrIdentity) -> Boolean
+--       Compares repository owner, repository name, and PR number.
+--
 --------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -304,7 +366,11 @@ rule BarRenderedWhenEligible {
             continued_in_conv_id: conversation.continued_in_conv_id,
             pr_status: resolve_pr_status(conversation),
             work_change: resolve_work_change(conversation),
-            auto_fix_affordance: resolve_auto_fix_affordance(conversation)
+            auto_fix_affordance: resolve_auto_fix_affordance(conversation),
+            viewport: derive_viewport(conversation),
+            actionable_prs: actionable_pr_entries(conversation),
+            explicit_active_pr: explicit_active_pr(conversation),
+            active_summary_resolved: active_summary_resolved(conversation)
         }
     )
 }
@@ -564,7 +630,63 @@ rule ReviewZoneAlwaysShowsDiff {
 }
 
 -- ===========================================================
--- WAB 4. RESOLVE LINK VERBS OPEN GITHUB (REQ-WAB-010)
+-- WAB 4. RESPONSIVE PR RAIL (REQ-WAB-002, REQ-WAB-011, REQ-WAB-012)
+-- ===========================================================
+
+rule PrRailPresentedWhenRepresentable {
+    when: WorkActionsBarRendered(bar)
+
+    requires: should_present_pr_rail(bar.inputs)
+
+    ensures: bar.presentation.kind = pr_rail
+    ensures: bar.presentation.pr_rail != null
+    ensures: bar.presentation.pr_rail.entries = bar.inputs.actionable_prs
+    ensures: bar.presentation.selection_owner = work_actions
+}
+
+rule ThreeZonePresentedWhenRailUnavailable {
+    when: WorkActionsBarRendered(bar)
+
+    requires: not should_present_pr_rail(bar.inputs)
+
+    ensures: bar.presentation.kind = three_zone
+    ensures: bar.presentation.pr_rail = null
+    ensures: bar.presentation.selection_owner = state_bar
+}
+
+rule CollapsedActiveRailPrExpanded {
+    when: UserActivatesRailPr(bar, pr, was_expanded)
+
+    requires: bar.presentation.kind = pr_rail
+    requires: bar.inputs.explicit_active_pr != null
+    requires: same_pr(pr.pr, bar.inputs.explicit_active_pr)
+    requires: was_expanded = false
+
+    ensures: bar.presentation.pr_rail.expanded_pr = pr.pr
+}
+
+rule ExpandedActiveRailPrCollapsed {
+    when: UserActivatesRailPr(bar, pr, was_expanded)
+
+    requires: bar.presentation.kind = pr_rail
+    requires: bar.inputs.explicit_active_pr != null
+    requires: same_pr(pr.pr, bar.inputs.explicit_active_pr)
+    requires: was_expanded = true
+
+    ensures: bar.presentation.pr_rail.expanded_pr = null
+}
+
+rule InactiveRailPrSelected {
+    when: UserActivatesRailPr(bar, pr, was_expanded)
+
+    requires: bar.presentation.kind = pr_rail
+    requires: bar.inputs.explicit_active_pr = null or not same_pr(pr.pr, bar.inputs.explicit_active_pr)
+
+    ensures: PinActivePrRequested(bar.conversation, pr.pr)
+}
+
+-- ===========================================================
+-- WAB 5. RESOLVE LINK VERBS OPEN GITHUB (REQ-WAB-010)
 -- ===========================================================
 
 rule ResolveLinkVerbNavigatesToGitHub {
@@ -640,6 +762,20 @@ invariant SecondaryRidesOnlyOnAddressFeedback {
              and b.presentation.resolve_zone.secondary = merge_link)
 }
 
+invariant RailOwnsOnlyRepresentableSelection {
+    for b in WorkActionsBar:
+        b.presentation.selection_owner = work_actions implies
+            (b.presentation.kind = pr_rail
+             and b.inputs.active_summary_resolved = true
+             and b.inputs.actionable_prs.count() > 0)
+}
+
+invariant DesktopRailRequiresMultiplePrs {
+    for b in WorkActionsBar:
+        (b.inputs.viewport = desktop and b.presentation.kind = pr_rail) implies
+            b.inputs.actionable_prs.count() > 1
+}
+
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
@@ -665,4 +801,7 @@ surface WorkActionsBarSurface {
         WorkActionsBarRendered(bar)
         UserClicksResolveLink(bar)
             when bar.presentation.resolve_zone.verb in { merge_link, open_pr_link, create_pr_link }
+        UserActivatesRailPr(bar, pr, was_expanded)
+            when bar.presentation.kind = pr_rail
+        PinActivePrRequested(bar.conversation, pr)
 }

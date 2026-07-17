@@ -1192,6 +1192,52 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
   });
 
+  it('shows each desktop PR feedback status without requiring selection', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      feedback_status: 'approved',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, feedback_status: 'approved' },
+          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Needs review', url: 'https://github.com/o/r/pull/13', head: 'task-124', feedback_status: 'open' },
+          { ...selection().associated_prs[0]!, pr_number: 14, title: 'Being handled', url: 'https://github.com/o/r/pull/14', head: 'task-125', feedback_status: 'in_progress' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-feedback" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('button', { name: /#13 Needs review open task-124 feedback open/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#14 Being handled open task-125 feedback in progress/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123$/ })).toBeInTheDocument();
+  });
+
+  it('falls back when an explicit active PR is absent from associated summaries', () => {
+    const handle = prStatusHandle({
+      found: false,
+      selection: {
+        ...selection(),
+        associated_prs: [
+          ...selection().associated_prs,
+          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+        ],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 99 }, provenance: 'pinned' },
+      },
+    });
+    handle.activePrSummary = null;
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
+    expect(screen.getByText('Done?')).toBeInTheDocument();
+  });
+
   it('keeps the legacy desktop presentation for a single actionable PR', () => {
     renderWithProviders(
       <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,

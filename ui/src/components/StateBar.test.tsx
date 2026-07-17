@@ -509,6 +509,61 @@ describe('StateBar PR badge', () => {
     expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
   });
 
+  it('keeps the selector when Work Actions is unavailable for an archived conversation', () => {
+    const selection = makeSelection({
+      associated_prs: [
+        ...makeSelection().associated_prs,
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123-pr-status', head: 'follow-up', feedback_status: 'open' },
+      ],
+    });
+    const handle = makePrStatusHandle(mockPrStatus({ found: true, number: 12, display_state: 'open' }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation({ archived: true })}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          workActionsAvailable={false}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
+  });
+
+  it('keeps the selector when an explicit active PR is missing from associated summaries', () => {
+    const selection = makeSelection({
+      associated_prs: [
+        ...makeSelection().associated_prs,
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123-pr-status', head: 'follow-up', feedback_status: 'open' },
+      ],
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 99 }, provenance: 'pinned' },
+    });
+    const handle = makePrStatusHandle(mockPrStatus({ found: false }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(handle.activePrSummary).toBeNull();
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
+  });
+
   it('keeps the selector when a terminal active PR cannot be represented by the desktop rail', () => {
     const openPr = makeSelection().associated_prs[0]!;
     const terminalPr = { ...openPr, pr_number: 34, title: 'Merged PR', display_state: 'merged' as const, state: 'CLOSED', url: 'https://github.com/o/r/pull/34' };

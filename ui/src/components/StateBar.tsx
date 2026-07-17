@@ -135,6 +135,7 @@ interface StateBarProps {
    *  assigns `undefined` from a ternary, which the strict mode rejects
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
+  workActionsAvailable?: boolean;
   prStatusHandle?: ConversationPrStatusHandle;
 }
 
@@ -536,6 +537,7 @@ export function StateBar({
   turnRetryContext,
   onOpenFiles,
   prStatusHandle,
+  workActionsAvailable = true,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
   // tool-widget header (which still reads it from the atom). The
@@ -975,7 +977,8 @@ export function StateBar({
     ? derivePrRailAvailability(prStatusHandle, isMobile)
     : null;
   const workActionsPrRailOwnsSelection = Boolean(
-    (isWork || isBranchMode)
+    workActionsAvailable
+    && (isWork || isBranchMode)
     && ['idle', 'error', 'context_exhausted'].includes(convState.type)
     && prRailAvailability?.shouldRender
   );

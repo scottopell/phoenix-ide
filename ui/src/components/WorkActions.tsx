@@ -104,6 +104,18 @@ function abandonHintText(isBranch: boolean): string {
     : 'Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation.';
 }
 
+function railFeedbackIndicator(
+  pr: (NonNullable<ConversationPrStatusHandle['activeSelection']>['associated_prs'])[number],
+  selectedFreshness: string | null,
+): { label: string; text: string } | null {
+  if (selectedFreshness) {
+    return { label: `${selectedFreshness} feedback`, text: selectedFreshness.replace(' new', '') };
+  }
+  if (pr.feedback_status === 'in_progress') return { label: 'feedback in progress', text: 'in progress' };
+  if (pr.feedback_status === 'open') return { label: 'feedback open', text: 'feedback' };
+  return null;
+}
+
 export function WorkControlBar({
   conversationId,
   convModeLabel,
@@ -446,6 +458,7 @@ export function WorkControlBar({
             const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
             const selected = identity === activeIdentity;
             const isExpanded = selected && expanded;
+            const feedbackIndicator = railFeedbackIndicator(pr, selected ? freshnessLabel : null);
             return (
               <button
                 key={identity}
@@ -462,8 +475,13 @@ export function WorkControlBar({
                 {!isMobile && <span className="desktop-pr-chip-title">{pr.title}</span>}
                 <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
                 {!isMobile && <span className="desktop-pr-chip-branch">{pr.head}</span>}
-                {selected && freshnessLabel && (
-                  <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>{freshnessLabel.replace(' new', '')}</span>
+                {(isMobile ? selected && freshnessLabel : feedbackIndicator) && (
+                  <span
+                    className="mobile-pr-notification"
+                    aria-label={feedbackIndicator?.label ?? `${freshnessLabel} feedback`}
+                  >
+                    {feedbackIndicator?.text ?? freshnessLabel?.replace(' new', '')}
+                  </span>
                 )}
               </button>
             );
