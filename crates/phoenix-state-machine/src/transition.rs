@@ -1474,7 +1474,6 @@ fn handle_core_sub_agents(
                 }
                 SubAgentCompletionDisposition::SuspendParent => {
                     CoreTransitionResult::new(CoreState::Idle)
-                        .with_effect(Effect::notify_agent_done())
                 }
             };
             Ok(next

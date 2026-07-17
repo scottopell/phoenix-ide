@@ -422,7 +422,7 @@ async fn concurrent_exact_protocol_selection_ensure_is_idempotent() {
         .fetch_one(&pool)
         .await
         .unwrap(),
-        5
+        6
     );
 }
 
@@ -630,23 +630,23 @@ async fn registration_replay_uses_stable_intent_not_fresh_acceptance_time() {
 }
 
 #[tokio::test]
-async fn registration_replay_rejects_an_incomplete_invariant_without_repair() {
+async fn registration_replay_repairs_an_incomplete_invariant() {
     let (pool, repo) = registered(bash()).await;
     sqlx::query("DELETE FROM wake_workflow_bindings WHERE workflow_id = 'wake-workflow'")
         .execute(&pool)
         .await
         .unwrap();
-    let error = WakeWorkflowAdapter::new(&repo)
+    let replay = WakeWorkflowAdapter::new(&repo)
         .register(&registration(bash()))
         .await
-        .unwrap_err();
-    assert!(matches!(error, WorkflowRepositoryError::CorruptState(_)));
+        .unwrap();
+    assert!(matches!(replay, WakeRegistrationResult::Replay { .. }));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wake_workflow_bindings")
             .fetch_one(&pool)
             .await
             .unwrap(),
-        0
+        1
     );
 }
 

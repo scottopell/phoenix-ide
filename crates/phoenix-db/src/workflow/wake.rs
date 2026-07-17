@@ -162,6 +162,7 @@ impl<'a> WakeWorkflowAdapter<'a> {
              JOIN wake_workflow_bindings b ON b.workflow_id = wi.workflow_id \
              WHERE o.id = (SELECT id FROM wake_runtime_obligations \
              WHERE conversation_id = ?1 AND status = 'owed' ORDER BY created_at, id LIMIT 1) \
+               AND wi.sequence <= o.snapshot_upper_bound \
              ORDER BY wi.sequence",
         )
         .bind(conversation_id)
@@ -427,6 +428,21 @@ impl<'a> WakeWorkflowAdapter<'a> {
         .bind(predecessor_id)
         .execute(&mut *tx)
         .await?;
+        let predecessor_remaining: i64 = sqlx::query_scalar(
+            "SELECT \
+             (SELECT COUNT(*) FROM wake_workflow_bindings WHERE conversation_id = ?1) + \
+             (SELECT COUNT(*) FROM wake_observation_inbox WHERE conversation_id = ?1) + \
+             (SELECT COUNT(*) FROM wake_runtime_obligations WHERE conversation_id = ?1)",
+        )
+        .bind(predecessor_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if predecessor_remaining != 0 {
+            tx.rollback().await?;
+            return Err(WorkflowRepositoryError::CorruptState(
+                "wake continuation ownership transfer was incomplete".to_owned(),
+            ));
+        }
         tx.commit().await?;
         Ok(result.rows_affected())
     }
@@ -462,22 +478,42 @@ impl<'a> WakeWorkflowAdapter<'a> {
     }
 
     /// Ensure the externally retryable wake protocol selection exists.
+    #[allow(clippy::too_many_lines)]
     pub async fn ensure_protocol_selection(
         &self,
         registered_at: DateTime<Utc>,
     ) -> WorkflowRepositoryResult<()> {
-        let existing: Option<(String, i64, i64, i64)> = sqlx::query_as(
-            "SELECT profile_id, selector_version, protocol_version, external_acceptance_enabled \
-             FROM workflow_protocol_selections WHERE id = ?1",
+        let existing: Option<(String, i64, i64, i64, String, i64)> = sqlx::query_as(
+            "SELECT s.profile_id, s.selector_version, s.protocol_version, s.external_acceptance_enabled, \
+             s.authority, s.accepting FROM workflow_protocol_selections s WHERE s.id = ?1",
         )
         .bind(SELECTION_ID)
         .fetch_optional(self.repository.pool())
         .await?;
-        if let Some((profile, selector_version, version, external)) = existing {
+        if let Some((profile, selector_version, version, external, authority, accepting)) = existing
+        {
+            let stored_codecs: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT codec_family, codec_version FROM workflow_profile_codecs \
+                 WHERE selection_id = ?1 ORDER BY codec_family, codec_version",
+            )
+            .bind(SELECTION_ID)
+            .fetch_all(self.repository.pool())
+            .await?;
+            let stored_executors: Vec<String> = sqlx::query_scalar(
+                "SELECT executor_kind FROM workflow_profile_executors \
+                 WHERE selection_id = ?1 ORDER BY executor_kind",
+            )
+            .bind(SELECTION_ID)
+            .fetch_all(self.repository.pool())
+            .await?;
             if profile == wake_profile::PROFILE_ID
                 && selector_version == 1
                 && version == i64::from(wake_profile::PROTOCOL_VERSION)
                 && external == 1
+                && authority == "engine_protocol"
+                && accepting == 1
+                && stored_codecs == expected_codec_rows()
+                && stored_executors == vec![EXECUTOR_KIND.to_owned()]
             {
                 return Ok(());
             }
@@ -488,19 +524,13 @@ impl<'a> WakeWorkflowAdapter<'a> {
             });
         }
 
-        let codecs = [
-            wake_profile::snapshot_codec(),
-            wake_profile::event_codec(),
-            wake_profile::intent_codec(),
-            wake_profile::barrier_codec(),
-            wake_profile::terminal_codec(),
-        ]
-        .into_iter()
-        .map(|codec| DurableCodecRef {
-            family: codec.family.to_owned(),
-            version: codec.version,
-        })
-        .collect();
+        let codecs = wake_codecs()
+            .into_iter()
+            .map(|codec| DurableCodecRef {
+                family: codec.family.to_owned(),
+                version: codec.version,
+            })
+            .collect();
         let registration = DurableProtocolSelectionRegistration {
             selection_id: SELECTION_ID.to_owned(),
             profile_id: wake_profile::PROFILE_ID.to_owned(),
@@ -611,12 +641,16 @@ impl<'a> WakeWorkflowAdapter<'a> {
         let mut tx = self.repository.pool().begin().await?;
 
         if let Some(existing) = lookup_wake_registration(&mut tx, request).await? {
-            tx.rollback().await?;
             return match existing {
                 ExternalAcceptanceResult::Replay {
                     workflow_id,
                     handle_receipt,
                 } => {
+                    insert_registration_core(&mut tx, request, &receipt, &snapshot, &commit)
+                        .await?;
+                    insert_registration_transition(&mut tx, &commit).await?;
+                    insert_wake_binding(&mut tx, request).await?;
+                    tx.commit().await?;
                     validate_registration_invariant(self.repository, request, &snapshot, &commit)
                         .await?;
                     Ok(WakeRegistrationResult::Replay {
@@ -624,7 +658,10 @@ impl<'a> WakeWorkflowAdapter<'a> {
                         receipt: handle_receipt,
                     })
                 }
-                ExternalAcceptanceResult::Conflict => Ok(WakeRegistrationResult::Conflict),
+                ExternalAcceptanceResult::Conflict => {
+                    tx.rollback().await?;
+                    Ok(WakeRegistrationResult::Conflict)
+                }
                 ExternalAcceptanceResult::New { .. }
                 | ExternalAcceptanceResult::Retryable
                 | ExternalAcceptanceResult::NotAccepting => {
@@ -1331,7 +1368,8 @@ async fn insert_registration_core(
          (id, profile_id, protocol_version, authority, execution_mode, authoritative_workflow_id, \
           protocol_selection_id, version, generation, status, snapshot_codec_family, \
           snapshot_codec_version, snapshot_payload, accepted_at) \
-         VALUES (?1, ?2, ?3, 'engine_protocol', 'authoritative', NULL, ?4, 1, 0, 'active', ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, 'engine_protocol', 'authoritative', NULL, ?4, 1, 0, 'active', ?5, ?6, ?7, ?8) \
+         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&request.workflow_id)
     .bind(wake_profile::PROFILE_ID)
@@ -1348,7 +1386,8 @@ async fn insert_registration_core(
          (id, selection_id, profile_id, protocol_version, authority, authority_scope, \
           idempotency_key, intent_fingerprint, workflow_id, receipt_codec_family, \
           receipt_codec_version, receipt_payload, accepted_at) \
-         VALUES (?1, ?2, ?3, ?4, 'engine_protocol', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, 'engine_protocol', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&request.binding_id)
     .bind(SELECTION_ID)
@@ -1377,7 +1416,8 @@ async fn insert_registration_transition(
     sqlx::query(
         "INSERT INTO workflow_transitions \
          (id, workflow_id, from_version, to_version, generation, event_codec_family, \
-          event_codec_version, event_payload, committed_at) VALUES (?1, ?2, 0, 1, 0, ?3, ?4, ?5, ?6)",
+          event_codec_version, event_payload, committed_at) VALUES (?1, ?2, 0, 1, 0, ?3, ?4, ?5, ?6) \
+          ON CONFLICT(id) DO NOTHING",
     )
     .bind(&commit.transition_id)
     .bind(&commit.workflow_id)
@@ -1393,7 +1433,8 @@ async fn insert_registration_transition(
           kind, codec_family, codec_version, role, ambiguity_policy, intent_payload, status, \
           pending_reconciliation, next_eligible_at, destructive_resource) \
          VALUES (?1, ?2, ?3, 1, 0, ?4, ?5, ?6, ?7, 'required', \
-                 'observable_reconciliation', ?8, 'eligible', 0, NULL, NULL)",
+                 'observable_reconciliation', ?8, 'eligible', 0, NULL, NULL) \
+          ON CONFLICT(id) DO NOTHING",
     )
     .bind(&effect.effect_id)
     .bind(&commit.workflow_id)
@@ -1409,7 +1450,8 @@ async fn insert_registration_transition(
         "INSERT INTO workflow_barriers \
          (id, workflow_id, declaring_transition_id, declaring_workflow_version, status, satisfied_at, \
           event_codec_family, event_codec_version, event_payload) \
-         VALUES (?1, ?2, ?3, 1, 'waiting', NULL, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, 1, 'waiting', NULL, ?4, ?5, ?6) \
+         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&barrier.barrier_id)
     .bind(&commit.workflow_id)
@@ -1421,7 +1463,8 @@ async fn insert_registration_transition(
     .await?;
     sqlx::query(
         "INSERT INTO workflow_barrier_members (barrier_id, effect_id, receipt_family) \
-         VALUES (?1, ?2, 'current_generation_effect')",
+         VALUES (?1, ?2, 'current_generation_effect') \
+         ON CONFLICT(barrier_id, effect_id) DO NOTHING",
     )
     .bind(&member.barrier_id)
     .bind(&member.effect_id)
@@ -1482,7 +1525,8 @@ async fn insert_wake_binding(
           resource_kind, bash_work_scope_kind, bash_work_scope_stable_key, bash_handle_id, tmux_work_scope_kind, \
           tmux_work_scope_stable_key, tmux_server_generation, tmux_window_id, registering_tool_use_id, registered_at, \
           expires_at, registration_fence_version, observe_effect_id, lifecycle_fence_status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'open')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'open') \
+         ON CONFLICT(contract_id) DO NOTHING",
     )
     .bind(&request.intent.contract_id)
     .bind(&request.workflow_id)
@@ -2010,6 +2054,26 @@ fn resource_columns(
             None,
         ),
     }
+}
+
+fn wake_codecs() -> [phoenix_workflow::CodecRef; 6] {
+    [
+        wake_profile::snapshot_codec(),
+        wake_profile::event_codec(),
+        wake_profile::intent_codec(),
+        wake_profile::manual_codec(),
+        wake_profile::barrier_codec(),
+        wake_profile::terminal_codec(),
+    ]
+}
+
+fn expected_codec_rows() -> Vec<(String, i64)> {
+    let mut rows = wake_codecs()
+        .into_iter()
+        .map(|codec| (codec.family.to_owned(), i64::from(codec.version)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
 }
 
 fn is_unique_constraint(error: &sqlx::Error) -> bool {
