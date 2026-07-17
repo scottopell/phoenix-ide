@@ -193,6 +193,10 @@ class BareDeployCommandTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "state": "committed"}), "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
+            def materialize(_commit, _source, destination, _kind):
+                destination.write_text((ROOT / "scripts/bare_supervisor.py").read_text())
+                destination.chmod(0o700)
+
             staged_supervisors = []
 
             def start(_layout, _protocol, selected_source):
@@ -202,6 +206,7 @@ class BareDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_load_env_file", return_value=None), \
                  mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
                  mock.patch.object(self.dev, "_prepare_release_candidate", return_value=candidate), \
+                 mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize) as source_file, \
                  mock.patch.object(self.dev, "_start_bare_supervisor", side_effect=start), \
                  mock.patch.object(self.dev, "_configure_bare_reboot_persistence"), \
                  mock.patch.object(self.dev, "_installed_bare_runtime", return_value=(None, None)), \
@@ -209,6 +214,12 @@ class BareDeployCommandTests(unittest.TestCase):
                  mock.patch("uuid.uuid4", return_value=mock.Mock(hex="d" * 32)):
                 self.dev.prod_daemon_deploy("v2.0.0")
 
+            source_file.assert_called_once_with(
+                "b" * 40,
+                "scripts/bare_supervisor.py",
+                mock.ANY,
+                "published_release",
+            )
             self.assertEqual([(ROOT / "scripts/bare_supervisor.py").read_text()], staged_supervisors)
             activation = next(command for command in commands if "activate" in command)
             self.assertIn("--transaction-id", activation)

@@ -706,7 +706,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("URL: http://localhost:9555", rendered)
 
     def test_prod_status_falls_back_to_legacy_public_version(self):
-        legacy_identity = {"version": "0.9.0", "git_sha": "abc123def456"}
+        legacy_identity = self.dev.RuntimeIdentity(version="0.9.0", git_sha="abc123def456")
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
              mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \

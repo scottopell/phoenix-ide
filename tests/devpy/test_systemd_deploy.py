@@ -85,6 +85,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
+            def materialize(_commit, _source, destination, _kind):
+                destination.write_text((ROOT / "scripts/systemd_deploy_helper.py").read_text())
+                destination.chmod(0o700)
+
             with mock.patch.object(self.dev, "check_systemd_available", return_value=True), \
                  mock.patch.object(
                      self.dev,
@@ -97,6 +101,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_linux_musl_target", return_value="x86_64-unknown-linux-musl"), \
                  mock.patch.object(self.dev, "_prepare_local_candidate", return_value=candidate) as prepare, \
                  mock.patch.object(self.dev, "_systemd_installed_runtime", return_value=(None, None)), \
+                 mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize) as source_file, \
                  mock.patch.object(
                      self.dev,
                      "_stage_systemd_root_handoff",
@@ -112,10 +117,13 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 self.dev.native_prod_deploy()
 
             prepare.assert_called_once_with(target="x86_64-unknown-linux-musl")
-            self.assertEqual(
-                (ROOT / "scripts/systemd_deploy_helper.py").read_text(),
-                captured["helper_text"],
+            source_file.assert_called_once_with(
+                "b" * 40,
+                "scripts/systemd_deploy_helper.py",
+                mock.ANY,
+                "local_head",
             )
+            self.assertEqual((ROOT / "scripts/systemd_deploy_helper.py").read_text(), captured["helper_text"])
             files = captured["files"]
             manifest = captured["manifest"]
             self.assertNotIn("value", captured["manifest_text"])

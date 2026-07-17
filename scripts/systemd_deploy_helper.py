@@ -584,14 +584,16 @@ class Systemctl:
 
     def verify_units(self, service: Path, socket: Path, candidate_binary: Path) -> None:
         with tempfile.TemporaryDirectory(prefix="phoenix-systemd-verify-") as temporary:
-            verification_service = Path(temporary) / service.name
+            verification_service = Path(temporary) / f"{self.manifest.unit_name}.service"
+            verification_socket = Path(temporary) / f"{self.manifest.unit_name}.socket"
             target_binary = self.manifest.targets.binary
             content = service.read_text()
             if target_binary not in content:
                 raise ActivationError("candidate service does not execute the fixed production binary")
             verification_service.write_text(content.replace(target_binary, str(candidate_binary)))
+            verification_socket.write_bytes(socket.read_bytes())
             result = self.run(
-                ["systemd-analyze", "verify", str(socket), str(verification_service)],
+                ["systemd-analyze", "verify", str(verification_socket), str(verification_service)],
                 capture_output=True,
                 text=True,
             )
@@ -907,28 +909,78 @@ def copy_handoff_file(source: Path, destination: Path, expected_hash: str, sourc
             Path(temporary).unlink(missing_ok=True)
 
 
+def installed_runtime_identity(binary: Path) -> Identity:
+    result = subprocess.run(
+        [str(binary), "--build-identity"], capture_output=True, text=True, timeout=10, check=True
+    )
+    try:
+        value = json.loads(result.stdout)
+        identity = Identity(version=str(value["version"]), git_sha=str(value["git_sha"]))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ActivationError("installed runtime has invalid embedded identity") from exc
+    if not identity.version or not identity.git_sha or identity.git_sha == "unknown":
+        raise ActivationError("installed runtime has incomplete embedded identity")
+    return identity
+
+
+def installed_environment(path: Path) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    if not path.exists():
+        return environment
+    for raw in path.read_text().splitlines():
+        if not raw or raw.lstrip().startswith("#"):
+            continue
+        key, separator, value = raw.partition("=")
+        if not separator or not key:
+            raise ActivationError("installed environment snapshot is invalid")
+        environment[key] = value.replace("\\n", "\n")
+    return environment
+
+
+def installed_health_url(environment: dict[str, str]) -> str:
+    tls = environment.get("PHOENIX_TLS", "").lower() not in {"", "0", "false", "off", "disabled"}
+    tls = tls or bool(environment.get("PHOENIX_TLS_CERT_PATH") and environment.get("PHOENIX_TLS_KEY_PATH"))
+    scheme = "https" if tls else "http"
+    port = environment.get("PHOENIX_PORT", "8031")
+    return f"{scheme}://localhost:{port}/api/version"
+
+
 def capture_rollback(transaction: Path, policy: ValidationPolicy, manifest_path: Path) -> None:
-    manifest = Manifest.load(manifest_path)
-    previous = manifest.previous is not None
     sources = {
         "binary": Path(policy.targets.binary),
         "service": Path(policy.targets.service),
         "socket": Path(policy.targets.socket),
         "environment": Path(policy.targets.environment),
     }
-    rollback = {name: {"path": None, "sha256": None} for name in sources}
-    if previous and not all(sources[name].is_file() for name in ("binary", "service", "socket")):
+    installed = any(source.exists() for source in sources.values())
+    if installed and not all(sources[name].is_file() for name in ("binary", "service", "socket")):
         raise ValidationError("existing runtime lacks complete rollback binary and units")
-    for name, source in sources.items():
-        if source.is_symlink():
-            raise ValidationError(f"rollback {name} must not be a symlink")
-        if previous and source.is_file():
-            destination = transaction / f"rollback-{name}"
-            copy_handoff_file(source, destination, sha256(source), 0, 0o600)
-            rollback[name] = {"path": str(destination), "sha256": sha256(destination)}
+    rollback: dict[str, dict[str, Optional[str]]] = {
+        name: {"path": None, "sha256": None} for name in sources
+    }
+    if installed:
+        for name, source in sources.items():
+            if source.is_symlink():
+                raise ValidationError(f"rollback {name} must not be a symlink")
+            if source.is_file():
+                destination = transaction / f"rollback-{name}"
+                copy_handoff_file(source, destination, sha256(source), 0, 0o700 if name == "binary" else 0o600)
+                rollback[name] = {"path": str(destination), "sha256": sha256(destination)}
     manifest_raw = json.loads(manifest_path.read_text())
     manifest_raw["rollback"] = rollback
     deployed_sha = Path(policy.targets.deployed_sha)
+    if installed:
+        assert rollback["binary"]["path"] is not None
+        previous = installed_runtime_identity(Path(rollback["binary"]["path"]))
+        manifest_raw["previous"] = dataclasses.asdict(previous)
+        rollback_environment = rollback["environment"]
+        environment_path = rollback_environment["path"]
+        manifest_raw["previous_health_url"] = installed_health_url(
+            installed_environment(Path(environment_path)) if environment_path is not None else {}
+        )
+    else:
+        manifest_raw["previous"] = None
+        manifest_raw["previous_health_url"] = None
     manifest_raw["previous_deployed_sha"] = deployed_sha.read_text().strip() if deployed_sha.is_file() else None
     atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
 
@@ -980,13 +1032,13 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
             copy_handoff_file(Path(item["source"]), transaction / name, item["sha256"], source_uid, allowed[name])
         manifest_path = transaction / "manifest.json"
         manifest = Manifest.load(manifest_path)
+        capture_rollback(transaction, policy, manifest_path)
         data_directory_preexisting = prepare_data_directory(manifest.service_user, policy.targets.deployed_sha)
         if not isinstance(data_directory_preexisting, bool):
             raise ActivationError("data directory preparation did not return presence state")
         manifest_raw = json.loads(manifest_path.read_text())
         manifest_raw["data_directory_preexisting"] = data_directory_preexisting
         atomic_write(manifest_path, (json.dumps(manifest_raw, sort_keys=True, indent=2) + "\n").encode())
-        capture_rollback(transaction, policy, manifest_path)
         manifest = Manifest.load(manifest_path)
         write_policy_status(manifest, policy, "prepared")
         return transaction / "manifest.json"

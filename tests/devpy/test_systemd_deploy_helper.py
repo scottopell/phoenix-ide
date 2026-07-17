@@ -199,12 +199,16 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
             owner_uid=os.getuid(),
         )
 
-    def test_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
+    def staging_sources(self):
         sources = []
         for name in ("candidate-binary", "candidate.service", "candidate.socket", "helper.py"):
             source = self.base / f"source-{name}"
             source.write_text(name)
             sources.append({"name": name, "source": str(source), "sha256": digest(source)})
+        return sources
+
+    def test_stage_handoff_copies_allowlisted_files_and_acquires_claim(self):
+        sources = self.staging_sources()
         source_manifest = self.base / "source-manifest.json"
         source_manifest.write_text(json.dumps(self.raw))
         sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
@@ -218,6 +222,41 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         status = json.loads(policy.status_path.read_text())
         self.assertEqual("prepared", status["state"])
         self.assertEqual(self.transaction_id, status["transaction_id"])
+
+    def test_root_staging_derives_previous_runtime_from_captured_install(self):
+        sources = self.staging_sources()
+        source_manifest = self.base / "manifest-source.json"
+        stale = dict(self.raw)
+        stale["previous"] = None
+        stale["previous_health_url"] = None
+        source_manifest.write_text(json.dumps(stale))
+        sources.append({"name": "manifest.json", "source": str(source_manifest), "sha256": digest(source_manifest)})
+        policy = self.staging_policy()
+        Path(policy.targets.binary).parent.mkdir(parents=True, exist_ok=True)
+        Path(policy.targets.service).parent.mkdir(parents=True, exist_ok=True)
+        Path(policy.targets.binary).write_text("installed binary")
+        Path(policy.targets.service).write_text("[Service]\nUser=nobody\n")
+        Path(policy.targets.socket).write_text("[Socket]\nListenStream=9443\n")
+        Path(policy.targets.environment).parent.mkdir(parents=True, exist_ok=True)
+        Path(policy.targets.environment).write_text("PHOENIX_PORT=9443\nPHOENIX_TLS=auto\n")
+        identity = helper.Identity(version="1.2.3", git_sha="a" * 12)
+        original_copy = helper.copy_handoff_file
+
+        def copy_file(source, destination, expected_sha, source_uid, mode):
+            if source in map(Path, dataclasses.astuple(policy.targets)[:4]):
+                shutil.copy2(source, destination)
+                destination.chmod(mode)
+            else:
+                original_copy(source, destination, expected_sha, source_uid, mode)
+
+        with mock.patch.object(helper, "prepare_data_directory", return_value=True), \
+             mock.patch.object(helper, "installed_runtime_identity", return_value=identity), \
+             mock.patch.object(helper, "copy_handoff_file", side_effect=copy_file):
+            manifest_path = helper.stage_handoff(self.bundle(sources), os.getuid(), policy)
+        manifest = helper.Manifest.load(manifest_path)
+        self.assertEqual(identity, manifest.previous)
+        self.assertEqual("https://localhost:9443/api/version", manifest.previous_health_url)
+        self.assertIsNotNone(manifest.rollback.binary.path)
 
     def test_stage_handoff_rejects_non_allowlisted_artifact_before_claim(self):
         source = self.base / "secret"
@@ -330,6 +369,8 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         def run(command, **_kwargs):
             calls.append(command)
             verification_service = Path(command[-1])
+            self.assertEqual(f"{manifest.unit_name}.service", verification_service.name)
+            self.assertEqual(f"{manifest.unit_name}.socket", Path(command[-2]).name)
             self.assertIn(manifest.candidate.binary.path, verification_service.read_text())
             self.assertNotIn(manifest.targets.binary, verification_service.read_text())
             return subprocess.CompletedProcess(command, 0, "", "")

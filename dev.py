@@ -6359,16 +6359,18 @@ def native_prod_deploy(release: str | None = None):
         candidate_socket.chmod(0o600)
 
         helper = staging / "helper.py"
-        shutil.copy2(ROOT / "scripts/systemd_deploy_helper.py", helper)
-        helper.chmod(0o700)
+        _materialize_source_file(
+            prepared.source_commit,
+            "scripts/systemd_deploy_helper.py",
+            helper,
+            prepared.source_kind.value,
+        )
         protocol = subprocess.run(
             [sys.executable, str(helper), "--protocol-version"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         if protocol != str(SYSTEMD_HANDOFF_PROTOCOL_VERSION):
             raise SystemExit(f"systemd helper protocol mismatch: expected {SYSTEMD_HANDOFF_PROTOCOL_VERSION}, got {protocol!r}")
-
-        previous_identity, previous_health_url = _systemd_installed_runtime()
 
         root_transaction = SYSTEMD_TRANSACTION_ROOT / transaction_id
         root_paths = {name: root_transaction / name for name in (
@@ -6385,9 +6387,9 @@ def native_prod_deploy(release: str | None = None):
             "release_tag": prepared.release_tag,
             "release_commit": prepared.release_commit,
             "expected": prepared.identity.as_dict(),
-            "previous": previous_identity.as_dict() if previous_identity else None,
+            "previous": None,
             "expected_health_url": _prod_api_health_url(env_snapshot),
-            "previous_health_url": previous_health_url,
+            "previous_health_url": None,
             "candidate": {
                 "binary": _systemd_artifact(root_paths["candidate-binary"], candidate_binary),
                 "service": _systemd_artifact(root_paths["candidate.service"], candidate_service),
@@ -6813,8 +6815,12 @@ def prod_daemon_deploy(release: str | None = None):
             if release else _prepare_local_candidate(target=_linux_musl_target())
         )
         supervisor_source = staging / "bare-supervisor.py"
-        shutil.copy2(ROOT / "scripts/bare_supervisor.py", supervisor_source)
-        supervisor_source.chmod(0o700)
+        _materialize_source_file(
+            prepared.source_commit,
+            "scripts/bare_supervisor.py",
+            supervisor_source,
+            prepared.source_kind.value,
+        )
         protocol = subprocess.run(
             [sys.executable, str(supervisor_source), "--protocol-version"],
             capture_output=True, text=True, check=True,
@@ -7962,7 +7968,7 @@ def launchd_prod_status():
         legacy = _legacy_prod_identity(status_env)
         identity = legacy[0] if legacy is not None else None
     if identity:
-        print(f"  Version: {identity['version']} ({identity['git_sha']})")
+        print(f"  Version: {identity.version} ({identity.git_sha})")
     else:
         print("  Health: not responding")
 
