@@ -208,37 +208,17 @@ user-visible handling. The steady-state engine SHALL NOT require permanent
 protocol selectors, executor registries, shadow workflows, rollback selectors, or
 exact-drain machinery as part of normal operation.
 
-### REQ-DWF-015: One Scheduler Authority per SQLite Database
+### REQ-DWF-017: Runtime Acceptance Boundary
 
-THE SYSTEM SHALL operate with exactly one Phoenix scheduler authority for each
-SQLite database. That authority SHALL be the only component permitted to claim or
-advance engine work from that database.
+WHEN a canonical delivery item requires later entry into a separately scheduled
+product runtime
+THE SYSTEM SHALL durably represent that acceptance is owed until the same
+transaction that persists the runtime's accepting product state marks the exact
+canonical delivery item accepted or suppressed by a reducer-authorized terminal
+action.
 
-Remote executors, clients, and external systems MAY supply evidence or durable
-receipts through typed profile adapters, but they SHALL NOT independently claim
-scheduler authority over Phoenix workflow rows.
-
-### REQ-DWF-016: Migration Safety Without Permanent Parallel Authority
-
-WHEN a profile's execution semantics or persisted shape changes
-THE SYSTEM SHALL prove migration safety through typed profile-version migrations,
-active-row migration tests, and explicit incompatible-row handling.
-
-Temporary profile-local comparison, shadow execution, or drain inventory MAY be
-used for a specific migration when justified by risk, but such machinery SHALL
-NOT be part of the permanent engine state model and SHALL NOT create a second
-steady-state semantic authority.
-
-### REQ-DWF-017: Durable Acknowledgement Boundary
-
-WHEN Phoenix durably acknowledges accepted intent while still owing independently
-recoverable execution, observation, compensation, reducer delivery, runtime
-acceptance, or client-visible completion handling
-THE SYSTEM SHALL represent that obligation as durable workflow state before the
-acknowledgement becomes visible.
-
-Work that completes as one synchronous local transaction with no owed crash-spanning
-obligation SHALL remain outside the workflow engine.
+Profiles that do not enter a separately scheduled runtime SHALL omit this
+capability rather than simulate an acceptance record.
 
 ### REQ-DWF-018: Deterministic Verification
 
@@ -253,7 +233,28 @@ THE verification SHALL check authority, atomicity, dependency, receipt, delivery
 barrier, and single-authority invariants after every operation and retain
 minimized counterexamples as regressions.
 
-### REQ-DWF-019: Canonical Durable Delivery
+### REQ-DWF-033: One Scheduler Authority per SQLite Database
+
+THE SYSTEM SHALL operate with exactly one Phoenix scheduler authority for each
+SQLite database. That authority SHALL be the only component permitted to claim or
+advance engine work from that database.
+
+Remote executors, clients, and external systems MAY supply evidence or durable
+receipts through typed profile adapters, but they SHALL NOT independently claim
+scheduler authority over Phoenix workflow rows.
+
+### REQ-DWF-034: Durable Acknowledgement Boundary
+
+WHEN Phoenix durably acknowledges accepted intent while still owing independently
+recoverable execution, observation, compensation, reducer delivery, runtime
+acceptance, or client-visible completion handling
+THE SYSTEM SHALL represent that obligation as durable workflow state before the
+acknowledgement becomes visible.
+
+Work that completes as one synchronous local transaction with no owed crash-spanning
+obligation SHALL remain outside the workflow engine.
+
+### REQ-DWF-035: Canonical Durable Delivery
 
 WHEN a receipt or barrier-derived reducer event must be delivered
 THE SYSTEM SHALL represent that obligation through exactly one canonical durable
@@ -265,7 +266,7 @@ outbox, obligation, or acceptance lifecycle for the same semantic delivery.
 Duplicate, stale, or restarted delivery of an already accepted canonical item
 SHALL NOT begin another product action.
 
-### REQ-DWF-020: Submit-Then-Observe Remote Work
+### REQ-DWF-036: Submit-Then-Observe Remote Work
 
 WHEN a profile models long-running remote work whose execution continues outside
 the Phoenix process
@@ -280,31 +281,7 @@ cannot answer authoritatively whether submission happened
 THE SYSTEM SHALL enter explicit ambiguity or manual resolution rather than blindly
 submitting again.
 
-### REQ-DWF-021: Runtime Acceptance Boundary
-
-WHEN a canonical delivery item requires later entry into a separately scheduled
-product runtime
-THE SYSTEM SHALL durably represent that acceptance is owed until the same
-transaction that persists the runtime's accepting product state marks the exact
-canonical delivery item accepted or suppressed by a reducer-authorized terminal
-action.
-
-Profiles that do not enter a separately scheduled runtime SHALL omit this
-capability rather than simulate an acceptance record.
-
-### REQ-DWF-022: Cross-Client Projection Parity
-
-THE SYSTEM SHALL expose each supported client's user-action capabilities and
-user-visible workflow presentation from the same typed product-state and engine
-projection enforced by API and runtime actions. Supported clients SHALL NOT
-maintain an independent semantic policy for compose, cancel, retry, delete,
-resolve, lifecycle transition, or runtime start.
-
-Equivalent accepted intent SHALL produce equivalent visible state,
-presentation detail, capabilities, and terminal meaning on every supported
-client surface.
-
-### REQ-DWF-023: Execution Capability Classes
+### REQ-DWF-037: Execution Capability Classes
 
 EVERY effect family SHALL declare one of these structural execution capability
 classes:
@@ -322,22 +299,7 @@ uncertain.
 Takeover, retry, and ambiguity handling SHALL be constrained by that declared
 class.
 
-### REQ-DWF-024: Externally Retryable Acceptance
-
-WHEN a profile permits acceptance requests to be retried across a client-server
-boundary
-THE profile SHALL require a client-supplied stable idempotency key, atomically
-bind that key under the accepting profile plus client authority scope to exactly
-one accepted workflow, and return a typed acceptance receipt that echoes the key
-and identifies the durable workflow or product handle the client can observe.
-
-A retry with the same profile, authority scope, and idempotency key SHALL return
-the same acceptance receipt without creating another workflow or repeating
-acceptance effects. A conflicting request that reuses the key for different
-intent SHALL be rejected. Profiles without an externally retryable acceptance
-boundary SHALL omit this capability rather than fabricate a key.
-
-### REQ-DWF-025: Direct Turns Use Durable Client Message Identity
+### REQ-DWF-038: Direct Turns Use Durable Client Message Identity
 
 WHEN Phoenix accepts a direct turn whose outcome may span a crash boundary before
 terminal user-visible completion
@@ -348,7 +310,7 @@ A replay of the same client message identity SHALL return the same durable
 acceptance result or terminal outcome. A conflicting replay under the same client
 message identity SHALL be rejected rather than start another direct turn.
 
-### REQ-DWF-026: Typed Profile Migrations Prevent Silent Loss
+### REQ-DWF-039: Typed Profile Migrations Prevent Silent Loss
 
 WHEN persisted work from an earlier profile version is encountered after upgrade
 THE SYSTEM SHALL either migrate it losslessly into the current typed profile
@@ -358,7 +320,7 @@ migration, reconciliation need, or manual action visible.
 The system SHALL NOT silently discard active persisted work, owed delivery,
 acceptance bindings, or evidence because a prior version is no longer executable.
 
-### REQ-DWF-027: Scheduled Loops Use Explicit CoalesceLatest Policy
+### REQ-DWF-040: Scheduled Loops Use Explicit CoalesceLatest Policy
 
 WHEN a profile models recurring coordinator or observer work whose product meaning
 is latest-state rather than every-missed-occurrence replay
@@ -370,7 +332,7 @@ downtime or repeated kicks SHALL coalesce into one due occurrence, and the next
 occurrence SHALL be computed from current durable state after the active
 occurrence reaches a terminal disposition.
 
-### REQ-DWF-028: Additional Durable Consumers Are Independent Views
+### REQ-DWF-041: Additional Durable Consumers Are Independent Views
 
 WHEN a canonical delivery item is offered to an additional durable consumer such
 as notification, indexing, or audit export
@@ -381,7 +343,18 @@ canonical reducer-delivery or runtime-acceptance state.
 A consumer retry or failure SHALL NOT block or duplicate reducer consumption,
 runtime acceptance, or another consumer's progress.
 
-### REQ-DWF-029: Durable-Workflow Adoption Boundary
+### REQ-DWF-042: Migration Safety Without Permanent Authority
+
+WHEN a specific migration uses temporary comparison, shadow execution, or drain
+inventory to reduce rollout risk
+THE SYSTEM SHALL scope that machinery to the migration, prove that steady-state
+authority returns to the single canonical scheduler after the migration, and
+forbid such machinery from becoming a permanent semantic authority.
+
+Migration-local safety checks MAY compare outcomes or inventory owed work, but
+they SHALL NOT redefine the durable engine contract for normal operation.
+
+### REQ-DWF-032: Durable-Workflow Adoption Boundary
 
 WHEN accepted intent can create externally observable or crash-spanning work that
 requires ambiguity handling, recovery-policy enforcement, cancellation or
@@ -481,7 +454,7 @@ effects begin.
 
 Creation acceptance SHALL declare externally retryable acceptance. Its
 client-supplied idempotency key SHALL therefore be load-bearing under
-REQ-DWF-024 rather than incidental request metadata.
+REQ-DWF-029 and REQ-DWF-038 rather than incidental request metadata.
 
 ### REQ-DWF-CREATE-002: Creation Effect Mapping
 
@@ -538,13 +511,13 @@ The following immutable identifiers remain reserved for historical traceability 
 are superseded by the requirements above and SHALL NOT be used as current design
 authority:
 
-- REQ-DWF-020 Divergence Classification and Operator Action
-- REQ-DWF-021 Evidence-Based Authority Cutover
-- REQ-DWF-022 Mixed-Authority Semantic Parity
-- REQ-DWF-029 Externally Retryable Acceptance
-- REQ-DWF-030 Cross-Client Projection Parity
-- REQ-DWF-031 Independent Inbox Consumers
-- REQ-DWF-032 Durable-Workflow Adoption Boundary
+- REQ-DWF-015 Deprecated — selector-based one-scheduler authority semantics superseded by REQ-DWF-033
+- REQ-DWF-016 Deprecated — permanent parallel-authority migration semantics superseded by REQ-DWF-034
+- REQ-DWF-019 Deprecated — divergence-classification semantics removed from the current contract
+- REQ-DWF-020 Deprecated — evidence-based authority-cutover semantics removed from the current contract
+- REQ-DWF-021 Deprecated — mixed-authority semantic-parity semantics removed from the current contract
+- REQ-DWF-022 Deprecated — shadow/drain client-boundary semantics superseded by REQ-DWF-029 through REQ-DWF-042
 
-Current normative authority is REQ-DWF-020 through REQ-DWF-029 as defined in this
-document.
+Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042,
+REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
+REQ-DWF-CREATE-005 as defined in this document.

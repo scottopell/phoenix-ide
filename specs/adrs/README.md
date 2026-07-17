@@ -30,7 +30,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [016](016_durable-workflow-boundaries-include-clients-and-adoption.md) | Durable-workflow boundaries include client acceptance and profile adoption | Accepted | REQ-DWF-013, REQ-DWF-019, REQ-DWF-022, REQ-DWF-029–032, creation acceptance, wake delivery |
 | [017](017_production-deployment-shares-preparation-not-activation-ownership.md) | Production deployment shares preparation but keeps backend-owned activation | Accepted | REQ-PD-001 through REQ-PD-017 |
 | [018](018_release-updates-use-published-release-previews-and-approval-bound-installations.md) | Release updates use published release previews and approval-bound installations | Accepted | REQ-RU-001 through REQ-RU-010 |
-| [019](019_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014–029, wake and creation profile reshaping |
+| [019](019_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 
 ## For agents: which decisions bind your task
 

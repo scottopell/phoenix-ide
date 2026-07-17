@@ -42,7 +42,8 @@ These artifacts now state:
 
 1. one scheduler authority per SQLite database;
 2. durable acknowledgement as the workflow-adoption boundary;
-3. stable direct-turn acceptance keyed by client message identity;
+3. stable externally retryable acceptance and direct-turn acceptance keyed by
+   durable identities;
 4. universal attempt fencing plus optional reclaimable leases only where the
    phase is reclaimable;
 5. structural execution capability classes and recovery policies;
@@ -50,7 +51,8 @@ These artifacts now state:
 7. submit-then-observe for long-running remote work;
 8. typed profile versioning and migration with explicit incompatible-work
    handling;
-9. `CoalesceLatest` as the first explicit schedule policy.
+9. `CoalesceLatest` as the first explicit schedule policy;
+10. migration safety without permanent parallel authority.
 
 ## Implementation Status
 
@@ -58,8 +60,8 @@ These artifacts now state:
 | --- | --- | --- |
 | REQ-DWF-001–005 reducer authority, normalized ownership, atomic plans, DAGs, barriers | Specified, not implemented to new shape | Existing code still includes superseded permanent migration machinery and older entity shapes. |
 | REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Specified, not implemented to new shape | Current implementation still assumes universal claimed-step leasing. |
-| REQ-DWF-013–019 capabilities, typed migration, durable acknowledgement, canonical delivery | Specified, not implemented to new shape | Canonical single delivery lifecycle is normative; implementation still has overlapping wake and generic delivery state. |
-| REQ-DWF-020–029 remote submit-observe, runtime acceptance, direct turns, CoalesceLatest, independent consumers, adoption boundary | Specified only | These are normative requirements without matching implementation on this branch. |
+| REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Specified, not implemented to new shape | Existing code still reflects the superseded selector/shadow/drain worldview in adjacent spec and implementation history. |
+| REQ-DWF-029–042 externally retryable acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Specified only | These are normative requirements without matching implementation on this branch. |
 | REQ-DWF-WAKE-001–005 wake profile | Partially implemented under superseded architecture | Wake code exists, but not yet under the narrowed canonical-delivery and optional-lease contract. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only under new architecture | Earlier shadow and cutover machinery is superseded normatively; implementation has not been rewritten. |
 
