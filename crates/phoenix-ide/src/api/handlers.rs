@@ -4024,6 +4024,12 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
+            let repository =
+                phoenix_db::workflow::WorkflowRepository::new(state.runtime.db().pool().clone());
+            phoenix_db::workflow::wake::WakeWorkflowAdapter::new(&repository)
+                .transfer_conversation_owner(&id, &existing.id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             tracing::info!(
                 parent_id = %id,
                 existing_continuation = %existing.id,

@@ -245,17 +245,18 @@ impl<'a> WakeWorkflowAdapter<'a> {
             tx.rollback().await?;
             return Ok(0);
         }
-        let core_consumed = sqlx::query(
-            "UPDATE workflow_reducer_inbox SET delivery_status = 'consumed' \
-             WHERE delivery_status = 'pending' \
-             AND id IN (SELECT value FROM json_each(?1))",
-        )
-        .bind(&encoded_ids)
-        .execute(&mut *tx)
-        .await?;
-        if core_consumed.rows_affected() != inbox_ids.len() as u64 {
-            tx.rollback().await?;
-            return Ok(0);
+        for inbox_id in inbox_ids {
+            sqlx::query(
+                "INSERT INTO workflow_inbox_consumer_dispositions \
+                 (reducer_inbox_id, consumer_kind, status, consumed_at) \
+                 VALUES (?1, 'wake_runtime', 'consumed', ?2) \
+                 ON CONFLICT(reducer_inbox_id, consumer_kind) DO UPDATE SET \
+                 status = excluded.status, consumed_at = excluded.consumed_at",
+            )
+            .bind(inbox_id)
+            .bind(accepted_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
         }
         let result = sqlx::query(
             "UPDATE wake_runtime_obligations SET status = 'accepted', resolved_at = ?1, terminal_reason = 'accepted' \

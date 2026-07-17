@@ -177,6 +177,7 @@ impl Tool for TmuxRunTool {
             &cwd,
             &requested_name,
             cmd,
+            parsed.keep_open_on_exit,
             keep_open_for_observation,
             parsed.keep_open_on_exit,
         )
@@ -299,16 +300,18 @@ async fn resolve_tmux_paths(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_tmux_window(
     config_path: &Path,
     socket_path: &Path,
     cwd: &Path,
     requested_name: &str,
     cmd: &str,
-    keep_open_on_exit: bool,
+    keep_interactive_on_exit: bool,
+    retain_for_observation: bool,
     wait_targetable: bool,
 ) -> Result<TmuxRunTarget, ToolOutput> {
-    let wrapper = shell_wrapper(cmd, keep_open_on_exit);
+    let wrapper = shell_wrapper(cmd, keep_interactive_on_exit, retain_for_observation);
     let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
     let start_output = run_tmux_cli(
         config_path,
@@ -549,16 +552,25 @@ fn derived_window_name(cmd: &str) -> String {
     format!("tmux-run-{prefix:08x}")
 }
 
-fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
-    let retain_dead_pane = if keep_open_on_exit {
-        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on >/dev/null 2>&1 || exit 125;"
+fn shell_wrapper(
+    cmd: &str,
+    keep_interactive_on_exit: bool,
+    retain_for_observation: bool,
+) -> String {
+    let retain_dead_pane = if retain_for_observation && !keep_interactive_on_exit {
+        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on >/dev/null 2>&1 || exit 125; "
     } else {
         ""
     };
     let timestamp =
         r#"if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "$EPOCHREALTIME"; else date +%s; fi"#;
+    let completion = if keep_interactive_on_exit {
+        "exec \"${SHELL:-bash}\" -i"
+    } else {
+        "exit $code"
+    };
     format!(
-        "{retain_dead_pane} echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; exit $code"
+        "{retain_dead_pane}echo \"[phoenix] process started at unix seconds $({timestamp})\"; (\n{cmd}\n); code=$?; echo; echo \"[phoenix] process exited at unix seconds $({timestamp})\"; echo \"{EXIT_MARKER_PREFIX}$code\"; {completion}"
     )
 }
 
@@ -760,12 +772,16 @@ mod tests {
 
     #[test]
     fn wrapper_records_portable_subsecond_start_and_finish_markers() {
-        let wrapper = shell_wrapper("true", false);
+        let wrapper = shell_wrapper("true", false, false);
         assert!(wrapper.contains("[phoenix] process started at unix seconds"));
         assert!(wrapper.contains("[phoenix] process exited at unix seconds"));
         assert!(wrapper.contains("EPOCHREALTIME"));
         assert!(wrapper.contains("date +%s"));
         assert!(!wrapper.contains("python"));
+        assert!(wrapper.ends_with("exit $code"));
+        let retained = shell_wrapper("true", true, true);
+        assert!(retained.ends_with("exec \"${SHELL:-bash}\" -i"));
+        assert!(!retained.contains("remain-on-exit"));
     }
 
     #[tokio::test]
@@ -921,16 +937,10 @@ mod tests {
             "tmux_run must register the exact window identity"
         );
         let inspection = registry.inspect_window(&identity).await;
-        assert!(
-            matches!(
-                inspection,
-                TmuxTerminalInspection::Terminal {
-                    exit_code: 7,
-                    duration_ms: Some(_),
-                    ..
-                }
-            ),
-            "inspection: {inspection:?}; pane: {pane}"
+        assert_eq!(
+            inspection,
+            TmuxTerminalInspection::Live,
+            "interactive shell must remain targetable; pane: {pane}"
         );
         let rekeyed_scope = phoenix_core::work_scope::WorkScope::Worktree(
             cwd_tmp
@@ -948,14 +958,10 @@ mod tests {
             work_scope: rekeyed_scope.clone(),
             ..identity
         };
-        assert!(matches!(
+        assert_eq!(
             registry.inspect_window(&rekeyed_identity).await,
-            TmuxTerminalInspection::Terminal {
-                exit_code: 7,
-                duration_ms: Some(_),
-                ..
-            }
-        ));
+            TmuxTerminalInspection::Live
+        );
         assert!(registry.get_existing(&rekeyed_scope).await.is_some());
         assert_eq!(
             registry.conversation_count().await,
@@ -1321,14 +1327,10 @@ mod tests {
             restarted.get_existing(&scope).await.is_none(),
             "new registry simulates Phoenix restart"
         );
-        assert!(matches!(
+        assert_eq!(
             restarted.inspect_window(&identity).await,
-            TmuxTerminalInspection::Terminal {
-                exit_code: 3,
-                duration_ms: Some(_),
-                ..
-            }
-        ));
+            TmuxTerminalInspection::Live
+        );
         assert!(
             restarted.get_existing(&scope).await.is_none(),
             "read-only inspection must not materialize registry inventory"

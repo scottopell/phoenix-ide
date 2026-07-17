@@ -526,7 +526,7 @@ async fn deliver_owed(
                 WakeObservationResult {
                     message_id: format!("wake-result-{inbox_id}"),
                     registering_tool_use_id,
-                    content: format!("Durable wait observation: {output}"),
+                    content: output,
                     inbox_id,
                     resume_llm,
                 }
