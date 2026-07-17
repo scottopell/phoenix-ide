@@ -1222,9 +1222,41 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       <WorkControlBar conversationId="conv-desktop-feedback" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
     );
 
-    expect(screen.getByRole('button', { name: /#13 Needs review open task-124 feedback open/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#14 Being handled open task-125 feedback in progress/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123$/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#13 Needs review open task-124$/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#14 Being handled open task-125 feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123 feedback approved \(thumbs-up reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByText('👀').parentElement).toHaveAttribute('title', 'feedback in progress (eyes reaction)');
+    expect(screen.getByText('👍').parentElement).toHaveAttribute('title', 'feedback approved (thumbs-up reaction)');
+  });
+
+  it('shows the active PR review state in the compact desktop rail', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'approved',
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12open👍');
+    expect(screen.getByText('feedback approved (thumbs-up reaction)')).toHaveClass('pr-review-state-label');
+  });
+
+  it('shows review state on compact PR chips independently of freshness', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'in_progress',
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('button', { name: /#12 open feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByText('👀')).toBeInTheDocument();
   });
 
   it('uses the compact desktop rail when an explicit active PR is absent from associated summaries', () => {

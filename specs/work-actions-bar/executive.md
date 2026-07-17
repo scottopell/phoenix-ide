@@ -61,7 +61,7 @@ click to arm.
 | REQ-WAB-009 | Continuation mute: when continued_in_conv_id is set, RESOLVE and FINISH are suppressed and there is no primary |
 | REQ-WAB-010 | PR link verbs (Merge / Open PR) are GitHub links; Phoenix has no merge API |
 | REQ-WAB-011 | Mobile rail shows actionable PR status/freshness and expands one active PR without parallel selection state |
-| REQ-WAB-012 | Desktop multi-PR rail shows rich PR context, shares active selection authority, and preserves selector fallback |
+| REQ-WAB-012 | Desktop multi-PR rail shows rich PR context and sidebar-consistent review state, shares active selection authority, and preserves selector fallback |
 
 Increment 1 also depends on the `pr-association` migration from hidden singular-primary targeting
 to one explicit active PR. The work actions bar remains a composition surface: it does not infer
@@ -93,6 +93,7 @@ ambiguous.
 | `WorkControlBar` component | `ui/src/components/WorkActions.tsx` |
 | Responsive active-PR rail styling | `ui/src/components/WorkActions.css` |
 | Shared rail availability derivation | `ui/src/components/prRailAvailability.ts` |
+| Shared sidebar/Work Actions review-state mapping | `ui/src/components/prReviewState.ts` |
 | Desktop multi-PR QA surface | `ui/src/fixtures/desktopMultiPrConversation/renderFixture.tsx` |
 | `WorkDisposition` derivation | `deriveWorkDisposition` in the same file |
 | Shared FINISH-primary selector | `finishPrimaryForDisposition` in the same file |

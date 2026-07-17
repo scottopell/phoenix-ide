@@ -6,6 +6,7 @@ import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
+import { prReviewState } from './prReviewState';
 import { useIsMobile } from '../hooks';
 import './WorkActions.css';
 
@@ -98,16 +99,15 @@ function abandonHintText(isBranch: boolean): string {
     : 'Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation.';
 }
 
-function railFeedbackIndicator(
-  pr: (NonNullable<ConversationPrStatusHandle['activeSelection']>['associated_prs'])[number],
-  selectedFreshness: string | null,
-): { label: string; text: string } | null {
-  if (selectedFreshness) {
-    return { label: `${selectedFreshness} feedback`, text: selectedFreshness.replace(' new', '') };
-  }
-  if (pr.feedback_status === 'in_progress') return { label: 'feedback in progress', text: 'in progress' };
-  if (pr.feedback_status === 'open') return { label: 'feedback open', text: 'feedback' };
-  return null;
+function PrReviewStateIndicator({ feedbackStatus }: { feedbackStatus: 'open' | 'in_progress' | 'approved' | null }) {
+  const reviewState = prReviewState(feedbackStatus);
+  if (!reviewState) return null;
+  return (
+    <span className={`pr-review-state ${reviewState.className}`} title={reviewState.label}>
+      <span aria-hidden="true">{reviewState.symbol}</span>
+      <span className="pr-review-state-label">{reviewState.label}</span>
+    </span>
+  );
 }
 
 export function WorkControlBar({
@@ -452,7 +452,6 @@ export function WorkControlBar({
             const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
             const selected = identity === activeIdentity;
             const isExpanded = selected && expanded;
-            const feedbackIndicator = railFeedbackIndicator(pr, selected ? freshnessLabel : null);
             return (
               <button
                 key={identity}
@@ -469,12 +468,10 @@ export function WorkControlBar({
                 {!isMobile && <span className="desktop-pr-chip-title">{pr.title}</span>}
                 <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
                 {!isMobile && <span className="desktop-pr-chip-branch">{pr.head}</span>}
-                {(isMobile ? selected && freshnessLabel : feedbackIndicator) && (
-                  <span
-                    className="mobile-pr-notification"
-                    aria-label={feedbackIndicator?.label ?? `${freshnessLabel} feedback`}
-                  >
-                    {feedbackIndicator?.text ?? freshnessLabel?.replace(' new', '')}
+                <PrReviewStateIndicator feedbackStatus={pr.feedback_status} />
+                {selected && freshnessLabel && (
+                  <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>
+                    {freshnessLabel.replace(' new', '')}
                   </span>
                 )}
               </button>
@@ -500,6 +497,7 @@ export function WorkControlBar({
             <span className="mobile-pr-status-dot" aria-hidden="true" />
             <span className="mobile-pr-chip-number">#{activePrNumber}</span>
             <span className="mobile-pr-chip-state">{prStatus?.display_state ?? 'actions'}</span>
+            <PrReviewStateIndicator feedbackStatus={prStatus?.feedback_status ?? null} />
           </button>
         ) : (
           <span className="mobile-pr-chip desktop-work-actions-identity" data-testid="desktop-work-actions-identity">

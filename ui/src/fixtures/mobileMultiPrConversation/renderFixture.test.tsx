@@ -44,8 +44,8 @@ describe('MobileMultiPrConversationFixture', () => {
     });
 
     expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#417 open/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#423 open 2 new feedback/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: /#417 open feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#423 open feedback approved \(thumbs-up reaction\) 2 new feedback/ })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
   });
 

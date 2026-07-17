@@ -60,7 +60,7 @@ export const mobileMultiPrAssociatedPrs: AssociatedPrSummaryResponse[] = [
     base: 'main',
     head: 'feature/multi-pr-association',
     github_updated_at: '2026-07-15T14:24:00Z',
-    feedback_status: 'open',
+    feedback_status: 'in_progress',
   },
   {
     repo_owner: 'phoenix-ide',
@@ -74,7 +74,7 @@ export const mobileMultiPrAssociatedPrs: AssociatedPrSummaryResponse[] = [
     base: 'feature/multi-pr-association',
     head: 'feature/mobile-pr-selector',
     github_updated_at: '2026-07-15T14:29:00Z',
-    feedback_status: 'open',
+    feedback_status: 'approved',
   },
 ];
 

@@ -82,7 +82,10 @@ THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
 WHEN a desktop conversation has multiple actionable associated PRs and its active PR is either
 actionable or absent
 THE SYSTEM SHALL replace the persistent multi-zone action bar with a PR rail whose entries show the
-PR number, title, branch, open-or-draft status, and actionable feedback freshness.
+PR number, title, branch, open-or-draft status, review state, and actionable feedback freshness.
+Review state SHALL use the same approved and in-progress symbols and accessible labels as the
+conversation sidebar. Review state SHALL appear on every PR entry, independently of which PR is
+active and independently of fresh-comment counts.
 WHEN a desktop conversation has fewer than two actionable associated PRs, its active PR cannot be
 represented by the PR-selector rail, or PR metadata is still loading
 THE SYSTEM SHALL preserve the StateBar active-PR selector fallback and present the derived Work

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
 import type { Conversation, CachedPrSummary } from '../api';
+import { prReviewState } from './prReviewState';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import {
   computeChainRoots,
@@ -62,15 +63,13 @@ interface ConversationRowProps {
 }
 
 function sidebarFeedbackStatusSuffix(pr: CachedPrSummary): string {
-  if (pr.feedback_status === 'approved') return ' 👍';
-  if (pr.feedback_status === 'in_progress') return ' 👀';
-  return '';
+  const reviewState = prReviewState(pr.feedback_status);
+  return reviewState ? ` ${reviewState.symbol}` : '';
 }
 
 function sidebarFeedbackStatusText(pr: CachedPrSummary): string | null {
-  if (pr.feedback_status === 'approved') return 'approved (thumbs-up reaction)';
-  if (pr.feedback_status === 'in_progress') return 'in progress (eyes reaction)';
-  return null;
+  const reviewState = prReviewState(pr.feedback_status);
+  return reviewState?.label.replace('feedback ', '') ?? null;
 }
 
 function sidebarPrBadgeLabel(pr: CachedPrSummary): string {

@@ -147,6 +147,7 @@ enum RailFeedbackSignal {
     none
     | open
     | in_progress
+    | approved
     | fresh
 }
 
@@ -328,8 +329,9 @@ entity WorkActionsBar {
 --
 --   actionable_pr_entries(conv: bedrock/Conversation) -> List<RailPrEntry>
 --       Returns every open or draft associated PR with its own feedback signal.
---       The active PR's fresh/edited count may refine its signal to fresh; inactive
---       entries retain their association-owned open/in-progress signal.
+--       Approved and in-progress signals use the same symbols and accessible labels
+--       as the conversation sidebar on every entry. The active PR's fresh/edited
+--       count may additionally surface freshness without replacing review state.
 --
 --   explicit_active_pr(conv: bedrock/Conversation) -> pra/PrIdentity?
 --       Returns the explicit pinned or inferred active selection, if one exists.
