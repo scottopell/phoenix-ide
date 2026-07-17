@@ -496,8 +496,8 @@ export function WorkControlBar({
           >
             <span className="mobile-pr-status-dot" aria-hidden="true" />
             <span className="mobile-pr-chip-number">#{activePrNumber}</span>
-            <span className="mobile-pr-chip-state">{prStatus?.display_state ?? 'actions'}</span>
-            <PrReviewStateIndicator feedbackStatus={prStatus?.feedback_status ?? null} />
+            <span className="mobile-pr-chip-state">{activePr?.display_state ?? prStatus?.display_state ?? 'actions'}</span>
+            <PrReviewStateIndicator feedbackStatus={activePr?.feedback_status ?? prStatus?.feedback_status ?? null} />
           </button>
         ) : (
           <span className="mobile-pr-chip desktop-work-actions-identity" data-testid="desktop-work-actions-identity">

@@ -1235,6 +1235,12 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       number: 12,
       display_state: 'open',
       feedback_status: 'approved',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, feedback_status: 'approved' },
+        ],
+      },
     });
     renderWithProviders(
       <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
@@ -1244,12 +1250,39 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByText('feedback approved (thumbs-up reaction)')).toHaveClass('pr-review-state-label');
   });
 
+  it('uses the active summary for compact chip state and review status', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'open',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, display_state: 'draft', feedback_status: 'approved' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-summary-authority" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12draft👍');
+    expect(screen.getByRole('button', { name: '#12 draft feedback approved (thumbs-up reaction)' })).toBeInTheDocument();
+  });
+
   it('shows review state on compact PR chips independently of freshness', () => {
     const handle = prStatusHandle({
       found: true,
       number: 12,
       display_state: 'open',
       feedback_status: 'in_progress',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, feedback_status: 'in_progress' },
+        ],
+      },
     });
     renderWithProviders(
       <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
