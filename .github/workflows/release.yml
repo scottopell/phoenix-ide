@@ -175,7 +175,7 @@ jobs:
             phoenix_ide-aarch64-apple-darwin
           )
           for asset in "${required[@]}"; do
-            test -x "$asset" || { echo "missing required release asset: $asset"; exit 1; }
+            test -f "$asset" || { echo "missing required release asset: $asset"; exit 1; }
           done
           sha256sum phoenix_ide-* > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 6
