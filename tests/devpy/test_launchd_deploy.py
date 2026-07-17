@@ -754,15 +754,23 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("Config: unreadable launchd plist", rendered)
         self.assertIn("Last deploy: activation_failed_rolled_back (tx)", rendered)
 
-    def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
+    def test_release_workflow_lists_all_native_assets_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        self.assertIn("phoenix_ide-aarch64-apple-darwin", workflow)
-        self.assertIn("phoenix_ide-x86_64-apple-darwin", workflow)
+        for asset in (
+            "phoenix_ide-aarch64-apple-darwin",
+            "phoenix_ide-x86_64-apple-darwin",
+            "phoenix_ide-aarch64-unknown-linux-musl",
+            "phoenix_ide-x86_64-unknown-linux-musl",
+        ):
+            self.assertIn(asset, workflow)
         self.assertIn("SHA256SUMS", workflow)
+        self.assertIn('missing required release asset: $asset', workflow)
         self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
         self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
         self.assertIn("runner: macos-15-intel", workflow)
         self.assertIn("runner: macos-15", workflow)
+        self.assertIn("runner: ubuntu-24.04-arm", workflow)
+        self.assertIn("runner: ubuntu-latest", workflow)
         self.assertNotIn("runner: macos-14", workflow)
         self.assertNotIn("runner: macos-13", workflow)
 

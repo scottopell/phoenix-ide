@@ -28,7 +28,7 @@ Live production deployment remains an explicitly gated operator action; automate
 | REQ-PD-014 | persistent same-user bare-Linux supervisor owns the direct Phoenix child, reconciles interrupted durable phases, and has production-style detached initiator-death acceptance |
 | REQ-PD-015 | bare installation starts independently for the active boot, installs an idempotent owner `@reboot` entry when compatible crontab is available, and otherwise prints exact same-user host rc guidance without claiming persistence |
 | REQ-PD-016 | launchd disposable harness and Lima/VZ systemd success/rollback plus detached bare-supervisor commit/rollback/stop acceptance; extended systemd failure/reboot coverage remains outstanding |
-| REQ-PD-017 | Linux x86_64 asset exists; Linux aarch64 publication and cross-platform selection verification not implemented |
+| REQ-PD-017 | release workflow builds native macOS and musl Linux assets for x86_64 and aarch64, refuses incomplete asset sets before checksumming, and deployment selection tests cover all four targets |
 
 ## Operator surface
 

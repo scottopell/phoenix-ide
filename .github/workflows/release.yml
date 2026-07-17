@@ -57,12 +57,25 @@ jobs:
   build-linux:
     needs: gate
     if: needs.gate.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.tag }}
-      - run: sudo apt-get install -y musl-tools
+      - name: Install musl compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ] && ! command -v aarch64-linux-musl-gcc >/dev/null; then
+            sudo ln -s "$(command -v musl-gcc)" /usr/local/bin/aarch64-linux-musl-gcc
+          fi
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: ui/package.json
@@ -73,7 +86,7 @@ jobs:
           cache-dependency-path: ui/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile && pnpm run build
         working-directory: ui
@@ -83,16 +96,17 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Build Linux binaries
         run: |
-          cargo build --profile release-min --target x86_64-unknown-linux-musl
-          cargo build --release --target x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release-min/phoenix_ide phoenix_ide-x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/phoenix_ide phoenix_ide-x86_64-unknown-linux-musl-debug
+          cargo build --profile release-min --target "${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release-min/phoenix_ide" "phoenix_ide-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/phoenix_ide" "phoenix_ide-${{ matrix.target }}-debug"
         env:
           CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-release-assets
-          path: phoenix_ide-x86_64-unknown-linux-musl*
+          name: linux-${{ matrix.target }}-release-assets
+          path: phoenix_ide-${{ matrix.target }}*
 
   build-macos:
     needs: gate
@@ -154,7 +168,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          required=(
+            phoenix_ide-x86_64-unknown-linux-musl
+            phoenix_ide-aarch64-unknown-linux-musl
+            phoenix_ide-x86_64-apple-darwin
+            phoenix_ide-aarch64-apple-darwin
+          )
+          for asset in "${required[@]}"; do
+            test -x "$asset" || { echo "missing required release asset: $asset"; exit 1; }
+          done
           sha256sum phoenix_ide-* > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 6
           gh release create "${{ needs.gate.outputs.tag }}" \
             --repo scottopell/phoenix-ide \
             --title "${{ needs.gate.outputs.tag }}" \
