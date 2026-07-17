@@ -47,6 +47,19 @@ class SystemdDeployCommandTests(unittest.TestCase):
                     )
             self.assertTrue(all("systemd-run" not in call.args[0] for call in run.call_args_list))
 
+    def test_transient_launch_failure_abandons_staged_claim(self):
+        manifest = Path("/root/transactions/tx/manifest.json")
+        calls = [
+            subprocess.CalledProcessError(1, ["systemd-run"]),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=calls) as run:
+            with self.assertRaisesRegex(SystemExit, "staged claim released"):
+                self.dev._launch_systemd_activation("tx", manifest)
+        abandon = run.call_args_list[1].args[0]
+        self.assertIn("abandon", abandon)
+        self.assertIn(str(manifest), abandon)
+
     def test_native_deploy_hands_root_manifest_to_transient_unit(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -77,13 +90,17 @@ class SystemdDeployCommandTests(unittest.TestCase):
                 destination.chmod(0o700)
 
             with mock.patch.object(self.dev, "check_systemd_available", return_value=True), \
-                 mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SECRET": "value"}) or ".phoenix-ide.env"), \
+                 mock.patch.object(
+                     self.dev,
+                     "_load_env_file",
+                     side_effect=lambda env: env.update({"SECRET": "value", "PHOENIX_PORT": "9443", "PHOENIX_TLS": "auto"}) or ".phoenix-ide.env",
+                 ), \
                  mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
                  mock.patch.object(self.dev, "detect_service_user", return_value="nobody"), \
                  mock.patch("uuid.uuid4", return_value=mock.Mock(hex=transaction_id)), \
                  mock.patch.object(self.dev, "_linux_musl_target", return_value="x86_64-unknown-linux-musl"), \
                  mock.patch.object(self.dev, "_prepare_local_candidate", return_value=candidate) as prepare, \
-                 mock.patch.object(self.dev, "_systemd_current_identity", return_value=None), \
+                 mock.patch.object(self.dev, "_systemd_installed_runtime", return_value=(None, None)), \
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize) as source_file, \
                  mock.patch.object(
                      self.dev,
@@ -91,6 +108,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
                      side_effect=lambda _staging, _tx, _helper, files: captured.update(
                          manifest=json.loads(dict(files)["manifest.json"].read_text()),
                          manifest_text=dict(files)["manifest.json"].read_text(),
+                         socket_text=dict(files)["candidate.socket"].read_text(),
                          files=files,
                      ) or root_manifest,
                  ) as stage, \
@@ -108,10 +126,43 @@ class SystemdDeployCommandTests(unittest.TestCase):
             manifest = captured["manifest"]
             self.assertNotIn("value", captured["manifest_text"])
             self.assertEqual(identity.as_dict(), manifest["expected"])
+            self.assertEqual("https://localhost:9443/api/version", manifest["expected_health_url"])
+            self.assertIn("ListenStream=9443", captured["socket_text"])
             activation = commands[-1]
             self.assertIn("systemd-run", activation)
             self.assertIn(str(root_manifest), activation)
             self.assertIn(str(root_manifest.parent / "helper.py"), activation)
+
+    def test_candidate_and_previous_health_urls_use_their_own_snapshots(self):
+        previous = {"PHOENIX_PORT": "8031"}
+        candidate = {"PHOENIX_PORT": "9443", "PHOENIX_TLS": "auto"}
+        self.assertEqual("https://localhost:9443/api/version", self.dev._prod_api_health_url(candidate))
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / "prod.env"
+            binary = Path(td) / "binary"
+            env.write_text("PHOENIX_PORT=8031\n")
+            binary.write_text("runtime")
+            with mock.patch.object(
+                self.dev, "_binary_identity", return_value=self.dev.RuntimeIdentity("1.0.0", "a" * 12)
+            ):
+                identity, url = self.dev._installed_runtime(binary, env)
+            self.assertEqual(self.dev.RuntimeIdentity("1.0.0", "a" * 12), identity)
+            self.assertEqual("http://localhost:8031/api/version", url)
+        self.assertEqual("http://localhost:8031/api/version", self.dev._prod_api_health_url(previous))
+
+    def test_systemd_status_reads_root_owned_deployed_sha(self):
+        with mock.patch.object(
+            self.dev.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+        ) as run:
+            self.assertEqual("a" * 40, self.dev._read_systemd_deployed_sha())
+        self.assertEqual(["sudo", "cat", str(self.dev.SYSTEMD_DEPLOYED_SHA_PATH)], run.call_args.args[0])
+
+    def test_runtime_identity_refuses_incomplete_status_values(self):
+        identity = self.dev.RuntimeIdentity(None, "a" * 12)
+        with self.assertRaisesRegex(ValueError, "exact runtime identity"):
+            identity.as_dict()
 
     def test_linux_musl_target_tracks_host_architecture(self):
         import platform

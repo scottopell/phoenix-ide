@@ -88,6 +88,38 @@ class BareDeployCommandTests(unittest.TestCase):
         self.assertIn("--root", text)
         self.assertIn("run", text)
 
+    def test_status_shows_durable_state_without_supervisor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            status = root / "deploy/status.json"
+            status.parent.mkdir()
+            status.write_text(json.dumps({"state": "committed", "transaction_id": "tx"}))
+            deployed_sha = root / "deployed.sha"
+            deployed_sha.write_text("a" * 40 + "\n")
+            layout = {
+                "socket": root / "run/supervisor.sock",
+                "status": status,
+                "deployed_sha": deployed_sha,
+            }
+            with mock.patch.object(self.dev, "_bare_layout", return_value=layout), \
+                 mock.patch("builtins.print") as output:
+                self.dev.prod_daemon_status()
+        rendered = "\n".join(" ".join(str(value) for value in call.args) for call in output.call_args_list)
+        self.assertIn("Supervisor not running", rendered)
+        self.assertIn("Deployment: committed (tx)", rendered)
+        self.assertIn("a" * 40, rendered)
+
+    def test_unclaimed_frozen_transaction_is_discarded_after_launch_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            transaction = Path(td) / "tx"
+            transaction.mkdir(mode=0o700)
+            artifact = transaction / "manifest.json"
+            artifact.write_text("{}")
+            artifact.chmod(0o400)
+            transaction.chmod(0o500)
+            self.dev._discard_unclaimed_bare_transaction(transaction)
+            self.assertFalse(transaction.exists())
+
     def test_deploy_stages_only_transaction_reference_to_supervisor(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "phoenix"
@@ -132,7 +164,7 @@ class BareDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                  mock.patch.object(self.dev, "_start_bare_supervisor"), \
                  mock.patch.object(self.dev, "_configure_bare_reboot_persistence"), \
-                 mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+                 mock.patch.object(self.dev, "_installed_runtime", return_value=(None, None)), \
                  mock.patch.object(self.dev.subprocess, "run", side_effect=run), \
                  mock.patch("uuid.uuid4", return_value=mock.Mock(hex="d" * 32)):
                 self.dev.prod_daemon_deploy("v2.0.0")

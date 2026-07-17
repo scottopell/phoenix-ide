@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import pwd
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -247,7 +248,7 @@ class FakeSystemctl:
         self.start_failure = start_failure
         self.events = []
 
-    def verify_units(self, service, socket):
+    def verify_units(self, service, socket, candidate_binary):
         self.events.append("verify")
 
     def inspect(self):
@@ -298,6 +299,26 @@ class SystemdActivationTests(SystemdManifestValidationTests):
 
     def manifest(self):
         return helper.Manifest.load(self.manifest_path)
+
+    def test_unit_verification_uses_staged_candidate_executable(self):
+        manifest = self.manifest()
+        calls = []
+        service = Path(manifest.candidate.service.path)
+        service.write_text(f"[Service]\nExecStart={manifest.targets.binary}\n")
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            verification_service = Path(command[-1])
+            self.assertIn(manifest.candidate.binary.path, verification_service.read_text())
+            self.assertNotIn(manifest.targets.binary, verification_service.read_text())
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        helper.Systemctl(manifest, run=run).verify_units(
+            Path(manifest.candidate.service.path),
+            Path(manifest.candidate.socket.path),
+            Path(manifest.candidate.binary.path),
+        )
+        self.assertEqual("systemd-analyze", calls[0][0])
 
     def test_success_atomically_installs_candidate_and_commits(self):
         self.install_previous()
@@ -361,6 +382,8 @@ class SystemdActivationTests(SystemdManifestValidationTests):
         self.assertEqual("candidate crashed", status["failure"])
         self.assertEqual("rollback start failed", status["rollback_failure"])
         self.assertEqual(manifest.transaction_id, self.policy.active_path.read_text().strip())
+        self.assertTrue(helper.status_is_durable_terminal(manifest))
+        self.assertFalse(helper.release_claim(manifest))
 
     def test_preparation_failure_does_not_stop_service(self):
         manifest = self.manifest()

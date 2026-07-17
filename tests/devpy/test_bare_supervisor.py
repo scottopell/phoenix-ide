@@ -299,6 +299,24 @@ class BareTransactionTests(unittest.TestCase):
         self.assertFalse(self.layout.active_file.exists())
         owner.start_child.assert_called_once()
 
+    def test_https_loopback_health_url_is_accepted(self):
+        supervisor.validate_health_url("https://127.0.0.1:49155/api/version")
+        with self.assertRaisesRegex(supervisor.SupervisorError, "loopback"):
+            supervisor.validate_health_url("https://example.com:49155/api/version")
+
+    def test_environment_snapshot_does_not_inherit_supervisor_ambient_values(self):
+        path = self.layout.root / "child.env"
+        path.write_text("EXPLICIT=value\nMULTILINE=a\\nb\n")
+        with mock.patch.dict(__import__("os").environ, {"AMBIENT_SECRET": "must-not-leak"}):
+            environment = supervisor.parse_environment(path)
+        self.assertEqual({"EXPLICIT": "value", "MULTILINE": "a\nb"}, environment)
+
+    def test_disconnected_client_response_is_nonfatal(self):
+        connection = mock.Mock()
+        connection.sendall.side_effect = BrokenPipeError()
+        supervisor.send_response(connection, {"ok": True})
+        connection.sendall.assert_called_once()
+
     def test_manifest_hash_mismatch_is_rejected_before_claim(self):
         self.manifest()
         owner = supervisor.Supervisor(self.layout)

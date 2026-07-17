@@ -6261,6 +6261,53 @@ def _stage_systemd_root_handoff(
     return manifest_path
 
 
+def _read_systemd_installed_env() -> dict[str, str]:
+    import tempfile
+
+    result = subprocess.run(["sudo", "cat", str(PROD_ENV_FILE)], capture_output=True, text=True)
+    if result.returncode != 0:
+        return {}
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as snapshot:
+        snapshot.write(result.stdout)
+        path = Path(snapshot.name)
+    try:
+        return _load_installed_env(path)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _systemd_installed_runtime() -> tuple["RuntimeIdentity | None", str | None]:
+    binary = PROD_INSTALL_DIR / "phoenix-ide"
+    if not binary.is_file():
+        return None, None
+    identity = _binary_identity(binary)
+    if not identity.is_exact():
+        raise SystemExit(f"installed systemd binary has incomplete identity: {identity.display()}")
+    return identity, _prod_api_health_url(_read_systemd_installed_env())
+
+
+def _launch_systemd_activation(transaction_id: str, root_manifest: Path) -> None:
+    root_transaction = root_manifest.parent
+    activation_unit = f"phoenix-ide-deploy-{transaction_id}"
+    try:
+        subprocess.run([
+            "sudo", "systemd-run", "--no-block", f"--unit={activation_unit}",
+            "--property=Type=oneshot", "--",
+            "python3", str(root_transaction / "helper.py"), "activate", "--manifest", str(root_manifest),
+        ], check=True)
+    except subprocess.CalledProcessError:
+        cleanup = subprocess.run([
+            "sudo", "python3", str(root_transaction / "helper.py"),
+            "abandon", "--manifest", str(root_manifest),
+        ], capture_output=True, text=True)
+        if cleanup.returncode != 0:
+            raise SystemExit(
+                "systemd transient activation failed and its claim could not be released: "
+                f"{(cleanup.stderr or cleanup.stdout).strip()}"
+            )
+        raise SystemExit("systemd transient activation unit did not start; staged claim released")
+
+
 def native_prod_deploy(release: str | None = None):
     """Prepare and hand systemd activation to an independent root transient unit."""
     import tempfile
@@ -6290,10 +6337,17 @@ def native_prod_deploy(release: str | None = None):
         candidate_env = staging / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
         candidate_env.chmod(0o600)
+        try:
+            candidate_port = int(env_snapshot.get("PHOENIX_PORT", str(PROD_PORT)))
+            if not 1 <= candidate_port <= 65535:
+                raise ValueError
+        except ValueError as exc:
+            raise SystemExit("PHOENIX_PORT must be an integer from 1 through 65535") from exc
         config = dataclasses.replace(
             NATIVE_SYSTEMD_CONFIG,
             user=service_user,
             db_path=str(SYSTEMD_DB_PATH),
+            port=candidate_port,
             home_dir=str(Path.home()),
             env_file_path=str(PROD_ENV_FILE) if env_snapshot else None,
         )
@@ -6318,7 +6372,7 @@ def native_prod_deploy(release: str | None = None):
         if protocol != str(SYSTEMD_HANDOFF_PROTOCOL_VERSION):
             raise SystemExit(f"systemd helper protocol mismatch: expected {SYSTEMD_HANDOFF_PROTOCOL_VERSION}, got {protocol!r}")
 
-        previous_identity = _systemd_current_identity(env_snapshot)
+        previous_identity, previous_health_url = _systemd_installed_runtime()
 
         root_transaction = SYSTEMD_TRANSACTION_ROOT / transaction_id
         root_paths = {name: root_transaction / name for name in (
@@ -6336,8 +6390,8 @@ def native_prod_deploy(release: str | None = None):
             "release_commit": prepared.release_commit,
             "expected": prepared.identity.as_dict(),
             "previous": previous_identity.as_dict() if previous_identity else None,
-            "expected_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version",
-            "previous_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version" if previous_identity else None,
+            "expected_health_url": _prod_api_health_url(env_snapshot),
+            "previous_health_url": previous_health_url,
             "candidate": {
                 "binary": _systemd_artifact(root_paths["candidate-binary"], candidate_binary),
                 "service": _systemd_artifact(root_paths["candidate.service"], candidate_service),
@@ -6377,12 +6431,7 @@ def native_prod_deploy(release: str | None = None):
             files.append(("candidate.env", candidate_env))
         root_manifest = _stage_systemd_root_handoff(staging, transaction_id, helper, files)
 
-    activation_unit = f"phoenix-ide-deploy-{transaction_id}"
-    subprocess.run([
-        "sudo", "systemd-run", "--no-block", f"--unit={activation_unit}",
-        "--property=Type=oneshot", "--",
-        "python3", str(root_transaction / "helper.py"), "activate", "--manifest", str(root_manifest),
-    ], check=True)
+    _launch_systemd_activation(transaction_id, root_manifest)
     print("\n✓ Activation handed to an independent root systemd unit")
     print(f"  Transaction: {transaction_id}")
     print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
@@ -6559,6 +6608,33 @@ def _prod_local_health_url(env: dict[str, str] | None = None) -> str:
     return f"{scheme}://localhost:{port}/version"
 
 
+def _prod_api_health_url(env: dict[str, str] | None = None) -> str:
+    return _prod_local_health_url(env).removesuffix("/version") + "/api/version"
+
+
+def _load_installed_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.is_file():
+        return env
+    for raw in path.read_text().splitlines():
+        if not raw or raw.lstrip().startswith("#"):
+            continue
+        key, separator, value = raw.partition("=")
+        if not separator or not key:
+            raise SystemExit(f"invalid installed production environment snapshot: {path}")
+        env[key] = value.replace("\\n", "\n")
+    return env
+
+
+def _installed_runtime(binary: Path, environment: Path) -> tuple["RuntimeIdentity | None", str | None]:
+    if not binary.is_file():
+        return None, None
+    identity = _binary_identity(binary)
+    if not identity.is_exact():
+        raise SystemExit(f"installed production binary has incomplete identity: {identity.display()}")
+    return identity, _prod_api_health_url(_load_installed_env(environment))
+
+
 def _open_prod_health(env: dict[str, str] | None = None, timeout: float = 5.0):
     import ssl
     import urllib.request
@@ -6677,6 +6753,15 @@ def _configure_bare_reboot_persistence(layout: dict[str, Path]) -> bool:
     return False
 
 
+def _discard_unclaimed_bare_transaction(transaction: Path) -> None:
+    if not transaction.exists():
+        return
+    transaction.chmod(0o700)
+    for artifact in transaction.iterdir():
+        artifact.chmod(0o600)
+    shutil.rmtree(transaction)
+
+
 def prod_daemon_deploy(release: str | None = None):
     """Deploy through the persistent same-user supervisor on Linux without systemd."""
     import tempfile
@@ -6723,12 +6808,12 @@ def prod_daemon_deploy(release: str | None = None):
         candidate_env = transaction / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
         candidate_env.chmod(0o600)
-        previous_identity = _current_prod_identity(env_snapshot)
+        previous_identity, previous_health_url = _installed_runtime(layout["binary"], layout["environment"])
         rollback_binary = None
         rollback_env = None
         if previous_identity is not None:
-            if not layout["binary"].is_file() or not layout["environment"].is_file():
-                raise SystemExit("running bare production lacks rollback binary or environment")
+            if not layout["environment"].is_file():
+                raise SystemExit("installed bare production lacks rollback environment")
             rollback_binary = transaction / "rollback-binary"
             rollback_env = transaction / "rollback.env"
             shutil.copy2(layout["binary"], rollback_binary)
@@ -6740,8 +6825,8 @@ def prod_daemon_deploy(release: str | None = None):
             "transaction_id": transaction_id,
             "expected": prepared.identity.as_dict(),
             "previous": previous_identity.as_dict() if previous_identity else None,
-            "expected_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version",
-            "previous_health_url": f"http://127.0.0.1:{PROD_PORT}/api/version" if previous_identity else None,
+            "expected_health_url": _prod_api_health_url(env_snapshot),
+            "previous_health_url": previous_health_url,
             "candidate_binary": {"name": candidate.name, "sha256": _file_sha256(candidate)},
             "candidate_environment": {"name": candidate_env.name, "sha256": _file_sha256(candidate_env)},
             "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
@@ -6762,6 +6847,8 @@ def prod_daemon_deploy(release: str | None = None):
         "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
     ], capture_output=True, text=True)
     if result.returncode != 0:
+        if not layout["active"].exists():
+            _discard_unclaimed_bare_transaction(layout["transactions"] / transaction_id)
         raise SystemExit(f"bare deployment failed: {(result.stderr or result.stdout).strip()}")
     response = json.loads(result.stdout)
     state = response.get("state")
@@ -6779,6 +6866,11 @@ def prod_daemon_status():
     layout = _bare_layout()
     if not layout["socket"].exists():
         print("Status: Supervisor not running")
+        if layout["status"].exists():
+            status = json.loads(layout["status"].read_text())
+            print(f"  Deployment: {status.get('state')} ({status.get('transaction_id')})")
+        if layout["deployed_sha"].exists():
+            print(f"  Commit: {layout['deployed_sha'].read_text().strip()}")
         return
     result = subprocess.run(
         [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "status"],
@@ -6834,6 +6926,13 @@ def _read_systemd_deploy_status() -> dict[str, object] | None:
         return None
 
 
+def _read_systemd_deployed_sha() -> str | None:
+    result = subprocess.run(
+        ["sudo", "cat", str(SYSTEMD_DEPLOYED_SHA_PATH)], capture_output=True, text=True
+    )
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
 def native_prod_status():
     """Show production service status (native Linux)."""
     # Check if service exists
@@ -6856,7 +6955,7 @@ def native_prod_status():
         except Exception:
             print(f"  Health: not responding")
 
-        if sha := read_deployed_sha():
+        if sha := _read_systemd_deployed_sha():
             print(f"  Commit: {sha}")
     else:
         print(f"Production: {status}")
@@ -7144,7 +7243,15 @@ class RuntimeIdentity:
             return value
         return cls(version=value["version"], git_sha=value["git_sha"])
 
+    def is_exact(self) -> bool:
+        return bool(self.version and self.git_sha)
+
+    def display(self) -> str:
+        return f"{self.version or '<unknown>'} ({self.git_sha or '<unknown>'})"
+
     def as_dict(self) -> dict[str, str]:
+        if self.version is None or self.git_sha is None:
+            raise ValueError("exact runtime identity requires both version and git SHA")
         return {"version": self.version, "git_sha": self.git_sha}
 
 
@@ -7245,7 +7352,8 @@ def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
         context = ssl._create_unverified_context() if insecure_tls else None
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
             value = json.load(response)
-        return RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
+        identity = RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
+        return identity if identity.is_exact() else None
     except Exception:
         return None
 

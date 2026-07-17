@@ -351,6 +351,8 @@ TERMINAL_STATES = {
     "rejected_concurrent",
 }
 
+CLAIM_RELEASABLE_STATES = TERMINAL_STATES - {"activation_failed_rollback_failed"}
+
 
 class ActivationError(RuntimeError):
     pass
@@ -488,6 +490,12 @@ def release_claim(manifest: Manifest) -> bool:
         try:
             if claim.read_text().strip() != manifest.transaction_id:
                 return False
+            try:
+                status = json.loads(Path(manifest.status_path).read_text())
+            except (OSError, json.JSONDecodeError):
+                return False
+            if status.get("state") not in CLAIM_RELEASABLE_STATES:
+                return False
             if not status_is_durable_terminal(manifest):
                 return False
             claim.unlink()
@@ -534,8 +542,19 @@ class Systemctl:
             main_pid=self.main_pid(),
         )
 
-    def verify_units(self, service: Path, socket: Path) -> None:
-        result = self.run(["systemd-analyze", "verify", str(socket), str(service)], capture_output=True, text=True)
+    def verify_units(self, service: Path, socket: Path, candidate_binary: Path) -> None:
+        with tempfile.TemporaryDirectory(prefix="phoenix-systemd-verify-") as temporary:
+            verification_service = Path(temporary) / service.name
+            target_binary = self.manifest.targets.binary
+            content = service.read_text()
+            if target_binary not in content:
+                raise ActivationError("candidate service does not execute the fixed production binary")
+            verification_service.write_text(content.replace(target_binary, str(candidate_binary)))
+            result = self.run(
+                ["systemd-analyze", "verify", str(socket), str(verification_service)],
+                capture_output=True,
+                text=True,
+            )
         if result.returncode != 0:
             raise ActivationError(f"systemd unit validation failed: {(result.stderr or result.stdout).strip()}")
 
@@ -619,7 +638,7 @@ def service_group_id(service_user: str) -> int:
 def prepare_installs(manifest: Manifest, systemctl: Systemctl) -> PreparedInstalls:
     candidate_service = Path(manifest.candidate.service.path)
     candidate_socket = Path(manifest.candidate.socket.path)
-    systemctl.verify_units(candidate_service, candidate_socket)
+    systemctl.verify_units(candidate_service, candidate_socket, Path(manifest.candidate.binary.path))
     service_gid = service_group_id(manifest.service_user)
     reserved: list[Path] = []
 
@@ -772,7 +791,7 @@ def acquire_claim(transaction_id: str, policy: ValidationPolicy) -> Path:
                 status = {}
             if owner and not (
                 status.get("transaction_id") == owner
-                and status.get("state") in TERMINAL_STATES
+                and status.get("state") in CLAIM_RELEASABLE_STATES
             ):
                 raise ConcurrentDeploy(f"deployment transaction {owner} is unresolved")
         transaction = policy.transaction_root / transaction_id
@@ -904,7 +923,7 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol-version", action="store_true")
-    parser.add_argument("action", nargs="?", choices=("activate", "stage"))
+    parser.add_argument("action", nargs="?", choices=("activate", "stage", "abandon"))
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--source-uid", type=int)
@@ -923,6 +942,19 @@ def main() -> int:
         except Exception as exc:
             print(f"systemd handoff staging failed: {exc}", file=sys.stderr)
             return 1
+    if args.action == "abandon":
+        if args.manifest is None:
+            parser.error("abandon requires abandon --manifest PATH")
+        try:
+            manifest = Manifest.load(args.manifest)
+            validate_manifest(args.manifest, manifest, ValidationPolicy.production())
+            write_status(manifest, "precondition_failed", failure="transient activation unit did not start")
+            if not release_claim(manifest):
+                raise ActivationError("failed to release abandoned activation claim")
+            return 0
+        except Exception as exc:
+            print(f"systemd activation abandonment failed: {exc}", file=sys.stderr)
+            return 1
     if args.action != "activate" or args.manifest is None:
         parser.error("activation requires activate --manifest PATH")
     manifest = None
@@ -930,7 +962,7 @@ def main() -> int:
         manifest = Manifest.load(args.manifest)
         validate_manifest(args.manifest, manifest, ValidationPolicy.production())
         state = activate(manifest)
-        if state in TERMINAL_STATES and status_is_durable_terminal(manifest):
+        if state in CLAIM_RELEASABLE_STATES and status_is_durable_terminal(manifest):
             release_claim(manifest)
         print(state, flush=True)
         return 0 if state == "committed" else 1
