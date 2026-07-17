@@ -54,6 +54,53 @@ class BareDeployCommandTests(unittest.TestCase):
             self.assertIn("stop", command)
             self.assertNotIn("prod.pid", " ".join(command))
 
+    def test_bare_health_url_tracks_specific_bind_and_maps_wildcards_to_loopback(self):
+        self.assertEqual(
+            "http://192.0.2.10:9443/api/version",
+            self.dev._bare_api_health_url({"PHOENIX_BIND_ADDR": "192.0.2.10", "PHOENIX_PORT": "9443"}),
+        )
+        self.assertEqual(
+            "http://127.0.0.1:8031/api/version",
+            self.dev._bare_api_health_url({"PHOENIX_BIND_ADDR": "0.0.0.0"}),
+        )
+        self.assertEqual(
+            "https://[2001:db8::10]:8031/api/version",
+            self.dev._bare_api_health_url({"PHOENIX_BIND_ADDR": "2001:db8::10", "PHOENIX_TLS": "auto"}),
+        )
+
+    def test_same_protocol_supervisor_refreshes_when_selected_source_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket = root / "run/supervisor.sock"
+            socket.parent.mkdir(parents=True)
+            socket.touch()
+            installed = root / "bin/phoenix-supervisor.py"
+            installed.parent.mkdir()
+            installed.write_text("old supervisor")
+            selected = root / "selected.py"
+            selected.write_text("new supervisor")
+            layout = {"root": root, "socket": socket, "supervisor": installed}
+
+            def run(command, **_kwargs):
+                if "status" in command:
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1}), "")
+                if "shutdown-supervisor" in command:
+                    socket.unlink()
+                    return subprocess.CompletedProcess(command, 0, "{}", "")
+                raise AssertionError(command)
+
+            def popen(*_args, **_kwargs):
+                socket.touch()
+                return mock.Mock()
+
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=run), \
+                 mock.patch.object(self.dev.subprocess, "Popen", side_effect=popen) as started:
+                self.dev._start_bare_supervisor(layout, "1", selected)
+
+            self.assertEqual("new supervisor", installed.read_text())
+            started.assert_called_once()
+            self.assertTrue(socket.exists())
+
     def test_reboot_persistence_installs_idempotent_owner_crontab_entry(self):
         root = Path("/tmp/phoenix owner")
         layout = {"root": root, "supervisor": root / "bin/phoenix-supervisor.py"}
@@ -164,7 +211,7 @@ class BareDeployCommandTests(unittest.TestCase):
                  mock.patch.object(self.dev, "_materialize_source_file", side_effect=materialize), \
                  mock.patch.object(self.dev, "_start_bare_supervisor"), \
                  mock.patch.object(self.dev, "_configure_bare_reboot_persistence"), \
-                 mock.patch.object(self.dev, "_installed_runtime", return_value=(None, None)), \
+                 mock.patch.object(self.dev, "_installed_bare_runtime", return_value=(None, None)), \
                  mock.patch.object(self.dev.subprocess, "run", side_effect=run), \
                  mock.patch("uuid.uuid4", return_value=mock.Mock(hex="d" * 32)):
                 self.dev.prod_daemon_deploy("v2.0.0")
@@ -176,6 +223,8 @@ class BareDeployCommandTests(unittest.TestCase):
             manifest = json.loads((layout["transactions"] / ("d" * 32) / "manifest.json").read_text())
             self.assertNotIn("SECRET", json.dumps(manifest))
             self.assertEqual(candidate.identity.as_dict(), manifest["expected"])
+            installed_env = (layout["transactions"] / ("d" * 32) / "candidate.env").read_text()
+            self.assertIn(f"HOME={Path.home()}", installed_env)
 
 
 if __name__ == "__main__":

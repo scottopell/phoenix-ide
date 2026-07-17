@@ -7,6 +7,7 @@ import argparse
 import dataclasses
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -159,8 +160,10 @@ def direct_child_matches(child: subprocess.Popen[bytes], identity: ChildIdentity
 
 
 def fetch_identity(url: str) -> RuntimeIdentity:
-    context = ssl._create_unverified_context() if url.startswith("https://") else None
-    with urllib.request.urlopen(url, timeout=2, context=context) as response:
+    handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
+    if url.startswith("https://"):
+        handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    with urllib.request.build_opener(*handlers).open(url, timeout=2) as response:
         value = json.load(response)
     try:
         return RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
@@ -230,8 +233,12 @@ def sha256(path: Path) -> str:
 
 def validate_health_url(value: str) -> None:
     parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
-        raise SupervisorError("health endpoint must use loopback HTTP or HTTPS")
+    try:
+        host_is_ip = parsed.hostname is not None and ipaddress.ip_address(parsed.hostname) is not None
+    except ValueError:
+        host_is_ip = False
+    if parsed.scheme not in {"http", "https"} or not (host_is_ip or parsed.hostname == "localhost"):
+        raise SupervisorError("health endpoint must use an IP literal or localhost over HTTP or HTTPS")
     if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path != "/api/version":
         raise SupervisorError("health endpoint must be credential-free /api/version")
     try:

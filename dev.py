@@ -6612,6 +6612,22 @@ def _prod_api_health_url(env: dict[str, str] | None = None) -> str:
     return _prod_local_health_url(env).removesuffix("/version") + "/api/version"
 
 
+def _bare_api_health_url(env: dict[str, str]) -> str:
+    import ipaddress
+
+    bind = env.get("PHOENIX_BIND_ADDR", "127.0.0.1")
+    try:
+        address = ipaddress.ip_address(bind)
+    except ValueError as exc:
+        raise SystemExit("PHOENIX_BIND_ADDR must be an IP address") from exc
+    if address.is_unspecified:
+        address = ipaddress.ip_address("::1" if address.version == 6 else "127.0.0.1")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    scheme = "https" if tls_enabled_from_env(env) else "http"
+    port = env.get("PHOENIX_PORT", str(PROD_PORT))
+    return f"{scheme}://{host}:{port}/api/version"
+
+
 def _load_installed_env(path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.is_file():
@@ -6633,6 +6649,15 @@ def _installed_runtime(binary: Path, environment: Path) -> tuple["RuntimeIdentit
     if not identity.is_exact():
         raise SystemExit(f"installed production binary has incomplete identity: {identity.display()}")
     return identity, _prod_api_health_url(_load_installed_env(environment))
+
+
+def _installed_bare_runtime(binary: Path, environment: Path) -> tuple["RuntimeIdentity | None", str | None]:
+    if not binary.is_file():
+        return None, None
+    identity = _binary_identity(binary)
+    if not identity.is_exact():
+        raise SystemExit(f"installed bare binary has incomplete identity: {identity.display()}")
+    return identity, _bare_api_health_url(_load_installed_env(environment))
 
 
 def _open_prod_health(env: dict[str, str] | None = None, timeout: float = 5.0):
@@ -6697,7 +6722,20 @@ def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_sour
                     "running bare supervisor uses an incompatible protocol; stop it from an external shell "
                     "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
                 )
-            return
+            if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
+                return
+            stopped = subprocess.run(
+                [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "shutdown-supervisor"],
+                capture_output=True,
+                text=True,
+            )
+            if stopped.returncode != 0:
+                raise SystemExit(f"failed to refresh bare supervisor: {(stopped.stderr or stopped.stdout).strip()}")
+            deadline = time.monotonic() + 10
+            while layout["socket"].exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if layout["socket"].exists():
+                raise SystemExit("old bare supervisor did not stop during refresh")
         layout["socket"].unlink(missing_ok=True)
     layout["supervisor"].parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected_source, layout["supervisor"])
@@ -6769,6 +6807,7 @@ def prod_daemon_deploy(release: str | None = None):
 
     env_snapshot: dict[str, str] = {}
     _load_env_file(env_snapshot)
+    env_snapshot.setdefault("HOME", str(Path.home()))
     env_snapshot.setdefault("PHOENIX_PORT", str(PROD_PORT))
     env_snapshot.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
     env_snapshot.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
@@ -6808,7 +6847,7 @@ def prod_daemon_deploy(release: str | None = None):
         candidate_env = transaction / "candidate.env"
         candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
         candidate_env.chmod(0o600)
-        previous_identity, previous_health_url = _installed_runtime(layout["binary"], layout["environment"])
+        previous_identity, previous_health_url = _installed_bare_runtime(layout["binary"], layout["environment"])
         rollback_binary = None
         rollback_env = None
         if previous_identity is not None:
@@ -6825,7 +6864,7 @@ def prod_daemon_deploy(release: str | None = None):
             "transaction_id": transaction_id,
             "expected": prepared.identity.as_dict(),
             "previous": previous_identity.as_dict() if previous_identity else None,
-            "expected_health_url": _prod_api_health_url(env_snapshot),
+            "expected_health_url": _bare_api_health_url(env_snapshot),
             "previous_health_url": previous_health_url,
             "candidate_binary": {"name": candidate.name, "sha256": _file_sha256(candidate)},
             "candidate_environment": {"name": candidate_env.name, "sha256": _file_sha256(candidate_env)},
@@ -6943,14 +6982,16 @@ def native_prod_status():
     status = result.stdout.strip()
     
     if status == "active":
+        installed_env = _read_systemd_installed_env()
+        installed_port = installed_env.get("PHOENIX_PORT", str(PROD_PORT))
         print(f"Production: running")
-        print(f"  Port: {PROD_PORT}")
-        print(f"  URL: {_prod_display_url()}")
-        print(f"  Database: {SYSTEMD_DB_PATH}")
+        print(f"  Port: {installed_port}")
+        print(f"  URL: {_prod_local_health_url(installed_env).removesuffix('/version')}")
+        print(f"  Database: {installed_env.get('PHOENIX_DB_PATH', str(SYSTEMD_DB_PATH))}")
 
         # Health check
         try:
-            _open_prod_health(timeout=2).close()
+            _open_prod_health(installed_env, timeout=2).close()
             print(f"  Health: OK")
         except Exception:
             print(f"  Health: not responding")

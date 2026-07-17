@@ -299,9 +299,10 @@ class BareTransactionTests(unittest.TestCase):
         self.assertFalse(self.layout.active_file.exists())
         owner.start_child.assert_called_once()
 
-    def test_https_loopback_health_url_is_accepted(self):
+    def test_https_ip_health_url_is_accepted(self):
         supervisor.validate_health_url("https://127.0.0.1:49155/api/version")
-        with self.assertRaisesRegex(supervisor.SupervisorError, "loopback"):
+        supervisor.validate_health_url("https://192.0.2.10:49155/api/version")
+        with self.assertRaisesRegex(supervisor.SupervisorError, "IP literal"):
             supervisor.validate_health_url("https://example.com:49155/api/version")
 
     def test_environment_snapshot_does_not_inherit_supervisor_ambient_values(self):

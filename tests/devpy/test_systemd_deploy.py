@@ -164,6 +164,27 @@ class SystemdDeployCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact runtime identity"):
             identity.as_dict()
 
+    def test_status_uses_installed_systemd_environment(self):
+        commands = [
+            subprocess.CompletedProcess([], 0, "active\n", ""),
+            subprocess.CompletedProcess([], 1, "", "missing"),
+        ]
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=commands), \
+             mock.patch.object(
+                 self.dev,
+                 "_read_systemd_installed_env",
+                 return_value={"PHOENIX_PORT": "9443", "PHOENIX_DB_PATH": "/srv/phoenix.db"},
+             ), \
+             mock.patch.object(self.dev, "_open_prod_health", side_effect=OSError), \
+             mock.patch.object(self.dev, "_read_systemd_deployed_sha", return_value=None), \
+             mock.patch.object(self.dev, "_read_systemd_deploy_status", return_value=None), \
+             mock.patch("builtins.print") as output:
+            self.dev.native_prod_status()
+        rendered = "\n".join(" ".join(str(value) for value in call.args) for call in output.call_args_list)
+        self.assertIn("Port: 9443", rendered)
+        self.assertIn("Database: /srv/phoenix.db", rendered)
+        self.assertIn("http://localhost:9443", rendered)
+
     def test_linux_musl_target_tracks_host_architecture(self):
         import platform
 

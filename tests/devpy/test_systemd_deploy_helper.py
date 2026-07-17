@@ -213,6 +213,9 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         self.assertEqual(self.transaction_id, policy.active_path.read_text().strip())
         self.assertEqual("candidate-binary", (manifest.parent / "candidate-binary").read_text())
         self.assertEqual(self.raw["expected"], json.loads(manifest.read_text())["expected"])
+        status = json.loads(policy.status_path.read_text())
+        self.assertEqual("prepared", status["state"])
+        self.assertEqual(self.transaction_id, status["transaction_id"])
 
     def test_stage_handoff_rejects_non_allowlisted_artifact_before_claim(self):
         source = self.base / "secret"

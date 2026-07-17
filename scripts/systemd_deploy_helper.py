@@ -474,6 +474,26 @@ def write_status(manifest: Manifest, state: str, *, failure: Optional[str] = Non
         atomic_write(Path(manifest.status_path), (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
 
 
+def write_prepared_status(manifest: Manifest, policy: ValidationPolicy) -> None:
+    status = {
+        "transaction_id": manifest.transaction_id,
+        "state": "prepared",
+        "source_kind": manifest.source_kind,
+        "source_commit": manifest.source_commit,
+        "release_tag": manifest.release_tag,
+        "release_commit": manifest.release_commit,
+        "expected_version": manifest.expected.version,
+        "expected_git_sha": manifest.expected.git_sha,
+        "created_at": manifest.created_at,
+        "updated_at": utc_now(),
+        "failure": None,
+        "rollback_failure": None,
+    }
+    with policy.claim_lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        atomic_write(policy.status_path, (json.dumps(status, sort_keys=True, indent=2) + "\n").encode())
+
+
 def status_is_durable_terminal(manifest: Manifest) -> bool:
     try:
         status = json.loads(Path(manifest.status_path).read_text())
@@ -909,6 +929,8 @@ def stage_handoff(bundle_path: Path, source_uid: int, policy: ValidationPolicy) 
         manifest = Manifest.load(manifest_path)
         prepare_data_directory(manifest.service_user, policy)
         capture_rollback(transaction, policy, manifest_path)
+        manifest = Manifest.load(manifest_path)
+        write_prepared_status(manifest, policy)
         return transaction / "manifest.json"
     except BaseException:
         shutil.rmtree(transaction, ignore_errors=True)
