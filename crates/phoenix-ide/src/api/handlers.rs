@@ -3162,10 +3162,7 @@ fn db_message_selection_for_stream(
 }
 
 fn stream_state_starts_runtime(state: &ConvState) -> bool {
-    !matches!(
-        state,
-        ConvState::CreationFailed { .. } | ConvState::CreationCancelled { .. }
-    )
+    !state.is_terminal()
 }
 
 async fn read_stream_init_messages_with_tail(
@@ -4543,8 +4540,11 @@ struct CascadeProjectsReport {
 /// The `(branch_name, worktree_path, is_work_mode)` cleanup target for a
 /// conversation, or `None` when there is no worktree/branch to reap (Direct,
 /// or Explore with no worktree). `is_work_mode` gates the `branch -D`.
-fn cascade_project_target(conv: &crate::db::Conversation) -> Option<(String, String, bool)> {
-    match &conv.conv_mode {
+async fn cascade_project_target(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> Result<Option<(String, String, bool)>, crate::db::DbError> {
+    let target = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
@@ -4559,18 +4559,29 @@ fn cascade_project_target(conv: &crate::db::Conversation) -> Option<(String, Str
             worktree_path: Some(wt),
             ..
         } => {
-            // Top-level managed Explore: temp branch follows the REQ-PROJ-028
-            // naming scheme. `is_work_mode = true` so the blocking closure
-            // also runs `branch -D` on it.
-            let id_prefix: String = conv.id.chars().take(8).collect();
-            Some((format!("task-pending-{id_prefix}"), wt.to_string(), true))
+            let mut conversations = state
+                .db
+                .list_conversations_for_worktree(wt.as_str())
+                .await?;
+            if !conversations
+                .iter()
+                .any(|candidate| candidate.id == conv.id)
+            {
+                conversations.push(conv.clone());
+            }
+            crate::runtime::cleanup_branch_for_unowned_work_scope(
+                std::path::Path::new(wt.as_str()),
+                &conversations,
+            )
+            .map(|branch| (branch, wt.to_string(), true))
         }
         ConvMode::Direct
         | ConvMode::Explore {
             worktree_path: None,
             ..
         } => None,
-    }
+    };
+    Ok(target)
 }
 
 async fn cascade_projects_on_delete(
@@ -4608,7 +4619,18 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     }
 
-    let Some((branch_name, worktree_path, is_work_mode)) = cascade_project_target(conv) else {
+    let target = match cascade_project_target(state, conv).await {
+        Ok(target) => target,
+        Err(error) => {
+            return CascadeProjectsReport {
+                error: Some(format!(
+                    "failed to resolve worktree cleanup target: {error}"
+                )),
+                ..CascadeProjectsReport::default()
+            };
+        }
+    };
+    let Some((branch_name, worktree_path, is_work_mode)) = target else {
         return CascadeProjectsReport::default();
     };
 
@@ -7213,6 +7235,14 @@ mod conversation_cwd_validation_tests {
                 job_id: "job".to_string(),
             }
         ));
+        assert!(!stream_state_starts_runtime(&ConvState::Completed {
+            result: "done".to_string(),
+        }));
+        assert!(!stream_state_starts_runtime(&ConvState::Failed {
+            error: "boom".to_string(),
+            error_kind: crate::db::ErrorKind::SubAgentError,
+        }));
+        assert!(!stream_state_starts_runtime(&ConvState::Terminal));
         assert!(stream_state_starts_runtime(&ConvState::Idle));
     }
 

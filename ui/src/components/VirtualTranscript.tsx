@@ -1,8 +1,10 @@
 import {
   forwardRef,
   useCallback,
+  useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useReducer,
   useRef,
   type ReactNode,
@@ -43,6 +45,7 @@ export interface VirtualTranscriptHandle {
   scrollToIndex(index: number, align: 'start' | 'end', viewportStartOffset?: number): void;
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
+  preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
@@ -84,6 +87,7 @@ interface PhysicalStore<T> {
   rowElements: Map<string, HTMLDivElement>;
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
+  preservedViewport: { top: number; firstKey: string | null } | null;
   pinned: boolean;
   revision: number;
 }
@@ -146,11 +150,39 @@ function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number)
   return snapshot.targetIndex === index ? snapshot.targetOffset ?? null : null;
 }
 
-function resolveKeys<T>(
+interface ResolvedPhysicalKeys {
+  keys: string[];
+  duplicateKeys: string[];
+}
+
+function resolvePhysicalKeys<T>(
   items: readonly T[],
   getKey: (item: T, index: number) => string,
-): string[] {
-  return items.map((item, index) => getKey(item, index));
+): ResolvedPhysicalKeys {
+  const semanticKeys = items.map(getKey);
+  const reservedKeys = new Set(semanticKeys);
+  const allocatedKeys = new Set<string>();
+  const occurrences = new Map<string, number>();
+  const duplicateKeys = new Set<string>();
+  const keys = semanticKeys.map((semanticKey) => {
+    const occurrence = occurrences.get(semanticKey) ?? 0;
+    occurrences.set(semanticKey, occurrence + 1);
+    if (occurrence === 0) {
+      allocatedKeys.add(semanticKey);
+      return semanticKey;
+    }
+
+    duplicateKeys.add(semanticKey);
+    let discriminator = occurrence;
+    let physicalKey = `${semanticKey}\u0000duplicate:${discriminator}`;
+    while (reservedKeys.has(physicalKey) || allocatedKeys.has(physicalKey)) {
+      discriminator += 1;
+      physicalKey = `${semanticKey}\u0000duplicate:${discriminator}`;
+    }
+    allocatedKeys.add(physicalKey);
+    return physicalKey;
+  });
+  return { keys, duplicateKeys: [...duplicateKeys] };
 }
 
 function estimatedExtentForKey<T>(store: PhysicalStore<T>) {
@@ -334,7 +366,8 @@ function unobserveElement<T>(store: PhysicalStore<T>, element: Element | null): 
 }
 
 function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
-  const keys = resolveKeys(props.items, props.getKey);
+  const resolvedKeys = resolvePhysicalKeys(props.items, props.getKey);
+  const keys = resolvedKeys.keys;
   const store: PhysicalStore<T> = {
     items: props.items,
     keys,
@@ -353,6 +386,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     rowElements: new Map(),
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
+    preservedViewport: null,
     pinned: true,
     revision: 0,
   };
@@ -384,6 +418,12 @@ function VirtualTranscriptInner<T>(
     storeRef.current = createStore(props);
   }
   const store = storeRef.current;
+  const resolvedPhysicalKeys = useMemo(
+    () => resolvePhysicalKeys(items, getKey),
+    [getKey, items],
+  );
+  const duplicateKeySignature = JSON.stringify(resolvedPhysicalKeys.duplicateKeys);
+  const lastReportedDuplicateKeySignature = useRef('[]');
   const [, publishRevision] = useReducer((revision: number) => revision + 1, 0);
 
   if (
@@ -396,7 +436,7 @@ function VirtualTranscriptInner<T>(
     const wasPinned = store.pinned;
     store.items = items;
     store.getKey = getKey;
-    store.keys = resolveKeys(items, getKey);
+    store.keys = resolvedPhysicalKeys.keys;
     store.estimatedExtent = estimatedExtent;
     store.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(store.keys);
@@ -409,6 +449,15 @@ function VirtualTranscriptInner<T>(
   const publish = useCallback(() => {
     publishRevision();
   }, []);
+
+  useEffect(() => {
+    if (duplicateKeySignature === lastReportedDuplicateKeySignature.current) return;
+    lastReportedDuplicateKeySignature.current = duplicateKeySignature;
+    if (resolvedPhysicalKeys.duplicateKeys.length === 0) return;
+    console.error('[VirtualTranscript] duplicate semantic keys quarantined', {
+      duplicateKeys: resolvedPhysicalKeys.duplicateKeys,
+    });
+  }, [duplicateKeySignature, resolvedPhysicalKeys]);
 
   const rowRefCallbacks = useRef(new Map<string, (element: HTMLDivElement | null) => void>());
 
@@ -481,11 +530,20 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    const anchor = current.pinned ? null : captureTopAnchor(current);
-    const wasPinned = current.pinned;
+    const nextKeys = resolvedPhysicalKeys.keys;
+    const preserved = current.preservedViewport;
+    const prefixInserted = preserved !== null
+      && preserved.firstKey !== null
+      && nextKeys.indexOf(preserved.firstKey) > 0;
+    if (prefixInserted) {
+      current.preservedViewport = null;
+      current.viewportTop = preserved.top;
+    }
+    const anchor = prefixInserted || current.pinned ? null : captureTopAnchor(current);
+    const wasPinned = !prefixInserted && current.pinned;
     current.items = items;
     current.getKey = getKey;
-    current.keys = resolveKeys(items, getKey);
+    current.keys = nextKeys;
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(current.keys);
@@ -494,7 +552,7 @@ function VirtualTranscriptInner<T>(
     }
     applyPhysicalChange(current, anchor, wasPinned);
     publish();
-  }, [estimatedExtent, getKey, items, overscan, publish]);
+  }, [estimatedExtent, getKey, items, overscan, publish, resolvedPhysicalKeys]);
 
   useLayoutEffect(() => {
     const current = storeRef.current;
@@ -558,6 +616,15 @@ function VirtualTranscriptInner<T>(
       publish();
       return anchor;
     },
+    preserveViewportOnNextItemsChange() {
+      const current = storeRef.current;
+      if (!current) return;
+      current.preservedViewport = {
+        top: current.scroller?.scrollTop ?? current.viewportTop,
+        firstKey: current.keys[0] ?? null,
+      };
+      current.activeAnchor = null;
+    },
     measureOffsetForIndex(index) {
       const current = storeRef.current;
       if (!current) return null;
@@ -588,6 +655,7 @@ function VirtualTranscriptInner<T>(
     const current = storeRef.current;
     if (!current?.scroller) return;
     current.viewportTop = current.scroller.scrollTop;
+    if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = current.scroller.clientHeight;
     current.activeAnchor = captureTopAnchor(current);
     recompute(current);
@@ -626,7 +694,7 @@ function VirtualTranscriptInner<T>(
             <div className="virtual-transcript__spacer" style={{ height: topSpacer }} />
           {visibleItems.map((item, offset) => {
             const index = (range?.startIndex ?? 0) + offset;
-            const key = getKey(item, index);
+            const key = store.keys[index]!;
             return (
               <div
                 key={key}

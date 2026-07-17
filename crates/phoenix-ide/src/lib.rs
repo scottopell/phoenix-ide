@@ -1042,10 +1042,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// pending a user action (Continue / Abandon / `MarkAsMerged`) or already
 /// transferred to a continuation — not a genuine orphan.
 async fn reconcile_worktrees(db: &Database) {
-    let work_convs = match db.get_work_conversations().await {
+    let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to query Work/Branch conversations for reconciliation");
+            tracing::warn!(error = %e, "Failed to query worktree conversations for reconciliation");
             return;
         }
     };
@@ -1054,11 +1054,7 @@ async fn reconcile_worktrees(db: &Database) {
     let mut terminated = 0usize;
 
     for conv in &work_convs {
-        // REQ-BED-031: context-exhausted conversations own their worktree
-        // until the user acts. Don't compound a missing-on-disk anomaly by
-        // marking terminal — leave the row alone so Continue / Abandon /
-        // MarkAsMerged remain structurally available.
-        if matches!(conv.state, db::ConvState::ContextExhausted { .. }) {
+        if conv.archived || conv.state.is_terminal() {
             continue;
         }
         // REQ-BED-030: once a parent has handed ownership to a continuation,
@@ -1068,14 +1064,7 @@ async fn reconcile_worktrees(db: &Database) {
         if conv.continued_in_conv_id.is_some() {
             continue;
         }
-        // Already terminal — nothing to do (and we'd just be writing the
-        // same state back). Prune still happens via the per-root dedup
-        // below if any sibling conv triggers it.
-        if matches!(conv.state, db::ConvState::Terminal) {
-            continue;
-        }
-
-        // Migration 002 guarantees Work/Branch rows have non-empty, non-sentinel
+        // Persisted worktree-bearing modes have a non-empty, non-sentinel
         // worktree_path and base_branch. The only remaining reason to act is a
         // worktree directory that no longer exists on disk.
         let wt_path = match conv.conv_mode.worktree_path() {
@@ -1129,9 +1118,317 @@ async fn reconcile_worktrees(db: &Database) {
 
     if terminated > 0 {
         tracing::info!(
-            total_work = work_convs.len(),
+            total_worktree_conversations = work_convs.len(),
             terminated,
             "Worktree reconciliation complete"
+        );
+    }
+
+    reclaim_unowned_worktrees(db).await;
+}
+
+fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<bool, String> {
+    let submodules = phoenix_core::git::command()
+        .args(["submodule", "status", "--recursive"])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| format!("submodule inventory failed to start: {error}"))?;
+    if !submodules.status.success() {
+        return Err(format!(
+            "submodule inventory failed: {}",
+            String::from_utf8_lossy(&submodules.stderr).trim()
+        ));
+    }
+    let submodules = String::from_utf8(submodules.stdout)
+        .map_err(|error| format!("submodule inventory is not UTF-8: {error}"))?;
+    for line in submodules.lines() {
+        let Some(relative) = line.split_ascii_whitespace().nth(1) else {
+            continue;
+        };
+        let submodule_path = worktree_path.join(relative);
+        if line.starts_with('-') {
+            match std::fs::read_dir(&submodule_path) {
+                Ok(mut entries) => {
+                    if entries.next().is_some() {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect uninitialized submodule {relative}: {error}"
+                    ));
+                }
+            }
+        }
+        let ignored = phoenix_core::git::command()
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ])
+            .current_dir(submodule_path)
+            .output()
+            .map_err(|error| format!("submodule ignored-file inventory failed: {error}"))?;
+        if !ignored.status.success() {
+            return Err(format!(
+                "submodule ignored-file inventory failed for {relative}: {}",
+                String::from_utf8_lossy(&ignored.stderr).trim()
+            ));
+        }
+        if ignored.stdout.iter().any(|byte| *byte != 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_registered_phoenix_worktree(
+    repo_root: &std::path::Path,
+    worktree_path: &std::path::Path,
+) -> Result<(), String> {
+    for path in [
+        repo_root.join(".phoenix"),
+        repo_root.join(".phoenix/worktrees"),
+        worktree_path.to_path_buf(),
+    ] {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlinked Phoenix worktree path: {}",
+                path.display()
+            ));
+        }
+    }
+
+    let listed = phoenix_core::git::command()
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|error| format!("git worktree inventory failed to start: {error}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git worktree inventory failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    let expected = std::fs::canonicalize(worktree_path)
+        .map_err(|error| format!("cannot canonicalize worktree path: {error}"))?;
+    let registered = String::from_utf8(listed.stdout)
+        .map_err(|error| format!("git worktree inventory is not UTF-8: {error}"))?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| path == expected);
+    if !registered {
+        return Err("path is not registered as a Git worktree".to_string());
+    }
+    Ok(())
+}
+
+/// Reclaim a clean Phoenix worktree whose persisted scope has no owner.
+/// Dirty or unreadable worktrees are retained so startup recovery cannot erase
+/// uncommitted evidence.
+fn reclaim_unowned_worktree(
+    worktree_path: &std::path::Path,
+    branch_to_delete: Option<&str>,
+) -> Result<bool, String> {
+    let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(worktree_path) else {
+        return Err("path is not a canonical Phoenix worktree".to_string());
+    };
+    verify_registered_phoenix_worktree(&repo_root, worktree_path)?;
+
+    let status = phoenix_core::git::command()
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| format!("git status failed to start: {error}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    if !status.stdout.is_empty() {
+        return Ok(false);
+    }
+
+    let ignored = phoenix_core::git::command()
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| format!("ignored-file inventory failed to start: {error}"))?;
+    if !ignored.status.success() {
+        return Err(format!(
+            "ignored-file inventory failed: {}",
+            String::from_utf8_lossy(&ignored.stderr).trim()
+        ));
+    }
+
+    if submodules_have_ignored_evidence(worktree_path)? {
+        return Ok(false);
+    }
+    let ignored_paths = ignored
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|p| !p.is_empty());
+    if ignored_paths
+        .clone()
+        .any(|path| !path.starts_with(b"target/"))
+    {
+        return Ok(false);
+    }
+
+    // The repository root's target/ is the sole disposable ignored subtree.
+    // Every other ignored path is treated as user evidence and retained.
+    if ignored_paths.count() > 0 {
+        crate::git_ops::run_git(worktree_path, &["clean", "-fdX", "--", "target"])
+            .map_err(|error| format!("ignored build-output cleanup failed: {error}"))?;
+    }
+    let path = worktree_path.to_string_lossy().into_owned();
+    // Git requires --force to remove an otherwise-clean worktree containing an
+    // initialized submodule. The status and ignored-file gates above establish
+    // that neither the root checkout nor any submodule contains user evidence.
+    crate::git_ops::run_git(&repo_root, &["worktree", "remove", &path, "--force"])
+        .map_err(|error| format!("git worktree remove refused: {error}"))?;
+
+    if let Some(branch) = branch_to_delete {
+        if crate::git_ops::find_branch_in_worktree_list(&repo_root, branch).is_none() {
+            if let Err(error) = crate::git_ops::run_git(&repo_root, &["branch", "-D", branch]) {
+                tracing::debug!(%error, branch, "startup worktree reconciliation: branch delete failed");
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn add_physical_project_worktrees(
+    projects: &[db::Project],
+    by_path: &mut std::collections::BTreeMap<String, Vec<db::Conversation>>,
+) {
+    for project in projects {
+        let worktrees_dir = std::path::Path::new(&project.canonical_path)
+            .join(".phoenix")
+            .join("worktrees");
+        let entries = match std::fs::read_dir(&worktrees_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(path = %worktrees_dir.display(), %error, "failed to inventory Phoenix worktree directory");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                by_path
+                    .entry(path.to_string_lossy().into_owned())
+                    .or_default();
+            }
+        }
+    }
+}
+
+async fn reclaim_unowned_worktrees(db: &Database) {
+    let conversations = match db.managed_worktree_conversations().await {
+        Ok(conversations) => conversations,
+        Err(error) => {
+            tracing::warn!(%error, "failed to inventory managed worktrees for startup reclamation");
+            return;
+        }
+    };
+
+    let mut by_path: std::collections::BTreeMap<String, Vec<db::Conversation>> =
+        std::collections::BTreeMap::new();
+    for conv in conversations {
+        if let Some(path) = conv.conv_mode.worktree_path() {
+            by_path.entry(path.to_string()).or_default().push(conv);
+        }
+    }
+
+    let projects = match db.list_projects().await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "failed to inventory project roots for startup reclamation");
+            return;
+        }
+    };
+    add_physical_project_worktrees(&projects, &mut by_path);
+
+    let mut reclaimed = 0usize;
+    let mut quarantined = 0usize;
+    for (path, owners) in by_path {
+        if owners
+            .iter()
+            .any(crate::runtime::conversation_owns_work_scope)
+        {
+            continue;
+        }
+        let worktree = std::path::PathBuf::from(&path);
+        if !worktree.exists() {
+            continue;
+        }
+        let branch = if owners.is_empty() {
+            None
+        } else {
+            crate::runtime::cleanup_branch_for_unowned_work_scope(&worktree, &owners)
+        };
+        let worktree_for_cleanup = worktree.clone();
+        match tokio::task::spawn_blocking(move || {
+            reclaim_unowned_worktree(&worktree_for_cleanup, branch.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(true)) => {
+                reclaimed += 1;
+                tracing::info!(worktree = %worktree.display(), "reclaimed unowned Phoenix worktree");
+            }
+            Ok(Ok(false)) => {
+                quarantined += 1;
+                tracing::warn!(
+                    worktree = %worktree.display(),
+                    "retaining dirty unowned Phoenix worktree for manual recovery"
+                );
+            }
+            Ok(Err(error)) => {
+                quarantined += 1;
+                tracing::warn!(
+                    worktree = %worktree.display(),
+                    %error,
+                    "retaining unowned Phoenix worktree because safe reclamation failed"
+                );
+            }
+            Err(error) => {
+                quarantined += 1;
+                tracing::warn!(
+                    worktree = %worktree.display(),
+                    %error,
+                    "retaining unowned Phoenix worktree because reclamation task failed"
+                );
+            }
+        }
+    }
+
+    if reclaimed > 0 || quarantined > 0 {
+        tracing::info!(
+            reclaimed,
+            quarantined,
+            "startup worktree reclamation complete"
         );
     }
 }
@@ -1398,6 +1695,28 @@ mod reconcile_worktrees_tests {
         .unwrap();
     }
 
+    fn add_worktree(repo_root: &std::path::Path, path: &str, branch: &str) {
+        let status = phoenix_core::git::command()
+            .args(["worktree", "add", "-q", "-b", branch, path, "main"])
+            .current_dir(repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+    }
+
+    async fn set_state(db: &db::Database, id: &str, state: &ConvState) {
+        db.update_conversation_state(id, state).await.unwrap();
+    }
+
+    async fn wire_continuation(db: &db::Database, from: &str, to: &str) {
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(to)
+            .bind(from)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
     /// Case (a): parent reached `ContextExhausted`. Worktree directory is
     /// missing on disk but the row's state is `ContextExhausted` — reconcile
     /// must SKIP it. Mode stays Work, cwd stays the worktree path.
@@ -1528,6 +1847,692 @@ mod reconcile_worktrees_tests {
             "worktree_path must be preserved untouched"
         );
         assert_eq!(after.cwd, wt_path, "cwd must NOT be reset to project root");
+    }
+
+    #[tokio::test]
+    async fn marks_missing_top_level_explore_worktree_terminal() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let conv_id = "explore-orphan";
+        let wt_path = repo_root
+            .join(".phoenix/worktrees")
+            .join(conv_id)
+            .to_string_lossy()
+            .into_owned();
+        let mode = ConvMode::Explore {
+            worktree_path: Some(NonEmptyString::new(&wt_path).unwrap()),
+            next_taskmd_id_hint: None,
+        };
+        seed_work_conv(&db, conv_id, conv_id, &wt_path, &mode, &project.id).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(matches!(
+            db.get_conversation(conv_id).await.unwrap().state,
+            ConvState::Terminal
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserves_completed_work_sub_agent_when_shared_worktree_is_missing() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let conv_id = "completed-sub-agent";
+        let (wt_path, mode) = work_mode_at(&repo_root, conv_id, "task-completed-sub");
+        seed_work_conv(&db, conv_id, conv_id, &wt_path, &mode, &project.id).await;
+        set_state(
+            &db,
+            conv_id,
+            &ConvState::Completed {
+                result: "preserve me".to_string(),
+            },
+        )
+        .await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(matches!(
+            db.get_conversation(conv_id).await.unwrap().state,
+            ConvState::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reclaims_clean_scope_after_handoff_chain_terminates() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "owner", "task-clean-reclaim");
+        add_worktree(&repo_root, &wt_path, "task-clean-reclaim");
+
+        seed_work_conv(&db, "owner", "owner", &wt_path, &mode, &project.id).await;
+        seed_work_conv(&db, "leaf", "leaf", &wt_path, &mode, &project.id).await;
+        set_state(
+            &db,
+            "owner",
+            &ConvState::HandedOff {
+                successor_conv_id: "leaf".to_string(),
+            },
+        )
+        .await;
+        set_state(&db, "leaf", &ConvState::Terminal).await;
+        wire_continuation(&db, "owner", "leaf").await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+        assert!(
+            crate::git_ops::find_branch_in_worktree_list(&repo_root, "task-clean-reclaim")
+                .is_none()
+        );
+
+        reconcile_worktrees(&db).await;
+        assert!(!std::path::Path::new(&wt_path).exists());
+    }
+
+    #[tokio::test]
+    async fn explore_continuation_reclaims_original_owner_temp_branch() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let owner_id = "12345678-owner";
+        let leaf_id = "87654321-leaf";
+        let wt_path = repo_root
+            .join(".phoenix/worktrees")
+            .join(owner_id)
+            .to_string_lossy()
+            .into_owned();
+        let branch = "task-pending-12345678";
+        add_worktree(&repo_root, &wt_path, branch);
+        let mode = ConvMode::Explore {
+            worktree_path: Some(NonEmptyString::new(&wt_path).unwrap()),
+            next_taskmd_id_hint: None,
+        };
+        seed_work_conv(&db, owner_id, "owner", &wt_path, &mode, &project.id).await;
+        seed_work_conv(&db, leaf_id, "leaf", &wt_path, &mode, &project.id).await;
+        set_state(
+            &db,
+            owner_id,
+            &ConvState::HandedOff {
+                successor_conv_id: leaf_id.to_string(),
+            },
+        )
+        .await;
+        set_state(&db, leaf_id, &ConvState::Terminal).await;
+        wire_continuation(&db, owner_id, leaf_id).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+        let branch_exists = phoenix_core::git::command()
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !branch_exists,
+            "the original owner's temp branch must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_unregistered_nested_checkout_without_cleaning_ignored_files() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        db.find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let path = repo_root.join(".phoenix/worktrees/unregistered");
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        std::fs::write(path.join("target/evidence"), "keep").unwrap();
+        let status = phoenix_core::git::command()
+            .args(["init", "-q"])
+            .current_dir(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        reconcile_worktrees(&db).await;
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("target/evidence")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retains_symlinked_external_checkout_without_cleaning_ignored_files() {
+        use std::os::unix::fs::symlink;
+
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        db.find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_root = external.path();
+        let status = phoenix_core::git::command()
+            .args(["init", "-q"])
+            .current_dir(external_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(external_root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(external_root.join("target")).unwrap();
+        std::fs::write(external_root.join("target/evidence"), "keep").unwrap();
+        let link = repo_root.join(".phoenix/worktrees/symlinked");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(external_root, &link).unwrap();
+
+        let result = reclaim_unowned_worktree(&link, None);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(external_root.join("target/evidence")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaims_rowless_physical_worktree() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        db.find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let wt_path = repo_root
+            .join(".phoenix/worktrees/rowless")
+            .to_string_lossy()
+            .into_owned();
+        let branch = "task-pending-rowless";
+        add_worktree(&repo_root, &wt_path, branch);
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("rowless-only"),
+            "keep branch commit",
+        )
+        .unwrap();
+        let status = phoenix_core::git::command()
+            .args(["add", "rowless-only"])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = phoenix_core::git::command()
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "unmerged rowless work",
+            ])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        reconcile_worktrees(&db).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+        let branch_exists = phoenix_core::git::command()
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            branch_exists,
+            "rowless cleanup must preserve an unmerged branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaims_unowned_scope_with_ignored_build_artifacts() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        std::fs::write(repo_root.join(".gitignore"), "target/\n").unwrap();
+        let status = phoenix_core::git::command()
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = phoenix_core::git::command()
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "ignore build output",
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (wt_path, mode) = work_mode_at(&repo_root, "ignored", "task-ignored-reclaim");
+        add_worktree(&repo_root, &wt_path, "task-ignored-reclaim");
+        std::fs::create_dir(std::path::Path::new(&wt_path).join("target")).unwrap();
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("target/artifact"),
+            "disposable",
+        )
+        .unwrap();
+        seed_work_conv(&db, "ignored", "ignored", &wt_path, &mode, &project.id).await;
+        set_state(&db, "ignored", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+    }
+
+    #[tokio::test]
+    async fn retains_unowned_scope_with_ignored_user_evidence() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        std::fs::write(repo_root.join(".gitignore"), ".env\n").unwrap();
+        let status = phoenix_core::git::command()
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = phoenix_core::git::command()
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "ignore local env",
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (wt_path, mode) = work_mode_at(&repo_root, "ignored-user", "task-ignore-user");
+        add_worktree(&repo_root, &wt_path, "task-ignore-user");
+        std::fs::write(std::path::Path::new(&wt_path).join(".env"), "SECRET=keep").unwrap();
+        seed_work_conv(
+            &db,
+            "ignored-user",
+            "ignored-user",
+            &wt_path,
+            &mode,
+            &project.id,
+        )
+        .await;
+        set_state(&db, "ignored-user", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&wt_path).join(".env")).unwrap(),
+            "SECRET=keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaims_unowned_scope_with_clean_initialized_submodule() {
+        let (_git_tmp, repo_root) = init_repo();
+        let submodule_tmp = tempfile::tempdir().unwrap();
+        let submodule_root = submodule_tmp.path();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let status = phoenix_core::git::command()
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(submodule_root, &["init", "-q", "-b", "main"]);
+        std::fs::write(submodule_root.join("tracked.txt"), "base").unwrap();
+        run(submodule_root, &["add", "tracked.txt"]);
+        run(
+            submodule_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init submodule",
+            ],
+        );
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                submodule_root.to_str().unwrap(),
+                "vendor/sub",
+            ],
+        );
+        run(&repo_root, &["add", ".gitmodules", "vendor/sub"]);
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "add submodule",
+            ],
+        );
+
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "clean-sub", "task-clean-sub");
+        add_worktree(&repo_root, &wt_path, "task-clean-sub");
+        run(
+            std::path::Path::new(&wt_path),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "-q",
+            ],
+        );
+        seed_work_conv(&db, "clean-sub", "clean-sub", &wt_path, &mode, &project.id).await;
+        set_state(&db, "clean-sub", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(!std::path::Path::new(&wt_path).exists());
+    }
+
+    #[tokio::test]
+    async fn retains_unowned_scope_with_files_in_uninitialized_submodule() {
+        let (_git_tmp, repo_root) = init_repo();
+        let submodule_tmp = tempfile::tempdir().unwrap();
+        let submodule_root = submodule_tmp.path();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let status = phoenix_core::git::command()
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(submodule_root, &["init", "-q", "-b", "main"]);
+        std::fs::write(submodule_root.join("tracked.txt"), "base").unwrap();
+        run(submodule_root, &["add", "tracked.txt"]);
+        run(
+            submodule_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init submodule",
+            ],
+        );
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                submodule_root.to_str().unwrap(),
+                "vendor/sub",
+            ],
+        );
+        run(&repo_root, &["add", ".gitmodules", "vendor/sub"]);
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "add submodule",
+            ],
+        );
+
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "uninit-sub", "task-uninit-sub");
+        add_worktree(&repo_root, &wt_path, "task-uninit-sub");
+        let submodule_path = std::path::Path::new(&wt_path).join("vendor/sub");
+        std::fs::create_dir_all(&submodule_path).unwrap();
+        std::fs::write(submodule_path.join("evidence.txt"), "keep").unwrap();
+        seed_work_conv(
+            &db,
+            "uninit-sub",
+            "uninit-sub",
+            &wt_path,
+            &mode,
+            &project.id,
+        )
+        .await;
+        set_state(&db, "uninit-sub", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert_eq!(
+            std::fs::read_to_string(submodule_path.join("evidence.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_unowned_scope_with_ignored_submodule_evidence() {
+        let (_git_tmp, repo_root) = init_repo();
+        let submodule_tmp = tempfile::tempdir().unwrap();
+        let submodule_root = submodule_tmp.path();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let status = phoenix_core::git::command()
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(submodule_root, &["init", "-q", "-b", "main"]);
+        std::fs::write(submodule_root.join("tracked.txt"), "base").unwrap();
+        std::fs::write(submodule_root.join(".gitignore"), ".env\n").unwrap();
+        run(submodule_root, &["add", "tracked.txt", ".gitignore"]);
+        run(
+            submodule_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init submodule",
+            ],
+        );
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                submodule_root.to_str().unwrap(),
+                "vendor/sub",
+            ],
+        );
+        run(&repo_root, &["add", ".gitmodules", "vendor/sub"]);
+        run(
+            &repo_root,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "add submodule",
+            ],
+        );
+
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "dirty-sub", "task-dirty-sub");
+        add_worktree(&repo_root, &wt_path, "task-dirty-sub");
+        run(
+            std::path::Path::new(&wt_path),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "-q",
+            ],
+        );
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("vendor/sub/.env"),
+            "SECRET=keep",
+        )
+        .unwrap();
+        seed_work_conv(&db, "dirty-sub", "dirty-sub", &wt_path, &mode, &project.id).await;
+        set_state(&db, "dirty-sub", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&wt_path).join("vendor/sub/.env"))
+                .unwrap(),
+            "SECRET=keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_dirty_unowned_scope_for_manual_recovery() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "dirty", "task-dirty-retain");
+        add_worktree(&repo_root, &wt_path, "task-dirty-retain");
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("evidence.txt"),
+            "keep me",
+        )
+        .unwrap();
+
+        seed_work_conv(&db, "dirty", "dirty", &wt_path, &mode, &project.id).await;
+        set_state(&db, "dirty", &ConvState::Terminal).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert!(std::path::Path::new(&wt_path).join("evidence.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn leaves_live_worktree_scope_untouched() {
+        let (_git_tmp, repo_root) = init_repo();
+        let db = fresh_db().await;
+        let project = db
+            .find_or_create_project(repo_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let (wt_path, mode) = work_mode_at(&repo_root, "live", "task-live-keep");
+        add_worktree(&repo_root, &wt_path, "task-live-keep");
+        seed_work_conv(&db, "live", "live", &wt_path, &mode, &project.id).await;
+
+        reconcile_worktrees(&db).await;
+
+        assert!(std::path::Path::new(&wt_path).exists());
     }
 
     /// Branch-mode genuine orphan — same treatment as Work: marked Terminal,

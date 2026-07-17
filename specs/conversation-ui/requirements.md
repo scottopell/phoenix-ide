@@ -69,13 +69,17 @@ AND auto-scroll to newest content
 
 WHEN opening a conversation with history beyond the initial view
 THE SYSTEM SHALL display the newest messages without waiting for the complete transcript
-AND offer an explicit action to load the complete earlier history
-AND preserve chronological order without gaps or duplicates across loaded pages
+AND automatically acquire the complete earlier history as the reader approaches the beginning of the loaded view
+AND preserve the reader's viewport position, chronological order, and message identity without gaps or duplicates
+AND conceal transcript batching and acquisition progress while acquisition succeeds
+
+IF automatic earlier-history acquisition fails
+THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
-**Rationale:** Users need to read the conversation history and understand tool execution. Long transcripts must not delay access to the newest activity; users incur complete-history loading only when they request it or follow a message deep link.
+**Rationale:** Users need to read the conversation history and understand tool execution. Long transcripts must not delay access to the newest activity, and transcript batching must not interrupt continuous reading.
 
 ---
 

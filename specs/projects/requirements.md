@@ -499,10 +499,14 @@ AND clean up orphaned registry entries
 AND report worktrees that exist on disk but have no registry entry
 
 WHEN a conversation is in context-exhausted state (REQ-BED-021)
-OR a conversation has `continued_in_conv_id` set (REQ-BED-030)
+AND it has not transferred ownership through `continued_in_conv_id` (REQ-BED-030)
 THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 AND SHALL NOT demote the conversation's mode
   (the worktree is preserved pending explicit user action per REQ-BED-031)
+
+WHEN a conversation has transferred ownership through `continued_in_conv_id`
+THE SYSTEM SHALL treat that row as a history reference rather than a live worktree owner
+AND SHALL preserve the worktree only while a non-archived live conversation resolves to the same `WorkScope`
 
 WHEN a conversation undergoes a terminal-transition cascade (hard-delete,
 archive, abandon, mark-merged — REQ-BED-032 step 4)
@@ -519,11 +523,27 @@ AND no live conversation other than the one being deleted resolves to its
 THE SYSTEM SHALL remove the worktree and delete the task branch (Work mode) as
 the sole owner's normal cleanup
 
+WHEN the server starts
+AND a Phoenix-owned worktree exists on disk
+AND no non-archived live conversation resolves to its `WorkScope`
+AND the worktree has no tracked or untracked changes
+THE SYSTEM SHALL remove the worktree
+AND SHALL apply its mode's branch disposition
+
+WHEN the server starts
+AND a Phoenix-owned worktree exists on disk
+AND no non-archived live conversation resolves to its `WorkScope`
+AND the worktree has tracked or untracked changes OR its status cannot be determined
+THE SYSTEM SHALL retain the worktree for manual recovery
+AND SHALL report why safe reclamation was skipped
+
 **Rationale:** The registry enables the UI to show all active worktrees and detect
 orphans. Reconciliation on startup handles worktrees deleted externally or
 conversations that ended without cleanup. Context-exhausted conversations and
-their continuations are an explicit exception: their worktrees are held
-intentionally and must survive restart unchanged. The cascade's any-live-owner
+an uncontinued context-exhausted row is an explicit exception: its worktree is held
+intentionally and must survive restart unchanged. Continued context-exhausted and
+handed-off rows have permanently transferred ownership; their live successors are
+scored independently as owners of the same scope. The cascade's any-live-owner
 guard is the same signal that gates the bash/tmux/browser cascades
 (REQ-BASH-WS-002): a Work-mode sub-agent inherits the parent's `worktree_path`,
 so removing the worktree or deleting the branch while the parent is live would

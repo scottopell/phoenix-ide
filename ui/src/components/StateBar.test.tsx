@@ -959,6 +959,54 @@ describe('StateBar mobile layout', () => {
     expect(screen.queryByText('Direct Project')).not.toBeInTheDocument();
   });
 
+  it('keeps active-PR selection in StateBar when the terminal active PR cannot be represented by the rail', () => {
+    const selection = makeSelection({
+      active_pr: {
+        pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 },
+        provenance: 'pinned',
+      },
+      associated_prs: [
+        {
+          ...makeSelection().associated_prs[0]!,
+          state: 'MERGED',
+          display_state: 'merged',
+        },
+        {
+          ...makeSelection().associated_prs[0]!,
+          pr_number: 13,
+          title: 'Still open',
+          url: 'https://github.com/o/r/pull/13',
+          head: 'task-124',
+        },
+      ],
+    });
+    renderStateBar({
+      prStatus: mockPrStatus({ found: true, number: 12, display_state: 'merged', selection }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
+  });
+
+  it('keeps active-PR selection in StateBar while the mobile PR rail is hidden', () => {
+    const selection = makeSelection();
+    delete selection.active_pr;
+    selection.associated_prs.push({
+      ...selection.associated_prs[0]!,
+      pr_number: 13,
+      title: 'Second open PR',
+      url: 'https://github.com/o/r/pull/13',
+      head: 'task-124',
+    });
+    renderStateBar({
+      convState: { type: 'awaiting_llm' },
+      prStatus: mockPrStatus({ found: false, selection }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.getByTestId('active-pr-selector-trigger')).toBeInTheDocument();
+  });
+
   it('keeps model picker enablement and file button keyboard behavior on mobile', () => {
     const onUpgradeModel = vi.fn();
     const onOpenFiles = vi.fn();

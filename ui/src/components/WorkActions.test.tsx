@@ -1135,3 +1135,253 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     });
   });
 });
+
+describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
+  const enableMobile = () => {
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: query === '(max-width: 768px)',
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+  };
+
+  const twoOpenPrSelection = (active = true): AssociatedPrStatusEnvelope => ({
+    associated_prs: [
+      ...selection().associated_prs,
+      { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+    ],
+    ...(active ? { active_pr: selection().active_pr } : {}),
+  });
+
+  it('shows a thin rail of open PRs and expands the selected PR actions upward', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_freshness: { state: 'new', count: 3 },
+      feedback_status: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 open 3 new feedback/ })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: /#13 open/ })).toBeInTheDocument();
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open 3 new feedback/ }));
+    expect(screen.getByTestId('mobile-pr-actions')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 3 new');
+    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
+    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
+  });
+
+  it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-no-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
+  });
+
+  it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-open" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+  });
+
+  it('renders feedback coverage warnings on the mobile Address feedback hero', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-coverage" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    const hero = screen.getByTestId('mobile-primary-address-feedback');
+    expect(hero.querySelector('.work-actions-pr-coverage')).toHaveTextContent('GitHub sign-in needed');
+  });
+
+  it('preserves terminal action explanations on mobile', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-hints" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Captures a diff snapshot'));
+  });
+
+  it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
+    enableMobile();
+    const mixedSelection = selection({
+      associated_prs: [
+        { ...selection().associated_prs[0]!, state: 'CLOSED', display_state: 'merged' },
+        { ...selection().associated_prs[0]!, pr_number: 13, title: 'Still open', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
+      ],
+    });
+    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: mixedSelection });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-terminal-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('No confirmation'));
+    expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
+  });
+
+  it('renders disposition guidance beside an actionable PR rail', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-continued" convModeLabel="Work" phaseType="idle" continuedInConvId="continued-conversation" prStatusHandle={prStatusHandle()} />,
+    );
+
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
+  });
+
+  it('keeps Address feedback for a cached PR before associations load', () => {
+    enableMobile();
+    const handle = prStatusHandle(
+      { found: true, number: 12, url: 'https://github.com/o/r/pull/12', display_state: 'open', check_state: 'failing', feedback_status: 'open' },
+      { activeSelection: null, activePrSummary: null, ambiguous: false },
+    );
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-cached" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
+  });
+
+  it('keeps stuck-phase Abandon as the mobile hero action', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      selection: twoOpenPrSelection(),
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-stuck" convModeLabel="Work" phaseType="error" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--hero');
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
+  });
+
+  it('keeps terminal cleanup primary in the mobile fallback', () => {
+    enableMobile();
+    const terminalSelection = selection({
+      associated_prs: [{ ...selection().associated_prs[0]!, state: 'MERGED', display_state: 'merged' }],
+    });
+    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: terminalSelection });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-merged" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
+  });
+
+  it('lets a pinned mobile selection resume automatic inference', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const pinnedSelection = twoOpenPrSelection();
+    pinnedSelection.active_pr = { ...pinnedSelection.active_pr!, provenance: 'pinned' };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      selection: pinnedSelection,
+    }, { resumeInference });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-pinned" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+  });
+
+  it('pins a different open PR through the shared handle', async () => {
+    enableMobile();
+    const pinActivePr = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({ found: false, selection: twoOpenPrSelection(false) }, { pinActivePr });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-select" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#13 open/ }));
+    await waitFor(() => expect(pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 13 }));
+  });
+
+  it('reports a failed active-PR mutation without inventing a selection', async () => {
+    enableMobile();
+    const pinActivePr = vi.fn().mockRejectedValue(new Error('Could not save selection'));
+    const handle = prStatusHandle({ found: false, selection: twoOpenPrSelection(false) }, { pinActivePr });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-error" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /#13 open/ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not save selection');
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+  });
+});

@@ -127,6 +127,7 @@ interface MessageListProps {
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
+  onUpdateOlderMessagesRestore?: ((restoreBasis: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
   transcriptPositioning: TranscriptPositioningInput;
@@ -347,6 +348,7 @@ function MessageListImpl({
   onChaptersChange,
   hasOlderMessages = false,
   onLoadOlderMessages,
+  onUpdateOlderMessagesRestore,
   loadingOlderMessages = false,
   olderHistoryError,
   transcriptPositioning,
@@ -395,8 +397,17 @@ function MessageListImpl({
     [messages, pendingMessages],
   );
   const tailUnits = useMemo(
-    () => buildTailUnits({ convState, streamingHandle, endsInAgentRun }),
-    [convState, streamingHandle, endsInAgentRun],
+    () => buildTailUnits({
+      convState,
+      streamingHandle,
+      endsInAgentRun,
+      finalizedAgentKeys: new Set(
+        historicalUnits
+          .filter((unit) => unit.kind === 'agent_turn')
+          .map((unit) => unit.key),
+      ),
+    }),
+    [convState, streamingHandle, endsInAgentRun, historicalUnits],
   );
 
   const allUnits = useMemo<RenderUnit[]>(
@@ -531,8 +542,18 @@ function MessageListImpl({
   const transcriptPositioningViewKeyRef = useRef(historyViewKey(
     transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
   ));
+  const currentHistoryViewKey = historyViewKey(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  );
+  const currentHistoryViewKeyRef = useRef(currentHistoryViewKey);
+  currentHistoryViewKeyRef.current = currentHistoryViewKey;
   const executorAttachEpochRef = useRef(0);
   const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
+  const earlierHistoryRequestScheduledRef = useRef(false);
+  const cancelScheduledEarlierHistoryRef = useRef<(() => void) | null>(null);
+  const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
+  const updateEarlierHistoryRestoreRef = useRef<() => void>(() => {});
+  const touchStartYRef = useRef<number | null>(null);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -656,17 +677,37 @@ function MessageListImpl({
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
       };
-      const onTouchStart = () => {
+      const requestFromUpwardIntent = () => {
+        const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
+        if (!visibleRange || visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
+      };
+      const onTouchStart = (e: TouchEvent) => {
+        touchStartYRef.current = e.touches[0]?.clientY ?? null;
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
-      const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
-      const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
-      const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
+      const onTouchMove = (e: TouchEvent) => {
+        dispatchScrollEvent({ type: 'touchMoved' });
+        const currentY = e.touches[0]?.clientY;
+        if (currentY !== undefined && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
+          requestFromUpwardIntent();
+        }
+      };
+      const onTouchEnd = (e: TouchEvent) => {
+        touchStartYRef.current = null;
+        dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
+      };
+      const onTouchCancel = (e: TouchEvent) => {
+        touchStartYRef.current = null;
+        dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
+      };
       const onWheel = (e: WheelEvent) => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
-        if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
+        if (e.deltaY < 0) {
+          dispatchScrollEvent({ type: 'upwardIntent' });
+          requestFromUpwardIntent();
+        }
       };
       const onScroll = () => {
         if (continuityRestoreInFlightRef.current) {
@@ -691,6 +732,17 @@ function MessageListImpl({
             ? { type: 'upwardIntent', snapshot }
             : { type: 'downwardMovement', snapshot },
         );
+        if (snapshot.scrollTop < previousTop) requestFromUpwardIntent();
+        updateEarlierHistoryRestoreRef.current();
+      };
+      const onKeyDown = (e: KeyboardEvent) => {
+        const target = e.target;
+        const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
+        if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+        dispatchScrollEvent({ type: 'interactionStarted' });
+        dispatchScrollEvent({ type: 'upwardIntent' });
+        requestFromUpwardIntent();
       };
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -699,6 +751,7 @@ function MessageListImpl({
       ref.addEventListener('touchcancel', onTouchCancel, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('keydown', onKeyDown);
       detachGestureListenersRef.current = () => {
         ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
@@ -707,6 +760,7 @@ function MessageListImpl({
         ref.removeEventListener('touchcancel', onTouchCancel);
         ref.removeEventListener('wheel', onWheel);
         ref.removeEventListener('scroll', onScroll);
+        window.removeEventListener('keydown', onKeyDown);
       };
     }
   }, [dispatchScrollEvent]);
@@ -861,12 +915,17 @@ function MessageListImpl({
     return true;
   }, [findUnitIndexByMessageId, scrollToUnitIndex]);
 
-  const captureHistoryRestoreBasis = useCallback((): RestoreBasis => {
+  const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
-    if (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading')) {
+    if (!readerIntent && (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading'))) {
       return { kind: 'following_tail' };
     }
-    const anchor = transcriptRef.current?.captureVisibleAnchor();
+    const transcript = transcriptRef.current;
+    if (readerIntent && !transcript?.physicalSnapshot().visibleRange) {
+      transcript?.preserveViewportOnNextItemsChange();
+      return { kind: 'reader_viewport' };
+    }
+    const anchor = transcript?.captureVisibleAnchor();
     if (!anchor) return { kind: 'following_tail' };
     const unit = historicalUnits[anchor.index];
     if (!unit || unit.key !== anchor.key) return { kind: 'following_tail' };
@@ -874,6 +933,49 @@ function MessageListImpl({
     if (!messageId) return { kind: 'following_tail' };
     return { kind: 'reader_anchor', messageId, viewportStartOffset: anchor.offset };
   }, [historicalUnits, messageIdForHistoricalUnit]);
+
+  const requestEarlierHistory = useCallback((source: 'range' | 'upward-intent' | 'retry') => {
+    const machine = scrollMachineRef.current;
+    const ownsCurrentView = machine.kind === 'live' && machine.conversationId === conversationId;
+    const readerOwnsViewport = ownsCurrentView && machine.follow.kind === 'reading';
+    if (
+      earlierHistoryRequestScheduledRef.current
+      || !hasOlderMessages
+      || loadingOlderMessages
+      || !onLoadOlderMessages
+      || (!ownsCurrentView && source !== 'retry')
+      || (olderHistoryError && source !== 'retry')
+      || (source === 'range' && !readerOwnsViewport)
+    ) return;
+    earlierHistoryRequestScheduledRef.current = true;
+    const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');
+    const ownerViewKey = currentHistoryViewKey;
+    cancelScheduledEarlierHistoryRef.current = scheduleDeferred(() => {
+      cancelScheduledEarlierHistoryRef.current = null;
+      if (currentHistoryViewKeyRef.current !== ownerViewKey) return;
+      onLoadOlderMessages(restoreBasis);
+    });
+  }, [captureHistoryRestoreBasis, conversationId, currentHistoryViewKey, hasOlderMessages, loadingOlderMessages, olderHistoryError, onLoadOlderMessages]);
+  requestEarlierHistoryRef.current = requestEarlierHistory;
+  updateEarlierHistoryRestoreRef.current = () => {
+    if (!loadingOlderMessages || !onUpdateOlderMessagesRestore) return;
+    onUpdateOlderMessagesRestore(captureHistoryRestoreBasis(true));
+  };
+
+  useEffect(() => {
+    cancelScheduledEarlierHistoryRef.current?.();
+    cancelScheduledEarlierHistoryRef.current = null;
+    earlierHistoryRequestScheduledRef.current = false;
+  }, [conversationId, currentHistoryViewKey]);
+
+  useEffect(() => () => {
+    cancelScheduledEarlierHistoryRef.current?.();
+    cancelScheduledEarlierHistoryRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!hasOlderMessages || olderHistoryError) earlierHistoryRequestScheduledRef.current = false;
+  }, [hasOlderMessages, olderHistoryError]);
 
   useImperativeHandle(
     ref,
@@ -1021,7 +1123,8 @@ function MessageListImpl({
     const active = transcriptPositioningStateRef.current.active;
     const phase = transcriptPositioningStateRef.current.phase;
     if (active && phase?.kind === 'awaiting_physical') {
-      const physicalSnapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? snapshot;
+      const transcript = transcriptRef.current;
+      const physicalSnapshot = transcript ? transcript.physicalSnapshot(phase.targetIndex) : snapshot;
       dispatchTranscriptPositioningRef.current({
         type: 'physical_observed',
         commandKey: active.key,
@@ -1033,8 +1136,11 @@ function MessageListImpl({
         targetMeasured: physicalSnapshot.targetMeasured ?? false,
       });
     }
-    if (visibleRange) onVisibleRangeChange?.(visibleRange);
-  }, [onVisibleRangeChange]);
+    if (visibleRange) {
+      onVisibleRangeChange?.(visibleRange);
+      if (visibleRange.startIndex <= 2) requestEarlierHistory('range');
+    }
+  }, [onVisibleRangeChange, requestEarlierHistory]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);
@@ -1077,23 +1183,15 @@ function MessageListImpl({
         </>
       )}
       <section id="chat-view" className="view active">
-        {(hasOlderMessages && onLoadOlderMessages) && (
-          <div>
-            <button
-              type="button"
-              className="btn-secondary"
-              disabled={loadingOlderMessages}
-              onClick={() => onLoadOlderMessages()}
-            >
-              {loadingOlderMessages
-                ? 'Loading earlier history…'
-                : olderHistoryError
-                  ? 'Retry loading earlier history'
-                  : 'Load earlier history'}
+        {olderHistoryError && hasOlderMessages && onLoadOlderMessages && (
+          <div role="alert">
+            <span>Could not load earlier history: {olderHistoryError}</span>
+            <button type="button" onClick={() => requestEarlierHistory('retry')}>
+              Retry
             </button>
           </div>
         )}
-        {olderHistoryError && (
+        {olderHistoryError && !hasOlderMessages && (
           <div role="alert">Could not load earlier history: {olderHistoryError}</div>
         )}
         <VirtualTranscript

@@ -5895,10 +5895,10 @@ impl Database {
         //     is in the JSON column and must survive restart
         //   - awaiting_commission_review_approval: capital-spend review approval pending; state data
         //     carries the unpersisted assistant message/tool_use and must survive restart
-        //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
+        //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
                    json_extract(state, '$.type') = 'llm_requesting'
                    AND EXISTS (
@@ -6071,6 +6071,30 @@ impl Database {
 
             self.persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                 .await?;
+
+            let interrupted_state = serde_json::to_string(&ConvState::Failed {
+                error: "Sub-agent interrupted by server restart".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+            })
+            .unwrap();
+            for agent in &pending_sub_agents {
+                if sub_agent_outcomes.contains_key(&agent.agent_id) {
+                    continue;
+                }
+                sqlx::query(
+                    "UPDATE conversations
+                     SET state = ?1, state_updated_at = ?2, updated_at = ?2
+                     WHERE id = ?3
+                       AND json_extract(state, '$.type') NOT IN
+                           ('completed', 'failed', 'creation_failed', 'creation_cancelled',
+                            'context_exhausted', 'handed_off', 'terminal')",
+                )
+                .bind(&interrupted_state)
+                .bind(now.to_rfc3339())
+                .bind(&agent.agent_id)
+                .execute(&self.pool)
+                .await?;
+            }
 
             tracing::info!(
                 conv_id = %conv_id,
@@ -12487,6 +12511,22 @@ mod tests {
         // executor's `handle_spawn_agents_tool` would.
         let agent_a = "11111111-1111-4111-8111-111111111111";
         let agent_b = "22222222-2222-4222-8222-222222222222";
+        for agent_id in [agent_a, agent_b] {
+            db.create_conversation(agent_id, agent_id, "/tmp", false, Some("conv-sa"), None)
+                .await
+                .unwrap();
+            db.update_conversation_state(agent_id, &ConvState::LlmRequesting { attempt: 0 })
+                .await
+                .unwrap();
+        }
+        db.update_conversation_state(
+            agent_b,
+            &ConvState::ContextExhausted {
+                summary: "preserve this reason".to_string(),
+            },
+        )
+        .await
+        .unwrap();
         let placeholder = format!("Spawning 2 sub-agent(s): {agent_a}, {agent_b}");
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new("tool-2", think("t")),
@@ -12588,6 +12628,53 @@ mod tests {
         // Idempotent: re-running the sweep must not duplicate or 400-trip.
         db.reset_all_to_idle().await.unwrap();
         assert_eq!(db.get_messages("conv-sa").await.unwrap().len(), 4);
+        assert!(matches!(
+            db.get_conversation(agent_a).await.unwrap().state,
+            ConvState::Failed { .. }
+        ));
+        assert!(matches!(
+            db.get_conversation(agent_b).await.unwrap().state,
+            ConvState::ContextExhausted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reset_all_to_idle_preserves_completed_and_failed_states() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("completed", "completed", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("failed", "failed", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "completed",
+            &ConvState::Completed {
+                result: "done".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            "failed",
+            &ConvState::Failed {
+                error: "boom".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+            },
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("completed").await.unwrap().state,
+            ConvState::Completed { .. }
+        ));
+        assert!(matches!(
+            db.get_conversation("failed").await.unwrap().state,
+            ConvState::Failed { .. }
+        ));
     }
 
     /// A pending sub-agent that ALREADY reached its terminal state in its child

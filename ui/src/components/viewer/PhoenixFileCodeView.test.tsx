@@ -68,7 +68,8 @@ describe('PhoenixFileCodeView (Pierre file wiring)', () => {
 
   it('jumps to a line through the typed scroll handle', () => {
     const { ref } = renderView();
-    ref.current?.scrollToLine(2);
+    const viewer = ref.current;
+    if (viewer) viewer.scrollToLine(2);
     expect(codeViewMockState.scrollToCalls).toContainEqual(
       expect.objectContaining({ type: 'line', id: ITEM_ID, lineNumber: 2 }),
     );
@@ -83,7 +84,10 @@ describe('PhoenixFileCodeView (Pierre file wiring)', () => {
       activeFindMatch: { kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 },
     });
 
-    ref.current?.scrollToFindTarget({ kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 });
+    const viewer = ref.current;
+    if (viewer) {
+      viewer.scrollToFindTarget({ kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 });
+    }
 
     expect(codeViewMockState.scrollToCalls).toContainEqual(
       expect.objectContaining({ type: 'line', id: ITEM_ID, lineNumber: 2 }),

@@ -98,6 +98,37 @@ class CheckPlanTests(unittest.TestCase):
     def test_ci_lane_inventory_covers_every_devpy_lane_once(self):
         self.assertEqual([], self.dev._ci_lane_inventory_errors())
 
+    def test_changed_path_planner_reuses_resolved_merge_base(self):
+        with (
+            mock.patch.object(self.dev, "_resolve_check_merge_base", return_value="abc123") as resolve,
+            mock.patch.object(self.dev.subprocess, "run") as run,
+        ):
+            run.side_effect = [
+                mock.Mock(returncode=0, stdout="crates/example.rs\n"),
+                mock.Mock(returncode=0, stdout="tasks/new.md\n"),
+            ]
+
+            paths = self.dev._compute_changed_paths_vs_base()
+
+        resolve.assert_called_once_with()
+        self.assertEqual({"crates/example.rs", "tasks/new.md"}, paths)
+        self.assertEqual(
+            ["git", "diff", "--name-only", "abc123"],
+            run.call_args_list[0].args[0],
+        )
+
+    def test_rust_timing_checker_change_runs_structural_and_self_tests(self):
+        cats = self.dev._categorize_changed_paths({"scripts/check_rust_test_timing.py"})
+        self.assertIn("ASTGREP", cats)
+        self.assertIn("SPECS", cats)
+        with mock.patch.object(
+            self.dev, "_changed_paths_vs_base",
+            return_value={"scripts/check_rust_test_timing.py"},
+        ):
+            active, _ = self.dev._gate_lanes()
+        self.assertIn("ast-grep", active)
+        self.assertIn("spec-shape", active)
+
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
         with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \

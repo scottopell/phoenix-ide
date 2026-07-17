@@ -199,7 +199,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     if (!content || !targetLine) return undefined;
     const timer = setTimeout(() => {
       if (usePierreCode) {
-        fileCodeRef.current?.scrollToLine(targetLine);
+        const fileCode = fileCodeRef.current;
+        if (fileCode) fileCode.scrollToLine(targetLine);
         highlight(targetLine);
       } else {
         const lineEl = lineRefs.current.get(targetLine);
@@ -220,7 +221,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       // Pierre-backed payloads render in their own scroller; jump via the typed
       // handle. Other bodies expose DOM line refs the viewer scrolls directly.
       if (usePierreCode) {
-        fileCodeRef.current?.scrollToLine(note.anchor.lineNumber);
+        const fileCode = fileCodeRef.current;
+        if (fileCode) fileCode.scrollToLine(note.anchor.lineNumber);
         highlight(note.anchor.lineNumber);
       } else {
         const el = lineRefs.current.get(note.anchor.lineNumber);
@@ -281,7 +283,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useEffect(() => {
     if (!find.isOpen || !activeFindMatch) return;
     if (usePierreCode) {
-      fileCodeRef.current?.scrollToFindTarget(activeFindMatch);
+      const fileCode = fileCodeRef.current;
+      if (fileCode) fileCode.scrollToFindTarget(activeFindMatch);
       return;
     }
     const selector = `[data-find-occurrence="${activeFindIndex}"]`;
@@ -323,7 +326,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     const target = nextProjection.matches[0]?.target;
     if (!target) return;
     if (usePierreCode) {
-      fileCodeRef.current?.scrollToFindTarget(target);
+      const fileCode = fileCodeRef.current;
+      if (fileCode) fileCode.scrollToFindTarget(target);
       return;
     }
     queueMicrotask(() => {

@@ -1475,10 +1475,10 @@ rule ServerRestartWorktreeReconciliationWork {
     when: ServerRestarted(conversation)
 
     requires: conversation.mode = work
-    -- REQ-BED-031 / REQ-PROJ-015 extension: context-exhausted conversations
-    -- and conversations that have already handed ownership off to a
-    -- continuation are NOT orphans. Their worktree is intentionally
-    -- preserved; skip them entirely. See @guidance.
+    -- An uncontinued context-exhausted conversation preserves its scope pending
+    -- explicit user action. A row with continued_in_conv_id has transferred
+    -- ownership and is only a history reference; its successor is evaluated as
+    -- an independent owner of the same scope. See @guidance.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.state != terminal
@@ -1499,10 +1499,9 @@ rule ServerRestartWorktreeReconciliationWork {
         --      is preserved pending user action (Continue / Abandon);
         --      missing-on-disk shouldn't happen for these but if it does,
         --      don't compound the problem by marking terminal.
-        --   3. Skip rows with continued_in_conv_id set (REQ-BED-030): the
-        --      parent's worktree_path is a history reference; the
-        --      continuation owns the worktree. The continuation itself
-        --      is reconciled under its own row.
+        --   3. Rows with continued_in_conv_id set are history references,
+        --      not owners. Their continuation is evaluated under its own row
+        --      and preserves the shared scope only while it remains live.
         --   4. Skip rows already in Terminal (idempotent on restart loop).
         --   5. For remaining rows: check worktree_path and base_branch
         --      non-empty (or not a __LEGACY_EMPTY__ sentinel from the
@@ -1540,8 +1539,8 @@ rule ServerRestartWorktreeReconciliationBranch {
     when: ServerRestarted(conversation)
 
     requires: conversation.mode = branch
-    -- REQ-BED-031 / REQ-PROJ-015 extension: skip context-exhausted and
-    -- handed-off rows. See Work variant @guidance for rationale.
+    -- Preserve only uncontinued context-exhausted owners. Handed-off and
+    -- continued rows have transferred ownership. See Work variant @guidance.
     requires: conversation.parent_status != context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.state != terminal
@@ -1581,6 +1580,12 @@ rule ServerRestartWorktreeReconciliationExplore {
     ensures: conversation.state = terminal
     ensures: GitWorktreePruned(conversation.project)
 }
+
+-- Startup reclamation evaluates ownership for the whole shared worktree path.
+-- Transferred predecessors are history references and never reacquire ownership;
+-- live successors preserve the scope through their own rows. An unowned checkout
+-- is removed only when Git reports no tracked or untracked changes. Dirty or
+-- unreadable scopes remain in place and are reported for manual recovery.
 
 ------------------------------------------------------------
 -- Invariants

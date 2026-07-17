@@ -4,6 +4,7 @@ import { MessageList, type MessageListHandle } from './MessageList';
 import { ConversationNav } from './ConversationNav';
 import { resolveActiveUnitIndex } from './conversationNavSpy';
 import type { Chapter } from '../conversation/conversationChapters';
+import type { RestoreBasis } from '../conversation/historyExpansion';
 
 /** Everything MessageList accepts, minus the wiring this stack owns
  *  (`onVisibleRangeChange`, `onChaptersChange`, and the imperative ref). */
@@ -42,8 +43,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     listRef.current?.scrollToUnitIndex(unitIndex);
   }, []);
 
-  const handleLoadOlderMessages = useCallback(() => {
-    onLoadOlderMessages?.(listRef.current?.captureHistoryRestoreBasis());
+  const handleLoadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
+    onLoadOlderMessages?.(restoreBasis ?? listRef.current?.captureHistoryRestoreBasis());
   }, [onLoadOlderMessages]);
 
   return (

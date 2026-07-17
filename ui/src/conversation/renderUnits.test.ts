@@ -612,6 +612,22 @@ describe('buildRenderUnits', () => {
       expect(out.tailUnits.filter((u) => u.kind === 'streaming_agent')).toEqual([]);
     });
 
+    it('lets the finalized historical unit own a streaming key during a torn transition', () => {
+      const out = buildRenderUnits({
+        messages: [agentMsg('request-1')],
+        pendingMessages: [],
+        convState: { type: 'llm_requesting', attempt: 1 },
+        streamingHandle: { key: 'request-1' },
+      });
+
+      expect(out.historicalUnits.map((unit) => unit.key)).toEqual(['request-1']);
+      expect(out.tailUnits).toEqual([]);
+      expect(debugSpy).toHaveBeenCalledWith(
+        '[renderUnits] suppressed finalized streaming unit',
+        { key: 'request-1', reason: 'historical_key_owns_identity' },
+      );
+    });
+
     it('emits pending_user at the tail of historicalUnits; sub_agent_status before streaming_agent in tailUnits', () => {
       const state: ConversationState = {
         type: 'awaiting_sub_agents',
@@ -662,7 +678,7 @@ describe('buildRenderUnits', () => {
       }
     });
 
-    it('historical unit keys are unique', () => {
+    it('complete render-unit keys are unique', () => {
       const out = buildRenderUnits({
         messages: [
           userMsg('a'),
@@ -671,10 +687,10 @@ describe('buildRenderUnits', () => {
           userMsg('d'),
         ],
         pendingMessages: [],
-        convState: IDLE,
-        streamingHandle: null,
+        convState: { type: 'llm_requesting', attempt: 1 },
+        streamingHandle: { key: 'stream-e' },
       });
-      const keys = out.historicalUnits.map((u) => u.key);
+      const keys = [...out.historicalUnits, ...out.tailUnits].map((unit) => unit.key);
       expect(new Set(keys).size).toBe(keys.length);
     });
 

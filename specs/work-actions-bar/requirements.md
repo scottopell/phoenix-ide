@@ -50,9 +50,9 @@ is live, and the bar's verbs have no meaning outside Work and Branch.
 
 ---
 
-### REQ-WAB-002: Three-Zone Layout
+### REQ-WAB-002: Responsive Three-Zone Presentation
 
-THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
+THE SYSTEM SHALL organize available work actions into three logical zones:
 
 **REVIEW zone** — always present when the bar is visible:
 - `View Diff` — opens the diff viewer through the viewer slot (REQ-VS-003, fullscreen
@@ -74,6 +74,17 @@ THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
 - One of the two terminal verbs may be suppressed in specific `WorkDisposition` cases
   (REQ-WAB-004).
 
+WHEN the conversation is presented in a narrow mobile viewport
+THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
+rail containing the actionable associated PRs and their current status.
+THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
+
+WHEN the user activates a PR in the rail
+THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
+region upward from the rail. The expanded region SHALL present the active PR's single hero action
+in one row and its supporting context actions in a separate row. Closing or switching the expanded
+region changes only presentation; it does not create a parallel active-PR selection.
+
 ---
 
 ### REQ-WAB-003: Single Primary Across the Entire Bar
@@ -94,6 +105,11 @@ A RESOLVE disposition may additionally carry a single **secondary** link-out (th
 `Merge on GitHub #N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
 the primary and never glows; it exists only alongside an `address_feedback` primary. This does
 not violate the single-primary rule: there is still exactly one glowing button.
+
+On mobile, the expanded active-PR region SHALL emphasize exactly one hero action. Supporting
+review, link-out, cleanup, and abandon controls SHALL remain visually secondary. Cleanup SHALL
+never be inferred as the mobile hero action from repository structure alone; when legal, it remains
+available only among supporting context actions.
 
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
 presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
@@ -265,6 +281,29 @@ AND SHALL show a muted inline note: "Continued — actions belong on the continu
 The continuation is the live conversation; any terminal decision belongs there. bedrock
 REQ-BED-031 also forbids terminal actions on a context-exhausted parent that has a
 continuation, so the suppressed bar matches the server-side legality gate.
+
+---
+
+### REQ-WAB-011: Mobile Active-PR Rail
+
+WHEN actionable associated PRs exist on mobile
+THE SYSTEM SHALL render a thin PR rail directly above the conversation input that:
+
+- contains only open or draft actionable PRs, never closed or merged history;
+- identifies each PR by number and current state;
+- marks the explicit active PR without silently selecting one;
+- shows feedback freshness as a compact notification-style badge on its targeted PR;
+- scrolls horizontally rather than wrapping into multiple persistent rows; and
+- uses the full repository-plus-PR identity when selecting or expanding a PR.
+
+WHEN the active PR is expanded
+THE SYSTEM SHALL animate a non-modal action region into rows above the rail. The first row SHALL
+contain the single hero action. A supporting row SHALL provide the legal review, GitHub link-out,
+cleanup, and abandon controls without promoting cleanup as the suggested action. The action region
+SHALL expose active-PR branch context and SHALL collapse when the active PR is activated again.
+
+The rail SHALL NOT store a parallel active PR, infer by recency, show closed PRs as selectable, or
+reinterpret a compatibility primary-PR projection as authoritative.
 
 ---
 

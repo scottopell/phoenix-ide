@@ -970,6 +970,25 @@ export function StateBar({
     prStatus && !prStatus.found
       ? unavailablePrHint(prStatus.unavailable_reason)
       : null;
+  const mobileActionablePrs = prStatusHandle?.activeSelection?.associated_prs.filter(
+    (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+  ) ?? [];
+  const mobileActivePrIsActionable = Boolean(
+    prStatusHandle?.activePrSummary
+    && mobileActionablePrs.some(
+      (pr) => pr.repo_owner === prStatusHandle.activePrSummary?.repo_owner
+        && pr.repo_name === prStatusHandle.activePrSummary?.repo_name
+        && pr.pr_number === prStatusHandle.activePrSummary?.pr_number,
+    ),
+  );
+  const mobilePrRailCanRepresentSelection = mobileActionablePrs.length > 0
+    && (!prStatusHandle?.activePrSummary || mobileActivePrIsActionable);
+  const mobilePrRailOwnsSelection = Boolean(
+    isMobile
+    && (isWork || isBranchMode)
+    && ['idle', 'error', 'context_exhausted'].includes(convState.type)
+    && mobilePrRailCanRepresentSelection
+  );
 
   const cwdSummary = summarizePath(conversation?.cwd);
   const modeHelp = modeTitle(mode, isExplore, isWork, isBranchMode);
@@ -978,7 +997,7 @@ export function StateBar({
   const prStatusContent = (
     <>
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
-      {prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
+      {!mobilePrRailOwnsSelection && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
       {prHint && !prLoading && (
         <span
           className="pr-hint"

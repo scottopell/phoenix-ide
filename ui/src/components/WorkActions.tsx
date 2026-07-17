@@ -5,6 +5,8 @@ import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatu
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
+import { useIsMobile } from '../hooks';
+import './WorkActions.css';
 
 interface WorkControlBarProps {
   conversationId: string;
@@ -115,6 +117,9 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
+  const [expandedMobilePrIdentity, setExpandedMobilePrIdentity] = useState<string | null>(null);
+  const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
+  const isMobile = useIsMobile();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
@@ -134,6 +139,15 @@ export function WorkControlBar({
     () => associatedPrs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft'),
     [associatedPrs],
   );
+  const activePrIsActionable = Boolean(
+    activePr
+    && actionablePrs.some(
+      (pr) => pr.repo_owner === activePr.repo_owner
+        && pr.repo_name === activePr.repo_name
+        && pr.pr_number === activePr.pr_number,
+    ),
+  );
+  const mobileRailCanRepresentActiveSelection = actionablePrs.length > 0 && (!activePr || activePrIsActionable);
   const diffLabel = useMemo(
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
@@ -187,6 +201,70 @@ export function WorkControlBar({
     return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
   }, [actionablePrs, associatedPrs]);
 
+  const handleCleanUp = async () => {
+    setError(null);
+    setMarkingMerged(true);
+    try {
+      if (!(await terminalActionStillSafe())) return;
+      await api.markMerged(conversationId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to mark as merged');
+    } finally {
+      setMarkingMerged(false);
+    }
+  };
+
+  const handleAbandon = async () => {
+    const confirmText = isBranch
+      ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
+      : 'Abandon this task? The worktree and task branch will be deleted.';
+    if (!window.confirm(confirmText)) return;
+    setError(null);
+    setAbandoning(true);
+    try {
+      if (!(await terminalActionStillSafe())) return;
+      await api.abandonTask(conversationId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to abandon task');
+    } finally {
+      setAbandoning(false);
+    }
+  };
+
+  const resumeMobilePrInference = async () => {
+    if (!prStatusHandle.resumeInference) return;
+    setError(null);
+    try {
+      await prStatusHandle.resumeInference();
+      setExpandedMobilePrIdentity(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resume automatic PR selection');
+    }
+  };
+
+  const selectMobilePr = async (pr: (typeof associatedPrs)[number], selected: boolean) => {
+    const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+    if (selected) {
+      setExpandedMobilePrIdentity((current) => current === identity ? null : identity);
+      return;
+    }
+    if (!prStatusHandle.pinActivePr) return;
+    setSavingPrIdentity(identity);
+    setError(null);
+    try {
+      await prStatusHandle.pinActivePr({
+        repo_owner: pr.repo_owner,
+        repo_name: pr.repo_name,
+        pr_number: pr.pr_number,
+      });
+      setExpandedMobilePrIdentity(identity);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to select active PR');
+    } finally {
+      setSavingPrIdentity(null);
+    }
+  };
+
   if (!disposition.visible) return null;
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
@@ -208,6 +286,200 @@ export function WorkControlBar({
   const addressFeedbackAriaLabel = canShowPrDiff
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
+
+  if (isMobile) {
+    if (!mobileRailCanRepresentActiveSelection) {
+      return (
+        <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
+          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+          )}
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--hero"
+              data-testid="mobile-primary-address-feedback"
+              disabled={capturing}
+              onClick={handleAddressFeedback}
+            >
+              <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+              <CoverageMarker marker={coverageMarker} />
+            </button>
+          )}
+          {disposition.primary === 'review' && (
+            <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
+              Review workspace changes
+            </button>
+          )}
+          {disposition.showCleanUp && !cleanupBlockedByAmbiguity && (
+            <button
+              type="button"
+              className={`mobile-pr-action mobile-pr-action--cleanup${disposition.primary === 'clean_up' ? ' mobile-pr-action--hero' : ''}`}
+              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+              title={cleanUpHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleCleanUp}
+            >
+              Clean up
+            </button>
+          )}
+          {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
+            <button
+              type="button"
+              className={`mobile-pr-action mobile-pr-action--danger${disposition.primary === 'abandon' ? ' mobile-pr-action--hero' : ''}`}
+              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+              title={abandonHintText(isBranch)}
+              disabled={isLoading}
+              onClick={handleAbandon}
+            >
+              Abandon
+            </button>
+          )}
+          {disposition.note && <span className="work-actions-note">{disposition.note.text}</span>}
+          {error && <div className="work-actions-error" role="alert">{error}</div>}
+        </div>
+      );
+    }
+
+    const activeIdentity = activePr
+      ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
+      : null;
+    const expanded = activeIdentity !== null && expandedMobilePrIdentity === activeIdentity;
+    const mobileHero = disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--cleanup"
+        disabled={isLoading}
+        onClick={handleCleanUp}
+      >
+        Clean up
+      </button>
+    ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
+        disabled={isLoading}
+        onClick={handleAbandon}
+      >
+        Abandon
+      </button>
+    ) : disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
+      <button
+        type="button"
+        className="mobile-pr-action mobile-pr-action--hero"
+        data-testid="mobile-primary-address-feedback"
+        disabled={capturing}
+        onClick={handleAddressFeedback}
+      >
+        <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+        <CoverageMarker marker={coverageMarker} />
+      </button>
+    ) : disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
+      <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+    ) : disposition.primary === 'review' ? (
+      <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
+        Review workspace changes
+      </button>
+    ) : null;
+
+    return (
+      <div className="mobile-pr-dock" data-testid="mobile-work-controls">
+        {expanded && (
+          <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
+            {mobileHero && <div className="mobile-pr-actions-hero">{mobileHero}</div>}
+            <div className="mobile-pr-actions-secondary">
+              <button type="button" className="mobile-pr-action mobile-pr-action--review" aria-label={`${activePrLabel} diff`} onClick={() => openDiffFullscreen('active_pr')}>
+                <span className="mobile-pr-action-icon" aria-hidden="true">Δ</span><span>PR diff</span>
+              </button>
+              <button type="button" className="mobile-pr-action mobile-pr-action--workspace" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>
+                <span className="mobile-pr-action-icon" aria-hidden="true">▱</span><span>Workspace</span>
+              </button>
+              {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+                <a
+                  className="mobile-pr-action mobile-pr-action--external"
+                  href={disposition.secondaryResolve.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={disposition.secondaryResolve.kind === 'merge_pr'
+                    ? `Merge on GitHub #${disposition.secondaryResolve.number}`
+                    : disposition.secondaryResolve.kind === 'open_pr'
+                      ? `Open PR #${disposition.secondaryResolve.number}`
+                      : 'Create PR on GitHub'}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">↗</span><span>GitHub</span>
+                </a>
+              )}
+              {!cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up' && (
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--cleanup"
+                  aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+                  title={cleanUpHintText(isBranch)}
+                  disabled={isLoading}
+                  onClick={handleCleanUp}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
+                </button>
+              )}
+              {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--danger"
+                  aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+                  title={abandonHintText(isBranch)}
+                  disabled={isLoading}
+                  onClick={handleAbandon}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Abandon</span>
+                </button>
+              )}
+              {prStatusHandle.activeSelection?.active_pr?.provenance === 'pinned' && prStatusHandle.resumeInference && (
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--automatic"
+                  onClick={resumeMobilePrInference}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">↻</span><span>Auto</span>
+                </button>
+              )}
+            </div>
+            <div className="mobile-pr-actions-context">
+              <strong>{activePrLabel}</strong>
+              <span className="mobile-pr-actions-branch">{activePr?.head} → {activePr?.base}</span>
+            </div>
+          </div>
+        )}
+        <div className="mobile-pr-rail" aria-label="Open pull requests">
+          {actionablePrs.map((pr) => {
+            const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
+            const selected = identity === activeIdentity;
+            const isExpanded = selected && expanded;
+            return (
+              <button
+                key={identity}
+                type="button"
+                className={`mobile-pr-chip${selected ? ' mobile-pr-chip--active' : ''}`}
+                data-pr-identity={identity}
+                aria-pressed={selected}
+                aria-expanded={isExpanded}
+                disabled={savingPrIdentity !== null}
+                onClick={() => selectMobilePr(pr, selected)}
+              >
+                <span className={`mobile-pr-status-dot mobile-pr-status-dot--${pr.display_state}`} aria-hidden="true" />
+                <span className="mobile-pr-chip-number">#{pr.pr_number}</span>
+                <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
+                {selected && freshnessLabel && (
+                  <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>{freshnessLabel.replace(' new', '')}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {error && <div className="work-actions-error" role="alert">{error}</div>}
+        {note && <span className="work-actions-note mobile-pr-dock-note">{note.text}</span>}
+      </div>
+    );
+  }
 
   return (
     <div className="work-actions-bar">
@@ -280,18 +552,7 @@ export function WorkControlBar({
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
               data-testid="clean-up-button"
               disabled={isLoading}
-              onClick={async () => {
-                setError(null);
-                setMarkingMerged(true);
-                try {
-                  if (!(await terminalActionStillSafe())) return;
-                  await api.markMerged(conversationId);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to mark as merged');
-                } finally {
-                  setMarkingMerged(false);
-                }
-              }}
+              onClick={handleCleanUp}
             >
               {markingMerged ? 'Cleaning...' : 'Clean up'}
             </button>
@@ -304,22 +565,7 @@ export function WorkControlBar({
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
               data-testid="abandon-button"
               disabled={isLoading}
-              onClick={async () => {
-                const confirmText = isBranch
-                  ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-                  : 'Abandon this task? The worktree and task branch will be deleted.';
-                if (!window.confirm(confirmText)) return;
-                setError(null);
-                setAbandoning(true);
-                try {
-                  if (!(await terminalActionStillSafe())) return;
-                  await api.abandonTask(conversationId);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to abandon task');
-                } finally {
-                  setAbandoning(false);
-                }
-              }}
+              onClick={handleAbandon}
             >
               {abandoning ? 'Abandoning...' : 'Abandon'}
             </button>

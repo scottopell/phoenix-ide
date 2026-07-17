@@ -2576,6 +2576,16 @@ def cmd_qa_coordinator() -> None:
     )
 
 
+def cmd_qa_mobile_multi_pr_conversation() -> None:
+    """Capture the mobile multi-PR conversation fixture."""
+    subprocess.run(
+        ["pnpm", "qa:mobile-multi-pr-conversation"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 def cmd_qa_new_conversation() -> None:
     """Capture the new-conversation page at desktop and mobile sizes."""
     subprocess.run(
@@ -3122,6 +3132,8 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p.startswith("tests/devpy/"):
             cats.add("SPECS")
+        if p == "scripts/check_rust_test_timing.py":
+            cats.update({"ASTGREP", "SPECS"})
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -3150,7 +3162,8 @@ def _changed_paths_vs_base():
     return _changed_paths_memo[0]
 
 
-def _compute_changed_paths_vs_base():
+def _resolve_check_merge_base():
+    """Resolve the comparison commit used by incremental check planning."""
     def _git(args):
         return subprocess.run(
             ["git", *args], cwd=ROOT, capture_output=True, text=True,
@@ -3158,21 +3171,27 @@ def _compute_changed_paths_vs_base():
 
     base = os.environ.get("PHOENIX_CHECK_BASE")
     candidates = [base] if base else []
-    # origin/HEAD points at the remote's default branch when the symbolic ref
-    # is configured; fall back to common names.
     head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
     if head_ref.returncode == 0 and head_ref.stdout.strip():
         candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
     candidates += ["origin/main", "main", "origin/master", "master"]
 
-    merge_base = None
-    for cand in candidates:
-        if not cand:
+    for candidate in candidates:
+        if not candidate:
             continue
-        mb = _git(["merge-base", "HEAD", cand])
-        if mb.returncode == 0 and mb.stdout.strip():
-            merge_base = mb.stdout.strip()
-            break
+        merge_base = _git(["merge-base", "HEAD", candidate])
+        if merge_base.returncode == 0 and merge_base.stdout.strip():
+            return merge_base.stdout.strip()
+    return None
+
+
+def _compute_changed_paths_vs_base():
+    def _git(args):
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True,
+        )
+
+    merge_base = _resolve_check_merge_base()
     if merge_base is None:
         return None
 
@@ -4128,6 +4147,18 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             "ast-grep", "scan", "--inline-rules", inline_rules,
             "crates/", "ui/src/",
         ])
+        comparison_commit = "HEAD^" if _on_integration_base() else _resolve_check_merge_base()
+        if comparison_commit is None:
+            timing_command = [
+                sys.executable, "-c",
+                "import sys; print('cannot resolve comparison commit for Rust test timing lint', file=sys.stderr); sys.exit(1)",
+            ]
+        else:
+            timing_command = [
+                "uv", "run", "scripts/check_rust_test_timing.py",
+                "--base-sha", comparison_commit, "crates/",
+            ]
+        run_step("rust-test-timing", timing_command)
 
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
@@ -8174,6 +8205,7 @@ def main():
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
+    qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
@@ -8296,6 +8328,8 @@ def main():
             cmd_qa_mobile_conversation_list()
         elif args.qa_command == "coordinator":
             cmd_qa_coordinator()
+        elif args.qa_command == "mobile-multi-pr-conversation":
+            cmd_qa_mobile_multi_pr_conversation()
         elif args.qa_command == "new-conversation":
             cmd_qa_new_conversation()
         elif args.qa_command == "message-list":

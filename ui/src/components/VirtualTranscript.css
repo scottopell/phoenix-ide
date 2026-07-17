@@ -1,7 +1,7 @@
 .virtual-transcript {
   overflow-y: auto;
   overflow-anchor: none;
-  contain: strict;
+  contain: size layout style;
 }
 
 .virtual-transcript__inner {

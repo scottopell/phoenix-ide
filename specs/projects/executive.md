@@ -52,7 +52,13 @@ user-visible cleanup affordance, but does not push, merge, or run unattended
 cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
 Mark as Merged and Abandon. Managed mode deletes the branch on terminal; Branch mode keeps it.
 Branch discovery uses local `git for-each-ref` for instant listing and cached `git ls-remote`
-for on-demand remote search (5-minute TTL).
+for on-demand remote search (5-minute TTL). Startup reconciliation resolves ownership by canonical `WorkScope`: an uncontinued
+context-exhausted row preserves its checkout, while continued and handed-off predecessors
+permanently cede ownership to independently-scored successors. Clean on-disk scopes with no
+persisted live owner are reclaimed with mode-appropriate branch disposition; scopes with
+tracked, untracked, or unreadable status remain in place for manual recovery. Terminal
+fallback cleanup likewise removes only `WorkScope::Worktree(path)`, so Direct conversations
+and Explore sub-agents cannot remove a checkout merely because they use it as their cwd.
 
 ## Status Summary
 
@@ -73,7 +79,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` plus network-block enforcement probing to decide whether top-level Explore can expose sandboxed bash |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
-| **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
+| **REQ-PROJ-015:** Project Worktree Registry | Descoped | `ConvMode` paths form the de facto registry; `conversation_owns_work_scope`, lifecycle cleanup, deployment disk accounting, and startup reconciliation share persisted owner semantics. Clean unowned scopes are reclaimed; dirty/unreadable scopes are retained. |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |
 | **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Task 08603 (M3). ConvMode::Work stores base_branch |
 | **REQ-PROJ-018:** Direct Mode | ✅ Complete | Default for all conversations |

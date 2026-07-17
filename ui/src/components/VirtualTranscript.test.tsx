@@ -1,5 +1,5 @@
 import { type ReactElement } from 'react';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
@@ -139,6 +139,55 @@ describe('VirtualTranscript', () => {
     const scroller = document.querySelector('.virtual-transcript');
     expect(scroller).toBeInstanceOf(HTMLElement);
     expect(getComputedStyle(scroller as Element).overflowAnchor).toBe('none');
+  });
+
+  it('quarantines duplicate semantic keys into independent physical rows', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+    const items = [
+      { id: 'same', label: 'Item first', height: 20 },
+      { id: 'same', label: 'Item second', height: 60 },
+      { id: 'same', label: 'Item third', height: 30 },
+      { id: 'same\u0000duplicate:1', label: 'Reserved suffix', height: 20 },
+      ...makeItems(10, 20),
+    ];
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={items}
+        getKey={(item) => item.id}
+        estimatedExtent={(item) => item.height}
+        overscan={200}
+        initialTail={false}
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    const mountedRows = Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-index]'));
+    const duplicateRows = mountedRows.slice(0, 3);
+    const physicalKeys = mountedRows.slice(0, 4).map((row) => row.dataset['virtualKey']);
+    expect(new Set(physicalKeys).size).toBe(4);
+    expect(physicalKeys[0]).toBe('same');
+    expect(physicalKeys[1]).toContain('duplicate:2');
+    expect(physicalKeys[2]).toContain('duplicate:3');
+    expect(physicalKeys[3]).toBe('same\u0000duplicate:1');
+    expect(error).toHaveBeenCalledWith(
+      '[VirtualTranscript] duplicate semantic keys quarantined',
+      { duplicateKeys: ['same'] },
+    );
+
+    act(() => ref.current?.scrollToIndex(4, 'start'));
+    const anchoredTop = scrollTopOf(scroller);
+    act(() => resizeObservers[0]!.triggerEntries([
+      [duplicateRows[0]!, 25],
+      [duplicateRows[1]!, 70],
+      [duplicateRows[2]!, 35],
+    ]));
+    expect(scrollTopOf(scroller)).toBe((anchoredTop ?? 0) + 20);
+    expect(ref.current?.captureVisibleAnchor()?.key).toBe('item-0');
   });
 
   it('initially tails and reports signed physical anchor offsets', () => {
@@ -457,6 +506,61 @@ describe('VirtualTranscript', () => {
     act(() => resizeObservers[0]!.triggerEntries([[header, 40]]));
 
     expect(totals.at(-1)).toBe(40);
+  });
+
+  it('preserves absolute viewport position for a header-only view across the next prepend', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const initial = makeItems(20, 20);
+    const view = render(
+      <VirtualTranscript
+        ref={ref}
+        items={initial}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        header={<div data-height={500}>System prompt</div>}
+        renderItem={renderRow}
+      />,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    act(() => ref.current?.scrollToIndex(10, 'start'));
+    const viewportTop = scroller.scrollTop;
+
+    act(() => ref.current?.preserveViewportOnNextItemsChange());
+    const unrelatedTailUpdate = [...initial, { id: 'streaming-tail', height: 40, label: 'streaming tail' }];
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={unrelatedTailUpdate}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+    scroller.scrollTop = viewportTop + 25;
+    fireEvent.scroll(scroller);
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...unrelatedTailUpdate]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+
+    expect(scroller.scrollTop).toBe(viewportTop + 25);
   });
 
   it('preserves measured extents by stable key across prepends and removes only absent keys', () => {

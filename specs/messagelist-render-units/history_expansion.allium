@@ -1,5 +1,5 @@
 -- allium: 3
--- Demand-driven conversation history expansion
+-- Reader-driven conversation history expansion
 --
 -- Scope: coverage acquisition, asynchronous ownership, and the one-shot
 -- positioning obligation caused by expanding a loaded tail into complete
@@ -13,8 +13,8 @@ use "./scroll_policy.allium" as scroll
 use "../virtual-transcript/virtual_transcript.allium" as vt
 
 enum Coverage { tail complete }
-enum RequestIntent { manual_expand deep_link }
-enum RestoreBasis { reader_anchor following_tail target_message }
+enum RequestIntent { reader_expand deep_link }
+enum RestoreBasis { reader_anchor reader_viewport following_tail target_message }
 enum CommandKind { restore_after_prefix_expansion jump_to_message }
 enum FailureKind { request_failed target_not_found anchor_not_found }
 
@@ -65,7 +65,8 @@ surface HistoryExpansionController {
 
     provides:
         ViewChanged(view, conversation_id, view_generation, transcript_generation, has_earlier_history)
-        ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+        ReaderExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+        ReaderRestoreUpdated(view, request_token, restore_basis, anchor_message_id, viewport_start_offset)
         DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
         LoadedTargetRequested(view, command_token, target_message_id)
         DeepLinkTargetChanged(view, target_message_id)
@@ -177,10 +178,10 @@ rule ChangedDeepLinkClearsStaleFailure {
     ensures: view.failure = null
 }
 
-rule ChangedDeepLinkPreservesManualRequest {
+rule ChangedDeepLinkPreservesReaderRequest {
     when: DeepLinkTargetChanged(view, _)
     requires: view.active_request != null
-    requires: view.active_request.intent = manual_expand
+    requires: view.active_request.intent = reader_expand
     ensures: view.active_request = view.active_request
 }
 
@@ -208,19 +209,19 @@ rule LoadedTargetRequestClearsPriorRequestFailure {
     ensures: view.failure = null
 }
 
-rule ManualExpansionStartsOneRequest {
-    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+rule ReaderExpansionStartsOneRequest {
+    when: ReaderExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
     requires: view.pending_command = null
     requires: view.failure = null
-    requires: restore_basis in { reader_anchor, following_tail }
-    requires: restore_basis = following_tail
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request = HistoryRequest(
         view: view,
         token: request_token,
-        intent: manual_expand,
+        intent: reader_expand,
         restore_basis: restore_basis,
         message_id: anchor_message_id,
         viewport_start_offset: viewport_start_offset,
@@ -229,20 +230,20 @@ rule ManualExpansionStartsOneRequest {
     ensures: view.failure = null
 }
 
-rule ManualExpansionRetryClearsAndReplacesFailure {
-    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
+rule ReaderExpansionRetryClearsAndReplacesFailure {
+    when: ReaderExpansionRequested(view, request_token, restore_basis, anchor_message_id, viewport_start_offset, snapshot_event_seq)
     requires: view.coverage = tail
     requires: view.active_request = null
     requires: view.pending_command = null
     requires: view.failure != null
     requires: view.failure.kind = request_failed
-    requires: restore_basis in { reader_anchor, following_tail }
-    requires: restore_basis = following_tail
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
         or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request = HistoryRequest(
         view: view,
         token: request_token,
-        intent: manual_expand,
+        intent: reader_expand,
         restore_basis: restore_basis,
         message_id: anchor_message_id,
         viewport_start_offset: viewport_start_offset,
@@ -300,7 +301,20 @@ rule StaleHistorySuccessCannotMutateView {
     ensures: view.failure = view.failure
 }
 
-rule ManualReaderExpansionCreatesContinuityCommand {
+rule ActiveReaderExpansionTracksLatestRestoreBasis {
+    when: ReaderRestoreUpdated(view, request_token, restore_basis, anchor_message_id, viewport_start_offset)
+    requires: view.active_request != null
+    requires: view.active_request.token = request_token
+    requires: view.active_request.intent = reader_expand
+    requires: restore_basis in { reader_anchor, reader_viewport, following_tail }
+    requires: restore_basis in { reader_viewport, following_tail }
+        or anchor_message_id != null and viewport_start_offset != null
+    ensures: view.active_request.restore_basis = restore_basis
+    ensures: view.active_request.message_id = anchor_message_id
+    ensures: view.active_request.viewport_start_offset = viewport_start_offset
+}
+
+rule ReaderExpansionCreatesContinuityCommand {
     when: HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, _)
     requires: view.active_request != null
     requires: view.pending_command = null
@@ -308,7 +322,7 @@ rule ManualReaderExpansionCreatesContinuityCommand {
     requires: command_token != ""
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
-    requires: view.active_request.intent = manual_expand
+    requires: view.active_request.intent = reader_expand
     requires: view.active_request.restore_basis = reader_anchor
     ensures: view.coverage = complete
     ensures: view.pending_command = ScrollCommand(
@@ -323,15 +337,29 @@ rule ManualReaderExpansionCreatesContinuityCommand {
     ensures: view.active_request = null
 }
 
-rule ManualFollowingExpansionCreatesNoPositionCommand {
+rule FollowingReaderExpansionCreatesNoPositionCommand {
     when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
     requires: view.active_request != null
     requires: view.pending_command = null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
     requires: transcript_generation = view.transcript_generation
-    requires: view.active_request.intent = manual_expand
+    requires: view.active_request.intent = reader_expand
     requires: view.active_request.restore_basis = following_tail
+    ensures: view.coverage = complete
+    ensures: view.pending_command = null
+    ensures: view.active_request = null
+}
+
+rule ReaderViewportExpansionCreatesNoPositionCommand {
+    when: HistoryLoaded(view, request_token, _, view_generation, transcript_generation, _)
+    requires: view.active_request != null
+    requires: view.pending_command = null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = reader_expand
+    requires: view.active_request.restore_basis = reader_viewport
     ensures: view.coverage = complete
     ensures: view.pending_command = null
     ensures: view.active_request = null
@@ -525,6 +553,14 @@ contract HistoryExpansionSafety {
         -- message so unitTop - viewportTop equals the captured
         -- viewport_start_offset, preserves the scroll policy's existing reader
         -- or following ownership, and never highlights a message.
+
+    @invariant ActiveReaderExpansionUsesLatestRestoreBasis
+        -- Reader movement during an active reader expansion updates that
+        -- request's restore basis only when request token and view identity match.
+
+    @invariant ReaderViewportExpansionEmitsNoPositioningCommand
+        -- A reader_viewport expansion preserves the physical viewport without
+        -- issuing a message-target positioning command.
 
     @invariant FollowingTailExpansionEmitsNoPositioningCommand
         -- Expanding complete history while following the tail leaves physical

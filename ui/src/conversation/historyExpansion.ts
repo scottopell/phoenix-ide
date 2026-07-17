@@ -6,10 +6,11 @@ export type HistoryView = {
 
 export type RestoreBasis =
   | { kind: 'reader_anchor'; messageId: string; viewportStartOffset: number }
+  | { kind: 'reader_viewport' }
   | { kind: 'following_tail' };
 
 export type HistoryIntent =
-  | { kind: 'manual_expansion'; restore: RestoreBasis }
+  | { kind: 'reader_expansion'; restore: RestoreBasis }
   | { kind: 'deep_link'; targetMessageId: string };
 
 export type ActiveHistoryRequest = {
@@ -67,6 +68,7 @@ export type HistoryExpansionEvent =
       targetPresent: boolean;
       commandToken: HistoryCommandToken;
     }
+  | { type: 'reader_restore_updated'; requestToken: number; view: HistoryView; restore: RestoreBasis }
   | { type: 'history_failed'; requestToken: number; view: HistoryView; transcriptGeneration: number; message: string }
   | {
       type: 'command_acknowledged';
@@ -139,6 +141,23 @@ export function reduceHistoryExpansion(
         return state;
       }
       return { ...state, activeRequest: event.request, pendingCommand: null, failure: null };
+
+    case 'reader_restore_updated': {
+      const active = state.activeRequest;
+      if (
+        !active
+        || active.token !== event.requestToken
+        || !sameView(active.view, event.view)
+        || active.intent.kind !== 'reader_expansion'
+      ) return state;
+      return {
+        ...state,
+        activeRequest: {
+          ...active,
+          intent: { kind: 'reader_expansion', restore: event.restore },
+        },
+      };
+    }
 
     case 'history_loaded': {
       const request = state.activeRequest;

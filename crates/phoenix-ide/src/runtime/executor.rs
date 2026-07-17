@@ -2344,54 +2344,57 @@ where
         let _ = reply_rx.await;
     }
 
-    /// Remove the conversation's worktree if it still exists on disk.
-    ///
-    /// REQ-PROJ-028 creates worktrees at first message. If the user never
-    /// approved a task (Explore mode), the worktree and temp branch leak.
-    /// Work/Branch conversations clean up via mark-merged/abandon before
-    /// reaching `ConvState::Terminal`, so this is a no-op for them in the
-    /// normal case.
-    ///
-    /// REQ-BED-031 / approved-task handoff: `ContextExhausted` and
-    /// `HandedOff` are terminal states whose worktree must be preserved for a
-    /// successor conversation. Skip cleanup in those states; reconcile /
-    /// abandon / mark-merged are the only paths permitted to remove the worktree.
+    /// Remove the conversation's worktree if its canonical [`WorkScope`] owns
+    /// one and it still exists on disk.
     fn cleanup_worktree_if_present(&self) {
+        if self.context.is_sub_agent {
+            return;
+        }
+
         if matches!(
             self.state,
             ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. }
         ) {
             tracing::debug!(
                 conv_id = %self.context.conversation_id,
-                "skipping terminal worktree cleanup for successor-owned worktree"
+                "skipping terminal worktree cleanup for preserved/transferred scope"
             );
             return;
         }
 
-        // Direct mode and legacy Managed have working_dir == repo_root, so fall
-        // back to working_dir when the strict Phoenix-worktree predicate fails.
-        let wd = &self.context.working_dir;
-        let repo_root =
-            crate::git_ops::repo_root_from_phoenix_worktree(wd).unwrap_or_else(|| wd.clone());
+        let scope = phoenix_core::work_scope::WorkScope::resolve(
+            self.context.conversation_id.clone(),
+            self.context.work_scope_worktree.as_deref(),
+        );
+        let phoenix_core::work_scope::WorkScope::Worktree(worktree_path) = scope else {
+            return;
+        };
+        let worktree_path = std::path::PathBuf::from(worktree_path);
+        if !worktree_path.exists() {
+            return;
+        }
+        let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(&worktree_path)
+        else {
+            tracing::warn!(
+                conv_id = %self.context.conversation_id,
+                worktree = %worktree_path.display(),
+                "refusing terminal worktree cleanup for non-Phoenix WorkScope path"
+            );
+            return;
+        };
 
-        let worktree_path = repo_root
-            .join(".phoenix")
-            .join("worktrees")
-            .join(&self.context.conversation_id);
-
-        if worktree_path.exists() {
-            let worktree_str = worktree_path.to_string_lossy().to_string();
-            tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
-            if let Err(error) = crate::git_ops::run_git(
-                &repo_root,
-                &["worktree", "remove", &worktree_str, "--force"],
-            ) {
-                tracing::warn!(
-                    worktree = %worktree_str,
-                    %error,
-                    "Failed to remove worktree on terminal; it may remain on disk"
-                );
-            }
+        let worktree_str = worktree_path.to_string_lossy().into_owned();
+        tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
+        if let Err(error) = crate::git_ops::run_git(
+            &repo_root,
+            &["worktree", "remove", &worktree_str, "--force"],
+        ) {
+            tracing::warn!(
+                conv_id = %self.context.conversation_id,
+                worktree = %worktree_str,
+                %error,
+                "terminal worktree cleanup failed; worktree may remain on disk"
+            );
         }
     }
 
@@ -8007,7 +8010,8 @@ mod context_exhausted_preserves_worktree_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         broadcast::Receiver<SseEvent>,
     ) {
-        let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000);
+        let mut context = ConvContext::new(conv_id, working_dir.clone(), "test-model", 200_000);
+        context.work_scope_worktree = Some(working_dir);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
@@ -8193,22 +8197,18 @@ mod context_exhausted_preserves_worktree_tests {
         );
     }
 
-    /// Negative control: the original Explore-mode-leak intent of
-    /// `cleanup_worktree_if_present` (commit 4a94509) is preserved.
-    /// A non-context-exhausted terminal exit (here `ConvState::Terminal`,
-    /// the post-abandon / post-mark-merged sink) still cleans up any
-    /// stray worktree at `.phoenix/worktrees/{conv_id}`.
     #[tokio::test]
-    async fn terminal_exit_still_cleans_up_non_context_exhausted_terminal() {
+    async fn terminal_exit_cleans_inherited_worktree_scope_path() {
         let (_tmp, repo_root) = init_repo();
-        let conv_id = "term-exit-stray-1";
-        let branch = "stray-explore-branch";
-        let wt_path = add_worktree(&repo_root, conv_id, branch);
+        let owner_id = "original-owner";
+        let leaf_id = "continued-leaf";
+        let branch = "continued-work-branch";
+        let wt_path = add_worktree(&repo_root, owner_id, branch);
 
         let storage = Arc::new(InMemoryStorage::new());
         let (rt, _rx) = build_runtime_with_state(
             storage,
-            conv_id,
+            leaf_id,
             PathBuf::from(&wt_path),
             ConvState::Terminal,
         );
@@ -8217,8 +8217,62 @@ mod context_exhausted_preserves_worktree_tests {
 
         assert!(
             !Path::new(&wt_path).exists(),
-            "Non-ContextExhausted terminal exit must still reap stray worktrees \
-             (the original 4a94509 intent for Explore-mode leaks)"
+            "terminal cleanup must remove the inherited WorkScope path rather than \
+             deriving a nonexistent path from the continuation id"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_sub_agent_cannot_remove_parent_worktree_scope() {
+        let (_tmp, repo_root) = init_repo();
+        let owner_id = "worktree-owner";
+        let sub_agent_id = "work-sub-agent";
+        let branch = "shared-work-branch";
+        let wt_path = add_worktree(&repo_root, owner_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let (mut rt, _rx) = build_runtime_with_state(
+            storage,
+            sub_agent_id,
+            PathBuf::from(&wt_path),
+            ConvState::Completed {
+                result: "done".to_string(),
+            },
+        );
+        rt.context.is_sub_agent = true;
+        rt.context.root_conversation_id = owner_id.to_string();
+
+        rt.emit_terminal_lifecycle_event().await;
+
+        assert!(
+            Path::new(&wt_path).exists(),
+            "a Work sub-agent must not remove its live parent's inherited WorkScope"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_scope_cannot_remove_shared_cwd_worktree() {
+        let (_tmp, repo_root) = init_repo();
+        let owner_id = "worktree-owner";
+        let direct_id = "direct-continuation";
+        let branch = "shared-cwd-branch";
+        let wt_path = add_worktree(&repo_root, owner_id, branch);
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let (mut rt, _rx) = build_runtime_with_state(
+            storage,
+            direct_id,
+            PathBuf::from(&wt_path),
+            ConvState::Terminal,
+        );
+        rt.context.work_scope_worktree = None;
+
+        rt.emit_terminal_lifecycle_event().await;
+
+        assert!(
+            Path::new(&wt_path).exists(),
+            "a conversation-scoped Direct/Explore-sub-agent runtime must not remove \
+             a worktree merely because its cwd points inside that checkout"
         );
     }
 }

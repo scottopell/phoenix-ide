@@ -18,7 +18,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{ConvMode, Conversation};
+use phoenix_core::domain::db_schema::Conversation;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -389,7 +389,7 @@ async fn cleanup_managed_worktree_inner(
     })?;
     if owners
         .iter()
-        .any(|conv| managed_worktree_scope_owner(conv, &conversations))
+        .any(|conv| crate::runtime::conversation_owns_work_scope(conv))
     {
         return Err((
             StatusCode::CONFLICT,
@@ -403,7 +403,8 @@ async fn cleanup_managed_worktree_inner(
         });
     }
 
-    let branch_to_delete = cleanup_branch_for_leftover(owners[0]);
+    let branch_to_delete =
+        crate::runtime::cleanup_branch_for_unowned_work_scope(worktree, owners.iter().copied());
     let cleanup_repo_root = repo_root.clone();
     let cleanup_worktree = worktree.to_path_buf();
     let removed = tokio::task::spawn_blocking(move || {
@@ -473,25 +474,6 @@ fn remove_leftover_worktree(
         }
     }
     Ok(removed)
-}
-
-fn cleanup_branch_for_leftover(conv: &Conversation) -> Option<String> {
-    match &conv.conv_mode {
-        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore {
-            worktree_path: Some(_),
-            ..
-        } => {
-            let id_prefix: String = conv.id.chars().take(8).collect();
-            Some(format!("task-pending-{id_prefix}"))
-        }
-        ConvMode::Explore {
-            worktree_path: None,
-            ..
-        }
-        | ConvMode::Branch { .. }
-        | ConvMode::Direct => None,
-    }
 }
 
 async fn build_disk_info(state: &AppState) -> DeploymentDiskInfo {
@@ -593,13 +575,7 @@ fn managed_worktrees_from_conversations(
             DiskSize::Absent
         };
         if let Some(convs) = by_path.get(path) {
-            details.push(managed_worktree_detail(
-                path,
-                size,
-                repository,
-                convs,
-                conversations,
-            ));
+            details.push(managed_worktree_detail(path, size, repository, convs));
         }
     }
 
@@ -644,13 +620,12 @@ fn managed_worktree_detail(
     size: DiskSize,
     repository: Option<String>,
     path_conversations: &[&Conversation],
-    all_conversations: &[Conversation],
 ) -> ManagedWorktreeDiskEntry {
     let source = path_conversations[0];
     let live = path_conversations
         .iter()
         .copied()
-        .find(|conv| managed_worktree_scope_owner(conv, all_conversations));
+        .find(|conv| crate::runtime::conversation_owns_work_scope(conv));
     let owner = live.unwrap_or(source);
     ManagedWorktreeDiskEntry {
         path: path.to_string(),
@@ -672,95 +647,6 @@ fn managed_worktree_detail(
                 cleanup_allowed: true,
             },
         },
-    }
-}
-
-fn managed_worktree_scope_owner(conv: &Conversation, conversations: &[Conversation]) -> bool {
-    use phoenix_core::domain::sm_state::ConvState;
-    if conv.archived {
-        return false;
-    }
-    match &conv.state {
-        ConvState::ContextExhausted { .. } => match conv.continued_in_conv_id.as_deref() {
-            Some(_) => continuation_chain_has_live_owner(conv, conversations),
-            None => true,
-        },
-        ConvState::HandedOff { .. } => match conv.continued_in_conv_id.as_deref() {
-            Some(_) => !continuation_chain_has_live_owner(conv, conversations),
-            None => true,
-        },
-        ConvState::Completed { .. }
-        | ConvState::Failed { .. }
-        | ConvState::CreationFailed { .. }
-        | ConvState::CreationCancelled { .. }
-        | ConvState::Terminal => false,
-        ConvState::Idle
-        | ConvState::Provisioning { .. }
-        | ConvState::LlmRequesting { .. }
-        | ConvState::SeededLlmRequesting { .. }
-        | ConvState::ToolExecuting { .. }
-        | ConvState::CancellingTool { .. }
-        | ConvState::AwaitingSubAgents { .. }
-        | ConvState::CancellingSubAgents { .. }
-        | ConvState::Error { .. }
-        | ConvState::AwaitingRecovery { .. }
-        | ConvState::AwaitingContinuation { .. }
-        | ConvState::AwaitingTaskApproval { .. }
-        | ConvState::AwaitingUserResponse { .. }
-        | ConvState::AwaitingCommissionReviewApproval { .. } => true,
-    }
-}
-
-fn continuation_chain_has_live_owner(conv: &Conversation, conversations: &[Conversation]) -> bool {
-    let by_id: BTreeMap<&str, &Conversation> = conversations
-        .iter()
-        .map(|candidate| (candidate.id.as_str(), candidate))
-        .collect();
-    let mut next = conv.continued_in_conv_id.as_deref();
-    let mut seen = BTreeSet::new();
-    while let Some(id) = next {
-        if !seen.insert(id) {
-            return false;
-        }
-        let Some(member) = by_id.get(id).copied() else {
-            return false;
-        };
-        if managed_worktree_single_node_owner(member) {
-            return true;
-        }
-        next = member.continued_in_conv_id.as_deref();
-    }
-    false
-}
-
-fn managed_worktree_single_node_owner(conv: &Conversation) -> bool {
-    use phoenix_core::domain::sm_state::ConvState;
-    if conv.archived {
-        return false;
-    }
-    match &conv.state {
-        ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. } => {
-            conv.continued_in_conv_id.is_none()
-        }
-        ConvState::Completed { .. }
-        | ConvState::Failed { .. }
-        | ConvState::CreationFailed { .. }
-        | ConvState::CreationCancelled { .. }
-        | ConvState::Terminal => false,
-        ConvState::Idle
-        | ConvState::Provisioning { .. }
-        | ConvState::LlmRequesting { .. }
-        | ConvState::SeededLlmRequesting { .. }
-        | ConvState::ToolExecuting { .. }
-        | ConvState::CancellingTool { .. }
-        | ConvState::AwaitingSubAgents { .. }
-        | ConvState::CancellingSubAgents { .. }
-        | ConvState::Error { .. }
-        | ConvState::AwaitingRecovery { .. }
-        | ConvState::AwaitingContinuation { .. }
-        | ConvState::AwaitingTaskApproval { .. }
-        | ConvState::AwaitingUserResponse { .. }
-        | ConvState::AwaitingCommissionReviewApproval { .. } => true,
     }
 }
 
@@ -1233,6 +1119,7 @@ impl DeploymentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::domain::db_schema::ConvMode;
     use phoenix_core::domain::db_schema::NonEmptyString;
     use std::fs;
 
@@ -1512,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn handed_off_dead_end_protector_is_live_not_leftover() {
+    fn handed_off_with_terminal_successor_is_leftover() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let wt = repo.join(".phoenix").join("worktrees").join("handoff");
@@ -1543,7 +1430,7 @@ mod tests {
 
         assert!(matches!(
             details[0].disposition,
-            ManagedWorktreeDisposition::Live { .. }
+            ManagedWorktreeDisposition::Leftover { .. }
         ));
     }
 
@@ -1562,7 +1449,10 @@ mod tests {
         };
 
         assert_eq!(
-            cleanup_branch_for_leftover(&conv),
+            crate::runtime::cleanup_branch_for_unowned_work_scope(
+                Path::new("/repo/.phoenix/worktrees/abcdef123456"),
+                [&conv],
+            ),
             Some("task-pending-abcdef12".to_string())
         );
     }
@@ -1580,7 +1470,13 @@ mod tests {
             base_branch: NonEmptyString::new("main").unwrap(),
         };
 
-        assert_eq!(cleanup_branch_for_leftover(&conv), None);
+        assert_eq!(
+            crate::runtime::cleanup_branch_for_unowned_work_scope(
+                Path::new("/repo/.phoenix/worktrees/branchy"),
+                [&conv],
+            ),
+            None
+        );
     }
 
     #[test]
