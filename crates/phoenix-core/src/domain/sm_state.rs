@@ -500,6 +500,7 @@ impl ToolInput {
             "commission_review" => parse::<CommissionReviewInput>(name, value),
             "approved_commission_review" => parse::<ApprovedCommissionReviewInput>(name, value),
             "propose_task" => parse::<ProposeTaskInput>(name, value),
+            "request_work_tools" => parse::<RequestWorkToolsInput>(name, value),
             "ask_user_question" => parse::<AskUserQuestionInput>(name, value),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
@@ -512,6 +513,20 @@ impl ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_work_tools_parses_through_live_tool_path() {
+        let input = ToolInput::from_name_and_value(
+            "request_work_tools",
+            serde_json::json!({"reason": "inspect production traces"}),
+        );
+        assert_eq!(
+            input,
+            ToolInput::RequestWorkTools(RequestWorkToolsInput {
+                reason: "inspect production traces".to_string(),
+            })
+        );
+    }
 
     #[test]
     fn legacy_bash_tool_input_deserializes_as_modern_run() {

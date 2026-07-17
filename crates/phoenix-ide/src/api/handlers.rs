@@ -3148,7 +3148,15 @@ async fn get_system_prompt(
     };
     // Mirror the mode context the live request uses (worktree boundaries,
     // Explore guidance) so the inspected prompt matches what the model sees.
-    let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
+    let mode_context = crate::runtime::conv_mode_to_context(
+        &conversation.conv_mode,
+        state
+            .runtime
+            .db()
+            .has_full_work_tools(&conversation.id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    );
     let explore_bash = if matches!(
         mode_context,
         crate::system_prompt::ModeContext::Explore { .. }

@@ -3547,12 +3547,11 @@ where
         }
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
-                true
-            }
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let parent_allows_work = self
+            .context
+            .mode_context
+            .as_ref()
+            .is_some_and(ModeContext::allows_work_tools);
 
         let mut work_count_in_batch = 0u32;
         for &(_, mode) in &resolved_tasks {
@@ -3793,9 +3792,28 @@ where
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
             Effect::GrantWorkTools => {
+                let next_taskmd_id_hint = match self.context.mode_context.as_ref() {
+                    Some(ModeContext::Explore {
+                        next_taskmd_id_hint,
+                    }) => next_taskmd_id_hint.clone(),
+                    Some(ModeContext::ExploreWithWorkTools { .. }) => {
+                        return Err("Work tools are already granted".to_string());
+                    }
+                    Some(
+                        ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. },
+                    )
+                    | None => return Err("Work tools can only be granted to Explore".to_string()),
+                };
                 self.storage
-                    .grant_full_work_tools(&self.context.conversation_id)
+                    .grant_full_work_tools_and_update_state(
+                        &self.context.conversation_id,
+                        &self.state,
+                        self.state_updated_at,
+                    )
                     .await?;
+                self.context.mode_context = Some(ModeContext::ExploreWithWorkTools {
+                    next_taskmd_id_hint,
+                });
                 self.tool_executor.upgrade_to_work_mode();
                 self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
                 self.storage
@@ -4331,10 +4349,12 @@ where
                 // via the existing User message path (not System, which is
                 // UI-only bookkeeping and not sent to the LLM).
                 let msg_id = uuid::Uuid::new_v4().to_string();
-                let grace_prompt = if matches!(
-                    &self.context.mode_context,
-                    Some(ModeContext::Explore { .. })
-                ) {
+                let grace_prompt = if self
+                    .context
+                    .mode_context
+                    .as_ref()
+                    .is_some_and(ModeContext::is_explore)
+                {
                     "You have reached your turn limit. Only submit_result or submit_error can \
                          produce a useful terminal outcome from this grace turn. Call submit_result \
                          with whatever findings you have so far, or call submit_error if you are \

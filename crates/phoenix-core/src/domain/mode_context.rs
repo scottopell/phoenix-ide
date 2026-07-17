@@ -9,6 +9,11 @@ pub enum ModeContext {
         /// Stable taskmd ID hint captured when the Explore workflow starts.
         next_taskmd_id_hint: Option<String>,
     },
+    /// Explore lifecycle with a user-approved full Work capability set.
+    ExploreWithWorkTools {
+        /// Stable taskmd ID hint captured when the Explore workflow starts.
+        next_taskmd_id_hint: Option<String>,
+    },
     /// Isolated worktree with write access for an approved task.
     Work {
         branch_name: String,
@@ -23,4 +28,25 @@ pub enum ModeContext {
         base_branch: String,
         worktree_path: String,
     },
+}
+
+impl ModeContext {
+    #[must_use]
+    pub fn is_explore(&self) -> bool {
+        matches!(
+            self,
+            Self::Explore { .. } | Self::ExploreWithWorkTools { .. }
+        )
+    }
+
+    #[must_use]
+    pub fn allows_work_tools(&self) -> bool {
+        matches!(
+            self,
+            Self::ExploreWithWorkTools { .. }
+                | Self::Work { .. }
+                | Self::Direct
+                | Self::Branch { .. }
+        )
+    }
 }

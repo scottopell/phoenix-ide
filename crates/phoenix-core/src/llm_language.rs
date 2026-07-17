@@ -264,6 +264,18 @@ pub fn mode_explore(
 }
 
 #[must_use]
+pub fn mode_explore_with_work_tools(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => {
+            "\n\nYou remain in Explore mode, but the user approved the full Work toolset for this conversation. You may use unrestricted shell, network, patch, and Work sub-agents to complete the investigation. This approval does not start a task or change the task/worktree lifecycle; use `propose_task` separately if implementation work should begin."
+        }
+        LlmLanguage::Caveman => {
+            "\n\nStill explore cave, but big caveman allow all work tools for investigation. No task started. Use propose_task if build work should begin."
+        }
+    }
+}
+
+#[must_use]
 pub fn mode_work(
     lang: LlmLanguage,
     branch_name: &str,

@@ -146,6 +146,10 @@ pub fn from_transition_error(err: &TransitionError) -> UserFacingError {
             "Conversation is awaiting task approval",
             "Approve or abandon the proposed task before sending a new message.",
         ),
+        TransitionError::AwaitingWorkToolApproval => UserFacingError::retryable(
+            "Conversation is awaiting Work tool approval",
+            "Approve or reject the Work tool request before sending a new message.",
+        ),
         TransitionError::AwaitingUserResponse => UserFacingError::retryable(
             "Conversation is awaiting your response",
             "Answer the agent's pending question before sending a new message.",

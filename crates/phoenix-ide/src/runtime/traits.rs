@@ -153,7 +153,12 @@ pub trait StateStore: Send + Sync {
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
 
-    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String>;
+    async fn grant_full_work_tools_and_update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String>;
 
     /// Update the conversation mode (e.g., Explore -> Work on task approval)
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
@@ -439,8 +444,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_state(conv_id).await
     }
 
-    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String> {
-        (**self).grant_full_work_tools(conv_id).await
+    async fn grant_full_work_tools_and_update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .grant_full_work_tools_and_update_state(conv_id, state, state_updated_at)
+            .await
     }
 
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
@@ -755,9 +767,14 @@ impl StateStore for DatabaseStorage {
         Ok(conv.state)
     }
 
-    async fn grant_full_work_tools(&self, conv_id: &str) -> Result<(), String> {
+    async fn grant_full_work_tools_and_update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
         self.db
-            .grant_full_work_tools(conv_id)
+            .grant_full_work_tools_and_update_state(conv_id, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }

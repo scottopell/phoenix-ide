@@ -2203,7 +2203,7 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
-        conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
+        conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode, false));
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
@@ -2455,7 +2455,13 @@ impl RuntimeManager {
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id().to_string());
         let context_window = self.llm_registry.context_window(&model_id);
-        let mode_context = conv_mode_to_context(&conv.conv_mode);
+        let mode_context = conv_mode_to_context(
+            &conv.conv_mode,
+            self.db
+                .has_full_work_tools(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
             ConvContext::sub_agent(
@@ -3266,8 +3272,14 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
-pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
+pub(crate) fn conv_mode_to_context(mode: &ConvMode, full_work_tools_granted: bool) -> ModeContext {
     match mode {
+        ConvMode::Explore {
+            next_taskmd_id_hint,
+            ..
+        } if full_work_tools_granted => ModeContext::ExploreWithWorkTools {
+            next_taskmd_id_hint: next_taskmd_id_hint.as_ref().map(ToString::to_string),
+        },
         ConvMode::Explore {
             next_taskmd_id_hint,
             ..

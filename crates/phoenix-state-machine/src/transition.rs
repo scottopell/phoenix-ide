@@ -367,6 +367,8 @@ pub enum TransitionError {
     ContextExhausted,
     #[error("Conversation is awaiting task approval")]
     AwaitingTaskApproval,
+    #[error("Conversation is awaiting Work tool approval")]
+    AwaitingWorkToolApproval,
     #[error("Conversation is awaiting user response to questions")]
     AwaitingUserResponse,
     #[error("Conversation has reached terminal state (completed or abandoned)")]
@@ -419,8 +421,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::ToolExecuting { .. }
-        | ConvState::AwaitingSubAgents { .. }
-        | ConvState::AwaitingWorkToolApproval { .. } => Err(TransitionError::AgentBusy),
+        | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
 
         // transition_core: CancellationInProgress
         ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
@@ -428,6 +429,9 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         }
 
         // transition_parent: explicit reject arms
+        ConvState::AwaitingWorkToolApproval { .. } => {
+            Err(TransitionError::AwaitingWorkToolApproval)
+        }
         ConvState::AwaitingTaskApproval { .. } => Err(TransitionError::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Err(TransitionError::AwaitingUserResponse),
         ConvState::AwaitingCommissionReviewApproval { .. } => {
@@ -1724,7 +1728,6 @@ pub fn transition_parent(
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
                 .with_effect(Effect::GrantWorkTools)
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
@@ -2406,7 +2409,10 @@ pub fn transition_parent(
                 // non-blocking fork and keep running. `ModeKind::Managed` covers
                 // both Explore and Work, so the precise mode comes from
                 // `mode_context`.
-                let is_explore = matches!(context.mode_context, Some(ModeContext::Explore { .. }));
+                let is_explore = context
+                    .mode_context
+                    .as_ref()
+                    .is_some_and(ModeContext::is_explore);
                 let fork_eligible = matches!(context.mode, ModeKind::Branch)
                     || matches!(
                         context.mode_context,
@@ -5644,13 +5650,19 @@ mod tests {
         );
     }
 
-    /// Task 13018 follow-up: a `propose_task` whose payload failed to
-    /// deserialise (`ToolInput::Malformed{name: "propose_task", ...}`) must
-    /// be intercepted in the typed approval flow — the serde error is
-    /// surfaced as a `tool_result` and the LLM is re-requested. Without this
-    /// interception the malformed call would fall through to the executor
-    /// where `propose_task`'s fallback `run()` returns a generic error, hiding
-    /// the precise serde diagnostic and skipping the typed approval path.
+    #[test]
+    fn work_tool_approval_rejects_user_messages_as_approval_conflict() {
+        let state = ConvState::AwaitingWorkToolApproval {
+            reason: "inspect traces".to_string(),
+        };
+        assert!(matches!(
+            check_user_message_acceptable(&state),
+            Err(TransitionError::AwaitingWorkToolApproval)
+        ));
+    }
+
+    /// A `propose_task` whose payload failed to deserialize must be intercepted
+    /// in the typed approval flow so the precise serde error reaches the model.
     #[test]
     fn test_malformed_propose_task_surfaces_serde_error_to_llm() {
         use crate::state::ToolInput;

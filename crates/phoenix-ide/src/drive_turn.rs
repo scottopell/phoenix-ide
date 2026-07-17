@@ -43,6 +43,7 @@ pub enum StableOutcome {
         error_kind: phoenix_core::domain::db_schema::ErrorKind,
     },
     AwaitingRecovery,
+    AwaitingWorkToolApproval,
     AwaitingTaskApproval,
     AwaitingUserResponse,
     AwaitingCommissionReviewApproval,
@@ -471,9 +472,8 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             error_kind: error_kind.clone(),
         }),
         ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
-        ConvState::AwaitingWorkToolApproval { .. } | ConvState::AwaitingUserResponse { .. } => {
-            Some(StableOutcome::AwaitingUserResponse)
-        }
+        ConvState::AwaitingWorkToolApproval { .. } => Some(StableOutcome::AwaitingWorkToolApproval),
+        ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingCommissionReviewApproval { .. } => {
             Some(StableOutcome::AwaitingCommissionReviewApproval)
@@ -592,6 +592,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(waiter.await.unwrap().unwrap(), StableOutcome::Terminal);
+    }
+
+    #[test]
+    fn stable_outcome_distinguishes_work_tool_approval() {
+        let outcome = stable_outcome(&ConvState::AwaitingWorkToolApproval {
+            reason: "inspect traces".to_string(),
+        });
+        assert_eq!(outcome, Some(StableOutcome::AwaitingWorkToolApproval));
+        assert_eq!(
+            serde_json::to_value(outcome.unwrap()).unwrap(),
+            serde_json::json!({"type": "awaiting_work_tool_approval"})
+        );
     }
 
     #[test]

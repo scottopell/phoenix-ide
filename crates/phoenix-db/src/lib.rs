@@ -4210,14 +4210,26 @@ impl Database {
         Ok(queue)
     }
 
-    /// Persist the full Work-tool grant for a conversation.
+    /// Atomically persist a full Work-tool grant and its post-approval state.
     ///
     /// # Errors
     /// Returns an error when the conversation does not exist or the database update fails.
-    pub async fn grant_full_work_tools(&self, id: &str) -> DbResult<()> {
+    ///
+    /// # Panics
+    /// Panics if the state cannot be serialized.
+    pub async fn grant_full_work_tools_and_update_state(
+        &self,
+        id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let state_json = serde_json::to_string(state).unwrap();
         let result = sqlx::query(
-            "UPDATE conversations SET full_work_tools_granted = 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE conversations SET full_work_tools_granted = 1, state = ?1, \
+             state_updated_at = ?2, updated_at = ?3 WHERE id = ?4",
         )
+        .bind(state_json)
+        .bind(state_updated_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .bind(id)
         .execute(&self.pool)
@@ -11933,6 +11945,33 @@ mod tests {
         if let ConvState::ContextExhausted { summary } = conv_after.state {
             assert_eq!(summary, "Test summary");
         }
+    }
+
+    #[tokio::test]
+    async fn work_tool_grant_atomically_persists_post_approval_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-grant", "slug-grant", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "conv-grant",
+            &ConvState::AwaitingWorkToolApproval {
+                reason: "inspect traces".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let next_state = ConvState::LlmRequesting { attempt: 1 };
+        db.grant_full_work_tools_and_update_state("conv-grant", &next_state, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(db.has_full_work_tools("conv-grant").await.unwrap());
+        assert_eq!(
+            db.get_conversation("conv-grant").await.unwrap().state,
+            next_state
+        );
     }
 
     #[tokio::test]

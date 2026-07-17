@@ -823,7 +823,16 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
-    async fn grant_full_work_tools(&self, _conv_id: &str) -> Result<(), String> {
+    async fn grant_full_work_tools_and_update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.states
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state.clone());
         Ok(())
     }
 

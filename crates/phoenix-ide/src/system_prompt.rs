@@ -236,6 +236,18 @@ pub fn build_system_prompt_with_options(
                     ));
                 }
             }
+            ModeContext::ExploreWithWorkTools {
+                next_taskmd_id_hint,
+            } => {
+                prompt.push_str(llm_language::mode_explore_with_work_tools(language));
+                if let Some(next_id) = next_taskmd_id_hint {
+                    prompt.push_str(&llm_language::next_taskmd_id_hint(
+                        language,
+                        tasks_dir_name,
+                        next_id,
+                    ));
+                }
+            }
             ModeContext::Work {
                 branch_name,
                 base_branch,
@@ -748,6 +760,29 @@ mod tests {
         assert_eq!(first_prompt, second_prompt);
         assert!(second_prompt.contains(&format!("`{hinted_id}`")));
         assert!(!second_prompt.contains(&format!("`{recomputed_id}`")));
+    }
+
+    #[test]
+    fn approved_explore_prompt_exposes_work_capabilities_without_task_handoff() {
+        let mode = ModeContext::ExploreWithWorkTools {
+            next_taskmd_id_hint: Some("12345".to_string()),
+        };
+        let prompt = build_system_prompt_with_options(
+            Path::new("/tmp/project"),
+            "tasks",
+            false,
+            Some(&mode),
+            None,
+            None,
+            LlmLanguage::PhoenixNative,
+            None,
+            ExploreBashCapability::Unavailable,
+        );
+        assert!(prompt.contains("remain in Explore mode"));
+        assert!(prompt.contains("unrestricted shell, network, patch, and Work sub-agents"));
+        assert!(prompt.contains("does not start a task"));
+        assert!(prompt.contains("next available taskmd ID"));
+        assert!(!prompt.contains("This conversation is read-only"));
     }
 
     #[test]
