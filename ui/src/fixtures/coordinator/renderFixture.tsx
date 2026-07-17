@@ -39,7 +39,7 @@ export function CoordinatorFixture({ scenario }: Props) {
                 coordinatorId,
                 openWork: fixtureOpenWork,
                 initialView: scenario.initialView,
-                ...(scenario.fleetError ? { fleetError: 'projection unavailable' } : {}),
+                ...(scenario.fleetError ? { workError: 'projection unavailable' } : {}),
                 conversation: <FixtureConversation working={scenario.working} />,
               }}
             />
@@ -151,7 +151,7 @@ const fixtureOpenWork: GlobalOpenWorkResponse = {
       base_branch: 'main',
       worktree_path: '/phoenix/worktrees/mobile-first-coordinator',
       member_count: 2,
-      signals: ['active runtime', 'task open'],
+      signals: ['needs action', 'task open'],
       href: '/c/mobile-first-coordinator',
       reference: '@work:mobile-first-coordinator',
     }],

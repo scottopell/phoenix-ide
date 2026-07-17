@@ -1254,8 +1254,10 @@ export const api = {
     return resp.json();
   },
 
-  async getGlobalOpenWork(offset = 0): Promise<GlobalOpenWorkResponse> {
-    const resp = await fetch(`/api/global/open-work?offset=${offset}`);
+  async getGlobalOpenWork(offset = 0, query = ''): Promise<GlobalOpenWorkResponse> {
+    const params = new URLSearchParams({ offset: String(offset) });
+    if (query) params.set('query', query);
+    const resp = await fetch(`/api/global/open-work?${params.toString()}`);
     if (!resp.ok) throw new Error('Failed to load Global Open Work');
     return resp.json();
   },
