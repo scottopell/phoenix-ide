@@ -2501,19 +2501,13 @@ where
         Ok(())
     }
 
-    async fn activate_queued_project_instructions(&self) -> Result<(), String> {
-        // Avoid consuming a persisted sequence when the common case has no queue.
-        // Activation remains authoritative and atomic below: if the queue changes
-        // after this preflight, activation may still return None (queue removed),
-        // or a later boundary will activate a queue inserted after this read.
-        if self
-            .storage
-            .load_queued_project_instruction_bundle(&self.context.conversation_id)
-            .await?
-            .is_none()
-        {
+    async fn activate_queued_project_instructions(
+        &self,
+        expected_queued_bundle_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(expected_queued_bundle_id) = expected_queued_bundle_id else {
             return Ok(());
-        }
+        };
 
         let (reserved_broadcast_range, reserved_seqs) =
             self.broadcast_tx.reserve_next_persisted_message_range(1);
@@ -2521,7 +2515,11 @@ where
         let sequence_id = reserved_seqs[0];
         match self
             .storage
-            .activate_queued_project_instruction_bundle(&self.context.conversation_id, sequence_id)
+            .activate_queued_project_instruction_bundle(
+                &self.context.conversation_id,
+                expected_queued_bundle_id,
+                sequence_id,
+            )
             .await
         {
             Ok(Some(activation)) => {
@@ -2536,24 +2534,39 @@ where
                 );
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                let error =
+                    "queued project instructions changed before turn activation".to_string();
+                let _ = self
+                    .broadcast_tx
+                    .send_reserved_seq(sequence_id, |seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "retry the message with the current project instructions",
+                        ),
+                    });
+                Err(error)
+            }
             Err(error) => {
                 tracing::error!(
                     conv_id = %self.context.conversation_id,
                     %error,
                     "Failed to activate queued project instructions"
                 );
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
-                    sequence_id: seq,
-                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                        "start the next turn",
-                    ),
-                });
+                let _ = self
+                    .broadcast_tx
+                    .send_reserved_seq(sequence_id, |seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "start the next turn",
+                        ),
+                    });
                 Err(error)
             }
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // Steering messages are buffered rather than fed to the state machine.
         // They are delivered as `UserMessage` when the conversation next enters `Idle`.
@@ -2565,6 +2578,7 @@ where
             message_id,
             user_agent,
             skill_invocation,
+            expected_queued_project_instruction_bundle_id,
         } = event
         {
             let entry = crate::state_machine::event::SteerEntry {
@@ -2575,6 +2589,7 @@ where
                 message_id: message_id.clone(),
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             };
             self.steering_queue.push(entry);
             let queue_position = self.steering_queue.len() - 1;
@@ -2640,7 +2655,14 @@ where
 
             // Compute the pure transition before performing boundary side effects.
             // A rejected UserMessage must not activate a queued snapshot.
-            let starts_user_turn = matches!(current_event, Event::UserMessage { .. });
+            let expected_queued_bundle_id = match &current_event {
+                Event::UserMessage {
+                    expected_queued_project_instruction_bundle_id,
+                    ..
+                } => Some(expected_queued_project_instruction_bundle_id.clone()),
+                _ => None,
+            };
+            let starts_user_turn = expected_queued_bundle_id.is_some();
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2665,7 +2687,10 @@ where
                 // Activation must precede transition effects so the first model
                 // request observes the new snapshot, but follows validation so
                 // rejected messages leave the queue and timeline untouched.
-                self.activate_queued_project_instructions().await?;
+                self.activate_queued_project_instructions(
+                    expected_queued_bundle_id.flatten().as_deref(),
+                )
+                .await?;
                 self.parent_tool_cycle_count = 0;
             }
 
@@ -2926,6 +2951,7 @@ where
     /// the drain event's persist effects inline, then run the deferred
     /// `RequestLlm`. Guarantees the spawned LLM task reads a DB that already
     /// contains the steered messages.
+    #[allow(clippy::too_many_lines)]
     async fn run_effects_with_inline_drain(
         &mut self,
         original_effects: Vec<Effect>,
@@ -2948,7 +2974,37 @@ where
         // persisting any drained user message. The LlmRequesting mid-turn drain
         // deliberately skips this boundary action.
         if suppress_intermediate_state_change {
-            self.activate_queued_project_instructions().await?;
+            if entries.iter().all(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .is_none()
+            }) {
+                let queued_id = self
+                    .storage
+                    .load_queued_project_instruction_bundle(&self.context.conversation_id)
+                    .await?
+                    .map(|bundle| bundle.id.into_boxed_str());
+                for entry in &mut entries {
+                    entry
+                        .expected_queued_project_instruction_bundle_id
+                        .clone_from(&queued_id);
+                }
+            }
+            let expected_queued_bundle_id = entries.first().and_then(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .as_deref()
+            });
+            if entries.iter().any(|entry| {
+                entry
+                    .expected_queued_project_instruction_bundle_id
+                    .as_deref()
+                    != expected_queued_bundle_id
+            }) {
+                return Err("steering batch spans different project-instruction snapshots".into());
+            }
+            self.activate_queued_project_instructions(expected_queued_bundle_id)
+                .await?;
             // These steers are becoming a new user turn. Expansion happened at
             // enqueue time while the prior turn was active, so rerender slash
             // invocations from the now-active snapshot selected at this boundary.
@@ -9368,6 +9424,7 @@ mod explore_prompt_cache_shape_tests {
                 message_id: "user-msg-1".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -9384,6 +9441,12 @@ mod explore_prompt_cache_shape_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
+        let queued_id = storage
+            .load_queued_project_instruction_bundle(conv_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
         event_tx
             .send(Event::UserMessage {
                 text: "start next turn".to_string(),
@@ -9393,6 +9456,7 @@ mod explore_prompt_cache_shape_tests {
                 message_id: "user-msg-2".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: Some(queued_id.into()),
             })
             .await
             .unwrap();
@@ -9656,6 +9720,7 @@ mod steer_drain_detector_tests {
             message_id: id.to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         }
     }
 
@@ -9727,6 +9792,7 @@ mod steer_drain_detector_tests {
             message_id: id.to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         }
     }
 
@@ -9746,6 +9812,86 @@ mod steer_drain_detector_tests {
             4,
             "activation preflight must not leave an unused sequence between user-message effects"
         );
+    }
+
+    #[tokio::test]
+    async fn activation_db_error_fills_reserved_sequence() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-activation-error", ConvState::Idle, vec![]);
+        let queued_id = storage.queue_project_instruction_bundle(
+            "conv-activation-error",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        storage.set_fail_project_instruction_activation(true);
+        let mut event = user_message("activation-error");
+        if let Event::UserMessage {
+            expected_queued_project_instruction_bundle_id,
+            ..
+        } = &mut event
+        {
+            *expected_queued_project_instruction_bundle_id = Some(queued_id.into());
+        }
+        let mut events = rt.broadcast_tx.subscribe();
+
+        assert!(rt.process_event(event).await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Error { sequence_id: 1, .. })
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
+        assert!(storage.get_all_messages("conv-activation-error").is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_queue_rejects_bound_turn_and_fills_reserved_sequence() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-queue-cas", ConvState::Idle, vec![]);
+        let queued_a = storage.queue_project_instruction_bundle(
+            "conv-queue-cas",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 1,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        let mut event = user_message("bound-to-a");
+        if let Event::UserMessage {
+            expected_queued_project_instruction_bundle_id,
+            ..
+        } = &mut event
+        {
+            *expected_queued_project_instruction_bundle_id = Some(queued_a.into());
+        }
+        let queued_b = storage.queue_project_instruction_bundle(
+            "conv-queue-cas",
+            phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
+                estimated_tokens: 2,
+                guidance: vec![],
+                skills: vec![],
+            },
+        );
+        let mut events = rt.broadcast_tx.subscribe();
+
+        assert!(rt.process_event(event).await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Error { sequence_id: 1, .. })
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
+        assert_eq!(
+            storage
+                .load_queued_project_instruction_bundle("conv-queue-cas")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            queued_b
+        );
+        assert!(storage.get_all_messages("conv-queue-cas").is_empty());
     }
 
     #[tokio::test]
@@ -9814,7 +9960,7 @@ mod steer_drain_detector_tests {
             ConvState::LlmRequesting { attempt: 1 },
             queue,
         );
-        storage.queue_project_instruction_bundle(
+        let queued_id = storage.queue_project_instruction_bundle(
             "conv-drain-idle",
             phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle {
                 estimated_tokens: 1,
@@ -9824,6 +9970,9 @@ mod steer_drain_detector_tests {
         );
 
         let result = TransitionResult::new(ConvState::Idle);
+        for entry in &mut rt.steering_queue {
+            entry.expected_queued_project_instruction_bundle_id = Some(queued_id.clone().into());
+        }
         rt.apply_transition_result(result)
             .await
             .expect("apply_transition_result must succeed");
@@ -9863,6 +10012,7 @@ mod steer_drain_detector_tests {
             skills: vec![ProjectSkillSnapshot {
                 name: "alpha".to_string(),
                 description: "test".to_string(),
+                argument_hint: None,
                 source_label: ".agents/skills".to_string(),
                 body: body.to_string(),
                 base_dir: "/tmp/.agents/skills/alpha".to_string(),
@@ -9889,8 +10039,9 @@ mod steer_drain_detector_tests {
             )
             .await
             .unwrap();
-        storage
+        let queued_id = storage
             .queue_project_instruction_bundle("conv-slash-idle-drain", skill_bundle("queued body"));
+        rt.steering_queue[0].expected_queued_project_instruction_bundle_id = Some(queued_id.into());
 
         rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
             .await

@@ -3708,6 +3708,7 @@ async fn send_chat(
 
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
+            let mut expected_queued_project_instruction_bundle_id = None;
             let expanded = if state
                 .db
                 .is_coordinator_conversation(&conversation.id)
@@ -3727,6 +3728,10 @@ async fn send_chat(
                     ensure_active_project_instructions(&state, &id, FsPath::new(&conversation.cwd))
                         .await?
                 };
+                expected_queued_project_instruction_bundle_id =
+                    (project_instructions.role
+                        == phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Queued)
+                    .then(|| project_instructions.id.clone().into_boxed_str());
                 crate::message_expander::expand_with_project_skills(
                     &req.text,
                     &resolution_root,
@@ -3760,6 +3765,7 @@ async fn send_chat(
                 message_id: req.message_id,
                 user_agent: req.user_agent,
                 skill_invocation: expanded.skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             };
             tracing::info!(
                 conv_id = %id,
@@ -3800,6 +3806,7 @@ async fn send_chat(
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
+    let mut expected_queued_project_instruction_bundle_id = None;
     let expanded = if state
         .db
         .is_coordinator_conversation(&conversation.id)
@@ -3814,6 +3821,10 @@ async fn send_chat(
     } else {
         let project_instructions =
             project_instructions_for_next_turn(&state, &id, FsPath::new(&conversation.cwd)).await?;
+        expected_queued_project_instruction_bundle_id =
+            (project_instructions.role
+                == phoenix_core::domain::project_instruction_bundle::ProjectInstructionBundleRole::Queued)
+            .then(|| project_instructions.id.clone().into_boxed_str());
         crate::message_expander::expand_with_project_skills(
             &req.text,
             &resolution_root,
@@ -3855,6 +3866,7 @@ async fn send_chat(
         message_id: req.message_id,
         user_agent: req.user_agent,
         skill_invocation: expanded.skill_invocation,
+        expected_queued_project_instruction_bundle_id,
     };
 
     state
@@ -6101,7 +6113,7 @@ async fn list_conversation_skills(
             .map(|skill| SkillEntry {
                 name: skill.name,
                 description: skill.description,
-                argument_hint: None,
+                argument_hint: skill.argument_hint,
                 source: skill.source_label,
                 path: skill.source_path,
             })
@@ -7490,7 +7502,7 @@ mod project_instruction_refresh_tests {
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nname: alpha\ndescription: initial skill secret\n---\nbody",
+            "---\nname: alpha\ndescription: initial skill secret\nargument-hint: <snapshot-arg>\n---\nbody",
         )
         .unwrap();
         state
@@ -7566,6 +7578,14 @@ mod project_instruction_refresh_tests {
             .skills
             .iter()
             .any(|skill| skill.name == "alpha"));
+        assert_eq!(
+            conversation_skills
+                .skills
+                .iter()
+                .find(|skill| skill.name == "alpha")
+                .and_then(|skill| skill.argument_hint.as_deref()),
+            Some("<snapshot-arg>")
+        );
         assert!(!conversation_skills
             .skills
             .iter()
@@ -13562,6 +13582,7 @@ mod chat_authority_tests {
             skills: vec![ProjectSkillSnapshot {
                 name: "alpha".to_string(),
                 description: "test".to_string(),
+                argument_hint: None,
                 source_label: ".agents/skills".to_string(),
                 body: body.to_string(),
                 base_dir: "/tmp/.agents/skills/alpha".to_string(),

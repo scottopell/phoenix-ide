@@ -339,6 +339,7 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
             Some(ProjectSkillSnapshot {
                 name: skill.name,
                 description: skill.description,
+                argument_hint: None,
                 source_label: "creation discovery".into(),
                 body: crate::skills::strip_skill_frontmatter(&body),
                 base_dir,

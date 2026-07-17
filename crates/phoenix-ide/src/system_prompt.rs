@@ -216,12 +216,13 @@ pub fn discover_project_instruction_bundle_with_options(
             let raw = std::fs::read_to_string(skill.skill_md_path()).ok()?;
             let body = crate::skills::strip_skill_frontmatter(&raw);
             let content_hash = sha256_hex(&format!(
-                "{}\0{}\0{source_label}\0{source_path}\0{base_dir}\0{body}",
-                skill.name, skill.description
+                "{}\0{}\0{:?}\0{source_label}\0{source_path}\0{base_dir}\0{body}",
+                skill.name, skill.description, skill.argument_hint
             ));
             Some(ProjectSkillSnapshot {
                 name: skill.name,
                 description: skill.description,
+                argument_hint: skill.argument_hint,
                 source_label,
                 body,
                 base_dir,

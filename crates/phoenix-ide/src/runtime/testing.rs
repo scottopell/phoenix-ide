@@ -498,6 +498,7 @@ pub struct InMemoryStorage {
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
     project_instruction_bundles: Mutex<HashMap<String, TestProjectInstructionBundles>>,
+    fail_project_instruction_activation: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -516,6 +517,7 @@ impl InMemoryStorage {
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
             project_instruction_bundles: Mutex::new(HashMap::new()),
+            fail_project_instruction_activation: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -568,16 +570,21 @@ impl InMemoryStorage {
         self.modes.lock().unwrap().get(conv_id).cloned()
     }
 
+    pub fn set_fail_project_instruction_activation(&self, fail: bool) {
+        *self.fail_project_instruction_activation.lock().unwrap() = fail;
+    }
+
     pub fn queue_project_instruction_bundle(
         &self,
         conv_id: &str,
         bundle: phoenix_core::domain::project_instruction_bundle::NewProjectInstructionBundle,
-    ) {
+    ) -> String {
         use phoenix_core::domain::project_instruction_bundle::{
             ProjectInstructionBundle, ProjectInstructionBundleRole,
         };
+        let queued_id = uuid::Uuid::new_v4().to_string();
         let queued = ProjectInstructionBundle {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: queued_id.clone(),
             conversation_id: conv_id.to_string(),
             role: ProjectInstructionBundleRole::Queued,
             estimated_tokens: bundle.estimated_tokens,
@@ -591,6 +598,7 @@ impl InMemoryStorage {
             .entry(conv_id.to_string())
             .or_default()
             .queued = Some(queued);
+        queued_id
     }
 
     /// Get all messages for a conversation
@@ -992,6 +1000,7 @@ impl StateStore for InMemoryStorage {
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,
+        expected_queued_bundle_id: &str,
         sequence_id: i64,
     ) -> Result<
         Option<phoenix_core::domain::project_instruction_bundle::ProjectInstructionActivation>,
@@ -1000,12 +1009,17 @@ impl StateStore for InMemoryStorage {
         use phoenix_core::domain::project_instruction_bundle::{
             ProjectInstructionActivation, ProjectInstructionBundleRole,
         };
+        if *self.fail_project_instruction_activation.lock().unwrap() {
+            return Err("injected project instruction activation failure".into());
+        }
         let mut bundles = self.project_instruction_bundles.lock().unwrap();
         let mut messages = self.messages.lock().unwrap();
         let entry = bundles.entry(conv_id.to_string()).or_default();
-        let Some(mut queued) = entry.queued.take() else {
+        if entry.queued.as_ref().map(|bundle| bundle.id.as_str()) != Some(expected_queued_bundle_id)
+        {
             return Ok(None);
-        };
+        }
+        let mut queued = entry.queued.take().expect("queued bundle checked above");
         queued.role = ProjectInstructionBundleRole::Active;
         entry.active = Some(queued);
         entry.transcript_generation += 1;
@@ -1185,6 +1199,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .expect("Failed to send message");
@@ -1477,6 +1492,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1599,6 +1615,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1702,6 +1719,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -1819,6 +1837,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2542,6 +2561,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2656,6 +2676,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -2800,6 +2821,7 @@ mod tests {
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: None,
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 })
                 .await
                 .unwrap();
@@ -3233,6 +3255,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();
@@ -3281,6 +3304,7 @@ mod tests {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             })
             .await
             .unwrap();

@@ -37,6 +37,7 @@ pub struct ProjectGuidanceSnapshot {
 pub struct ProjectSkillSnapshot {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub source_label: String,
     /// Exact `SKILL.md` instruction body with YAML frontmatter removed.
     pub body: String,
@@ -236,6 +237,7 @@ mod tests {
                 .map(|(name, hash)| ProjectSkillSnapshot {
                     name: (*name).into(),
                     description: format!("secret-{name}"),
+                    argument_hint: None,
                     source_label: "test".into(),
                     body: format!("body-{name}"),
                     base_dir: "/test/skill".into(),

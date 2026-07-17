@@ -757,13 +757,14 @@ async fn insert_project_instruction_bundle_tx(
             .map_err(|_| DbError::Serialization("skill ordinal exceeds i64".to_string()))?;
         sqlx::query(
             "INSERT INTO project_instruction_skills
-             (bundle_id, ordinal, name, description, source_label, body, base_dir, source_path, content_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (bundle_id, ordinal, name, description, argument_hint, source_label, body, base_dir, source_path, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(id)
         .bind(ordinal)
         .bind(&skill.name)
         .bind(&skill.description)
+        .bind(&skill.argument_hint)
         .bind(&skill.source_label)
         .bind(&skill.body)
         .bind(&skill.base_dir)
@@ -2516,14 +2517,16 @@ impl Database {
     pub async fn activate_queued_project_instruction_bundle(
         &self,
         conversation_id: &str,
+        expected_queued_bundle_id: &str,
         sequence_id: i64,
     ) -> DbResult<Option<ProjectInstructionActivation>> {
         let mut tx = self.pool.begin().await?;
         let queued_id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM project_instruction_bundles
-             WHERE conversation_id = ?1 AND role = 'queued'",
+             WHERE conversation_id = ?1 AND role = 'queued' AND id = ?2",
         )
         .bind(conversation_id)
+        .bind(expected_queued_bundle_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(queued_id) = queued_id else {
@@ -2621,7 +2624,7 @@ impl Database {
         })
         .collect();
         let skills = sqlx::query(
-            "SELECT name, description, source_label, body, base_dir, source_path, content_hash
+            "SELECT name, description, argument_hint, source_label, body, base_dir, source_path, content_hash
              FROM project_instruction_skills WHERE bundle_id = ?1 ORDER BY ordinal",
         )
         .bind(&id)
@@ -2631,6 +2634,7 @@ impl Database {
         .map(|row| ProjectSkillSnapshot {
             name: row.get("name"),
             description: row.get("description"),
+            argument_hint: row.get("argument_hint"),
             source_label: row.get("source_label"),
             body: row.get("body"),
             base_dir: row.get("base_dir"),
@@ -4542,7 +4546,8 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         let rows = sqlx::query(
-            "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir
+            "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir,
+                    expected_queued_project_instruction_bundle_id
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
@@ -4600,6 +4605,8 @@ impl Database {
                 message_id,
                 user_agent: row.try_get("user_agent")?,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id: row
+                    .try_get("expected_queued_project_instruction_bundle_id")?,
             });
         }
         tx.commit().await?;
@@ -7983,8 +7990,8 @@ async fn insert_steering_entry_tx(
     sqlx::query(
         "INSERT INTO steering_messages
             (message_id, conversation_id, ordinal, text, llm_text, user_agent,
-             skill_name, skill_body, skill_dir)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             skill_name, skill_body, skill_dir, expected_queued_project_instruction_bundle_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(&entry.message_id)
     .bind(conversation_id)
@@ -7995,6 +8002,7 @@ async fn insert_steering_entry_tx(
     .bind(skill_name)
     .bind(skill_body)
     .bind(skill_dir)
+    .bind(&entry.expected_queued_project_instruction_bundle_id)
     .execute(&mut **tx)
     .await?;
     for (file_ordinal, file) in entry.files.iter().enumerate() {
@@ -8691,6 +8699,7 @@ mod tests {
             skills: vec![ProjectSkillSnapshot {
                 name: format!("skill-{label}"),
                 description: format!("description-{label}"),
+                argument_hint: Some(format!("<arg-{label}>")),
                 source_label: format!("source-{label}"),
                 body: format!("body-{label}"),
                 base_dir: format!("/skills/{label}"),
@@ -8834,7 +8843,7 @@ mod tests {
             .await
             .unwrap();
         let activation = db
-            .activate_queued_project_instruction_bundle("bundle-queue", 17)
+            .activate_queued_project_instruction_bundle("bundle-queue", &reviewed.id, 17)
             .await
             .unwrap()
             .unwrap();
@@ -12397,6 +12406,7 @@ mod tests {
             message_id: "sa".into(),
             user_agent: Some("UA".into()),
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: Some("bundle-a".into()),
         };
         let entry_b = SteerEntry {
             text: "second".into(),
@@ -12410,6 +12420,7 @@ mod tests {
                 body: "BODY".into(),
                 skill_dir: "/skills/build".into(),
             }),
+            expected_queued_project_instruction_bundle_id: None,
         };
         db.update_steering_queue("conv-s", &[entry_a, entry_b])
             .await
@@ -12419,6 +12430,12 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].message_id, "sa");
         assert_eq!(queue[0].llm_text.as_deref(), Some("first-expanded"));
+        assert_eq!(
+            queue[0]
+                .expected_queued_project_instruction_bundle_id
+                .as_deref(),
+            Some("bundle-a")
+        );
         assert_eq!(queue[0].images.len(), 1);
         assert_eq!(queue[0].files[0].original_name, "a.txt");
         assert!(queue[0].skill_invocation.is_none());

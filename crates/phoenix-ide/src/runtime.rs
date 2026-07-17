@@ -746,6 +746,15 @@ impl SseBroadcaster {
         self.send_with_ring(event, seq, RingOp::Append)
     }
 
+    /// Fill an already-reserved sequence with a replayable ephemeral event.
+    pub fn send_reserved_seq(
+        &self,
+        seq: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send_with_ring(build(seq), seq, RingOp::Append)
+    }
+
     /// Broadcast a persisted `Message` event using the DB-allocated
     /// `message.sequence_id`, advance the broadcaster's counter, AND reset
     /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
@@ -2441,6 +2450,7 @@ impl RuntimeManager {
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: Some("Phoenix Sub-Agent".to_string()),
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 })
                 .await;
 
@@ -3018,6 +3028,7 @@ impl RuntimeManager {
             ref message_id,
             ref user_agent,
             ref skill_invocation,
+            ref expected_queued_project_instruction_bundle_id,
         } = event
         else {
             return Err("enqueue_steer_message expects Event::SteerMessage".into());
@@ -3032,6 +3043,8 @@ impl RuntimeManager {
             message_id: message_id.clone(),
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),
+            expected_queued_project_instruction_bundle_id:
+                expected_queued_project_instruction_bundle_id.clone(),
         };
         let db = self.db();
         let mut queue = db

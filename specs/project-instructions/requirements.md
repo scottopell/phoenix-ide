@@ -79,15 +79,17 @@ Activation SHALL atomically preserve conversation history, persist a visible con
 
 A rejected user message SHALL NOT activate the queued bundle, advance transcript generation, or add an activation timeline event.
 
+Each accepted user-authored turn SHALL be bound to the exact queued bundle used for slash expansion, or explicitly to the active bundle when no queue existed. Activation SHALL compare-and-swap that expected bundle ID before any turn effects. If the queue was removed or replaced, the system SHALL reject the turn rather than execute an expansion from one bundle under another bundle, and SHALL emit a sequenced resynchronization error without leaving an SSE sequence gap.
+
 ### REQ-PI-007 — Durable Recovery
 
 WHEN Phoenix restarts
-THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles, including captured skill bodies and invocation paths,
+THE SYSTEM SHALL recover the exact active, queued, and newer candidate bundles, including captured skill bodies, invocation paths, and argument hints,
 AND SHALL preserve the same activation boundary and source manifest.
 
 The system-prompt inspection surface SHALL render the persisted active bundle rather than rediscovering mutable filesystem sources.
 
-The conversation-scoped skill-catalog endpoint SHALL return skill metadata from the persisted active bundle rather than rediscovering mutable filesystem sources. The directory-scoped project skill endpoint used before conversation creation SHALL remain live discovery of the requested project directory.
+The conversation-scoped skill-catalog endpoint SHALL return skill metadata, including argument hints, from the persisted active bundle rather than rediscovering mutable filesystem sources. The directory-scoped project skill endpoint used before conversation creation SHALL remain live discovery of the requested project directory.
 
 WHEN a conversation predates project-instruction snapshots
 THE SYSTEM SHALL resolve and persist its initial bundle before its next model request without dropping or rewriting conversation history.

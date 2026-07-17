@@ -798,6 +798,7 @@ async fn provision_conversation(
             message_id,
             user_agent: None,
             skill_invocation,
+            expected_queued_project_instruction_bundle_id: None,
         },
     };
     manager

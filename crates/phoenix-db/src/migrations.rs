@@ -241,6 +241,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_project_instruction_bundles",
         sql: MIGRATION_045,
     },
+    Migration {
+        version: 46,
+        name: "add_project_skill_argument_hints_and_steer_bundle_binding",
+        sql: MIGRATION_046,
+    },
 ];
 
 const MIGRATION_044: &str = r"
@@ -592,6 +597,11 @@ WHERE 1 = (
 );
 
 DROP TABLE work_scope_pr_feedback_baselines_old;
+";
+
+const MIGRATION_046: &str = r"
+ALTER TABLE project_instruction_skills ADD COLUMN argument_hint TEXT;
+ALTER TABLE steering_messages ADD COLUMN expected_queued_project_instruction_bundle_id TEXT;
 ";
 
 const MIGRATION_045: &str = r"

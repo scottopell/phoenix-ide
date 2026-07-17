@@ -33,6 +33,7 @@ value SourceChange {
 
 value SkillSnapshot {
     name: String
+    argument_hint: String?
     body: String
     base_dir: String
     source_path: String
@@ -142,11 +143,12 @@ rule PreserveQueueWhenSourcesChangeAgain {
 }
 
 rule ActivateBeforeNextUserTurn {
-    when: UserAuthoredTurnStarting(conversation_id)
+    when: UserAuthoredTurnStarting(conversation_id, expected_queued_snapshot_id)
     for instructions in ProjectInstructions
         where instructions.conversation_id = conversation_id:
         requires: instructions.queued != null
         let queued = instructions.queued
+        requires: instructions.queued.id = expected_queued_snapshot_id
         let generation = instructions.transcript_generation
         ensures: instructions.active = queued
         ensures: instructions.queued = null
@@ -156,6 +158,16 @@ rule ActivateBeforeNextUserTurn {
         ensures: ProviderContinuationInvalidated(conversation_id)
         ensures: DurableContentFreeSystemTimelineEventPersisted(conversation_id)
         ensures: TimelineEventExcludedFromModelContext(conversation_id)
+}
+
+rule RejectTurnWhenExpectedQueueChanged {
+    when: UserAuthoredTurnStarting(conversation_id, expected_queued_snapshot_id)
+    for instructions in ProjectInstructions
+        where instructions.conversation_id = conversation_id:
+        requires: instructions.queued = null or instructions.queued.id != expected_queued_snapshot_id
+        ensures: UserAuthoredTurnRejected(conversation_id)
+        ensures: SequencedResynchronizationErrorEmitted(conversation_id)
+        ensures: NoSseSequenceGap(conversation_id)
 }
 
 rule KeepActiveSnapshotThroughToolLoop {

@@ -687,6 +687,7 @@ pub fn transition_core(
                 message_id,
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id: _,
             },
         ) => Ok(
             CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
@@ -1672,6 +1673,8 @@ fn creation_provisioned_transition(
             message_id: initial_message.message_id,
             user_agent: initial_message.user_agent,
             skill_invocation: initial_message.skill_invocation,
+            expected_queued_project_instruction_bundle_id: initial_message
+                .expected_queued_project_instruction_bundle_id,
         },
     )?;
     for effect in &mut result.effects {
@@ -4167,6 +4170,7 @@ mod tests {
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
         )
         .unwrap();
@@ -4194,6 +4198,7 @@ mod tests {
             message_id: "creation-message-id".to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         };
         let from_provisioning = transition(
             &ConvState::Provisioning {
@@ -4219,6 +4224,7 @@ mod tests {
                 message_id: message.message_id,
                 user_agent: message.user_agent,
                 skill_invocation: message.skill_invocation,
+                expected_queued_project_instruction_bundle_id: None,
             },
         )
         .unwrap();
@@ -4333,6 +4339,7 @@ mod tests {
                     message_id: "creation-message-id".to_string(),
                     user_agent: None,
                     skill_invocation: None,
+                    expected_queued_project_instruction_bundle_id: None,
                 },
             },
         );
@@ -4358,6 +4365,7 @@ mod tests {
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
         );
 
@@ -4381,6 +4389,7 @@ mod tests {
                 message_id: "test-message-id".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
         )
         .unwrap();
@@ -5782,6 +5791,7 @@ mod tests {
                 message_id: "msg-1".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
         );
 
@@ -5818,6 +5828,7 @@ mod tests {
                 message_id: "msg-1".to_string(),
                 user_agent: None,
                 skill_invocation: None,
+                expected_queued_project_instruction_bundle_id: None,
             },
         )
         .unwrap();
@@ -5978,6 +5989,7 @@ mod tests {
             message_id: id.to_string(),
             user_agent: None,
             skill_invocation: None,
+            expected_queued_project_instruction_bundle_id: None,
         }
     }
 

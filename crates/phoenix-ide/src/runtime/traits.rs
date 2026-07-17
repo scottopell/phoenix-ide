@@ -224,6 +224,7 @@ pub trait StateStore: Send + Sync {
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,
+        expected_queued_bundle_id: &str,
         sequence_id: i64,
     ) -> Result<Option<ProjectInstructionActivation>, String>;
 
@@ -547,10 +548,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,
+        expected_queued_bundle_id: &str,
         sequence_id: i64,
     ) -> Result<Option<ProjectInstructionActivation>, String> {
         (**self)
-            .activate_queued_project_instruction_bundle(conv_id, sequence_id)
+            .activate_queued_project_instruction_bundle(
+                conv_id,
+                expected_queued_bundle_id,
+                sequence_id,
+            )
             .await
     }
 
@@ -919,10 +925,15 @@ impl StateStore for DatabaseStorage {
     async fn activate_queued_project_instruction_bundle(
         &self,
         conv_id: &str,
+        expected_queued_bundle_id: &str,
         sequence_id: i64,
     ) -> Result<Option<ProjectInstructionActivation>, String> {
         self.db
-            .activate_queued_project_instruction_bundle(conv_id, sequence_id)
+            .activate_queued_project_instruction_bundle(
+                conv_id,
+                expected_queued_bundle_id,
+                sequence_id,
+            )
             .await
             .map_err(|e| e.to_string())
     }

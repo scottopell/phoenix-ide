@@ -288,6 +288,7 @@ async fn drive_conversation(
                 message_id,
                 user_agent: Some("drive-turn".into()),
                 skill_invocation: expanded.skill_invocation,
+                expected_queued_project_instruction_bundle_id: None,
             },
         )
         .await

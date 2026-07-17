@@ -16,6 +16,7 @@ pub struct SteerEntry {
     pub message_id: String,
     pub user_agent: Option<String>,
     pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    pub expected_queued_project_instruction_bundle_id: Option<Box<str>>,
 }
 
 use crate::domain::llm_types::{ContentBlock, Usage};
@@ -44,6 +45,8 @@ pub enum Event {
         /// If this message triggered a skill invocation, the details are here.
         /// When present, the message is persisted as `MessageContent::Skill`.
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+        /// Exact queued snapshot used for expansion; `None` binds the turn to the active snapshot.
+        expected_queued_project_instruction_bundle_id: Option<Box<str>>,
     },
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
@@ -217,6 +220,8 @@ pub enum Event {
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+        /// Exact queued snapshot used for expansion; `None` binds the turn to the active snapshot.
+        expected_queued_project_instruction_bundle_id: Option<Box<str>>,
     },
     /// Removes a steering entry from the executor's in-memory queue.
     /// Intercepted by the executor before reaching the state machine.
@@ -308,6 +313,8 @@ pub enum CoreEvent {
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+        /// Exact queued snapshot used for expansion; `None` binds the turn to the active snapshot.
+        expected_queued_project_instruction_bundle_id: Option<Box<str>>,
     },
     UserCancel {
         reason: Option<String>,
@@ -411,6 +418,7 @@ pub enum ParentEvent {
 /// Combined event type for sub-agent conversations.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
+#[allow(clippy::large_enum_variant)]
 pub enum SubAgentEvent {
     Core(CoreEvent),
     SubAgent(SubAgentOnlyEvent),
@@ -455,6 +463,7 @@ impl TryFrom<Event> for ParentEvent {
                 message_id,
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             } => Ok(ParentEvent::Core(CoreEvent::UserMessage {
                 text,
                 llm_text,
@@ -463,6 +472,7 @@ impl TryFrom<Event> for ParentEvent {
                 message_id,
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             })),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
@@ -612,6 +622,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 message_id,
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             } => Ok(SubAgentEvent::Core(CoreEvent::UserMessage {
                 text,
                 llm_text,
@@ -620,6 +631,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 message_id,
                 user_agent,
                 skill_invocation,
+                expected_queued_project_instruction_bundle_id,
             })),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",

@@ -105,6 +105,7 @@ mod tests {
                 phoenix_core::domain::project_instruction_bundle::ProjectSkillSnapshot {
                     name: skill.name,
                     description: skill.description,
+                    argument_hint: None,
                     source_label: "test".into(),
                     body,
                     base_dir,
