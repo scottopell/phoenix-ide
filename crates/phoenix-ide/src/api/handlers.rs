@@ -3450,7 +3450,7 @@ async fn upload_conversation_attachments(
 }
 
 async fn send_chat(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
@@ -3477,7 +3477,9 @@ async fn send_chat(
                 AppError::BadRequest(message)
             }
             crate::send_chat_service::SendChatServiceError::Expansion {
-                message, error_type, reference,
+                message,
+                error_type,
+                reference,
             } => AppError::UnprocessableEntity(ExpansionErrorResponse {
                 error: message,
                 error_type: error_type.to_string(),
