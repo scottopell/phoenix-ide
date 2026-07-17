@@ -309,6 +309,13 @@ describe('typed semantic display projections', () => {
     expect(line?.fragmentId.length).toBeLessThan(64);
   });
 
+  it('omits the hidden result path from legacy read_file projections', () => {
+    const legacy = buildReadFileOutputProjection('plain alpha', { path: 'src/hidden-path.ts' });
+    expect(legacy.fragments.some((fragment) => fragment.kind === 'path')).toBe(false);
+    expect(legacy.fullText).not.toContain('src/hidden-path.ts');
+    expect(legacy.fullText).toContain('plain alpha');
+  });
+
   it('projects agent prose from rendered Markdown text, not source-only syntax', () => {
     const fragments = buildAgentTextFragments([
       { type: 'text', text: 'Read **bold docs** at [the guide](https://example.test/secret-url).' },
@@ -317,6 +324,14 @@ describe('typed semantic display projections', () => {
     expect(fragments[0]?.semanticText).toBe('Read bold docs at the guide.');
     expect(fragments[0]?.semanticText).not.toContain('https://');
     expect(fragments[0]?.display.sourceText).toContain('[the guide]');
+  });
+
+  it('keeps hidden link destinations out of active rendered occurrence order', () => {
+    const fragments = buildAgentTextFragments([
+      { type: 'text', text: '[label](https://example.test/label) label' },
+    ], 'full', { forSearch: true });
+
+    expect(fragments[0]?.semanticText).toBe('label label');
   });
 
   it('does not parse Markdown when building ordinary render fragments', () => {
@@ -437,12 +452,26 @@ describe('owned ordinary-message sources', () => {
     const projection = buildConversationSearchProjection(units, 'alpha', { density: 'full' });
 
     expect(projection.matches).toHaveLength(4);
+    expect(projection.sources.every((source) => source.fragmentId === 'message-text')).toBe(true);
     expect(projection.sources.map((source) => source.revealTarget)).toEqual([
       { kind: 'message-text', fragmentId: 'message-text' },
       { kind: 'message-text', fragmentId: 'message-text' },
       { kind: 'message-text', fragmentId: 'message-text' },
       { kind: 'message-text', fragmentId: 'message-text' },
     ]);
+  });
+
+  it('projects attachment filenames as separate owned fragments', () => {
+    const user = systemMsg('user-files', 'body without filename');
+    user.message_type = 'user';
+    user.content = { text: 'body without filename', files: [{ original_name: 'alpha-report.txt', size_bytes: 12, media_type: 'text/plain', stored_path: '/tmp/alpha-report.txt' }] };
+    const projection = buildConversationSearchProjection([{ kind: 'user', key: 'user-files', message: user }], 'alpha-report', { density: 'full' });
+
+    expect(projection.matches).toHaveLength(1);
+    expect(projection.sources.find((source) => source.fragmentId === 'message-attachment-0')?.revealTarget).toEqual({
+      kind: 'message-attachment', fragmentId: 'message-attachment-0',
+    });
+    expect(projection.sources.find((source) => source.fragmentId === 'message-text')?.text).toBe('body without filename');
   });
 });
 
@@ -954,9 +983,12 @@ describe('buildConversationSearchProjection', () => {
 
     const projection = buildConversationSearchProjection(units, 'alpha');
     expect(projection.sources.map((source) => [source.unitKind, source.role, source.text])).toEqual([
-      ['user', 'user-message', 'User alpha\nalpha.txt'],
-      ['pending_user', 'pending-user-message', 'Pending alpha\nqueued-alpha.md'],
-      ['skill', 'skill-message', '/dogfood alpha --trace\nalpha.txt'],
+      ['user', 'user-message', 'User alpha'],
+      ['user', 'user-message-attachment-0', 'alpha.txt'],
+      ['pending_user', 'pending-user-message', 'Pending alpha'],
+      ['pending_user', 'pending-user-message-attachment-0', 'queued-alpha.md'],
+      ['skill', 'skill-message', '/dogfood alpha --trace'],
+      ['skill', 'skill-message-attachment-0', 'alpha.txt'],
       ['system', 'system-message', 'System alpha'],
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-input-1', '"alpha" in src'],

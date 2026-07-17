@@ -1237,7 +1237,7 @@ describe('agent Markdown find activation', () => {
     );
 
     expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')?.textContent).toBe('guide');
-    expect(container.querySelector('[data-fragment-id="agent-text-0"]')?.textContent).toContain('[the guide](https://example.test/hidden)');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')?.textContent).toBe('Read bold docs at the guide.');
   });
 });
 
@@ -1254,6 +1254,24 @@ describe('ordinary message find highlighting', () => {
     );
 
     expect(container.querySelector('[data-fragment-id="message-text"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
+  });
+
+  it('marks attachment matches in the owned filename chip', () => {
+    const message = {
+      ...agentMessage('user-file-find', []),
+      message_type: 'user',
+      content: { text: 'body', files: [{ original_name: 'alpha-report.txt', size_bytes: 12 }] },
+    } as Message;
+    const { container } = render(
+      <MemoryRouter>
+        <UserMessage
+          message={message}
+          activeHighlight={{ owner: 'message-attachment', fragmentId: 'message-attachment-0', start: 0, end: 5 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="message-attachment-0"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
   });
 });
 
@@ -2309,7 +2327,7 @@ describe('compact tool summaries', () => {
     const results = new Map<string, Message>([
       ['tool-read', toolMessage('tool-read', '     1\thidden token')],
     ]);
-    const fragmentId = buildReadFileOutputProjection('     1\thidden token', { path: 'src/hidden.ts' }).fragments[1]!.fragmentId;
+    const fragmentId = buildReadFileOutputProjection('     1\thidden token', { path: 'src/hidden.ts' }, { toolUseId: 'tool-read' }).fragments[1]!.fragmentId;
     const revealRequest = {
       nonce: 1,
       unitKey: 'unit-1',
@@ -2350,7 +2368,7 @@ describe('compact tool summaries', () => {
       ['read-a', toolMessage('read-a', '     1\tsame token')],
       ['read-b', toolMessage('read-b', '     1\tsame token')],
     ]);
-    const fragmentId = buildReadFileOutputProjection('     1\tsame token', { path: 'b.ts' }).fragments[1]!.fragmentId;
+    const fragmentId = buildReadFileOutputProjection('     1\tsame token', { path: 'b.ts' }, { toolUseId: 'read-b' }).fragments[1]!.fragmentId;
 
     const { container } = render(
       <MemoryRouter>

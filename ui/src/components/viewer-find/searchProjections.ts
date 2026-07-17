@@ -203,6 +203,11 @@ export interface KeywordSearchRevealTarget {
   toolUseId: string;
 }
 
+export interface MessageAttachmentRevealTarget {
+  kind: 'message-attachment';
+  fragmentId: string;
+}
+
 export interface MessageTextRevealTarget {
   kind: 'message-text';
   fragmentId: string;
@@ -228,6 +233,7 @@ export interface ConversationTextFragmentRevealTarget {
 export type ConversationFragmentRevealTarget =
   | ConversationTextFragmentRevealTarget
   | MessageTextRevealTarget
+  | MessageAttachmentRevealTarget
   | ToolUseInputRevealTarget
   | CommissionReviewResultRevealTarget
   | SearchResultRevealTarget
@@ -660,17 +666,17 @@ export function buildConversationSearchProjection(
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
       case 'user':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
+        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'user-message', userMessageParts(unit.message));
         break;
       case 'pending_user':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
+        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'pending-user-message', queuedMessageParts(unit.message));
         break;
       case 'skill':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
+        addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'skill-message', skillMessageParts(unit.message));
         break;
       case 'system':
         if (!isHiddenSystemMessage(unit.message)) {
-          addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageText(unit.message), 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
+          addConversationMessageSources(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageParts(unit.message));
         }
         break;
       case 'agent_turn':
@@ -797,43 +803,43 @@ function addConversationSource(
   });
 }
 
-function userMessageText(message: Message): string {
-  if (typeof message.content === 'string') return message.content;
+function addConversationMessageSources(
+  sources: ConversationSearchSource[],
+  unitIndex: number,
+  unitKind: RenderUnit['kind'],
+  unitKey: string,
+  role: string,
+  parts: { text: string; attachments: string[] },
+): void {
+  if (parts.text) addConversationSource(sources, unitIndex, unitKind, unitKey, role, parts.text, 'message-text', { kind: 'message-text', fragmentId: 'message-text' });
+  parts.attachments.forEach((name, index) => {
+    const fragmentId = `message-attachment-${index}`;
+    addConversationSource(sources, unitIndex, unitKind, unitKey, `${role}-attachment-${index}`, name, fragmentId, { kind: 'message-attachment', fragmentId });
+  });
+}
+
+function userMessageParts(message: Message): { text: string; attachments: string[] } {
+  if (typeof message.content === 'string') return { text: message.content, attachments: [] };
   const content = message.content as { text?: string; files?: Array<{ original_name?: string }> };
-  const parts: string[] = [];
-  if (typeof content.text === 'string' && content.text.length > 0) parts.push(content.text);
-  for (const file of content.files ?? []) {
-    if (typeof file.original_name === 'string' && file.original_name.length > 0) parts.push(file.original_name);
-  }
-  return parts.join('\n');
-}
-
-function skillMessageText(message: Message): string {
-  const content = message.content as {
-    text?: string;
-    name?: string;
-    trigger?: string;
-    args?: string;
-    source?: string;
-    snippet?: string;
-    files?: Array<{ original_name?: string }>;
+  return {
+    text: typeof content.text === 'string' ? content.text : '',
+    attachments: (content.files ?? []).flatMap((file) => typeof file.original_name === 'string' && file.original_name ? [file.original_name] : []),
   };
-  const parts: string[] = [];
-  const trigger = typeof content.trigger === 'string' && content.trigger.trim().length > 0
-    ? content.trigger.trim()
-    : [content.name ? `/${content.name}` : '', typeof content.args === 'string' ? content.args.trim() : '']
-      .filter((part) => part.length > 0)
-      .join(' ');
-  if (trigger.length > 0) parts.push(trigger);
-  for (const file of content.files ?? []) {
-    if (typeof file.original_name === 'string' && file.original_name.length > 0) parts.push(file.original_name);
-  }
-  return parts.join('\n');
 }
 
-function queuedMessageText(message: QueuedMessage): string {
-  const parts = [message.text, ...(message.files ?? []).map((file) => file.original_name)];
-  return parts.filter((part) => part.length > 0).join('\n');
+function skillMessageParts(message: Message): { text: string; attachments: string[] } {
+  const content = message.content as { name?: string; trigger?: string; args?: string; files?: Array<{ original_name?: string }> };
+  const text = typeof content.trigger === 'string' && content.trigger.trim()
+    ? content.trigger.trim()
+    : [content.name ? `/${content.name}` : '', typeof content.args === 'string' ? content.args.trim() : ''].filter(Boolean).join(' ');
+  return {
+    text,
+    attachments: (content.files ?? []).flatMap((file) => typeof file.original_name === 'string' && file.original_name ? [file.original_name] : []),
+  };
+}
+
+function queuedMessageParts(message: QueuedMessage): { text: string; attachments: string[] } {
+  return { text: message.text, attachments: (message.files ?? []).map((file) => file.original_name) };
 }
 
 function isHiddenSystemMessage(message: Message): boolean {
@@ -917,7 +923,8 @@ function buildReadFileProjectionFragments(
   };
   const fragments: ReadFileFragment[] = [];
   const windowLabel = readFileWindowLabel(input);
-  if (path.length > 0) {
+  const hasStructuredDisplay = options.toolUseId !== undefined && options.toolUseId !== null;
+  if (path.length > 0 && hasStructuredDisplay) {
     const pathText = windowLabel ? `${path}:${windowLabel}` : path;
     fragments.push({
       fragmentId: 'read-file-path',

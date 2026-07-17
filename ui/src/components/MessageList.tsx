@@ -163,13 +163,27 @@ function formatAttachmentBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function SkillFileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+function SkillFileChips({
+  files,
+  activeHighlight = null,
+}: {
+  files: { original_name: string; size_bytes: number; stored_path?: string }[];
+  activeHighlight?: ConversationHighlight | null;
+}) {
   if (files.length === 0) return null;
   return (
     <div className="message-files">
       {files.map((file, idx) => (
-        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
-          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        <span
+          key={`${file.stored_path ?? file.original_name}-${idx}`}
+          className="message-file-chip"
+          title={file.stored_path}
+          data-fragment-id={`message-attachment-${idx}`}
+        >
+          📎 {activeHighlight?.owner === 'message-attachment' && activeHighlight.fragmentId === `message-attachment-${idx}`
+            ? renderHighlightedText(file.original_name, activeHighlight.start, activeHighlight.end)
+            : file.original_name}{' '}
+          <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
         </span>
       ))}
     </div>
@@ -230,7 +244,7 @@ function renderHistoricalUnit(
                 ? renderHighlightedText(trigger, activeHighlight.start, activeHighlight.end)
                 : <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />}
             </span>
-            <SkillFileChips files={c.files ?? []} />
+            <SkillFileChips files={c.files ?? []} activeHighlight={activeHighlight} />
           </div>
         </div>
       );
@@ -524,8 +538,10 @@ function MessageListImpl({
       start: activeFindMatch.start,
       end: activeFindMatch.end,
     };
-    return activeFindRevealTarget.kind === 'message-text'
-      ? { ...range, owner: 'message-text' }
+    return activeFindRevealTarget.kind === 'message-attachment'
+      ? { ...range, owner: 'message-attachment' }
+      : activeFindRevealTarget.kind === 'message-text'
+        ? { ...range, owner: 'message-text' }
       : activeFindRevealTarget.kind === 'agent-text'
         ? { ...range, owner: 'agent-text' }
       : activeFindRevealTarget.kind === 'tool-use-input'
@@ -1271,6 +1287,7 @@ function MessageListImpl({
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (
                 activeFindRevealTarget?.kind === 'agent-text'
+                || activeFindRevealTarget?.kind === 'message-attachment'
                 || activeFindRevealTarget?.kind === 'message-text'
                 || activeFindRevealTarget?.kind === 'tool-use-input'
                 || activeFindRevealTarget?.kind === 'tool-result-read-file'

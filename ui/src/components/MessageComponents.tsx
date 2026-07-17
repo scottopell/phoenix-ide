@@ -353,13 +353,27 @@ function formatAttachmentBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function FileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+function FileChips({
+  files,
+  activeHighlight = null,
+}: {
+  files: { original_name: string; size_bytes: number; stored_path?: string }[];
+  activeHighlight?: ConversationHighlight | null;
+}) {
   if (files.length === 0) return null;
   return (
     <div className="message-files">
       {files.map((file, idx) => (
-        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
-          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        <span
+          key={`${file.stored_path ?? file.original_name}-${idx}`}
+          className="message-file-chip"
+          title={file.stored_path}
+          data-fragment-id={`message-attachment-${idx}`}
+        >
+          📎 {activeHighlight?.owner === 'message-attachment' && activeHighlight.fragmentId === `message-attachment-${idx}`
+            ? renderHighlightedText(file.original_name, activeHighlight.start, activeHighlight.end)
+            : file.original_name}{' '}
+          <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
         </span>
       ))}
     </div>
@@ -410,7 +424,7 @@ function UserMessageImpl({ message, activeHighlight = null }: { message: Message
             ))}
           </div>
         )}
-        <FileChips files={files} />
+        <FileChips files={files} activeHighlight={activeHighlight} />
       </div>
     </div>
   );
@@ -473,7 +487,7 @@ function QueuedUserMessageImpl({
             ))}
           </div>
         )}
-        <FileChips files={message.files ?? []} />
+        <FileChips files={message.files ?? []} activeHighlight={activeHighlight} />
       </div>
     </div>
   );
@@ -482,32 +496,6 @@ function QueuedUserMessageImpl({
 // ============================================================================
 // Compact-density helpers
 // ============================================================================
-
-function mapRenderedHighlightToSource(
-  sourceText: string,
-  renderedText: string,
-  start: number,
-  end: number,
-): { start: number; end: number } | null {
-  const needle = renderedText.slice(start, end);
-  if (!needle) return null;
-  const renderedPrefix = renderedText.slice(0, start).toLocaleLowerCase();
-  const normalizedNeedle = needle.toLocaleLowerCase();
-  let occurrence = 0;
-  let renderedCursor = 0;
-  while ((renderedCursor = renderedPrefix.indexOf(normalizedNeedle, renderedCursor)) !== -1) {
-    occurrence += 1;
-    renderedCursor += normalizedNeedle.length;
-  }
-  const normalizedSource = sourceText.toLocaleLowerCase();
-  let sourceCursor = 0;
-  for (let index = 0; index <= occurrence; index += 1) {
-    sourceCursor = normalizedSource.indexOf(normalizedNeedle, sourceCursor);
-    if (sourceCursor === -1) return null;
-    if (index < occurrence) sourceCursor += normalizedNeedle.length;
-  }
-  return { start: sourceCursor, end: sourceCursor + needle.length };
-}
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
@@ -638,6 +626,7 @@ export interface AgentTextHighlight {
 
 export type ConversationHighlight = AgentTextHighlight & (
   | { owner: 'message-text' }
+  | { owner: 'message-attachment' }
   | { owner: 'agent-text' }
   | { owner: 'tool-input'; toolUseId: string }
   | { owner: 'tool-result'; toolUseId: string }
@@ -837,9 +826,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     const highlightedSemanticText = highlight
       ? buildMarkdownDisplayBlocks(fragment.display.sourceText).map((block) => block.searchableText).join('\n') || fragment.display.sourceText
       : fragment.semanticText;
-    const sourceHighlight = highlight
-      ? mapRenderedHighlightToSource(fragment.display.sourceText, highlightedSemanticText, highlight.start, highlight.end)
-      : null;
+
     if (!expanded) {
       return (
         <CollapsibleText
@@ -854,9 +841,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     return (
       <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
         <div className="agent-text-block">
-          {highlight && sourceHighlight ? (
+          {highlight ? (
             <div className="viewer-find-inline-highlight" data-active-fragment-highlight>
-              {renderHighlightedText(fragment.display.sourceText, sourceHighlight.start, sourceHighlight.end)}
+              {renderHighlightedText(highlightedSemanticText, highlight.start, highlight.end)}
             </div>
           ) : (
             <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
