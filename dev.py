@@ -215,7 +215,6 @@ LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
 LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
-LAUNCHD_OVERRIDE_PATH = Path.home() / ".phoenix-ide" / "launchd-overrides.json"
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -6429,92 +6428,11 @@ def _bind_is_loopback(effective_env: dict[str, str]) -> bool:
         return False  # binary falls back to 0.0.0.0 on an invalid value
 
 
-def _systemd_override_env() -> dict[str, str]:
-    """Environment values systemd applies from drop-in `*.conf` overrides
-    (written by `./dev.py prod set`), layered on top of the unit's
-    EnvironmentFile. These reach the running service, so the deploy preflight
-    must honour them when deciding whether auth is configured — otherwise an
-    operator who set PHOENIX_PASSWORD via `prod set` is wrongly refused."""
-    env: dict[str, str] = {}
-    for _name, content in list_systemd_overrides():
-        for raw in content.splitlines():
-            line = raw.strip()
-            if line.startswith("Environment="):
-                kv = line[len("Environment=") :].strip().strip('"')
-                key, sep, value = kv.partition("=")
-                if key and sep:
-                    env[key.strip()] = value
-    return env
-
-
-_GENERATED_LAUNCHD_ENV_DEFAULTS = {
-    "HOME": str(Path.home()),
-    "PATH": None,
-    "PHOENIX_DB_PATH": str(PROD_DB_PATH),
-    "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
-    "PHOENIX_LOG_STDOUT": "false",
-    "PHOENIX_VERSION": None,
-}
-
-
-def _migrate_launchd_override_env() -> dict[str, str]:
-    if not LAUNCHD_PLIST_PATH.exists():
-        return {}
-    try:
-        with LAUNCHD_PLIST_PATH.open("rb") as stream:
-            plist_env = dict(plistlib.load(stream).get("EnvironmentVariables", {}))
-    except (OSError, plistlib.InvalidFileException) as exc:
-        raise SystemExit(f"cannot migrate launchd overrides from {LAUNCHD_PLIST_PATH}: {exc}") from exc
-    repo_env: dict[str, str] = {}
-    _load_env_file(repo_env)
-    overrides = {
-        key: str(value)
-        for key, value in plist_env.items()
-        if not (
-            key in _GENERATED_LAUNCHD_ENV_DEFAULTS
-            and (
-                _GENERATED_LAUNCHD_ENV_DEFAULTS[key] is None
-                or _GENERATED_LAUNCHD_ENV_DEFAULTS[key] == str(value)
-            )
-        )
-        and repo_env.get(key, str(PROD_PORT) if key == "PHOENIX_PORT" else None) != str(value)
-    }
-    _write_launchd_override_env(overrides)
-    return overrides
-
-
-def _launchd_override_env() -> dict[str, str]:
-    """Explicit launchd overrides written by `prod set`.
-
-    Generated plist environment is deliberately not an override source: values
-    from a previous deploy must not shadow edits to `.phoenix-ide.env`.
-    """
-    if not LAUNCHD_OVERRIDE_PATH.exists():
-        return _migrate_launchd_override_env()
-    try:
-        value = json.loads(LAUNCHD_OVERRIDE_PATH.read_text())
-        if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
-            raise ValueError("launchd overrides must be a string map")
-        return value
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        raise SystemExit(f"invalid launchd override store {LAUNCHD_OVERRIDE_PATH}: {exc}") from exc
-
-
-def _write_launchd_override_env(overrides: dict[str, str]) -> None:
-    _write_json_atomic(LAUNCHD_OVERRIDE_PATH, overrides, mode=0o600)
-
-
 def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
     """Refuse to deploy an unauthenticated, network-reachable prod server.
 
-    `effective_env` is the environment the deployed service will actually run
-    with, assembled the same way the calling deploy path assembles it:
-      - systemd: .phoenix-ide.env (EnvironmentFile=) plus any drop-in `*.conf`
-        overrides (`./dev.py prod set`), which systemd layers on top.
-      - launchd: .phoenix-ide.env plus the plist's existing EnvironmentVariables
-        (also written by `./dev.py prod set`).
-      - the non-systemd daemon inherits the deploying shell's os.environ and
-        then layers .phoenix-ide.env on top — so effective_env is that merge.
+    `effective_env` is the single `.phoenix-ide.env` snapshot installed for the
+    candidate. Backend-specific legacy override stores are not consulted.
 
     `socket_activated` is True for the systemd (.socket) and launchd (Sockets)
     paths: the listener fd comes from the init system, which binds all
@@ -6899,81 +6817,6 @@ def prod_daemon_stop():
         raise SystemExit(f"failed to stop supervised Phoenix: {(result.stderr or result.stdout).strip()}")
     print("✓ Phoenix stopped; supervisor remains running")
 
-
-
-def get_systemd_override_dir() -> Path:
-    """Get the systemd drop-in override directory for phoenix-ide."""
-    return Path(f"/etc/systemd/system/{PROD_SERVICE_NAME}.service.d")
-
-
-def list_systemd_overrides() -> list[tuple[str, str]]:
-    """List all systemd drop-in overrides. Returns [(filename, content), ...]."""
-    override_dir = get_systemd_override_dir()
-    if not override_dir.exists():
-        return []
-    
-    overrides = []
-    for conf in sorted(override_dir.glob("*.conf")):
-        try:
-            content = conf.read_text().strip()
-            overrides.append((conf.name, content))
-        except Exception:
-            overrides.append((conf.name, "<unreadable>"))
-    return overrides
-
-
-def native_prod_override_set(name: str, value: str):
-    """Set a systemd environment override."""
-    override_dir = get_systemd_override_dir()
-    conf_file = override_dir / f"{name}.conf"
-    content = f"[Service]\nEnvironment={name}={value}\n"
-    
-    subprocess.run(["sudo", "mkdir", "-p", str(override_dir)], check=True)
-    
-    # Remove any existing conf files that set the same variable
-    # (prevents conflicts from differently-named files)
-    if override_dir.exists():
-        for existing in override_dir.glob("*.conf"):
-            if existing.name == f"{name}.conf":
-                continue  # Will be overwritten anyway
-            try:
-                existing_content = existing.read_text()
-                if f"Environment={name}=" in existing_content:
-                    subprocess.run(["sudo", "rm", str(existing)], check=True)
-                    print(f"  Removed conflicting override: {existing.name}")
-            except Exception:
-                pass
-    
-    # Write via sudo tee
-    proc = subprocess.run(
-        ["sudo", "tee", str(conf_file)],
-        input=content.encode(),
-        capture_output=True
-    )
-    if proc.returncode != 0:
-        print(f"ERROR: Failed to write {conf_file}", file=sys.stderr)
-        sys.exit(1)
-    
-    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
-    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
-    print(f"✓ Set {name}={value}")
-    print(f"  Service restarted")
-
-
-def native_prod_override_unset(name: str):
-    """Remove a systemd environment override."""
-    override_dir = get_systemd_override_dir()
-    conf_file = override_dir / f"{name}.conf"
-    
-    if not conf_file.exists():
-        print(f"No override '{name}' found")
-        return
-    
-    subprocess.run(["sudo", "rm", str(conf_file)], check=True)
-    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
-    subprocess.run(["sudo", "systemctl", "restart", PROD_SERVICE_NAME], check=True)
-    print(f"✓ Removed {name} override")
-    print(f"  Service restarted")
 
 
 def _read_systemd_deploy_status() -> dict[str, object] | None:
@@ -7720,7 +7563,6 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
 def _launchd_candidate_env() -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
     env_file = _load_env_file(env)
-    env.update(_launchd_override_env())
     return env, env_file
 
 
@@ -8005,98 +7847,6 @@ def launchd_prod_stop():
     print(f"Stopped {LAUNCHD_LABEL}")
 
 
-def _sync_launchd_socket_port(plist: dict) -> None:
-    env_vars = plist.get("EnvironmentVariables", {})
-    socket_port = env_vars.get("PHOENIX_PORT", str(PROD_PORT))
-    plist.setdefault("Sockets", {}).setdefault("Listeners", {})["SockServiceName"] = socket_port
-
-
-def _refuse_launchd_override_during_deploy() -> None:
-    owner = _deploy_claim_owner()
-    if owner is not None:
-        raise SystemExit(
-            f"cannot modify production overrides while deployment {owner} owns the active claim; "
-            "run './dev.py prod status'"
-        )
-
-
-def launchd_prod_override_set(name: str, value: str):
-    """Set an environment variable in the launchd plist and reload."""
-    _refuse_launchd_override_during_deploy()
-    import plistlib
-
-    if not LAUNCHD_PLIST_PATH.exists():
-        print("ERROR: No plist found. Run './dev.py prod deploy' first.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(LAUNCHD_PLIST_PATH, "rb") as f:
-        plist = plistlib.load(f)
-
-    if "EnvironmentVariables" not in plist:
-        plist["EnvironmentVariables"] = {}
-    plist["EnvironmentVariables"][name] = value
-    overrides = _launchd_override_env()
-    overrides[name] = value
-    _write_launchd_override_env(overrides)
-    if name == "PHOENIX_PORT":
-        _sync_launchd_socket_port(plist)
-
-    with open(LAUNCHD_PLIST_PATH, "wb") as f:
-        plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
-
-    # Reload service
-    _launchd_stop_if_loaded()
-    uid = os.getuid()
-    subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
-        capture_output=True,
-    )
-    print(f"✓ Set {name}={value}")
-    print(f"  Service reloaded")
-
-
-def launchd_prod_override_unset(name: str):
-    """Remove an environment variable from the launchd plist and reload."""
-    _refuse_launchd_override_during_deploy()
-    import plistlib
-
-    if not LAUNCHD_PLIST_PATH.exists():
-        print("ERROR: No plist found. Run './dev.py prod deploy' first.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(LAUNCHD_PLIST_PATH, "rb") as f:
-        plist = plistlib.load(f)
-
-    overrides = _launchd_override_env()
-    if name not in overrides:
-        print(f"No explicit override '{name}' found")
-        return
-    del overrides[name]
-    _write_launchd_override_env(overrides)
-
-    env_vars = plist.get("EnvironmentVariables", {})
-    env_vars.pop(name, None)
-    repo_env: dict[str, str] = {}
-    _load_env_file(repo_env)
-    if name in repo_env:
-        env_vars[name] = repo_env[name]
-    if name == "PHOENIX_PORT":
-        _sync_launchd_socket_port(plist)
-
-    with open(LAUNCHD_PLIST_PATH, "wb") as f:
-        plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
-
-    # Reload service
-    _launchd_stop_if_loaded()
-    uid = os.getuid()
-    subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
-        capture_output=True,
-    )
-    print(f"✓ Removed {name} override")
-    print(f"  Service reloaded")
-
-
 def cmd_prod_build():
     """Build the production binary from local HEAD."""
     if sys.platform == "darwin":
@@ -8163,37 +7913,21 @@ def cmd_prod_stop():
         sys.exit(1)
 
 
-def cmd_prod_override_set(name: str, value: str):
-    """Set an environment override for the production service."""
-    env = detect_prod_env()
-
-    if env == "launchd":
-        launchd_prod_override_set(name, value)
-    elif env == "native":
-        native_prod_override_set(name, value)
-    elif env == "daemon":
-        print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
-        print("Stop the daemon and restart with environment variables set.", file=sys.stderr)
-        sys.exit(1)
-    else:
-        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
-        sys.exit(1)
+def _reject_prod_override_command() -> None:
+    raise SystemExit(
+        "prod set/unset no longer mutate production configuration; "
+        "edit .phoenix-ide.env directly, then run './dev.py prod deploy'"
+    )
 
 
-def cmd_prod_override_unset(name: str):
-    """Remove an environment override from the production service."""
-    env = detect_prod_env()
+def cmd_prod_override_set(_name: str, _value: str):
+    """Reject legacy override mutation in favor of the environment file."""
+    _reject_prod_override_command()
 
-    if env == "launchd":
-        launchd_prod_override_unset(name)
-    elif env == "native":
-        native_prod_override_unset(name)
-    elif env == "daemon":
-        print("ERROR: Overrides not supported for daemon mode", file=sys.stderr)
-        sys.exit(1)
-    else:
-        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
-        sys.exit(1)
+
+def cmd_prod_override_unset(_name: str):
+    """Reject legacy override mutation in favor of the environment file."""
+    _reject_prod_override_command()
 
 
 # =============================================================================

@@ -609,59 +609,22 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(helper.status_is_durable_terminal(manifest))
             self.assertIn("precondition_failed", helper.TERMINAL_STATES)
 
-    def test_legacy_plist_overrides_are_migrated_once(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SAME": "repo"})):
-            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-                "HOME": str(Path.home()), "PHOENIX_PASSWORD": "legacy-secret",
-                "PHOENIX_PORT": "9443", "SAME": "repo",
-            }}))
-            overrides = self.dev._launchd_override_env()
-            mode = self.dev.LAUNCHD_OVERRIDE_PATH.stat().st_mode & 0o777
-        self.assertEqual({"PHOENIX_PASSWORD": "legacy-secret", "PHOENIX_PORT": "9443"}, overrides)
-        self.assertEqual(0o600, mode)
-
-    def test_legacy_custom_generated_key_value_is_preserved(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "_load_env_file", return_value=None):
-            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-                "PHOENIX_DB_PATH": "/custom/prod.db",
-                "PHOENIX_LOG_STDOUT": "true",
-            }}))
-            overrides = self.dev._launchd_override_env()
-        self.assertEqual({
-            "PHOENIX_DB_PATH": "/custom/prod.db",
-            "PHOENIX_LOG_STDOUT": "true",
-        }, overrides)
-
-    def test_generated_plist_values_do_not_shadow_repo_env(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+    def test_candidate_env_uses_only_repo_environment_file(self):
+        with mock.patch.object(
+            self.dev,
+            "_load_env_file",
+            side_effect=lambda env: env.update({"PHOENIX_PASSWORD": "repo-secret", "PHOENIX_PORT": "9443"}),
+        ):
             env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("9443", env["PHOENIX_PORT"])
+        self.assertEqual({"PHOENIX_PASSWORD": "repo-secret", "PHOENIX_PORT": "9443"}, env)
 
-    def test_explicit_launchd_override_wins_over_repo_env(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
-            self.dev._write_launchd_override_env({"PHOENIX_PORT": "9555"})
-            env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("9555", env["PHOENIX_PORT"])
-
-    def test_candidate_env_includes_prod_set_overrides(self):
-        with mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"BASE": "yes"})), \
-             mock.patch.object(self.dev, "_launchd_override_env", return_value={"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "9443"}):
-            env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("yes", env["BASE"])
-        self.assertEqual("secret", env["PHOENIX_PASSWORD"])
-        self.assertEqual("9443", env["PHOENIX_PORT"])
+    def test_prod_override_commands_reject_without_backend_detection(self):
+        with mock.patch.object(self.dev, "detect_prod_env") as detect:
+            with self.assertRaisesRegex(SystemExit, r"edit \.phoenix-ide\.env directly"):
+                self.dev.cmd_prod_override_set("PHOENIX_PORT", "9443")
+            with self.assertRaisesRegex(SystemExit, r"edit \.phoenix-ide\.env directly"):
+                self.dev.cmd_prod_override_unset("PHOENIX_PORT")
+        detect.assert_not_called()
 
     def test_rollback_endpoint_is_derived_from_rollback_plist(self):
         with tempfile.TemporaryDirectory() as td:
@@ -725,13 +688,6 @@ class PreparationTests(unittest.TestCase):
             path.write_text(json.dumps(value))
             with self.assertRaisesRegex(helper.ActivationError, "unsupported handoff protocol"):
                 helper.Manifest.load(path)
-
-    def test_override_mutation_refuses_active_deploy(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"):
-            self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("deploy-owner\n")
-            with self.assertRaisesRegex(SystemExit, "deploy-owner"):
-                self.dev._refuse_launchd_override_during_deploy()
 
     def test_prod_status_uses_effective_launchd_env(self):
         with tempfile.TemporaryDirectory() as td, \

@@ -4,7 +4,7 @@
 
 The shared contract covers launchd, systemd, and bare Linux with common candidate preparation and backend-owned activation. Native macOS launchd uses a distinct one-shot LaunchAgent. Linux systemd uses a validated root-owned transaction and transient activation unit. Bare Linux uses a persistent same-user supervisor with an owner-only Unix socket and direct Phoenix child ownership. All three backends provide immutable handoff, atomic installation, exact identity verification, durable status and claim fencing, and verified rollback.
 
-The Lima/VZ harness proves successful systemd activation and exact-identity rollback with real socket/service units, changed `MainPID`, truthful `deployed.sha`, terminal claim release, and survival after termination of the initiating SSH process group. It also verifies the bare-Linux transaction engine's direct child ownership, `/proc` start-time binding, exact identity, verified rollback, and child-only stop. Bare supervisor restart reconciliation, production-style detached-start acceptance, reboot persistence, and broader systemd failure and reboot coverage remain outstanding.
+The Lima/VZ harness proves successful systemd activation and exact-identity rollback with real socket/service units, changed `MainPID`, truthful `deployed.sha`, terminal claim release, and survival after termination of the initiating SSH process group. It also verifies the bare-Linux transaction engine's direct child ownership, `/proc` start-time binding, exact identity, verified rollback, and child-only stop. Bare supervisor startup reconciles interrupted durable phases and re-establishes exact direct-child ownership after restart. Production-style detached-start acceptance verifies survival after launcher exit, socket-only commit and rollback, and child-only stop. Installation configures owner `@reboot` cron when available and otherwise emits exact same-user host rc guidance without claiming persistence. Broader systemd failure and reboot coverage remain outstanding.
 
 Live production deployment remains an explicitly gated operator action; automated integration validation uses disposable resources.
 
@@ -23,11 +23,11 @@ Live production deployment remains an explicitly gated operator action; automate
 | REQ-PD-009 | all three backends verify exact version/SHA and backend-owned process identity; bare Linux binds its direct child by PID and `/proc` start time |
 | REQ-PD-010 | all three backends implement exact verified rollback |
 | REQ-PD-011 | all three backends persist durable terminal status and truthful SHA with fenced claim release |
-| REQ-PD-012 | `.phoenix-ide.env` exists, but launchd override JSON and systemd drop-ins remain competing stores |
-| REQ-PD-013 | local/release deploy, durable status, and stop exist for all three backends; `prod set`/`prod unset` still mutate backend override stores instead of returning `.phoenix-ide.env` guidance |
-| REQ-PD-014 | persistent same-user bare-Linux supervisor owns the direct Phoenix child; restart reconciliation and detached-start initiator-death acceptance remain outstanding |
-| REQ-PD-015 | bare-Linux reboot persistence not implemented |
-| REQ-PD-016 | launchd disposable harness and Lima/VZ systemd success/rollback plus bare supervisor-core acceptance; extended systemd failure/reboot coverage and production-style detached bare-supervisor acceptance remain outstanding |
+| REQ-PD-012 | modern deployment snapshots only `.phoenix-ide.env`; legacy launchd JSON and systemd drop-ins are neither consulted nor migrated |
+| REQ-PD-013 | local/release deploy, durable status, and stop exist for all three backends; `prod set`/`prod unset` reject without mutation and direct operators to `.phoenix-ide.env` |
+| REQ-PD-014 | persistent same-user bare-Linux supervisor owns the direct Phoenix child, reconciles interrupted durable phases, and has production-style detached initiator-death acceptance |
+| REQ-PD-015 | bare installation starts independently for the active boot, installs an idempotent owner `@reboot` entry when compatible crontab is available, and otherwise prints exact same-user host rc guidance without claiming persistence |
+| REQ-PD-016 | launchd disposable harness and Lima/VZ systemd success/rollback plus detached bare-supervisor commit/rollback/stop acceptance; extended systemd failure/reboot coverage remains outstanding |
 | REQ-PD-017 | Linux x86_64 asset exists; Linux aarch64 publication and cross-platform selection verification not implemented |
 
 ## Operator surface
