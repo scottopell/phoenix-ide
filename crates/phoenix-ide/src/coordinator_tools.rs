@@ -278,6 +278,7 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Expansion { .. } => "message_expansion_failed",
         SendChatServiceError::Internal(_) => "internal_error",
         SendChatServiceError::Dispatch(_) => "dispatch_failed",
+        SendChatServiceError::IdempotencyConflict => "idempotency_conflict",
     }
 }
 

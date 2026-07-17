@@ -1,10 +1,11 @@
 use crate::api::{record_pr_auto_fix_context_baseline, validate_submitted_attachments};
 use crate::api::{FileAttachment, ImageAttachment};
 use crate::db::ConvState;
-use crate::runtime::RuntimeManager;
+use crate::runtime::{ChatAcceptanceReceipt, RuntimeManager};
 use crate::state_machine::{check_user_message_acceptable, Event, TransitionError};
 use phoenix_core::domain::db_schema::ImageData;
 use phoenix_core::domain::skill_invocation::SkillInvocation;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,8 @@ pub(crate) enum SendChatServiceError {
     Internal(String),
     #[error("dispatch failed: {0}")]
     Dispatch(String),
+    #[error("message_id was already used for a different target or payload")]
+    IdempotencyConflict,
 }
 
 #[derive(Clone)]
@@ -58,12 +61,17 @@ impl SendChatApplicationService {
         &self,
         req: SendChatRequest,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
-        if self
-            .db
-            .message_exists(&req.message_id)
-            .await
-            .map_err(|e| SendChatServiceError::Internal(e.to_string()))?
-        {
+        let request_fingerprint = request_fingerprint(&req)?;
+        let mut receipts = self.runtime.lock_chat_acceptance().await;
+        if let Some(receipt) = receipts.get(&req.message_id) {
+            return replay_receipt(receipt, &req, &request_fingerprint);
+        }
+        if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
+            if message.conversation_id != req.conversation_id
+                || !persisted_message_matches(&message.content, &req)
+            {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
             return Ok(SendChatOutcome::Delivered);
         }
 
@@ -85,10 +93,21 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
-        if steering_queue
+        if let Some(entry) = steering_queue
             .iter()
-            .any(|e| e.message_id == req.message_id)
+            .find(|entry| entry.message_id == req.message_id)
         {
+            if conversation.id != req.conversation_id || entry.text != req.text {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+            receipts.insert(
+                req.message_id.clone(),
+                ChatAcceptanceReceipt {
+                    conversation_id: req.conversation_id.clone(),
+                    request_fingerprint,
+                    steering: true,
+                },
+            );
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
 
@@ -121,7 +140,7 @@ impl SendChatApplicationService {
                     llm_text: expanded.llm_text,
                     images: map_images(req.images),
                     files: validated_files.clone(),
-                    message_id: req.message_id,
+                    message_id: req.message_id.clone(),
                     user_agent: req.user_agent,
                     skill_invocation: expanded.skill_invocation,
                 };
@@ -129,6 +148,14 @@ impl SendChatApplicationService {
                     .enqueue_steer_message(&conversation.id, event)
                     .await
                     .map_err(SendChatServiceError::Dispatch)?;
+                receipts.insert(
+                    req.message_id.clone(),
+                    ChatAcceptanceReceipt {
+                        conversation_id: conversation.id.clone(),
+                        request_fingerprint,
+                        steering: true,
+                    },
+                );
                 record_pr_auto_fix_context_baseline(
                     self.runtime.db(),
                     &conversation.id,
@@ -151,7 +178,7 @@ impl SendChatApplicationService {
             llm_text: expanded.llm_text,
             images: map_images(req.images),
             files: validated_files,
-            message_id: req.message_id,
+            message_id: req.message_id.clone(),
             user_agent: req.user_agent,
             skill_invocation: expanded.skill_invocation,
         };
@@ -159,6 +186,14 @@ impl SendChatApplicationService {
             .send_event(&conversation.id, event)
             .await
             .map_err(SendChatServiceError::Dispatch)?;
+        receipts.insert(
+            req.message_id.clone(),
+            ChatAcceptanceReceipt {
+                conversation_id: conversation.id.clone(),
+                request_fingerprint,
+                steering: false,
+            },
+        );
         record_pr_auto_fix_context_baseline(
             self.runtime.db(),
             &conversation.id,
@@ -238,6 +273,75 @@ async fn expand_message(
         display_text: expanded.display_text,
         llm_text,
         skill_invocation: expanded.skill_invocation,
+    })
+}
+
+fn persisted_message_matches(
+    content: &phoenix_core::domain::db_schema::MessageContent,
+    req: &SendChatRequest,
+) -> bool {
+    let phoenix_core::domain::db_schema::MessageContent::User(user) = content else {
+        return false;
+    };
+    user.text == req.text
+        && user.images.len() == req.images.len()
+        && user
+            .images
+            .iter()
+            .zip(&req.images)
+            .all(|(stored, requested)| {
+                stored.data == requested.data && stored.media_type == requested.media_type
+            })
+        && user.files.len() == req.files.len()
+        && user
+            .files
+            .iter()
+            .zip(&req.files)
+            .all(|(stored, requested)| {
+                stored.original_name == requested.original_name
+                    && stored.media_type == requested.media_type
+                    && stored.size_bytes == requested.size_bytes
+                    && stored.stored_path == requested.stored_path
+            })
+}
+
+fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceError> {
+    use sha2::Digest as _;
+
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "conversation_id": req.conversation_id,
+        "text": req.text,
+        "images": req.images.iter().map(|image| serde_json::json!({
+            "data": image.data,
+            "media_type": image.media_type,
+        })).collect::<Vec<_>>(),
+        "files": req.files,
+        "user_agent": req.user_agent,
+    }))
+    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+    Ok(sha2::Sha256::digest(canonical).iter().fold(
+        String::with_capacity(64),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        },
+    ))
+}
+
+fn replay_receipt(
+    receipt: &ChatAcceptanceReceipt,
+    req: &SendChatRequest,
+    request_fingerprint: &str,
+) -> Result<SendChatOutcome, SendChatServiceError> {
+    if receipt.conversation_id != req.conversation_id
+        || receipt.request_fingerprint != request_fingerprint
+    {
+        return Err(SendChatServiceError::IdempotencyConflict);
+    }
+    Ok(if receipt.steering {
+        SendChatOutcome::QueuedAsSteering
+    } else {
+        SendChatOutcome::Delivered
     })
 }
 

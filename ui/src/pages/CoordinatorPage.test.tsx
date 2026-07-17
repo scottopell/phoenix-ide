@@ -123,6 +123,21 @@ describe('CoordinatorPage', () => {
     });
   });
 
+  it('keeps an applied find-work query stable without rerunning bootstrap', async () => {
+    renderPage();
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+
+    fireEvent.change(screen.getByPlaceholderText('task id, branch, title, signal'), {
+      target: { value: 'auth' },
+    });
+    fireEvent.submit(screen.getByPlaceholderText('task id, branch, title, signal').closest('form')!);
+
+    await waitFor(() => expect(apiMock.getGlobalOpenWork).toHaveBeenCalledWith(0, 'auth'));
+    expect(apiMock.ensureGlobalCoordinator).toHaveBeenCalledTimes(1);
+    expect(screen.getByDisplayValue('auth')).toBeInTheDocument();
+  });
+
   it('loads the coordinator contract and renders attention-first work', async () => {
     renderPage();
 

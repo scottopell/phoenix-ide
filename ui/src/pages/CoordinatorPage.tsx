@@ -56,14 +56,24 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
   });
   const coordinatorConversation = useConversationSnapshot(slug ?? null);
   const previousCoordinatorState = useRef<ConversationState['type'] | null>(coordinatorConversation?.state?.type ?? null);
+  const appliedQueryRef = useRef('');
+  const datasetGenerationRef = useRef(0);
+  const latestRequestRef = useRef(0);
 
   const refreshOpenWork = useCallback(async (
     options?: { offset?: number; query?: string; append?: boolean },
   ) => {
     if (fixtureData) return;
     const offset = options?.offset ?? 0;
-    const query = options?.query ?? openWork.appliedQuery;
+    const query = options?.query ?? appliedQueryRef.current;
     const append = options?.append ?? false;
+    const generation = append ? datasetGenerationRef.current : datasetGenerationRef.current + 1;
+    if (!append) {
+      datasetGenerationRef.current = generation;
+      appliedQueryRef.current = query;
+    }
+    const requestId = latestRequestRef.current + 1;
+    latestRequestRef.current = requestId;
 
     setOpenWork((prev) => ({
       ...prev,
@@ -75,6 +85,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
 
     try {
       const page = await api.getGlobalOpenWork(offset, query);
+      if (generation !== datasetGenerationRef.current || requestId !== latestRequestRef.current) return;
       setOpenWork((prev) => ({
         ...prev,
         data: append && prev.data
@@ -91,6 +102,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         refreshedAt: page.generated_at,
       }));
     } catch (e) {
+      if (generation !== datasetGenerationRef.current || requestId !== latestRequestRef.current) return;
       setOpenWork((prev) => ({
         ...prev,
         error: e instanceof Error ? e.message : String(e),
@@ -99,7 +111,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         appliedQuery: query,
       }));
     }
-  }, [fixtureData, openWork.appliedQuery]);
+  }, [fixtureData]);
 
   useEffect(() => {
     if (fixtureData) return;

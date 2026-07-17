@@ -138,6 +138,13 @@ pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatAcceptanceReceipt {
+    pub conversation_id: String,
+    pub request_fingerprint: String,
+    pub steering: bool,
+}
+
 /// Manager for all conversation runtimes
 pub struct RuntimeManager {
     db: Database,
@@ -162,6 +169,9 @@ pub struct RuntimeManager {
     /// Serializes the slow runtime-construction path. Fast lookups remain
     /// lock-free; eviction state therefore has exactly one consumer.
     runtime_creation_lock: AsyncMutex<()>,
+    /// Serializes message-id acceptance and bridges the gap between event
+    /// dispatch and durable message persistence for in-process retries.
+    chat_acceptance_receipts: AsyncMutex<HashMap<String, ChatAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1291,6 +1301,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creation_lock: AsyncMutex::new(()),
+            chat_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -2881,6 +2892,12 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    pub(crate) async fn lock_chat_acceptance(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, ChatAcceptanceReceipt>> {
+        self.chat_acceptance_receipts.lock().await
     }
 
     pub async fn send_event(

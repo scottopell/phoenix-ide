@@ -259,6 +259,10 @@
 }
 
 @media (width <= 1024px) {
+.coordinator-page [hidden] {
+  display: none !important;
+}
+
   .coordinator-page {
     grid-template-columns: minmax(0, 1fr);
   }
