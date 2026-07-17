@@ -292,7 +292,11 @@ export function parseCommissionReviewResult(displayData: unknown, rawContent: st
 
 export type CommissionReviewSearchFragment = { fragmentId: string; text: string };
 
-export function buildCommissionReviewInlineSearchFragments(data: CommissionReviewDisplayData): CommissionReviewSearchFragment[] {
+export function buildCommissionReviewInlineSearchFragments(
+  data: CommissionReviewDisplayData,
+  options: { renderAllDetails?: boolean } = {},
+): CommissionReviewSearchFragment[] {
+  const renderAllDetails = options.renderAllDetails === true;
   const fragments: CommissionReviewSearchFragment[] = [
     { fragmentId: 'commission-review-header', text: `Commission review\n${formatCommissionReviewLabel(data.reviewStatus)} · trust ${formatCommissionReviewLabel(data.findingsTrust)}` },
     { fragmentId: 'commission-review-outcome', text: commissionReviewOutcomeLabel(data) },
@@ -314,13 +318,13 @@ export function buildCommissionReviewInlineSearchFragments(data: CommissionRevie
     fragments.push({ fragmentId: 'commission-review-summary', text: data.reviewerSummary });
   }
   data.warningsSummary.forEach((warning, index) => fragments.push({ fragmentId: `commission-review-warning-${index}`, text: warning }));
-  data.unreviewed.slice(0, 3).forEach((entry, index) => fragments.push({
+  (renderAllDetails ? data.unreviewed : data.unreviewed.slice(0, 3)).forEach((entry, index) => fragments.push({
     fragmentId: `commission-review-unreviewed-${index}`,
     text: `${entry.file}${entry.reason ? ` · ${formatCommissionReviewLabel(entry.reason)}` : ''}`,
   }));
   [...data.findings]
     .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
-    .slice(0, 5)
+    .slice(0, renderAllDetails ? data.findings.length : 5)
     .forEach((finding, index) => fragments.push({
       fragmentId: `commission-review-finding-${index}`,
       text: `${finding.severity}\n${finding.title}\n${finding.file}${finding.line !== undefined ? `:${finding.line}` : ''}${finding.symbol ? ` · ${finding.symbol}` : ''}\n${finding.rationale || 'No rationale provided by the reviewer.'}${finding.suggestedFix ? `\nFix: ${finding.suggestedFix}` : ''}`,

@@ -64,7 +64,8 @@ export function buildBrowserProfileVisibleText(
       const blocked = typeof data['blocked_step'] === 'string' ? `Blocked step: ${data['blocked_step']}` : '';
       const warnings = visibleStrings(data['methodology_warnings']);
       const path = typeof data['samples_path'] === 'string' ? `Raw samples written to ${data['samples_path']}` : '';
-      return [outcome === 'completed' ? '✓ completed' : outcome === 'blocked' ? '✗ blocked' : outcome, requested, warmup, warnings.length ? `${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : '', blocked, ...warnings, path].filter(Boolean).join('\n');
+      const metricRows = scenarioMetricSearchRows(samples.filter((sample): sample is RunSample => !!sample && typeof sample === 'object'));
+      return [outcome === 'completed' ? '✓ completed' : outcome === 'blocked' ? '✗ blocked' : outcome, requested, warmup, warnings.length ? `${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : '', blocked, ...warnings, ...metricRows, path].filter(Boolean).join('\n');
     }
     case 'heap_snapshot': {
       if (data['baseline'] === undefined) return `heap_snapshot\n${fallbackText}`;
@@ -292,6 +293,16 @@ const SCENARIO_METRICS: MetricDef[] = [
     nullWhen: (s) => s.react_commits === null,
   },
 ];
+
+function scenarioMetricSearchRows(samples: RunSample[]): string[] {
+  return SCENARIO_METRICS.flatMap((metric) => {
+    const values = samples.map((sample) => numericValue(sample, metric));
+    const measured = values.filter((value): value is number => value !== null);
+    if (measured.length === 0) return [];
+    const last = values.at(-1) ?? null;
+    return [`${metric.label}\nmin ${fmtVal(Math.min(...measured), metric.unit)} · max ${fmtVal(Math.max(...measured), metric.unit)} · last ${last === null ? '—' : fmtVal(last, metric.unit)}`];
+  });
+}
 
 function SparklineGrid({ samples }: { samples: RunSample[] }) {
   // Only show metric rows where at least one sample has a non-null value;

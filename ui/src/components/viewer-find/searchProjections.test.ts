@@ -610,7 +610,10 @@ describe('buildConversationSearchProjection', () => {
     result.display_data = {
       outcome: 'completed', requested_runs: 2, warmup: 1,
       methodology_warnings: ['Visible warning text'],
-      raw_samples: [{ duration_ms: 123, secret: 'hidden raw sample needle' }, { duration_ms: 456 }],
+      raw_samples: [
+        { run_index: 0, script_ms: 12.5, wall_ms: 20, long_tasks: 1, dom_nodes: 1500, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null, secret: 'hidden raw sample needle' },
+        { run_index: 1, script_ms: 15, wall_ms: 22, long_tasks: 0, dom_nodes: 1600, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null },
+      ],
       samples_path: '/tmp/samples.json',
     };
     const units: RenderUnit[] = [{
@@ -626,6 +629,8 @@ describe('buildConversationSearchProjection', () => {
     });
     expect(buildConversationSearchProjection(units, 'hidden raw sample needle', { density: 'full' }).matches).toHaveLength(0);
     expect(buildConversationSearchProjection(units, 'opaque raw sample needle', { density: 'full' }).matches).toHaveLength(0);
+    expect(buildConversationSearchProjection(units, 'DOM nodes', { density: 'full' }).matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, 'min 12.5 ms', { density: 'full' }).matches).toHaveLength(1);
   });
 
   it('indexes only the visible source and snippet for completed skill results', () => {
@@ -701,6 +706,21 @@ describe('buildConversationSearchProjection', () => {
       kind: 'tool-result-commission-review', toolUseId: 'review-tool', fragmentId: 'commission-review-finding-0',
     });
     expect(buildConversationSearchProjection(units, 'opaque-hidden-result', { density: 'full' }).matches).toHaveLength(0);
+
+    const extraFindings = Array.from({ length: 6 }, (_, index) => ({
+      severity: 'low', file: `src/finding-${index}.ts`, line: index + 1,
+      title: index === 5 ? 'Sixth visible finding' : `Finding ${index + 1}`,
+      rationale: `Rationale ${index + 1}`,
+    }));
+    displayData.findings = extraFindings;
+    displayData.finding_summary = { total: 6, critical: 0, high: 0, medium: 0, low: 6 };
+
+    expect(buildConversationSearchProjection(units, 'Sixth visible finding', {
+      density: 'full', commissionReviewCanOpenFullReview: false,
+    }).matches).toHaveLength(1);
+    expect(buildConversationSearchProjection(units, 'Sixth visible finding', {
+      density: 'full', commissionReviewCanOpenFullReview: true,
+    }).matches).toHaveLength(0);
   });
 
   it('indexes tool results but excludes unowned tool header and input metadata', () => {

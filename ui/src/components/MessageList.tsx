@@ -335,6 +335,7 @@ interface SystemPromptHeaderProps {
   expanded: boolean;
   onToggle: () => void;
   contentRef: React.RefObject<HTMLPreElement>;
+  activeHighlight: { fragmentId: 'system-prompt-text'; start: number; end: number } | null;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -342,6 +343,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   expanded,
   onToggle,
   contentRef,
+  activeHighlight,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
@@ -353,7 +355,13 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
             {expanded ? ' hide' : ' show'}
           </span>
         </div>
-        {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
+        {expanded && (
+          <pre ref={contentRef} className="system-prompt-content" data-fragment-id="system-prompt-text">
+            {activeHighlight
+              ? renderHighlightedText(systemPrompt, activeHighlight.start, activeHighlight.end)
+              : systemPrompt}
+          </pre>
+        )}
       </div>
     </div>
   );
@@ -510,9 +518,10 @@ function MessageListImpl({
           streamingBuffer: findStreamingBuffer,
           systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
+          commissionReviewCanOpenFullReview: onOpenCommissionReview !== undefined,
         })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded],
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, onOpenCommissionReview, systemPrompt, systemPromptExpanded],
   );
   const findSessionMatches = useMemo(
     () => projectionMatchesToSessionMatches(findProjection.matches, stableConversationMatchId),
@@ -550,6 +559,13 @@ function MessageListImpl({
           ? { ...range, owner: 'tool-result', toolUseId: activeFindRevealTarget.toolUseId }
           : null;
   }, [activeFindMatch, activeFindRevealTarget]);
+  const activeSystemPromptHighlight = activeFindMatch?.kind === 'header-text'
+    ? {
+        fragmentId: activeFindMatch.fragmentId,
+        start: activeFindMatch.start,
+        end: activeFindMatch.end,
+      }
+    : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;
@@ -1365,6 +1381,7 @@ function MessageListImpl({
               expanded={systemPromptExpanded}
               onToggle={toggleSystemPrompt}
               contentRef={systemPromptRef}
+              activeHighlight={activeSystemPromptHighlight}
             />
           ) : null}
           empty={<EmptyTranscriptState />}

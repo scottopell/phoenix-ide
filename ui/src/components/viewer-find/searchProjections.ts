@@ -323,6 +323,7 @@ export interface SearchOutputProjection {
 export interface ConversationHeaderSearchMatchTarget {
   kind: 'header-text';
   headerKey: 'system-prompt';
+  fragmentId: 'system-prompt-text';
   sourceId: string;
   start: number;
   end: number;
@@ -658,6 +659,7 @@ export interface ConversationProjectionOptions {
   streamingBuffer?: StreamingBuffer | null;
   systemPrompt?: string | null;
   systemPromptExpanded?: boolean;
+  commissionReviewCanOpenFullReview?: boolean;
 }
 
 export function buildConversationSearchProjection(
@@ -688,7 +690,13 @@ export function buildConversationSearchProjection(
         }
         break;
       case 'agent_turn':
-        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density, unit.key === options.latestAgentKey)) {
+        for (const source of agentTurnSources(
+          unit.agent,
+          unit.toolResultsByUseId,
+          density,
+          unit.key === options.latestAgentKey,
+          options.commissionReviewCanOpenFullReview === true,
+        )) {
           addConversationSource(
             sources,
             unitIndex,
@@ -728,6 +736,7 @@ export function buildConversationSearchProjection(
       ? {
           kind: 'header-text',
           headerKey: source.target.headerKey,
+          fragmentId: source.target.fragmentId,
           sourceId: source.id,
           start: match.start,
           end: match.end,
@@ -766,10 +775,12 @@ function addConversationHeaderSource(
     unitKind: 'system',
     unitIndex: -1,
     role: headerKey,
+    fragmentId: 'system-prompt-text',
     text,
     target: {
       kind: 'header-text',
       headerKey,
+      fragmentId: 'system-prompt-text',
       sourceId: `conversation-header:${headerKey}`,
       start: 0,
       end: 0,
@@ -1488,6 +1499,7 @@ function agentTurnSources(
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
+  commissionReviewCanOpenFullReview: boolean,
 ): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
@@ -1567,7 +1579,8 @@ function agentTurnSources(
       if (block.name === 'commission_review') {
         const data = parseCommissionReviewResult(toolResult.display_data, resultText);
         if (data) {
-          buildCommissionReviewInlineSearchFragments(data).forEach((fragment, fragmentIndex) => out.push({
+          const renderAllDetails = !(commissionReviewCanOpenFullReview && message.sequence_id !== undefined);
+          buildCommissionReviewInlineSearchFragments(data, { renderAllDetails }).forEach((fragment, fragmentIndex) => out.push({
             role: `commission-review-${index}-${fragmentIndex}`,
             text: fragment.text,
             fragmentId: fragment.fragmentId,

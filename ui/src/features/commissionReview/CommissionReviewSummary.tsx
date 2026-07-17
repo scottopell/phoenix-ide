@@ -100,7 +100,7 @@ export function CommissionReviewSummaryCard({
   const highlightedFragment = (fragmentId: string, text: string) => activeHighlight?.fragmentId === fragmentId
     ? highlightCommissionText(text, activeHighlight)
     : text;
-  const searchableFragments = new Map(buildCommissionReviewInlineSearchFragments(data).map((fragment) => [fragment.fragmentId, fragment.text]));
+  const searchableFragments = new Map(buildCommissionReviewInlineSearchFragments(data, { renderAllDetails }).map((fragment) => [fragment.fragmentId, fragment.text]));
   return (
     <section className={`commission-review-result ${outcomeClass} ${showFullDetails ? 'commission-review-result--full' : ''}`} aria-label="Commission review summary">
       <div className="commission-review-summary-header">

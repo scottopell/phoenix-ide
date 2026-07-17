@@ -1,8 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { BrowserProfileResponseView } from './BrowserProfileResponseView';
+import { BrowserProfileResponseView, buildBrowserProfileVisibleText } from './BrowserProfileResponseView';
 
 describe('BrowserProfileResponseView find highlighting', () => {
+  it('projects the same visible scenario metric labels and statistics as the sparkline grid', () => {
+    const text = buildBrowserProfileVisibleText('run_scenario', {
+      outcome: 'completed',
+      requested_runs: 2,
+      raw_samples: [
+        { run_index: 0, script_ms: 12.5, wall_ms: 20, long_tasks: 1, dom_nodes: 1500, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null },
+        { run_index: 1, script_ms: 15, wall_ms: 22, long_tasks: 0, dom_nodes: 1600, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null },
+      ],
+    }, 'opaque');
+
+    expect(text).toContain('script\nmin 12.5 ms · max 15.0 ms · last 15.0 ms');
+    expect(text).toContain('DOM nodes\nmin 1,500 · max 1,600 · last 1,600');
+    expect(text).not.toContain('JS heap');
+  });
   it('marks an active occurrence in the visible scenario summary', () => {
     const displayData = {
       outcome: 'completed', requested_runs: 2, warmup: 1,

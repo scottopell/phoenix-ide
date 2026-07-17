@@ -87,6 +87,9 @@ vi.mock('./MessageComponents', async () => {
         </span>
       );
     },
+    renderHighlightedText: (text: string, start: number, end: number) => (
+      <>{text.slice(0, start)}<mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(start, end)}</mark>{text.slice(end)}</>
+    ),
     formatMessageTime: () => '12:00',
   };
 });
@@ -491,6 +494,8 @@ describe('MessageList', () => {
 
     const header = document.querySelector('.system-prompt-content') as HTMLElement;
     await waitFor(() => expect(header).toHaveClass('viewer-find-row-match--active'));
+    expect(header).toHaveAttribute('data-fragment-id', 'system-prompt-text');
+    expect(header.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('alpha directive');
   });
 
   it('does not re-scroll the active transcript match on unrelated streaming-buffer ticks', async () => {
