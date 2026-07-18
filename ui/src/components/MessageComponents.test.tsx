@@ -886,8 +886,28 @@ describe('inline tool timers', () => {
     const log = screen.getByRole('log');
     expect(log).toBeInTheDocument();
     expect(log.className).toContain('bash-output-viewport');
-    expect(screen.getByText('… ✓ src/components/MessageComponents.test.tsx (68 tests)')).toBeInTheDocument();
+    expect(screen.getByText('✓ src/components/MessageComponents.test.tsx (68 tests)')).toBeInTheDocument();
     expect(screen.getByText('watching for file changes')).toBeInTheDocument();
+  });
+
+  it('preserves every returned line in finalized full-density bash output', () => {
+    const lines = Array.from({ length: 12 }, (_, offset) => ({ offset, bytes: `line ${offset}` }));
+    const agent = agentMessage('agent-bash-all-lines', [{
+      type: 'tool_use', id: 'tool-bash-all-lines', name: 'bash', input: { op: 'peek', handle: 'b-all' },
+    }]);
+    const result = toolMessage('tool-bash-all-lines', JSON.stringify({
+      status: 'running', handle: 'b-all', truncated_before: false, lines,
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage message={agent} toolResults={new Map([['tool-bash-all-lines', result]])} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('line 0')).toBeInTheDocument();
+    expect(screen.getByText('line 11')).toBeInTheDocument();
+    expect(screen.queryByText('[older output omitted from this tail]')).not.toBeInTheDocument();
   });
 
   it('renders tombstone exit metadata and final duration in typed bash output', () => {

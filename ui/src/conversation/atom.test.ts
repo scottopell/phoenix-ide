@@ -2540,6 +2540,22 @@ describe('bash tool progress', () => {
   });
 });
 
+it('replaces bash progress at the same sequence when output advances', () => {
+  const base = {
+    handle: 'b-1', start_offset: 0, truncated_before: false, partial: null,
+  };
+  let atom = createInitialAtom();
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 0, toolUseId: 'tool-1',
+    progress: { ...base, end_offset: 1, lines: [{ offset: 0, text: 'first' }] },
+  });
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 0, toolUseId: 'tool-1',
+    progress: { ...base, end_offset: 2, lines: [{ offset: 1, text: 'second' }] },
+  });
+  expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('second');
+});
+
 it('applies replaceable bash progress without advancing the replay sequence floor', () => {
   const progress = {
     handle: 'b-1',

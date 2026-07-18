@@ -1375,12 +1375,16 @@ function BashOutputView({
   lines,
   partial,
   truncatedBefore,
+  bounded = false,
 }: {
   lines: string[];
   partial: string | null;
   truncatedBefore: boolean;
+  bounded?: boolean;
 }) {
-  const visible = summarizeBashVisibleTail(lines, partial, truncatedBefore);
+  const visible = bounded
+    ? summarizeBashVisibleTail(lines, partial, truncatedBefore)
+    : [...lines, ...(partial ? [partial] : [])];
   if (visible.length === 0) return null;
   return (
     <div className="bash-output-shell">
@@ -2320,6 +2324,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
             lines={liveBashProgress.lines.map((line) => line.text)}
             partial={liveBashProgress.partial ?? null}
             truncatedBefore={liveBashProgress.truncated_before}
+            bounded
           />
         </div>
       )}

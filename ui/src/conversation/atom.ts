@@ -678,7 +678,12 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     }
     case 'sse_bash_tool_progress': {
       const existing = atom.liveBashProgress[action.toolUseId];
-      if (existing && existing.sequenceId >= action.sequenceId) return atom;
+      if (existing && existing.sequenceId > action.sequenceId) return atom;
+      if (
+        existing
+        && existing.sequenceId === action.sequenceId
+        && existing.progress.end_offset > action.progress.end_offset
+      ) return atom;
       return {
         ...atom,
         liveBashProgress: {
