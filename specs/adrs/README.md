@@ -30,6 +30,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [016](016_durable-workflow-boundaries-include-clients-and-adoption.md) | Durable-workflow boundaries include client acceptance and profile adoption | Accepted | REQ-DWF-013, REQ-DWF-019, REQ-DWF-022, REQ-DWF-029–032, creation acceptance, wake delivery |
 | [017](017_production-deployment-shares-preparation-not-activation-ownership.md) | Production deployment shares preparation but keeps backend-owned activation | Accepted | REQ-PD-001 through REQ-PD-017 |
 | [018](018_release-updates-use-published-release-previews-and-approval-bound-installations.md) | Release updates use published release previews and approval-bound installations | Accepted | REQ-RU-001 through REQ-RU-010 |
+| [019](019_runtime-ownership-requires-positive-evidence.md) | Runtime ownership requires positive evidence | Accepted | REQ-DEPLOY-002A, REQ-RU-004A |
 
 ## For agents: which decisions bind your task
 
@@ -56,6 +57,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
+| Specifying runtime ownership evidence or ownership-gated update eligibility | 019, 017, 018 |
 
 ## Decision dependencies
 
@@ -74,6 +76,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   └── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │       └── ADR-018 (release updates use published release previews and approval-bound installations)
+      │           └── ADR-019 (runtime ownership requires positive evidence)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)

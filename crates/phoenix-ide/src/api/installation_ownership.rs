@@ -176,7 +176,12 @@ async fn request_bare_status(path: &std::path::Path) -> Result<(String, u32), St
 }
 
 #[cfg(target_os = "linux")]
-fn bare_evidence(response: &str, peer_pid: u32) -> BareSupervisorEvidence {
+fn bare_evidence(
+    response: &str,
+    peer_pid: u32,
+    process_pid: u32,
+    parent_pid: u32,
+) -> BareSupervisorEvidence {
     let status: BareStatusResponse = match serde_json::from_str(response) {
         Ok(status) => status,
         Err(error) => {
@@ -185,18 +190,19 @@ fn bare_evidence(response: &str, peer_pid: u32) -> BareSupervisorEvidence {
             ))
         }
     };
-    if !status.ok
-        || status.protocol_version != 1
-        || status.supervisor_pid != peer_pid
-        || unsafe { libc::getppid() }.cast_unsigned() != peer_pid
-    {
+    if !status.ok || status.protocol_version != 1 || status.supervisor_pid != peer_pid {
         return BareSupervisorEvidence::Unreadable(
-            "supervisor status did not match the authenticated direct parent".to_string(),
+            "supervisor status did not match the authenticated protocol peer".to_string(),
         );
     }
     match status.child {
+        Some(child) if child.pid == process_pid && parent_pid != peer_pid => {
+            BareSupervisorEvidence::Unreadable(
+                "supervisor claimed the current process but is not its direct parent".to_string(),
+            )
+        }
         Some(child)
-            if child.pid == std::process::id()
+            if child.pid == process_pid
                 && child.runtime.version == env!("CARGO_PKG_VERSION")
                 && child.runtime.git_sha == env!("PHOENIX_GIT_SHA") =>
         {
@@ -224,7 +230,12 @@ async fn probe_bare_supervisor(runtime_env: &PhoenixRuntimeEnvironment) -> BareS
     )
     .await
     {
-        Ok(Ok((response, peer_pid))) => bare_evidence(&response, peer_pid),
+        Ok(Ok((response, peer_pid))) => bare_evidence(
+            &response,
+            peer_pid,
+            std::process::id(),
+            unsafe { libc::getppid() }.cast_unsigned(),
+        ),
         Ok(Err(reason)) => BareSupervisorEvidence::Unreadable(reason),
         Err(_) => {
             BareSupervisorEvidence::Unreadable("supervisor status probe timed out".to_string())
@@ -312,6 +323,44 @@ mod tests {
                 BareSupervisorEvidence::Unreadable("denied".to_string()),
             ),
             InstallationOwnership::Ambiguous { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_bare_supervisor_is_not_owner_evidence() {
+        let response = serde_json::json!({
+            "ok": true,
+            "protocol_version": 1,
+            "supervisor_pid": 42,
+            "child": null,
+        })
+        .to_string();
+        assert_eq!(
+            bare_evidence(&response, 42, 100, 7),
+            BareSupervisorEvidence::DoesNotOwnCurrentProcess
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn false_bare_claim_is_unreadable_evidence() {
+        let response = serde_json::json!({
+            "ok": true,
+            "protocol_version": 1,
+            "supervisor_pid": 42,
+            "child": {
+                "pid": 100,
+                "runtime": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "git_sha": env!("PHOENIX_GIT_SHA"),
+                },
+            },
+        })
+        .to_string();
+        assert!(matches!(
+            bare_evidence(&response, 42, 100, 7),
+            BareSupervisorEvidence::Unreadable(_)
         ));
     }
 

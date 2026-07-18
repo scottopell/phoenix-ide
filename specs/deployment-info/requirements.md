@@ -125,11 +125,6 @@ backend.
 THE SYSTEM SHALL keep runtime ownership independent from browser locality and
 release-update prerequisites.
 
-**Rationale:** Host capability answers which backend an operator could install;
-it does not establish who owns this process. Disruptive actions need positive
-runtime evidence, while diagnostics need explicit uncertainty rather than a
-plausible but unproven label.
-
 ---
 
 ### REQ-DEPLOY-003: Report network binding and TLS configuration
