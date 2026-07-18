@@ -572,6 +572,16 @@ function tryParseJsonText(text: string): Record<string, unknown> | null {
   }
 }
 
+function formatVisibleMillis(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
+}
+
 function bashVisibleSearchText(
   block: ContentBlock,
   result: Message | undefined,
@@ -587,8 +597,19 @@ function bashVisibleSearchText(
   if (op === 'kill' && handle) parts.push(`kill ${handle}`);
   const parsed = result ? tryParseJsonText(toolResultText(result)) : null;
   if (parsed) {
-    if (typeof parsed['status'] === 'string') parts.push(String(parsed['status']).replace(/_/g, ' '));
+    if (typeof parsed['status'] === 'string') {
+      const status = String(parsed['status']);
+      const finalCause = typeof parsed['final_cause'] === 'string' ? parsed['final_cause'] : null;
+      parts.push(status === 'kill_pending_kernel'
+        ? 'kill pending (kernel)'
+        : status === 'tombstoned' && finalCause
+          ? `finished (${finalCause.replace(/_/g, ' ')})`
+          : status.replace(/_/g, ' '));
+    }
     if (typeof parsed['handle'] === 'string') parts.push(parsed['handle'] as string);
+    if (typeof parsed['waited_ms'] === 'number') parts.push(`waited ${formatVisibleMillis(parsed['waited_ms'])}`);
+    if (typeof parsed['duration_ms'] === 'number') parts.push(`ran ${formatVisibleMillis(parsed['duration_ms'])}`);
+    if (parsed['exit_code'] !== undefined && parsed['exit_code'] !== null) parts.push(`exit ${String(parsed['exit_code'])}`);
     if (parsed['truncated_before'] === true) parts.push('older output omitted');
     const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
     for (const line of lines.slice(-2)) {
@@ -628,10 +649,10 @@ function agentTurnSources(
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
       const result = toolResultsByUseId.get(block.id ?? '');
-      if (block.name === 'bash' && density === 'compact') {
+      if (block.name === 'bash') {
         out.push({ role: `tool-use-visible-bash-${index}`, text: bashVisibleSearchText(block, result, liveBashProgress[block.id ?? '']?.progress) });
-      }
-      if (densityToolDetailsVisible(block.name, density)) {
+        if (density === 'full') out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
+      } else if (densityToolDetailsVisible(block.name, density)) {
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
         out.push({ role: `tool-use-result-${index}`, text: toolResultText(result) });
       }

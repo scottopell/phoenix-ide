@@ -244,7 +244,8 @@ function summarizeBashOutputTail(parsed: Record<string, unknown>): string | null
   const tailParts = bytes.slice(-2);
   if (partial) tailParts.push(`${partial} …`);
   if (tailParts.length === 0) return null;
-  const prefix = parsed['truncated_before'] === true ? '… ' : '';
+  const localTailTruncated = bytes.length > 2;
+  const prefix = parsed['truncated_before'] === true || localTailTruncated ? '… ' : '';
   return truncate(`${prefix}${tailParts.join(' · ')}`, 140);
 }
 function summarizeBashCompactCard(

@@ -233,7 +233,7 @@ describe('buildConversationSearchProjection', () => {
     expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
   });
 
-  it('indexes full-density non-think tool details while compact still excludes them', () => {
+  it('indexes full-density inputs while bash results follow visible formatting', () => {
     const units: RenderUnit[] = [
       {
         kind: 'agent_turn',
@@ -243,7 +243,7 @@ describe('buildConversationSearchProjection', () => {
           { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'bash ls', input: { script: 'secret alpha payload' } },
         ]),
         toolResultsByUseId: new Map([
-          ['tool-1', toolMsg('t1', 'tool-1', { result: 'hidden alpha result' })],
+          ['tool-1', toolMsg('t1', 'tool-1', { content: JSON.stringify({ status: 'tombstoned', final_cause: 'exited', exit_code: 7, duration_ms: 1200, lines: [] }) })],
         ]),
       },
     ];
@@ -252,9 +252,12 @@ describe('buildConversationSearchProjection', () => {
     expect(fullInputProjection.matches).toHaveLength(1);
     expect(fullInputProjection.matches[0]?.target.sourceId).toContain('tool-use-input-0');
 
-    const fullResultProjection = buildConversationSearchProjection(units, 'hidden alpha result', { density: 'full' });
+    const fullResultProjection = buildConversationSearchProjection(units, 'exit 7', { density: 'full' });
     expect(fullResultProjection.matches).toHaveLength(1);
-    expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-result-0');
+    expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-visible-bash-0');
+    expect(buildConversationSearchProjection(units, 'ran 1.2s', { density: 'full' }).matches).toHaveLength(1);
+    const rawJsonProjection = buildConversationSearchProjection(units, 'final_cause', { density: 'full' });
+    expect(rawJsonProjection.matches).toHaveLength(0);
 
     const compactProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
     expect(compactProjection.matches).toHaveLength(0);
