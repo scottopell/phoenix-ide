@@ -140,6 +140,10 @@ export function ReleaseUpdatePanel() {
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
+  const approvalStatusSafe = snapshot?.transaction.kind === 'none'
+    || (snapshot?.transaction.kind === 'present'
+      && TERMINAL_STATES.has(snapshot.transaction.state)
+      && snapshot.transaction.state !== 'activation_failed_rollback_failed');
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
 
   return (
@@ -179,7 +183,7 @@ export function ReleaseUpdatePanel() {
               </div>
               {snapshot.preview.notes && <details><summary>Release notes</summary><pre>{snapshot.preview.notes}</pre></details>}
               {authorityText(snapshot.authority) && <div className="release-update__hint">{authorityText(snapshot.authority)}</div>}
-              {snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && !active && (
+              {snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && (
                 confirming ? (
                   <div className="release-update__confirm">
                     <span>Install {snapshot.preview.tag}? Phoenix will reconnect after backend-owned verification or rollback.</span>

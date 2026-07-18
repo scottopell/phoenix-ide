@@ -714,10 +714,11 @@ pub async fn approve(
     loop {
         if let ReleaseTransactionStatus::Present {
             transaction_id: durable_id,
+            state: durable_state,
             ..
         } = read_status(&state, selected_backend)
         {
-            if durable_id == transaction_id {
+            if durable_id == transaction_id && durable_state != "preparing" {
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = child.wait() {
                         tracing::warn!(%error, "failed to reap release controller");

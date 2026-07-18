@@ -82,6 +82,7 @@ describe('ReleaseUpdatePanel', () => {
     render(<ReleaseUpdatePanel />);
     expect(await screen.findByText(/status permissions denied/i)).toBeInTheDocument();
     expect(screen.queryByText(/no deployment transaction/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
   it('distinguishes verified rollback from rollback failure', async () => {
@@ -105,6 +106,7 @@ describe('ReleaseUpdatePanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(await screen.findByText(/offline recovery required/i)).toBeInTheDocument();
     expect(screen.getByText(/claim remains retained/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
     view.unmount();
   });
 });
