@@ -2188,27 +2188,49 @@ impl WakeRepository {
         Ok(out)
     }
 
+    async fn list_workflows_owed_to_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WorkflowId>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT b.workflow_id
+             FROM wake_bindings b
+             LEFT JOIN workflow_deliveries d ON d.workflow_id = b.workflow_id
+             WHERE b.conversation_id = ?1
+               AND (b.resolved_at IS NULL OR d.status = 'Pending')
+             ORDER BY b.workflow_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|value| Ok(WorkflowId(to_u64(value, "workflow_id")?)))
+            .collect()
+    }
+
     pub async fn transfer_active_for_continuation(
         &self,
         from_conversation_id: &str,
         to_conversation_id: &str,
         timestamp: Timestamp,
     ) -> DbResult<()> {
-        let active = self
-            .list_active_unresolved_for_conversation(from_conversation_id)
+        let owed = self
+            .list_workflows_owed_to_conversation(from_conversation_id)
             .await?;
-        for row in active {
+        for workflow_id in owed {
             for _ in 0..20 {
                 let mut tx = self.workflow_repo.begin_tx().await?;
-                let Some(head) = tx.fetch_workflow_head(row.workflow_id).await? else {
+                let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
                     tx.rollback().await?;
                     break;
                 };
                 let pending_delivery_ids =
-                    fetch_pending_terminal_delivery_ids_tx(&mut tx, row.workflow_id).await?;
+                    fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
                 tx.rollback().await?;
                 let input = WakeTransferInput {
-                    workflow_id: row.workflow_id,
+                    workflow_id,
                     from_conversation_id: from_conversation_id.to_string(),
                     to_conversation_id: to_conversation_id.to_string(),
                     expected_version: head.version,

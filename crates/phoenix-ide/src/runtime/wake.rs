@@ -357,7 +357,11 @@ async fn deliver_pending(
                 continue;
             };
             let rendered = render_terminal_result(&current);
-            let display_data = serde_json::to_value(&current.receipt.terminal).ok();
+            let display_data = Some(serde_json::json!({
+                "type": "wake_result",
+                "adopted": false,
+                "terminal": &current.receipt.terminal,
+            }));
             let auto_resume = !matches!(
                 current.receipt.terminal,
                 phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }

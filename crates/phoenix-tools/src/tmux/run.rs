@@ -451,7 +451,7 @@ async fn wait_for_text_response(
                     err => return err,
                 }
             };
-            if exited && close_after_completion {
+            if close_after_completion && (exited || status == "readiness_timed_out") {
                 let _ = kill_window(config_path, socket_path, &target.window_id).await;
             }
             return response;
@@ -469,28 +469,8 @@ async fn wait_for_text_response(
                         exit_code: None,
                         readiness_seen: false,
                     });
-                if observation.exit_code.is_none() {
-                    if close_after_completion {
-                        let _ = kill_window(config_path, socket_path, &target.window_id).await;
-                    } else {
-                        let response = structured_response(
-                            "cancelled",
-                            target,
-                            cwd,
-                            cmd,
-                            None,
-                            &observation.captured_output,
-                            true,
-                        );
-                        return register_tmux_wake_if_live(
-                            ctx,
-                            server_token,
-                            target,
-                            true,
-                            response,
-                        )
-                        .await;
-                    }
+                if observation.exit_code.is_none() && close_after_completion {
+                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
                 }
                 return error_envelope("cancelled", "tmux_run cancelled while waiting for readiness");
             }
@@ -535,10 +515,7 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     } else {
         "exit $code"
     };
-    let marker_cmd = r"python3 - <<'PY'
-import time
-print(int(time.time()*1000))
-PY";
+    let marker_cmd = "printf '%s000' \"$(date +%s)\"";
     format!(
         "(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
     )
