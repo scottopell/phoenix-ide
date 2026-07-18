@@ -2521,8 +2521,8 @@ describe('bash tool progress', () => {
 
     atom = conversationReducer(atom, {
       type: 'sse_message',
-      sequenceId: 2,
-      message: makeMessage(2, {
+      sequenceId: 1,
+      message: makeMessage(1, {
         message_type: 'tool',
         content: { tool_use_id: 'tool-1', content: 'done', is_error: false },
       }),
@@ -2535,7 +2535,31 @@ describe('bash tool progress', () => {
     atom = conversationReducer(atom, {
       type: 'sse_bash_tool_progress', sequenceId: 1, toolUseId: 'tool-1', progress,
     });
-    atom = conversationReducer(atom, { type: 'sse_agent_done', sequenceId: 2 });
+    atom = conversationReducer(atom, { type: 'sse_agent_done', sequenceId: 1 });
     expect(atom.liveBashProgress).toEqual({});
   });
+});
+
+it('applies replaceable bash progress without advancing the replay sequence floor', () => {
+  const progress = {
+    handle: 'b-1',
+    start_offset: 0,
+    end_offset: 1,
+    truncated_before: false,
+    lines: [{ offset: 0, text: 'building' }],
+    partial: null,
+  };
+  let atom = createInitialAtom();
+  atom = { ...atom, lastAppliedEventSeq: 4 };
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 4, toolUseId: 'tool-1', progress,
+  });
+  expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('building');
+  expect(atom.lastAppliedEventSeq).toBe(4);
+
+  atom = conversationReducer(atom, {
+    type: 'sse_state_change', sequenceId: 5, phase: { type: 'idle' }, stateUpdatedAt: 0,
+  });
+  expect(atom.lastAppliedEventSeq).toBe(5);
+  expect(atom.eventGap).toBeNull();
 });

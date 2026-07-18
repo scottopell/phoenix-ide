@@ -802,6 +802,36 @@ fn suffix_within_bytes(text: &str, max_bytes: usize) -> String {
     text.get(start..).unwrap_or_default().to_string()
 }
 
+struct LiveBashProgressPoller {
+    reporter: Arc<LiveBashProgressReporter>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveBashProgressPoller {
+    fn spawn(handle: Arc<Handle>, reporter: Arc<LiveBashProgressReporter>) -> Self {
+        let task_reporter = reporter.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LIVE_PROGRESS_MIN_INTERVAL);
+            interval.tick().await;
+            while task_reporter.is_active() {
+                interval.tick().await;
+                if handle.state().await.is_terminal() {
+                    break;
+                }
+                task_reporter.maybe_emit_handle(&handle, false).await;
+            }
+        });
+        Self { reporter, task }
+    }
+}
+
+impl Drop for LiveBashProgressPoller {
+    fn drop(&mut self) {
+        self.reporter.deactivate();
+        self.task.abort();
+    }
+}
+
 struct LiveBashProgressReporter {
     sink: Arc<dyn crate::BashProgressSink>,
     last_emitted_output_bytes: std::sync::atomic::AtomicU64,
@@ -1089,18 +1119,9 @@ async fn run_wait(
     if let Some(reporter) = &progress_reporter {
         reporter.maybe_emit_handle(&handle, true).await;
     }
-    let progress_handle = handle.clone();
-    let progress_task = progress_reporter.as_ref().map(|reporter| {
-        let reporter = reporter.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(LIVE_PROGRESS_MIN_INTERVAL);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                reporter.maybe_emit_handle(&progress_handle, false).await;
-            }
-        })
-    });
+    let _progress_poller = progress_reporter
+        .as_ref()
+        .map(|reporter| LiveBashProgressPoller::spawn(handle.clone(), reporter.clone()));
 
     let mut exit_rx = handle.exit_observer();
     let started = Instant::now();
@@ -1116,12 +1137,6 @@ async fn run_wait(
             still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, &handle.cmd).await
         }
     };
-    if let Some(task) = progress_task {
-        task.abort();
-    }
-    if let Some(reporter) = progress_reporter {
-        reporter.deactivate();
-    }
     response
 }
 
@@ -1161,6 +1176,16 @@ async fn run_kill(
 
     // Send the signal EXACTLY ONCE (REQ-BASH-003).
     send_signal_to_group(pgid, signal);
+
+    let progress_reporter = ctx
+        .bash_progress_sink()
+        .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+    if let Some(reporter) = &progress_reporter {
+        reporter.maybe_emit_handle(&handle, true).await;
+    }
+    let _progress_poller = progress_reporter
+        .as_ref()
+        .map(|reporter| LiveBashProgressPoller::spawn(handle.clone(), reporter.clone()));
 
     // Race exit observer vs KILL_RESPONSE_TIMEOUT.
     let mut exit_rx = handle.exit_observer();

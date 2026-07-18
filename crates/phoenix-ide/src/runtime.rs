@@ -764,9 +764,9 @@ impl SseBroadcaster {
     /// Broadcast a replaceable live-progress event without consuming the
     /// reconnect ring reserved for lifecycle-critical ephemeral events.
     pub fn send_live_progress(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let seq = self.next_seq();
-        let event = build(seq);
-        self.send_with_ring(event, seq, RingOp::BroadcastOnly)
+        let witnessed_seq = self.current_seq();
+        let event = build(witnessed_seq);
+        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -3701,9 +3701,14 @@ mod broadcaster_tests {
         let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 0);
         assert!(!truncated);
-        assert_eq!(highest, i64::try_from(REPLAY_RING_CAPACITY + 11).unwrap());
+        assert_eq!(highest, 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], SseEvent::Token { text, .. } if text == "lifecycle"));
+        assert_eq!(
+            b.current_seq(),
+            1,
+            "replaceable progress must not create replay gaps"
+        );
     }
 
     /// `send_seq` (ephemeral) appends the event to the ring.
