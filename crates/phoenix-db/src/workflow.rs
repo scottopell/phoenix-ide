@@ -199,6 +199,14 @@ pub struct LocalAttemptRecord {
     pub lease: Option<LocalReclaimableLease>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowSequenceName {
+    Attempt,
+    Observation,
+    Receipt,
+    Delivery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenewLeaseInput {
     pub authority: LocalAttemptAuthority,
@@ -650,6 +658,32 @@ impl<'a> WorkflowTx<'a> {
         }))
     }
 
+    pub(crate) async fn allocate_sequence_value(
+        &mut self,
+        workflow_id: WorkflowId,
+        sequence: WorkflowSequenceName,
+    ) -> DbResult<u64> {
+        let name = workflow_sequence_name_str(sequence);
+        sqlx::query(
+            "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
+             VALUES (?1, ?2, 2)
+             ON CONFLICT(workflow_id, sequence_name)
+             DO UPDATE SET next_value = workflow_sequences.next_value + 1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(name)
+        .execute(&mut *self.tx)
+        .await?;
+        let allocated = sqlx::query_scalar::<_, i64>(
+            "SELECT next_value - 1 FROM workflow_sequences WHERE workflow_id = ?1 AND sequence_name = ?2",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(name)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        to_u64(allocated, "allocated_sequence")
+    }
+
     pub(crate) async fn begin_attempt(
         &mut self,
         input: &BeginAttemptInput,
@@ -714,13 +748,14 @@ impl<'a> WorkflowTx<'a> {
                 attempt: None,
             });
         }
-        let ordinal = to_u32(sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_attempts WHERE workflow_id = ?1 AND effect_id = ?2",
-        )
-        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
-        .fetch_one(&mut *self.tx)
-        .await?, "ordinal")?;
+        let ordinal = to_u32(
+            to_i64(
+                self.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Attempt)
+                    .await?,
+                "attempt_ordinal",
+            )? - 1,
+            "ordinal",
+        )?;
         let declared_workflow_version = Version(to_u64(
             effect.get::<i64, _>("declared_workflow_version"),
             "declared_workflow_version",
@@ -2201,6 +2236,15 @@ fn parse_workflow_status(value: &str) -> DbResult<WorkflowStatus> {
         other => Err(DbError::Serialization(format!(
             "unknown workflow status: {other}"
         ))),
+    }
+}
+
+fn workflow_sequence_name_str(sequence: WorkflowSequenceName) -> &'static str {
+    match sequence {
+        WorkflowSequenceName::Attempt => "attempt",
+        WorkflowSequenceName::Observation => "observation",
+        WorkflowSequenceName::Receipt => "receipt",
+        WorkflowSequenceName::Delivery => "delivery",
     }
 }
 

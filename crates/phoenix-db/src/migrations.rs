@@ -310,6 +310,8 @@ CREATE TABLE wake_terminal_receipt_tails (
 
 CREATE INDEX wake_terminal_receipts_by_conversation
 ON wake_terminal_receipts(conversation_id, delivery_id);
+CREATE INDEX wake_terminal_receipts_by_workflow_delivery
+ON wake_terminal_receipts(workflow_id, delivery_id);
 ";
 
 const MIGRATION_047: &str = r"
@@ -347,6 +349,8 @@ ON wake_bindings(
     COALESCE(bash_handle_id, ''), COALESCE(tmux_server_generation, ''), COALESCE(tmux_window_id, '')
 );
 CREATE INDEX wake_bindings_by_conversation ON wake_bindings(conversation_id);
+CREATE INDEX wake_bindings_active_unresolved
+ON wake_bindings(expires_at, workflow_id);
 ";
 
 const MIGRATION_046: &str = r"
@@ -448,6 +452,20 @@ CREATE TABLE workflow_barrier_members (
     FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
+CREATE TABLE workflow_sequences (
+    workflow_id INTEGER NOT NULL,
+    sequence_name TEXT NOT NULL CHECK (sequence_name <> ''),
+    next_value INTEGER NOT NULL CHECK (next_value >= 1),
+    PRIMARY KEY (workflow_id, sequence_name),
+    FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_global_sequences (
+    sequence_name TEXT NOT NULL CHECK (sequence_name <> ''),
+    next_value INTEGER NOT NULL CHECK (next_value >= 1),
+    PRIMARY KEY (sequence_name)
+) WITHOUT ROWID;
+
 CREATE TABLE workflow_attempts (
     workflow_id INTEGER NOT NULL,
     effect_id INTEGER NOT NULL,
@@ -467,6 +485,9 @@ CREATE UNIQUE INDEX workflow_attempts_one_live_per_effect
 ON workflow_attempts(workflow_id, effect_id)
 WHERE status IN ('Begun', 'ObservationRecorded');
 
+CREATE INDEX workflow_attempts_observation_restart
+ON workflow_attempts(workflow_id, effect_id, status, created_at, attempt_id);
+
 CREATE TABLE workflow_reclaimable_leases (
     workflow_id INTEGER NOT NULL,
     attempt_id INTEGER NOT NULL,
@@ -474,6 +495,9 @@ CREATE TABLE workflow_reclaimable_leases (
     PRIMARY KEY (workflow_id, attempt_id),
     FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
+
+CREATE INDEX workflow_reclaimable_leases_by_expiry
+ON workflow_reclaimable_leases(lease_until, workflow_id, attempt_id);
 
 CREATE TABLE workflow_authoritative_observations (
     workflow_id INTEGER NOT NULL,
@@ -569,6 +593,9 @@ CREATE TABLE workflow_deliveries (
         ))
     )
 ) WITHOUT ROWID;
+
+CREATE INDEX workflow_deliveries_pending_global
+ON workflow_deliveries(status, workflow_id, delivery_id);
 
 CREATE TABLE workflow_manual_resolutions (
     workflow_id INTEGER NOT NULL,

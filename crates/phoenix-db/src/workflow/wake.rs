@@ -5,7 +5,7 @@ use super::{
     ClaimOutcome, CommitOutcome, CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance,
     DbError, DbResult, DeliveryResolutionDecision, DeliveryResolutionPlan, LocalCodec,
     LocalDeliveryRecord, LocalEffectDecl, LocalReceiptRecord, RecordObservationInput,
-    WorkflowRepository, WorkflowTx,
+    WorkflowRepository, WorkflowSequenceName, WorkflowTx,
 };
 use phoenix_workflow::{
     wake_profile::{
@@ -21,62 +21,44 @@ use phoenix_workflow::{
 use serde::Serialize;
 use sqlx::Row;
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 
 #[cfg(test)]
-fn fail_after_canonical_transition_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
-    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+type FailpointKey = (u64, u64);
+
+#[cfg(test)]
+fn next_failpoint_namespace() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn fail_after_canonical_transition_set() -> &'static Mutex<std::collections::BTreeSet<FailpointKey>>
+{
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<FailpointKey>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
 }
 #[cfg(test)]
-fn fail_after_canonical_receipt_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
-    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+fn fail_after_canonical_receipt_set() -> &'static Mutex<std::collections::BTreeSet<FailpointKey>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<FailpointKey>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
 }
 #[cfg(test)]
-fn fail_after_transfer_binding_update_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
-    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+fn fail_after_transfer_binding_update_set(
+) -> &'static Mutex<std::collections::BTreeSet<FailpointKey>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<FailpointKey>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
 }
 
 #[cfg(test)]
-pub fn fail_after_canonical_transition_once(workflow_id: WorkflowId) {
-    fail_after_canonical_transition_set()
-        .lock()
-        .unwrap()
-        .insert(workflow_id.0);
-}
-
-#[cfg(test)]
-pub fn fail_after_canonical_receipt_once(workflow_id: WorkflowId) {
-    fail_after_canonical_receipt_set()
-        .lock()
-        .unwrap()
-        .insert(workflow_id.0);
-}
-
-#[cfg(test)]
-pub fn fail_after_resolve_transition_once(workflow_id: WorkflowId) {
-    fail_after_canonical_transition_set()
-        .lock()
-        .unwrap()
-        .insert(workflow_id.0);
-}
-
-#[cfg(test)]
-pub fn fail_after_transfer_binding_update_once(workflow_id: WorkflowId) {
-    fail_after_transfer_binding_update_set()
-        .lock()
-        .unwrap()
-        .insert(workflow_id.0);
-}
-
-#[cfg(test)]
-fn maybe_fail_after_canonical_transition(workflow_id: WorkflowId) -> DbResult<()> {
+fn maybe_fail_after_canonical_transition(namespace: u64, workflow_id: WorkflowId) -> DbResult<()> {
     if fail_after_canonical_transition_set()
         .lock()
         .unwrap()
-        .remove(&workflow_id.0)
+        .remove(&(namespace, workflow_id.0))
     {
         return Err(DbError::Serialization(
             "test failpoint after canonical transition".to_string(),
@@ -86,11 +68,11 @@ fn maybe_fail_after_canonical_transition(workflow_id: WorkflowId) -> DbResult<()
 }
 
 #[cfg(test)]
-fn maybe_fail_after_canonical_receipt(workflow_id: WorkflowId) -> DbResult<()> {
+fn maybe_fail_after_canonical_receipt(namespace: u64, workflow_id: WorkflowId) -> DbResult<()> {
     if fail_after_canonical_receipt_set()
         .lock()
         .unwrap()
-        .remove(&workflow_id.0)
+        .remove(&(namespace, workflow_id.0))
     {
         return Err(DbError::Serialization(
             "test failpoint after canonical receipt".to_string(),
@@ -100,11 +82,14 @@ fn maybe_fail_after_canonical_receipt(workflow_id: WorkflowId) -> DbResult<()> {
 }
 
 #[cfg(test)]
-fn maybe_fail_after_transfer_binding_update(workflow_id: WorkflowId) -> DbResult<()> {
+fn maybe_fail_after_transfer_binding_update(
+    namespace: u64,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
     if fail_after_transfer_binding_update_set()
         .lock()
         .unwrap()
-        .remove(&workflow_id.0)
+        .remove(&(namespace, workflow_id.0))
     {
         return Err(DbError::Serialization(
             "test failpoint after transfer binding update".to_string(),
@@ -114,11 +99,11 @@ fn maybe_fail_after_transfer_binding_update(workflow_id: WorkflowId) -> DbResult
 }
 
 #[cfg(not(test))]
-fn maybe_fail_after_canonical_transition(_workflow_id: WorkflowId) {}
+fn maybe_fail_after_canonical_transition(_namespace: (), _workflow_id: WorkflowId) {}
 #[cfg(not(test))]
-fn maybe_fail_after_canonical_receipt(_workflow_id: WorkflowId) {}
+fn maybe_fail_after_canonical_receipt(_namespace: (), _workflow_id: WorkflowId) {}
 #[cfg(not(test))]
-fn maybe_fail_after_transfer_binding_update(_workflow_id: WorkflowId) {}
+fn maybe_fail_after_transfer_binding_update(_namespace: (), _workflow_id: WorkflowId) {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeBindingRecord {
@@ -171,6 +156,67 @@ pub enum WakeObservationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeObservationLease {
+    pub workflow_id: WorkflowId,
+    pub process_incarnation: ProcessIncarnation,
+    pub now: Timestamp,
+    pub lease_until: phoenix_workflow::LeaseExpiry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeActiveUnresolvedRow {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub contract_id: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeObservationCandidateReason {
+    NoLiveAttempt,
+    ExpiredLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeObservationCandidateRow {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub contract_id: String,
+    pub reason: WakeObservationCandidateReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeExpiredUnresolvedRow {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub contract_id: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakePendingGlobalRow {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub contract_id: String,
+    pub delivery_id: DeliveryId,
+    pub receipt_id: ReceiptId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeTerminalEvidenceInput {
+    pub workflow_id: WorkflowId,
+    pub authority: super::LocalAttemptAuthority,
+    pub observation_time: Timestamp,
+    pub evidence: WakeTerminalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeExpireIfUnresolvedInput {
+    pub workflow_id: WorkflowId,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeTerminalEvidenceOutcome {
     Recorded {
         receipt: LocalReceiptRecord,
@@ -206,6 +252,13 @@ pub enum WakeCancellationOutcome {
         delivery: WakePendingDelivery,
     },
     Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeCancelIfUnresolvedInput {
+    pub workflow_id: WorkflowId,
+    pub timestamp: Timestamp,
+    pub reason: WakeCancellationReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +307,8 @@ pub enum WakeTransferOutcome {
 #[derive(Debug, Clone)]
 pub struct WakeRepository {
     workflow_repo: WorkflowRepository,
+    #[cfg(test)]
+    failpoint_namespace: u64,
 }
 
 impl WakeRepository {
@@ -261,19 +316,49 @@ impl WakeRepository {
     pub fn new(pool: sqlx::SqlitePool) -> Self {
         Self {
             workflow_repo: WorkflowRepository::new(pool),
+            #[cfg(test)]
+            failpoint_namespace: next_failpoint_namespace(),
         }
+    }
+
+    #[cfg(test)]
+    fn fail_after_canonical_transition_once(&self, workflow_id: WorkflowId) {
+        fail_after_canonical_transition_set()
+            .lock()
+            .unwrap()
+            .insert((self.failpoint_namespace, workflow_id.0));
+    }
+
+    #[cfg(test)]
+    fn fail_after_canonical_receipt_once(&self, workflow_id: WorkflowId) {
+        fail_after_canonical_receipt_set()
+            .lock()
+            .unwrap()
+            .insert((self.failpoint_namespace, workflow_id.0));
+    }
+
+    #[cfg(test)]
+    fn fail_after_resolve_transition_once(&self, workflow_id: WorkflowId) {
+        self.fail_after_canonical_transition_once(workflow_id);
+    }
+
+    #[cfg(test)]
+    fn fail_after_transfer_binding_update_once(&self, workflow_id: WorkflowId) {
+        fail_after_transfer_binding_update_set()
+            .lock()
+            .unwrap()
+            .insert((self.failpoint_namespace, workflow_id.0));
     }
 
     pub async fn register(
         &self,
         input: &WakeRegistrationIntent,
         prepared_fingerprint: &str,
-        workflow_id: WorkflowId,
         now: Timestamp,
     ) -> DbResult<WakeRegistrationOutcome> {
         for _ in 0..20 {
             match self
-                .register_once(input, prepared_fingerprint, workflow_id, now)
+                .register_once_with_id(None, input, prepared_fingerprint, now)
                 .await
             {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
@@ -284,15 +369,39 @@ impl WakeRepository {
                 result => return result,
             }
         }
-        self.register_once(input, prepared_fingerprint, workflow_id, now)
+        self.register_once_with_id(None, input, prepared_fingerprint, now)
             .await
     }
 
-    async fn register_once(
+    pub async fn register_allocated(
         &self,
+        workflow_id: WorkflowId,
         input: &WakeRegistrationIntent,
         prepared_fingerprint: &str,
-        workflow_id: WorkflowId,
+        now: Timestamp,
+    ) -> DbResult<WakeRegistrationOutcome> {
+        for _ in 0..20 {
+            match self
+                .register_once_with_id(Some(workflow_id), input, prepared_fingerprint, now)
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.register_once_with_id(Some(workflow_id), input, prepared_fingerprint, now)
+            .await
+    }
+
+    async fn register_once_with_id(
+        &self,
+        allocated_workflow_id: Option<WorkflowId>,
+        input: &WakeRegistrationIntent,
+        prepared_fingerprint: &str,
         now: Timestamp,
     ) -> DbResult<WakeRegistrationOutcome> {
         let mut tx = self.workflow_repo.begin_tx().await?;
@@ -309,6 +418,10 @@ impl WakeRepository {
             });
         }
 
+        let workflow_id = match allocated_workflow_id {
+            Some(workflow_id) => workflow_id,
+            None => next_global_workflow_id_tx(&mut tx).await?,
+        };
         let snapshot = WakeRegistrationSnapshot {
             contract_id: input.contract_id.clone(),
             resource: input.resource.clone(),
@@ -400,9 +513,7 @@ impl WakeRepository {
             }
         }
         #[cfg(test)]
-        maybe_fail_after_canonical_transition(workflow_id)?;
-        #[cfg(not(test))]
-        maybe_fail_after_canonical_transition(workflow_id);
+        maybe_fail_after_canonical_transition(self.failpoint_namespace, workflow_id)?;
         insert_binding_tx(&mut tx, workflow_id, input, prepared_fingerprint, now).await?;
         tx.commit().await?;
         Ok(WakeRegistrationOutcome::Registered {
@@ -453,6 +564,42 @@ impl WakeRepository {
             | ClaimOutcome::AuthorityConflict
             | ClaimOutcome::UnsupportedCodec => WakeObservationOutcome::StaleAttempt,
         })
+    }
+
+    pub async fn claim_observation_allocated(
+        &self,
+        workflow_id: WorkflowId,
+        process_incarnation: ProcessIncarnation,
+        now: Timestamp,
+        lease_until: phoenix_workflow::LeaseExpiry,
+    ) -> DbResult<WakeObservationOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let attempt_id = AttemptId(
+            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Attempt)
+                .await?,
+        );
+        let result = tx
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id,
+                effect_id: REGISTRATION_EFFECT_ID,
+                attempt_id,
+                process_incarnation,
+                now,
+                lease_until: Some(lease_until),
+            })
+            .await?;
+        match result.outcome {
+            ClaimOutcome::Started => {
+                tx.commit().await?;
+                Ok(WakeObservationOutcome::Started { canonical: result })
+            }
+            ClaimOutcome::Ineligible
+            | ClaimOutcome::AuthorityConflict
+            | ClaimOutcome::UnsupportedCodec => {
+                tx.rollback().await?;
+                Ok(WakeObservationOutcome::StaleAttempt)
+            }
+        }
     }
 
     pub async fn record_terminal_evidence(
@@ -648,9 +795,7 @@ impl WakeRepository {
             return Ok(WakeTerminalEvidenceOutcome::StaleAttempt);
         }
         #[cfg(test)]
-        maybe_fail_after_canonical_receipt(workflow_id)?;
-        #[cfg(not(test))]
-        maybe_fail_after_canonical_receipt(workflow_id);
+        maybe_fail_after_canonical_receipt(self.failpoint_namespace, workflow_id)?;
         insert_terminal_receipt_projection_tx(
             &mut tx,
             &binding,
@@ -674,6 +819,65 @@ impl WakeRepository {
                 canonical_delivery: canonical.delivery.expect("authorized delivery"),
             },
         })
+    }
+
+    pub async fn record_terminal_allocated(
+        &self,
+        input: &WakeTerminalEvidenceInput,
+    ) -> DbResult<WakeTerminalEvidenceOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let observation_id = tx
+            .allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Observation)
+            .await?;
+        let receipt_id = ReceiptId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Receipt)
+                .await?,
+        );
+        let delivery_id = DeliveryId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Delivery)
+                .await?,
+        );
+        tx.commit().await?;
+        self.record_terminal_evidence(
+            input.workflow_id,
+            &input.authority,
+            observation_id,
+            receipt_id,
+            delivery_id,
+            input.observation_time,
+            &input.evidence,
+        )
+        .await
+    }
+
+    pub async fn cancel_allocated(
+        &self,
+        input: &WakeCancelIfUnresolvedInput,
+    ) -> DbResult<WakeCancellationOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(head) = tx.fetch_workflow_head(input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        };
+        let receipt_id = ReceiptId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Receipt)
+                .await?,
+        );
+        let delivery_id = DeliveryId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Delivery)
+                .await?,
+        );
+        tx.commit().await?;
+        self.cancel(&WakeCancellationInput {
+            workflow_id: input.workflow_id,
+            expected_version: head.version,
+            expected_generation: head.generation,
+            receipt_id,
+            delivery_id,
+            timestamp: input.timestamp,
+            reason: input.reason,
+        })
+        .await
     }
 
     pub async fn cancel(&self, input: &WakeCancellationInput) -> DbResult<WakeCancellationOutcome> {
@@ -796,9 +1000,7 @@ impl WakeRepository {
             .execute(&mut *tx.tx)
             .await?;
         #[cfg(test)]
-        maybe_fail_after_canonical_transition(input.workflow_id)?;
-        #[cfg(not(test))]
-        maybe_fail_after_canonical_transition(input.workflow_id);
+        maybe_fail_after_canonical_transition(self.failpoint_namespace, input.workflow_id)?;
         sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.receipt_id.0, "receipt_id")?)
@@ -867,6 +1069,185 @@ impl WakeRepository {
             receipt: outcome.0,
             delivery: outcome.1,
         })
+    }
+
+    pub async fn list_pending_global(&self, limit: usize) -> DbResult<Vec<WakePendingGlobalRow>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT p.workflow_id, p.conversation_id, p.contract_id, p.delivery_id, p.receipt_id
+             FROM wake_terminal_receipts p
+             JOIN workflow_deliveries d
+               ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
+             WHERE d.status = 'Pending'
+             ORDER BY p.workflow_id, p.delivery_id
+             LIMIT ?1",
+        )
+        .bind(to_i64(limit as u64, "limit")?)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                Ok(WakePendingGlobalRow {
+                    workflow_id: WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?),
+                    conversation_id: row.get("conversation_id"),
+                    contract_id: row.get("contract_id"),
+                    delivery_id: DeliveryId(to_u64(
+                        row.get::<i64, _>("delivery_id"),
+                        "delivery_id",
+                    )?),
+                    receipt_id: ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?),
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_active_unresolved(
+        &self,
+        limit: usize,
+    ) -> DbResult<Vec<WakeActiveUnresolvedRow>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE w.status = 'Active'
+               AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
+             ORDER BY b.workflow_id
+             LIMIT ?1",
+        )
+        .bind(to_i64(limit as u64, "limit")?)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                Ok(WakeActiveUnresolvedRow {
+                    workflow_id: WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?),
+                    conversation_id: row.get("conversation_id"),
+                    contract_id: row.get("contract_id"),
+                    expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_observation_candidates(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> DbResult<Vec<WakeObservationCandidateRow>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id,
+                    CASE
+                      WHEN EXISTS (
+                        SELECT 1 FROM workflow_attempts a
+                        WHERE a.workflow_id = b.workflow_id
+                          AND a.status IN ('Begun', 'ObservationRecorded')
+                      ) THEN 'ExpiredLease'
+                      ELSE 'NoLiveAttempt'
+                    END AS candidate_reason
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE w.status = 'Active'
+               AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
+               AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM workflow_attempts a
+                        WHERE a.workflow_id = b.workflow_id
+                          AND a.status IN ('Begun', 'ObservationRecorded')
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workflow_attempts a
+                        JOIN workflow_reclaimable_leases l
+                          ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+                        WHERE a.workflow_id = b.workflow_id
+                          AND a.status IN ('Begun', 'ObservationRecorded')
+                          AND l.lease_until <= ?1
+                    )
+               )
+             ORDER BY b.workflow_id
+             LIMIT ?2",
+        )
+        .bind(to_i64(now.0, "now")?)
+        .bind(to_i64(limit as u64, "limit")?)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                let reason = match row.get::<String, _>("candidate_reason").as_str() {
+                    "NoLiveAttempt" => WakeObservationCandidateReason::NoLiveAttempt,
+                    "ExpiredLease" => WakeObservationCandidateReason::ExpiredLease,
+                    other => {
+                        return Err(DbError::Serialization(format!(
+                            "unknown wake observation candidate reason: {other}"
+                        )))
+                    }
+                };
+                Ok(WakeObservationCandidateRow {
+                    workflow_id: WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?),
+                    conversation_id: row.get("conversation_id"),
+                    contract_id: row.get("contract_id"),
+                    reason,
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_expired_unresolved(
+        &self,
+        now: Timestamp,
+        limit: usize,
+    ) -> DbResult<Vec<WakeExpiredUnresolvedRow>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE w.status = 'Active'
+               AND b.expires_at <= ?1
+               AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
+             ORDER BY b.workflow_id
+             LIMIT ?2",
+        )
+        .bind(to_i64(now.0, "now")?)
+        .bind(to_i64(limit as u64, "limit")?)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                Ok(WakeExpiredUnresolvedRow {
+                    workflow_id: WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?),
+                    conversation_id: row.get("conversation_id"),
+                    contract_id: row.get("contract_id"),
+                    expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
     }
 
     pub async fn list_pending(&self, conversation_id: &str) -> DbResult<Vec<WakePendingDelivery>> {
@@ -998,9 +1379,7 @@ impl WakeRepository {
         .await?;
 
         #[cfg(test)]
-        maybe_fail_after_transfer_binding_update(input.workflow_id)?;
-        #[cfg(not(test))]
-        maybe_fail_after_transfer_binding_update(input.workflow_id);
+        maybe_fail_after_transfer_binding_update(self.failpoint_namespace, input.workflow_id)?;
 
         for delivery_id in &input.exact_pending_delivery_ids {
             sqlx::query(
@@ -1146,9 +1525,7 @@ impl WakeRepository {
         match outcome {
             CommitOutcome::Committed => {
                 #[cfg(test)]
-                maybe_fail_after_canonical_transition(input.workflow_id)?;
-                #[cfg(not(test))]
-                maybe_fail_after_canonical_transition(input.workflow_id);
+                maybe_fail_after_canonical_transition(self.failpoint_namespace, input.workflow_id)?;
                 tx.commit().await?;
                 Ok(WakeResolvePendingOutcome::Resolved)
             }
@@ -1201,6 +1578,31 @@ impl WakeRepository {
             }
         }
     }
+}
+
+async fn next_global_workflow_id_tx(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
+         VALUES ('workflow', 2)
+         ON CONFLICT(sequence_name)
+         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
+    )
+    .execute(&mut *tx.tx)
+    .await?;
+    let allocated = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(WorkflowId(to_u64(allocated, "workflow_id")?))
+}
+
+#[cfg(test)]
+async fn next_test_workflow_id(repo: &WakeRepository) -> DbResult<WorkflowId> {
+    let mut tx = repo.workflow_repo.begin_tx().await?;
+    let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+    tx.commit().await?;
+    Ok(workflow_id)
 }
 
 fn local_codec(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
@@ -2285,7 +2687,7 @@ mod tests {
     ) -> super::WakeObservationOutcome {
         let input = intent();
         assert!(matches!(
-            repo.register(&input, "fp-1", workflow_id, Timestamp(10))
+            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
                 .await
                 .unwrap(),
             WakeRegistrationOutcome::Registered { .. }
@@ -2390,13 +2792,29 @@ mod tests {
         .map(|row| (row.get("target_scope"), row.get("idempotency_key")))
     }
 
+    async fn registered_workflow_id(
+        repo: &WakeRepository,
+        input: &WakeRegistrationIntent,
+        fingerprint: &str,
+    ) -> WorkflowId {
+        match repo
+            .register(input, fingerprint, Timestamp(10))
+            .await
+            .unwrap()
+        {
+            WakeRegistrationOutcome::Registered { workflow_id, .. }
+            | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id,
+            WakeRegistrationOutcome::Conflict => panic!("expected registered or replayed"),
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_concurrent_registration_replays_single_winner() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = intent();
         let (left, right) = tokio::join!(
-            first.register(&input, "fp-1", WorkflowId(100), Timestamp(10)),
-            second.register(&input, "fp-1", WorkflowId(101), Timestamp(10))
+            first.register(&input, "fp-1", Timestamp(10)),
+            second.register(&input, "fp-1", Timestamp(10))
         );
         let outcomes = [left.unwrap(), right.unwrap()];
         assert_eq!(
@@ -2420,15 +2838,11 @@ mod tests {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
         assert!(matches!(
-            repo.register(&input, "fp-1", WorkflowId(102), Timestamp(10))
-                .await
-                .unwrap(),
+            repo.register(&input, "fp-1", Timestamp(10)).await.unwrap(),
             WakeRegistrationOutcome::Registered { .. }
         ));
         assert_eq!(
-            repo.register(&input, "fp-2", WorkflowId(103), Timestamp(10))
-                .await
-                .unwrap(),
+            repo.register(&input, "fp-2", Timestamp(10)).await.unwrap(),
             WakeRegistrationOutcome::Conflict
         );
     }
@@ -2437,15 +2851,16 @@ mod tests {
     async fn failpoint_rolls_back_everything() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
-        fail_after_canonical_transition_once(WorkflowId(104));
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        repo.fail_after_canonical_transition_once(workflow_id);
         let err = repo
-            .register(&input, "fp-1", WorkflowId(104), Timestamp(10))
+            .register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
             .await;
         assert!(err.is_err());
-        assert!(repo.fetch_binding(WorkflowId(104)).await.unwrap().is_none());
+        assert!(repo.fetch_binding(workflow_id).await.unwrap().is_none());
         assert_eq!(
             repo.workflow_repo
-                .fetch_workflow_head(WorkflowId(104))
+                .fetch_workflow_head(workflow_id)
                 .await
                 .unwrap(),
             None
@@ -2456,19 +2871,19 @@ mod tests {
     async fn restart_reload_finds_binding() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = intent();
-        let registered = first
-            .register(&input, "fp-1", WorkflowId(105), Timestamp(10))
-            .await
-            .unwrap();
+        let registered = first.register(&input, "fp-1", Timestamp(10)).await.unwrap();
         assert!(matches!(
             registered,
             WakeRegistrationOutcome::Registered { .. }
         ));
-        let binding = second
-            .reload_binding(WorkflowId(105))
-            .await
-            .unwrap()
-            .unwrap();
+        let workflow_id = match registered {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
+            other @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected registered, got {other:?}")
+            }
+        };
+        let binding = second.reload_binding(workflow_id).await.unwrap().unwrap();
         assert_eq!(binding.contract_id, "contract-1");
         assert_eq!(binding.prepared_fingerprint, "fp-1");
     }
@@ -2477,7 +2892,7 @@ mod tests {
     async fn terminal_receipt_failpoint_rolls_back_canonical_and_projection() {
         let (_dir, repo, _) = open_repo_pair().await;
         let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(106)).await);
-        fail_after_canonical_receipt_once(WorkflowId(106));
+        repo.fail_after_canonical_receipt_once(canonical.authority.as_ref().unwrap().workflow_id);
         let err = repo
             .record_terminal_evidence(
                 WorkflowId(106),
@@ -2504,16 +2919,20 @@ mod tests {
     async fn cancel_failpoint_rolls_back_everything() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
-        repo.register(&input, "fp-1", WorkflowId(107), Timestamp(10))
-            .await
-            .unwrap();
-        fail_after_canonical_transition_once(WorkflowId(107));
-        let err = repo.cancel(&cancel_input(WorkflowId(107))).await;
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        repo.fail_after_canonical_transition_once(workflow_id);
+        let err = repo.cancel(&cancel_input(workflow_id)).await;
         assert!(err.is_err());
         assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
         let head = repo
             .workflow_repo
-            .fetch_workflow_head(WorkflowId(107))
+            .fetch_workflow_head(workflow_id)
             .await
             .unwrap()
             .unwrap();
@@ -2526,11 +2945,9 @@ mod tests {
     async fn cancel_replays_after_cancelled_projection_exists() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
-        repo.register(&input, "fp-1", WorkflowId(108), Timestamp(10))
-            .await
-            .unwrap();
-        let first = repo.cancel(&cancel_input(WorkflowId(108))).await.unwrap();
-        let second = repo.cancel(&cancel_input(WorkflowId(108))).await.unwrap();
+        let workflow_id = registered_workflow_id(&repo, &input, "fp-1").await;
+        let first = repo.cancel(&cancel_input(workflow_id)).await.unwrap();
+        let second = repo.cancel(&cancel_input(workflow_id)).await.unwrap();
         assert!(matches!(first, WakeCancellationOutcome::Cancelled { .. }));
         match second {
             WakeCancellationOutcome::Replayed { receipt, delivery } => {
@@ -2599,11 +3016,8 @@ mod tests {
     async fn restart_reload_lists_pending_cancellation_projection() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = intent();
-        first
-            .register(&input, "fp-1", WorkflowId(109), Timestamp(10))
-            .await
-            .unwrap();
-        first.cancel(&cancel_input(WorkflowId(109))).await.unwrap();
+        let workflow_id = registered_workflow_id(&first, &input, "fp-1").await;
+        first.cancel(&cancel_input(workflow_id)).await.unwrap();
         let pending = second.list_pending("conv-1").await.unwrap();
         assert_eq!(pending.len(), 1);
         assert!(matches!(
@@ -2619,10 +3033,8 @@ mod tests {
     async fn cancellation_has_no_runtime_acceptance() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
-        repo.register(&input, "fp-1", WorkflowId(110), Timestamp(10))
-            .await
-            .unwrap();
-        let outcome = repo.cancel(&cancel_input(WorkflowId(110))).await.unwrap();
+        let workflow_id = registered_workflow_id(&repo, &input, "fp-1").await;
+        let outcome = repo.cancel(&cancel_input(workflow_id)).await.unwrap();
         let delivery = match outcome {
             WakeCancellationOutcome::Cancelled { delivery, .. }
             | WakeCancellationOutcome::Replayed { delivery, .. } => delivery,
@@ -2981,7 +3393,7 @@ mod tests {
         )
         .await
         .unwrap();
-        fail_after_transfer_binding_update_once(workflow_id);
+        restarted.fail_after_transfer_binding_update_once(workflow_id);
 
         let err = restarted
             .transfer(&transfer_input(
@@ -3021,9 +3433,9 @@ mod tests {
     async fn transfer_restart_reload_sees_new_owner() {
         let (_dir, repo, restarted) = open_repo_pair().await;
         insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
-        let workflow_id = WorkflowId(123);
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
         assert!(matches!(
-            repo.register(&intent(), "fp-1", workflow_id, Timestamp(10))
+            repo.register_allocated(workflow_id, &intent(), "fp-1", Timestamp(10))
                 .await
                 .unwrap(),
             WakeRegistrationOutcome::Registered { .. }
@@ -3285,7 +3697,7 @@ mod tests {
         )
         .await
         .unwrap();
-        fail_after_resolve_transition_once(WorkflowId(113));
+        restarted.fail_after_resolve_transition_once(WorkflowId(113));
         let input = resolve_input(
             WorkflowId(113),
             Version(1),
@@ -3510,16 +3922,322 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_public_register_allocates_distinct_workflow_ids_for_distinct_intents() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let left_input = intent();
+        let mut right_input = intent();
+        right_input.contract_id = "contract-2".into();
+        right_input.registering_tool_use_id = "tool-2".into();
+        right_input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: "conv-1".into(),
+            },
+            handle_id: "b-2".into(),
+        });
+
+        let (left, right) = tokio::join!(
+            first.register(&left_input, "fp-1", Timestamp(10)),
+            second.register(&right_input, "fp-2", Timestamp(10))
+        );
+
+        let left_id = match left.unwrap() {
+            WakeRegistrationOutcome::Registered { workflow_id, .. }
+            | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id,
+            WakeRegistrationOutcome::Conflict => panic!("expected registration success"),
+        };
+        let right_id = match right.unwrap() {
+            WakeRegistrationOutcome::Registered { workflow_id, .. }
+            | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id,
+            WakeRegistrationOutcome::Conflict => panic!("expected registration success"),
+        };
+        assert_ne!(left_id, right_id);
+    }
+
+    #[tokio::test]
+    async fn replay_register_does_not_allocate_or_create_extra_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = intent();
+
+        let first = repo.register(&input, "fp-1", Timestamp(10)).await.unwrap();
+        let first_id = match first {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
+            other @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected registered, got {other:?}")
+            }
+        };
+        let before_next = next_test_workflow_id(&repo).await.unwrap();
+        assert_eq!(before_next.0, first_id.0 + 1);
+
+        let replay = repo.register(&input, "fp-1", Timestamp(10)).await.unwrap();
+        match replay {
+            WakeRegistrationOutcome::Replayed { workflow_id, .. } => {
+                assert_eq!(workflow_id, first_id);
+            }
+            other @ (WakeRegistrationOutcome::Registered { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected replay, got {other:?}")
+            }
+        }
+
+        let rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflows")
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        let after_next = next_test_workflow_id(&repo).await.unwrap();
+        assert_eq!(after_next.0, before_next.0 + 1);
+    }
+
+    #[tokio::test]
+    async fn per_workflow_sequence_values_are_unique_under_concurrent_transactions() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = registered_workflow_id(&first, &intent(), "fp-1").await;
+
+        let (left, right) = tokio::join!(
+            async {
+                let mut tx = first.workflow_repo.begin_tx().await.unwrap();
+                let seq = tx
+                    .allocate_sequence_value(workflow_id, WorkflowSequenceName::Receipt)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                seq
+            },
+            async {
+                let mut tx = second.workflow_repo.begin_tx().await.unwrap();
+                let seq = tx
+                    .allocate_sequence_value(workflow_id, WorkflowSequenceName::Receipt)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                seq
+            }
+        );
+
+        assert_ne!(left, right);
+        let mut values = [left, right];
+        values.sort_unstable();
+        assert_eq!(values, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn discovery_queries_are_bounded_ordered_and_restart_consistent() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+
+        let active_a = WorkflowId(600);
+        let active_b = WorkflowId(601);
+        let pending = WorkflowId(602);
+        let expired = WorkflowId(603);
+        let leased = WorkflowId(604);
+
+        assert!(matches!(
+            repo.register_allocated(active_a, &intent(), "fp-a", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let mut intent_b = intent();
+        intent_b.contract_id = "contract-b".into();
+        intent_b.registering_tool_use_id = "tool-b".into();
+        intent_b.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: "conv-1".into(),
+            },
+            handle_id: "b-active-b".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(active_b, &intent_b, "fp-b", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let pending_conv = "conv-0";
+        insert_conversation(&repo.workflow_repo.pool, pending_conv).await;
+        let pending_input = WakeRegistrationIntent {
+            contract_id: "contract-p".into(),
+            conversation_id: pending_conv.into(),
+            registration_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: pending_conv.into(),
+            },
+            resource: WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+                work_scope: wake_types::WorkScopeIdentity {
+                    kind: wake_types::WorkScopeKind::Conversation,
+                    stable_key: pending_conv.into(),
+                },
+                handle_id: "b-pending".into(),
+            }),
+            registering_tool_use_id: "tool-p".into(),
+            registered_at: Timestamp(10),
+            expires_at: Timestamp(100),
+        };
+        assert!(matches!(
+            repo.register_allocated(pending, &pending_input, "fp-p", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let pending_started = unwrap_started(
+            repo.begin_observation(
+                pending,
+                AttemptId(1),
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(pending_started.attempt.as_ref().unwrap().id, AttemptId(1));
+        repo.record_terminal_evidence(
+            pending,
+            pending_started.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+
+        let mut expired_intent = intent();
+        expired_intent.contract_id = "contract-e".into();
+        expired_intent.registering_tool_use_id = "tool-e".into();
+        expired_intent.expires_at = Timestamp(15);
+        expired_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: "conv-1".into(),
+            },
+            handle_id: "b-expired".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(expired, &expired_intent, "fp-e", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let mut leased_intent = intent();
+        leased_intent.contract_id = "contract-l".into();
+        leased_intent.registering_tool_use_id = "tool-l".into();
+        leased_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: "conv-1".into(),
+            },
+            handle_id: "b-leased".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(leased, &leased_intent, "fp-l", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        unwrap_started(
+            repo.begin_observation(
+                leased,
+                AttemptId(1),
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(25),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let active = repo.list_active_unresolved(2).await.unwrap();
+        assert_eq!(
+            active.iter().map(|row| row.workflow_id).collect::<Vec<_>>(),
+            vec![active_a, active_b]
+        );
+
+        let observation = repo
+            .list_observation_candidates(Timestamp(30), 2)
+            .await
+            .unwrap();
+        assert_eq!(observation.len(), 2);
+        assert_eq!(observation[0].workflow_id, active_a);
+        assert_eq!(
+            observation[0].reason,
+            WakeObservationCandidateReason::NoLiveAttempt
+        );
+        assert_eq!(observation[1].workflow_id, active_b);
+        assert_eq!(
+            observation[1].reason,
+            WakeObservationCandidateReason::NoLiveAttempt
+        );
+
+        let observation_restarted = restarted
+            .list_observation_candidates(Timestamp(30), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            observation_restarted
+                .iter()
+                .map(|row| (row.workflow_id, row.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (active_a, WakeObservationCandidateReason::NoLiveAttempt),
+                (active_b, WakeObservationCandidateReason::NoLiveAttempt),
+                (pending, WakeObservationCandidateReason::ExpiredLease),
+                (expired, WakeObservationCandidateReason::NoLiveAttempt),
+                (leased, WakeObservationCandidateReason::ExpiredLease),
+            ]
+        );
+
+        let expired_rows = repo
+            .list_expired_unresolved(Timestamp(30), 1)
+            .await
+            .unwrap();
+        assert_eq!(expired_rows.len(), 1);
+        assert_eq!(expired_rows[0].workflow_id, expired);
+
+        let expired_restarted = restarted
+            .list_expired_unresolved(Timestamp(30), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired_restarted
+                .iter()
+                .map(|row| row.workflow_id)
+                .collect::<Vec<_>>(),
+            vec![expired]
+        );
+
+        let pending_rows = repo.list_pending_global(1).await.unwrap();
+        assert!(pending_rows.is_empty());
+        let pending_restarted = restarted.list_pending_global(5).await.unwrap();
+        assert!(pending_restarted.is_empty());
+        let pending_local = repo.list_pending(pending_conv).await.unwrap();
+        assert!(pending_local.is_empty());
+        let pending_local_restarted = restarted.list_pending(pending_conv).await.unwrap();
+        assert!(pending_local_restarted.is_empty());
+        let pending_original = repo.list_pending("conv-1").await.unwrap();
+        assert!(pending_original.is_empty());
+        let pending_original_restarted = restarted.list_pending("conv-1").await.unwrap();
+        assert!(pending_original_restarted.is_empty());
+    }
+
+    #[tokio::test]
     async fn restart_reload_lists_pending_projection() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = tmux_intent();
+        let workflow_id = next_test_workflow_id(&first).await.unwrap();
         first
-            .register(&input, "fp-2", WorkflowId(110), Timestamp(10))
+            .register_allocated(workflow_id, &input, "fp-2", Timestamp(10))
             .await
             .unwrap();
         let started = first
             .begin_observation(
-                WorkflowId(110),
+                workflow_id,
                 AttemptId(1),
                 ProcessIncarnation(1),
                 Timestamp(20),
@@ -3530,7 +4248,7 @@ mod tests {
         let canonical = unwrap_started(started);
         first
             .record_terminal_evidence(
-                WorkflowId(110),
+                workflow_id,
                 canonical.authority.as_ref().unwrap(),
                 1,
                 ReceiptId(1),
