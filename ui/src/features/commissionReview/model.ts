@@ -291,9 +291,13 @@ export function parseCommissionReviewResult(displayData: unknown, rawContent: st
 }
 
 export function formatCommissionReviewDuration(elapsedMs: number): string {
-  if (elapsedMs < 1000) return `${elapsedMs}ms`;
-  const seconds = elapsedMs / 1000;
-  return seconds >= 10 ? `${Math.round(seconds)}s` : `${seconds.toFixed(1)}s`;
+  if (elapsedMs < 1000) return `${Math.round(elapsedMs)}ms`;
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  if (totalSeconds < 10) return `${(elapsedMs / 1000).toFixed(1)}s`;
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
 }
 
 export type CommissionReviewSearchFragment = { fragmentId: string; text: string };

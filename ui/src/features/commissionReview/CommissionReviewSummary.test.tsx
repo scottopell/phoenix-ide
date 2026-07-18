@@ -60,6 +60,15 @@ describe('CommissionReviewSummaryCard disclosure', () => {
     expect(document.querySelector('[data-fragment-id="commission-review-retry"] .viewer-find-inline-match--active')).toHaveTextContent('review');
   });
 
+  it('formats minute-scale elapsed values exactly as the tool card', () => {
+    const minuteData = {
+      ...data,
+      summary: { ...data.summary, elapsedMs: 60_000 },
+    };
+    render(<CommissionReviewSummaryCard data={minuteData} formatDuration={() => '1m'} />);
+    expect(document.querySelector('[data-fragment-id="commission-review-elapsed"]')).toHaveTextContent('1m');
+  });
+
   it('owns and marks visible metric and full-detail fields', () => {
     const { rerender } = render(
       <CommissionReviewSummaryCard

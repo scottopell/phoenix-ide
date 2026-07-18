@@ -14,12 +14,6 @@ import { buildMarkdownFileSearchProjection } from '../viewer-find';
 // internal memoization and forces a full re-parse.
 const REMARK_PLUGINS = [remarkGfm];
 
-function markdownChildText(node: React.ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (!isValidElement<{ children?: React.ReactNode }>(node)) return '';
-  return Children.toArray(node.props.children).map(markdownChildText).join('');
-}
-
 function decorateMarkdownFindChildren(
   children: React.ReactNode,
   matches: readonly { start: number; end: number; occurrenceIndex: number }[],
@@ -77,13 +71,14 @@ export function MarkdownViewerBody({
     () => findQuery ? buildMarkdownFileSearchProjection(content, findQuery) : { sources: [], matches: [] },
     [content, findQuery],
   );
-  const matchesByLineAndText = useMemo(() => {
-    const matches = new Map<string, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+  const matchesBySourceOffset = useMemo(() => {
+    const matches = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
-      const key = `${match.target.lineNumber}:${match.sourceText}`;
-      const blockMatches = matches.get(key) ?? [];
+      const sourceOffset = Number(/:(\d+)-\d+$/.exec(match.sourceId)?.[1]);
+      if (!Number.isFinite(sourceOffset)) return;
+      const blockMatches = matches.get(sourceOffset) ?? [];
       blockMatches.push({ start: match.start, end: match.end, occurrenceIndex });
-      matches.set(key, blockMatches);
+      matches.set(sourceOffset, blockMatches);
     });
     return matches;
   }, [findProjection.matches]);
@@ -95,15 +90,13 @@ export function MarkdownViewerBody({
     const rawLines = content.split('\n');
 
     const annotatable = (Tag: React.ElementType) =>
-      ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number }; end?: { line?: number } } }; [key: string]: unknown }) => {
+      ({ children, node, ...props }: { children?: React.ReactNode; node?: { position?: { start?: { line?: number; offset?: number }; end?: { line?: number } } }; [key: string]: unknown }) => {
         const ln = node?.position?.start?.line ?? 0;
         const startLine = (node?.position?.start?.line ?? 1) - 1;
         const endLine = (node?.position?.end?.line ?? startLine + 1) - 1;
         const rawLineContent = rawLines.slice(startLine, endLine + 1).join(' ').slice(0, 200);
-        const renderedText = Children.toArray(children).map(markdownChildText).join('').trim();
-        const exactMatches = matchesByLineAndText.get(`${ln}:${renderedText}`);
-        const blockMatches = exactMatches ?? [...matchesByLineAndText]
-          .find(([key]) => key.startsWith(`${ln}:`) && renderedText.includes(key.slice(key.indexOf(':') + 1)))?.[1] ?? [];
+        const sourceOffset = node?.position?.start?.offset;
+        const blockMatches = sourceOffset === undefined ? [] : matchesBySourceOffset.get(sourceOffset) ?? [];
         return (
           <AnnotatableBlock
             as={Tag}
@@ -149,7 +142,7 @@ export function MarkdownViewerBody({
         );
       },
     } as unknown as Components;
-  }, [activeFindOccurrence, content, highlightedLine, matchesByLineAndText, modifiedLines, onAnnotate, registerLineRef, syntaxStyle]);
+  }, [activeFindOccurrence, content, highlightedLine, matchesBySourceOffset, modifiedLines, onAnnotate, registerLineRef, syntaxStyle]);
 
   return (
     <div className="viewer-markdown">

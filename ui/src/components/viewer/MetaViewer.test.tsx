@@ -469,7 +469,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps HTML preview ineligible while allowing HTML source and rendered Markdown find', () => {
+  it('keeps undecorated HTML source and preview ineligible while allowing rendered Markdown find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -484,10 +484,7 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
@@ -504,6 +501,24 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
     expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('alpha');
     expect(document.querySelector('[data-line="3"] .viewer-find-match--active')).toHaveTextContent('alpha');
+  });
+
+  it('treats rendered and source-style Markdown as different find surfaces', () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' }} />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
   });
 
   it('marks matches in lower-level Markdown headings', () => {
@@ -531,6 +546,18 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('target');
   });
 
+  it('keeps identical same-line table cells as distinct match owners', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '| alpha | alpha |\n| --- | --- |' });
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('th .viewer-find-match--active')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('th .viewer-find-match--active')).toHaveLength(1);
+  });
+
   it('keeps source-style Markdown fallbacks searchable', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' });
 
@@ -540,7 +567,7 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-find-occurrence="0"]')).toHaveTextContent('alpha');
   });
 
-  it('closes file find when switching HTML source to preview', async () => {
+  it('keeps HTML find unavailable when switching source to preview', async () => {
     renderViewer({
       ...textCommon,
       kind: 'html',
@@ -549,31 +576,9 @@ describe('MetaViewer payload routing', () => {
       previewUrl: '/preview/tmp/project/thing',
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
-
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
-
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
-  });
-
-  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'html',
-      language: 'html',
-      content: '<p>alpha</p>',
-      previewUrl: '/preview/tmp/project/thing',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull());
   });
 
   it('resets find state when the viewed absolutePath changes', async () => {
@@ -662,23 +667,5 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByText('2 of 3')).toBeInTheDocument();
   });
 
-  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
-
-    renderViewer({
-      ...textCommon,
-      kind: 'html',
-      language: 'html',
-      content: '<p>alpha</p>',
-      previewUrl: '/preview/tmp/project/thing',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
-  });
 });
 

@@ -283,6 +283,13 @@ function SkillToolBlock({
   const inputText = skillCommandFromInput(input);
 
   if (activeHighlight) {
+    if (isError) {
+      return (
+        <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+          <TerminalToolResultHighlight semanticText={resultText} fragmentId={activeHighlight.fragmentId} activeHighlight={activeHighlight} />
+        </div>
+      );
+    }
     const visibleResult = skillResultVisibleText(resultText);
     return (
       <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>

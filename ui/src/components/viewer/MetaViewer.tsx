@@ -79,9 +79,20 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const lastScrollTopRef = useRef(0);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
+  const findSurfaceShape = htmlPreview
+    ? 'html-preview'
+    : rangeSource
+      ? `range:${focusRange?.startLine ?? 0}-${focusRange?.endLine ?? 0}`
+      : isTextLikePayload(payload) && payload.renderMode === 'plainLargeText'
+        ? 'plain-large-text'
+        : payload.kind === 'markdown'
+          ? 'rendered-markdown'
+          : payload.kind === 'html'
+            ? 'html-source'
+            : usePierreCode ? 'pierre-source' : 'prose';
   const findSurfaceKey = useMemo(
-    () => createSurfaceKey(`${absolutePath}\u0000${payload.kind}`),
-    [absolutePath, payload.kind],
+    () => createSurfaceKey(`${absolutePath}\u0000${payload.kind}\u0000${findSurfaceShape}`),
+    [absolutePath, findSurfaceShape, payload.kind],
   );
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
@@ -252,7 +263,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
   const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
-  const findEligible = (textLike && !htmlPreview) || largeFallback;
+  const findEligible = ((textLike && payload.kind !== 'html') && !htmlPreview) || largeFallback;
   const findSourceText = findEligible ? content : '';
   const restoreFindFocus = useCallback((focusOrigin: HTMLElement | null) => {
     queueMicrotask(() => (focusOrigin ?? findButtonRef.current)?.focus());
