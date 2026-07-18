@@ -241,7 +241,409 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_continuation_dispatch_intents",
         sql: MIGRATION_045,
     },
+    Migration {
+        version: 46,
+        name: "create_workflow_foundation_tables",
+        sql: MIGRATION_046,
+    },
 ];
+
+const MIGRATION_046: &str = r"
+CREATE TABLE workflows (
+    workflow_id INTEGER PRIMARY KEY,
+    profile_kind TEXT NOT NULL CHECK (profile_kind <> ''),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    runtime_acceptance_enabled INTEGER NOT NULL CHECK (runtime_acceptance_enabled IN (0, 1)),
+    external_acceptance_enabled INTEGER NOT NULL CHECK (external_acceptance_enabled IN (0, 1)),
+    version INTEGER NOT NULL CHECK (version >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    status TEXT NOT NULL CHECK (status IN (
+        'Active', 'Cancelling', 'ManualResolution', 'Incompatible',
+        'Cancelled', 'DeletionPending', 'Deleted', 'Completed', 'Failed'
+    )),
+    snapshot_codec_family TEXT NOT NULL CHECK (snapshot_codec_family <> ''),
+    snapshot_codec_version INTEGER NOT NULL CHECK (snapshot_codec_version >= 1),
+    snapshot_payload BLOB NOT NULL,
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+);
+
+CREATE TABLE workflow_supported_codecs (
+    workflow_id INTEGER NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    codec_family TEXT NOT NULL CHECK (codec_family <> ''),
+    codec_version INTEGER NOT NULL CHECK (codec_version >= 1),
+    PRIMARY KEY (workflow_id, codec_family, codec_version)
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_transitions (
+    workflow_id INTEGER NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    transition_id INTEGER NOT NULL CHECK (transition_id >= 1),
+    from_version INTEGER NOT NULL CHECK (from_version >= 0),
+    to_version INTEGER NOT NULL CHECK (to_version >= 1),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    event_codec_family TEXT NOT NULL CHECK (event_codec_family <> ''),
+    event_codec_version INTEGER NOT NULL CHECK (event_codec_version >= 1),
+    event_payload BLOB NOT NULL,
+    committed_at INTEGER NOT NULL CHECK (committed_at >= 0),
+    PRIMARY KEY (workflow_id, transition_id),
+    UNIQUE (workflow_id, to_version),
+    CHECK (to_version = from_version + 1)
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_effects (
+    workflow_id INTEGER NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    effect_id INTEGER NOT NULL CHECK (effect_id >= 1),
+    declared_workflow_version INTEGER NOT NULL CHECK (declared_workflow_version >= 0),
+    family TEXT NOT NULL CHECK (family <> ''),
+    kind TEXT NOT NULL CHECK (kind <> ''),
+    intent_codec_family TEXT NOT NULL CHECK (intent_codec_family <> ''),
+    intent_codec_version INTEGER NOT NULL CHECK (intent_codec_version >= 1),
+    intent_payload BLOB NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    role TEXT NOT NULL CHECK (role IN ('Required', 'Optional', 'Compensation')),
+    capability_kind TEXT NOT NULL CHECK (capability_kind IN (
+        'ReclaimableObservation', 'IdempotentSubmission', 'ObservableSubmission',
+        'SafelyRepeatable', 'ManualOnAmbiguity'
+    )),
+    stable_command_id INTEGER,
+    next_eligible_at INTEGER CHECK (next_eligible_at >= 0),
+    destructive_resource TEXT CHECK (destructive_resource IS NULL OR destructive_resource <> ''),
+    status TEXT NOT NULL CHECK (status IN (
+        'Blocked', 'Eligible', 'Executing', 'RetryWait', 'AmbiguityWait',
+        'Receipted', 'Invalidated'
+    )),
+    pending_reconciliation INTEGER NOT NULL DEFAULT 0 CHECK (pending_reconciliation IN (0, 1)),
+    PRIMARY KEY (workflow_id, effect_id),
+    CHECK ((capability_kind IN ('IdempotentSubmission', 'ObservableSubmission')) = (stable_command_id IS NOT NULL)),
+    CHECK ((status = 'Executing') <= (generation >= 1))
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_effect_dependencies (
+    workflow_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    depends_on_effect_id INTEGER NOT NULL,
+    PRIMARY KEY (workflow_id, effect_id, depends_on_effect_id),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, depends_on_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    CHECK (effect_id <> depends_on_effect_id)
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_barriers (
+    workflow_id INTEGER NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    barrier_id INTEGER NOT NULL CHECK (barrier_id >= 1),
+    status TEXT NOT NULL CHECK (status IN ('Waiting', 'Satisfied')),
+    reducer_event_codec_family TEXT NOT NULL CHECK (reducer_event_codec_family <> ''),
+    reducer_event_codec_version INTEGER NOT NULL CHECK (reducer_event_codec_version >= 1),
+    reducer_event_payload BLOB NOT NULL,
+    PRIMARY KEY (workflow_id, barrier_id)
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_barrier_members (
+    workflow_id INTEGER NOT NULL,
+    barrier_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    receipt_family TEXT NOT NULL CHECK (receipt_family IN ('CurrentGenerationEffect', 'CompensationEffect')),
+    PRIMARY KEY (workflow_id, barrier_id, effect_id),
+    FOREIGN KEY (workflow_id, barrier_id) REFERENCES workflow_barriers(workflow_id, barrier_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_attempts (
+    workflow_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL CHECK (attempt_id >= 1),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    declared_workflow_version INTEGER NOT NULL CHECK (declared_workflow_version >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    process_incarnation INTEGER NOT NULL CHECK (process_incarnation >= 0),
+    status TEXT NOT NULL CHECK (status IN ('Begun', 'ObservationRecorded', 'ReceiptAccepted', 'AuthorityLost')),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    PRIMARY KEY (workflow_id, attempt_id),
+    UNIQUE (workflow_id, effect_id, generation, ordinal),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_reclaimable_leases (
+    workflow_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    lease_until INTEGER NOT NULL CHECK (lease_until >= 0),
+    PRIMARY KEY (workflow_id, attempt_id),
+    FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_authoritative_observations (
+    workflow_id INTEGER NOT NULL,
+    observation_id INTEGER NOT NULL CHECK (observation_id >= 1),
+    effect_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    declared_workflow_version INTEGER NOT NULL CHECK (declared_workflow_version >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    process_incarnation INTEGER NOT NULL CHECK (process_incarnation >= 0),
+    observation_codec_family TEXT NOT NULL CHECK (observation_codec_family <> ''),
+    observation_codec_version INTEGER NOT NULL CHECK (observation_codec_version >= 1),
+    observation_payload BLOB NOT NULL,
+    observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+    recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+    PRIMARY KEY (workflow_id, observation_id),
+    UNIQUE (workflow_id, effect_id, generation),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_stale_observations (
+    workflow_id INTEGER NOT NULL,
+    observation_id INTEGER NOT NULL CHECK (observation_id >= 1),
+    effect_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    declared_workflow_version INTEGER NOT NULL CHECK (declared_workflow_version >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    process_incarnation INTEGER NOT NULL CHECK (process_incarnation >= 0),
+    observation_codec_family TEXT NOT NULL CHECK (observation_codec_family <> ''),
+    observation_codec_version INTEGER NOT NULL CHECK (observation_codec_version >= 1),
+    observation_payload BLOB NOT NULL,
+    observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+    recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+    PRIMARY KEY (workflow_id, observation_id),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_receipts (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL CHECK (receipt_id >= 1),
+    effect_id INTEGER NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    declared_workflow_version INTEGER NOT NULL CHECK (declared_workflow_version >= 0),
+    process_incarnation INTEGER NOT NULL CHECK (process_incarnation >= 0),
+    attempt_id INTEGER,
+    origin TEXT NOT NULL CHECK (origin IN (
+        'Execution', 'Adoption', 'Reconciliation', 'Manual',
+        'CancellationArbitration', 'ScheduleCollapse'
+    )),
+    receipt_codec_family TEXT NOT NULL CHECK (receipt_codec_family <> ''),
+    receipt_codec_version INTEGER NOT NULL CHECK (receipt_codec_version >= 1),
+    receipt_payload BLOB NOT NULL,
+    PRIMARY KEY (workflow_id, receipt_id),
+    UNIQUE (workflow_id, effect_id, generation),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE RESTRICT
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_deliveries (
+    workflow_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL CHECK (delivery_id >= 1),
+    effect_id INTEGER,
+    barrier_id INTEGER,
+    consumer_kind TEXT NOT NULL CHECK (consumer_kind <> ''),
+    event_codec_family TEXT NOT NULL CHECK (event_codec_family <> ''),
+    event_codec_version INTEGER NOT NULL CHECK (event_codec_version >= 1),
+    payload_kind TEXT NOT NULL CHECK (payload_kind IN ('Receipt', 'Barrier')),
+    payload_blob BLOB NOT NULL,
+    requires_runtime_acceptance INTEGER NOT NULL CHECK (requires_runtime_acceptance IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('Pending', 'Accepted', 'Suppressed')),
+    runtime_acceptance_status TEXT CHECK (runtime_acceptance_status IN ('Owed', 'Accepted', 'Suppressed')),
+    suppression_reason TEXT CHECK (suppression_reason IN ('Cancelled', 'Superseded', 'LifecycleTerminal', 'ReducerTerminal')),
+    accepted_by_transition_id INTEGER,
+    PRIMARY KEY (workflow_id, delivery_id),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, barrier_id) REFERENCES workflow_barriers(workflow_id, barrier_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, accepted_by_transition_id) REFERENCES workflow_transitions(workflow_id, transition_id) ON DELETE RESTRICT,
+    CHECK ((effect_id IS NOT NULL) <> (barrier_id IS NOT NULL)),
+    CHECK ((status = 'Accepted') = (accepted_by_transition_id IS NOT NULL)),
+    CHECK ((status = 'Suppressed') = (suppression_reason IS NOT NULL)),
+    CHECK ((requires_runtime_acceptance = 1) = (runtime_acceptance_status IS NOT NULL)),
+    CHECK (NOT (requires_runtime_acceptance = 0 AND accepted_by_transition_id IS NOT NULL AND status = 'Pending')),
+    CHECK (
+        (status = 'Pending' AND (
+            runtime_acceptance_status IS NULL OR runtime_acceptance_status = 'Owed'
+        )) OR
+        (status = 'Accepted' AND (
+            runtime_acceptance_status IS NULL OR runtime_acceptance_status = 'Accepted'
+        )) OR
+        (status = 'Suppressed' AND (
+            runtime_acceptance_status IS NULL OR runtime_acceptance_status = 'Suppressed'
+        ))
+    )
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_manual_resolutions (
+    workflow_id INTEGER NOT NULL,
+    manual_resolution_id INTEGER NOT NULL CHECK (manual_resolution_id >= 1),
+    workflow_version INTEGER NOT NULL CHECK (workflow_version >= 0),
+    effect_id INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('Required', 'Resolved')),
+    accepted_choice_ordinal INTEGER,
+    resolved_by TEXT CHECK (resolved_by IS NULL OR resolved_by <> ''),
+    PRIMARY KEY (workflow_id, manual_resolution_id),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_manual_resolution_choices (
+    workflow_id INTEGER NOT NULL,
+    manual_resolution_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind TEXT NOT NULL CHECK (kind IN ('Retry', 'Compensate', 'Suppress', 'AcceptAsTerminal')),
+    payload_codec_family TEXT NOT NULL CHECK (payload_codec_family <> ''),
+    payload_codec_version INTEGER NOT NULL CHECK (payload_codec_version >= 1),
+    payload_blob BLOB NOT NULL,
+    receipt_codec_family TEXT NOT NULL CHECK (receipt_codec_family <> ''),
+    receipt_codec_version INTEGER NOT NULL CHECK (receipt_codec_version >= 1),
+    receipt_blob BLOB NOT NULL,
+    receipt_event_codec_family TEXT NOT NULL CHECK (receipt_event_codec_family <> ''),
+    receipt_event_codec_version INTEGER NOT NULL CHECK (receipt_event_codec_version >= 1),
+    receipt_event_blob BLOB NOT NULL,
+    PRIMARY KEY (workflow_id, manual_resolution_id, ordinal),
+    FOREIGN KEY (workflow_id, manual_resolution_id) REFERENCES workflow_manual_resolutions(workflow_id, manual_resolution_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_external_acceptance_bindings (
+    profile_kind TEXT NOT NULL CHECK (profile_kind <> ''),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    target_scope TEXT NOT NULL CHECK (target_scope <> ''),
+    idempotency_key TEXT NOT NULL CHECK (idempotency_key <> ''),
+    intent_fingerprint TEXT NOT NULL CHECK (intent_fingerprint <> ''),
+    workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    receipt_handle BLOB NOT NULL,
+    disposition_handle BLOB NOT NULL,
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    PRIMARY KEY (profile_kind, profile_version, target_scope, idempotency_key)
+) WITHOUT ROWID;
+
+CREATE TABLE workflow_schedules (
+    workflow_id INTEGER NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    schedule_id INTEGER NOT NULL CHECK (schedule_id >= 1),
+    policy TEXT NOT NULL CHECK (policy IN ('CoalesceLatest')),
+    schedule_key TEXT NOT NULL CHECK (schedule_key <> ''),
+    status TEXT NOT NULL CHECK (status IN ('Idle', 'Due', 'Active')),
+    next_eligible_at INTEGER NOT NULL CHECK (next_eligible_at >= 0),
+    active_effect_id INTEGER,
+    due_occurrence_id INTEGER,
+    due_generation INTEGER CHECK (due_generation IS NULL OR due_generation >= 0),
+    due_at INTEGER CHECK (due_at IS NULL OR due_at >= 0),
+    active_occurrence_id INTEGER,
+    active_generation INTEGER CHECK (active_generation IS NULL OR active_generation >= 0),
+    active_due_at INTEGER CHECK (active_due_at IS NULL OR active_due_at >= 0),
+    PRIMARY KEY (workflow_id, schedule_id),
+    UNIQUE (workflow_id, schedule_key),
+    FOREIGN KEY (workflow_id, active_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE SET NULL,
+    CHECK ((status = 'Active') = (active_effect_id IS NOT NULL)),
+    CHECK ((due_occurrence_id IS NULL) = (due_generation IS NULL AND due_at IS NULL)),
+    CHECK ((active_occurrence_id IS NULL) = (active_generation IS NULL AND active_due_at IS NULL))
+) WITHOUT ROWID;
+
+CREATE TRIGGER workflow_receipts_origin_attempt_shape
+BEFORE INSERT ON workflow_receipts
+FOR EACH ROW
+WHEN ((NEW.origin = 'Execution') <> (NEW.attempt_id IS NOT NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_receipts origin/attempt mismatch');
+END;
+
+CREATE TRIGGER workflow_receipts_attempt_capability
+BEFORE INSERT ON workflow_receipts
+FOR EACH ROW
+WHEN NEW.attempt_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM workflow_effects effects
+    JOIN workflow_attempts attempts
+      ON attempts.workflow_id = NEW.workflow_id
+     AND attempts.attempt_id = NEW.attempt_id
+     AND attempts.effect_id = effects.effect_id
+    WHERE effects.workflow_id = NEW.workflow_id
+      AND effects.effect_id = NEW.effect_id
+      AND effects.capability_kind IN (
+          'ReclaimableObservation', 'IdempotentSubmission',
+          'ObservableSubmission', 'SafelyRepeatable', 'ManualOnAmbiguity'
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_receipts attempt capability mismatch');
+END;
+
+CREATE TRIGGER workflow_reclaimable_leases_capability
+BEFORE INSERT ON workflow_reclaimable_leases
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_attempts attempts
+    JOIN workflow_effects effects
+      ON effects.workflow_id = attempts.workflow_id
+     AND effects.effect_id = attempts.effect_id
+    WHERE attempts.workflow_id = NEW.workflow_id
+      AND attempts.attempt_id = NEW.attempt_id
+      AND effects.capability_kind = 'ReclaimableObservation'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_reclaimable_leases requires reclaimable capability');
+END;
+
+CREATE TRIGGER workflow_authoritative_observations_attempt_shape
+BEFORE INSERT ON workflow_authoritative_observations
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_attempts attempts
+    WHERE attempts.workflow_id = NEW.workflow_id
+      AND attempts.attempt_id = NEW.attempt_id
+      AND attempts.effect_id = NEW.effect_id
+      AND attempts.generation = NEW.generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_authoritative_observations attempt mismatch');
+END;
+
+CREATE TRIGGER workflow_stale_observations_attempt_shape
+BEFORE INSERT ON workflow_stale_observations
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflow_attempts attempts
+    WHERE attempts.workflow_id = NEW.workflow_id
+      AND attempts.attempt_id = NEW.attempt_id
+      AND attempts.effect_id = NEW.effect_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_stale_observations attempt mismatch');
+END;
+
+CREATE TRIGGER workflow_manual_resolutions_choice_fk
+BEFORE UPDATE OF accepted_choice_ordinal ON workflow_manual_resolutions
+FOR EACH ROW
+WHEN NEW.accepted_choice_ordinal IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM workflow_manual_resolution_choices choices
+    WHERE choices.workflow_id = NEW.workflow_id
+      AND choices.manual_resolution_id = NEW.manual_resolution_id
+      AND choices.ordinal = NEW.accepted_choice_ordinal
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_manual_resolutions accepted choice missing');
+END;
+
+CREATE TRIGGER workflow_schedules_occurrence_shape
+BEFORE INSERT ON workflow_schedules
+FOR EACH ROW
+WHEN NOT (
+    (NEW.status = 'Idle' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NULL) OR
+    (NEW.status = 'Due' AND NEW.due_occurrence_id IS NOT NULL AND NEW.active_occurrence_id IS NULL) OR
+    (NEW.status = 'Active' AND NEW.active_occurrence_id IS NOT NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_schedules occurrence shape mismatch');
+END;
+
+CREATE TRIGGER workflow_schedules_occurrence_shape_update
+BEFORE UPDATE ON workflow_schedules
+FOR EACH ROW
+WHEN NOT (
+    (NEW.status = 'Idle' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NULL) OR
+    (NEW.status = 'Due' AND NEW.due_occurrence_id IS NOT NULL AND NEW.active_occurrence_id IS NULL) OR
+    (NEW.status = 'Active' AND NEW.active_occurrence_id IS NOT NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow_schedules occurrence shape mismatch');
+END;
+";
 
 const MIGRATION_044: &str = r"
 CREATE TABLE coordinator (
@@ -1437,6 +1839,40 @@ mod tests {
             .unwrap()
     }
 
+    async fn setup_workflow_only_schema(pool: &SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (\
+                id TEXT PRIMARY KEY, \
+                conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', \
+                state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
+                cwd TEXT NOT NULL DEFAULT '/tmp', \
+                parent_conversation_id TEXT, \
+                user_initiated BOOLEAN NOT NULL DEFAULT 1, \
+                archived BOOLEAN NOT NULL DEFAULT 0, \
+                model TEXT, \
+                steering_queue TEXT NOT NULL DEFAULT '[]', \
+                state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                created_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            .execute(pool)
+            .await
+            .unwrap();
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
     /// Create the conversations table with `conv_mode` and state columns
     /// (minimal schema needed for migration tests).
     async fn setup_conversations_table(pool: &SqlitePool) {
@@ -1546,9 +1982,124 @@ mod tests {
         assert_eq!(again, 0);
     }
 
-    /// Migration 028: the `conv_mode` JSON blob is projected into the `cm_*`
-    /// columns per variant; a malformed/absent blob leaves `cm_kind` NULL (read
-    /// path defaults to explore).
+    async fn assert_workflow_foundation_tables(pool: &SqlitePool) {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'workflow_%' OR name='workflows' ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for expected in [
+            "workflows",
+            "workflow_transitions",
+            "workflow_effects",
+            "workflow_effect_dependencies",
+            "workflow_barriers",
+            "workflow_barrier_members",
+            "workflow_attempts",
+            "workflow_reclaimable_leases",
+            "workflow_authoritative_observations",
+            "workflow_stale_observations",
+            "workflow_receipts",
+            "workflow_deliveries",
+            "workflow_manual_resolutions",
+            "workflow_manual_resolution_choices",
+            "workflow_external_acceptance_bindings",
+            "workflow_schedules",
+            "workflow_supported_codecs",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == expected),
+                "missing {expected}: {tables:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_045_creates_workflow_foundation_tables_and_invariants() {
+        let pool = test_pool().await;
+        setup_workflow_only_schema(&pool).await;
+
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 1);
+
+        assert_workflow_foundation_tables(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO workflows (
+                workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                external_acceptance_enabled, version, generation, status,
+                snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                created_at, updated_at
+             ) VALUES (1, 'test', 1, 1, 1, 0, 0, 'Active', 'snapshot', 1, X'00', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (1, 1, 0, 'f', 'k', 'intent', 1, X'01', 0, 'Required', 'ReclaimableObservation', 'Eligible')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal, declared_workflow_version, generation, process_incarnation, status, created_at) VALUES (1, 1, 1, 0, 0, 0, 1, 'Begun', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_transitions (workflow_id, transition_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES (1, 1, 0, 1, 0, 'event', 1, X'02', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_barriers (workflow_id, barrier_id, status, reducer_event_codec_family, reducer_event_codec_version, reducer_event_payload) VALUES (1, 1, 'Waiting', 'barrier', 1, X'03')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("INSERT INTO workflow_reclaimable_leases (workflow_id, attempt_id, lease_until) VALUES (1, 1, 10)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_authoritative_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (1, 1, 1, 1, 0, 0, 1, 'obs', 1, X'04', 2, 3)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (1, 1, 1, 0, 0, 1, 1, 'Execution', 'receipt', 1, X'05')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (1, 1, 1, NULL, 'consumer', 'event', 1, 'Receipt', X'06', 1, 'Pending', 'Owed', NULL, NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_manual_resolutions (workflow_id, manual_resolution_id, workflow_version, effect_id, status, accepted_choice_ordinal, resolved_by) VALUES (1, 1, 1, 1, 'Required', NULL, NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_manual_resolution_choices (workflow_id, manual_resolution_id, ordinal, kind, payload_codec_family, payload_codec_version, payload_blob, receipt_codec_family, receipt_codec_version, receipt_blob, receipt_event_codec_family, receipt_event_codec_version, receipt_event_blob) VALUES (1, 1, 0, 'Retry', 'manual', 1, X'07', 'receipt', 1, X'08', 'event', 1, X'09')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_manual_resolutions SET accepted_choice_ordinal = 0 WHERE workflow_id = 1 AND manual_resolution_id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_schedules (workflow_id, schedule_id, policy, schedule_key, status, next_eligible_at, active_effect_id, due_occurrence_id, due_generation, due_at, active_occurrence_id, active_generation, active_due_at) VALUES (1, 1, 'CoalesceLatest', 'sched', 'Due', 10, NULL, 1, 0, 10, NULL, NULL, NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (1, 2, 1, 1, 1, 1, NULL, 'Execution', 'receipt', 1, X'05')")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (1, 2, 1, NULL, 'consumer', 'event', 1, 'Receipt', X'06', 1, 'Pending', NULL, NULL, NULL)")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO workflow_schedules (workflow_id, schedule_id, policy, schedule_key, status, next_eligible_at, active_effect_id, due_occurrence_id, due_generation, due_at, active_occurrence_id, active_generation, active_due_at) VALUES (1, 2, 'CoalesceLatest', 'sched2', 'Idle', 10, NULL, 1, 0, 10, NULL, NULL, NULL)")
+            .execute(&pool)
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn migration_028_projects_conv_mode_into_columns() {
         let pool = test_pool().await;

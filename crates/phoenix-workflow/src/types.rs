@@ -151,6 +151,10 @@ impl SupportedCodecRegistry {
     pub fn supports(&self, codec: &CodecRef) -> bool {
         self.0.contains(codec)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &CodecRef> {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +408,23 @@ impl ErasedAcceptanceProfile {
     #[must_use]
     pub fn external_acceptance_enabled(&self) -> bool {
         self.capabilities.external_acceptance_enabled()
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        profile: ProfileRef,
+        supported_codecs: SupportedCodecRegistry,
+        runtime_acceptance_enabled: bool,
+        external_acceptance_enabled: bool,
+    ) -> Self {
+        Self {
+            profile,
+            supported_codecs,
+            capabilities: ErasedAcceptanceCapabilities::from_flags(
+                runtime_acceptance_enabled,
+                external_acceptance_enabled,
+            ),
+        }
     }
 }
 

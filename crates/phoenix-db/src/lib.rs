@@ -5,6 +5,7 @@
 mod ddl;
 mod migrations;
 pub mod retrieval;
+pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -20,6 +21,7 @@ pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
 };
 pub use schema::*;
+pub use workflow::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
