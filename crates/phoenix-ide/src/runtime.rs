@@ -31,7 +31,7 @@ use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAg
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
-    TmuxLifecycleEvent, TmuxRegistry, ToolRegistry,
+    TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
 use phoenix_core::work_scope::WorkScope;
 
@@ -244,6 +244,7 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     wake_kick_tx: tokio::sync::watch::Sender<u64>,
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1314,6 +1315,11 @@ impl RuntimeManager {
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
+        let wake_registrar: Arc<dyn WakeRegistrar> =
+            Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
+                phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
+                wake_kick_tx.clone(),
+            ));
         Self {
             db,
             llm_registry,
@@ -1351,6 +1357,7 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             wake_kick_tx,
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
+            wake_registrar: Some(wake_registrar),
         }
     }
 
@@ -1375,6 +1382,10 @@ impl RuntimeManager {
     /// terminal attach path).
     pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
         &self.tmux_registry
+    }
+
+    pub fn wake_registrar(&self) -> Option<Arc<dyn WakeRegistrar>> {
+        self.wake_registrar.clone()
     }
 
     /// Get the spawn channel sender (cloned for each runtime)
@@ -2316,6 +2327,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         )
+        .with_wake_registrar(self.wake_registrar())
         .with_parent(parent_event_tx.clone())
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
@@ -2730,6 +2742,7 @@ impl RuntimeManager {
             runtime
         };
         let runtime = runtime
+            .with_wake_registrar(self.wake_registrar())
             .with_state_updated_at(initial_state_updated_at)
             .with_steering_queue(steering_queue)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())

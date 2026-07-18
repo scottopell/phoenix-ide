@@ -64,6 +64,11 @@ use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
 use phoenix_core::work_scope::WorkScope;
+use phoenix_workflow::wake_profile::{
+    WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
+    WorkScopeKind,
+};
+use phoenix_workflow::{Timestamp, WorkflowId};
 
 /// Test-only `LlmSelector` that offers no completion service.
 ///
@@ -104,6 +109,86 @@ where
     fn emit(&self, progress: BashToolProgress) {
         self(progress);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterWakeInput {
+    pub contract_id: String,
+    pub conversation_id: String,
+    pub root_conversation_id: String,
+    pub registering_tool_use_id: String,
+    pub registration_scope: WorkScopeIdentity,
+    pub resource: WakeResourceIdentity,
+    pub expires_at: Timestamp,
+    pub prepared_fingerprint: String,
+}
+
+impl RegisterWakeInput {
+    #[must_use]
+    pub fn into_intent(self, registered_at: Timestamp) -> WakeRegistrationIntent {
+        WakeRegistrationIntent {
+            contract_id: self.contract_id,
+            conversation_id: self.conversation_id,
+            registration_scope: self.registration_scope,
+            resource: self.resource,
+            registering_tool_use_id: self.registering_tool_use_id,
+            registered_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelWakeInput {
+    pub workflow_id: WorkflowId,
+    pub timestamp: Timestamp,
+    pub reason: WakeCancellationReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisteredWake {
+    Registered { workflow_id: WorkflowId },
+    Replayed { workflow_id: WorkflowId },
+    Conflict,
+    Cancelled,
+    CancelReplayed,
+    CancelStale,
+}
+
+impl RegisteredWake {
+    #[must_use]
+    pub fn workflow_id(&self) -> Option<WorkflowId> {
+        match self {
+            Self::Registered { workflow_id } | Self::Replayed { workflow_id } => Some(*workflow_id),
+            Self::Conflict | Self::Cancelled | Self::CancelReplayed | Self::CancelStale => None,
+        }
+    }
+}
+
+#[async_trait]
+pub trait WakeRegistrar: Send + Sync {
+    async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
+    async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
+}
+
+/// Converts a runtime scope to a scope that may own a durable wake.
+///
+/// # Errors
+/// Returns an error for global scope, which has no durable conversation/worktree owner.
+pub fn work_scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, String> {
+    Ok(match scope {
+        WorkScope::Worktree(path) => WorkScopeIdentity {
+            kind: WorkScopeKind::Worktree,
+            stable_key: path.clone(),
+        },
+        WorkScope::Conversation(id) => WorkScopeIdentity {
+            kind: WorkScopeKind::Conversation,
+            stable_key: id.clone(),
+        },
+        WorkScope::Global => {
+            return Err("global work scope cannot own a durable wake".to_string());
+        }
+    })
 }
 
 /// Typed image data for LLM consumption.
@@ -307,6 +392,8 @@ pub struct ToolContext {
 
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
+    tool_use_id: Option<String>,
+    wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
 impl ToolContext {
@@ -338,6 +425,8 @@ impl ToolContext {
             worktree_path,
             work_scope,
             bash_progress_sink: None,
+            tool_use_id: None,
+            wake_registrar: None,
         }
     }
 
@@ -350,6 +439,18 @@ impl ToolContext {
     #[must_use]
     pub fn with_root_conversation_id(mut self, root_conversation_id: String) -> Self {
         self.root_conversation_id = root_conversation_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_use_id(mut self, tool_use_id: impl Into<String>) -> Self {
+        self.tool_use_id = Some(tool_use_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_wake_registrar(mut self, wake_registrar: Option<Arc<dyn WakeRegistrar>>) -> Self {
+        self.wake_registrar = wake_registrar;
         self
     }
 
@@ -407,6 +508,16 @@ impl ToolContext {
     #[must_use]
     pub fn llm_selector(&self) -> &Arc<dyn LlmSelector> {
         &self.llm_selector
+    }
+
+    #[must_use]
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn wake_registrar(&self) -> Option<&Arc<dyn WakeRegistrar>> {
+        self.wake_registrar.as_ref()
     }
 
     /// Resolve the conversation's tmux server, lazily spawning it on
@@ -1266,5 +1377,64 @@ mod tests {
                 "{label}: deprecated `mode` should no longer appear in the schema"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_registrar_seam_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct MockWakeRegistrar {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl WakeRegistrar for MockWakeRegistrar {
+        async fn register(&self, _input: RegisterWakeInput) -> Result<RegisteredWake, String> {
+            self.calls.lock().await.push("register".to_string());
+            Ok(RegisteredWake::Conflict)
+        }
+
+        async fn cancel(&self, _input: CancelWakeInput) -> Result<RegisteredWake, String> {
+            self.calls.lock().await.push("cancel".to_string());
+            Ok(RegisteredWake::CancelStale)
+        }
+    }
+
+    fn test_context() -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "conv".to_string(),
+            PathBuf::from("/tmp"),
+            BrowserSessionManager::new(),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(TmuxRegistry::new()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn old_constructor_keeps_optional_fields_unset() {
+        let ctx = test_context();
+        assert_eq!(ctx.tool_use_id(), None);
+        assert!(ctx.wake_registrar().is_none());
+    }
+
+    #[tokio::test]
+    async fn builder_injects_tool_use_id_and_wake_registrar() {
+        let registrar: Arc<dyn WakeRegistrar> = Arc::new(MockWakeRegistrar {
+            calls: Mutex::new(Vec::new()),
+        });
+        let ctx = test_context()
+            .with_tool_use_id("tool-123")
+            .with_wake_registrar(Some(registrar.clone()));
+        assert_eq!(ctx.tool_use_id(), Some("tool-123"));
+        assert!(ctx.wake_registrar().is_some());
+        assert!(Arc::ptr_eq(ctx.wake_registrar().unwrap(), &registrar));
     }
 }

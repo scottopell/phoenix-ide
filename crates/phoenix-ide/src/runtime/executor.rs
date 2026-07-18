@@ -1650,6 +1650,7 @@ where
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
+    wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -1905,6 +1906,7 @@ where
             bash_handles,
             tmux_registry,
             llm_registry,
+            wake_registrar: None,
             terminals,
             event_rx,
             event_tx,
@@ -1943,6 +1945,15 @@ where
             fork_cmd_tx: None,
             state_watcher: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_wake_registrar(
+        mut self,
+        wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
+    ) -> Self {
+        self.wake_registrar = wake_registrar;
+        self
     }
 
     pub fn with_startup_creation_completion(
@@ -4823,7 +4834,9 @@ where
             scope_worktree,
         )
         .with_bash_progress_sink(bash_progress_sink)
-        .with_root_conversation_id(self.context.root_conversation_id.clone());
+        .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_tool_use_id(tool.id.clone())
+        .with_wake_registrar(self.wake_registrar.clone());
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();

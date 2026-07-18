@@ -3,14 +3,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use crate::runtime::RuntimeManager;
 use phoenix_core::work_scope::WorkScope;
 use phoenix_db::workflow::wake::{
-    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
-    WakeRepository, WakeTerminalEvidenceInput,
+    WakeCancelIfUnresolvedInput, WakeCancellationOutcome, WakeForgetIfUnresolvedInput,
+    WakeObservationCandidateRow, WakeObservationOutcome, WakeRegistrationOutcome, WakeRepository,
+    WakeTerminalEvidenceInput,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
+use phoenix_tools::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
 use phoenix_workflow::wake_profile::{
     BashTerminalEvidence, BashTerminalStatus, TmuxTerminalEvidence, TmuxTerminalStatus,
     WakeForgottenReason, WakeResourceIdentity, WakeTerminalEvidence,
@@ -22,6 +26,70 @@ const OBSERVATION_BATCH_LIMIT: usize = 64;
 const EXPIRY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+pub(crate) struct ProductionWakeRegistrar {
+    repo: WakeRepository,
+    kick_tx: watch::Sender<u64>,
+}
+
+impl ProductionWakeRegistrar {
+    pub(crate) fn new(repo: WakeRepository, kick_tx: watch::Sender<u64>) -> Self {
+        Self { repo, kick_tx }
+    }
+
+    fn kick(&self) {
+        self.kick_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+}
+
+#[async_trait]
+impl WakeRegistrar for ProductionWakeRegistrar {
+    async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String> {
+        let now = Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        let prepared_fingerprint = input.prepared_fingerprint.clone();
+        let intent = input.into_intent(now);
+        let outcome = self
+            .repo
+            .register(&intent, &prepared_fingerprint, now)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.kick();
+        Ok(match outcome {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => {
+                RegisteredWake::Registered { workflow_id }
+            }
+            WakeRegistrationOutcome::Replayed { workflow_id, .. } => {
+                RegisteredWake::Replayed { workflow_id }
+            }
+            WakeRegistrationOutcome::Conflict => RegisteredWake::Conflict,
+        })
+    }
+
+    async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String> {
+        let outcome = self
+            .repo
+            .cancel_allocated(&WakeCancelIfUnresolvedInput {
+                workflow_id: input.workflow_id,
+                timestamp: input.timestamp,
+                reason: input.reason,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        self.kick();
+        Ok(match outcome {
+            WakeCancellationOutcome::Cancelled { .. } => RegisteredWake::Cancelled,
+            WakeCancellationOutcome::Replayed { .. } => RegisteredWake::CancelReplayed,
+            WakeCancellationOutcome::Stale => RegisteredWake::CancelStale,
+        })
+    }
+}
 
 pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u64>) {
     let worker = WakeWorker::new(
@@ -685,6 +753,83 @@ mod tests {
         stale_worker.run_once().await.unwrap();
         fresh_worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    fn register_input(handle: &str, fingerprint: &str, expires_at: u64) -> RegisterWakeInput {
+        RegisterWakeInput {
+            contract_id: format!("contract-{handle}"),
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            registering_tool_use_id: "tool-use".to_string(),
+            registration_scope: conv_scope(),
+            resource: WakeResourceIdentity::Bash(BashResourceIdentity {
+                work_scope: conv_scope(),
+                handle_id: handle.to_string(),
+            }),
+            expires_at: Timestamp(expires_at),
+            prepared_fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn production_registrar_replays_and_conflicts_exactly() {
+        let (_db, repo) = open_repo().await;
+        let (kick_tx, kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+
+        let first = registrar
+            .register(register_input("b-1", "fp-1", 50))
+            .await
+            .unwrap();
+        let replay = registrar
+            .register(register_input("b-1", "fp-1", 50))
+            .await
+            .unwrap();
+        let conflict = registrar
+            .register(register_input("b-1", "fp-2", 50))
+            .await
+            .unwrap();
+
+        let first_id = first
+            .workflow_id()
+            .expect("first registration should allocate workflow");
+        assert_eq!(
+            replay,
+            RegisteredWake::Replayed {
+                workflow_id: first_id
+            }
+        );
+        assert_eq!(conflict, RegisteredWake::Conflict);
+        assert_eq!(*kick_rx.borrow(), 3);
+    }
+
+    #[tokio::test]
+    async fn production_registrar_cancel_kicks_and_replays() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (kick_tx, kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+
+        let cancelled = registrar
+            .cancel(CancelWakeInput {
+                workflow_id: phoenix_workflow::WorkflowId(workflow_id),
+                timestamp: Timestamp(5),
+                reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap();
+        let replay = registrar
+            .cancel(CancelWakeInput {
+                workflow_id: phoenix_workflow::WorkflowId(workflow_id),
+                timestamp: Timestamp(5),
+                reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(cancelled, RegisteredWake::Cancelled);
+        assert_eq!(replay, RegisteredWake::CancelReplayed);
+        assert_eq!(*kick_rx.borrow(), 2);
     }
 
     #[tokio::test]
