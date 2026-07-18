@@ -21,33 +21,62 @@ use phoenix_workflow::{
 use serde::Serialize;
 use sqlx::Row;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(test)]
-static FAIL_AFTER_CANONICAL_TRANSITION: AtomicU64 = AtomicU64::new(0);
+fn fail_after_canonical_transition_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
 #[cfg(test)]
-static FAIL_AFTER_CANONICAL_RECEIPT: AtomicU64 = AtomicU64::new(0);
+fn fail_after_canonical_receipt_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+#[cfg(test)]
+fn fail_after_transfer_binding_update_set() -> &'static Mutex<std::collections::BTreeSet<u64>> {
+    static SET: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
 
 #[cfg(test)]
 pub fn fail_after_canonical_transition_once(workflow_id: WorkflowId) {
-    FAIL_AFTER_CANONICAL_TRANSITION.store(workflow_id.0, Ordering::SeqCst);
+    fail_after_canonical_transition_set()
+        .lock()
+        .unwrap()
+        .insert(workflow_id.0);
 }
 
 #[cfg(test)]
 pub fn fail_after_canonical_receipt_once(workflow_id: WorkflowId) {
-    FAIL_AFTER_CANONICAL_RECEIPT.store(workflow_id.0, Ordering::SeqCst);
+    fail_after_canonical_receipt_set()
+        .lock()
+        .unwrap()
+        .insert(workflow_id.0);
 }
 
 #[cfg(test)]
 pub fn fail_after_resolve_transition_once(workflow_id: WorkflowId) {
-    FAIL_AFTER_CANONICAL_TRANSITION.store(workflow_id.0, Ordering::SeqCst);
+    fail_after_canonical_transition_set()
+        .lock()
+        .unwrap()
+        .insert(workflow_id.0);
+}
+
+#[cfg(test)]
+pub fn fail_after_transfer_binding_update_once(workflow_id: WorkflowId) {
+    fail_after_transfer_binding_update_set()
+        .lock()
+        .unwrap()
+        .insert(workflow_id.0);
 }
 
 #[cfg(test)]
 fn maybe_fail_after_canonical_transition(workflow_id: WorkflowId) -> DbResult<()> {
-    if FAIL_AFTER_CANONICAL_TRANSITION
-        .compare_exchange(workflow_id.0, 0, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+    if fail_after_canonical_transition_set()
+        .lock()
+        .unwrap()
+        .remove(&workflow_id.0)
     {
         return Err(DbError::Serialization(
             "test failpoint after canonical transition".to_string(),
@@ -58,12 +87,27 @@ fn maybe_fail_after_canonical_transition(workflow_id: WorkflowId) -> DbResult<()
 
 #[cfg(test)]
 fn maybe_fail_after_canonical_receipt(workflow_id: WorkflowId) -> DbResult<()> {
-    if FAIL_AFTER_CANONICAL_RECEIPT
-        .compare_exchange(workflow_id.0, 0, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+    if fail_after_canonical_receipt_set()
+        .lock()
+        .unwrap()
+        .remove(&workflow_id.0)
     {
         return Err(DbError::Serialization(
             "test failpoint after canonical receipt".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_fail_after_transfer_binding_update(workflow_id: WorkflowId) -> DbResult<()> {
+    if fail_after_transfer_binding_update_set()
+        .lock()
+        .unwrap()
+        .remove(&workflow_id.0)
+    {
+        return Err(DbError::Serialization(
+            "test failpoint after transfer binding update".to_string(),
         ));
     }
     Ok(())
@@ -73,6 +117,8 @@ fn maybe_fail_after_canonical_receipt(workflow_id: WorkflowId) -> DbResult<()> {
 fn maybe_fail_after_canonical_transition(_workflow_id: WorkflowId) {}
 #[cfg(not(test))]
 fn maybe_fail_after_canonical_receipt(_workflow_id: WorkflowId) {}
+#[cfg(not(test))]
+fn maybe_fail_after_transfer_binding_update(_workflow_id: WorkflowId) {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeBindingRecord {
@@ -184,6 +230,25 @@ pub enum WakeResolvePendingOutcome {
     VersionConflict,
     SetMismatch,
     AlreadyResolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeTransferInput {
+    pub workflow_id: WorkflowId,
+    pub from_conversation_id: String,
+    pub to_conversation_id: String,
+    pub expected_version: Version,
+    pub exact_pending_delivery_ids: Vec<DeliveryId>,
+    pub transition_id: TransitionId,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeTransferOutcome {
+    Transferred,
+    VersionConflict,
+    OwnerMismatch,
+    SetMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -843,6 +908,122 @@ impl WakeRepository {
         }
         tx.commit().await?;
         Ok(pending)
+    }
+
+    pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
+        for _ in 0..5 {
+            match self.transfer_once(input).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.transfer_once(input).await
+    }
+
+    async fn transfer_once(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let to_exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations WHERE id = ?1")
+                .bind(&input.to_conversation_id)
+                .fetch_one(&mut *tx.tx)
+                .await?;
+        if to_exists == 0 {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::OwnerMismatch);
+        }
+        let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::OwnerMismatch);
+        };
+        if binding.conversation_id != input.from_conversation_id {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::OwnerMismatch);
+        }
+        let Some(head) = tx.fetch_workflow_head(input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::OwnerMismatch);
+        };
+        if head.version != input.expected_version {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::VersionConflict);
+        }
+        let current_pending_ids =
+            fetch_pending_terminal_delivery_ids_tx(&mut tx, input.workflow_id).await?;
+        if current_pending_ids != input.exact_pending_delivery_ids {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::SetMismatch);
+        }
+
+        let event = WakeRegistrationEvent::OwnershipTransferred {
+            from_conversation_id: input.from_conversation_id.clone(),
+            to_conversation_id: input.to_conversation_id.clone(),
+            pending_delivery_ids: input.exact_pending_delivery_ids.clone(),
+        };
+        let event_codec = local_codec(&wake_profile::event_codec());
+        let event_payload = json_blob(&event)?;
+        let next_snapshot_codec = LocalCodec {
+            family: head.snapshot_codec.family.to_string(),
+            version: head.snapshot_codec.version,
+        };
+        let committed = tx
+            .commit_transition_head_cas(
+                input.workflow_id,
+                input.expected_version,
+                head.generation,
+                head.status,
+                &event_codec,
+                &event_payload,
+                &next_snapshot_codec,
+                &head.snapshot_payload,
+                input.transition_id,
+                input.timestamp,
+            )
+            .await?;
+        if !committed {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::VersionConflict);
+        }
+
+        sqlx::query(
+            "UPDATE wake_bindings SET conversation_id = ?2 WHERE workflow_id = ?1 AND conversation_id = ?3",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(&input.to_conversation_id)
+        .bind(&input.from_conversation_id)
+        .execute(&mut *tx.tx)
+        .await?;
+
+        #[cfg(test)]
+        maybe_fail_after_transfer_binding_update(input.workflow_id)?;
+        #[cfg(not(test))]
+        maybe_fail_after_transfer_binding_update(input.workflow_id);
+
+        for delivery_id in &input.exact_pending_delivery_ids {
+            sqlx::query(
+                "UPDATE wake_terminal_receipts
+                 SET conversation_id = ?3
+                 WHERE workflow_id = ?1 AND delivery_id = ?2 AND conversation_id = ?4
+                   AND EXISTS (
+                       SELECT 1 FROM workflow_deliveries d
+                       WHERE d.workflow_id = wake_terminal_receipts.workflow_id
+                         AND d.delivery_id = wake_terminal_receipts.delivery_id
+                         AND d.status = 'Pending'
+                   )",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(&input.to_conversation_id)
+            .bind(&input.from_conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(WakeTransferOutcome::Transferred)
     }
 
     pub async fn resolve_pending_exact(
@@ -1588,6 +1769,31 @@ fn projection_parts(
     }
 }
 
+async fn fetch_pending_terminal_delivery_ids_tx(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<Vec<DeliveryId>> {
+    let rows = sqlx::query(
+        "SELECT d.delivery_id
+         FROM workflow_deliveries d
+         JOIN wake_terminal_receipts p
+           ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+         WHERE d.workflow_id = ?1 AND d.status = 'Pending'
+         ORDER BY d.delivery_id",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_all(&mut *tx.tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DeliveryId(to_u64(
+                row.get::<i64, _>("delivery_id"),
+                "delivery_id",
+            )?))
+        })
+        .collect()
+}
+
 async fn fetch_any_terminal_projection_tx(
     tx: &mut WorkflowTx<'_>,
     workflow_id: WorkflowId,
@@ -2141,6 +2347,49 @@ mod tests {
         }
     }
 
+    fn transfer_input(
+        workflow_id: WorkflowId,
+        from_conversation_id: &str,
+        to_conversation_id: &str,
+        expected_version: Version,
+        exact_pending_delivery_ids: Vec<DeliveryId>,
+        transition_id: TransitionId,
+    ) -> WakeTransferInput {
+        WakeTransferInput {
+            workflow_id,
+            from_conversation_id: from_conversation_id.into(),
+            to_conversation_id: to_conversation_id.into(),
+            expected_version,
+            exact_pending_delivery_ids,
+            transition_id,
+            timestamp: Timestamp(30),
+        }
+    }
+
+    async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
+        sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES (?1)")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn external_acceptance_identity(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+    ) -> Option<(String, String)> {
+        sqlx::query(
+            "SELECT target_scope, idempotency_key
+             FROM workflow_external_acceptance_bindings
+             WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_optional(&repo.workflow_repo.pool)
+        .await
+        .unwrap()
+        .map(|row| (row.get("target_scope"), row.get("idempotency_key")))
+    }
+
     #[tokio::test]
     async fn duplicate_concurrent_registration_replays_single_winner() {
         let (_dir, first, second) = open_repo_pair().await;
@@ -2471,6 +2720,468 @@ mod tests {
             | WakeTerminalEvidenceOutcome::WrongResource
             | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
                 panic!("expected recorded, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_transfer_before_terminal_then_terminal_targets_new_owner() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(118);
+        let started = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        let identity_before = external_acceptance_identity(&repo, workflow_id).await;
+
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        assert!(repo.list_pending("conv-2").await.unwrap().is_empty());
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-2"
+        );
+        assert_eq!(
+            external_acceptance_identity(&repo, workflow_id).await,
+            identity_before
+        );
+
+        repo.record_terminal_evidence(
+            workflow_id,
+            started.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let pending = repo.list_pending("conv-2").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].conversation_id, "conv-2");
+    }
+
+    #[tokio::test]
+    async fn pending_transfer_moves_list_pending_old_to_new() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(119);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![DeliveryId(1)],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let pending = repo.list_pending("conv-2").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].conversation_id, "conv-2");
+        assert_eq!(pending[0].receipt.conversation_id, "conv-2");
+    }
+
+    #[tokio::test]
+    async fn resolved_transfer_leaves_historical_projection_old_but_binding_new() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(120);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                workflow_id,
+                Version(1),
+                TransitionId(2),
+                vec![DeliveryId(1)],
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(2),
+                vec![],
+                TransitionId(3),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        assert!(repo.list_pending("conv-2").await.unwrap().is_empty());
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-2"
+        );
+        let projection = fetch_any_terminal_projection_tx(
+            &mut restarted.workflow_repo.begin_tx().await.unwrap(),
+            workflow_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(projection.conversation_id, "conv-1");
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_set_and_version_mismatch_do_not_mutate() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(121);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        let before = repo
+            .workflow_repo
+            .fetch_workflow_head(workflow_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-x",
+                "conv-2",
+                Version(1),
+                vec![DeliveryId(1)],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::OwnerMismatch
+        );
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(2),
+                vec![DeliveryId(1)],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::VersionConflict
+        );
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::SetMismatch
+        );
+
+        let after = restarted
+            .workflow_repo
+            .fetch_workflow_head(workflow_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.version, after.version);
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-1"
+        );
+        assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
+        assert!(restarted.list_pending("conv-2").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_failpoint_rolls_back_binding_and_projection() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(122);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        fail_after_transfer_binding_update_once(workflow_id);
+
+        let err = restarted
+            .transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![DeliveryId(1)],
+                TransitionId(2),
+            ))
+            .await;
+        assert!(err.is_err());
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-1"
+        );
+        assert_eq!(
+            restarted
+                .workflow_repo
+                .fetch_workflow_head(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            Version(1)
+        );
+        assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
+        assert!(restarted.list_pending("conv-2").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_restart_reload_sees_new_owner() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(123);
+        assert!(matches!(
+            repo.register(&intent(), "fp-1", workflow_id, Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![],
+                TransitionId(2),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        assert_eq!(
+            restarted
+                .reload_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_vs_terminal_race_repeated_has_one_coherent_owner() {
+        for run in 0..10 {
+            let (_dir, first, second) = open_repo_pair().await;
+            insert_conversation(&first.workflow_repo.pool, "conv-2").await;
+            let workflow_id = WorkflowId(400 + run);
+            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+            let authority = canonical.authority.unwrap();
+            let transfer = transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![],
+                TransitionId(2),
+            );
+            let evidence = bash_evidence(19);
+            let (left, right) = tokio::join!(
+                first.transfer(&transfer),
+                second.record_terminal_evidence(
+                    workflow_id,
+                    &authority,
+                    1,
+                    ReceiptId(1),
+                    DeliveryId(1),
+                    Timestamp(20),
+                    &evidence
+                )
+            );
+            match left.unwrap() {
+                WakeTransferOutcome::Transferred
+                | WakeTransferOutcome::VersionConflict
+                | WakeTransferOutcome::SetMismatch => {}
+                other @ WakeTransferOutcome::OwnerMismatch => {
+                    panic!("unexpected transfer race outcome: {other:?}")
+                }
+            }
+            match right.unwrap() {
+                WakeTerminalEvidenceOutcome::Recorded { .. }
+                | WakeTerminalEvidenceOutcome::Replayed { .. } => {
+                    let binding_owner = first
+                        .fetch_binding(workflow_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .conversation_id;
+                    let old_pending = first.list_pending("conv-1").await.unwrap();
+                    let new_pending = first.list_pending("conv-2").await.unwrap();
+                    assert!(old_pending.len() + new_pending.len() <= 1);
+                    if let Some(item) = old_pending.first() {
+                        assert_eq!(binding_owner, item.conversation_id);
+                    }
+                    if let Some(item) = new_pending.first() {
+                        assert_eq!(binding_owner, item.conversation_id);
+                    }
+                }
+                WakeTerminalEvidenceOutcome::StaleAttempt => {
+                    let binding_owner = first
+                        .fetch_binding(workflow_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .conversation_id;
+                    assert_eq!(binding_owner, "conv-2");
+                    assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+                    assert!(first.list_pending("conv-2").await.unwrap().is_empty());
+                }
+                other @ (WakeTerminalEvidenceOutcome::WrongResource
+                | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+                    panic!("unexpected terminal race outcome: {other:?}")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_vs_cancel_race_repeated_has_one_coherent_owner() {
+        for run in 0..10 {
+            let (_dir, first, second) = open_repo_pair().await;
+            insert_conversation(&first.workflow_repo.pool, "conv-2").await;
+            let workflow_id = WorkflowId(500 + run);
+            register_and_begin(&first, workflow_id).await;
+            let transfer = transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(1),
+                vec![],
+                TransitionId(2),
+            );
+            let cancel = cancel_input(workflow_id);
+            let (left, right) = tokio::join!(first.transfer(&transfer), second.cancel(&cancel));
+            match left.unwrap() {
+                WakeTransferOutcome::Transferred
+                | WakeTransferOutcome::VersionConflict
+                | WakeTransferOutcome::SetMismatch => {}
+                other @ WakeTransferOutcome::OwnerMismatch => {
+                    panic!("unexpected transfer race outcome: {other:?}")
+                }
+            }
+            match right.unwrap() {
+                WakeCancellationOutcome::Cancelled { .. }
+                | WakeCancellationOutcome::Replayed { .. } => {
+                    let binding_owner = first
+                        .fetch_binding(workflow_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .conversation_id;
+                    let old_pending = first.list_pending("conv-1").await.unwrap();
+                    let new_pending = first.list_pending("conv-2").await.unwrap();
+                    assert!(old_pending.len() + new_pending.len() <= 1);
+                    if let Some(item) = old_pending.first() {
+                        assert_eq!(binding_owner, item.conversation_id);
+                    }
+                    if let Some(item) = new_pending.first() {
+                        assert_eq!(binding_owner, item.conversation_id);
+                    }
+                }
+                WakeCancellationOutcome::Stale => {
+                    let binding_owner = first
+                        .fetch_binding(workflow_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .conversation_id;
+                    assert_eq!(binding_owner, "conv-2");
+                    assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+                    assert!(first.list_pending("conv-2").await.unwrap().is_empty());
+                }
             }
         }
     }

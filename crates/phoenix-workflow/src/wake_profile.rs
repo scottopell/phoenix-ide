@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 
 use crate::{
     AcceptanceProfile, BarrierId, CancellationReceiptDecl, CancellationRequest, CodecRef,
-    DeliveryItem, DeliveryPayload, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole,
-    ExecutionCapability, ExternalAcceptanceDisabled, Generation, ManualChoice, ManualChoiceKind,
-    ProfileRef, RuntimeAcceptanceEnabled, SupportedCodecRegistry, Timestamp, TransitionPlan,
-    WorkflowProfile,
+    DeliveryId, DeliveryItem, DeliveryPayload, EffectDecl, EffectId, EffectInvalidationDecl,
+    EffectRole, ExecutionCapability, ExternalAcceptanceDisabled, Generation, ManualChoice,
+    ManualChoiceKind, ProfileRef, RuntimeAcceptanceEnabled, SupportedCodecRegistry, Timestamp,
+    TransitionPlan, WorkflowProfile,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -220,9 +220,20 @@ pub struct WakeRegistrationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeRegistrationEvent {
     Registered,
-    TerminalProjected { terminal: Box<WakeTerminalPayload> },
-    RuntimeAccepted { terminal: Box<WakeTerminalPayload> },
-    RuntimeSuppressed { terminal: Box<WakeTerminalPayload> },
+    TerminalProjected {
+        terminal: Box<WakeTerminalPayload>,
+    },
+    RuntimeAccepted {
+        terminal: Box<WakeTerminalPayload>,
+    },
+    RuntimeSuppressed {
+        terminal: Box<WakeTerminalPayload>,
+    },
+    OwnershipTransferred {
+        from_conversation_id: String,
+        to_conversation_id: String,
+        pending_delivery_ids: Vec<DeliveryId>,
+    },
     CancelRequested,
 }
 
