@@ -30,7 +30,7 @@ import {
   findHistoricalUnitIndexByMessageId,
 } from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
-import type { InputAreaHandle } from '../components/InputArea';
+import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
@@ -192,7 +192,12 @@ async function getConversationMetaForRoute(routeSegment: string) {
 }
 
 
-export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
+interface ConversationPageProps {
+  routePrefix?: '/c' | '/global';
+  composerQuickAction?: ComposerQuickAction | undefined;
+}
+
+export function ConversationPage({ routePrefix = '/c', composerQuickAction }: ConversationPageProps) {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -217,7 +222,7 @@ export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | 
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
       {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent routePrefix={routePrefix} />
+      <ConversationPageContent routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
     </ReviewNotesProvider>
   );
 }
@@ -269,7 +274,13 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
-function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global' }) {
+function ConversationPageContent({
+  routePrefix,
+  composerQuickAction,
+}: {
+  routePrefix: '/c' | '/global';
+  composerQuickAction?: ComposerQuickAction | undefined;
+}) {
   const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -2494,6 +2505,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           focusToken={focusToken}
+          quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
@@ -2538,6 +2550,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             failedMessages={failedMessages}
             convModeLabel={conversation.conv_mode_label}
             focusToken={focusToken}
+            quickAction={composerQuickAction}
             onSend={handleSend}
             onCancel={handleCancel}
             onRetry={handleRetry}
@@ -2600,6 +2613,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           focusToken={focusToken}
+          quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
