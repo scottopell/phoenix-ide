@@ -379,6 +379,7 @@ class PreparationTests(unittest.TestCase):
             exact_release_tag="v1.2.3",
             expected_full_commit="a" * 40,
             transaction_id="tx-123",
+            backend="launchd",
         )
         with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
              mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \

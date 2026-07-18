@@ -29,6 +29,9 @@ runtime-ownership snapshot defined by `specs/deployment-info/requirements.md`
 and shall not independently infer ownership from the host platform, PID 1, or
 installed artifacts. Development, unmanaged, ambiguous, and unsupported
 ownership states shall not be eligible for disruptive in-app updates.
+The system shall pass the proven managed backend to the independent controller,
+and the controller shall deploy through that backend rather than re-inferring one
+from host characteristics.
 
 Browser locality, host tools, privileges, and deployment-claim availability
 shall remain separate update-authority decisions and shall not alter the

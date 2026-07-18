@@ -54,6 +54,17 @@ enum ReleaseUpdateBackend {
     Unsupported,
 }
 
+impl ReleaseUpdateBackend {
+    fn controller_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Launchd => Some("launchd"),
+            Self::Systemd => Some("systemd"),
+            Self::BareLinux => Some("bare_linux"),
+            Self::Unsupported => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -780,6 +791,10 @@ pub async fn approve(
             "--release",
             &tag,
             "--controller-mode",
+            "--controller-backend",
+            selected_backend
+                .controller_arg()
+                .expect("allowed update has a managed backend"),
             "--controller-release-tag",
             &tag,
             "--controller-expected-full-commit",
@@ -956,6 +971,23 @@ mod tests {
                 ReleaseUpdateBackend::Unsupported
             ));
         }
+    }
+
+    #[test]
+    fn controller_backend_argument_matches_proven_owner() {
+        assert_eq!(
+            ReleaseUpdateBackend::Launchd.controller_arg(),
+            Some("launchd")
+        );
+        assert_eq!(
+            ReleaseUpdateBackend::Systemd.controller_arg(),
+            Some("systemd")
+        );
+        assert_eq!(
+            ReleaseUpdateBackend::BareLinux.controller_arg(),
+            Some("bare_linux")
+        );
+        assert_eq!(ReleaseUpdateBackend::Unsupported.controller_arg(), None);
     }
 
     #[test]

@@ -7387,6 +7387,7 @@ class ProdDeployControllerOptions:
     expected_asset_name: str | None = None
     expected_asset_sha256: str | None = None
     transaction_id: str | None = None
+    backend: str | None = None
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
         if release is None:
@@ -7405,6 +7406,18 @@ class ProdDeployControllerOptions:
         if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
             raise SystemExit("--controller-expected-full-commit must be a full 40-character lowercase git SHA")
         return release, expected
+
+    def require_backend(self) -> str:
+        if not self.enabled:
+            return detect_prod_env()
+        backend = {
+            "launchd": "launchd",
+            "systemd": "native",
+            "bare_linux": "daemon",
+        }.get(self.backend or "")
+        if backend is None:
+            raise SystemExit("controller mode requires a valid --controller-backend")
+        return backend
 
 
 
@@ -8180,7 +8193,7 @@ def cmd_prod_deploy(
 ):
     """Deploy local HEAD or an immutable published release."""
     controller = controller or ProdDeployControllerOptions()
-    env = detect_prod_env()
+    env = controller.require_backend()
     if controller.enabled and not release:
         raise SystemExit("controller mode requires --release")
     if not release:
@@ -8473,6 +8486,11 @@ def main():
         help="Render the pre-deploy check as a live lane table",
     )
     deploy_parser.add_argument("--controller-mode", action="store_true", help=argparse.SUPPRESS)
+    deploy_parser.add_argument(
+        "--controller-backend",
+        choices=("launchd", "systemd", "bare_linux"),
+        help=argparse.SUPPRESS,
+    )
     deploy_parser.add_argument("--controller-release-tag", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-full-commit", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
@@ -8606,6 +8624,7 @@ def main():
                     expected_asset_name=args.controller_expected_asset_name,
                     expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
+                    backend=args.controller_backend,
                 ),
             )
         elif args.prod_command == "status":

@@ -32,12 +32,26 @@ class BareDeployCommandTests(unittest.TestCase):
         check.assert_not_called()
         deploy.assert_called_once_with("v2.0.0")
 
+    def test_controller_backend_bypasses_host_redetection(self):
+        controller = self.dev.ProdDeployControllerOptions(enabled=True, backend="bare_linux")
+        with mock.patch.object(self.dev, "detect_prod_env") as detect, \
+             mock.patch.object(self.dev, "prod_daemon_deploy") as deploy:
+            self.dev.cmd_prod_deploy("v2.0.0", controller=controller)
+        detect.assert_not_called()
+        deploy.assert_called_once_with("v2.0.0", controller=controller)
+
+    def test_controller_requires_explicit_supported_backend(self):
+        controller = self.dev.ProdDeployControllerOptions(enabled=True)
+        with self.assertRaisesRegex(SystemExit, "valid --controller-backend"):
+            self.dev.cmd_prod_deploy("v2.0.0", controller=controller)
+
     def test_controller_uses_installed_bare_env_and_transaction_id(self):
         controller = self.dev.ProdDeployControllerOptions(
             enabled=True,
             exact_release_tag="v2.0.0",
             expected_full_commit="a" * 40,
             transaction_id="tx-123",
+            backend="bare_linux",
         )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "phoenix"

@@ -16,7 +16,7 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 | REQ-RU-002 | `ReleasePreview` and `ReleaseUpdatePanel` present tag, full commit, asset, checksum, notes, and running identity before approval. |
 | REQ-RU-003 | `client_is_local`, `valid_approval`, and controller exact-tag/full-commit validation enforce same-host, preview-bound approval. |
 | REQ-RU-004 | The pinned `dev.py` controller delegates to the existing launchd/systemd/bare activation owners. |
-| REQ-RU-004A | `api::installation_ownership` is shared by `/api/deployment` and `release_updates`; `release_updates::backend` internally maps only proven managed owners to update backends without exporting a parallel ownership value. |
+| REQ-RU-004A | `api::installation_ownership` is shared by `/api/deployment` and `release_updates`; `release_updates::backend` internally maps only proven managed owners to update backends without exporting a parallel ownership value, and controller mode receives that selected backend instead of re-detecting from the host. |
 | REQ-RU-005 | `release_updates::approve` launches the controller independently and returns only after durable backend handoff. |
 | REQ-RU-006 | `read_status` normalizes backend-owned status and the UI polls/restores it after reconnect. |
 | REQ-RU-007 | Committed status displays backend-verified expected identity and approved source commit. |
