@@ -19,6 +19,14 @@ const COMMITTED = [
   '+hello world',
 ].join('\n');
 
+const DEFAULT_CHECKOUT_STATUS: import('../../api').CheckoutStatus = {
+  kind: 'named_branch',
+  branch_name: 'main',
+  exact_ref: 'refs/heads/main',
+  repository_identity: null,
+  remote_status: { kind: 'no_known' },
+};
+
 function renderDiff(committed = COMMITTED, uncommitted = '', checkoutStatus?: import('../../api').CheckoutStatus) {
   return render(
     <ReviewNotesProvider>
@@ -28,7 +36,7 @@ function renderDiff(committed = COMMITTED, uncommitted = '', checkoutStatus?: im
         commitLog=""
         committedDiff={committed}
         uncommittedDiff={uncommitted}
-        checkoutStatus={checkoutStatus}
+        checkoutStatus={checkoutStatus ?? DEFAULT_CHECKOUT_STATUS}
         onClose={() => undefined}
         onSendNotes={() => undefined}
       />
@@ -106,6 +114,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog="abc123 add hello context"
           committedDiff={COMMITTED}
@@ -145,6 +154,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={[
@@ -273,6 +283,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open={false}
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -400,6 +411,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -426,6 +438,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -444,6 +457,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open={false}
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -458,6 +472,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -588,7 +603,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     });
 
     const panel = screen.getByLabelText('Checkout status');
-    expect(panel).toHaveTextContent('Branch task-82003');
+    expect(panel).toHaveTextContent(/Branch\s*task-82003/);
     expect(panel).toHaveTextContent('task-82003');
     expect(panel).toHaveTextContent('acme/phoenix');
     expect(panel).toHaveTextContent('Tracked upstream:');
@@ -604,10 +619,11 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       kind: 'named_branch',
       branch_name: 'main',
       exact_ref: 'refs/heads/main',
+      repository_identity: null,
       remote_status: { kind: 'no_known' },
     });
 
-    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('No known remote ref for this branch yet.');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('No known remote branch (last fetched state).');
     expect(screen.getByText(/No changes vs/)).toBeInTheDocument();
   });
 
@@ -624,6 +640,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
             kind: 'named_branch',
             branch_name: 'task-82003',
             exact_ref: 'refs/heads/task-82003',
+            repository_identity: null,
             remote_status: {
               kind: 'matching',
               remote_ref: 'refs/remotes/origin/task-82003',
@@ -672,7 +689,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
           commitLog=""
           committedDiff={COMMITTED}
           uncommittedDiff=""
-          checkoutStatus={{ kind: 'unavailable', reason: 'git status failed' }}
+          checkoutStatus={{ kind: 'unavailable', repository_identity: null, reason: 'git status failed' }}
           onClose={() => undefined}
           onSendNotes={() => undefined}
         />
@@ -693,6 +710,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}

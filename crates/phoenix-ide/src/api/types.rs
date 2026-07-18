@@ -860,11 +860,10 @@ pub enum BranchRemoteStatus {
     },
     Matching {
         remote_ref: String,
+        ahead: u32,
+        behind: u32,
     },
-    NoKnown {
-        #[serde(skip_serializing_if = "Vec::is_empty", default)]
-        candidate_remote_refs: Vec<String>,
-    },
+    NoKnown,
     Unavailable {
         reason: String,
     },

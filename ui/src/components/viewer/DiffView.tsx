@@ -48,7 +48,7 @@ export interface DiffViewProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
-  checkoutStatus?: CheckoutStatus | undefined;
+  checkoutStatus: CheckoutStatus;
   onClose: () => void;
   /** Drop the formatted review-notes pile into the chat input. Same
    *  signature as ProseReader's onSendNotes. */
@@ -372,9 +372,7 @@ function stableDiffMatchIds(): (match: {
   };
 }
 
-function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStatus | undefined }) {
-  if (!checkoutStatus) return null;
-
+function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus: CheckoutStatus }) {
   if (checkoutStatus.kind === 'unavailable') {
     return (
       <section className="checkout-status-panel checkout-status-panel--warning" aria-label="Checkout status">
@@ -392,7 +390,9 @@ function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStat
       <section className="checkout-status-panel" aria-label="Checkout status">
         <div className="checkout-status-panel__header">
           <GitBranch size={16} aria-hidden="true" />
-          <span className="checkout-status-panel__title">On an unborn branch</span>
+          <span className="checkout-status-panel__title">
+            Unborn branch{checkoutStatus.branch_name ? <> <code>{checkoutStatus.branch_name}</code></> : null}
+          </span>
         </div>
         <p className="checkout-status-panel__detail">Create the first commit to establish this branch.</p>
       </section>
@@ -409,7 +409,7 @@ function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStat
         </div>
         {checkoutStatus.pointing_refs.length > 0 && (
           <p className="checkout-status-panel__detail">
-            Pointing refs: {' '}
+            Points to: {' '}
             {checkoutStatus.pointing_refs.map((ref, index) => (
               <span key={ref}>
                 {index > 0 ? ', ' : ''}
@@ -423,14 +423,13 @@ function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStat
   }
 
   const remoteSummary = describeRemoteStatus(checkoutStatus.remote_status);
+  const tone = remoteStatusTone(checkoutStatus.remote_status);
   return (
-    <section className="checkout-status-panel" aria-label="Checkout status">
+    <section className={`checkout-status-panel checkout-status-panel--${tone}`} aria-label="Checkout status">
       <div className="checkout-status-panel__header">
         <GitBranch size={16} aria-hidden="true" />
-        <span className="checkout-status-panel__title">
-          Branch <code title={checkoutStatus.exact_ref}>{checkoutStatus.branch_name}</code>
-        </span>
-        <code className="checkout-status-panel__code" title={checkoutStatus.exact_ref}>{shortenRef(checkoutStatus.exact_ref)}</code>
+        <span className="checkout-status-panel__eyebrow">Branch</span>
+        <code className="checkout-status-panel__title" title={checkoutStatus.exact_ref}>{checkoutStatus.branch_name}</code>
         {checkoutStatus.repository_identity && (
           <span className="checkout-status-panel__repo">{checkoutStatus.repository_identity}</span>
         )}
@@ -440,9 +439,17 @@ function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStat
   );
 }
 
+function remoteStatusTone(remoteStatus: BranchRemoteStatus): 'success' | 'warning' | 'danger' {
+  if (remoteStatus.kind === 'unavailable') return 'danger';
+  if (remoteStatus.kind === 'no_known') return 'warning';
+  if (remoteStatus.ahead > 0 && remoteStatus.behind > 0) return 'danger';
+  if (remoteStatus.ahead > 0 || remoteStatus.behind > 0) return 'warning';
+  return 'success';
+}
+
 function describeRemoteStatus(remoteStatus: BranchRemoteStatus): React.ReactNode {
   if (remoteStatus.kind === 'no_known') {
-    return 'No known remote ref for this branch yet.';
+    return 'Remote · No known remote branch (last fetched state).';
   }
   if (remoteStatus.kind === 'unavailable') {
     return `Last-fetched remote status unavailable: ${remoteStatus.reason}`;
@@ -451,7 +458,7 @@ function describeRemoteStatus(remoteStatus: BranchRemoteStatus): React.ReactNode
   const relationLabel = remoteStatus.kind === 'tracked' ? 'Tracked upstream' : 'Matching remote';
   return (
     <>
-      <span>{relationLabel}: </span>
+      <span>Remote · {relationLabel}: </span>
       <code title={remoteStatus.remote_ref}>{shortenRef(remoteStatus.remote_ref)}</code>
       <span> · Last fetched </span>
       <span>{describeAheadBehind(remoteStatus.ahead, remoteStatus.behind)}</span>
@@ -563,7 +570,6 @@ interface DiffSummaryBarProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
-  checkoutStatus?: CheckoutStatus | undefined;
 }
 
 /** Section labels + truncation indicators above the diff surface. The diff
@@ -578,7 +584,6 @@ function DiffSummaryBar({
   uncommittedDiff,
   uncommittedTruncatedKib,
   uncommittedSaturated,
-  checkoutStatus,
 }: DiffSummaryBarProps) {
   return (
     <div className="diff-summary-bar">

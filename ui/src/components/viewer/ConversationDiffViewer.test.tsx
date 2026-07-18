@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
+import type { ConversationDiffResponse } from '../../api';
 import { ConversationDiffViewer } from './ConversationDiffViewer';
 import { api } from '../../api';
 
@@ -14,7 +15,7 @@ vi.mock('@pierre/diffs/react', async () => {
   return makeCodeViewMock();
 });
 
-function payloadFor(marker: string) {
+function payloadFor(marker: string): ConversationDiffResponse {
   return {
     comparator: 'origin/main',
     label: 'Workspace Diff',
@@ -26,6 +27,7 @@ function payloadFor(marker: string) {
       kind: 'named_branch',
       branch_name: marker.toLowerCase(),
       exact_ref: `refs/heads/${marker.toLowerCase()}`,
+      repository_identity: null,
       remote_status: { kind: 'no_known' },
     },
   };

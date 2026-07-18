@@ -242,7 +242,7 @@ export type CheckoutStatus =
     kind: 'named_branch';
     branch_name: string;
     exact_ref: string;
-    repository_identity?: string;
+    repository_identity: string | null;
     remote_status: BranchRemoteStatus;
   }
   | {
@@ -250,8 +250,16 @@ export type CheckoutStatus =
     head_oid: string;
     pointing_refs: string[];
   }
-  | { kind: 'unborn' }
-  | { kind: 'unavailable'; reason: string };
+  | {
+    kind: 'unborn';
+    repository_identity: string | null;
+    branch_name?: string;
+  }
+  | {
+    kind: 'unavailable';
+    repository_identity: string | null;
+    reason: string;
+  };
 
 export interface ConversationDiffResponse {
   comparator: string;
@@ -262,7 +270,7 @@ export interface ConversationDiffResponse {
   uncommitted_diff: string;
   uncommitted_truncated_kib?: number;
   uncommitted_saturated?: boolean;
-  checkout_status?: CheckoutStatus;
+  checkout_status: CheckoutStatus;
   kind?: ConversationDiffKind;
   label?: string;
   pr_number?: number;

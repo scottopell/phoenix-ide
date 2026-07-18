@@ -90,20 +90,6 @@ struct LiveCheckoutObservation {
     remote_status: BranchRemoteStatus,
 }
 
-fn exact_head_ref(worktree_path: &FsPath) -> Result<String, String> {
-    let exact = run_git(
-        worktree_path,
-        &["rev-parse", "--symbolic-full-name", "HEAD"],
-    )
-    .map_err(|e| format!("failed to resolve exact HEAD ref: {e}"))?
-    .trim()
-    .to_string();
-    if exact.is_empty() {
-        return Err("failed to resolve exact HEAD ref: empty response".to_string());
-    }
-    Ok(exact)
-}
-
 fn configured_upstream_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
     run_git(
         worktree_path,
@@ -130,14 +116,18 @@ fn ref_exists(worktree_path: &FsPath, git_ref: &str) -> bool {
     .is_ok()
 }
 
-fn ahead_behind_counts(worktree_path: &FsPath, remote_ref: &str) -> Result<(u32, u32), String> {
+fn ahead_behind_counts(
+    worktree_path: &FsPath,
+    head_oid: &str,
+    remote_ref: &str,
+) -> Result<(u32, u32), String> {
     let counts = run_git(
         worktree_path,
         &[
             "rev-list",
             "--left-right",
             "--count",
-            &format!("HEAD...{remote_ref}"),
+            &format!("{head_oid}...{remote_ref}"),
         ],
     )
     .map_err(|e| format!("failed to compare HEAD to {remote_ref}: {e}"))?;
@@ -155,10 +145,13 @@ fn ahead_behind_counts(worktree_path: &FsPath, remote_ref: &str) -> Result<(u32,
     Ok((ahead, behind))
 }
 
-fn branch_remote_status(worktree_path: &FsPath, branch_name: &str) -> BranchRemoteStatus {
+fn branch_remote_status(
+    worktree_path: &FsPath,
+    branch_name: &str,
+    head_oid: &str,
+) -> BranchRemoteStatus {
     if let Some(remote_ref) = configured_upstream_ref(worktree_path, branch_name) {
-        return match ahead_behind_counts(worktree_path, &remote_ref) {
-            Ok((0, 0)) => BranchRemoteStatus::Matching { remote_ref },
+        return match ahead_behind_counts(worktree_path, head_oid, &remote_ref) {
             Ok((ahead, behind)) => BranchRemoteStatus::Tracked {
                 remote_ref,
                 ahead,
@@ -170,11 +163,8 @@ fn branch_remote_status(worktree_path: &FsPath, branch_name: &str) -> BranchRemo
 
     let fallback = fallback_remote_ref(branch_name);
     if ref_exists(worktree_path, &fallback) {
-        return match ahead_behind_counts(worktree_path, &fallback) {
-            Ok((0, 0)) => BranchRemoteStatus::Matching {
-                remote_ref: fallback,
-            },
-            Ok((ahead, behind)) => BranchRemoteStatus::Tracked {
+        return match ahead_behind_counts(worktree_path, head_oid, &fallback) {
+            Ok((ahead, behind)) => BranchRemoteStatus::Matching {
                 remote_ref: fallback,
                 ahead,
                 behind,
@@ -183,18 +173,16 @@ fn branch_remote_status(worktree_path: &FsPath, branch_name: &str) -> BranchRemo
         };
     }
 
-    BranchRemoteStatus::NoKnown {
-        candidate_remote_refs: vec![fallback],
-    }
+    BranchRemoteStatus::NoKnown
 }
 
-fn detached_pointing_refs(worktree_path: &FsPath) -> Vec<String> {
+fn detached_pointing_refs(worktree_path: &FsPath, head_oid: &str) -> Vec<String> {
     const MAX_POINTING_REFS: usize = 8;
     let Ok(output) = run_git(
         worktree_path,
         &[
             "for-each-ref",
-            "--points-at=HEAD",
+            &format!("--points-at={head_oid}"),
             "--format=%(refname)",
             "refs/heads",
             "refs/remotes",
@@ -218,15 +206,15 @@ fn detached_pointing_refs(worktree_path: &FsPath) -> Vec<String> {
 fn live_checkout_observation_details(
     worktree_path: &FsPath,
     branch_name: String,
+    head_oid: &str,
     repository_identity: Option<String>,
-) -> Result<LiveCheckoutObservation, String> {
-    let exact_ref = exact_head_ref(worktree_path)?;
-    Ok(LiveCheckoutObservation {
+) -> LiveCheckoutObservation {
+    LiveCheckoutObservation {
         repository_identity,
-        branch_name: branch_name.clone(),
-        exact_ref,
-        remote_status: branch_remote_status(worktree_path, &branch_name),
-    })
+        exact_ref: format!("refs/heads/{branch_name}"),
+        remote_status: branch_remote_status(worktree_path, &branch_name, head_oid),
+        branch_name,
+    }
 }
 
 fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
@@ -234,29 +222,27 @@ fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStat
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
             repository_identity,
             branch_name,
-            ..
-        } => match live_checkout_observation_details(
-            worktree_path,
-            branch_name,
-            Some(repository_identity.clone()),
-        ) {
-            Ok(live) => CheckoutStatus::NamedBranch {
+            head_oid,
+        } => {
+            let live = live_checkout_observation_details(
+                worktree_path,
+                branch_name,
+                &head_oid,
+                Some(repository_identity),
+            );
+            CheckoutStatus::NamedBranch {
                 repository_identity: live.repository_identity,
                 branch_name: live.branch_name,
                 exact_ref: live.exact_ref,
                 remote_status: live.remote_status,
-            },
-            Err(reason) => CheckoutStatus::Unavailable {
-                repository_identity: Some(repository_identity),
-                reason,
-            },
-        },
+            }
+        }
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::Detached {
             head_oid,
             ..
         } => CheckoutStatus::Detached {
+            pointing_refs: detached_pointing_refs(worktree_path, &head_oid),
             head_oid,
-            pointing_refs: detached_pointing_refs(worktree_path),
         },
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unborn {
             repository_identity,
@@ -2584,16 +2570,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_head_ref_reports_local_branch_ref() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path());
-        assert_eq!(
-            exact_head_ref(repo.path()).unwrap(),
-            "refs/heads/main".to_string()
-        );
-    }
-
-    #[test]
     fn configured_upstream_ref_reads_tracking_ref() {
         let upstream = tempfile::tempdir().unwrap();
         init_repo(upstream.path());
@@ -2640,6 +2616,8 @@ mod tests {
                 exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
                 },
             }
         );
@@ -2694,9 +2672,7 @@ mod tests {
                 ),
                 branch_name: "feature/live".to_string(),
                 exact_ref: "refs/heads/feature/live".to_string(),
-                remote_status: BranchRemoteStatus::NoKnown {
-                    candidate_remote_refs: vec!["refs/remotes/origin/feature/live".to_string()],
-                },
+                remote_status: BranchRemoteStatus::NoKnown,
             }
         );
     }
@@ -2742,7 +2718,7 @@ mod tests {
                 committed_diff: "diff --git a/a b/a".to_string(),
                 committed_total_bytes: 20,
                 committed_saturated: false,
-                uncommitted_diff: "".to_string(),
+                uncommitted_diff: String::new(),
                 uncommitted_total_bytes: 0,
                 uncommitted_saturated: false,
             },
@@ -2755,6 +2731,8 @@ mod tests {
                 exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
                 },
             },
         );
@@ -2766,6 +2744,8 @@ mod tests {
                 exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
                 },
             }
         );
