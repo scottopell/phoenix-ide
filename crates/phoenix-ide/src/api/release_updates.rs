@@ -15,6 +15,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     fs,
     net::SocketAddr,
@@ -668,7 +670,10 @@ pub async fn approve(
                 .into_response()
         }
     };
-    let mut child = Command::new("uv")
+    let mut controller_command = Command::new("uv");
+    #[cfg(unix)]
+    controller_command.process_group(0);
+    let child = controller_command
         .arg("run")
         .arg(&controller)
         .args([
@@ -693,7 +698,7 @@ pub async fn approve(
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn();
-    let child = match child.as_mut() {
+    let mut child = match child {
         Ok(child) => child,
         Err(error) => {
             return (
@@ -713,6 +718,11 @@ pub async fn approve(
         } = read_status(&state, selected_backend)
         {
             if durable_id == transaction_id {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = child.wait() {
+                        tracing::warn!(%error, "failed to reap release controller");
+                    }
+                });
                 return (
                     StatusCode::ACCEPTED,
                     Json(ApproveReleaseUpdateResponse { transaction_id }),
@@ -740,6 +750,11 @@ pub async fn approve(
                     .into_response();
             }
             Ok(None) if tokio::time::Instant::now() >= deadline => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
                 let _ = child.kill();
                 let _ = child.wait();
                 return (

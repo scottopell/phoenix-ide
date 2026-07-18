@@ -113,6 +113,13 @@ export function ReleaseUpdatePanel() {
 
   const approve = useCallback(async () => {
     if (!snapshot || snapshot.preview.kind !== 'available') return;
+    const currentIdentity = `${snapshot.preview.tag}:${snapshot.preview.commit}:${snapshot.preview.asset_sha256}`;
+    if (confirmedIdentity !== currentIdentity) {
+      setConfirming(false);
+      setConfirmedIdentity(null);
+      setError('The release preview changed. Review the new identity before approving.');
+      return;
+    }
     setApproving(true);
     setError(null);
     try {
@@ -129,7 +136,7 @@ export function ReleaseUpdatePanel() {
     } finally {
       setApproving(false);
     }
-  }, [load, snapshot]);
+  }, [confirmedIdentity, load, snapshot]);
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
