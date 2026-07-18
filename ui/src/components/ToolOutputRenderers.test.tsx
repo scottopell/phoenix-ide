@@ -309,6 +309,21 @@ describe('buildPatchOutputProjection parity', () => {
     expect(container.querySelector('[data-fragment-id="patch-diff"]')?.textContent).toBe(diff);
     expect(container.querySelectorAll('[data-fragment-id="patch-diff"]')).toHaveLength(1);
   });
+
+  it('bounds large active diffs around the selected match', () => {
+    const largeDiff = `${'a'.repeat(8_000)}needle${'b'.repeat(8_000)}`;
+    const start = largeDiff.indexOf('needle');
+    const { container } = render(
+      <PatchResultView
+        diff={largeDiff}
+        toolUseId="patch-large"
+        activeHighlight={{ fragmentId: 'patch-diff', start, end: start + 6 }}
+      />,
+    );
+
+    expect(container.querySelector('[data-fragment-id="patch-diff"]')?.textContent?.length).toBeLessThan(5_100);
+    expect(container.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('needle');
+  });
 });
 
 describe('ReadFileResultView', () => {

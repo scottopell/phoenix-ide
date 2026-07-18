@@ -359,6 +359,7 @@ interface MarkdownNode {
   children?: MarkdownNode[];
   value?: string;
   alt?: string;
+  lang?: string;
 }
 
 export interface MarkdownDisplayBlock {
@@ -367,6 +368,7 @@ export interface MarkdownDisplayBlock {
   sourceRange: { start: number; end: number };
   searchableText: string;
   kind: string;
+  language?: string;
 }
 
 export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
@@ -385,6 +387,7 @@ export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownD
             sourceRange: { start: node.position.start.offset, end: node.position.end.offset },
             searchableText,
             kind: node.type,
+            ...(node.lang ? { language: node.lang } : {}),
           });
         }
       }
@@ -1480,8 +1483,10 @@ export function buildAgentTextFragments(
   blocks.forEach((block, index) => {
     if (block.type !== 'text') return;
     const sourceText = block.text ?? '';
-    const markdownBlocks = options.forSearch ? buildMarkdownDisplayBlocks(sourceText) : [];
-    const semanticText = options.forSearch && markdownBlocks.length > 0
+    const markdownBlocks = options.forSearch
+      ? buildMarkdownDisplayBlocks(sourceText).filter((markdownBlock) => markdownBlock.kind !== 'code' || markdownBlock.language === 'mermaid')
+      : [];
+    const semanticText = options.forSearch
       ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')
       : sourceText;
     const fragmentId = `agent-text-${index}`;

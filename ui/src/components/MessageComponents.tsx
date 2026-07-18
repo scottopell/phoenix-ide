@@ -1962,11 +1962,22 @@ export function PatchResultView({
   );
   const fragment = projection.fragments[0];
   const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+  const maxLength = 5_000;
+  const windowStart = highlight && fragment.display.diff.length > maxLength
+    ? Math.max(0, Math.min(highlight.start - Math.floor(maxLength / 2), fragment.display.diff.length - maxLength))
+    : 0;
+  const visibleDiff = highlight
+    ? fragment.display.diff.slice(windowStart, windowStart + maxLength)
+    : fragment.display.diff;
   return (
     <div className="tool-block-output-content" data-fragment-id={fragment.fragmentId}>
-      {highlight
-        ? renderHighlightedText(fragment.display.diff, highlight.start, highlight.end)
-        : fragment.display.diff}
+      {highlight ? (
+        <>
+          {windowStart > 0 ? '…\n' : ''}
+          {renderHighlightedText(visibleDiff, highlight.start - windowStart, highlight.end - windowStart)}
+          {windowStart + visibleDiff.length < fragment.display.diff.length ? '\n…' : ''}
+        </>
+      ) : fragment.display.diff}
     </div>
   );
 }

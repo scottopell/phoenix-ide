@@ -73,6 +73,7 @@ describe('BrowserProfileResponseView find highlighting', () => {
 
     expect(container.querySelector('[data-fragment-id="browser-profile-visible"] .viewer-find-inline-match--active')?.textContent)
       .toBe('Visible warning');
+    expect(container.querySelector('.profile-scenario')).toBeInTheDocument();
   });
 });
 

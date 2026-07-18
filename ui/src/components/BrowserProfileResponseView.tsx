@@ -132,15 +132,22 @@ export function buildBrowserProfileVisibleText(
   }
 }
 
-export function BrowserProfileResponseView({ action, displayData, fallbackText, isError, activeHighlight = null }: Props) {
-  if (activeHighlight) {
-    const visibleText = buildBrowserProfileVisibleText(action, displayData, fallbackText, isError);
-    return (
-      <div className="profile-response" data-fragment-id="browser-profile-visible">
+export function BrowserProfileResponseView(props: Props) {
+  const { activeHighlight = null } = props;
+  const card = <BrowserProfileStructuredView {...props} />;
+  if (!activeHighlight) return card;
+  const visibleText = buildBrowserProfileVisibleText(props.action, props.displayData, props.fallbackText, props.isError);
+  return (
+    <div className="profile-response" data-fragment-id="browser-profile-visible">
+      <div className="profile-find-match">
         {highlightProfileText(visibleText, activeHighlight.start, activeHighlight.end)}
       </div>
-    );
-  }
+      {card}
+    </div>
+  );
+}
+
+function BrowserProfileStructuredView({ action, displayData, fallbackText, isError }: Props) {
   if (isError) {
     // Blocked scenarios still carry a structured payload. Everything else
     // is a plain error message — show the text as-is with an action chip.

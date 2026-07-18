@@ -84,6 +84,17 @@ function queued(localId: string, text: string, files?: QueuedMessage['files']): 
   };
 }
 
+describe('buildAgentTextFragments', () => {
+  it('excludes fenced code from transcript search when the renderer cannot own a mark', () => {
+    const fragments = buildAgentTextFragments([
+      { type: 'text', text: 'Visible prose\n\n```ts\nconst hiddenNeedle = true;\n```' },
+    ], 'full', { forSearch: true });
+
+    expect(fragments[0]?.semanticText).toContain('Visible prose');
+    expect(fragments[0]?.semanticText).not.toContain('hiddenNeedle');
+  });
+});
+
 describe('buildMarkdownFileSearchProjection', () => {
   it('indexes owned rendered blocks but excludes fenced code without decoration ownership', () => {
     const markdown = '# Visible heading\n\n```ts\nconst hiddenNeedle = true;\n```\n\nVisible paragraph needle';
