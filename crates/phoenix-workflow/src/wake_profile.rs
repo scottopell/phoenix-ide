@@ -205,7 +205,8 @@ pub enum WakeBarrierEvent {
 pub enum RuntimeAvailability {
     Idle,
     Pending,
-    TerminalDelivered,
+    Accepted,
+    Suppressed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +262,7 @@ impl WorkflowProfile for WakeProfile {
         matches!(
             (&snapshot.runtime_availability, &snapshot.terminal),
             (
-                RuntimeAvailability::Idle,
+                RuntimeAvailability::Accepted,
                 Some(
                     WakeTerminalPayload::Fired { .. }
                         | WakeTerminalPayload::Expired { .. }

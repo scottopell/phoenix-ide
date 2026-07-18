@@ -1,11 +1,12 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use super::{
-    to_i64, to_u64, wake_profile, AcceptReceiptInput, BeginAttemptInput, BeginAttemptResult,
-    ClaimOutcome, CommitOutcome, CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance,
-    DbError, DbResult, DeliveryResolutionDecision, DeliveryResolutionPlan, LocalCodec,
-    LocalDeliveryRecord, LocalEffectDecl, LocalReceiptRecord, RecordObservationInput,
-    WorkflowRepository, WorkflowSequenceName, WorkflowTx,
+    parse_effect_status, to_i64, to_u64, wake_profile, AcceptReceiptInput, BeginAttemptInput,
+    BeginAttemptResult, ClaimOutcome, CommitOutcome, CommitTransitionPlanCas,
+    CreateWorkflowWithExternalAcceptance, DbError, DbResult, DeliveryResolutionDecision,
+    DeliveryResolutionPlan, ExpireLeaseInput, LocalCodec, LocalDeliveryRecord, LocalEffectDecl,
+    LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
+    WorkflowSequenceName, WorkflowTx,
 };
 use phoenix_workflow::{
     wake_profile::{
@@ -16,7 +17,7 @@ use phoenix_workflow::{
     },
     AttemptId, AuthorityOutcome, DeliveryId, EffectId, EffectRole, EffectStatus,
     ErasedAcceptanceProfile, Generation, ProcessIncarnation, ProfileRef, ReceiptId, ReceiptOrigin,
-    Timestamp, TransitionId, Version, WorkflowId, WorkflowStatus,
+    RuntimeAcceptanceStatus, Timestamp, TransitionId, Version, WorkflowId, WorkflowStatus,
 };
 use serde::Serialize;
 use sqlx::Row;
@@ -98,13 +99,6 @@ fn maybe_fail_after_transfer_binding_update(
     Ok(())
 }
 
-#[cfg(not(test))]
-fn maybe_fail_after_canonical_transition(_namespace: (), _workflow_id: WorkflowId) {}
-#[cfg(not(test))]
-fn maybe_fail_after_canonical_receipt(_namespace: (), _workflow_id: WorkflowId) {}
-#[cfg(not(test))]
-fn maybe_fail_after_transfer_binding_update(_namespace: (), _workflow_id: WorkflowId) {}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeBindingRecord {
     pub workflow_id: WorkflowId,
@@ -151,8 +145,13 @@ pub struct WakeTerminalReceiptProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeObservationOutcome {
-    Started { canonical: BeginAttemptResult },
-    StaleAttempt,
+    Started {
+        canonical: BeginAttemptResult,
+    },
+    Busy {
+        lease_until: phoenix_workflow::LeaseExpiry,
+    },
+    Ineligible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +160,12 @@ pub struct WakeObservationLease {
     pub process_incarnation: ProcessIncarnation,
     pub now: Timestamp,
     pub lease_until: phoenix_workflow::LeaseExpiry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeLeaseRenewalOutcome {
+    Renewed,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +219,20 @@ pub struct WakeTerminalEvidenceInput {
 pub struct WakeExpireIfUnresolvedInput {
     pub workflow_id: WorkflowId,
     pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeExpireIfUnresolvedOutcome {
+    Expired {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    Replayed {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    NotDue,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,7 +446,7 @@ impl WakeRepository {
             resource: input.resource.clone(),
             registered: true,
             terminal: None,
-            runtime_availability: wake_profile::RuntimeAvailability::Pending,
+            runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
         let observe_intent = ObserveHandleIntent {
             contract_id: input.contract_id.clone(),
@@ -539,34 +558,36 @@ impl WakeRepository {
         self.fetch_binding(workflow_id).await
     }
 
-    pub async fn begin_observation(
+    pub async fn claim_observation_if_eligible(
         &self,
         workflow_id: WorkflowId,
-        attempt_id: AttemptId,
         process_incarnation: ProcessIncarnation,
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
-        let result = self
-            .workflow_repo
-            .begin_attempt(&BeginAttemptInput {
-                workflow_id,
-                effect_id: REGISTRATION_EFFECT_ID,
-                attempt_id,
-                process_incarnation,
-                now,
-                lease_until: Some(lease_until),
-            })
-            .await?;
-        Ok(match result.outcome {
-            ClaimOutcome::Started => WakeObservationOutcome::Started { canonical: result },
-            ClaimOutcome::Ineligible
-            | ClaimOutcome::AuthorityConflict
-            | ClaimOutcome::UnsupportedCodec => WakeObservationOutcome::StaleAttempt,
-        })
+        for _ in 0..20 {
+            match self
+                .claim_observation_if_eligible_once(
+                    workflow_id,
+                    process_incarnation,
+                    now,
+                    lease_until,
+                )
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.claim_observation_if_eligible_once(workflow_id, process_incarnation, now, lease_until)
+            .await
     }
 
-    pub async fn claim_observation_allocated(
+    async fn claim_observation_if_eligible_once(
         &self,
         workflow_id: WorkflowId,
         process_incarnation: ProcessIncarnation,
@@ -574,6 +595,68 @@ impl WakeRepository {
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
         let mut tx = self.workflow_repo.begin_tx().await?;
+        let effect = sqlx::query(
+            "SELECT status FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        let Some(effect) = effect else {
+            tx.rollback().await?;
+            return Ok(WakeObservationOutcome::Ineligible);
+        };
+        let initial_effect_status = parse_effect_status(&effect.get::<String, _>("status"))?;
+
+        let live_attempt = sqlx::query(
+            "SELECT a.attempt_id, l.lease_until
+             FROM workflow_attempts a
+             LEFT JOIN workflow_reclaimable_leases l
+               ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+             WHERE a.workflow_id = ?1
+               AND a.effect_id = ?2
+               AND a.status IN ('Begun', 'ObservationRecorded')
+             ORDER BY a.attempt_id
+             LIMIT 1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        if let Some(live_attempt) = live_attempt {
+            let existing_lease_until = phoenix_workflow::LeaseExpiry(to_u64(
+                live_attempt.get::<i64, _>("lease_until"),
+                "lease_until",
+            )?);
+            if existing_lease_until.is_live_at(now) {
+                tx.rollback().await?;
+                return Ok(WakeObservationOutcome::Busy {
+                    lease_until: existing_lease_until,
+                });
+            }
+            let attempt_id = AttemptId(to_u64(
+                live_attempt.get::<i64, _>("attempt_id"),
+                "attempt_id",
+            )?);
+            let expired = expire_observation_lease_in_tx(
+                &mut tx,
+                &ExpireLeaseInput {
+                    workflow_id,
+                    effect_id: REGISTRATION_EFFECT_ID,
+                    attempt_id,
+                    now,
+                },
+            )
+            .await?;
+            if expired != AuthorityOutcome::Authorized {
+                tx.rollback().await?;
+                return Ok(WakeObservationOutcome::Ineligible);
+            }
+        } else if initial_effect_status != EffectStatus::Eligible {
+            tx.rollback().await?;
+            return Ok(WakeObservationOutcome::Ineligible);
+        }
+
         let attempt_id = AttemptId(
             tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Attempt)
                 .await?,
@@ -593,13 +676,60 @@ impl WakeRepository {
                 tx.commit().await?;
                 Ok(WakeObservationOutcome::Started { canonical: result })
             }
-            ClaimOutcome::Ineligible
-            | ClaimOutcome::AuthorityConflict
-            | ClaimOutcome::UnsupportedCodec => {
+            ClaimOutcome::AuthorityConflict => {
                 tx.rollback().await?;
-                Ok(WakeObservationOutcome::StaleAttempt)
+                let lease = sqlx::query_scalar::<_, i64>(
+                    "SELECT l.lease_until
+                     FROM workflow_attempts a
+                     JOIN workflow_reclaimable_leases l
+                       ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+                     WHERE a.workflow_id = ?1
+                       AND a.effect_id = ?2
+                       AND a.status IN ('Begun', 'ObservationRecorded')
+                     ORDER BY a.attempt_id
+                     LIMIT 1",
+                )
+                .bind(to_i64(workflow_id.0, "workflow_id")?)
+                .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+                .fetch_optional(&self.workflow_repo.pool)
+                .await?;
+                Ok(match lease {
+                    Some(lease_until) => WakeObservationOutcome::Busy {
+                        lease_until: phoenix_workflow::LeaseExpiry(to_u64(
+                            lease_until,
+                            "lease_until",
+                        )?),
+                    },
+                    None => WakeObservationOutcome::Ineligible,
+                })
+            }
+            ClaimOutcome::Ineligible | ClaimOutcome::UnsupportedCodec => {
+                tx.rollback().await?;
+                Ok(WakeObservationOutcome::Ineligible)
             }
         }
+    }
+
+    pub async fn renew_observation_lease(
+        &self,
+        authority: &super::LocalAttemptAuthority,
+        now: Timestamp,
+        new_lease_until: phoenix_workflow::LeaseExpiry,
+    ) -> DbResult<WakeLeaseRenewalOutcome> {
+        Ok(
+            match self
+                .workflow_repo
+                .renew_lease_exact(&RenewLeaseInput {
+                    authority: authority.clone(),
+                    now,
+                    new_lease_until,
+                })
+                .await?
+            {
+                AuthorityOutcome::Authorized => WakeLeaseRenewalOutcome::Renewed,
+                AuthorityOutcome::StaleAuthority => WakeLeaseRenewalOutcome::Stale,
+            },
+        )
     }
 
     pub async fn record_terminal_evidence(
@@ -794,6 +924,37 @@ impl WakeRepository {
             tx.rollback().await?;
             return Ok(WakeTerminalEvidenceOutcome::StaleAttempt);
         }
+        let head = tx.fetch_workflow_head(workflow_id).await?.ok_or_else(|| {
+            DbError::Serialization("wake workflow head missing after receipt".to_string())
+        })?;
+        let next_snapshot = WakeRegistrationSnapshot {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            registered: true,
+            terminal: Some(terminal.clone()),
+            runtime_availability: wake_profile::RuntimeAvailability::Idle,
+        };
+        let event = WakeRegistrationEvent::TerminalProjected {
+            terminal: Box::new(terminal.clone()),
+        };
+        if !tx
+            .commit_transition_head_cas(
+                workflow_id,
+                head.version,
+                head.generation,
+                WorkflowStatus::Completed,
+                &local_codec(&wake_profile::event_codec()),
+                &json_blob(&event)?,
+                &local_codec(&wake_profile::snapshot_codec()),
+                &json_blob(&next_snapshot)?,
+                TransitionId(head.version.next().0),
+                observation_time,
+            )
+            .await?
+        {
+            tx.rollback().await?;
+            return Ok(WakeTerminalEvidenceOutcome::StaleAttempt);
+        }
         #[cfg(test)]
         maybe_fail_after_canonical_receipt(self.failpoint_namespace, workflow_id)?;
         insert_terminal_receipt_projection_tx(
@@ -894,6 +1055,201 @@ impl WakeRepository {
         self.cancel_once(input).await
     }
 
+    pub async fn expire_if_unresolved(
+        &self,
+        workflow_id: WorkflowId,
+        now: Timestamp,
+    ) -> DbResult<WakeExpireIfUnresolvedOutcome> {
+        for _ in 0..20 {
+            match self.expire_if_unresolved_once(workflow_id, now).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.expire_if_unresolved_once(workflow_id, now).await
+    }
+
+    async fn expire_if_unresolved_once(
+        &self,
+        workflow_id: WorkflowId,
+        now: Timestamp,
+    ) -> DbResult<WakeExpireIfUnresolvedOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeExpireIfUnresolvedOutcome::Stale);
+        };
+        if binding.expires_at.0 > now.0 {
+            tx.rollback().await?;
+            return Ok(WakeExpireIfUnresolvedOutcome::NotDue);
+        }
+        if let Some(existing) = fetch_any_terminal_projection_tx(&mut tx, workflow_id).await? {
+            let outcome = replay_terminal_projection(&mut tx, workflow_id, existing).await?;
+            tx.commit().await?;
+            return Ok(WakeExpireIfUnresolvedOutcome::Replayed {
+                receipt: outcome.0,
+                delivery: outcome.1,
+            });
+        }
+        let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeExpireIfUnresolvedOutcome::Stale);
+        };
+
+        let receipt_id = ReceiptId(
+            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Receipt)
+                .await?,
+        );
+        let delivery_id = DeliveryId(
+            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Delivery)
+                .await?,
+        );
+        let next_snapshot = WakeRegistrationSnapshot {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            registered: true,
+            terminal: Some(WakeTerminalPayload::Expired {
+                contract_id: binding.contract_id.clone(),
+                resource: binding.resource.clone(),
+                resolved_at: now,
+            }),
+            runtime_availability: wake_profile::RuntimeAvailability::Idle,
+        };
+        let next_snapshot_payload = json_blob(&next_snapshot)?;
+        let next_snapshot_codec = LocalCodec {
+            family: wake_profile::snapshot_codec().family.to_string(),
+            version: wake_profile::snapshot_codec().version,
+        };
+        let event = WakeRegistrationEvent::TerminalProjected {
+            terminal: Box::new(next_snapshot.terminal.clone().expect("terminal")),
+        };
+        let event_payload = json_blob(&event)?;
+        let event_codec = local_codec(&wake_profile::event_codec());
+        let transition_id = TransitionId(head.version.next().0);
+        let committed = tx
+            .commit_transition_head_cas(
+                workflow_id,
+                head.version,
+                head.generation,
+                WorkflowStatus::Completed,
+                &event_codec,
+                &event_payload,
+                &next_snapshot_codec,
+                &next_snapshot_payload,
+                transition_id,
+                now,
+            )
+            .await?;
+        if !committed {
+            if let Some(existing) = fetch_any_terminal_projection_tx(&mut tx, workflow_id).await? {
+                let outcome = replay_terminal_projection(&mut tx, workflow_id, existing).await?;
+                tx.commit().await?;
+                return Ok(WakeExpireIfUnresolvedOutcome::Replayed {
+                    receipt: outcome.0,
+                    delivery: outcome.1,
+                });
+            }
+            tx.rollback().await?;
+            return Ok(WakeExpireIfUnresolvedOutcome::Stale);
+        }
+        sqlx::query(
+            "UPDATE workflow_attempts
+             SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query("DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
+        let terminal = match next_snapshot.terminal.clone().expect("terminal") {
+            WakeTerminalPayload::Expired {
+                contract_id,
+                resource,
+                resolved_at,
+            } => WakeTerminalPayload::Expired {
+                contract_id,
+                resource,
+                resolved_at,
+            },
+            WakeTerminalPayload::Fired { .. }
+            | WakeTerminalPayload::Cancelled { .. }
+            | WakeTerminalPayload::Forgotten { .. } => unreachable!(),
+        };
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .bind(to_i64(receipt_id.0, "receipt_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(to_i64(head.generation.0, "generation")?)
+            .bind(to_i64(head.version.next().0, "declared_workflow_version")?)
+            .bind(0_i64)
+            .bind("DeadlineExpiration")
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, 1, 'Pending', 'Owed', NULL, NULL)")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        insert_terminal_receipt_projection_tx(
+            &mut tx,
+            &binding,
+            &LocalReceiptRecord {
+                receipt_id,
+                workflow_id,
+                effect_id: REGISTRATION_EFFECT_ID,
+                generation: head.generation,
+                declared_workflow_version: head.version.next(),
+                process_incarnation: ProcessIncarnation(0),
+                attempt_id: None,
+                origin: ReceiptOrigin::DeadlineExpiration,
+                receipt_codec: local_codec(&wake_profile::terminal_codec()),
+                receipt_payload: json_blob(&terminal)?,
+            },
+            &LocalDeliveryRecord {
+                delivery_id,
+                workflow_id,
+                effect_id: Some(REGISTRATION_EFFECT_ID),
+                barrier_id: None,
+                consumer_kind: "reducer".to_string(),
+                event_codec: local_codec(&wake_profile::terminal_codec()),
+                payload_kind: super::LocalDeliveryPayloadKind::Receipt,
+                payload_blob: json_blob(&terminal)?,
+                requires_runtime_acceptance: true,
+                status: phoenix_workflow::DeliveryStatus::Pending,
+                runtime_acceptance_status: Some(RuntimeAcceptanceStatus::Owed),
+                suppression_reason: None,
+                accepted_by_transition_id: None,
+            },
+            &terminal,
+        )
+        .await?;
+        let projection = fetch_any_terminal_projection_tx(&mut tx, workflow_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("wake expiry projection missing after insert".to_string())
+            })?;
+        let outcome = replay_terminal_projection(&mut tx, workflow_id, projection).await?;
+        tx.commit().await?;
+        Ok(WakeExpireIfUnresolvedOutcome::Expired {
+            receipt: outcome.0,
+            delivery: outcome.1,
+        })
+    }
+
     async fn cancel_once(
         &self,
         input: &WakeCancellationInput,
@@ -931,7 +1287,7 @@ impl WakeRepository {
             resource: binding.resource.clone(),
             registered: true,
             terminal: Some(terminal.clone()),
-            runtime_availability: wake_profile::RuntimeAvailability::Pending,
+            runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
         let updated = sqlx::query(
             "UPDATE workflows
@@ -1261,10 +1617,11 @@ impl WakeRepository {
                     p.resolved_at, p.bash_handle_id, p.tmux_server_generation, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at
+                    p.cancelled_at, b.scope_kind, b.scope_stable_key
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+             JOIN wake_bindings b ON b.workflow_id = p.workflow_id
              WHERE p.conversation_id = ?1 AND d.status = 'Pending'
              ORDER BY d.delivery_id"
         )
@@ -1347,8 +1704,8 @@ impl WakeRepository {
         let event_codec = local_codec(&wake_profile::event_codec());
         let event_payload = json_blob(&event)?;
         let next_snapshot_codec = LocalCodec {
-            family: head.snapshot_codec.family.to_string(),
-            version: head.snapshot_codec.version,
+            family: wake_profile::snapshot_codec().family.to_string(),
+            version: wake_profile::snapshot_codec().version,
         };
         let committed = tx
             .commit_transition_head_cas(
@@ -1480,12 +1837,12 @@ impl WakeRepository {
             return Ok(WakeResolvePendingOutcome::SetMismatch);
         }
 
-        let terminal = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id)
+        let projection = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id)
             .await?
             .ok_or_else(|| {
                 DbError::Serialization("wake pending delivery set missing projection".to_string())
-            })?
-            .terminal;
+            })?;
+        let terminal = projection.terminal;
         let event = match input.decision {
             WakeResolveDecision::Accept => WakeRegistrationEvent::RuntimeAccepted {
                 terminal: Box::new(terminal.clone()),
@@ -1502,9 +1859,16 @@ impl WakeRepository {
         };
         let event_codec = local_codec(&wake_profile::event_codec());
         let event_payload = json_blob(&event)?;
+        let mut snapshot: WakeRegistrationSnapshot = serde_json::from_slice(&head.snapshot_payload)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        snapshot.runtime_availability = match input.decision {
+            WakeResolveDecision::Accept => wake_profile::RuntimeAvailability::Accepted,
+            WakeResolveDecision::Suppress => wake_profile::RuntimeAvailability::Suppressed,
+        };
+        let next_snapshot_payload = json_blob(&snapshot)?;
         let next_snapshot_codec = LocalCodec {
-            family: head.snapshot_codec.family.to_string(),
-            version: head.snapshot_codec.version,
+            family: wake_profile::snapshot_codec().family.to_string(),
+            version: wake_profile::snapshot_codec().version,
         };
         let outcome = tx
             .resolve_deliveries_exact(DeliveryResolutionPlan {
@@ -1516,7 +1880,7 @@ impl WakeRepository {
                 event_codec: &event_codec,
                 event_payload: &event_payload,
                 next_snapshot_codec: &next_snapshot_codec,
-                next_snapshot_payload: &head.snapshot_payload,
+                next_snapshot_payload: &next_snapshot_payload,
                 committed_at: input.timestamp,
                 exact_delivery_ids: &input.delivery_ids,
                 decision,
@@ -1578,6 +1942,50 @@ impl WakeRepository {
             }
         }
     }
+}
+
+async fn expire_observation_lease_in_tx(
+    tx: &mut WorkflowTx<'_>,
+    input: &ExpireLeaseInput,
+) -> DbResult<AuthorityOutcome> {
+    let lease = sqlx::query("SELECT a.status as attempt_status, e.capability_kind FROM workflow_reclaimable_leases l JOIN workflow_attempts a ON a.workflow_id = l.workflow_id AND a.attempt_id = l.attempt_id JOIN workflow_effects e ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id WHERE l.workflow_id = ?1 AND l.attempt_id = ?2 AND a.effect_id = ?3 AND l.lease_until <= ?4")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .bind(to_i64(input.now.0, "now")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+    let Some(lease) = lease else {
+        return Ok(AuthorityOutcome::StaleAuthority);
+    };
+    let attempt_status = lease.get::<String, _>("attempt_status");
+    if !matches!(attempt_status.as_str(), "Begun" | "ObservationRecorded") {
+        return Ok(AuthorityOutcome::StaleAuthority);
+    }
+    sqlx::query(
+        "DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1 AND attempt_id = ?2",
+    )
+    .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+    .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    sqlx::query("UPDATE workflow_attempts SET status = 'AuthorityLost' WHERE workflow_id = ?1 AND attempt_id = ?2")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+    let next_status = match lease.get::<String, _>("capability_kind").as_str() {
+        "ReclaimableObservation" => "Eligible",
+        "SafelyRepeatable" => "RetryWait",
+        _ => "AmbiguityWait",
+    };
+    sqlx::query("UPDATE workflow_effects SET status = ?3 WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .bind(next_status)
+        .execute(&mut *tx.tx)
+        .await?;
+    Ok(AuthorityOutcome::Authorized)
 }
 
 async fn next_global_workflow_id_tx(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
@@ -2201,7 +2609,12 @@ async fn fetch_any_terminal_projection_tx(
     workflow_id: WorkflowId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT * FROM wake_terminal_receipts WHERE workflow_id = ?1 ORDER BY receipt_id LIMIT 1",
+        "SELECT p.*, b.scope_kind, b.scope_stable_key
+         FROM wake_terminal_receipts p
+         JOIN wake_bindings b ON b.workflow_id = p.workflow_id
+         WHERE p.workflow_id = ?1
+         ORDER BY p.receipt_id
+         LIMIT 1",
     )
     .bind(to_i64(workflow_id.0, "workflow_id")?)
     .fetch_optional(&mut *tx.tx)
@@ -2247,7 +2660,10 @@ async fn fetch_projection_by_receipt_tx(
     receipt_id: ReceiptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT * FROM wake_terminal_receipts WHERE workflow_id = ?1 AND receipt_id = ?2",
+        "SELECT p.*, b.scope_kind, b.scope_stable_key
+         FROM wake_terminal_receipts p
+         JOIN wake_bindings b ON b.workflow_id = p.workflow_id
+         WHERE p.workflow_id = ?1 AND p.receipt_id = ?2",
     )
     .bind(to_i64(workflow_id.0, "workflow_id")?)
     .bind(to_i64(receipt_id.0, "receipt_id")?)
@@ -2266,10 +2682,11 @@ async fn fetch_projection_for_attempt_tx(
     attempt_id: AttemptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*
+        "SELECT p.*, b.scope_kind, b.scope_stable_key
          FROM wake_terminal_receipts p
          JOIN workflow_receipts r
            ON r.workflow_id = p.workflow_id AND r.receipt_id = p.receipt_id
+         JOIN wake_bindings b ON b.workflow_id = p.workflow_id
          WHERE p.workflow_id = ?1 AND r.attempt_id = ?2",
     )
     .bind(to_i64(workflow_id.0, "workflow_id")?)
@@ -2368,12 +2785,22 @@ fn projection_from_row(
 }
 
 fn resource_from_projection_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIdentity> {
+    let scope_kind = match row.get::<String, _>("scope_kind").as_str() {
+        "Conversation" => wake_types::WorkScopeKind::Conversation,
+        "Worktree" => wake_types::WorkScopeKind::Worktree,
+        other => {
+            return Err(DbError::Serialization(format!(
+                "unknown projection scope kind: {other}"
+            )))
+        }
+    };
+    let scope_stable_key: String = row.get("scope_stable_key");
     match row.get::<String, _>("resource_kind").as_str() {
         "Bash" => Ok(WakeResourceIdentity::Bash(
             wake_types::BashResourceIdentity {
                 work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: row.get::<String, _>("conversation_id"),
+                    kind: scope_kind,
+                    stable_key: scope_stable_key,
                 },
                 handle_id: row.get("bash_handle_id"),
             },
@@ -2381,8 +2808,8 @@ fn resource_from_projection_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeR
         "TmuxWindow" => Ok(WakeResourceIdentity::TmuxWindow(
             wake_types::TmuxResourceIdentity {
                 work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: row.get::<String, _>("conversation_id"),
+                    kind: scope_kind,
+                    stable_key: scope_stable_key,
                 },
                 server_generation: row.get("tmux_server_generation"),
                 window_id: row.get("tmux_window_id"),
@@ -2493,6 +2920,7 @@ async fn fetch_receipt_tx(
             "Reconciliation" => ReceiptOrigin::Reconciliation,
             "Manual" => ReceiptOrigin::Manual,
             "CancellationArbitration" => ReceiptOrigin::CancellationArbitration,
+            "DeadlineExpiration" => ReceiptOrigin::DeadlineExpiration,
             "ScheduleCollapse" => ReceiptOrigin::ScheduleCollapse,
             other => {
                 return Err(DbError::Serialization(format!(
@@ -2563,6 +2991,7 @@ fn delivery_from_join_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<LocalDelive
 mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
+    use crate::workflow::WorkflowHead;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -2692,9 +3121,8 @@ mod tests {
                 .unwrap(),
             WakeRegistrationOutcome::Registered { .. }
         ));
-        repo.begin_observation(
+        repo.claim_observation_if_eligible(
             workflow_id,
-            AttemptId(1),
             ProcessIncarnation(1),
             Timestamp(20),
             phoenix_workflow::LeaseExpiry(30),
@@ -2706,7 +3134,7 @@ mod tests {
     fn unwrap_started(outcome: super::WakeObservationOutcome) -> super::BeginAttemptResult {
         match outcome {
             super::WakeObservationOutcome::Started { canonical } => canonical,
-            other @ WakeObservationOutcome::StaleAttempt => {
+            other @ (WakeObservationOutcome::Busy { .. } | WakeObservationOutcome::Ineligible) => {
                 panic!("expected started, got {other:?}")
             }
         }
@@ -2747,6 +3175,96 @@ mod tests {
             transition_id,
             timestamp: Timestamp(30),
         }
+    }
+
+    fn decode_snapshot(head: &WorkflowHead) -> WakeRegistrationSnapshot {
+        serde_json::from_slice(&head.snapshot_payload).expect("snapshot decodes")
+    }
+
+    async fn head_snapshot(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+    ) -> (WorkflowHead, WakeRegistrationSnapshot) {
+        let head = repo
+            .workflow_repo
+            .fetch_workflow_head(workflow_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = decode_snapshot(&head);
+        (head, snapshot)
+    }
+
+    async fn assert_snapshot_projection_parity(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+        conversation_id: &str,
+        expected_runtime: wake_profile::RuntimeAvailability,
+        expect_pending_delivery: bool,
+        expected_terminal: fn(&WakeTerminalPayload) -> bool,
+    ) {
+        let (_head, snapshot) = head_snapshot(repo, workflow_id).await;
+        assert!(expected_terminal(
+            snapshot.terminal.as_ref().expect("terminal snapshot")
+        ));
+        assert_eq!(snapshot.runtime_availability, expected_runtime);
+
+        let pending = repo.list_pending(conversation_id).await.unwrap();
+        if expect_pending_delivery {
+            assert_eq!(pending.len(), 1);
+            let item = pending
+                .iter()
+                .find(|item| item.workflow_id == workflow_id)
+                .expect("pending delivery for workflow");
+            assert!(expected_terminal(&item.receipt.terminal));
+        } else {
+            assert!(pending.iter().all(|item| item.workflow_id != workflow_id));
+        }
+
+        let projection = fetch_any_terminal_projection_tx(
+            &mut repo.workflow_repo.begin_tx().await.unwrap(),
+            workflow_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(expected_terminal(&projection.terminal));
+        assert_eq!(projection.conversation_id, conversation_id);
+
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        let has_pending = deliveries
+            .iter()
+            .any(|d| d.status == phoenix_workflow::DeliveryStatus::Pending);
+        assert_eq!(has_pending, expect_pending_delivery);
+    }
+
+    fn is_fired(terminal: &WakeTerminalPayload) -> bool {
+        matches!(terminal, WakeTerminalPayload::Fired { .. })
+    }
+
+    fn is_cancelled(terminal: &WakeTerminalPayload) -> bool {
+        matches!(terminal, WakeTerminalPayload::Cancelled { .. })
+    }
+
+    fn is_expired(terminal: &WakeTerminalPayload) -> bool {
+        matches!(terminal, WakeTerminalPayload::Expired { .. })
+    }
+
+    async fn fetch_receipt_origin(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+        receipt_id: ReceiptId,
+    ) -> ReceiptOrigin {
+        let mut tx = repo.workflow_repo.begin_tx().await.unwrap();
+        fetch_receipt_tx(&mut tx, workflow_id, receipt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .origin
     }
 
     fn transfer_input(
@@ -3009,6 +3527,121 @@ mod tests {
                 ) => {}
                 other => panic!("unexpected race outcome: {other:?}"),
             }
+            let deliveries = first
+                .workflow_repo
+                .list_deliveries(workflow_id)
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(
+                deliveries
+                    .iter()
+                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_vs_terminal_race_repeated_has_single_winner_with_typed_losers() {
+        for run in 0..10 {
+            let (_dir, first, second) = open_repo_pair().await;
+            let workflow_id = WorkflowId(800 + run);
+            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+            let authority = canonical.authority.unwrap();
+            let evidence = bash_evidence(19);
+            let (left, right) = tokio::join!(
+                first.record_terminal_evidence(
+                    workflow_id,
+                    &authority,
+                    1,
+                    ReceiptId(1),
+                    DeliveryId(1),
+                    Timestamp(20),
+                    &evidence
+                ),
+                second.expire_if_unresolved(workflow_id, Timestamp(100))
+            );
+            let pending = first.list_pending("conv-1").await.unwrap();
+            assert_eq!(pending.len(), 1);
+            let terminal = &pending[0].receipt.terminal;
+            match (left.unwrap(), right.unwrap(), terminal) {
+                (
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+                    WakeExpireIfUnresolvedOutcome::Stale
+                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                    WakeTerminalPayload::Fired { .. },
+                )
+                | (
+                    WakeTerminalEvidenceOutcome::StaleAttempt
+                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+                    WakeExpireIfUnresolvedOutcome::Expired { .. }
+                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                    WakeTerminalPayload::Expired { .. },
+                ) => {}
+                other => panic!("unexpected expiry race outcome: {other:?}"),
+            }
+            let deliveries = first
+                .workflow_repo
+                .list_deliveries(workflow_id)
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(
+                deliveries
+                    .iter()
+                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_vs_cancel_race_repeated_has_single_winner_with_typed_losers() {
+        for run in 0..10 {
+            let (_dir, first, second) = open_repo_pair().await;
+            let workflow_id = WorkflowId(900 + run);
+            register_and_begin(&first, workflow_id).await;
+            let cancel = cancel_input(workflow_id);
+            let (left, right) = tokio::join!(
+                first.expire_if_unresolved(workflow_id, Timestamp(100)),
+                second.cancel(&cancel)
+            );
+            let pending = first.list_pending("conv-1").await.unwrap();
+            assert_eq!(pending.len(), 1);
+            let terminal = &pending[0].receipt.terminal;
+            match (left.unwrap(), right.unwrap(), terminal) {
+                (
+                    WakeExpireIfUnresolvedOutcome::Expired { .. }
+                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
+                    WakeTerminalPayload::Expired { .. },
+                )
+                | (
+                    WakeExpireIfUnresolvedOutcome::Stale
+                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                    WakeCancellationOutcome::Cancelled { .. }
+                    | WakeCancellationOutcome::Replayed { .. },
+                    WakeTerminalPayload::Cancelled { .. },
+                ) => {}
+                other => panic!("unexpected cancel/expiry race outcome: {other:?}"),
+            }
+            let deliveries = first
+                .workflow_repo
+                .list_deliveries(workflow_id)
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(
+                deliveries
+                    .iter()
+                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -3042,6 +3675,66 @@ mod tests {
         };
         assert!(!delivery.canonical_delivery.requires_runtime_acceptance);
         assert_eq!(delivery.canonical_delivery.runtime_acceptance_status, None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_snapshot_projection_parity_before_and_after_accept_restart() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = registered_workflow_id(&repo, &intent(), "fp-1").await;
+        let outcome = repo.cancel(&cancel_input(workflow_id)).await.unwrap();
+        let receipt_id = match outcome {
+            WakeCancellationOutcome::Cancelled { receipt, delivery }
+            | WakeCancellationOutcome::Replayed { receipt, delivery } => {
+                assert!(!delivery.canonical_delivery.requires_runtime_acceptance);
+                assert_eq!(delivery.canonical_delivery.runtime_acceptance_status, None);
+                receipt.receipt_id
+            }
+            WakeCancellationOutcome::Stale => panic!("expected cancelled delivery"),
+        };
+        assert_eq!(
+            fetch_receipt_origin(&repo, workflow_id, receipt_id).await,
+            ReceiptOrigin::CancellationArbitration
+        );
+        assert_snapshot_projection_parity(
+            &repo,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Idle,
+            true,
+            is_cancelled,
+        )
+        .await;
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Idle,
+            true,
+            is_cancelled,
+        )
+        .await;
+
+        assert_eq!(
+            restarted
+                .resolve_pending_exact(&resolve_input(
+                    workflow_id,
+                    Version(2),
+                    TransitionId(3),
+                    vec![DeliveryId(1)],
+                ))
+                .await
+                .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Accepted,
+            false,
+            is_cancelled,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3086,6 +3779,21 @@ mod tests {
         let pending = first.list_pending("conv-1").await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].receipt.receipt_id, ReceiptId(1));
+        let head = first
+            .workflow_repo
+            .fetch_workflow_head(WorkflowId(107))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.version, Version(2));
+        let transition_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = ?1",
+        )
+        .bind(107_i64)
+        .fetch_one(&first.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(transition_count, 2);
     }
 
     #[tokio::test]
@@ -3214,9 +3922,9 @@ mod tests {
                 workflow_id,
                 "conv-1",
                 "conv-2",
-                Version(1),
+                Version(2),
                 vec![DeliveryId(1)],
-                TransitionId(2),
+                TransitionId(3),
             ))
             .await
             .unwrap(),
@@ -3249,8 +3957,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 workflow_id,
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![DeliveryId(1)],
             ))
             .await
@@ -3263,9 +3971,9 @@ mod tests {
                 workflow_id,
                 "conv-1",
                 "conv-2",
-                Version(2),
+                Version(3),
                 vec![],
-                TransitionId(3),
+                TransitionId(4),
             ))
             .await
             .unwrap(),
@@ -3321,9 +4029,9 @@ mod tests {
                 workflow_id,
                 "conv-x",
                 "conv-2",
-                Version(1),
+                Version(2),
                 vec![DeliveryId(1)],
-                TransitionId(2),
+                TransitionId(3),
             ))
             .await
             .unwrap(),
@@ -3334,9 +4042,9 @@ mod tests {
                 workflow_id,
                 "conv-1",
                 "conv-2",
-                Version(2),
+                Version(3),
                 vec![DeliveryId(1)],
-                TransitionId(2),
+                TransitionId(4),
             ))
             .await
             .unwrap(),
@@ -3347,9 +4055,9 @@ mod tests {
                 workflow_id,
                 "conv-1",
                 "conv-2",
-                Version(1),
+                Version(2),
                 vec![],
-                TransitionId(2),
+                TransitionId(3),
             ))
             .await
             .unwrap(),
@@ -3400,9 +4108,9 @@ mod tests {
                 workflow_id,
                 "conv-1",
                 "conv-2",
-                Version(1),
+                Version(2),
                 vec![DeliveryId(1)],
-                TransitionId(2),
+                TransitionId(3),
             ))
             .await;
         assert!(err.is_err());
@@ -3423,7 +4131,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .version,
-            Version(1)
+            Version(2)
         );
         assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
         assert!(restarted.list_pending("conv-2").await.unwrap().is_empty());
@@ -3618,8 +4326,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(111),
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![DeliveryId(1)]
             ))
             .await
@@ -3657,8 +4365,8 @@ mod tests {
         .unwrap();
         let mut input = resolve_input(
             WorkflowId(112),
-            Version(1),
-            TransitionId(2),
+            Version(2),
+            TransitionId(3),
             vec![DeliveryId(1)],
         );
         input.decision = WakeResolveDecision::Suppress;
@@ -3700,8 +4408,8 @@ mod tests {
         restarted.fail_after_resolve_transition_once(WorkflowId(113));
         let input = resolve_input(
             WorkflowId(113),
-            Version(1),
-            TransitionId(2),
+            Version(2),
+            TransitionId(3),
             vec![DeliveryId(1)],
         );
         let err = restarted.resolve_pending_exact(&input).await;
@@ -3712,7 +4420,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(head.version, Version(1));
+        assert_eq!(head.version, Version(2));
         let deliveries = restarted
             .workflow_repo
             .list_deliveries(WorkflowId(113))
@@ -3743,8 +4451,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(114),
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![DeliveryId(1)]
             ))
             .await
@@ -3772,8 +4480,8 @@ mod tests {
             .unwrap();
         let input = resolve_input(
             WorkflowId(115),
-            Version(1),
-            TransitionId(2),
+            Version(2),
+            TransitionId(3),
             vec![DeliveryId(1)],
         );
         let (left, right) = tokio::join!(
@@ -3816,8 +4524,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(116),
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![]
             ))
             .await
@@ -3827,8 +4535,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(116),
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![DeliveryId(1), DeliveryId(999)]
             ))
             .await
@@ -3838,8 +4546,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(116),
-                Version(1),
-                TransitionId(2),
+                Version(2),
+                TransitionId(3),
                 vec![DeliveryId(1), DeliveryId(1)]
             ))
             .await
@@ -3865,8 +4573,8 @@ mod tests {
         .unwrap();
         let first = resolve_input(
             WorkflowId(117),
-            Version(1),
-            TransitionId(2),
+            Version(2),
+            TransitionId(3),
             vec![DeliveryId(1)],
         );
         assert_eq!(
@@ -3883,8 +4591,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(117),
-                Version(2),
-                TransitionId(3),
+                Version(3),
+                TransitionId(4),
                 vec![DeliveryId(1)]
             ))
             .await
@@ -3894,8 +4602,8 @@ mod tests {
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
                 WorkflowId(117),
-                Version(2),
-                TransitionId(3),
+                Version(3),
+                TransitionId(4),
                 vec![DeliveryId(999)]
             ))
             .await
@@ -4084,9 +4792,8 @@ mod tests {
             WakeRegistrationOutcome::Registered { .. }
         ));
         let pending_started = unwrap_started(
-            repo.begin_observation(
+            repo.claim_observation_if_eligible(
                 pending,
-                AttemptId(1),
                 ProcessIncarnation(1),
                 Timestamp(20),
                 phoenix_workflow::LeaseExpiry(30),
@@ -4142,9 +4849,8 @@ mod tests {
             WakeRegistrationOutcome::Registered { .. }
         ));
         unwrap_started(
-            repo.begin_observation(
+            repo.claim_observation_if_eligible(
                 leased,
-                AttemptId(1),
                 ProcessIncarnation(1),
                 Timestamp(20),
                 phoenix_workflow::LeaseExpiry(25),
@@ -4227,6 +4933,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_observation_reclaims_expired_lease_and_starts_fresh_attempt() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(700);
+        let started = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        let first_authority = started.authority.expect("authority");
+        assert_eq!(first_authority.attempt_id, AttemptId(1));
+
+        let reclaimed = restarted
+            .claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(2),
+                Timestamp(31),
+                phoenix_workflow::LeaseExpiry(40),
+            )
+            .await
+            .unwrap();
+        let reclaimed = unwrap_started(reclaimed);
+        let authority = reclaimed.authority.expect("authority");
+        assert!(authority.attempt_id.0 > first_authority.attempt_id.0);
+
+        let stale = repo
+            .renew_observation_lease(
+                &first_authority,
+                Timestamp(31),
+                phoenix_workflow::LeaseExpiry(35),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale, WakeLeaseRenewalOutcome::Stale);
+    }
+
+    #[tokio::test]
+    async fn renew_observation_lease_fences_stale_and_requires_monotonic_future() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(701);
+        let started = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        let authority = started.authority.expect("authority");
+        assert_eq!(
+            repo.renew_observation_lease(
+                &authority,
+                Timestamp(21),
+                phoenix_workflow::LeaseExpiry(35),
+            )
+            .await
+            .unwrap(),
+            WakeLeaseRenewalOutcome::Renewed
+        );
+        assert_eq!(
+            repo.renew_observation_lease(
+                &authority,
+                Timestamp(21),
+                phoenix_workflow::LeaseExpiry(34),
+            )
+            .await
+            .unwrap(),
+            WakeLeaseRenewalOutcome::Stale
+        );
+        let replacement = unwrap_started(
+            restarted
+                .claim_observation_if_eligible(
+                    workflow_id,
+                    ProcessIncarnation(2),
+                    Timestamp(36),
+                    phoenix_workflow::LeaseExpiry(50),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(replacement.authority.expect("authority").attempt_id.0 > authority.attempt_id.0);
+        assert_eq!(
+            repo.renew_observation_lease(
+                &authority,
+                Timestamp(36),
+                phoenix_workflow::LeaseExpiry(45),
+            )
+            .await
+            .unwrap(),
+            WakeLeaseRenewalOutcome::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_if_unresolved_not_due_returns_typed_not_due() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = registered_workflow_id(&repo, &intent(), "fp-1").await;
+        assert_eq!(
+            repo.expire_if_unresolved(workflow_id, Timestamp(99))
+                .await
+                .unwrap(),
+            WakeExpireIfUnresolvedOutcome::NotDue
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_if_unresolved_records_expired_and_updates_snapshot() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(702);
+        let started = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        let authority = started.authority.expect("authority");
+        let expired = repo
+            .expire_if_unresolved(workflow_id, Timestamp(100))
+            .await
+            .unwrap();
+        let (receipt_id, delivery_id) = match expired {
+            WakeExpireIfUnresolvedOutcome::Expired { receipt, delivery } => {
+                assert!(matches!(
+                    delivery.receipt.terminal,
+                    WakeTerminalPayload::Expired { .. }
+                ));
+                (receipt.receipt_id, delivery.canonical_delivery.delivery_id)
+            }
+            other @ (WakeExpireIfUnresolvedOutcome::Replayed { .. }
+            | WakeExpireIfUnresolvedOutcome::NotDue
+            | WakeExpireIfUnresolvedOutcome::Stale) => {
+                panic!("expected expired, got {other:?}")
+            }
+        };
+        assert_eq!(
+            fetch_receipt_origin(&repo, workflow_id, receipt_id).await,
+            ReceiptOrigin::DeadlineExpiration
+        );
+        assert_eq!(
+            repo.renew_observation_lease(
+                &authority,
+                Timestamp(100),
+                phoenix_workflow::LeaseExpiry(110),
+            )
+            .await
+            .unwrap(),
+            WakeLeaseRenewalOutcome::Stale
+        );
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Idle,
+            true,
+            is_expired,
+        )
+        .await;
+        assert_eq!(
+            restarted
+                .resolve_pending_exact(&resolve_input(
+                    workflow_id,
+                    Version(2),
+                    TransitionId(3),
+                    vec![delivery_id],
+                ))
+                .await
+                .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Accepted,
+            false,
+            is_expired,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fired_snapshot_projection_parity_before_and_after_suppress_restart() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(704);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Idle,
+            true,
+            is_fired,
+        )
+        .await;
+
+        let mut input = resolve_input(
+            workflow_id,
+            Version(2),
+            TransitionId(3),
+            vec![DeliveryId(1)],
+        );
+        input.decision = WakeResolveDecision::Suppress;
+        assert_eq!(
+            restarted.resolve_pending_exact(&input).await.unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Suppressed,
+            false,
+            is_fired,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_preserves_snapshot_bytes_and_semantics() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(705);
+        let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
+        repo.record_terminal_evidence(
+            workflow_id,
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        let (before_head, before_snapshot) = head_snapshot(&repo, workflow_id).await;
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(2),
+                vec![DeliveryId(1)],
+                TransitionId(3),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        let (after_head, after_snapshot) = head_snapshot(&restarted, workflow_id).await;
+        assert_eq!(before_snapshot, after_snapshot);
+        assert_eq!(before_head.snapshot_payload, after_head.snapshot_payload);
+        assert_eq!(after_head.version, Version(3));
+        assert_snapshot_projection_parity(
+            &restarted,
+            workflow_id,
+            "conv-2",
+            wake_profile::RuntimeAvailability::Idle,
+            true,
+            is_fired,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn worktree_scope_projection_reload_preserves_exact_scope() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(703);
+        let mut input = intent();
+        input.conversation_id = "conv-wt".into();
+        insert_conversation(&first.workflow_repo.pool, "conv-wt").await;
+
+        input.registration_scope = wake_types::WorkScopeIdentity {
+            kind: wake_types::WorkScopeKind::Worktree,
+            stable_key: "worktree:/tmp/demo".into(),
+        };
+        input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: input.registration_scope.clone(),
+            handle_id: "b-wt".into(),
+        });
+        assert!(matches!(
+            first
+                .register_allocated(workflow_id, &input, "fp-wt", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let started = unwrap_started(
+            first
+                .claim_observation_if_eligible(
+                    workflow_id,
+                    ProcessIncarnation(1),
+                    Timestamp(20),
+                    phoenix_workflow::LeaseExpiry(30),
+                )
+                .await
+                .unwrap(),
+        );
+        first
+            .record_terminal_evidence(
+                workflow_id,
+                started.authority.as_ref().unwrap(),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                    identity: wake_types::BashResourceIdentity {
+                        work_scope: input.registration_scope.clone(),
+                        handle_id: "b-wt".into(),
+                    },
+                    status: wake_types::BashTerminalStatus::Exited,
+                    occurred_at: Timestamp(19),
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    signal_number: None,
+                    kill_signal_sent: None,
+                    final_tail: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        let pending = second.list_pending("conv-wt").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        match &pending[0].receipt.terminal {
+            WakeTerminalPayload::Fired {
+                resource: WakeResourceIdentity::Bash(identity),
+                ..
+            } => {
+                assert_eq!(
+                    identity.work_scope.kind,
+                    wake_types::WorkScopeKind::Worktree
+                );
+                assert_eq!(identity.work_scope.stable_key, "worktree:/tmp/demo");
+            }
+            other @ (WakeTerminalPayload::Fired { .. }
+            | WakeTerminalPayload::Cancelled { .. }
+            | WakeTerminalPayload::Expired { .. }
+            | WakeTerminalPayload::Forgotten { .. }) => {
+                panic!("expected fired bash receipt, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn restart_reload_lists_pending_projection() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = tmux_intent();
@@ -4236,9 +5280,8 @@ mod tests {
             .await
             .unwrap();
         let started = first
-            .begin_observation(
+            .claim_observation_if_eligible(
                 workflow_id,
-                AttemptId(1),
                 ProcessIncarnation(1),
                 Timestamp(20),
                 phoenix_workflow::LeaseExpiry(30),

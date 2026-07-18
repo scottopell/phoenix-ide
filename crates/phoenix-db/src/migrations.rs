@@ -546,7 +546,7 @@ CREATE TABLE workflow_receipts (
     attempt_id INTEGER,
     origin TEXT NOT NULL CHECK (origin IN (
         'Execution', 'Adoption', 'Reconciliation', 'Manual',
-        'CancellationArbitration', 'ScheduleCollapse'
+        'CancellationArbitration', 'DeadlineExpiration', 'ScheduleCollapse'
     )),
     receipt_codec_family TEXT NOT NULL CHECK (receipt_codec_family <> ''),
     receipt_codec_version INTEGER NOT NULL CHECK (receipt_codec_version >= 1),
