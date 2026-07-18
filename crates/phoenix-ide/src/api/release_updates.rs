@@ -31,6 +31,13 @@ use uuid::Uuid;
 const REPOSITORY: &str = "scottopell/phoenix-ide";
 const USER_AGENT: &str = "phoenix-ide-release-updates";
 const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(300);
+const TERMINAL_STATUS_STATES: &[&str] = &[
+    "committed",
+    "precondition_failed",
+    "activation_failed_rolled_back",
+    "activation_failed_rollback_failed",
+    "rejected_concurrent",
+];
 static PREVIEW_CACHE: OnceLock<RwLock<Option<(Instant, ReleasePreview)>>> = OnceLock::new();
 static GITHUB_REQUEST_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static SYSTEMD_AUTHORITY_CACHE: OnceLock<RwLock<Option<(Instant, bool)>>> = OnceLock::new();
@@ -327,6 +334,14 @@ fn status_path(state: &AppState, backend: ReleaseUpdateBackend) -> Option<PathBu
     }
 }
 
+fn approved_marker(state: &AppState, transaction_id: &str) -> PathBuf {
+    state
+        .runtime_env
+        .home()
+        .join(".phoenix-ide/deploy/controllers")
+        .join(format!("{transaction_id}.approved"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
     let Some(path) = status_path(state, backend) else {
@@ -378,9 +393,6 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             }
         }
     };
-    if value.get("source_kind").and_then(serde_json::Value::as_str) != Some("published_release") {
-        return ReleaseTransactionStatus::None;
-    }
     let string = |name: &str| {
         value
             .get(name)
@@ -392,6 +404,12 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             reason: "durable deployment status has no transaction ID".to_string(),
         };
     };
+    let published = value.get("source_kind").and_then(serde_json::Value::as_str)
+        == Some("published_release")
+        || approved_marker(state, &transaction_id).is_file();
+    if !published {
+        return ReleaseTransactionStatus::None;
+    }
     let Some(state) = string("state") else {
         return ReleaseTransactionStatus::Unreadable {
             reason: "durable deployment status has no state".to_string(),
@@ -641,6 +659,22 @@ pub async fn approve(
                 .into_response()
         }
     };
+    let marker = approved_marker(&state, &transaction_id);
+    if let Err(error) = fs::write(&marker, format!("{tag}\n{commit}\n")) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    #[cfg(unix)]
+    if let Err(error) = fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
     let controller = root.join(format!("dev-{commit}-{transaction_id}.py"));
     if let Err(error) = materialize_controller(&commit, &controller).await {
         return (
@@ -718,7 +752,10 @@ pub async fn approve(
             ..
         } = read_status(&state, selected_backend)
         {
-            if durable_id == transaction_id && durable_state != "preparing" {
+            if durable_id == transaction_id
+                && (durable_state == "activating"
+                    || TERMINAL_STATUS_STATES.contains(&durable_state.as_str()))
+            {
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = child.wait() {
                         tracing::warn!(%error, "failed to reap release controller");
@@ -750,7 +787,14 @@ pub async fn approve(
                 )
                     .into_response();
             }
-            Ok(None) if tokio::time::Instant::now() >= deadline => {
+            Ok(None)
+                if tokio::time::Instant::now() >= deadline
+                    && !matches!(
+                        read_status(&state, selected_backend),
+                        ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
+                            if durable_id == &transaction_id
+                    ) =>
+            {
                 #[cfg(unix)]
                 unsafe {
                     libc::kill(-child.id().cast_signed(), libc::SIGKILL);

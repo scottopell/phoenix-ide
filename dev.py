@@ -6929,8 +6929,6 @@ def prod_daemon_deploy(
             "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
             "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
             "source_commit": prepared.source_commit,
-            "source_kind": prepared.source_kind.value,
-            "release_tag": prepared.release_tag,
             "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
             "previous_running": previous_running,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -8044,8 +8042,10 @@ def launchd_prod_deploy(
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-                "transaction_id": transaction_id, "state": "precondition_failed",
-                "source_kind": locals().get("source_kind"), "source_commit": locals().get("source_commit"),
+             "transaction_id": transaction_id, "state": "precondition_failed",
+             "source_kind": "published_release" if release else locals().get("source_kind"),
+             "source_commit": locals().get("source_commit"),
+
                 "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
                 "expected_version": locals().get("identity", {}).get("version"),
                 "expected_git_sha": locals().get("identity", {}).get("git_sha"),
