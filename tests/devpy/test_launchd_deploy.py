@@ -329,6 +329,66 @@ class PreparationTests(unittest.TestCase):
         check.assert_not_called()
         build.assert_not_called()
 
+    def test_controller_release_revalidates_exact_tag_to_expected_commit(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            digest = self.dev._file_sha256(asset)
+            (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
+            release_commit = "abc123def456" + "0" * 28
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            candidate = self.dev._prepare_release_candidate(
+                "v1.2.3", staging, expected_full_commit=release_commit
+            )
+        self.assertEqual(release_commit, candidate.release_commit)
+        self.assertEqual(3, len(run.call_args_list))
+
+    def test_controller_rejects_latest_release_alias(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(SystemExit, "exact release tag"):
+                self.dev._prepare_release_candidate("latest", Path(td), expected_full_commit="a" * 40)
+
+    def test_controller_uses_installed_launchd_env_and_transaction_id(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v1.2.3",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        installed = {"PHOENIX_PASSWORD": "installed", "PHOENIX_PORT": "9443"}
+        with mock.patch.object(
+            self.dev, "_launchd_env_from_plist", return_value=installed
+        ) as read_installed:
+            env, path = self.dev._launchd_candidate_env(controller)
+        self.assertEqual(installed, env)
+        self.assertEqual("tx-123", controller.transaction_id)
+        self.assertIsNone(path)
+        read_installed.assert_called_once_with(self.dev.LAUNCHD_PLIST_PATH)
+
+    def test_controller_release_path_skips_checks_and_build(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v1.2.3",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev, "prod_build") as build:
+            self.dev.cmd_prod_deploy("v1.2.3", controller=controller)
+        deploy.assert_called_once_with("v1.2.3", controller=controller)
+        check.assert_not_called()
+        build.assert_not_called()
+
     def test_release_asset_selection_supports_all_native_targets(self):
         import platform
 

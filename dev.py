@@ -6318,24 +6318,32 @@ def _launch_systemd_activation(transaction_id: str, root_manifest: Path) -> None
         raise SystemExit("systemd transient activation unit did not start; staged claim released")
 
 
-def native_prod_deploy(release: str | None = None):
+def native_prod_deploy(
+    release: str | None = None,
+    *,
+    controller: "ProdDeployControllerOptions | None" = None,
+):
     """Prepare and hand systemd activation to an independent root transient unit."""
     import tempfile
     import uuid
 
+    controller = controller or ProdDeployControllerOptions()
+    if controller.enabled:
+        release, _expected_full_commit = controller.require_exact_release(release)
+        _require_noninteractive_sudo_ready()
     if not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
-    env_snapshot: dict[str, str] = {}
-    env_file_loaded = _load_env_file(env_snapshot)
+    env_snapshot = _read_systemd_installed_env() if controller.enabled else {}
+    env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
     _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
     service_user = detect_service_user()
-    transaction_id = uuid.uuid4().hex
+    transaction_id = controller.transaction_id or uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
         prepared = (
-            _prepare_release_candidate(release, staging)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
             if release
             else _prepare_local_candidate(target=_linux_musl_target())
         )
@@ -6812,13 +6820,22 @@ def _discard_unclaimed_bare_transaction(transaction: Path) -> None:
     shutil.rmtree(transaction)
 
 
-def prod_daemon_deploy(release: str | None = None):
+def prod_daemon_deploy(
+    release: str | None = None,
+    *,
+    controller: "ProdDeployControllerOptions | None" = None,
+):
     """Deploy through the persistent same-user supervisor on Linux without systemd."""
     import tempfile
     import uuid
 
-    env_snapshot: dict[str, str] = {}
-    _load_env_file(env_snapshot)
+    controller = controller or ProdDeployControllerOptions()
+    if controller.enabled:
+        release, _expected_full_commit = controller.require_exact_release(release)
+    layout = _bare_layout()
+    env_snapshot = _load_installed_env(layout["environment"]) if controller.enabled else {}
+    if not controller.enabled:
+        _load_env_file(env_snapshot)
     env_snapshot.setdefault("HOME", str(Path.home()))
     env_snapshot.setdefault("PATH", os.environ.get("PATH", os.defpath))
     env_snapshot.setdefault("PHOENIX_PORT", str(PROD_PORT))
@@ -6826,13 +6843,12 @@ def prod_daemon_deploy(release: str | None = None):
     env_snapshot.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
     env_snapshot.setdefault("PHOENIX_LOG_STDOUT", "false")
     _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
-    layout = _bare_layout()
-    transaction_id = uuid.uuid4().hex
+    transaction_id = controller.transaction_id or uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-bare-{transaction_id}-") as td:
         staging = Path(td)
         prepared = (
-            _prepare_release_candidate(release, staging)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
             if release else _prepare_local_candidate(target=_linux_musl_target())
         )
         supervisor_source = staging / "bare-supervisor.py"
@@ -7321,6 +7337,47 @@ class PreparedCandidate:
     release_commit: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ProdDeployControllerOptions:
+    enabled: bool = False
+    exact_release_tag: str | None = None
+    expected_full_commit: str | None = None
+    transaction_id: str | None = None
+
+    def require_exact_release(self, release: str | None) -> tuple[str, str]:
+        if release is None:
+            raise SystemExit("controller mode requires --release")
+        if not self.enabled:
+            return release, ""
+        if self.exact_release_tag is None:
+            raise SystemExit("controller mode requires --controller-release-tag")
+        if release != self.exact_release_tag:
+            raise SystemExit(
+                f"controller mode requires --release to exactly match --controller-release-tag ({self.exact_release_tag})"
+            )
+        expected = self.expected_full_commit
+        if expected is None:
+            raise SystemExit("controller mode requires --controller-expected-full-commit")
+        if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
+            raise SystemExit("--controller-expected-full-commit must be a full 40-character lowercase git SHA")
+        return release, expected
+
+
+
+def _noninteractive_sudo_prefix() -> list[str]:
+    return ["sudo", "-n"]
+
+
+
+def _require_noninteractive_sudo_ready() -> None:
+    result = subprocess.run(_noninteractive_sudo_prefix() + ["true"], capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        if detail:
+            raise SystemExit(f"non-interactive sudo is required before disruption: {detail}")
+        raise SystemExit("non-interactive sudo is required before disruption")
+
+
 def _binary_identity(binary: Path) -> RuntimeIdentity:
     result = subprocess.run(
         [str(binary), "--build-identity"], capture_output=True, text=True, timeout=10, check=True
@@ -7492,7 +7549,14 @@ def _release_asset_name() -> str:
     return f"phoenix_ide-{architecture}-{platform_target}"
 
 
-def _prepare_release_candidate(requested: str, staging: Path) -> PreparedCandidate:
+def _prepare_release_candidate(
+    requested: str,
+    staging: Path,
+    *,
+    expected_full_commit: str | None = None,
+) -> PreparedCandidate:
+    if expected_full_commit is not None and requested == "latest":
+        raise SystemExit("controller mode requires an exact release tag, not 'latest'")
     if requested == "latest":
         view = subprocess.run(
             ["gh", "release", "view", "--repo", "scottopell/phoenix-ide", "--json", "tagName,isPrerelease"],
@@ -7510,13 +7574,26 @@ def _prepare_release_candidate(requested: str, staging: Path) -> PreparedCandida
     if requested != "latest" and tag != requested:
         raise SystemExit(f"release resolution mismatch: requested {requested}, resolved {tag}")
 
-    commit_result = subprocess.run(
-        ["gh", "api", f"repos/scottopell/phoenix-ide/commits/{tag}", "--jq", ".sha"],
-        capture_output=True, text=True, check=True,
-    )
-    release_commit = commit_result.stdout.strip()
+    if expected_full_commit is None:
+        commit_result = subprocess.run(
+            ["gh", "api", f"repos/scottopell/phoenix-ide/commits/{tag}", "--jq", ".sha"],
+            capture_output=True, text=True, check=True,
+        )
+        release_commit = commit_result.stdout.strip()
+    else:
+        release_commit = expected_full_commit
     if not re.fullmatch(r"[0-9a-f]{40}", release_commit):
         raise SystemExit(f"release {tag} did not resolve to an immutable commit SHA")
+    if expected_full_commit is not None:
+        tagged_commit_result = subprocess.run(
+            ["gh", "api", f"repos/scottopell/phoenix-ide/commits/{tag}", "--jq", ".sha"],
+            capture_output=True, text=True, check=True,
+        )
+        tagged_commit = tagged_commit_result.stdout.strip()
+        if tagged_commit != expected_full_commit:
+            raise SystemExit(
+                f"release {tag} resolved to {tagged_commit}, expected exact commit {expected_full_commit}"
+            )
 
     asset_name = _release_asset_name()
     subprocess.run(
@@ -7724,20 +7801,34 @@ def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> N
         pass
 
 
-def _launchd_candidate_env() -> tuple[dict[str, str], Path | None]:
+def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = None) -> tuple[dict[str, str], Path | None]:
     env: dict[str, str] = {}
+    if controller is not None and controller.enabled:
+        try:
+            return _launchd_env_from_plist(LAUNCHD_PLIST_PATH), None
+        except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+            raise SystemExit(
+                f"installed launchd configuration is unreadable: {type(exc).__name__}"
+            ) from exc
     env_file = _load_env_file(env)
     return env, env_file
 
 
-def launchd_prod_deploy(release: str | None = None):
+def launchd_prod_deploy(
+    release: str | None = None,
+    *,
+    controller: "ProdDeployControllerOptions | None" = None,
+):
     """Prepare a candidate, then hand transactional activation to launchd."""
     import uuid
 
-    launchd_env, _env_file = _launchd_candidate_env()
+    controller = controller or ProdDeployControllerOptions()
+    if controller.enabled:
+        release, _expected_full_commit = controller.require_exact_release(release)
+    launchd_env, _env_file = _launchd_candidate_env(controller)
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
-    transaction_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
@@ -7761,7 +7852,7 @@ def launchd_prod_deploy(release: str | None = None):
         staging.mkdir(parents=True)
         staging.chmod(0o700)
         prepared = (
-            _prepare_release_candidate(release, staging)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
             if release
             else _prepare_local_candidate(target=None)
         )
@@ -8022,25 +8113,42 @@ def cmd_prod_build():
         sys.exit(1)
 
 
-def cmd_prod_deploy(release: str | None = None, pretty: bool = False):
+def cmd_prod_deploy(
+    release: str | None = None,
+    pretty: bool = False,
+    *,
+    controller: "ProdDeployControllerOptions | None" = None,
+):
     """Deploy local HEAD or an immutable published release."""
+    controller = controller or ProdDeployControllerOptions()
     env = detect_prod_env()
+    if controller.enabled and not release:
+        raise SystemExit("controller mode requires --release")
     if not release:
         print("Running pre-deploy checks...\n")
         cmd_check(gate=False, pretty=pretty)
         print()
 
     if env == "launchd":
-        launchd_prod_deploy(release)
+        if controller.enabled:
+            launchd_prod_deploy(release, controller=controller)
+        else:
+            launchd_prod_deploy(release)
 
     elif env == "native":
-        native_prod_deploy(release)
+        if controller.enabled:
+            native_prod_deploy(release, controller=controller)
+        else:
+            native_prod_deploy(release)
 
     elif env == "daemon":
         print("Detected: Bare Linux (persistent supervisor mode)")
         print("    Deploying through the same-user Phoenix supervisor")
         print()
-        prod_daemon_deploy(release)
+        if controller.enabled:
+            prod_daemon_deploy(release, controller=controller)
+        else:
+            prod_daemon_deploy(release)
 
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
@@ -8305,6 +8413,10 @@ def main():
         "--pretty", action="store_true", default=False,
         help="Render the pre-deploy check as a live lane table",
     )
+    deploy_parser.add_argument("--controller-mode", action="store_true", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--controller-release-tag", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--controller-expected-full-commit", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     # Override management
@@ -8423,7 +8535,16 @@ def main():
                     f"positional deploy version {args.legacy_version!r} was removed; "
                     "use 'prod deploy --release vX.Y.Z' (local build-from-tag no longer exists)"
                 )
-            cmd_prod_deploy(args.release, pretty=pretty)
+            cmd_prod_deploy(
+                args.release,
+                pretty=pretty,
+                controller=ProdDeployControllerOptions(
+                    enabled=args.controller_mode,
+                    exact_release_tag=args.controller_release_tag,
+                    expected_full_commit=args.controller_expected_full_commit,
+                    transaction_id=args.transaction_id,
+                ),
+            )
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

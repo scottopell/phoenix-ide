@@ -1,0 +1,296 @@
+-- allium: 3
+-- In-app release update lifecycle
+--
+-- Scope: stable published release discovery, immutable preview identity,
+-- same-host approval binding, controller/backend independence, reconnect
+-- hydration, and truthful terminal messaging. Production deployment owns
+-- activation, exact runtime verification, and rollback mechanics; this
+-- module models the operator-facing contract above that backend.
+--
+-- Requirement traceability: REQ-RU-001 through REQ-RU-009 are modelled
+-- here. REQ-RU-010 is an operator-tooling boundary stated in
+-- requirements.md rather than a runtime rule.
+
+config {
+    hydration_stale_after: Duration = 120_000.ms
+}
+
+enum ReleaseChannel { stable }
+enum PreviewState { discovered | approved | superseded | terminal }
+enum InstallState {
+    idle | requested | in_progress | committed | rolled_back | rollback_failed
+    | rejected | failed
+}
+enum ControllerConnectionState { connected | disconnected }
+
+enum TerminalMessageKind {
+    none | success | rollback | rollback_failure | rejected | failure
+}
+
+value ReleaseIdentity {
+    tag: String
+    full_commit: String
+    asset_target: String
+}
+
+value ReleaseSummary {
+    version_text: String
+    notes_excerpt: String
+}
+
+entity ReleasePreview {
+    id: String
+    channel: ReleaseChannel
+    identity: ReleaseIdentity
+    summary: ReleaseSummary
+    state: PreviewState
+    discovered_at: Timestamp
+
+    transitions state {
+        discovered -> approved
+        discovered -> superseded
+        approved -> terminal
+        approved -> superseded
+        terminal -> superseded
+        terminal: superseded
+    }
+}
+
+entity UpdateInstallation {
+    id: String
+    preview: ReleasePreview
+    approved_identity: ReleaseIdentity
+    same_host_approved: Boolean
+    state: InstallState
+    backend_status_seen_at: Timestamp?
+    backend_terminal_reason: String?
+
+    transitions state {
+        idle -> requested
+        requested -> in_progress
+        requested -> rejected
+        in_progress -> committed
+        in_progress -> rolled_back
+        in_progress -> rollback_failed
+        in_progress -> failed
+        terminal: committed, rolled_back, rollback_failed, rejected, failed
+    }
+}
+
+entity UpdateController {
+    id: String
+    preview: ReleasePreview?
+    installation: UpdateInstallation?
+    connection: ControllerConnectionState
+    visible_terminal_message: TerminalMessageKind
+    hydrated_from_backend: Boolean
+
+    transitions connection {
+        connected -> disconnected
+        disconnected -> connected
+    }
+}
+
+-- Helpers
+--
+-- stable_published_release_exists(preview) -> Boolean
+--   preview resolves one stable published release; draft, prerelease, local,
+--   or unverifiable artifacts do not satisfy this helper.
+-- preview_is_immutable(preview) -> Boolean
+--   preview.identity and preview.summary are fixed once preview is discovered.
+-- same_host_session(controller) -> Boolean
+--   the controller's browser session is same-host according to the same-host
+--   locality contract.
+-- approval_matches_preview(preview, installation) -> Boolean
+--   installation.approved_identity exactly matches preview.identity.
+-- backend_install_uses_published_release_contract(installation) -> Boolean
+--   the installation request delegates to the production-deployment published-
+--   release path rather than a parallel activation flow.
+-- durable_backend_status_exists(installation) -> Boolean
+--   a durable backend status exists for installation's published-release
+--   deployment attempt and can be re-read after reconnect or restart.
+-- committed_matches_approved_identity(installation) -> Boolean
+--   durable backend commit status proves the running runtime identity matches
+--   installation.approved_identity exactly.
+-- rollback_recorded(installation) -> Boolean
+--   durable backend status records rollback to the previous runtime.
+-- rollback_failure_recorded(installation) -> Boolean
+--   durable backend status records rollback failure distinctly from rollback.
+-- rejection_recorded(installation) -> Boolean
+--   durable backend status records a rejected or non-started attempt.
+-- failure_recorded(installation) -> Boolean
+--   durable backend status records a failed attempt that did not commit.
+-- audit_trail_complete(installation) -> Boolean
+--   durable release-update records preserve preview.id, approved_identity,
+--   installation.id, and terminal backend outcome.
+
+rule DiscoverStablePublishedRelease {
+    when: StableReleaseDiscovered(preview)
+    requires: preview.state = discovered
+    requires: preview.channel = stable
+    requires: stable_published_release_exists(preview)
+    ensures: preview_is_immutable(preview)
+}
+
+rule SupersedeOlderPreviewWhenStableIdentityChanges {
+    when: NewStableReleaseDiscovered(old_preview, new_preview)
+    requires: stable_published_release_exists(new_preview)
+    requires: old_preview.identity != new_preview.identity
+    requires: old_preview.state in { discovered, approved, terminal }
+    ensures: old_preview.state = superseded
+    ensures: new_preview.state = discovered
+    ensures: preview_is_immutable(new_preview)
+}
+
+rule SameHostApprovalBindsExactIdentity {
+    when: InstallApproved(controller, preview, installation)
+    requires: controller.preview = preview
+    requires: preview.state = discovered
+    requires: same_host_session(controller)
+    requires: approval_matches_preview(preview, installation)
+    ensures: preview.state = approved
+    ensures: installation.preview = preview
+    ensures: installation.approved_identity = preview.identity
+    ensures: installation.same_host_approved = true
+    ensures: installation.state = requested
+}
+
+rule StaleOrRemoteApprovalRejected {
+    when: InstallApprovalRejected(controller, preview, installation)
+    requires: controller.preview = preview
+    requires: preview.state in { discovered, approved }
+    requires: not same_host_session(controller)
+        or not approval_matches_preview(preview, installation)
+    ensures: installation.state = rejected
+    ensures: controller.visible_terminal_message = rejected
+}
+
+rule RequestedInstallDelegatesToProductionDeployment {
+    when: BackendInstallStarted(installation)
+    requires: installation.state = requested
+    requires: installation.same_host_approved
+    requires: backend_install_uses_published_release_contract(installation)
+    ensures: installation.state = in_progress
+}
+
+rule ControllerDisconnectDoesNotChangeBackendInstall {
+    when: ControllerDisconnected(controller, installation)
+    requires: controller.installation = installation
+    requires: controller.connection = connected
+    requires: installation.state in { requested, in_progress }
+    ensures: controller.connection = disconnected
+    ensures: installation.state in { requested, in_progress }
+}
+
+rule ReconnectHydratesDurableBackendStatus {
+    when: ControllerReconnected(controller, installation)
+    requires: controller.installation = installation
+    requires: controller.connection = disconnected
+    requires: durable_backend_status_exists(installation)
+    ensures: controller.connection = connected
+    ensures: controller.hydrated_from_backend = true
+    ensures: installation.backend_status_seen_at != null
+}
+
+rule HydratedStatusShowsNonterminalProgress {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: controller.hydrated_from_backend
+    requires: controller.installation.state in { requested, in_progress }
+    requires: controller.installation.backend_status_seen_at != null
+    ensures: controller.visible_terminal_message = none
+}
+
+rule StaleNonterminalStatusRemainsVisibleAfterReconnect {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: controller.hydrated_from_backend
+    requires: controller.installation.state in { requested, in_progress }
+    requires: controller.installation.backend_status_seen_at != null
+    requires: now() - controller.installation.backend_status_seen_at > config.hydration_stale_after
+    ensures: controller.visible_terminal_message = none
+}
+
+rule CommittedInstallShowsTruthfulSuccess {
+    when: BackendCommitted(installation)
+    requires: installation.state = in_progress
+    requires: committed_matches_approved_identity(installation)
+    ensures: installation.state = committed
+    ensures: installation.preview.state = terminal
+    ensures: audit_trail_complete(installation)
+}
+
+rule HydratedCommittedInstallShowsSuccess {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: durable_backend_status_exists(controller.installation)
+    requires: committed_matches_approved_identity(controller.installation)
+    ensures: controller.installation.state = committed
+    ensures: controller.visible_terminal_message = success
+    ensures: controller.hydrated_from_backend = true
+}
+
+rule HydratedRollbackShowsRollback {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: durable_backend_status_exists(controller.installation)
+    requires: rollback_recorded(controller.installation)
+    ensures: controller.installation.state = rolled_back
+    ensures: controller.visible_terminal_message = rollback
+    ensures: controller.hydrated_from_backend = true
+}
+
+rule HydratedRollbackFailureShowsRollbackFailure {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: durable_backend_status_exists(controller.installation)
+    requires: rollback_failure_recorded(controller.installation)
+    ensures: controller.installation.state = rollback_failed
+    ensures: controller.visible_terminal_message = rollback_failure
+    ensures: controller.hydrated_from_backend = true
+}
+
+rule HydratedRejectionShowsRejection {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: durable_backend_status_exists(controller.installation)
+    requires: rejection_recorded(controller.installation)
+    ensures: controller.installation.state = rejected
+    ensures: controller.visible_terminal_message = rejected
+    ensures: controller.hydrated_from_backend = true
+}
+
+rule HydratedFailureShowsFailure {
+    when: controller: UpdateController.connection transitions_to connected
+    requires: controller.installation != null
+    requires: durable_backend_status_exists(controller.installation)
+    requires: failure_recorded(controller.installation)
+    ensures: controller.installation.state = failed
+    ensures: controller.visible_terminal_message = failure
+    ensures: controller.hydrated_from_backend = true
+}
+
+invariant PreviewApprovalBindsExactIdentity {
+    for installation in UpdateInstallations:
+        installation.same_host_approved implies
+            installation.approved_identity = installation.preview.identity
+}
+
+invariant SuccessRequiresExactCommittedIdentity {
+    for installation in UpdateInstallations:
+        installation.state = committed implies
+            committed_matches_approved_identity(installation)
+}
+
+invariant TerminalMessagesAreTruthful {
+    for controller in UpdateControllers:
+        controller.visible_terminal_message = success implies
+            controller.installation != null
+            and controller.installation.state = committed
+}
+
+invariant AuditTrailPreservedForTerminalInstalls {
+    for installation in UpdateInstallations:
+        installation.state in { committed, rolled_back, rollback_failed, rejected, failed } implies
+            audit_trail_complete(installation)
+}

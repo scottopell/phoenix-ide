@@ -19,6 +19,7 @@ import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
 import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
 import type { ManagedResourceCategory } from '../generated/ManagedResourceCategory';
+import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
 import './AboutDeploymentPage.css';
 
 const RESOURCE_POLL_MS = 1_000;
@@ -768,6 +769,8 @@ export function AboutDeploymentPage() {
 
           {info && (
             <>
+              <ReleaseUpdatePanel />
+
               <section className="settings-section">
                 <h3 className="settings-section__title">Build</h3>
                 <Row label="Version"><code>{info.build.version}</code></Row>

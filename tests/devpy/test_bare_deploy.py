@@ -32,6 +32,35 @@ class BareDeployCommandTests(unittest.TestCase):
         check.assert_not_called()
         deploy.assert_called_once_with("v2.0.0")
 
+    def test_controller_uses_installed_bare_env_and_transaction_id(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v2.0.0",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "phoenix"
+            environment = root / "config/phoenix.env"
+            environment.parent.mkdir(parents=True)
+            environment.write_text("PHOENIX_PASSWORD=installed\nPHOENIX_PORT=9443\n")
+            layout = {
+                "root": root,
+                "supervisor": root / "bin/phoenix-supervisor.py",
+                "binary": root / "bin/phoenix-ide",
+                "environment": environment,
+                "transactions": root / "deploy/transactions",
+                "status": root / "deploy/status.json",
+                "socket": root / "run/supervisor.sock",
+                "deployed_sha": root / "deployed.sha",
+            }
+            with mock.patch.object(self.dev, "_bare_layout", return_value=layout), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_prepare_release_candidate", side_effect=SystemExit("stop here")) as prepare:
+                with self.assertRaisesRegex(SystemExit, "stop here"):
+                    self.dev.prod_daemon_deploy("v2.0.0", controller=controller)
+        prepare.assert_called_once_with("v2.0.0", mock.ANY, expected_full_commit="a" * 40)
+
     def test_stop_routes_through_supervisor_socket_not_pid_file(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

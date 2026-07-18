@@ -4,6 +4,8 @@ import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
+import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
+import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
@@ -1162,6 +1164,31 @@ export const api = {
   async deploymentInfo(): Promise<DeploymentInfo> {
     const resp = await fetch('/api/deployment');
     if (!resp.ok) throw new Error('Failed to load deployment info');
+    return resp.json();
+  },
+
+  async releaseUpdateSnapshot(refresh = false): Promise<ReleaseUpdateSnapshot> {
+    const resp = await fetch(`/api/release-updates${refresh ? '?refresh=true' : ''}`);
+    if (!resp.ok) throw new Error('Failed to load release update status');
+    return resp.json();
+  },
+
+  async approveReleaseUpdate(tag: string, commit: string): Promise<ApproveReleaseUpdateResponse> {
+    const resp = await fetch('/api/release-updates/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag, commit }),
+    });
+    if (!resp.ok) {
+      let detail = 'Failed to start release update';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // keep fallback
+      }
+      throw new Error(detail);
+    }
     return resp.json();
   },
 

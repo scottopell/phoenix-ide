@@ -418,6 +418,15 @@ pub fn create_router(state: AppState) -> Router {
             "/api/deployment/disk/managed-worktrees/cleanup",
             post(super::deployment::cleanup_managed_worktree),
         )
+        // Published production release updates (REQ-RU-001 through REQ-RU-010)
+        .route(
+            "/api/release-updates",
+            get(super::release_updates::snapshot),
+        )
+        .route(
+            "/api/release-updates/approve",
+            post(super::release_updates::approve),
+        )
         // Usage analytics (read-only)
         .route("/api/usage", get(super::usage::usage_overview))
         .route(

@@ -213,6 +213,41 @@ class SystemdDeployCommandTests(unittest.TestCase):
         check.assert_not_called()
         deploy.assert_called_once_with("v2.0.0")
 
+    def test_controller_requires_noninteractive_sudo_before_disruption(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v2.0.0",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        with mock.patch.object(
+            self.dev.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "password required"),
+        ) as run, mock.patch.object(self.dev, "check_systemd_available") as available:
+            with self.assertRaisesRegex(SystemExit, "non-interactive sudo is required before disruption"):
+                self.dev.native_prod_deploy("v2.0.0", controller=controller)
+        self.assertEqual(["sudo", "-n", "true"], run.call_args.args[0])
+        available.assert_not_called()
+
+    def test_controller_uses_installed_systemd_env_and_transaction_id(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v2.0.0",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        with mock.patch.object(self.dev, "check_systemd_available", return_value=True), \
+             mock.patch.object(self.dev, "_require_noninteractive_sudo_ready"), \
+             mock.patch.object(self.dev, "_read_systemd_installed_env", return_value={"PHOENIX_PASSWORD": "installed", "PHOENIX_PORT": "9443"}), \
+             mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+             mock.patch.object(self.dev, "detect_service_user", return_value="nobody"), \
+             mock.patch.object(self.dev, "_linux_musl_target", return_value="x86_64-unknown-linux-musl"), \
+             mock.patch.object(self.dev, "_prepare_release_candidate", side_effect=SystemExit("stop here")) as prepare:
+            with self.assertRaisesRegex(SystemExit, "stop here"):
+                self.dev.native_prod_deploy("v2.0.0", controller=controller)
+        prepare.assert_called_once_with("v2.0.0", mock.ANY, expected_full_commit="a" * 40)
+
 
 if __name__ == "__main__":
     unittest.main()
