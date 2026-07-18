@@ -22,6 +22,18 @@ The system shall allow installation approval only from a same-host browser sessi
 
 After approval, the system shall request installation through the production-deployment contract for published releases and shall not introduce a parallel activation, verification, or rollback path for in-app updates.
 
+### REQ-RU-004A — Runtime ownership gates backend eligibility
+
+The system shall derive the release-update backend from the authoritative
+runtime-ownership snapshot defined by `specs/deployment-info/requirements.md`
+and shall not independently infer ownership from the host platform, PID 1, or
+installed artifacts. Development, unmanaged, ambiguous, and unsupported
+ownership states shall not be eligible for disruptive in-app updates.
+
+Browser locality, host tools, privileges, and deployment-claim availability
+shall remain separate update-authority decisions and shall not alter the
+runtime-ownership snapshot.
+
 ### REQ-RU-005 — Independent controller and backend lifecycles
 
 The in-app release-update controller shall remain independent from the backend installation lifecycle. Closing the dialog, navigating away, disconnecting, or restarting Phoenix shall not cancel or complete installation by implication.

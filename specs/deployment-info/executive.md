@@ -9,6 +9,8 @@ the machine is it using right now?"
 
 **In scope:**
 - Build identity: version, git SHA, uptime, start time
+- Authoritative runtime ownership from live socket-activation or authenticated
+  bare-supervisor evidence
 - Network binding and TLS posture (mode, cert/key/CA paths, auto-mode hosts,
   socket activation)
 - A live managed-resource monitor with a focused resource endpoint, host and
@@ -56,6 +58,7 @@ staying safe to open because ordinary inspection changes nothing.
 |---|---|---|
 | **REQ-DEPLOY-001:** Reach "About this deployment" from settings | Implemented | `ui/src/components/SettingsDropdown.tsx` links to the route rendered by `ui/src/pages/AboutDeploymentPage.tsx`. The page is read-only apart from typed leftover-worktree cleanup actions. |
 | **REQ-DEPLOY-002:** Report build identity and uptime | Implemented | `crates/phoenix-ide/src/api/deployment.rs` builds `BuildInfo` from `env!("CARGO_PKG_VERSION")`, `env!("PHOENIX_GIT_SHA")`, and `crate::hot_restart::{started_at, uptime_secs}`. The UI renders version, git SHA, started time, and uptime. |
+| **REQ-DEPLOY-002A:** Report authoritative runtime ownership | Implemented | `api::installation_ownership` classifies live launchd/systemd socket activation and authenticated bare-supervisor direct-child evidence into one typed snapshot. `/api/deployment` exposes it, and release-update backend eligibility derives from the same value; absent, conflicting, unreadable, development, and unsupported evidence remains explicit. |
 | **REQ-DEPLOY-003:** Report network binding and TLS configuration | Implemented | `DeploymentInfo.network` carries bind address, socket activation, and `TlsInfo`; `AboutDeploymentPage` renders plain HTTP explicitly when TLS is disabled and shows cert/key/CA/hosts when enabled. |
 | **REQ-DEPLOY-004:** Report live managed-resource and host usage | Implemented | `GET /api/about/resources` returns `AboutResourcesSnapshot` with host metrics plus managed totals and category rows. API, Bash process groups, and shell-mode terminal process groups are attributed with native PID/start identity; Browser, tmux-server, and MCP gaps remain explicit with reasons. Per-process proportional-memory failures are debug-logged, and managed totals include both `process_count` and `deduplicated_pid_count`. |
 | **REQ-DEPLOY-004A:** Poll live resource data while the page is visible | Implemented | `ui/src/pages/AboutDeploymentPage.tsx` polls with `RESOURCE_POLL_MS = 1_000`, skips initial, timed, and manual resource fetches while `document.visibilityState !== 'visible'`, triggers an immediate fetch on `visibilitychange` back to visible, skips overlapping automatic polls, lets an explicit user refresh supersede and abort an active sample, and ignores completions from unmounted or obsolete requests. |

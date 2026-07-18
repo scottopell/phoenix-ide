@@ -4,7 +4,11 @@
 //! This module resolves an immutable release preview and launches the selected
 //! release's deployment controller; it never replaces or restarts Phoenix.
 
-use super::{local_reveal::client_is_local, AppState};
+use super::{
+    installation_ownership::{self, InstallationOwnership},
+    local_reveal::client_is_local,
+    AppState,
+};
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
@@ -42,10 +46,8 @@ static PREVIEW_CACHE: OnceLock<RwLock<Option<(Instant, ReleasePreview)>>> = Once
 static GITHUB_REQUEST_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static SYSTEMD_AUTHORITY_CACHE: OnceLock<RwLock<Option<(Instant, bool)>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum ReleaseUpdateBackend {
+#[derive(Clone, Copy, Debug)]
+enum ReleaseUpdateBackend {
     Launchd,
     Systemd,
     BareLinux,
@@ -79,6 +81,8 @@ pub enum ReleaseUpdateAuthority {
     RemoteBrowser,
     NotProduction,
     UnsupportedHost,
+    UnmanagedInstallation { reason: String },
+    AmbiguousInstallation { reason: String },
     MissingPrerequisite { reason: String },
 }
 
@@ -109,7 +113,7 @@ pub enum ReleaseTransactionStatus {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ReleaseUpdateSnapshot {
-    pub backend: ReleaseUpdateBackend,
+    pub installation_ownership: InstallationOwnership,
     pub current_version: String,
     pub current_git_sha: String,
     pub preview: ReleasePreview,
@@ -152,23 +156,15 @@ pub struct SnapshotQuery {
     refresh: bool,
 }
 
-fn backend(_state: &AppState) -> ReleaseUpdateBackend {
-    if cfg!(target_os = "macos") {
-        ReleaseUpdateBackend::Launchd
-    } else if cfg!(target_os = "linux") {
-        let pid_one = Command::new("ps")
-            .args(["-p", "1", "-o", "comm="])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-        if pid_one.as_deref() == Some("systemd") {
-            ReleaseUpdateBackend::Systemd
-        } else {
-            ReleaseUpdateBackend::BareLinux
-        }
-    } else {
-        ReleaseUpdateBackend::Unsupported
+fn backend(ownership: &InstallationOwnership) -> ReleaseUpdateBackend {
+    match ownership {
+        InstallationOwnership::LaunchdManaged => ReleaseUpdateBackend::Launchd,
+        InstallationOwnership::SystemdManaged => ReleaseUpdateBackend::Systemd,
+        InstallationOwnership::BareSupervisorManaged { .. } => ReleaseUpdateBackend::BareLinux,
+        InstallationOwnership::Development
+        | InstallationOwnership::Unmanaged { .. }
+        | InstallationOwnership::Ambiguous { .. }
+        | InstallationOwnership::Unsupported { .. } => ReleaseUpdateBackend::Unsupported,
     }
 }
 
@@ -491,17 +487,31 @@ fn command_exists(path: &std::ffi::OsStr, name: &str) -> bool {
 fn authority(
     state: &AppState,
     local: bool,
+    ownership: &InstallationOwnership,
     backend: ReleaseUpdateBackend,
     refresh_privilege: bool,
 ) -> ReleaseUpdateAuthority {
     if !local {
         return ReleaseUpdateAuthority::RemoteBrowser;
     }
-    if !state.runtime_env.is_production() {
-        return ReleaseUpdateAuthority::NotProduction;
-    }
-    if matches!(backend, ReleaseUpdateBackend::Unsupported) {
-        return ReleaseUpdateAuthority::UnsupportedHost;
+    match ownership {
+        InstallationOwnership::Development => return ReleaseUpdateAuthority::NotProduction,
+        InstallationOwnership::Unmanaged { reason } => {
+            return ReleaseUpdateAuthority::UnmanagedInstallation {
+                reason: reason.clone(),
+            }
+        }
+        InstallationOwnership::Ambiguous { reason } => {
+            return ReleaseUpdateAuthority::AmbiguousInstallation {
+                reason: reason.clone(),
+            }
+        }
+        InstallationOwnership::Unsupported { .. } => {
+            return ReleaseUpdateAuthority::UnsupportedHost
+        }
+        InstallationOwnership::LaunchdManaged
+        | InstallationOwnership::SystemdManaged
+        | InstallationOwnership::BareSupervisorManaged { .. } => {}
     }
     let path = controller_path(state);
     for command in ["uv", "gh"] {
@@ -547,16 +557,17 @@ pub async fn snapshot(
     headers: HeaderMap,
     Query(query): Query<SnapshotQuery>,
 ) -> impl IntoResponse {
-    let selected_backend = backend(&state);
+    let ownership = installation_ownership::detect(&state.runtime_env).await;
+    let selected_backend = backend(&ownership);
     let local = client_is_local(peer.ip(), &headers);
     let preview = cached_preview(query.refresh)
         .await
         .unwrap_or_else(|reason| ReleasePreview::Unavailable { reason });
     Json(ReleaseUpdateSnapshot {
-        backend: selected_backend,
+        installation_ownership: ownership.clone(),
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         current_git_sha: env!("PHOENIX_GIT_SHA").to_string(),
-        authority: authority(&state, local, selected_backend, query.refresh),
+        authority: authority(&state, local, &ownership, selected_backend, query.refresh),
         transaction: read_status(&state, selected_backend),
         preview,
         sampled_at: Utc::now(),
@@ -621,11 +632,13 @@ pub async fn approve(
     headers: HeaderMap,
     Json(request): Json<ApproveReleaseUpdateRequest>,
 ) -> impl IntoResponse {
-    let selected_backend = backend(&state);
+    let ownership = installation_ownership::detect(&state.runtime_env).await;
+    let selected_backend = backend(&ownership);
     if !matches!(
         authority(
             &state,
             client_is_local(peer.ip(), &headers),
+            &ownership,
             selected_backend,
             true,
         ),
@@ -886,6 +899,39 @@ mod tests {
         assert!(version_triplet("v2.0.0") > version_triplet("1.99.99"));
         assert!(version_triplet("1.9.0") < version_triplet("1.10.0"));
         assert_eq!(None, version_triplet("latest"));
+    }
+
+    #[test]
+    fn update_backend_is_derived_only_from_installation_ownership() {
+        assert!(matches!(
+            backend(&InstallationOwnership::LaunchdManaged),
+            ReleaseUpdateBackend::Launchd
+        ));
+        assert!(matches!(
+            backend(&InstallationOwnership::SystemdManaged),
+            ReleaseUpdateBackend::Systemd
+        ));
+        assert!(matches!(
+            backend(&InstallationOwnership::BareSupervisorManaged { supervisor_pid: 42 }),
+            ReleaseUpdateBackend::BareLinux
+        ));
+        for ownership in [
+            InstallationOwnership::Development,
+            InstallationOwnership::Unmanaged {
+                reason: "manual".to_string(),
+            },
+            InstallationOwnership::Ambiguous {
+                reason: "conflict".to_string(),
+            },
+            InstallationOwnership::Unsupported {
+                platform: "other".to_string(),
+            },
+        ] {
+            assert!(matches!(
+                backend(&ownership),
+                ReleaseUpdateBackend::Unsupported
+            ));
+        }
     }
 
     #[test]

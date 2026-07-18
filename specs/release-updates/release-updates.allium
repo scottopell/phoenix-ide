@@ -7,7 +7,8 @@
 -- activation, exact runtime verification, and rollback mechanics; this
 -- module models the operator-facing contract above that backend.
 --
--- Requirement traceability: REQ-RU-001 through REQ-RU-009 are modelled
+-- Requirement traceability: REQ-RU-001 through REQ-RU-009, including
+-- REQ-RU-004A, are modelled
 -- here. REQ-RU-010 is an operator-tooling boundary stated in
 -- requirements.md rather than a runtime rule.
 
@@ -101,6 +102,10 @@ entity UpdateController {
 -- same_host_session(controller) -> Boolean
 --   the controller's browser session is same-host according to the same-host
 --   locality contract.
+-- supported_runtime_owner(controller) -> Boolean
+--   the deployment-info runtime-ownership snapshot proves launchd, systemd,
+--   or bare-supervisor ownership; development, unmanaged, ambiguous, and
+--   unsupported snapshots do not satisfy this helper.
 -- approval_matches_preview(preview, installation) -> Boolean
 --   installation.approved_identity exactly matches preview.identity.
 -- backend_install_uses_published_release_contract(installation) -> Boolean
@@ -147,6 +152,7 @@ rule SameHostApprovalBindsExactIdentity {
     requires: controller.preview = preview
     requires: preview.state = discovered
     requires: same_host_session(controller)
+    requires: supported_runtime_owner(controller)
     requires: approval_matches_preview(preview, installation)
     ensures: preview.state = approved
     ensures: installation.preview = preview
@@ -160,6 +166,7 @@ rule StaleOrRemoteApprovalRejected {
     requires: controller.preview = preview
     requires: preview.state in { discovered, approved }
     requires: not same_host_session(controller)
+        or not supported_runtime_owner(controller)
         or not approval_matches_preview(preview, installation)
     ensures: installation.state = rejected
     ensures: controller.visible_terminal_message = rejected

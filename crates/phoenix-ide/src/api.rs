@@ -14,6 +14,7 @@ mod discovery;
 mod git_handlers;
 pub(crate) mod global_read;
 pub(crate) mod handlers;
+mod installation_ownership;
 mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;

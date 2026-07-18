@@ -46,6 +46,7 @@ function deployment(overrides: Partial<DeploymentInfo> = {}): DeploymentInfo {
       },
     },
     log: { stdout: true, file: null },
+    installation_ownership: { kind: 'development' },
     local_access: false,
     sampled_at: '2026-06-01T00:00:01Z',
     ...overrides,

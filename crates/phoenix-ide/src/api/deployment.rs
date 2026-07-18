@@ -10,6 +10,7 @@
 //! yields current values.
 
 use super::AppState;
+use crate::api::installation_ownership::{self, InstallationOwnership};
 use crate::api::process_sample::ProcessObservation;
 use axum::{
     extract::{ConnectInfo, State},
@@ -80,6 +81,7 @@ pub struct DeploymentInfo {
     /// for any remote browser — the file-manager window opens on the server's
     /// desktop, which a remote user cannot see.
     pub local_access: bool,
+    pub installation_ownership: InstallationOwnership,
     pub sampled_at: DateTime<Utc>,
 }
 
@@ -335,6 +337,7 @@ pub async fn deployment_info(
     Json(DeploymentInfo {
         build,
         network,
+        installation_ownership: installation_ownership::detect(&state.runtime_env).await,
         log: cfg.log.clone(),
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),

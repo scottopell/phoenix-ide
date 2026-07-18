@@ -4,7 +4,7 @@
 
 Phoenix exposes a typed in-app published-release update surface on the About deployment page. It discovers GitHub's latest stable release, resolves the tag to a full source commit, selects the host asset and published checksum, and presents that immutable identity and release notes before any approval is possible.
 
-Approval is same-host only and binds the exact preview tag plus full commit. The server downloads that commit's deployment controller into an owner-only transaction artifact and waits until the controller's transaction ID appears in backend-owned durable status. Launchd, systemd, and bare Linux continue to own disruption, exact runtime verification, commit, and rollback through the production-deployment stack; the running Phoenix process never replaces or restarts itself.
+Approval is same-host only and binds the exact preview tag plus full commit. Backend eligibility derives from the same typed runtime-ownership snapshot shown by the deployment API; development, unmanaged, ambiguous, and unsupported processes cannot approve disruptive updates. The server downloads that commit's deployment controller into an owner-only transaction artifact and waits until the controller's transaction ID appears in backend-owned durable status. Launchd, systemd, and bare Linux continue to own disruption, exact runtime verification, commit, and rollback through the production-deployment stack; the running Phoenix process never replaces or restarts itself.
 
 After reconnect, the UI hydrates the authoritative native status file. In-progress, committed, precondition-failed, verified rollback, rollback failure, concurrent rejection, unreadable, and stale outcomes remain distinct. `./dev.py` remains available for bootstrap, local HEAD deployment, offline repair, migration, and emergency recovery.
 
@@ -16,6 +16,7 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 | REQ-RU-002 | `ReleasePreview` and `ReleaseUpdatePanel` present tag, full commit, asset, checksum, notes, and running identity before approval. |
 | REQ-RU-003 | `client_is_local`, `valid_approval`, and controller exact-tag/full-commit validation enforce same-host, preview-bound approval. |
 | REQ-RU-004 | The pinned `dev.py` controller delegates to the existing launchd/systemd/bare activation owners. |
+| REQ-RU-004A | `api::installation_ownership` is shared by `/api/deployment` and `release_updates`; `release_updates::backend` internally maps only proven managed owners to update backends without exporting a parallel ownership value. |
 | REQ-RU-005 | `release_updates::approve` launches the controller independently and returns only after durable backend handoff. |
 | REQ-RU-006 | `read_status` normalizes backend-owned status and the UI polls/restores it after reconnect. |
 | REQ-RU-007 | Committed status displays backend-verified expected identity and approved source commit. |

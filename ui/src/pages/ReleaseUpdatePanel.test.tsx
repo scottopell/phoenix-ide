@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
 
 const snapshot = {
-  backend: 'launchd' as const,
+  installation_ownership: { kind: 'launchd_managed' as const },
   current_version: '1.0.0',
   current_git_sha: '1'.repeat(40),
   preview: {
