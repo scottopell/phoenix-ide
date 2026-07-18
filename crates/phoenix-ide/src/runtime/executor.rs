@@ -3816,17 +3816,6 @@ where
                 });
                 self.tool_executor.upgrade_to_work_mode();
                 self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
-                self.storage
-                    .add_message(
-                        &uuid::Uuid::new_v4().to_string(),
-                        &self.context.conversation_id,
-                        &MessageContent::system(
-                            "Full Work toolset approved for this Explore conversation.",
-                        ),
-                        None,
-                        None,
-                    )
-                    .await?;
                 Ok(None)
             }
             Effect::PersistMessage {

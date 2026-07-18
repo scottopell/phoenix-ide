@@ -4210,6 +4210,24 @@ impl Database {
         Ok(queue)
     }
 
+    /// Persist the full Work-tool grant for a conversation.
+    ///
+    /// # Errors
+    /// Returns an error when the conversation does not exist or the database update fails.
+    pub async fn grant_full_work_tools(&self, id: &str) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE conversations SET full_work_tools_granted = 1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Atomically persist a full Work-tool grant and its post-approval state.
     ///
     /// # Errors
@@ -5957,7 +5975,7 @@ impl Database {
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_work_tool_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
                    json_extract(state, '$.type') = 'llm_requesting'
                    AND EXISTS (
@@ -11971,6 +11989,37 @@ mod tests {
         assert_eq!(
             db.get_conversation("conv-grant").await.unwrap().state,
             next_state
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_awaiting_work_tool_approval_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "conv-work-tool-wait",
+            "slug-work-tool-wait",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let approval_state = ConvState::AwaitingWorkToolApproval {
+            reason: "inspect production traces".to_string(),
+        };
+        db.update_conversation_state("conv-work-tool-wait", &approval_state)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert_eq!(
+            db.get_conversation("conv-work-tool-wait")
+                .await
+                .unwrap()
+                .state,
+            approval_state
         );
     }
 

@@ -1178,9 +1178,11 @@ pub enum SseEvent {
 /// `SubAgentRegistryOnResume`.
 fn sub_agent_registry_for_conv_mode(
     conv_mode: &ConvMode,
+    full_work_tools_granted: bool,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
     match conv_mode {
+        ConvMode::Explore { .. } if full_work_tools_granted => ToolRegistry::for_subagent_work(),
         ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(policy),
         ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
             ToolRegistry::for_subagent_work()
@@ -2155,6 +2157,24 @@ impl RuntimeManager {
             }
         };
 
+        let inherited_explore_work_grant = matches!(spec.mode, SubAgentMode::Work)
+            && matches!(parent_conv.conv_mode, ConvMode::Explore { .. });
+        if inherited_explore_work_grant {
+            if let Err(e) = self.db.grant_full_work_tools(&conv.id).await {
+                tracing::error!(error = %e, conv_id = %conv.id, "Failed to persist Work tools for sub-agent");
+                let _ = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: spec.agent_id,
+                        outcome: SubAgentOutcome::Failure {
+                            error: format!("Failed to grant Work tools to sub-agent: {e}"),
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await;
+                return;
+            }
+        }
+
         // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
         // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
         // falling back to the generic prompt. Best-effort: the live
@@ -2203,7 +2223,10 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
-        conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode, false));
+        conv_context.mode_context = Some(conv_mode_to_context(
+            &sub_conv_mode,
+            inherited_explore_work_grant,
+        ));
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
@@ -2576,6 +2599,10 @@ impl RuntimeManager {
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(
                 &conv.conv_mode,
+                self.db
+                    .has_full_work_tools(conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
             ToolRegistryExecutor::with_mcp(
@@ -3160,6 +3187,7 @@ impl RuntimeManager {
         match &conv.state {
             ConvState::Provisioning { .. }
             | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingWorkToolApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::SeededLlmRequesting { .. } => {
@@ -3324,9 +3352,10 @@ mod sub_agent_registry_resume_tests {
     use crate::platform::PlatformCapability;
     use crate::tools::ExploreToolPolicy;
 
-    fn registry_has(conv_mode: &ConvMode, tool: &str) -> bool {
+    fn registry_has(conv_mode: &ConvMode, full_work_tools_granted: bool, tool: &str) -> bool {
         sub_agent_registry_for_conv_mode(
             conv_mode,
+            full_work_tools_granted,
             ExploreToolPolicy::from_platform(&PlatformCapability::None {
                 details: "test".into(),
             }),
@@ -3337,13 +3366,22 @@ mod sub_agent_registry_resume_tests {
     }
 
     #[test]
+    fn approved_explore_work_subagent_resume_includes_patch() {
+        let mode = ConvMode::Explore {
+            worktree_path: None,
+            next_taskmd_id_hint: None,
+        };
+        assert!(registry_has(&mode, true, "patch"));
+    }
+
+    #[test]
     fn explore_subagent_resume_excludes_patch() {
         let mode = ConvMode::Explore {
             worktree_path: None,
             next_taskmd_id_hint: None,
         };
-        assert!(!registry_has(&mode, "patch"));
-        assert!(registry_has(&mode, "submit_result"));
+        assert!(!registry_has(&mode, false, "patch"));
+        assert!(registry_has(&mode, false, "submit_result"));
     }
 
     #[test]
@@ -3352,7 +3390,7 @@ mod sub_agent_registry_resume_tests {
         // ConvMode::Direct (Work sub-agents inherit parent conv_mode).
         // The previous bug mapped Direct -> Explore registry; the
         // resumed sub-agent must keep `patch`.
-        assert!(registry_has(&ConvMode::Direct, "patch"));
+        assert!(registry_has(&ConvMode::Direct, false, "patch"));
     }
 
     #[test]
@@ -3364,7 +3402,7 @@ mod sub_agent_registry_resume_tests {
             task_id: NonEmptyString::new("0001").unwrap(),
             task_title: NonEmptyString::new("x").unwrap(),
         };
-        assert!(registry_has(&mode, "patch"));
+        assert!(registry_has(&mode, false, "patch"));
     }
 
     #[test]
@@ -3374,7 +3412,7 @@ mod sub_agent_registry_resume_tests {
             worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
             base_branch: NonEmptyString::new("feature-x").unwrap(),
         };
-        assert!(registry_has(&mode, "patch"));
+        assert!(registry_has(&mode, false, "patch"));
     }
 }
 

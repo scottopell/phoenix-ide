@@ -2212,6 +2212,48 @@ pub fn transition_parent(
                 stamp_retry_count(&mut dd, final_attempt);
                 dd
             };
+            if let Some(error) = tool_calls.iter().find_map(|tool| match &tool.input {
+                ToolInput::Malformed { name, error, .. } if name == "request_work_tools" => {
+                    Some(error.clone())
+                }
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::CommissionReview(_)
+                | ToolInput::ApprovedCommissionReview(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::RequestWorkTools(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
+            }) {
+                let display_data = make_display_data(&content);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+                let results = tool_calls
+                    .iter()
+                    .map(|call| ToolResult::error(call.id.clone(), error.clone()))
+                    .collect();
+                let checkpoint = CheckpointData::tool_round(assistant_message, results)
+                    .expect("one result per malformed work-tool request response tool call");
+                return Ok(ParentTransitionResult::new(ParentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
+            }
+
             if let Some((tool, input)) = tool_calls.iter().find_map(|tool| match &tool.input {
                 ToolInput::RequestWorkTools(input) => Some((tool, input)),
                 ToolInput::Bash(_)
@@ -5648,6 +5690,47 @@ mod tests {
                 .any(|e| matches!(e, Effect::RequestLlm)),
             "Should have RequestLlm effect to feed errors back"
         );
+    }
+
+    #[test]
+    fn malformed_work_tool_request_returns_parse_error_to_model() {
+        let context = test_context();
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        let malformed = ToolCall::new(
+            "tool-malformed-work-tools",
+            ToolInput::from_name_and_value("request_work_tools", serde_json::json!({})),
+        );
+        let event = Event::LlmResponse {
+            request_id: "req-malformed-work-tools".to_string(),
+            content: vec![phoenix_core::domain::llm_types::ContentBlock::ToolUse {
+                id: "tool-malformed-work-tools".to_string(),
+                name: "request_work_tools".to_string(),
+                input: serde_json::json!({}),
+            }],
+            tool_calls: vec![malformed],
+            end_turn: false,
+            usage: phoenix_core::domain::llm_types::Usage::default(),
+        };
+
+        let result = transition(&state, &context, event).expect("transition");
+        assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+        let checkpoint = result.effects.iter().find_map(|effect| {
+            if let Effect::PersistCheckpoint { data } = effect {
+                Some(data)
+            } else {
+                None
+            }
+        });
+        let Some(CheckpointData::ToolRound { tool_results, .. }) = checkpoint else {
+            panic!("missing malformed-request checkpoint");
+        };
+        assert!(tool_results.iter().any(|result| {
+            matches!(
+                &result.outcome,
+                phoenix_core::domain::db_schema::ToolOutcome::Error { output, .. }
+                    if output.contains("reason")
+            )
+        }));
     }
 
     #[test]
