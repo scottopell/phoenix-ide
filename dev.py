@@ -6901,6 +6901,8 @@ def prod_daemon_deploy(
             "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
             "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
             "source_commit": prepared.source_commit,
+            "source_kind": prepared.source_kind.value,
+            "release_tag": prepared.release_tag,
             "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
             "previous_running": previous_running,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

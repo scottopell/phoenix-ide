@@ -72,6 +72,8 @@ class TransactionManifest:
     previous_deployed_sha: Optional[str]
     created_at: str
     previous_running: bool = True
+    source_kind: str = "local_head"
+    release_tag: Optional[str] = None
     health_timeout_secs: float = 30
 
     @classmethod
@@ -431,6 +433,8 @@ class Supervisor:
             "state": state,
             "phase": phase,
             "source_commit": manifest.source_commit,
+            "source_kind": manifest.source_kind,
+            "release_tag": manifest.release_tag,
             "expected_version": manifest.expected.version,
             "expected_git_sha": manifest.expected.git_sha,
             "failure": failure,

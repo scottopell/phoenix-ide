@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{OnceLock, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 use ts_rs::TS;
@@ -30,6 +30,7 @@ const REPOSITORY: &str = "scottopell/phoenix-ide";
 const USER_AGENT: &str = "phoenix-ide-release-updates";
 const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(300);
 static PREVIEW_CACHE: OnceLock<RwLock<Option<(Instant, ReleasePreview)>>> = OnceLock::new();
+static GITHUB_REQUEST_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -144,10 +145,18 @@ pub struct SnapshotQuery {
 fn backend(_state: &AppState) -> ReleaseUpdateBackend {
     if cfg!(target_os = "macos") {
         ReleaseUpdateBackend::Launchd
-    } else if cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() {
-        ReleaseUpdateBackend::Systemd
     } else if cfg!(target_os = "linux") {
-        ReleaseUpdateBackend::BareLinux
+        let pid_one = Command::new("ps")
+            .args(["-p", "1", "-o", "comm="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        if pid_one.as_deref() == Some("systemd") {
+            ReleaseUpdateBackend::Systemd
+        } else {
+            ReleaseUpdateBackend::BareLinux
+        }
     } else {
         ReleaseUpdateBackend::Unsupported
     }
@@ -178,6 +187,7 @@ fn asset_name() -> Result<String, String> {
 fn github_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| error.to_string())
 }
@@ -202,6 +212,11 @@ fn version_triplet(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 async fn discover_release() -> Result<ReleasePreview, String> {
+    let _permit = GITHUB_REQUEST_GATE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+        .acquire()
+        .await
+        .map_err(|_| "release discovery request gate closed".to_string())?;
     let asset = asset_name()?;
     let client = github_client()?;
     let release: GithubRelease = client
@@ -511,6 +526,11 @@ fn updater_dir(state: &AppState) -> Result<PathBuf, String> {
 }
 
 async fn materialize_controller(commit: &str, destination: &Path) -> Result<(), String> {
+    let _permit = GITHUB_REQUEST_GATE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+        .acquire()
+        .await
+        .map_err(|_| "release controller request gate closed".to_string())?;
     let response = github_client()?
         .get(format!(
             "https://raw.githubusercontent.com/{REPOSITORY}/{commit}/dev.py"
