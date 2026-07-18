@@ -266,7 +266,7 @@ CREATE TABLE wake_terminal_receipts (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     contract_id TEXT NOT NULL CHECK (contract_id <> ''),
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
-    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Expired', 'Forgotten')),
+    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
     resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
     bash_handle_id TEXT,
     tmux_server_generation TEXT,
@@ -279,6 +279,8 @@ CREATE TABLE wake_terminal_receipts (
     signal_number INTEGER,
     kill_signal_sent TEXT CHECK (kill_signal_sent IS NULL OR kill_signal_sent <> ''),
     forgotten_reason TEXT CHECK (forgotten_reason IN ('PhoenixRestart', 'CascadeDestroyedHandle', 'TmuxHandleMissing')),
+    cancelled_reason TEXT CHECK (cancelled_reason IN ('ExplicitCancel')),
+    cancelled_at INTEGER CHECK (cancelled_at IS NULL OR cancelled_at >= 0),
     PRIMARY KEY (workflow_id, receipt_id),
     FOREIGN KEY (workflow_id, receipt_id) REFERENCES workflow_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
     FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
@@ -286,13 +288,15 @@ CREATE TABLE wake_terminal_receipts (
     CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
     CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_generation IS NOT NULL AND tmux_window_id IS NOT NULL)),
     CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_generation IS NOT NULL OR tmux_window_id IS NOT NULL))),
-    CHECK ((resource_kind = 'Bash') = (bash_status IS NOT NULL OR terminal_kind IN ('Expired', 'Forgotten'))),
-    CHECK ((resource_kind = 'TmuxWindow') = (tmux_status IS NOT NULL OR terminal_kind IN ('Expired', 'Forgotten'))),
+    CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'Bash' OR bash_status IS NOT NULL),
+    CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'TmuxWindow' OR tmux_status IS NOT NULL),
     CHECK ((terminal_kind = 'Fired') = (occurred_at IS NOT NULL)),
     CHECK ((bash_status IS NOT NULL) = (resource_kind = 'Bash' AND terminal_kind = 'Fired')),
     CHECK ((tmux_status IS NOT NULL) = (resource_kind = 'TmuxWindow' AND terminal_kind = 'Fired')),
     CHECK ((kill_signal_sent IS NOT NULL) <= (bash_status IS NOT NULL)),
-    CHECK ((forgotten_reason IS NOT NULL) = (terminal_kind = 'Forgotten'))
+    CHECK ((forgotten_reason IS NOT NULL) = (terminal_kind = 'Forgotten')),
+    CHECK ((cancelled_reason IS NOT NULL) = (terminal_kind = 'Cancelled')),
+    CHECK ((cancelled_at IS NOT NULL) = (terminal_kind = 'Cancelled'))
 ) WITHOUT ROWID;
 
 CREATE TABLE wake_terminal_receipt_tails (

@@ -417,7 +417,7 @@ fn external_binding_from_input(
 type SqliteTx<'a> = Transaction<'a, Sqlite>;
 
 pub(crate) struct WorkflowTx<'a> {
-    tx: SqliteTx<'a>,
+    pub(crate) tx: SqliteTx<'a>,
 }
 
 impl<'a> WorkflowTx<'a> {
@@ -433,6 +433,86 @@ impl<'a> WorkflowTx<'a> {
     async fn rollback(self) -> DbResult<()> {
         self.tx.rollback().await?;
         Ok(())
+    }
+
+    pub(crate) async fn fetch_workflow_head(
+        &mut self,
+        workflow_id: WorkflowId,
+    ) -> DbResult<Option<WorkflowHead>> {
+        let row = sqlx::query(
+            "SELECT
+                workflow_id, profile_kind, profile_version,
+                runtime_acceptance_enabled, external_acceptance_enabled,
+                version, generation, status,
+                snapshot_codec_family, snapshot_codec_version, snapshot_payload
+             FROM workflows
+             WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let codec_rows = sqlx::query(
+            "SELECT codec_family, codec_version
+             FROM workflow_supported_codecs
+             WHERE workflow_id = ?1
+             ORDER BY codec_family, codec_version",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .fetch_all(&mut *self.tx)
+        .await?;
+        let codecs = codec_rows
+            .into_iter()
+            .map(|codec_row| {
+                let family: String = codec_row.get("codec_family");
+                Ok(CodecRef {
+                    family: Box::leak(family.into_boxed_str()),
+                    version: to_u32(codec_row.get::<i64, _>("codec_version"), "codec_version")?,
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        let supported_codecs = SupportedCodecRegistry::new(codecs).ok_or_else(|| {
+            DbError::Serialization("workflow_supported_codecs cannot be empty".to_string())
+        })?;
+        let profile_kind: String = row.get("profile_kind");
+        let profile = ProfileRef {
+            profile_kind,
+            profile_version: to_u32(row.get::<i64, _>("profile_version"), "profile_version")?,
+        };
+        let acceptance = ErasedAcceptanceProfile::from_parts(
+            profile.clone(),
+            supported_codecs,
+            row.get::<bool, _>("runtime_acceptance_enabled"),
+            row.get::<bool, _>("external_acceptance_enabled"),
+        );
+        Ok(Some(WorkflowHead {
+            binding: WorkflowBinding {
+                workflow_id,
+                profile,
+                acceptance,
+            },
+            version: Version(to_u64(row.get::<i64, _>("version"), "version")?),
+            generation: phoenix_workflow::Generation(to_u64(
+                row.get::<i64, _>("generation"),
+                "generation",
+            )?),
+            status: parse_workflow_status(&row.get::<String, _>("status"))?,
+            snapshot_codec: CodecRef {
+                family: Box::leak(
+                    row.get::<String, _>("snapshot_codec_family")
+                        .into_boxed_str(),
+                ),
+                version: to_u32(
+                    row.get::<i64, _>("snapshot_codec_version"),
+                    "snapshot_codec_version",
+                )?,
+            },
+            snapshot_payload: row.get("snapshot_payload"),
+        }))
     }
 
     pub(crate) async fn begin_attempt(
@@ -1989,80 +2069,10 @@ impl WorkflowRepository {
         &self,
         workflow_id: WorkflowId,
     ) -> DbResult<Option<WorkflowHead>> {
-        let row = sqlx::query(
-            "SELECT
-                workflow_id, profile_kind, profile_version,
-                runtime_acceptance_enabled, external_acceptance_enabled,
-                version, generation, status,
-                snapshot_codec_family, snapshot_codec_version, snapshot_payload
-             FROM workflows
-             WHERE workflow_id = ?1",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let codec_rows = sqlx::query(
-            "SELECT codec_family, codec_version
-             FROM workflow_supported_codecs
-             WHERE workflow_id = ?1
-             ORDER BY codec_family, codec_version",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .fetch_all(&self.pool)
-        .await?;
-        let codecs = codec_rows
-            .into_iter()
-            .map(|codec_row| {
-                let family: String = codec_row.get("codec_family");
-                Ok(CodecRef {
-                    family: Box::leak(family.into_boxed_str()),
-                    version: to_u32(codec_row.get::<i64, _>("codec_version"), "codec_version")?,
-                })
-            })
-            .collect::<DbResult<Vec<_>>>()?;
-        let supported_codecs = SupportedCodecRegistry::new(codecs).ok_or_else(|| {
-            DbError::Serialization("workflow_supported_codecs cannot be empty".to_string())
-        })?;
-        let profile_kind: String = row.get("profile_kind");
-        let profile = ProfileRef {
-            profile_kind,
-            profile_version: to_u32(row.get::<i64, _>("profile_version"), "profile_version")?,
-        };
-        let acceptance = ErasedAcceptanceProfile::from_parts(
-            profile.clone(),
-            supported_codecs,
-            row.get::<bool, _>("runtime_acceptance_enabled"),
-            row.get::<bool, _>("external_acceptance_enabled"),
-        );
-        Ok(Some(WorkflowHead {
-            binding: WorkflowBinding {
-                workflow_id,
-                profile,
-                acceptance,
-            },
-            version: Version(to_u64(row.get::<i64, _>("version"), "version")?),
-            generation: phoenix_workflow::Generation(to_u64(
-                row.get::<i64, _>("generation"),
-                "generation",
-            )?),
-            status: parse_workflow_status(&row.get::<String, _>("status"))?,
-            snapshot_codec: CodecRef {
-                family: Box::leak(
-                    row.get::<String, _>("snapshot_codec_family")
-                        .into_boxed_str(),
-                ),
-                version: to_u32(
-                    row.get::<i64, _>("snapshot_codec_version"),
-                    "snapshot_codec_version",
-                )?,
-            },
-            snapshot_payload: row.get("snapshot_payload"),
-        }))
+        let mut tx = self.begin_tx().await?;
+        let head = tx.fetch_workflow_head(workflow_id).await?;
+        tx.commit().await?;
+        Ok(head)
     }
 }
 

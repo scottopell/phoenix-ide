@@ -9,7 +9,7 @@ use super::{
 use phoenix_workflow::{
     wake_profile::{
         self as wake_types, BashTerminalEvidence, ObserveHandleIntent, TmuxTerminalEvidence,
-        WakeForgottenReason, WakeRegistrationEvent, WakeRegistrationIntent,
+        WakeCancellationReason, WakeForgottenReason, WakeRegistrationEvent, WakeRegistrationIntent,
         WakeRegistrationReceipt, WakeRegistrationSnapshot, WakeResourceIdentity,
         WakeTerminalEvidence, WakeTerminalPayload, REGISTRATION_EFFECT_ID,
     },
@@ -131,6 +131,29 @@ pub enum WakeTerminalEvidenceOutcome {
     StaleAttempt,
     WrongResource,
     EvidenceAfterObservation,
+}
+
+pub struct WakeCancellationInput {
+    pub workflow_id: WorkflowId,
+    pub expected_version: Version,
+    pub expected_generation: Generation,
+    pub receipt_id: ReceiptId,
+    pub delivery_id: DeliveryId,
+    pub timestamp: Timestamp,
+    pub reason: WakeCancellationReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeCancellationOutcome {
+    Cancelled {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    Replayed {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    Stale,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +581,199 @@ impl WakeRepository {
         })
     }
 
+    pub async fn cancel(&self, input: &WakeCancellationInput) -> DbResult<WakeCancellationOutcome> {
+        for _ in 0..20 {
+            match self.cancel_once(input).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if error.code().as_deref() == Some("5") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.cancel_once(input).await
+    }
+
+    async fn cancel_once(
+        &self,
+        input: &WakeCancellationInput,
+    ) -> DbResult<WakeCancellationOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        };
+        let Some(head) = tx.fetch_workflow_head(input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        };
+        if let Some(existing) = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id).await?
+        {
+            let outcome = replay_terminal_projection(&mut tx, input.workflow_id, existing).await?;
+            tx.commit().await?;
+            return Ok(WakeCancellationOutcome::Replayed {
+                receipt: outcome.0,
+                delivery: outcome.1,
+            });
+        }
+        if head.version != input.expected_version || head.generation != input.expected_generation {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        }
+        let terminal = WakeTerminalPayload::Cancelled {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            reason: input.reason,
+            resolved_at: input.timestamp,
+        };
+        let snapshot = WakeRegistrationSnapshot {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            registered: true,
+            terminal: Some(terminal.clone()),
+            runtime_availability: wake_profile::RuntimeAvailability::Pending,
+        };
+        let updated = sqlx::query(
+            "UPDATE workflows
+             SET version = version + 1,
+                 generation = ?3,
+                 status = 'Cancelled',
+                 snapshot_codec_family = ?4,
+                 snapshot_codec_version = ?5,
+                 snapshot_payload = ?6,
+                 updated_at = ?7
+             WHERE workflow_id = ?1 AND version = ?2 AND generation = ?8",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.expected_version.0, "expected_version")?)
+        .bind(to_i64(input.expected_generation.next().0, "generation")?)
+        .bind(wake_profile::snapshot_codec().family)
+        .bind(i64::from(wake_profile::snapshot_codec().version))
+        .bind(json_blob(&snapshot)?)
+        .bind(to_i64(input.timestamp.0, "timestamp")?)
+        .bind(to_i64(input.expected_generation.0, "expected_generation")?)
+        .execute(&mut *tx.tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            if let Some(existing) =
+                fetch_any_terminal_projection_tx(&mut tx, input.workflow_id).await?
+            {
+                let outcome =
+                    replay_terminal_projection(&mut tx, input.workflow_id, existing).await?;
+                tx.commit().await?;
+                return Ok(WakeCancellationOutcome::Replayed {
+                    receipt: outcome.0,
+                    delivery: outcome.1,
+                });
+            }
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        }
+        sqlx::query(
+            "INSERT INTO workflow_transitions (
+                workflow_id, transition_id, from_version, to_version, generation,
+                event_codec_family, event_codec_version, event_payload, committed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.expected_version.next().0, "transition_id")?)
+        .bind(to_i64(input.expected_version.0, "from_version")?)
+        .bind(to_i64(input.expected_version.next().0, "to_version")?)
+        .bind(to_i64(input.expected_generation.next().0, "generation")?)
+        .bind(wake_profile::event_codec().family)
+        .bind(i64::from(wake_profile::event_codec().version))
+        .bind(json_blob(&WakeRegistrationEvent::CancelRequested)?)
+        .bind(to_i64(input.timestamp.0, "timestamp")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_attempts
+             SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query("DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
+        #[cfg(test)]
+        maybe_fail_after_canonical_transition(input.workflow_id)?;
+        #[cfg(not(test))]
+        maybe_fail_after_canonical_transition(input.workflow_id);
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.receipt_id.0, "receipt_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(to_i64(input.expected_generation.next().0, "generation")?)
+            .bind(to_i64(input.expected_version.next().0, "declared_workflow_version")?)
+            .bind(0_i64)
+            .bind("CancellationArbitration")
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, 0, 'Pending', NULL, NULL, NULL)")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        insert_terminal_receipt_projection_tx(
+            &mut tx,
+            &binding,
+            &LocalReceiptRecord {
+                receipt_id: input.receipt_id,
+                workflow_id: input.workflow_id,
+                effect_id: REGISTRATION_EFFECT_ID,
+                generation: input.expected_generation.next(),
+                declared_workflow_version: input.expected_version.next(),
+                process_incarnation: ProcessIncarnation(0),
+                attempt_id: None,
+                origin: ReceiptOrigin::CancellationArbitration,
+                receipt_codec: local_codec(&wake_profile::terminal_codec()),
+                receipt_payload: json_blob(&terminal)?,
+            },
+            &LocalDeliveryRecord {
+                delivery_id: input.delivery_id,
+                workflow_id: input.workflow_id,
+                effect_id: Some(REGISTRATION_EFFECT_ID),
+                barrier_id: None,
+                consumer_kind: "reducer".to_string(),
+                event_codec: local_codec(&wake_profile::terminal_codec()),
+                payload_kind: super::LocalDeliveryPayloadKind::Receipt,
+                payload_blob: json_blob(&terminal)?,
+                requires_runtime_acceptance: false,
+                status: phoenix_workflow::DeliveryStatus::Pending,
+                runtime_acceptance_status: None,
+                suppression_reason: None,
+                accepted_by_transition_id: None,
+            },
+            &terminal,
+        )
+        .await?;
+        let projection = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(
+                    "wake cancellation projection missing after insert".to_string(),
+                )
+            })?;
+        let outcome = replay_terminal_projection(&mut tx, input.workflow_id, projection).await?;
+        tx.commit().await?;
+        Ok(WakeCancellationOutcome::Cancelled {
+            receipt: outcome.0,
+            delivery: outcome.1,
+        })
+    }
+
     pub async fn list_pending(&self, conversation_id: &str) -> DbResult<Vec<WakePendingDelivery>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let rows = sqlx::query(
@@ -568,7 +784,8 @@ impl WakeRepository {
                     p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
                     p.resolved_at, p.bash_handle_id, p.tmux_server_generation, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
-                    p.signal_number, p.kill_signal_sent, p.forgotten_reason
+                    p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
+                    p.cancelled_at
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -879,6 +1096,8 @@ async fn insert_terminal_receipt_projection_tx(
         signal_number,
         kill_signal_sent,
         forgotten_reason,
+        cancelled_reason,
+        cancelled_at,
         tail,
     ) = projection_parts(terminal);
     sqlx::query(
@@ -886,8 +1105,8 @@ async fn insert_terminal_receipt_projection_tx(
             workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
             terminal_kind, resolved_at, bash_handle_id, tmux_server_generation, tmux_window_id,
             bash_status, tmux_status, occurred_at, exit_code, duration_ms, signal_number,
-            kill_signal_sent, forgotten_reason
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+            kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
     )
     .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
     .bind(to_i64(receipt.receipt_id.0, "receipt_id")?)
@@ -908,6 +1127,8 @@ async fn insert_terminal_receipt_projection_tx(
     .bind(signal_number.map(i64::from))
     .bind(kill_signal_sent)
     .bind(forgotten_reason)
+    .bind(cancelled_reason)
+    .bind(cancelled_at.map(|ts| i64::try_from(ts.0)).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
     .execute(&mut *tx.tx)
     .await?;
     for (ordinal, line) in tail.into_iter().enumerate() {
@@ -942,6 +1163,8 @@ fn projection_parts(
     Option<i32>,
     Option<String>,
     Option<&'static str>,
+    Option<&'static str>,
+    Option<Timestamp>,
     Vec<String>,
 ) {
     match terminal {
@@ -970,6 +1193,8 @@ fn projection_parts(
                 ev.signal_number,
                 ev.kill_signal_sent.clone(),
                 None,
+                None,
+                None,
                 ev.final_tail.clone(),
             ),
             (WakeResourceIdentity::TmuxWindow(identity), WakeTerminalEvidence::TmuxWindow(ev)) => (
@@ -987,6 +1212,8 @@ fn projection_parts(
                 Some(ev.occurred_at),
                 ev.exit_code,
                 ev.duration_ms,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1014,6 +1241,8 @@ fn projection_parts(
                 None,
                 None,
                 None,
+                None,
+                None,
                 vec![],
             ),
             WakeResourceIdentity::TmuxWindow(identity) => (
@@ -1023,6 +1252,8 @@ fn projection_parts(
                 None,
                 Some(identity.server_generation.clone()),
                 Some(identity.window_id.clone()),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1067,6 +1298,8 @@ fn projection_parts(
                     None,
                     None,
                     Some(reason),
+                    None,
+                    None,
                     vec![],
                 ),
                 WakeResourceIdentity::TmuxWindow(identity) => (
@@ -1084,6 +1317,8 @@ fn projection_parts(
                     None,
                     None,
                     Some(reason),
+                    None,
+                    None,
                     vec![],
                 ),
                 WakeResourceIdentity::Subagent(_) => {
@@ -1091,10 +1326,105 @@ fn projection_parts(
                 }
             }
         }
-        WakeTerminalPayload::Cancelled { .. } => {
-            unreachable!("wake terminal projection does not persist cancellation")
+        WakeTerminalPayload::Cancelled {
+            resource,
+            reason,
+            resolved_at,
+            ..
+        } => {
+            let reason = match reason {
+                WakeCancellationReason::ExplicitCancel => "ExplicitCancel",
+            };
+            match resource {
+                WakeResourceIdentity::Bash(identity) => (
+                    "Bash",
+                    "Cancelled",
+                    *resolved_at,
+                    Some(identity.handle_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(reason),
+                    Some(*resolved_at),
+                    vec![],
+                ),
+                WakeResourceIdentity::TmuxWindow(identity) => (
+                    "TmuxWindow",
+                    "Cancelled",
+                    *resolved_at,
+                    None,
+                    Some(identity.server_generation.clone()),
+                    Some(identity.window_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(reason),
+                    Some(*resolved_at),
+                    vec![],
+                ),
+                WakeResourceIdentity::Subagent(_) => {
+                    unreachable!("subagent wake bindings not implemented")
+                }
+            }
         }
     }
+}
+
+async fn fetch_any_terminal_projection_tx(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<Option<WakeTerminalReceiptProjection>> {
+    let row = sqlx::query(
+        "SELECT * FROM wake_terminal_receipts WHERE workflow_id = ?1 ORDER BY receipt_id LIMIT 1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_optional(&mut *tx.tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
+    let tail = fetch_tail_lines_tx(tx, workflow_id, receipt_id).await?;
+    Ok(Some(projection_from_row(&row, tail)?))
+}
+
+async fn replay_terminal_projection(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    existing: WakeTerminalReceiptProjection,
+) -> DbResult<(LocalReceiptRecord, WakePendingDelivery)> {
+    let delivery =
+        fetch_pending_delivery_by_delivery_id_tx(&mut *tx, workflow_id, existing.delivery_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("wake projection missing canonical delivery".to_string())
+            })?;
+    let receipt = fetch_receipt_tx(&mut *tx, workflow_id, existing.receipt_id)
+        .await?
+        .ok_or_else(|| {
+            DbError::Serialization("wake projection missing canonical receipt".to_string())
+        })?;
+    Ok((
+        receipt,
+        WakePendingDelivery {
+            workflow_id,
+            conversation_id: existing.conversation_id.clone(),
+            receipt: existing,
+            canonical_delivery: delivery,
+        },
+    ))
 }
 
 async fn fetch_projection_by_receipt_tx(
@@ -1193,6 +1523,19 @@ fn projection_from_row(
                 }
             },
             resolved_at,
+        },
+        "Cancelled" => WakeTerminalPayload::Cancelled {
+            contract_id: contract_id.clone(),
+            resource: resource.clone(),
+            reason: match row.get::<String, _>("cancelled_reason").as_str() {
+                "ExplicitCancel" => WakeCancellationReason::ExplicitCancel,
+                other => {
+                    return Err(DbError::Serialization(format!(
+                        "unknown cancelled reason: {other}"
+                    )))
+                }
+            },
+            resolved_at: Timestamp(to_u64(row.get::<i64, _>("cancelled_at"), "cancelled_at")?),
         },
         other => {
             return Err(DbError::Serialization(format!(
@@ -1512,6 +1855,18 @@ mod tests {
         })
     }
 
+    fn cancel_input(workflow_id: WorkflowId) -> WakeCancellationInput {
+        WakeCancellationInput {
+            workflow_id,
+            expected_version: Version(1),
+            expected_generation: Generation(0),
+            receipt_id: ReceiptId(1),
+            delivery_id: DeliveryId(1),
+            timestamp: Timestamp(20),
+            reason: WakeCancellationReason::ExplicitCancel,
+        }
+    }
+
     async fn register_and_begin(
         repo: &WakeRepository,
         workflow_id: WorkflowId,
@@ -1672,6 +2027,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.version, Version(1));
+    }
+
+    #[tokio::test]
+    async fn cancel_failpoint_rolls_back_everything() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = intent();
+        repo.register(&input, "fp-1", WorkflowId(107), Timestamp(10))
+            .await
+            .unwrap();
+        fail_after_canonical_transition_once(WorkflowId(107));
+        let err = repo.cancel(&cancel_input(WorkflowId(107))).await;
+        assert!(err.is_err());
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let head = repo
+            .workflow_repo
+            .fetch_workflow_head(WorkflowId(107))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.version, Version(1));
+        assert_eq!(head.generation, Generation(0));
+        assert_eq!(head.status, WorkflowStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn cancel_replays_after_cancelled_projection_exists() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = intent();
+        repo.register(&input, "fp-1", WorkflowId(108), Timestamp(10))
+            .await
+            .unwrap();
+        let first = repo.cancel(&cancel_input(WorkflowId(108))).await.unwrap();
+        let second = repo.cancel(&cancel_input(WorkflowId(108))).await.unwrap();
+        assert!(matches!(first, WakeCancellationOutcome::Cancelled { .. }));
+        match second {
+            WakeCancellationOutcome::Replayed { receipt, delivery } => {
+                assert_eq!(receipt.receipt_id, ReceiptId(1));
+                assert_eq!(delivery.canonical_delivery.delivery_id, DeliveryId(1));
+                assert!(!delivery.canonical_delivery.requires_runtime_acceptance);
+                assert!(matches!(
+                    delivery.receipt.terminal,
+                    WakeTerminalPayload::Cancelled {
+                        reason: WakeCancellationReason::ExplicitCancel,
+                        ..
+                    }
+                ));
+            }
+            other
+            @ (WakeCancellationOutcome::Cancelled { .. } | WakeCancellationOutcome::Stale) => {
+                panic!("expected replayed, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_vs_terminal_race_repeated_has_single_winner() {
+        for run in 0..10 {
+            let (_dir, first, second) = open_repo_pair().await;
+            let workflow_id = WorkflowId(200 + run);
+            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+            let authority = canonical.authority.unwrap();
+            let evidence = bash_evidence(19);
+            let cancel = cancel_input(workflow_id);
+            let (left, right) = tokio::join!(
+                first.record_terminal_evidence(
+                    workflow_id,
+                    &authority,
+                    1,
+                    ReceiptId(1),
+                    DeliveryId(1),
+                    Timestamp(20),
+                    &evidence
+                ),
+                second.cancel(&cancel)
+            );
+            let pending = first.list_pending("conv-1").await.unwrap();
+            assert_eq!(pending.len(), 1);
+            let terminal = &pending[0].receipt.terminal;
+            match (left.unwrap(), right.unwrap(), terminal) {
+                (
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
+                    WakeTerminalPayload::Fired { .. },
+                )
+                | (
+                    WakeTerminalEvidenceOutcome::StaleAttempt
+                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+                    WakeCancellationOutcome::Cancelled { .. }
+                    | WakeCancellationOutcome::Replayed { .. },
+                    WakeTerminalPayload::Cancelled { .. },
+                ) => {}
+                other => panic!("unexpected race outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_reload_lists_pending_cancellation_projection() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let input = intent();
+        first
+            .register(&input, "fp-1", WorkflowId(109), Timestamp(10))
+            .await
+            .unwrap();
+        first.cancel(&cancel_input(WorkflowId(109))).await.unwrap();
+        let pending = second.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            WakeTerminalPayload::Cancelled {
+                reason: WakeCancellationReason::ExplicitCancel,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_has_no_runtime_acceptance() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = intent();
+        repo.register(&input, "fp-1", WorkflowId(110), Timestamp(10))
+            .await
+            .unwrap();
+        let outcome = repo.cancel(&cancel_input(WorkflowId(110))).await.unwrap();
+        let delivery = match outcome {
+            WakeCancellationOutcome::Cancelled { delivery, .. }
+            | WakeCancellationOutcome::Replayed { delivery, .. } => delivery,
+            WakeCancellationOutcome::Stale => panic!("expected cancelled delivery"),
+        };
+        assert!(!delivery.canonical_delivery.requires_runtime_acceptance);
+        assert_eq!(delivery.canonical_delivery.runtime_acceptance_status, None);
     }
 
     #[tokio::test]
