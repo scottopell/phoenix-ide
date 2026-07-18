@@ -25,7 +25,7 @@ describe('ContextExhaustedHandoff', () => {
 
   it('offers explicit review actions without workspace terminal actions', () => {
     renderHandoff();
-    expect(screen.getByRole('button', { name: 'Continue as-is' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Edit first' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy handoff' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /clean up/i })).not.toBeInTheDocument();
@@ -35,7 +35,7 @@ describe('ContextExhaustedHandoff', () => {
   it('submits the immutable generated handoff as-is', async () => {
     const onContinue = vi.fn().mockResolvedValue('accepted');
     renderHandoff({ onContinue });
-    fireEvent.click(screen.getByRole('button', { name: 'Continue as-is' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(onContinue).toHaveBeenCalledWith(generated));
   });
 
@@ -86,7 +86,7 @@ describe('ContextExhaustedHandoff', () => {
   it('shows only navigation after a successor exists', () => {
     renderHandoff({ continuedInConvId: 'successor-1' });
     expect(screen.getByRole('button', { name: 'Open continuation' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Continue as-is' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Edit first' })).not.toBeInTheDocument();
   });
 });

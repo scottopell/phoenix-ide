@@ -25,7 +25,7 @@ The context-exhausted card has two explicit modes.
 
 ### Review mode
 
-- Primary: **Continue as-is**
+- Primary: **Continue**
   - Creates the single successor conversation.
   - Submits the pristine generated handoff as the successor's first user message.
   - Navigates to the running successor.
@@ -125,9 +125,9 @@ The worktree is preserved while the exhausted parent has no successor, and owner
 
 Add component/integration coverage for:
 
-- review mode shows **Continue as-is**, **Edit first**, and **Copy handoff**;
+- review mode shows **Continue**, **Edit first**, and **Copy handoff**;
 - no **Clean up**, **Abandon**, work actions bar, or PR action appears anywhere in the context-exhausted handoff surface;
-- **Continue as-is** sends exactly the immutable generated handoff once;
+- **Continue** sends exactly the immutable generated handoff once;
 - **Edit first** does not create a successor;
 - edited continuation sends exactly the editor value;
 - empty edited text is rejected before API invocation;
@@ -149,7 +149,7 @@ Run relevant UI and Rust tests, `./dev.py codegen` when required, Allium validat
 ## Acceptance criteria
 
 - The context-exhausted page is a focused handoff experience with no workspace-destructive controls.
-- One click on **Continue as-is** creates the successor and submits the pristine handoff; it does not leave an intentionally unsent draft in the ordinary success path.
+- One click on **Continue** creates the successor and submits the pristine handoff; it does not leave an intentionally unsent draft in the ordinary success path.
 - Users can edit before successor creation and can always recover the pristine generated handoff.
 - User edits are browser-local, resume after cancel/revisit, and never mutate the stored generated continuation summary.
 - Copying supports both external use of the pristine handoff and external refinement of an edit draft without requiring premature successor creation.

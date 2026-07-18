@@ -160,7 +160,7 @@ export function ContextExhaustedHandoff({
           <>
             <div className="context-exhausted-actions">
               <button type="button" className="context-exhausted-continue" data-testid="continue-button" disabled={disabled || submitting} onClick={() => void submit(generatedHandoff)}>
-                {submitting ? 'Continuing…' : 'Continue as-is'}
+                {submitting ? 'Continuing…' : 'Continue'}
               </button>
               <button type="button" className="context-exhausted-copy" disabled={disabled || submitting} onClick={() => setMode('editing')}>Edit first</button>
               <button type="button" className="context-exhausted-copy" disabled={submitting} onClick={() => void onCopy(generatedHandoff)}>Copy handoff</button>
