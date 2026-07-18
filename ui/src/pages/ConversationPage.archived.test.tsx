@@ -726,7 +726,7 @@ describe('owned conversation navigation', () => {
 });
 
 describe('ConversationPage context exhausted handoff', () => {
-  it('dispatch_failed seeds the edited handoff draft and navigates to the continuation', async () => {
+  it('dispatch_failed keeps the edit on the parent for durable retry', async () => {
     vi.mocked(api.continueConversation).mockResolvedValue({
       status: 'dispatch_failed',
       conversation_id: 'successor-1',
@@ -748,7 +748,27 @@ describe('ConversationPage context exhausted handoff', () => {
       conversationId,
       expect.objectContaining({ handoff: 'Edited handoff for successor', message_id: expect.any(String) }),
     ));
-    await waitFor(() => expect(localStorage.getItem('seed-draft:successor-1')).toBe('Edited handoff for successor'));
+    expect(await screen.findByText('Dispatch failed upstream')).toBeInTheDocument();
+    expect(screen.getByTestId('context-exhausted-handoff')).toHaveValue('Edited handoff for successor');
+    expect(localStorage.getItem('seed-draft:successor-1')).toBeNull();
+  });
+
+  it('keeps an existing continuation retry failure on the parent', async () => {
+    vi.mocked(api.continueConversation).mockResolvedValue({
+      status: 'dispatch_failed',
+      conversation_id: 'successor-pending',
+      error: 'Still unavailable',
+    } as never);
+
+    renderPage(makeConversation({
+      state: { type: 'context_exhausted', summary: 'Generated summary' },
+      conv_mode_label: 'Work',
+      continued_in_conv_id: 'successor-pending',
+    }));
+
+    fireEvent.click(await screen.findByTestId('continuation-link'));
+    expect(await screen.findByText('Still unavailable')).toBeInTheDocument();
+    expect(screen.getByTestId('continuation-link')).toBeInTheDocument();
   });
 
   it('opens the existing continuation instead of re-seeding the generated summary', async () => {
@@ -777,6 +797,19 @@ describe('ConversationPage context exhausted handoff', () => {
 });
 
 describe('ConversationPage archived read-only rendering', () => {
+  it('keeps archived error conversations free of work actions', async () => {
+    renderPage(makeConversation({
+      archived: true,
+      conv_mode_label: 'Work',
+      state: { type: 'error', message: 'Historical failure', error_kind: 'server_error' },
+    }));
+
+    expect(await screen.findByText('Historical failure')).toBeInTheDocument();
+    expect(screen.queryByTestId('work-control-bar')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /clean up/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /abandon/i })).not.toBeInTheDocument();
+  });
+
   it('shows message history but hides composer, work actions, terminal, files, and work scope for archived idle conversations', async () => {
     renderPage(makeConversation({ archived: true }));
 

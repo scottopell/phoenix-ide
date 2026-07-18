@@ -453,11 +453,18 @@ THE SYSTEM SHALL atomically persist the exact selected handoff and client messag
 WHEN a pending opening-handoff intent is retried after interruption or failed dispatch
 THE SYSTEM SHALL dispatch the original persisted handoff with its original message identifier
 AND SHALL return the successor identity and dispatch outcome
+AND SHALL keep the user on the handoff surface when dispatch remains unsuccessful
 AND SHALL NOT replace the original intent with later request text
+AND SHALL NOT create a second manual-send path for the same handoff
 AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
 
-WHEN opening-handoff dispatch is accepted synchronously or queued durably
-THE SYSTEM SHALL treat the handoff as accepted
+WHEN the opening handoff is persisted as the successor's message or steering entry
+THE SYSTEM SHALL atomically consume the pending dispatch intent
+AND SHALL NOT retain the handoff payload in a second accepted representation
+
+WHEN a request loses a continuation-creation race to an earlier handoff
+THE SYSTEM SHALL report that the existing successor won
+AND SHALL NOT claim that the losing request's handoff was accepted
 
 **Rationale:** Context exhaustion is a focused transfer point. Explicit unchanged, edit-first, and copy paths make the consequence of each action visible, while keeping destructive workspace actions away from the continuation controls. Separating generated content from local edits ensures the operational handoff always remains recoverable. A successor creation and message dispatch cross a failure boundary, so the ownership transfer must durably record dispatch intent before asynchronous acceptance begins.
 

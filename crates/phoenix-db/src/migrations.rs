@@ -260,10 +260,18 @@ CREATE TABLE continuation_dispatch_intents (
     message_id TEXT UNIQUE NOT NULL,
     handoff TEXT NOT NULL CHECK (length(trim(handoff)) > 0),
     user_agent TEXT,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
-    created_at TEXT NOT NULL,
-    accepted_at TEXT
+    created_at TEXT NOT NULL
 );
+CREATE TRIGGER consume_continuation_dispatch_intent
+AFTER INSERT ON messages
+WHEN EXISTS (
+    SELECT 1 FROM continuation_dispatch_intents
+    WHERE message_id = NEW.message_id
+      AND successor_conversation_id = NEW.conversation_id
+)
+BEGIN
+    DELETE FROM continuation_dispatch_intents WHERE message_id = NEW.message_id;
+END;
 ";
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,

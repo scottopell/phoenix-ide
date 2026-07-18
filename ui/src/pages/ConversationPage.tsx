@@ -1915,6 +1915,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       message_id: generateUUID(),
       user_agent: navigator.userAgent,
     });
+    if (res.status === 'dispatch_failed') {
+      throw new Error(res.error ?? 'The continuation exists, but its opening handoff could not be sent. Retry from this page.');
+    }
     showInfo('Returning to your existing continuation');
     navigate(`${routePrefix}/${res.conversation_id}`);
   }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo]);
@@ -1927,10 +1930,11 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       user_agent: navigator.userAgent,
     });
     if (res.status === 'dispatch_failed') {
-      writeSeedDraft(res.conversation_id, handoff);
-      showError(res.error ?? 'Continuation created, but the handoff was not sent. Review the recovered draft and send it manually.');
-    } else if (res.status === 'already_exists') {
-      showInfo('Returning to your existing continuation');
+      showError(res.error ?? 'The continuation was created, but its opening handoff could not be sent. Retry the durable handoff from this page.');
+      return res.status;
+    }
+    if (res.status === 'already_exists') {
+      showInfo('An earlier handoff won this continuation; your local edit is still saved.');
     }
     navigate(`${routePrefix}/${res.conversation_id}`);
     return res.status;
@@ -2410,14 +2414,14 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         </>
       ) : convStateForChildren.type === 'error' ? (
         <>
-        <WorkControlBar
+        {!isArchived && <WorkControlBar
           conversationId={conversation.id}
           convModeLabel={conversation.conv_mode_label}
           phaseType={convStateForChildren.type}
           continuedInConvId={conversation.continued_in_conv_id}
           showError={showError}
           prStatusHandle={prStatusHandle}
-        />
+        />}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}

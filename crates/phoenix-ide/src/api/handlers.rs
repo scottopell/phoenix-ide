@@ -3765,26 +3765,33 @@ async fn dispatch_continuation_handoff(
     })
     .await;
     match dispatch {
+        Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {
+            // Channel delivery is not durable acceptance. The outbox intent stays
+            // pending until the message INSERT trigger consumes it, so a crash
+            // before executor persistence remains replayable.
+            (ContinueConversationStatus::Accepted, None)
+        }
         Ok(
-            crate::send_chat_service::SendChatOutcome::Delivered
-            | crate::send_chat_service::SendChatOutcome::AlreadyPersisted
+            crate::send_chat_service::SendChatOutcome::AlreadyPersisted
             | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
-        ) => match state
-            .db
-            .mark_continuation_dispatch_accepted(&parent_id)
-            .await
-        {
-            Ok(()) => (ContinueConversationStatus::Accepted, None),
-            Err(error) => {
+        ) => {
+            // Both outcomes have another durable representation. Normally the
+            // message trigger has already consumed the intent for AlreadyPersisted;
+            // this delete also handles durable steering and reconciliation.
+            if let Err(error) = state
+                .db
+                .delete_continuation_dispatch_intent(&parent_id)
+                .await
+            {
                 tracing::warn!(
                     parent_id,
                     continuation_id = conversation_id,
                     error = %error,
-                    "handoff accepted but durable intent remains pending; idempotent retry will reconcile",
+                    "handoff is durable but continuation intent cleanup failed",
                 );
-                (ContinueConversationStatus::Accepted, None)
             }
-        },
+            (ContinueConversationStatus::Accepted, None)
+        }
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
             (ContinueConversationStatus::DispatchFailed, Some(message))
         }
@@ -3800,6 +3807,17 @@ async fn dispatch_continuation_handoff(
                 Some(error.to_string()),
             )
         }
+    }
+}
+
+fn existing_continuation_status(
+    dispatch_status: ContinueConversationStatus,
+) -> ContinueConversationStatus {
+    match dispatch_status {
+        ContinueConversationStatus::Accepted | ContinueConversationStatus::AlreadyExists => {
+            ContinueConversationStatus::AlreadyExists
+        }
+        ContinueConversationStatus::DispatchFailed => ContinueConversationStatus::DispatchFailed,
     }
 }
 
@@ -3880,8 +3898,11 @@ async fn continue_conversation(
                 existing_continuation = %existing.id,
                 "continuation already existed; returning existing id idempotently",
             );
-            if let Some(intent) = intent.filter(|intent| !intent.accepted) {
-                let (status, error) = dispatch_continuation_handoff(&state, intent).await;
+            if let Some(intent) = intent {
+                let (dispatch_status, error) = dispatch_continuation_handoff(&state, intent).await;
+                // The persisted earlier intent won the race. Report the existing
+                // successor so a losing editor keeps its draft.
+                let status = existing_continuation_status(dispatch_status);
                 return Ok(Json(ContinueConversationResponse {
                     conversation_id: existing.id,
                     slug: existing.slug,

@@ -186,7 +186,6 @@ pub struct ContinuationDispatchIntent {
     pub message_id: String,
     pub handoff: String,
     pub user_agent: Option<String>,
-    pub accepted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2508,7 +2507,7 @@ impl Database {
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
         let row = sqlx::query(
-            "SELECT parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, status FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
+            "SELECT parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
         .fetch_optional(&self.pool)
@@ -2519,22 +2518,18 @@ impl Database {
             message_id: row.get("message_id"),
             handoff: row.get("handoff"),
             user_agent: row.get("user_agent"),
-            accepted: row.get::<String, _>("status") == "accepted",
         }))
     }
 
-    /// Marks a continuation's opening handoff as durably accepted.
+    /// Deletes a continuation intent after its message is durably represented elsewhere.
     ///
     /// # Errors
-    /// Returns a database error when the update fails.
-    pub async fn mark_continuation_dispatch_accepted(&self, parent_id: &str) -> DbResult<()> {
-        sqlx::query(
-            "UPDATE continuation_dispatch_intents SET status = 'accepted', accepted_at = ?1 WHERE parent_conversation_id = ?2",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(parent_id)
-        .execute(&self.pool)
-        .await?;
+    /// Returns a database error when the delete fails.
+    pub async fn delete_continuation_dispatch_intent(&self, parent_id: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1")
+            .bind(parent_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -4877,7 +4872,7 @@ impl Database {
 
         if let Some(intent) = intent {
             sqlx::query(
-                "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, status, created_at, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL)",
+                "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(parent_id)
             .bind(&new_id)
@@ -13194,18 +13189,16 @@ mod tests {
         assert_eq!(intent.successor_conversation_id, successor_id);
         assert_eq!(intent.message_id, "opening-message");
         assert_eq!(intent.handoff, "Exact edited handoff");
-        assert!(!intent.accepted);
 
-        db.mark_continuation_dispatch_accepted("parent-intent")
+        let content = MessageContent::User(UserContent::new("Exact edited handoff"));
+        db.add_message("opening-message", &successor_id, &content, None, None)
             .await
             .unwrap();
-        assert!(
-            db.continuation_dispatch_intent("parent-intent")
-                .await
-                .unwrap()
-                .unwrap()
-                .accepted
-        );
+        assert!(db
+            .continuation_dispatch_intent("parent-intent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -13245,7 +13238,6 @@ mod tests {
         let intent = intent.unwrap();
         assert_eq!(intent.message_id, "original-message");
         assert_eq!(intent.handoff, "Original handoff");
-        assert!(!intent.accepted);
     }
 
     /// Work -> Work: worktree fields and `task_id` all transfer; parent's

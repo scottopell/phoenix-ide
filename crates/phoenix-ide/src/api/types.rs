@@ -282,7 +282,7 @@ pub struct ContinueConversationRequest {
     pub user_agent: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinueConversationStatus {
     Accepted,
