@@ -41,6 +41,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
+    closeViewer: onClose,
   });
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const lineRefsSequenceId = useRef(sequenceId);
@@ -89,7 +90,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
       noteCount={notes.messageNotes.length}
       onToggleNotes={notes.togglePanel}
       onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
-      onClose={focused ? focusedExit.requestReturn : onClose}
+      onClose={focused ? focusedExit.requestClose : onClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       bodyScroll="shell"
       panel={
@@ -114,8 +115,9 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
           />
         ) : null
       }
-      confirm={focusedExit.promptOpen ? (
+      confirm={focusedExit.exitTarget ? (
         <FocusedReviewExitDialog
+          target={focusedExit.exitTarget}
           sending={focusedExit.sending}
           error={focusedExit.error}
           onSend={() => { void focusedExit.sendAndReturn(); }}

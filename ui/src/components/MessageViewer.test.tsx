@@ -124,6 +124,55 @@ describe('MessageViewer', () => {
     expect(onPresentationChange).toHaveBeenCalledWith('pane');
   });
 
+  it('keeps fullscreen close distinct from return-to-pane', () => {
+    const onClose = vi.fn();
+    const onPresentationChange = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Review this line')]}
+          onClose={onClose}
+          onSendNotes={vi.fn()}
+          presentation="fullscreen"
+          canTogglePresentation
+          onPresentationChange={onPresentationChange}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onPresentationChange).not.toHaveBeenCalled();
+  });
+
+  it('protects fullscreen close with pending notes and closes after discard', () => {
+    const onClose = vi.fn();
+    const onPresentationChange = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Review this line')]}
+          onClose={onClose}
+          onSendNotes={vi.fn()}
+          presentation="fullscreen"
+          canTogglePresentation
+          onPresentationChange={onPresentationChange}
+        />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Please revise' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+
+    expect(screen.getByRole('dialog', { name: 'Resolve feedback before closing' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Discard notes and close' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onPresentationChange).not.toHaveBeenCalled();
+  });
+
   it('keeps fullscreen notes and announces a send failure', async () => {
     const onPresentationChange = vi.fn();
     render(

@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { ArrowLeft, Maximize2, MessageSquare, Minimize2, Send } from 'lucide-react';
 import type { ReactNode } from 'react';
+import type { FocusedReviewExitTarget } from './useFocusedReviewExit';
 
 export type ViewerMode = 'overlay' | 'inline' | 'takeover';
 
@@ -195,12 +196,14 @@ export function ViewerPresentationControl({
 }
 
 export function FocusedReviewExitDialog({
+  target,
   sending,
   error,
   onSend,
   onDiscard,
   onKeepReviewing,
 }: {
+  target: FocusedReviewExitTarget;
   sending: boolean;
   error: string | null;
   onSend: () => void;
@@ -216,17 +219,22 @@ export function FocusedReviewExitDialog({
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [onKeepReviewing, sending]);
+  const closing = target === 'closed';
+  const title = closing ? 'Resolve feedback before closing' : 'Resolve feedback before returning';
+  const destination = closing ? 'closing the viewer' : 'returning to the pane';
+  const sendLabel = closing ? 'Send feedback and close' : 'Send feedback and return';
+  const discardLabel = closing ? 'Discard notes and close' : 'Discard notes and return';
   return (
-    <div className="modal-overlay" role="presentation">
+    <div className="focused-review-exit-overlay" role="presentation">
       <div className="modal confirm-dialog focused-review-exit" role="dialog" aria-modal="true" aria-labelledby="focused-review-exit-title">
-        <h3 id="focused-review-exit-title">Resolve feedback before returning</h3>
-        <p>Pending notes belong to this full-screen review. Send or discard them before returning to the pane.</p>
+        <h3 id="focused-review-exit-title">{title}</h3>
+        <p>Pending notes belong to this full-screen review. Send or discard them before {destination}.</p>
         {error && <p className="viewer-send-error" role="alert">{error}</p>}
         <div className="modal-actions focused-review-exit-actions">
           <button className="btn-secondary" type="button" onClick={onKeepReviewing}>Keep reviewing</button>
-          <button className="btn-danger" type="button" onClick={onDiscard}>Discard notes and return</button>
+          <button className="btn-danger" type="button" onClick={onDiscard}>{discardLabel}</button>
           <button className="btn-primary" type="button" onClick={onSend} disabled={sending}>
-            {sending ? 'Sending…' : 'Send feedback and return'}
+            {sending ? 'Sending…' : sendLabel}
           </button>
         </div>
       </div>

@@ -334,6 +334,30 @@ describe('MetaViewer payload routing', () => {
     expect(img).toHaveAttribute('src', '/preview/tmp/project/thing.png');
   });
 
+  it('preserves Markdown scroll position across presentation changes', () => {
+    const payload: MetaViewerPayload = {
+      ...textCommon,
+      kind: 'markdown',
+      content: '# Heading\n\nLong review content',
+      presentation: 'pane',
+      canTogglePresentation: true,
+      onPresentationChange: vi.fn(),
+    };
+    const view = renderViewer(payload);
+    const paneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    paneContent.scrollTop = 420;
+    fireEvent.scroll(paneContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...payload, presentation: 'fullscreen' }} />
+      </ReviewNotesProvider>,
+    );
+
+    const focusedContent = document.body.querySelector('.viewer-shell--takeover .viewer-content') as HTMLDivElement;
+    expect(focusedContent.scrollTop).toBe(420);
+  });
+
   it('shows fullscreen controls only for image payloads', () => {
     const { rerender } = render(
       <ReviewNotesProvider>

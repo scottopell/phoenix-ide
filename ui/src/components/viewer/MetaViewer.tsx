@@ -68,6 +68,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
+    closeViewer: onClose,
   });
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
@@ -88,6 +89,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const lastScrollTopRef = useRef(0);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
+  const previousPresentationRef = useRef(presentation);
   const findSurfaceShape = htmlPreview
     ? 'html-preview'
     : rangeSource
@@ -108,6 +110,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     if (el) lineRefs.current.set(lineNumber, el);
     else lineRefs.current.delete(lineNumber);
   }, []);
+
+  useLayoutEffect(() => {
+    if (usePierreCode || previousPresentationRef.current === presentation) return;
+    previousPresentationRef.current = presentation;
+    const el = contentRef.current;
+    if (el) el.scrollTop = lastScrollTopRef.current;
+  }, [presentation, usePierreCode]);
 
   // New file → new restoration target.
   useEffect(() => {
@@ -527,7 +536,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onToggleNotes={notes.togglePanel}
       onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
       banner={banner}
-      onClose={focused ? focusedExit.requestReturn : onClose}
+      onClose={focused ? focusedExit.requestClose : onClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       suppressCloseButtonFocus={findSession !== null}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
@@ -553,8 +562,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           />
         ) : null
       }
-      confirm={focusedExit.promptOpen ? (
+      confirm={focusedExit.exitTarget ? (
         <FocusedReviewExitDialog
+          target={focusedExit.exitTarget}
           sending={focusedExit.sending}
           error={focusedExit.error}
           onSend={() => { void focusedExit.sendAndReturn(); }}
