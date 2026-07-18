@@ -104,16 +104,25 @@ fn configured_upstream_ref(worktree_path: &FsPath, branch_name: &str) -> Option<
     .filter(|value| value.starts_with("refs/remotes/"))
 }
 
-fn fallback_remote_ref(branch_name: &str) -> String {
-    format!("refs/remotes/origin/{branch_name}")
-}
-
-fn ref_exists(worktree_path: &FsPath, git_ref: &str) -> bool {
-    run_git(
-        worktree_path,
-        &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
-    )
-    .is_ok()
+fn matching_remote_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
+    let output = run_git(worktree_path, &["remote"]).ok()?;
+    let mut remotes = output
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect::<Vec<_>>();
+    remotes.sort_unstable();
+    remotes.dedup();
+    remotes.into_iter().find_map(|remote| {
+        let candidate = format!("refs/remotes/{remote}/{branch_name}");
+        run_git(
+            worktree_path,
+            &["for-each-ref", "--format=%(refname)", &candidate],
+        )
+        .ok()
+        .filter(|value| value.trim() == candidate)
+        .map(|_| candidate)
+    })
 }
 
 fn ahead_behind_counts(
@@ -161,19 +170,17 @@ fn branch_remote_status(
         };
     }
 
-    let fallback = fallback_remote_ref(branch_name);
-    if ref_exists(worktree_path, &fallback) {
-        return match ahead_behind_counts(worktree_path, head_oid, &fallback) {
-            Ok((ahead, behind)) => BranchRemoteStatus::Matching {
-                remote_ref: fallback,
-                ahead,
-                behind,
-            },
-            Err(reason) => BranchRemoteStatus::Unavailable { reason },
-        };
+    let Some(remote_ref) = matching_remote_ref(worktree_path, branch_name) else {
+        return BranchRemoteStatus::NoKnown;
+    };
+    match ahead_behind_counts(worktree_path, head_oid, &remote_ref) {
+        Ok((ahead, behind)) => BranchRemoteStatus::Matching {
+            remote_ref,
+            ahead,
+            behind,
+        },
+        Err(reason) => BranchRemoteStatus::Unavailable { reason },
     }
-
-    BranchRemoteStatus::NoKnown
 }
 
 fn detached_pointing_refs(worktree_path: &FsPath, head_oid: &str) -> Vec<String> {
@@ -2673,6 +2680,61 @@ mod tests {
                     behind: 0,
                 },
             }
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_finds_matching_non_origin_remote() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["remote", "rename", "origin", "fork"]).unwrap();
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(clone.path(), &["push", "--quiet", "fork", "HEAD:feature"]).unwrap();
+
+        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature".to_string(),
+                head_oid: head_oid.trim().to_string(),
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/fork/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn matching_remote_ref_uses_deterministic_remote_order() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
+        run_git(
+            clone.path(),
+            &["remote", "add", "aaa", upstream.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(
+            clone.path(),
+            &[
+                "fetch",
+                "--quiet",
+                "aaa",
+                "feature:refs/remotes/aaa/feature",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            matching_remote_ref(clone.path(), "feature"),
+            Some("refs/remotes/aaa/feature".to_string())
         );
     }
 
