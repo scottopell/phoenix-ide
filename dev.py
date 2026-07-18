@@ -6874,19 +6874,6 @@ def prod_daemon_deploy(
     _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
     transaction_id = controller.transaction_id or uuid.uuid4().hex
 
-    if controller.enabled:
-        layout["status"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        _write_json_atomic(layout["status"], {
-            "transaction_id": transaction_id,
-            "state": "preparing",
-            "source_kind": "published_release",
-            "release_tag": release,
-            "source_commit": controller.expected_full_commit,
-            "created_at": now,
-            "updated_at": now,
-        })
-
     with tempfile.TemporaryDirectory(prefix=f"phoenix-bare-{transaction_id}-") as td:
         staging = Path(td)
         prepared = (

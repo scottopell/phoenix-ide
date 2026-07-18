@@ -342,6 +342,12 @@ fn approved_marker(state: &AppState, transaction_id: &str) -> PathBuf {
         .join(format!("{transaction_id}.approved"))
 }
 
+fn marker_identity(marker: &Path) -> Option<(String, String)> {
+    let contents = fs::read_to_string(marker).ok()?;
+    let mut lines = contents.lines();
+    Some((lines.next()?.to_string(), lines.next()?.to_string()))
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
     let Some(path) = status_path(state, backend) else {
@@ -405,6 +411,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         };
     };
     let marker = approved_marker(state, &transaction_id);
+    let approved_identity = marker_identity(&marker);
     let published = value.get("source_kind").and_then(serde_json::Value::as_str)
         == Some("published_release")
         || marker.is_file();
@@ -445,12 +452,10 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     ReleaseTransactionStatus::Present {
         transaction_id,
         state,
-        source_commit: string("source_commit"),
-        release_tag: string("release_tag").or_else(|| {
-            fs::read_to_string(&marker)
-                .ok()
-                .and_then(|contents| contents.lines().next().map(str::to_string))
-        }),
+        source_commit: string("source_commit")
+            .or_else(|| approved_identity.as_ref().map(|(_, commit)| commit.clone())),
+        release_tag: string("release_tag")
+            .or_else(|| approved_identity.as_ref().map(|(tag, _)| tag.clone())),
         expected_version: string("expected_version"),
         expected_git_sha: string("expected_git_sha"),
         created_at: string("created_at"),
@@ -461,10 +466,26 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
     }
 }
 
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
-    })
+fn controller_path(state: &AppState) -> std::ffi::OsString {
+    let home = state.runtime_env.home();
+    let mut directories = vec![
+        home.join(".local/bin"),
+        home.join(".cargo/bin"),
+        home.join(".local/share/mise/shims"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ];
+    if let Some(current) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&current));
+    }
+    std::env::join_paths(directories)
+        .unwrap_or_else(|_| std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin"))
+}
+
+fn command_exists(path: &std::ffi::OsStr, name: &str) -> bool {
+    std::env::split_paths(path).any(|directory| directory.join(name).is_file())
 }
 
 fn authority(
@@ -482,8 +503,9 @@ fn authority(
     if matches!(backend, ReleaseUpdateBackend::Unsupported) {
         return ReleaseUpdateAuthority::UnsupportedHost;
     }
+    let path = controller_path(state);
     for command in ["uv", "gh"] {
-        if !command_exists(command) {
+        if !command_exists(&path, command) {
             return ReleaseUpdateAuthority::MissingPrerequisite {
                 reason: format!("{command} is required for published release updates"),
             };
@@ -733,6 +755,7 @@ pub async fn approve(
             &transaction_id,
         ])
         .current_dir(&root)
+        .env("PATH", controller_path(&state))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
@@ -810,11 +833,12 @@ pub async fn approve(
                     .into_response();
             }
             Ok(None) if tokio::time::Instant::now() >= deadline => {
-                let claimed = matches!(
-                    durable,
-                    ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
-                        if durable_id == &transaction_id
-                );
+                let claimed = approved_marker(&state, &transaction_id).is_file()
+                    || matches!(
+                        durable,
+                        ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
+                            if durable_id == &transaction_id
+                    );
                 if claimed {
                     tokio::task::spawn_blocking(move || {
                         if let Err(error) = child.wait() {
