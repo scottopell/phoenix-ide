@@ -1,4 +1,3 @@
-import { toString as mdastToString } from 'mdast-util-to-string';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import { unified } from 'unified';
@@ -371,6 +370,12 @@ export interface MarkdownDisplayBlock {
   language?: string;
 }
 
+function renderedMarkdownText(node: MarkdownNode): string {
+  if (node.type === 'image' || node.type === 'imageReference') return '';
+  if (typeof node.value === 'string') return node.value;
+  return node.children?.map(renderedMarkdownText).join('') ?? '';
+}
+
 export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownDisplayBlock[] {
   const processor = unified().use(remarkParse).use(remarkGfm);
   const tree = processor.runSync(processor.parse(markdown)) as MarkdownNode;
@@ -379,7 +384,7 @@ export function buildMarkdownDisplayBlocks(markdown: string): readonly MarkdownD
     if (node.type !== 'root' && node.position?.start?.line && node.position.start.offset !== undefined && node.position.end?.offset !== undefined) {
       const isDisplayBlock = ['paragraph', 'heading', 'tableCell', 'code'].includes(node.type);
       if (isDisplayBlock) {
-        const searchableText = mdastToString(node as Parameters<typeof mdastToString>[0]);
+        const searchableText = renderedMarkdownText(node);
         if (searchableText) {
           blocks.push({
             id: `markdown:${path.join('.')}:${node.position.start.offset}-${node.position.end.offset}`,

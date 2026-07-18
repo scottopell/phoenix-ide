@@ -60,6 +60,26 @@ describe('CommissionReviewSummaryCard disclosure', () => {
     expect(document.querySelector('[data-fragment-id="commission-review-retry"] .viewer-find-inline-match--active')).toHaveTextContent('review');
   });
 
+  it('owns and marks visible metric and full-detail fields', () => {
+    const { rerender } = render(
+      <CommissionReviewSummaryCard
+        data={data}
+        formatDuration={() => '100ms'}
+        activeHighlight={{ fragmentId: 'commission-review-changes', start: 8, end: 10 }}
+      />,
+    );
+    expect(document.querySelector('[data-fragment-id="commission-review-changes"] .viewer-find-inline-match--active')).toHaveTextContent('+1');
+
+    rerender(
+      <CommissionReviewSummaryCard
+        data={data}
+        formatDuration={() => '100ms'}
+        activeHighlight={{ fragmentId: 'commission-review-status-details', start: 7, end: 14 }}
+      />,
+    );
+    expect(document.querySelector('[data-fragment-id="commission-review-status-details"] .viewer-find-inline-match--active')).toHaveTextContent('partial');
+  });
+
   it('renders every detail when no full review action is available', () => {
     render(<CommissionReviewSummaryCard data={data} formatDuration={() => '100ms'} />);
 

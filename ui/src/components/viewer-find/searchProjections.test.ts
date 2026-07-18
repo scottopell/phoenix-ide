@@ -93,6 +93,11 @@ describe('buildAgentTextFragments', () => {
     expect(fragments[0]?.semanticText).toContain('Visible prose');
     expect(fragments[0]?.semanticText).not.toContain('hiddenNeedle');
   });
+
+  it('excludes image alt text that is not rendered as visible Markdown text', () => {
+    const blocks = buildMarkdownDisplayBlocks('Visible ![hidden alt](image.png) text');
+    expect(blocks[0]?.searchableText).toBe('Visible  text');
+  });
 });
 
 describe('buildMarkdownFileSearchProjection', () => {
@@ -236,7 +241,7 @@ describe('typed semantic display projections', () => {
     const blocks = buildMarkdownDisplayBlocks('# **Plan**\n\nUse `alpha` and ![diagram text](diagram.png).\n\n```ts\nconst beta = 1;\n```');
     expect(blocks.map((block) => block.searchableText)).toEqual(expect.arrayContaining([
       'Plan',
-      'Use alpha and diagram text.',
+      'Use alpha and .',
       'const beta = 1;',
     ]));
     expect(blocks.some((block) => block.searchableText.includes('**'))).toBe(false);

@@ -290,6 +290,12 @@ export function parseCommissionReviewResult(displayData: unknown, rawContent: st
   };
 }
 
+export function formatCommissionReviewDuration(elapsedMs: number): string {
+  if (elapsedMs < 1000) return `${elapsedMs}ms`;
+  const seconds = elapsedMs / 1000;
+  return seconds >= 10 ? `${Math.round(seconds)}s` : `${seconds.toFixed(1)}s`;
+}
+
 export type CommissionReviewSearchFragment = { fragmentId: string; text: string };
 
 export function buildCommissionReviewInlineSearchFragments(
@@ -303,7 +309,10 @@ export function buildCommissionReviewInlineSearchFragments(
   ];
   if ('summary' in data) {
     fragments.push(
+      { fragmentId: 'commission-review-elapsed', text: `elapsed\n${formatCommissionReviewDuration(data.summary.elapsedMs)}` },
       { fragmentId: 'commission-review-coverage', text: `coverage\n${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed` },
+      { fragmentId: 'commission-review-changes', text: `changes\n+${data.summary.insertions} / -${data.summary.deletions}` },
+      { fragmentId: 'commission-review-total', text: `findings\n${data.findingSummary.total}` },
       { fragmentId: 'commission-review-target', text: `${data.summary.target.base} → ${data.summary.target.head}\n${data.summary.target.repoRoot}` },
     );
     if (data.summary.reviewerSummary) fragments.push({ fragmentId: 'commission-review-summary', text: data.summary.reviewerSummary });
@@ -335,6 +344,34 @@ export function buildCommissionReviewInlineSearchFragments(
       fragmentId: `commission-review-finding-${index}`,
       text: `${finding.severity}\n${finding.title}\n${finding.file}${finding.line !== undefined ? `:${finding.line}` : ''}${finding.symbol ? ` · ${finding.symbol}` : ''}\n${finding.rationale || 'No rationale provided by the reviewer.'}${finding.suggestedFix ? `\nFix: ${finding.suggestedFix}` : ''}`,
     }));
+  if (renderAllDetails) {
+    const stageDetails: Array<[string, string | undefined]> = [
+      ['target collection', data.stageStatus.targetCollection],
+      ['diff collection', data.stageStatus.diffCollection],
+      ['llm review', data.stageStatus.llmReview],
+      ['json parse', data.stageStatus.jsonParse],
+      ['finding extraction', data.stageStatus.findingExtraction],
+    ];
+    fragments.push({
+      fragmentId: 'commission-review-status-details',
+      text: [
+        `status\n${formatCommissionReviewLabel(data.status)}`,
+        `review\n${formatCommissionReviewLabel(data.reviewStatus)}`,
+        `findings\n${formatCommissionReviewLabel(data.findingsStatus)}`,
+        `trust\n${formatCommissionReviewLabel(data.findingsTrust)}`,
+        `retry\n${formatCommissionReviewLabel(data.retryRecommendation)}`,
+        ...stageDetails.map(([label, value]) => `${label}\n${value ? formatCommissionReviewLabel(value) : 'not reported'}`),
+        ...('summary' in data ? [
+          `target kind\n${data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}`,
+          `dirty\n${data.summary.target.dirty ? 'yes' : 'no'}`,
+        ] : []),
+      ].join('\n'),
+    });
+    data.warnings.forEach((warning, index) => fragments.push({
+      fragmentId: `commission-review-detail-warning-${index}`,
+      text: `${warning.kind ? formatCommissionReviewLabel(warning.kind) : 'warning'}\n${warning.message}${warning.file ? `\n${warning.file}` : ''}`,
+    }));
+  }
   return fragments;
 }
 

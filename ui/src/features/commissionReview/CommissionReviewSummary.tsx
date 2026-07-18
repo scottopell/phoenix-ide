@@ -142,14 +142,14 @@ export function CommissionReviewSummaryCard({
       {'summary' in data && 'findingSummary' in data && (
         <>
           <div className="commission-review-metrics" role="list" aria-label="Commission review metrics">
-            <div className="commission-review-metric" role="listitem"><span>elapsed</span><strong>{formatDuration(data.summary.elapsedMs)}</strong></div>
+            <div className="commission-review-metric" role="listitem" data-fragment-id="commission-review-elapsed">{highlightedFragment('commission-review-elapsed', `elapsed\n${formatDuration(data.summary.elapsedMs)}`)}</div>
             <div className="commission-review-metric" role="listitem" data-fragment-id="commission-review-coverage">
               {activeHighlight?.fragmentId === 'commission-review-coverage'
                 ? highlightCommissionText(`coverage\n${coverageLabel}`, activeHighlight)
                 : <><span>coverage</span><strong>{coverageLabel}</strong></>}
             </div>
-            <div className="commission-review-metric" role="listitem"><span>changes</span><strong>+{data.summary.insertions} / -{data.summary.deletions}</strong></div>
-            <div className="commission-review-metric" role="listitem"><span>findings</span><strong>{data.findingSummary.total}</strong></div>
+            <div className="commission-review-metric" role="listitem" data-fragment-id="commission-review-changes">{highlightedFragment('commission-review-changes', `changes\n+${data.summary.insertions} / -${data.summary.deletions}`)}</div>
+            <div className="commission-review-metric" role="listitem" data-fragment-id="commission-review-total">{highlightedFragment('commission-review-total', `findings\n${data.findingSummary.total}`)}</div>
           </div>
 
           <div className="commission-review-target" data-fragment-id="commission-review-target">
@@ -215,21 +215,25 @@ export function CommissionReviewSummaryCard({
       )}
 
       {renderAllDetails && (
-        <div className="commission-review-status-grid" aria-label="Commission review status details">
-          <div><span>status</span><strong>{formatCommissionReviewLabel(data.status)}</strong></div>
-          <div><span>review</span><strong>{formatCommissionReviewLabel(data.reviewStatus)}</strong></div>
-          <div><span>findings</span><strong>{formatCommissionReviewLabel(data.findingsStatus)}</strong></div>
-          <div><span>trust</span><strong>{formatCommissionReviewLabel(data.findingsTrust)}</strong></div>
-          <div><span>retry</span><strong>{formatCommissionReviewLabel(data.retryRecommendation)}</strong></div>
-          {stageDetails.map(([label, value]) => (
-            <div key={label}><span>{label}</span><strong>{value ? formatCommissionReviewLabel(value) : 'not reported'}</strong></div>
-          ))}
-          {'summary' in data && (
-            <>
-              <div><span>target kind</span><strong>{data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}</strong></div>
-              <div><span>dirty</span><strong>{data.summary.target.dirty ? 'yes' : 'no'}</strong></div>
-            </>
-          )}
+        <div className="commission-review-status-grid" aria-label="Commission review status details" data-fragment-id="commission-review-status-details">
+          {activeHighlight?.fragmentId === 'commission-review-status-details' ? (
+            highlightCommissionText(searchableFragments.get('commission-review-status-details') ?? '', activeHighlight)
+          ) : <>
+            <div><span>status</span><strong>{formatCommissionReviewLabel(data.status)}</strong></div>
+            <div><span>review</span><strong>{formatCommissionReviewLabel(data.reviewStatus)}</strong></div>
+            <div><span>findings</span><strong>{formatCommissionReviewLabel(data.findingsStatus)}</strong></div>
+            <div><span>trust</span><strong>{formatCommissionReviewLabel(data.findingsTrust)}</strong></div>
+            <div><span>retry</span><strong>{formatCommissionReviewLabel(data.retryRecommendation)}</strong></div>
+            {stageDetails.map(([label, value]) => (
+              <div key={label}><span>{label}</span><strong>{value ? formatCommissionReviewLabel(value) : 'not reported'}</strong></div>
+            ))}
+            {'summary' in data && (
+              <>
+                <div><span>target kind</span><strong>{data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}</strong></div>
+                <div><span>dirty</span><strong>{data.summary.target.dirty ? 'yes' : 'no'}</strong></div>
+              </>
+            )}
+          </>}
         </div>
       )}
 
@@ -238,10 +242,10 @@ export function CommissionReviewSummaryCard({
           <div className="commission-review-findings-header">Detailed warnings</div>
           <ul className="commission-review-warning-list">
             {data.warnings.map((warning, index) => (
-              <li key={`${warning.message}-${index}`}>
-                <strong>{warning.kind ? formatCommissionReviewLabel(warning.kind) : 'warning'}</strong>
-                <span>{warning.message}</span>
-                {warning.file && <code>{warning.file}</code>}
+              <li key={`${warning.message}-${index}`} data-fragment-id={`commission-review-detail-warning-${index}`}>
+                {activeHighlight?.fragmentId === `commission-review-detail-warning-${index}`
+                  ? highlightCommissionText(searchableFragments.get(`commission-review-detail-warning-${index}`) ?? '', activeHighlight)
+                  : <><strong>{warning.kind ? formatCommissionReviewLabel(warning.kind) : 'warning'}</strong><span>{warning.message}</span>{warning.file && <code>{warning.file}</code>}</>}
               </li>
             ))}
           </ul>
