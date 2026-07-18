@@ -6276,7 +6276,15 @@ def _read_systemd_installed_env() -> dict[str, str]:
 
     result = subprocess.run(["sudo", "cat", str(PROD_ENV_FILE)], capture_output=True, text=True)
     if result.returncode != 0:
-        return {}
+        missing = subprocess.run(
+            ["sudo", "test", "!", "-e", str(PROD_ENV_FILE)],
+            capture_output=True,
+            text=True,
+        )
+        if missing.returncode == 0:
+            return {}
+        detail = (result.stderr or result.stdout).strip()
+        raise SystemExit(f"installed systemd environment is unreadable: {detail or 'sudo cat failed'}")
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as snapshot:
         snapshot.write(result.stdout)
         path = Path(snapshot.name)

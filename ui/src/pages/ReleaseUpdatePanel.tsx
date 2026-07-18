@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import type { ReleaseTransactionStatus } from '../generated/ReleaseTransactionStatus';
 import type { ReleaseUpdateAuthority } from '../generated/ReleaseUpdateAuthority';
@@ -81,8 +81,11 @@ export function ReleaseUpdatePanel() {
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [confirmedIdentity, setConfirmedIdentity] = useState<string | null>(null);
+  const loadInFlight = useRef(false);
 
   const load = useCallback(async (refresh = false) => {
+    if (loadInFlight.current) return;
+    loadInFlight.current = true;
     try {
       const next = await api.releaseUpdateSnapshot(refresh);
       if (next.preview.kind === 'available') {
@@ -98,6 +101,7 @@ export function ReleaseUpdatePanel() {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setLoading(false);
+      loadInFlight.current = false;
     }
   }, [confirmedIdentity]);
 

@@ -31,6 +31,7 @@ const USER_AGENT: &str = "phoenix-ide-release-updates";
 const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(300);
 static PREVIEW_CACHE: OnceLock<RwLock<Option<(Instant, ReleasePreview)>>> = OnceLock::new();
 static GITHUB_REQUEST_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static SYSTEMD_AUTHORITY_CACHE: OnceLock<RwLock<Option<(Instant, bool)>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -375,11 +376,7 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             }
         }
     };
-    if value
-        .get("source_kind")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| kind != "published_release")
-    {
+    if value.get("source_kind").and_then(serde_json::Value::as_str) != Some("published_release") {
         return ReleaseTransactionStatus::None;
     }
     let string = |name: &str| {
@@ -449,6 +446,7 @@ fn authority(
     state: &AppState,
     local: bool,
     backend: ReleaseUpdateBackend,
+    refresh_privilege: bool,
 ) -> ReleaseUpdateAuthority {
     if !local {
         return ReleaseUpdateAuthority::RemoteBrowser;
@@ -467,14 +465,30 @@ fn authority(
         }
     }
     if matches!(backend, ReleaseUpdateBackend::Systemd) {
-        match Command::new("sudo").args(["-n", "true"]).status() {
-            Ok(status) if status.success() => {}
-            _ => {
-                return ReleaseUpdateAuthority::MissingPrerequisite {
-                    reason: "systemd updates require non-interactive sudo authorization"
-                        .to_string(),
-                }
-            }
+        let cache = SYSTEMD_AUTHORITY_CACHE.get_or_init(|| RwLock::new(None));
+        let cached = if refresh_privilege {
+            None
+        } else {
+            cache
+                .read()
+                .expect("systemd authority cache poisoned")
+                .as_ref()
+                .filter(|(sampled, _)| sampled.elapsed() < Duration::from_secs(60))
+                .map(|(_, allowed)| *allowed)
+        };
+        let allowed = cached.unwrap_or_else(|| {
+            let allowed = Command::new("sudo")
+                .args(["-n", "true"])
+                .status()
+                .is_ok_and(|status| status.success());
+            *cache.write().expect("systemd authority cache poisoned") =
+                Some((Instant::now(), allowed));
+            allowed
+        });
+        if !allowed {
+            return ReleaseUpdateAuthority::MissingPrerequisite {
+                reason: "systemd updates require non-interactive sudo authorization".to_string(),
+            };
         }
     }
     ReleaseUpdateAuthority::Allowed
@@ -495,7 +509,7 @@ pub async fn snapshot(
         backend: selected_backend,
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         current_git_sha: env!("PHOENIX_GIT_SHA").to_string(),
-        authority: authority(&state, local, selected_backend),
+        authority: authority(&state, local, selected_backend, query.refresh),
         transaction: read_status(&state, selected_backend),
         preview,
         sampled_at: Utc::now(),
@@ -565,7 +579,8 @@ pub async fn approve(
         authority(
             &state,
             client_is_local(peer.ip(), &headers),
-            selected_backend
+            selected_backend,
+            true,
         ),
         ReleaseUpdateAuthority::Allowed
     ) {
