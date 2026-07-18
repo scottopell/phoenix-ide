@@ -9,7 +9,10 @@ use super::{
     WorkflowSequenceName, WorkflowTx,
 };
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{Message, MessageContent};
+use phoenix_core::domain::{
+    db_schema::{Message, MessageContent},
+    sm_state::ConvState,
+};
 use phoenix_workflow::{
     wake_profile::{
         self as wake_types, BashTerminalEvidence, ObserveHandleIntent, TmuxTerminalEvidence,
@@ -386,6 +389,20 @@ pub enum WakeResolveMaterializedPendingOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeResolveMaterializedPendingError {
+    NotFullyMaterialized { delivery_ids: Vec<DeliveryId> },
+}
+
+#[derive(Debug, Clone)]
+pub struct WakeAdoptedMaterializedPending {
+    pub links: Vec<WakeDeliveryMessageLink>,
+    pub auto_resume: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum WakeAdoptMaterializedPendingOutcome {
+    Adopted(WakeAdoptedMaterializedPending),
+    Busy(Box<ConvState>),
+    NothingPending,
     NotFullyMaterialized { delivery_ids: Vec<DeliveryId> },
 }
 
@@ -2253,6 +2270,28 @@ impl WakeRepository {
         ))
     }
 
+    pub async fn adopt_materialized_pending_for_conversation(
+        &self,
+        conversation_id: &str,
+        timestamp: Timestamp,
+    ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
+        for _ in 0..20 {
+            match self
+                .adopt_materialized_pending_for_conversation_once(conversation_id, timestamp)
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.adopt_materialized_pending_for_conversation_once(conversation_id, timestamp)
+            .await
+    }
+
     pub async fn resolve_pending_exact(
         &self,
         input: &WakeResolvePendingInput,
@@ -2442,6 +2481,192 @@ enum ResolveMaterializedPendingAttempt {
 }
 
 impl WakeRepository {
+    async fn adopt_materialized_pending_for_conversation_once(
+        &self,
+        conversation_id: &str,
+        timestamp: Timestamp,
+    ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(state_json) =
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx.tx)
+                .await?
+        else {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+        };
+        let state: ConvState = serde_json::from_str(&state_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if !matches!(state, ConvState::Idle) {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::Busy(Box::new(state)));
+        }
+
+        let workflow_rows = sqlx::query(
+            "SELECT DISTINCT p.workflow_id
+             FROM wake_terminal_receipts p
+             JOIN workflow_deliveries d
+               ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
+             WHERE p.conversation_id = ?1 AND d.status = 'Pending'
+             ORDER BY p.workflow_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        if workflow_rows.is_empty() {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+        }
+
+        let mut batches = Vec::with_capacity(workflow_rows.len());
+        let mut missing_ids = Vec::new();
+        for row in workflow_rows {
+            let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
+            let pending_ids = fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+            let materialized =
+                fetch_materialized_pending_deliveries_tx(&mut tx, workflow_id).await?;
+            let materialized_ids: std::collections::BTreeSet<_> = materialized
+                .iter()
+                .map(|item| item.pending.canonical_delivery.delivery_id)
+                .collect();
+            missing_ids.extend(
+                pending_ids
+                    .iter()
+                    .copied()
+                    .filter(|delivery_id| !materialized_ids.contains(delivery_id)),
+            );
+            batches.push((workflow_id, pending_ids, materialized));
+        }
+        if !missing_ids.is_empty() {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized {
+                delivery_ids: missing_ids,
+            });
+        }
+
+        let mut links = Vec::new();
+        let mut auto_resume = false;
+        for (workflow_id, pending_ids, materialized) in batches {
+            let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
+                return Err(DbError::Serialization(
+                    "wake materialized batch missing workflow head".to_string(),
+                ));
+            };
+            let projection = materialized
+                .first()
+                .map(|item| &item.pending.receipt)
+                .ok_or_else(|| {
+                    DbError::Serialization(
+                        "wake materialized batch missing terminal projection".to_string(),
+                    )
+                })?;
+            let cancellation_only = materialized.iter().all(|item| {
+                matches!(
+                    item.pending.receipt.terminal,
+                    WakeTerminalPayload::Cancelled { .. }
+                )
+            });
+            let decision = if cancellation_only {
+                WakeResolveMaterializedDecision::Suppress
+            } else {
+                WakeResolveMaterializedDecision::Accept
+            };
+            let event = match decision {
+                WakeResolveMaterializedDecision::Accept => WakeRegistrationEvent::RuntimeAccepted {
+                    terminal: Box::new(projection.terminal.clone()),
+                },
+                WakeResolveMaterializedDecision::Suppress => {
+                    WakeRegistrationEvent::RuntimeSuppressed {
+                        terminal: Box::new(projection.terminal.clone()),
+                    }
+                }
+            };
+            let resolution_decision = match decision {
+                WakeResolveMaterializedDecision::Accept => DeliveryResolutionDecision::Accept,
+                WakeResolveMaterializedDecision::Suppress => DeliveryResolutionDecision::Suppress {
+                    reason: phoenix_workflow::SuppressionReason::ReducerTerminal,
+                },
+            };
+            let mut snapshot: WakeRegistrationSnapshot =
+                serde_json::from_slice(&head.snapshot_payload)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            snapshot.runtime_availability = match decision {
+                WakeResolveMaterializedDecision::Accept => {
+                    wake_profile::RuntimeAvailability::Accepted
+                }
+                WakeResolveMaterializedDecision::Suppress => {
+                    wake_profile::RuntimeAvailability::Suppressed
+                }
+            };
+            let event_codec = local_codec(&wake_profile::event_codec());
+            let event_payload = json_blob(&event)?;
+            let snapshot_codec = LocalCodec {
+                family: wake_profile::snapshot_codec().family.to_string(),
+                version: wake_profile::snapshot_codec().version,
+            };
+            let snapshot_payload = json_blob(&snapshot)?;
+            match tx
+                .resolve_deliveries_exact(DeliveryResolutionPlan {
+                    workflow_id,
+                    expected_version: head.version,
+                    transition_id: TransitionId(head.version.next().0),
+                    generation: head.generation,
+                    next_status: head.status,
+                    event_codec: &event_codec,
+                    event_payload: &event_payload,
+                    next_snapshot_codec: &snapshot_codec,
+                    next_snapshot_payload: &snapshot_payload,
+                    committed_at: timestamp,
+                    exact_delivery_ids: &pending_ids,
+                    decision: resolution_decision,
+                })
+                .await?
+            {
+                CommitOutcome::Committed => {}
+                CommitOutcome::VersionConflict | CommitOutcome::InvalidPlan => {
+                    tx.rollback().await?;
+                    return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+                }
+                CommitOutcome::UnsupportedCodec => {
+                    return Err(DbError::Serialization(
+                        "wake batch adoption returned unexpected codec error".to_string(),
+                    ));
+                }
+            }
+            auto_resume |= materialized.iter().any(|item| item.link.auto_resume);
+            links.extend(materialized.into_iter().map(|item| item.link));
+        }
+
+        if auto_resume {
+            let next_state = serde_json::to_string(&ConvState::LlmRequesting { attempt: 1 })
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let idle_state = serde_json::to_string(&ConvState::Idle)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let updated_at = timestamp_to_datetime(timestamp).to_rfc3339();
+            let updated = sqlx::query(
+                "UPDATE conversations
+                 SET state = ?1, state_updated_at = ?2, updated_at = ?2
+                 WHERE id = ?3 AND state = ?4",
+            )
+            .bind(next_state)
+            .bind(updated_at)
+            .bind(conversation_id)
+            .bind(idle_state)
+            .execute(&mut *tx.tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+            }
+        }
+
+        tx.commit().await?;
+        Ok(WakeAdoptMaterializedPendingOutcome::Adopted(
+            WakeAdoptedMaterializedPending { links, auto_resume },
+        ))
+    }
+
     async fn resolve_materialized_pending_for_workflow_once(
         &self,
         workflow_id: WorkflowId,
@@ -4704,6 +4929,157 @@ mod tests {
         ));
         assert_eq!(count_conversation_messages(&restarted, "conv-1").await, 1);
         assert!(restarted.list_pending("conv-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conversation_adoption_atomically_accepts_delivery_and_requests_one_turn() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(812);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+
+        let outcome = repo
+            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+            .await
+            .unwrap();
+        let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = outcome else {
+            panic!("expected adopted wake batch");
+        };
+        assert!(adopted.auto_resume);
+        assert_eq!(adopted.links.len(), 1);
+        let state_json =
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = 'conv-1'")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&state_json).unwrap(),
+            ConvState::LlmRequesting { attempt: 1 }
+        );
+        assert_snapshot_projection_parity(
+            &repo,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Accepted,
+            false,
+            is_fired,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conversation_adoption_leaves_busy_delivery_owed() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(813);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+        let busy = ConvState::LlmRequesting { attempt: 1 };
+        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-1'")
+            .bind(serde_json::to_string(&busy).unwrap())
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+                .await
+                .unwrap(),
+            WakeAdoptMaterializedPendingOutcome::Busy(_)
+        ));
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+        let (head, snapshot) = head_snapshot(&repo, workflow_id).await;
+        assert_eq!(head.version, Version(2));
+        assert_eq!(
+            snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_adoption_suppresses_cancellation_without_requesting_turn() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(814);
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &intent(), "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let pending = match repo
+            .cancel_allocated(&WakeCancelIfUnresolvedInput {
+                workflow_id,
+                timestamp: Timestamp(20),
+                reason: WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap()
+        {
+            WakeCancellationOutcome::Cancelled { delivery, .. }
+            | WakeCancellationOutcome::Replayed { delivery, .. } => delivery,
+            WakeCancellationOutcome::Stale => panic!("expected cancellation delivery"),
+        };
+        materialize_pending(
+            &repo,
+            &pending,
+            "wake cancelled",
+            None,
+            false,
+            Timestamp(50),
+        )
+        .await;
+
+        let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = repo
+            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+            .await
+            .unwrap()
+        else {
+            panic!("expected adopted cancellation");
+        };
+        assert!(!adopted.auto_resume);
+        let state_json =
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = 'conv-1'")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&state_json).unwrap(),
+            ConvState::Idle
+        );
+        assert_snapshot_projection_parity(
+            &repo,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Suppressed,
+            false,
+            is_cancelled,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_conversation_adoption_has_one_winner() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(815);
+        let pending = create_pending_terminal_delivery(&first, workflow_id).await;
+        materialize_pending(&first, &pending, "wake complete", None, true, Timestamp(50)).await;
+
+        let (left, right) = tokio::join!(
+            first.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51)),
+            second.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    WakeAdoptMaterializedPendingOutcome::Adopted(_)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(count_conversation_messages(&first, "conv-1").await, 1);
+        assert!(first.list_pending("conv-1").await.unwrap().is_empty());
     }
 
     #[tokio::test]

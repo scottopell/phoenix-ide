@@ -2526,6 +2526,29 @@ where
         Ok(())
     }
 
+    async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
+        if !matches!(self.state, ConvState::Idle) {
+            tracing::debug!(
+                conv_id = %self.context.conversation_id,
+                state = self.state.variant_name(),
+                "Ignoring wake batch notification because runtime is no longer idle"
+            );
+            return Ok(());
+        }
+        self.state = ConvState::LlmRequesting { attempt: 1 };
+        self.state_updated_at = Utc::now();
+        if let Some(state_watcher) = &self.state_watcher {
+            let _ = state_watcher.send(self.state.clone());
+        }
+        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+            sequence_id: seq,
+            state: self.state.clone(),
+            state_updated_at: self.state_updated_at,
+            presentation_mode: self.state.presentation_mode().to_string(),
+        });
+        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // A fresh user turn always resets the parent tool-cycle counter
         // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
@@ -2587,6 +2610,10 @@ where
                 "Steering message cancelled in executor"
             );
             return Ok(());
+        }
+
+        if matches!(event, Event::WakeBatchAdopted) {
+            return self.process_adopted_wake_batch().await;
         }
 
         // Check if this is a SubAgentResult that needs buffering

@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use crate::runtime::RuntimeManager;
 use phoenix_core::work_scope::WorkScope;
 use phoenix_db::workflow::wake::{
-    WakeCancelIfUnresolvedInput, WakeCancellationOutcome, WakeForgetIfUnresolvedInput,
-    WakeObservationCandidateRow, WakeObservationOutcome, WakeRegistrationOutcome, WakeRepository,
-    WakeTerminalEvidenceInput,
+    MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
+    WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
+    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
+    WakePendingDelivery, WakeRegistrationOutcome, WakeRepository, WakeTerminalEvidenceInput,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
@@ -105,7 +106,7 @@ pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u
                 .expect("UUID always contains at least eight bytes"),
         )),
     );
-    if let Err(error) = worker.run_loop(kick_rx).await {
+    if let Err(error) = worker.run_loop_with_manager(kick_rx, manager).await {
         tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
     }
 }
@@ -133,6 +134,28 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         }
     }
 
+    async fn run_loop_with_manager(
+        &self,
+        mut kick_rx: watch::Receiver<u64>,
+        manager: Arc<RuntimeManager>,
+    ) -> Result<(), String> {
+        loop {
+            let wait = self.run_once().await?;
+            deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+            let sleep = self.clock.sleep(wait);
+            tokio::pin!(sleep);
+            tokio::select! {
+                () = &mut sleep => {}
+                changed = kick_rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn run_loop(&self, mut kick_rx: watch::Receiver<u64>) -> Result<(), String> {
         loop {
             let wait = self.run_once().await?;
@@ -267,6 +290,101 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             }
         }
     }
+}
+
+async fn deliver_pending(
+    manager: &Arc<RuntimeManager>,
+    repo: &WakeRepository,
+    now: Timestamp,
+) -> Result<(), String> {
+    let pending = repo
+        .list_pending_global(OBSERVATION_BATCH_LIMIT)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut conversations = std::collections::BTreeSet::new();
+    for row in pending {
+        let current = repo
+            .list_pending(&row.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|item| {
+                item.workflow_id == row.workflow_id
+                    && item.canonical_delivery.delivery_id == row.delivery_id
+            });
+        let Some(current) = current else {
+            continue;
+        };
+        let rendered = render_terminal_result(&current);
+        let display_data = serde_json::to_value(&current.receipt.terminal).ok();
+        let auto_resume = !matches!(
+            current.receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+        );
+        match repo
+            .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                workflow_id: current.workflow_id,
+                delivery_id: current.canonical_delivery.delivery_id,
+                conversation_id: current.conversation_id.clone(),
+                rendered_content: rendered,
+                display_data,
+                auto_resume,
+                created_at: now,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            MaterializePendingDeliveryMessageOutcome::Materialized(_)
+            | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
+                conversations.insert(current.conversation_id);
+            }
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {}
+        }
+    }
+
+    for conversation_id in conversations {
+        if let Some(handle) = manager.try_get_handle(&conversation_id).await {
+            if !matches!(
+                *handle.state_rx.borrow(),
+                crate::state_machine::ConvState::Idle
+            ) {
+                continue;
+            }
+        }
+        match repo
+            .adopt_materialized_pending_for_conversation(&conversation_id, now)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
+                let handle = manager
+                    .get_or_create(&conversation_id)
+                    .await
+                    .map_err(|error| error.clone())?;
+                for link in adopted.links {
+                    let _ = handle
+                        .broadcast_tx
+                        .send_message(link.linked_message.message);
+                }
+                if adopted.auto_resume {
+                    handle
+                        .event_tx
+                        .send(crate::state_machine::Event::WakeBatchAdopted)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            WakeAdoptMaterializedPendingOutcome::Busy(_)
+            | WakeAdoptMaterializedPendingOutcome::NothingPending
+            | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn render_terminal_result(pending: &WakePendingDelivery) -> String {
+    serde_json::to_string(&pending.receipt.terminal)
+        .unwrap_or_else(|_| "Wake completed; inspect display metadata for details.".to_string())
 }
 
 fn duration_until(now: Timestamp, then: u64) -> Duration {

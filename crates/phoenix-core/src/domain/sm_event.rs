@@ -233,6 +233,12 @@ pub enum Event {
         entries: Vec<SteerEntry>,
     },
 
+    /// Internal notification that durable wake messages and the matching
+    /// `LlmRequesting` state were adopted atomically in `SQLite`. A live idle
+    /// executor uses this edge to mirror the persisted state and start the
+    /// already-adopted turn without persisting another message or state row.
+    WakeBatchAdopted,
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -276,6 +282,7 @@ impl Event {
             Event::SteerMessage { .. } => "SteerMessage",
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
+            Event::WakeBatchAdopted => "WakeBatchAdopted",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -589,6 +596,7 @@ impl TryFrom<Event> for ParentEvent {
             Event::GraceTurnExhausted { .. }
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
+            | Event::WakeBatchAdopted
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
@@ -719,6 +727,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
             | Event::SteerDrainedUserMessages { .. }
+            | Event::WakeBatchAdopted
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
