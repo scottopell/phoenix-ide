@@ -154,6 +154,7 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
 
 const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "http"),
+    ("phoenix_ide::otel", "pr_status.refresh"),
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
@@ -420,6 +421,15 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
+            let http = tracing::info_span!(target: "phoenix_ide::otel", "http");
+            let pr_refresh = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                parent: &http,
+                "pr_status.refresh",
+                operation = "branch_and_work_change",
+            );
+            drop(pr_refresh);
+            drop(http);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -466,10 +476,20 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, "llm.request");
-        assert!(spans[0].events.is_empty());
-        let attributes = format!("{:?}", spans[0].attributes);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["pr_status.refresh", "http", "llm.request"]
+        );
+        assert!(spans.iter().all(|span| span.events.is_empty()));
+        let llm_span = spans
+            .iter()
+            .find(|span| span.name == "llm.request")
+            .expect("LLM span exported");
+        let attributes = format!("{:?}", llm_span.attributes);
         for required in [
             "gpt-test",
             "openai",

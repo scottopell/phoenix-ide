@@ -22,6 +22,7 @@ use axum::{
 };
 use std::fmt::Write as _;
 use std::path::{Path as FsPath, PathBuf};
+use tracing::Instrument as _;
 
 fn build_diff_response(
     captured: crate::git_ops::CapturedDiff,
@@ -1149,6 +1150,11 @@ pub(crate) async fn get_conversation_pr_status(
         );
         refresh
     })
+    .instrument(tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "pr_status.refresh",
+        operation = "branch_and_work_change",
+    ))
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
@@ -1229,6 +1235,11 @@ pub(crate) async fn get_conversation_pr_status(
                     )
                 }
             })
+            .instrument(tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "pr_status.refresh",
+                operation = "active_pr",
+            ))
             .await
             .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
             if !active_refresh.observations.is_empty() {
@@ -1303,6 +1314,11 @@ pub(crate) async fn get_conversation_pr_status(
                         )
                     }
                 })
+                .instrument(tracing::info_span!(
+                    target: "phoenix_ide::otel",
+                    "pr_status.refresh",
+                    operation = "retargeted_pr",
+                ))
                 .await
                 .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
                 if !retargeted_refresh.observations.is_empty() {
