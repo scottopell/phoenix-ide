@@ -12,6 +12,7 @@ import {
   buildDiffSearchProjection,
   buildFileSearchProjection,
   buildMarkdownDisplayBlocks,
+  buildMarkdownFileSearchProjection,
   buildSubAgentCardFragments,
   buildTerminalToolResultProjection,
 } from './searchProjections';
@@ -82,6 +83,15 @@ function queued(localId: string, text: string, files?: QueuedMessage['files']): 
     status: 'pending',
   };
 }
+
+describe('buildMarkdownFileSearchProjection', () => {
+  it('indexes owned rendered blocks but excludes fenced code without decoration ownership', () => {
+    const markdown = '# Visible heading\n\n```ts\nconst hiddenNeedle = true;\n```\n\nVisible paragraph needle';
+
+    expect(buildMarkdownFileSearchProjection(markdown, 'needle').matches).toHaveLength(1);
+    expect(buildMarkdownFileSearchProjection(markdown, 'hiddenNeedle').matches).toHaveLength(0);
+  });
+});
 
 describe('buildFileSearchProjection', () => {
   it('projects file content into 1-based line targets and match ranges', () => {

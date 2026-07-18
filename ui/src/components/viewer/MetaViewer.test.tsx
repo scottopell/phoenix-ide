@@ -506,6 +506,14 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-line="3"] .viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
+  it('does not count rendered fenced-code text without an owned inline marker', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '# Title\n\n```ts\nconst hiddenNeedle = true;\n```' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hiddenNeedle' } });
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+  });
+
   it('marks a match in a later table cell with block-local offsets', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '| first | second target |\n| --- | --- |' });
 

@@ -412,7 +412,9 @@ export interface BlockSearchSource extends SearchableSource<BlockSearchMatchTarg
 export type BlockSearchProjection = SearchableSourceProjection<BlockSearchMatchTarget, BlockSearchSource>;
 
 export function buildMarkdownFileSearchProjection(content: string, query: string): FileSearchProjection {
-  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content).map((block) => ({
+  const sources: FileSearchSource[] = buildMarkdownDisplayBlocks(content)
+    .filter((block) => block.kind !== 'code')
+    .map((block) => ({
     id: `markdown:${block.id}`,
     kind: 'line',
     lineNumber: block.lineNumber,
