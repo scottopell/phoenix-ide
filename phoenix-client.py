@@ -25,6 +25,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 import httpx
@@ -182,8 +183,9 @@ class PhoenixClient:
 
     def cancel_wake(self, conv_id: str, contract_id: str) -> None:
         """Cancel one active durable wake contract."""
+        encoded_contract_id = quote(contract_id, safe='')
         resp = self.http.post(
-            f"{self.base_url}/api/conversations/{conv_id}/wake/{contract_id}/cancel"
+            f"{self.base_url}/api/conversations/{conv_id}/wake/{encoded_contract_id}/cancel"
         )
         resp.raise_for_status()
 

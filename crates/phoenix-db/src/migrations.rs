@@ -286,7 +286,7 @@ const MIGRATION_048: &str = r"
 CREATE TABLE wake_terminal_receipts (
     workflow_id INTEGER NOT NULL,
     receipt_id INTEGER NOT NULL,
-    delivery_id INTEGER NOT NULL UNIQUE,
+    delivery_id INTEGER NOT NULL,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     contract_id TEXT NOT NULL CHECK (contract_id <> ''),
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),

@@ -3560,12 +3560,11 @@ async fn get_wake_status(
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
     let rows = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved(1000)
+        .list_active_unresolved_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let contracts: Vec<_> = rows
         .into_iter()
-        .filter(|row| row.conversation_id == id)
         .map(|row| WakeContractStatus {
             workflow_id: row.workflow_id.0,
             contract_id: row.contract_id,
@@ -3590,11 +3589,9 @@ async fn cancel_wake(
         .map_err(|error| AppError::NotFound(error.to_string()))?;
     let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
     let row = repo
-        .list_active_unresolved(1000)
+        .fetch_binding_for_conversation_contract(&id, &contract_id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
-        .into_iter()
-        .find(|row| row.conversation_id == id && row.contract_id == contract_id)
         .ok_or_else(|| AppError::NotFound("Wake contract not found".to_string()))?;
     let outcome = repo
         .cancel_allocated(&phoenix_db::workflow::wake::WakeCancelIfUnresolvedInput {
@@ -3606,14 +3603,26 @@ async fn cancel_wake(
         })
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    if matches!(
-        outcome,
-        phoenix_db::workflow::wake::WakeCancellationOutcome::Stale
-    ) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Wake contract is already resolved",
-            "wake_already_resolved",
-        ))));
+    match outcome {
+        phoenix_db::workflow::wake::WakeCancellationOutcome::Cancelled { .. } => {}
+        phoenix_db::workflow::wake::WakeCancellationOutcome::Replayed { delivery, .. } => {
+            let terminal = &delivery.receipt.terminal;
+            if !matches!(
+                terminal,
+                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+            ) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Wake contract is already resolved",
+                    "wake_already_resolved",
+                ))));
+            }
+        }
+        phoenix_db::workflow::wake::WakeCancellationOutcome::Stale => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Wake contract is already resolved",
+                "wake_already_resolved",
+            ))));
+        }
     }
     state.runtime.kick_wake_worker();
     Ok(axum::Json(SuccessResponse { success: true }))
@@ -13203,5 +13212,234 @@ mod chat_authority_tests {
             result.0.steering,
             "must be routed as steering, not UserMessage"
         );
+    }
+}
+
+#[cfg(test)]
+mod wake_handler_tests {
+    use super::*;
+    use crate::api::Database;
+    use crate::chain_qa::ChainQa;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use axum::{body::Body, http::Request};
+    use phoenix_llm::ModelRegistry;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn make_test_state() -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform.clone(),
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions,
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
+            resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+        }
+    }
+
+    async fn seed_conversation(state: &AppState, id: &str) {
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+    }
+
+    async fn register_bash_wake(
+        state: &AppState,
+        workflow_id: u64,
+        conversation_id: &str,
+        contract_id: &str,
+    ) {
+        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: contract_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                stable_key: conversation_id.to_string(),
+            },
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
+                phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                        stable_key: conversation_id.to_string(),
+                    },
+                    handle_id: format!("b-{workflow_id}"),
+                },
+            ),
+            registering_tool_use_id: format!("tool-{workflow_id}"),
+            registered_at: phoenix_workflow::Timestamp(10),
+            expires_at: phoenix_workflow::Timestamp(100 + workflow_id),
+        };
+        let outcome = repo
+            .register_allocated(
+                phoenix_workflow::WorkflowId(workflow_id),
+                &intent,
+                &format!("fp-{workflow_id}"),
+                phoenix_workflow::Timestamp(10),
+            )
+            .await
+            .expect("register wake");
+        assert!(matches!(
+            outcome,
+            phoenix_db::workflow::wake::WakeRegistrationOutcome::Registered { .. }
+                | phoenix_db::workflow::wake::WakeRegistrationOutcome::Replayed { .. }
+        ));
+    }
+
+    async fn cancel_via_router(
+        state: &AppState,
+        conversation_id: &str,
+        contract_id: &str,
+    ) -> axum::response::Response {
+        create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/conversations/{conversation_id}/wake/{contract_id}/cancel"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn wake_status_lists_all_active_contracts_for_conversation_without_global_cap() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "conv-target").await;
+        seed_conversation(&state, "conv-other").await;
+        for id in 0..1002_u64 {
+            register_bash_wake(&state, id + 1, "conv-other", &format!("other-{id}")).await;
+        }
+        register_bash_wake(&state, 5000, "conv-target", "target-a").await;
+        register_bash_wake(&state, 5001, "conv-target", "target-b").await;
+
+        let axum::Json(response) =
+            get_wake_status(State(state.clone()), Path("conv-target".to_string()))
+                .await
+                .expect("wake status");
+
+        assert_eq!(response.pending_count, 2);
+        assert_eq!(response.soonest_expires_at, Some(5100));
+        assert_eq!(
+            response
+                .contracts
+                .into_iter()
+                .map(|c| c.contract_id)
+                .collect::<Vec<_>>(),
+            vec!["target-a".to_string(), "target-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_wake_conflicts_when_canonical_result_already_fired() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "conv-fired").await;
+        register_bash_wake(&state, 6100, "conv-fired", "contract-fired").await;
+        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let started = repo
+            .claim_observation_if_eligible(
+                phoenix_workflow::WorkflowId(6100),
+                phoenix_workflow::ProcessIncarnation(1),
+                phoenix_workflow::Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .expect("claim observation");
+        let authority = match started {
+            phoenix_db::workflow::wake::WakeObservationOutcome::Started { canonical } => {
+                canonical.authority.expect("authority")
+            }
+            other => panic!("expected Started, got {other:?}"),
+        };
+        let evidence = phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
+            phoenix_workflow::wake_profile::BashTerminalEvidence {
+                identity: phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                        stable_key: "conv-fired".into(),
+                    },
+                    handle_id: "b-6100".into(),
+                },
+                status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
+                occurred_at: phoenix_workflow::Timestamp(19),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".into()],
+            },
+        );
+        repo.record_terminal_evidence(
+            phoenix_workflow::WorkflowId(6100),
+            &authority,
+            1,
+            phoenix_workflow::ReceiptId(1),
+            phoenix_workflow::DeliveryId(1),
+            phoenix_workflow::Timestamp(20),
+            &evidence,
+        )
+        .await
+        .expect("record evidence");
+
+        let response = cancel_via_router(&state, "conv-fired", "contract-fired").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error_type"], "wake_already_resolved");
+    }
+
+    #[tokio::test]
+    async fn cancel_wake_replayed_cancelled_is_idempotent_success() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "conv-cancelled").await;
+        register_bash_wake(&state, 6200, "conv-cancelled", "contract-cancelled").await;
+
+        let first = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
+        assert_eq!(second.status(), StatusCode::OK);
     }
 }

@@ -208,7 +208,14 @@ impl Tool for TmuxRunTool {
                 let response =
                     return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
                         .await;
-                register_tmux_wake_if_live(&ctx, &server_generation, &target, response).await
+                register_tmux_wake_if_live(
+                    &ctx,
+                    &server_generation,
+                    &target,
+                    parsed.keep_open_on_exit,
+                    response,
+                )
+                .await
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -430,7 +437,15 @@ async fn wait_for_text_response(
             let response = if exited {
                 response
             } else {
-                match register_tmux_wake_if_live(ctx, server_generation, target, response).await {
+                match register_tmux_wake_if_live(
+                    ctx,
+                    server_generation,
+                    target,
+                    !close_after_completion,
+                    response,
+                )
+                .await
+                {
                     ok if ok.is_success() => ok,
                     err => return err,
                 }
@@ -590,18 +605,32 @@ fn observation_from_bytes(
 
 fn parse_exit_marker(output: &str) -> Option<i32> {
     output.lines().rev().find_map(|line| {
-        line.trim()
-            .strip_prefix(EXIT_MARKER_PREFIX)
-            .and_then(|code| code.parse::<i32>().ok())
+        let trimmed = line.trim();
+        let (_, code) = trimmed.rsplit_once(EXIT_MARKER_PREFIX)?;
+        code.trim().parse::<i32>().ok()
     })
+}
+
+fn response_keeps_live_inspectable_window(response: &ToolOutput) -> bool {
+    let Some(display) = response.display_data() else {
+        return false;
+    };
+    let Some(status) = display.get("status").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(status, "started" | "ready" | "readiness_timed_out")
 }
 
 async fn register_tmux_wake_if_live(
     ctx: &ToolContext,
     server_generation: &str,
     target: &TmuxRunTarget,
+    keep_open_on_exit: bool,
     mut response: ToolOutput,
 ) -> ToolOutput {
+    if !keep_open_on_exit || !response_keeps_live_inspectable_window(&response) {
+        return response;
+    }
     let Some(registrar) = ctx.wake_registrar() else {
         return response;
     };
@@ -1192,6 +1221,12 @@ mod tests {
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-generation.sock")).await;
     }
 
+    #[test]
+    fn parse_exit_marker_matches_tmux_run_marker_line() {
+        let output = "bash output\n[phoenix] process exited with code 17\n$ ";
+        assert_eq!(parse_exit_marker(output), Some(17));
+    }
+
     #[tokio::test]
     async fn exited_before_registration_skips_unresolved_wake_acknowledgment() {
         if skip_unless_tmux() {
@@ -1231,6 +1266,48 @@ mod tests {
         assert!(v.get("wake_registration").is_none());
         assert!(registrar.register_calls().is_empty());
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-exited.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn non_preserved_window_skips_durable_registration() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(19)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-no-preserve",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo READY",
+                    "name": "tmux-run-no-preserve",
+                    "keep_open_on_exit": false,
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": "READY",
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "ready");
+        assert!(v.get("wake_registration").is_none());
+        assert!(registrar.register_calls().is_empty());
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
     }
 
     #[tokio::test]

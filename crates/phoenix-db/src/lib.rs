@@ -5911,12 +5911,22 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        // Conversation + messages (FK CASCADE) and the standalone FTS prune
-        // run in one transaction. The FTS table has no FK cascade, so without
-        // the shared transaction a crash between the source delete and the
-        // prune would leave orphaned index rows and hard-deleted content could
-        // resurface in recall until the next reconcile (REQ-RET-003).
+        // Conversation + wake-owned workflow roots + messages (FK CASCADE) and
+        // the standalone FTS prune run in one transaction. The FTS table has no
+        // FK cascade, and wake workflow foundation tables do not point back to
+        // conversations, so without the shared transaction a crash could leave
+        // either orphaned index rows or invisible orphan workflow rows after a
+        // hard delete.
         let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM workflows
+             WHERE workflow_id IN (
+                 SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
+             )",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -14307,6 +14317,165 @@ mod tests {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "ghost"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_delete_conversation_removes_wake_owned_workflows_and_messages() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation_with_project(
+            "conv-del",
+            "conv-del",
+            "/tmp",
+            true,
+            None,
+            Some("claude-opus-test"),
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        let wake_repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
+        let workflow_id = phoenix_workflow::WorkflowId(9_101);
+        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: "contract-del".into(),
+            conversation_id: "conv-del".into(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                stable_key: "conv-del".into(),
+            },
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
+                phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                        stable_key: "conv-del".into(),
+                    },
+                    handle_id: "b-del".into(),
+                },
+            ),
+            registering_tool_use_id: "tool-del".into(),
+            registered_at: phoenix_workflow::Timestamp(10),
+            expires_at: phoenix_workflow::Timestamp(100),
+        };
+        wake_repo
+            .register_allocated(
+                workflow_id,
+                &intent,
+                "fp-del",
+                phoenix_workflow::Timestamp(10),
+            )
+            .await
+            .unwrap();
+        let started = wake_repo
+            .claim_observation_if_eligible(
+                workflow_id,
+                phoenix_workflow::ProcessIncarnation(1),
+                phoenix_workflow::Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap();
+        let authority = match started {
+            crate::workflow::wake::WakeObservationOutcome::Started { canonical } => {
+                canonical.authority.expect("authority")
+            }
+            other @ (crate::workflow::wake::WakeObservationOutcome::Busy { .. }
+            | crate::workflow::wake::WakeObservationOutcome::Ineligible) => {
+                panic!("expected started, got {other:?}")
+            }
+        };
+        let pending = match wake_repo
+            .record_terminal_evidence(
+                workflow_id,
+                &authority,
+                1,
+                phoenix_workflow::ReceiptId(1),
+                phoenix_workflow::DeliveryId(1),
+                phoenix_workflow::Timestamp(20),
+                &phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
+                    phoenix_workflow::wake_profile::BashTerminalEvidence {
+                        identity: phoenix_workflow::wake_profile::BashResourceIdentity {
+                            work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                                stable_key: "conv-del".into(),
+                            },
+                            handle_id: "b-del".into(),
+                        },
+                        status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
+                        occurred_at: phoenix_workflow::Timestamp(19),
+                        exit_code: Some(0),
+                        duration_ms: Some(12),
+                        signal_number: None,
+                        kill_signal_sent: None,
+                        final_tail: vec!["done".into()],
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+        {
+            crate::workflow::wake::WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
+            | crate::workflow::wake::WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => {
+                delivery
+            }
+            other @ (crate::workflow::wake::WakeTerminalEvidenceOutcome::StaleAttempt
+            | crate::workflow::wake::WakeTerminalEvidenceOutcome::WrongResource
+            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+                panic!("expected pending delivery, got {other:?}")
+            }
+        };
+        let _ = wake_repo
+            .materialize_pending_delivery_message(
+                &crate::workflow::wake::MaterializePendingDeliveryMessageInput {
+                    workflow_id,
+                    delivery_id: pending.canonical_delivery.delivery_id,
+                    conversation_id: pending.conversation_id.clone(),
+                    rendered_content: "wake complete".to_string(),
+                    display_data: None,
+                    auto_resume: true,
+                    created_at: phoenix_workflow::Timestamp(50),
+                },
+            )
+            .await
+            .unwrap();
+
+        db.delete_conversation("conv-del").await.unwrap();
+
+        assert!(db.get_conversation("conv-del").await.is_err());
+        let workflow_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = ?1")
+                .bind(9_101_i64)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let binding_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wake_bindings WHERE workflow_id = ?1")
+                .bind(9_101_i64)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let receipt_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_terminal_receipts WHERE workflow_id = ?1",
+        )
+        .bind(9_101_i64)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let link_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_delivery_messages WHERE workflow_id = ?1",
+        )
+        .bind(9_101_i64)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow_exists, 0);
+        assert_eq!(binding_exists, 0);
+        assert_eq!(receipt_exists, 0);
+        assert_eq!(link_exists, 0);
     }
 
     // ==================== Fork Proposal Tests ====================

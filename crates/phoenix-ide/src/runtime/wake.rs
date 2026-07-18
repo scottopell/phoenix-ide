@@ -27,6 +27,15 @@ const OBSERVATION_BATCH_LIMIT: usize = 64;
 const EXPIRY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+const ERROR_RETRY_BASE_INTERVAL: Duration = Duration::from_millis(250);
+const ERROR_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
+
+fn fresh_process_incarnation() -> ProcessIncarnation {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
+    bytes[7] &= 0x7f;
+    ProcessIncarnation(u64::from_le_bytes(bytes))
+}
 
 #[derive(Clone)]
 pub(crate) struct ProductionWakeRegistrar {
@@ -100,11 +109,7 @@ pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u
             manager.tmux_registry().clone(),
         )),
         Arc::new(SystemClock),
-        ProcessIncarnation(u64::from_le_bytes(
-            uuid::Uuid::new_v4().into_bytes()[..8]
-                .try_into()
-                .expect("UUID always contains at least eight bytes"),
-        )),
+        fresh_process_incarnation(),
     );
     if let Err(error) = worker.run_loop_with_manager(kick_rx, manager).await {
         tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
@@ -139,9 +144,43 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         mut kick_rx: watch::Receiver<u64>,
         manager: Arc<RuntimeManager>,
     ) -> Result<(), String> {
+        self.run_loop_inner(&mut kick_rx, Some(manager)).await
+    }
+
+    async fn run_loop_inner(
+        &self,
+        kick_rx: &mut watch::Receiver<u64>,
+        manager: Option<Arc<RuntimeManager>>,
+    ) -> Result<(), String> {
+        let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
         loop {
-            let wait = self.run_once().await?;
-            deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+            let wait = match self.run_once().await {
+                Ok(wait) => {
+                    if let Some(manager) = manager.as_ref() {
+                        if let Err(error) =
+                            deliver_pending(manager, &self.repo, self.clock.now()).await
+                        {
+                            tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker delivery failed; retrying");
+                            let wait = error_backoff;
+                            error_backoff =
+                                (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
+                            wait
+                        } else {
+                            error_backoff = ERROR_RETRY_BASE_INTERVAL;
+                            wait
+                        }
+                    } else {
+                        error_backoff = ERROR_RETRY_BASE_INTERVAL;
+                        wait
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker iteration failed; retrying");
+                    let wait = error_backoff;
+                    error_backoff = (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
+                    wait
+                }
+            };
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
             tokio::select! {
@@ -157,25 +196,14 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
 
     #[cfg(test)]
     async fn run_loop(&self, mut kick_rx: watch::Receiver<u64>) -> Result<(), String> {
-        loop {
-            let wait = self.run_once().await?;
-            let sleep = self.clock.sleep(wait);
-            tokio::pin!(sleep);
-            tokio::select! {
-                () = &mut sleep => {}
-                changed = kick_rx.changed() => {
-                    if changed.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
+        self.run_loop_inner(&mut kick_rx, None).await
     }
 
     async fn run_once(&self) -> Result<Duration, String> {
         let now = self.clock.now();
+        let next_wait = self.observe_candidates(now).await?;
         self.expire_due(now).await?;
-        self.observe_candidates(now).await
+        Ok(next_wait)
     }
 
     async fn expire_due(&self, now: Timestamp) -> Result<(), String> {
@@ -185,11 +213,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|e| e.to_string())?;
         for row in expired {
-            let _ = self
-                .repo
-                .expire_if_unresolved(row.workflow_id, now)
-                .await
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = self.repo.expire_if_unresolved(row.workflow_id, now).await {
+                tracing::warn!(workflow_id = row.workflow_id.0, error = %error, "wake expiry failed for one contract; continuing");
+            }
         }
         Ok(())
     }
@@ -217,16 +243,24 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                 .map_err(|e| e.to_string())?
             {
                 WakeObservationOutcome::Started { canonical } => {
+                    let workflow_id = candidate.workflow_id.0;
                     let Some(authority) = canonical.authority else {
                         continue;
                     };
                     let Some(_attempt) = canonical.attempt else {
                         continue;
                     };
-                    next_wait = next_wait.min(
-                        self.inspect_candidate(candidate, authority, now, claim_until)
-                            .await?,
-                    );
+                    match self
+                        .inspect_candidate(candidate, authority, now, claim_until)
+                        .await
+                    {
+                        Ok(wait) => {
+                            next_wait = next_wait.min(wait);
+                        }
+                        Err(error) => {
+                            tracing::warn!(workflow_id, error = %error, "wake inspection failed for one contract; continuing");
+                        }
+                    }
                 }
                 WakeObservationOutcome::Busy { lease_until } => {
                     next_wait = next_wait.min(duration_until(now, lease_until.0));
@@ -558,6 +592,7 @@ mod tests {
         WorkScopeKind,
     };
     use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
 
@@ -603,6 +638,10 @@ mod tests {
         outcomes: Mutex<HashMap<u64, VecDeque<InspectionOutcome>>>,
     }
 
+    struct FlakyInspector {
+        remaining_failures: AtomicUsize,
+    }
+
     impl MockInspector {
         fn new() -> Self {
             Self {
@@ -617,6 +656,14 @@ mod tests {
                 .entry(workflow_id)
                 .or_default()
                 .push_back(outcome);
+        }
+    }
+
+    impl FlakyInspector {
+        fn new(failures: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(failures),
+            }
         }
     }
 
@@ -635,6 +682,25 @@ mod tests {
                     .get_mut(&binding.workflow_id.0)
                     .and_then(VecDeque::pop_front)
                     .unwrap_or(InspectionOutcome::LiveRetry))
+            })
+        }
+    }
+
+    impl TerminalInspector for FlakyInspector {
+        fn inspect<'a>(
+            &'a self,
+            _binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+            _authority: &'a LocalAttemptAuthority,
+            _observation_time: Timestamp,
+        ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
+            Box::pin(async move {
+                let remaining = self.remaining_failures.load(Ordering::SeqCst);
+                if remaining > 0 {
+                    self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
+                    Err("transient inspection failure".to_string())
+                } else {
+                    Ok(InspectionOutcome::LiveRetry)
+                }
             })
         }
     }
@@ -985,5 +1051,71 @@ mod tests {
         clock.set(12);
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_inspection_wins_over_same_tick_expiry() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 12).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(11),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(12)),
+            ProcessIncarnation(1),
+        );
+
+        worker.run_once().await.unwrap();
+
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_retries_after_transient_inspection_error() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 50).await;
+        let clock = Arc::new(TestClock::new(10));
+        let sleep_rx = clock.expect_sleep();
+        let worker = WakeWorker::new(
+            repo,
+            Arc::new(FlakyInspector::new(1)),
+            clock,
+            ProcessIncarnation(1),
+        );
+        let (_tx, rx) = watch::channel(0u64);
+        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+
+        let observed_sleep = sleep_rx.await.unwrap();
+        assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
+        join.abort();
+    }
+
+    #[test]
+    fn process_incarnation_fits_signed_sqlite_range() {
+        for _ in 0..128 {
+            let incarnation = fresh_process_incarnation();
+            assert!(i64::try_from(incarnation.0).is_ok());
+        }
     }
 }

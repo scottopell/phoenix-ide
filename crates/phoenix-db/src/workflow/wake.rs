@@ -660,6 +660,30 @@ impl WakeRepository {
         self.fetch_binding(workflow_id).await
     }
 
+    pub async fn fetch_binding_for_conversation_contract(
+        &self,
+        conversation_id: &str,
+        contract_id: &str,
+    ) -> DbResult<Option<WakeBindingRecord>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let row = sqlx::query(
+            "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
+                    scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+                    tmux_server_generation, tmux_window_id, registering_tool_use_id,
+                    expires_at, prepared_fingerprint
+             FROM wake_bindings
+             WHERE conversation_id = ?1 AND contract_id = ?2
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(contract_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        let out = row.as_ref().map(binding_from_row).transpose()?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
     pub async fn claim_observation_if_eligible(
         &self,
         workflow_id: WorkflowId,
@@ -1757,17 +1781,32 @@ impl WakeRepository {
         .await?;
         let out = rows
             .into_iter()
-            .map(|row| {
-                Ok(WakeActiveUnresolvedRow {
-                    workflow_id: WorkflowId(to_u64(
-                        row.get::<i64, _>("workflow_id"),
-                        "workflow_id",
-                    )?),
-                    conversation_id: row.get("conversation_id"),
-                    contract_id: row.get("contract_id"),
-                    expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
-                })
-            })
+            .map(|row| parse_active_unresolved_row(&row))
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_active_unresolved_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeActiveUnresolvedRow>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE b.conversation_id = ?1
+               AND w.status = 'Active'
+               AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
+             ORDER BY b.workflow_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| parse_active_unresolved_row(&row))
             .collect::<DbResult<Vec<_>>>()?;
         tx.commit().await?;
         Ok(out)
@@ -2237,6 +2276,35 @@ impl WakeRepository {
             .bind(&input.from_conversation_id)
             .execute(&mut *tx.tx)
             .await?;
+
+            sqlx::query(
+                "UPDATE wake_delivery_messages
+                 SET conversation_id = ?3
+                 WHERE workflow_id = ?1 AND delivery_id = ?2 AND conversation_id = ?4",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(&input.to_conversation_id)
+            .bind(&input.from_conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE messages
+                 SET conversation_id = ?3
+                 WHERE message_id IN (
+                     SELECT l.message_id
+                     FROM wake_delivery_messages l
+                     WHERE l.workflow_id = ?1 AND l.delivery_id = ?2 AND l.conversation_id = ?3
+                 )
+                   AND conversation_id = ?4",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(&input.to_conversation_id)
+            .bind(&input.from_conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -2487,8 +2555,8 @@ impl WakeRepository {
         timestamp: Timestamp,
     ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
         let mut tx = self.workflow_repo.begin_tx().await?;
-        let Some(state_json) =
-            sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = ?1")
+        let Some(conversation_row) =
+            sqlx::query("SELECT state, archived FROM conversations WHERE id = ?1")
                 .bind(conversation_id)
                 .fetch_optional(&mut *tx.tx)
                 .await?
@@ -2496,6 +2564,11 @@ impl WakeRepository {
             tx.rollback().await?;
             return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
         };
+        if conversation_row.get::<i64, _>("archived") != 0 {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+        }
+        let state_json = conversation_row.get::<String, _>("state");
         let state: ConvState = serde_json::from_str(&state_json)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         if !matches!(state, ConvState::Idle) {
@@ -2995,6 +3068,15 @@ async fn insert_binding_tx(
     .execute(&mut *tx.tx)
     .await?;
     Ok(())
+}
+
+fn parse_active_unresolved_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeActiveUnresolvedRow> {
+    Ok(WakeActiveUnresolvedRow {
+        workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
+        conversation_id: row.get("conversation_id"),
+        contract_id: row.get("contract_id"),
+        expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
+    })
 }
 
 fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeBindingRecord> {
@@ -4996,6 +5078,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_adoption_refuses_archived_conversation_transactionally() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(8131);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = 'conv-1'")
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+                .await
+                .unwrap(),
+            WakeAdoptMaterializedPendingOutcome::NothingPending
+        ));
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+        let (head, snapshot) = head_snapshot(&repo, workflow_id).await;
+        assert_eq!(head.version, Version(2));
+        assert_eq!(
+            snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Idle
+        );
+        let state_json =
+            sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = 'conv-1'")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&state_json).unwrap(),
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
     async fn conversation_adoption_suppresses_cancellation_without_requesting_turn() {
         let (_dir, repo, _) = open_repo_pair().await;
         let workflow_id = WorkflowId(814);
@@ -5080,6 +5197,79 @@ mod tests {
         );
         assert_eq!(count_conversation_messages(&first, "conv-1").await, 1);
         assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identical_delivery_ids_across_workflows_get_distinct_terminal_receipts() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let first = create_pending_terminal_delivery(&repo, WorkflowId(8051)).await;
+        let mut second_intent = intent();
+        second_intent.contract_id = "contract-second-workflow".into();
+        second_intent.registering_tool_use_id = "tool-second-workflow".into();
+        second_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: second_intent.registration_scope.clone(),
+            handle_id: "b-second-workflow".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(8052), &second_intent, "fp-second", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                WorkflowId(8052),
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        let second = match repo
+            .record_terminal_evidence(
+                WorkflowId(8052),
+                started.authority.as_ref().unwrap(),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                    identity: wake_types::BashResourceIdentity {
+                        work_scope: second_intent.registration_scope.clone(),
+                        handle_id: "b-second-workflow".into(),
+                    },
+                    status: wake_types::BashTerminalStatus::Exited,
+                    occurred_at: Timestamp(19),
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    signal_number: None,
+                    kill_signal_sent: None,
+                    final_tail: vec![],
+                }),
+            )
+            .await
+            .unwrap()
+        {
+            WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
+            | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
+            WakeTerminalEvidenceOutcome::StaleAttempt
+            | WakeTerminalEvidenceOutcome::WrongResource
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation => {
+                panic!("expected terminal receipt")
+            }
+        };
+
+        assert_eq!(first.canonical_delivery.delivery_id, DeliveryId(1));
+        assert_eq!(second.canonical_delivery.delivery_id, DeliveryId(1));
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM wake_terminal_receipts WHERE delivery_id = 1",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
@@ -6708,6 +6898,29 @@ mod tests {
             vec![active_a, active_b]
         );
 
+        let conv_active = repo
+            .list_active_unresolved_for_conversation("conv-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            conv_active
+                .iter()
+                .map(|row| row.workflow_id)
+                .collect::<Vec<_>>(),
+            vec![active_a, active_b, expired, leased]
+        );
+        let exact = repo
+            .fetch_binding_for_conversation_contract("conv-1", "contract-b")
+            .await
+            .unwrap()
+            .expect("exact binding");
+        assert_eq!(exact.workflow_id, active_b);
+        assert!(repo
+            .fetch_binding_for_conversation_contract("conv-2", "contract-b")
+            .await
+            .unwrap()
+            .is_none());
+
         let observation = repo
             .list_observation_candidates(Timestamp(30), 2)
             .await
@@ -7031,6 +7244,71 @@ mod tests {
             is_fired,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn transfer_moves_materialized_link_and_message_to_new_owner_pending_delivery() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(7051);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        let materialized = materialize_pending(
+            &repo,
+            &pending,
+            "wake complete",
+            Some(serde_json::json!({"kind": "wake"})),
+            true,
+            Timestamp(50),
+        )
+        .await;
+        let linked = match materialized {
+            MaterializePendingDeliveryMessageOutcome::Materialized(link)
+            | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => link,
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                panic!("expected link")
+            }
+        };
+
+        assert_eq!(
+            repo.transfer(&transfer_input(
+                workflow_id,
+                "conv-1",
+                "conv-2",
+                Version(2),
+                vec![DeliveryId(1)],
+                TransitionId(3),
+            ))
+            .await
+            .unwrap(),
+            WakeTransferOutcome::Transferred
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let pending = restarted.list_pending("conv-2").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            restarted
+                .get_delivery_message_link(workflow_id, DeliveryId(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-2"
+        );
+        let link_owner: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM wake_delivery_messages WHERE workflow_id = ?1 AND delivery_id = 1",
+        )
+        .bind(7051_i64)
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        let message_owner: String =
+            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE message_id = ?1")
+                .bind(&linked.linked_message.message.message_id)
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(link_owner, "conv-2");
+        assert_eq!(message_owner, "conv-2");
     }
 
     #[tokio::test]

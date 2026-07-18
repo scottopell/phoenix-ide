@@ -496,6 +496,7 @@ impl TmuxRegistry {
             }
             ProbeResult::NoSocket => {
                 spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                server.generation = uuid::Uuid::new_v4().to_string();
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -508,6 +509,7 @@ impl TmuxRegistry {
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
                 spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                server.generation = uuid::Uuid::new_v4().to_string();
                 server.status = ServerStatus::Live;
             }
         }
@@ -1343,6 +1345,37 @@ mod tests {
         );
 
         kill_socket(&socket_path_for(tmp.path(), "conv-first-ensure")).await;
+    }
+
+    #[tokio::test]
+    async fn respawn_rotates_generation_to_fence_old_bindings() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let scope = WorkScope::Conversation("conv-rotate-generation".to_string());
+
+        let first = reg
+            .ensure_live(&scope, tmp.path())
+            .await
+            .expect("first ensure_live should succeed");
+        let socket_path = first.read().await.socket_path.clone();
+        let first_generation = first.read().await.generation.clone();
+
+        kill_socket(&socket_path).await;
+
+        let second = reg
+            .ensure_live(&scope, tmp.path())
+            .await
+            .expect("respawn ensure_live should succeed");
+        let second_generation = second.read().await.generation.clone();
+
+        assert_ne!(
+            first_generation, second_generation,
+            "respawning a missing/dead tmux server must rotate generation so stale wake bindings are fenced"
+        );
+        kill_socket(&socket_path).await;
     }
 
     async fn kill_socket(socket_path: &Path) {
