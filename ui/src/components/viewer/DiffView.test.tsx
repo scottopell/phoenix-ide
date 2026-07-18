@@ -23,6 +23,7 @@ const DEFAULT_CHECKOUT_STATUS: import('../../api').CheckoutStatus = {
   kind: 'named_branch',
   branch_name: 'main',
   exact_ref: 'refs/heads/main',
+  head_oid: '1234567890abcdef1234567890abcdef12345678',
   repository_identity: null,
   remote_status: { kind: 'no_known' },
 };
@@ -593,6 +594,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       kind: 'named_branch',
       branch_name: 'task-82003',
       exact_ref: 'refs/heads/task-82003',
+      head_oid: '1234567890abcdef1234567890abcdef12345678',
       repository_identity: 'acme/phoenix',
       remote_status: {
         kind: 'tracked',
@@ -619,6 +621,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       kind: 'named_branch',
       branch_name: 'main',
       exact_ref: 'refs/heads/main',
+      head_oid: '1234567890abcdef1234567890abcdef12345678',
       repository_identity: null,
       remote_status: { kind: 'no_known' },
     });
@@ -640,6 +643,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
             kind: 'named_branch',
             branch_name: 'task-82003',
             exact_ref: 'refs/heads/task-82003',
+            head_oid: '1234567890abcdef1234567890abcdef12345678',
             repository_identity: null,
             remote_status: {
               kind: 'matching',
@@ -698,6 +702,19 @@ describe('DiffView (Pierre CodeView wiring)', () => {
 
     expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Checkout status unavailable');
     expect(screen.getByLabelText('Checkout status')).toHaveTextContent('git status failed');
+  });
+
+  it('renders an unreferenced detached HEAD without crashing', () => {
+    renderDiff('', '', {
+      kind: 'detached',
+      head_oid: 'abcdef1234567890abcdef1234567890abcdef12',
+      pointing_refs: [],
+    });
+
+    const panel = screen.getByLabelText('Checkout status');
+    expect(panel).toHaveTextContent('Detached HEAD');
+    expect(panel).toHaveTextContent('abcdef123456');
+    expect(panel).not.toHaveTextContent('Points to:');
   });
 
   it('shows the empty state when there are no changes', () => {

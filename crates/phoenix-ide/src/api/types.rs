@@ -875,12 +875,13 @@ pub enum CheckoutStatus {
     NamedBranch {
         repository_identity: Option<String>,
         branch_name: String,
+        head_oid: String,
         exact_ref: String,
         remote_status: BranchRemoteStatus,
     },
     Detached {
         head_oid: String,
-        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        #[serde(default)]
         pointing_refs: Vec<String>,
     },
     Unborn {

@@ -242,6 +242,7 @@ export type CheckoutStatus =
     kind: 'named_branch';
     branch_name: string;
     exact_ref: string;
+    head_oid: string;
     repository_identity: string | null;
     remote_status: BranchRemoteStatus;
   }

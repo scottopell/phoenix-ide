@@ -27,6 +27,7 @@ function payloadFor(marker: string): ConversationDiffResponse {
       kind: 'named_branch',
       branch_name: marker.toLowerCase(),
       exact_ref: `refs/heads/${marker.toLowerCase()}`,
+      head_oid: '1234567890abcdef1234567890abcdef12345678',
       repository_identity: null,
       remote_status: { kind: 'no_known' },
     },
@@ -147,6 +148,7 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
         kind: 'named_branch',
         branch_name: 'task-82003',
         exact_ref: 'refs/heads/task-82003',
+        head_oid: '1234567890abcdef1234567890abcdef12345678',
         repository_identity: 'acme/phoenix',
         remote_status: {
           kind: 'tracked',
