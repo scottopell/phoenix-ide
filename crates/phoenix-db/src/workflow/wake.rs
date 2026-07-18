@@ -10,7 +10,7 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
-    db_schema::{Message, MessageContent},
+    db_schema::{Message, MessageContent, UserContent},
     sm_state::ConvState,
 };
 use phoenix_workflow::{
@@ -147,6 +147,7 @@ pub struct MaterializePendingDeliveryMessageInput {
     pub display_data: Option<serde_json::Value>,
     pub auto_resume: bool,
     pub created_at: Timestamp,
+    pub sequence_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +249,12 @@ pub struct WakePendingGlobalRow {
     pub receipt_id: ReceiptId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakePendingGlobalCursor {
+    pub workflow_id: WorkflowId,
+    pub delivery_id: DeliveryId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTerminalEvidenceInput {
     pub workflow_id: WorkflowId,
@@ -309,6 +316,7 @@ pub enum WakeTerminalEvidenceOutcome {
     StaleAttempt,
     WrongResource,
     EvidenceAfterObservation,
+    EvidenceAfterExpiry,
 }
 
 pub struct WakeCancellationInput {
@@ -924,6 +932,10 @@ impl WakeRepository {
         if evidence_time.0 > observation_time.0 {
             tx.rollback().await?;
             return Ok(WakeTerminalEvidenceOutcome::EvidenceAfterObservation);
+        }
+        if evidence_time.0 > binding.expires_at.0 {
+            tx.rollback().await?;
+            return Ok(WakeTerminalEvidenceOutcome::EvidenceAfterExpiry);
         }
         if let Some(existing) =
             fetch_projection_by_receipt_tx(&mut tx, workflow_id, receipt_id).await?
@@ -1726,20 +1738,48 @@ impl WakeRepository {
         })
     }
 
-    pub async fn list_pending_global(&self, limit: usize) -> DbResult<Vec<WakePendingGlobalRow>> {
+    pub async fn list_pending_global(
+        &self,
+        after: Option<WakePendingGlobalCursor>,
+        limit: usize,
+    ) -> DbResult<Vec<WakePendingGlobalRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
-        let rows = sqlx::query(
-            "SELECT p.workflow_id, p.conversation_id, p.contract_id, p.delivery_id, p.receipt_id
-             FROM wake_terminal_receipts p
-             JOIN workflow_deliveries d
-               ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
-             WHERE d.status = 'Pending'
-             ORDER BY p.workflow_id, p.delivery_id
-             LIMIT ?1",
-        )
-        .bind(to_i64(limit as u64, "limit")?)
-        .fetch_all(&mut *tx.tx)
-        .await?;
+        let rows = match after {
+            Some(after) => {
+                sqlx::query(
+                    "SELECT p.workflow_id, p.conversation_id, p.contract_id, p.delivery_id, p.receipt_id
+                     FROM wake_terminal_receipts p
+                     JOIN workflow_deliveries d
+                       ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
+                     WHERE d.status = 'Pending'
+                       AND (
+                           p.workflow_id > ?1
+                           OR (p.workflow_id = ?1 AND p.delivery_id > ?2)
+                       )
+                     ORDER BY p.workflow_id, p.delivery_id
+                     LIMIT ?3",
+                )
+                .bind(to_i64(after.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(after.delivery_id.0, "delivery_id")?)
+                .bind(to_i64(limit as u64, "limit")?)
+                .fetch_all(&mut *tx.tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT p.workflow_id, p.conversation_id, p.contract_id, p.delivery_id, p.receipt_id
+                     FROM wake_terminal_receipts p
+                     JOIN workflow_deliveries d
+                       ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
+                     WHERE d.status = 'Pending'
+                     ORDER BY p.workflow_id, p.delivery_id
+                     LIMIT ?1",
+                )
+                .bind(to_i64(limit as u64, "limit")?)
+                .fetch_all(&mut *tx.tx)
+                .await?
+            }
+        };
         let out = rows
             .into_iter()
             .map(|row| {
@@ -2038,17 +2078,16 @@ impl WakeRepository {
         let registering_tool_use_id: String = row.get("registering_tool_use_id");
         let terminal_kind: String = row.get("terminal_kind");
         let message_id = wake_delivery_message_id(input.workflow_id, input.delivery_id);
-        let sequence_id = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-        )
-        .bind(&input.conversation_id)
-        .fetch_one(&mut *tx.tx)
-        .await?;
-        let content = MessageContent::tool(
-            &registering_tool_use_id,
-            input.rendered_content.clone(),
-            false,
-        );
+        let sequence_id = match input.sequence_id {
+            Some(sequence_id) => sequence_id,
+            None => sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+            )
+            .bind(&input.conversation_id)
+            .fetch_one(&mut *tx.tx)
+            .await?,
+        };
+        let content = MessageContent::User(UserContent::meta(input.rendered_content.clone()));
         let content_str = serde_json::to_string(&content.to_stored_json())
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let display_str = input
@@ -4444,7 +4483,8 @@ mod tests {
             | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
             other @ (WakeTerminalEvidenceOutcome::StaleAttempt
             | WakeTerminalEvidenceOutcome::WrongResource
-            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                 panic!("expected recorded/replayed pending delivery, got {other:?}")
             }
         }
@@ -4465,6 +4505,7 @@ mod tests {
             display_data,
             auto_resume,
             created_at,
+            sequence_id: None,
         }
     }
 
@@ -4553,7 +4594,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_pending_delivery_message_creates_exact_tool_message_shape() {
+    async fn materialize_pending_delivery_message_creates_meta_user_message_with_optional_sequence()
+    {
         let (_dir, repo, _) = open_repo_pair().await;
         let workflow_id = WorkflowId(800);
         let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
@@ -4565,15 +4607,19 @@ mod tests {
             "duration_ms": 12
         });
 
-        let outcome = materialize_pending(
-            &repo,
-            &pending,
-            "bash finished normally",
-            Some(display_data.clone()),
-            true,
-            Timestamp(42),
-        )
-        .await;
+        let outcome = repo
+            .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                workflow_id: pending.workflow_id,
+                delivery_id: pending.canonical_delivery.delivery_id,
+                conversation_id: pending.conversation_id.clone(),
+                rendered_content: "bash finished normally".to_string(),
+                display_data: Some(display_data.clone()),
+                auto_resume: true,
+                created_at: Timestamp(42),
+                sequence_id: Some(17),
+            })
+            .await
+            .unwrap();
 
         let link = match outcome {
             MaterializePendingDeliveryMessageOutcome::Materialized(link) => link,
@@ -4595,22 +4641,21 @@ mod tests {
         let message = &link.linked_message.message;
         assert_eq!(message.message_id, expected_message_id);
         assert_eq!(message.conversation_id, "conv-1");
-        assert_eq!(message.sequence_id, 2);
+        assert_eq!(message.sequence_id, 17);
         assert_eq!(message.display_data, Some(display_data.clone()));
         assert_eq!(message.created_at, timestamp_to_datetime(Timestamp(42)));
         match &message.content {
-            MessageContent::Tool(tool) => {
-                assert_eq!(tool.tool_use_id, "tool-1");
-                assert_eq!(tool.content, "bash finished normally");
-                assert!(!tool.is_error);
+            MessageContent::User(user) => {
+                assert_eq!(user.text, "bash finished normally");
+                assert!(user.is_meta);
             }
-            other @ (MessageContent::User(_)
+            other @ (MessageContent::Tool(_)
             | MessageContent::Agent(_)
             | MessageContent::System(_)
             | MessageContent::Error(_)
             | MessageContent::Continuation(_)
             | MessageContent::Skill(_)) => {
-                panic!("expected tool content, got {other:?}")
+                panic!("expected meta user content, got {other:?}")
             }
         }
 
@@ -4692,6 +4737,7 @@ mod tests {
             display_data: None,
             auto_resume: false,
             created_at: Timestamp(45),
+            sequence_id: None,
         };
         assert!(matches!(
             repo.materialize_pending_delivery_message(&missing)
@@ -5255,7 +5301,8 @@ mod tests {
             | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
             WakeTerminalEvidenceOutcome::StaleAttempt
             | WakeTerminalEvidenceOutcome::WrongResource
-            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation => {
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry => {
                 panic!("expected terminal receipt")
             }
         };
@@ -5334,7 +5381,8 @@ mod tests {
             | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
             other @ (WakeTerminalEvidenceOutcome::StaleAttempt
             | WakeTerminalEvidenceOutcome::WrongResource
-            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                 panic!("expected recorded/replayed second delivery, got {other:?}")
             }
         };
@@ -5871,7 +5919,8 @@ mod tests {
             other @ (WakeTerminalEvidenceOutcome::Replayed { .. }
             | WakeTerminalEvidenceOutcome::StaleAttempt
             | WakeTerminalEvidenceOutcome::WrongResource
-            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                 panic!("expected recorded, got {other:?}")
             }
         }
@@ -6273,7 +6322,8 @@ mod tests {
                     assert!(first.list_pending("conv-2").await.unwrap().is_empty());
                 }
                 other @ (WakeTerminalEvidenceOutcome::WrongResource
-                | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+                | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+                | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                     panic!("unexpected terminal race outcome: {other:?}")
                 }
             }
@@ -6974,9 +7024,9 @@ mod tests {
             vec![expired]
         );
 
-        let pending_rows = repo.list_pending_global(1).await.unwrap();
+        let pending_rows = repo.list_pending_global(None, 1).await.unwrap();
         assert!(pending_rows.is_empty());
-        let pending_restarted = restarted.list_pending_global(5).await.unwrap();
+        let pending_restarted = restarted.list_pending_global(None, 5).await.unwrap();
         assert!(pending_restarted.is_empty());
         let pending_local = repo.list_pending(pending_conv).await.unwrap();
         assert!(pending_local.is_empty());
@@ -6986,6 +7036,78 @@ mod tests {
         assert!(pending_original.is_empty());
         let pending_original_restarted = restarted.list_pending("conv-1").await.unwrap();
         assert!(pending_original_restarted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_global_cursor_pages_past_an_unchanged_first_page() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        for workflow_id in 8000..8003 {
+            let mut input = intent();
+            input.contract_id = format!("contract-{workflow_id}");
+            input.registering_tool_use_id = format!("tool-{workflow_id}");
+            input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+                work_scope: input.registration_scope.clone(),
+                handle_id: format!("b-{workflow_id}"),
+            });
+            assert!(matches!(
+                repo.register_allocated(
+                    WorkflowId(workflow_id),
+                    &input,
+                    &format!("fp-{workflow_id}"),
+                    Timestamp(10),
+                )
+                .await
+                .unwrap(),
+                WakeRegistrationOutcome::Registered { .. }
+            ));
+            let started = unwrap_started(
+                repo.claim_observation_if_eligible(
+                    WorkflowId(workflow_id),
+                    ProcessIncarnation(1),
+                    Timestamp(20),
+                    phoenix_workflow::LeaseExpiry(30),
+                )
+                .await
+                .unwrap(),
+            );
+            let evidence = WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: wake_types::BashResourceIdentity {
+                    work_scope: input.registration_scope,
+                    handle_id: format!("b-{workflow_id}"),
+                },
+                status: wake_types::BashTerminalStatus::Exited,
+                occurred_at: Timestamp(19),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec![],
+            });
+            assert!(matches!(
+                repo.record_terminal_evidence(
+                    WorkflowId(workflow_id),
+                    started.authority.as_ref().unwrap(),
+                    1,
+                    ReceiptId(1),
+                    DeliveryId(1),
+                    Timestamp(20),
+                    &evidence,
+                )
+                .await
+                .unwrap(),
+                WakeTerminalEvidenceOutcome::Recorded { .. }
+            ));
+        }
+
+        let first = repo.list_pending_global(None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = WakePendingGlobalCursor {
+            workflow_id: first[1].workflow_id,
+            delivery_id: first[1].delivery_id,
+        };
+        let second = repo.list_pending_global(Some(cursor), 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].workflow_id, WorkflowId(8002));
     }
 
     #[tokio::test]
@@ -7080,6 +7202,104 @@ mod tests {
                 .unwrap(),
             WakeExpireIfUnresolvedOutcome::NotDue
         );
+    }
+
+    #[tokio::test]
+    async fn record_terminal_evidence_rejects_evidence_after_binding_expiry() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(1702);
+        let input = intent();
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-expired-evidence", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(101),
+                phoenix_workflow::LeaseExpiry(130),
+            )
+            .await
+            .unwrap(),
+        );
+        let authority = started.authority.expect("authority");
+
+        let outcome = repo
+            .record_terminal_evidence(
+                workflow_id,
+                &authority,
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(101),
+                &bash_evidence(101),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, WakeTerminalEvidenceOutcome::EvidenceAfterExpiry);
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let (_, snapshot) = head_snapshot(&restarted, workflow_id).await;
+        assert!(snapshot.terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_terminal_evidence_allows_occurrence_at_expiry_even_when_observed_later() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(1703);
+        let input = intent();
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-expiry-edge", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(101),
+                phoenix_workflow::LeaseExpiry(130),
+            )
+            .await
+            .unwrap(),
+        );
+        let authority = started.authority.expect("authority");
+
+        let outcome = repo
+            .record_terminal_evidence(
+                workflow_id,
+                &authority,
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(101),
+                &bash_evidence(100),
+            )
+            .await
+            .unwrap();
+        let delivery = match outcome {
+            WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
+            | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
+            other @ (WakeTerminalEvidenceOutcome::StaleAttempt
+            | WakeTerminalEvidenceOutcome::WrongResource
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
+                panic!("expected recorded/replayed, got {other:?}")
+            }
+        };
+        assert!(matches!(
+            delivery.receipt.terminal,
+            WakeTerminalPayload::Fired { .. }
+        ));
+        let pending = restarted.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            WakeTerminalPayload::Fired { .. }
+        ));
     }
 
     #[tokio::test]

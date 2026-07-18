@@ -995,9 +995,10 @@ async fn run_waiter(
         reporter.deactivate();
     }
 
+    let finished_at = SystemTime::now();
     let elapsed = started_at.elapsed();
     if handle
-        .transition_to_terminal(cause, elapsed, TOMBSTONE_TAIL_LINES)
+        .transition_to_terminal(cause, elapsed, finished_at, TOMBSTONE_TAIL_LINES)
         .await
     {
         handle.publish_exit(ExitState::Exited);
@@ -1084,7 +1085,7 @@ async fn race_run_response(
             // Run cancellation: treat as still_running — the agent
             // can choose to peek/kill the handle later. We do not
             // proactively kill: that's what kill is for.
-            background_run_response(&handle, started.elapsed(), &read_args, cmd, ctx).await
+            background_run_response(&handle, started.elapsed(), &read_args, cmd, ctx, false).await
         }
         Ok(()) = exit_rx.changed() => {
             // Process exited (or waiter panicked). Either way, build the
@@ -1092,7 +1093,7 @@ async fn race_run_response(
             terminal_or_panic_response(&handle, &read_args, true, false, Some(cmd)).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            background_run_response(&handle, Duration::from_secs(wait_seconds), &read_args, cmd, ctx).await
+            background_run_response(&handle, Duration::from_secs(wait_seconds), &read_args, cmd, ctx, true).await
         }
     }
 }
@@ -1458,8 +1459,12 @@ async fn background_run_response(
     read_args: &ReadArgs,
     cmd: &str,
     ctx: &ToolContext,
+    register_wake: bool,
 ) -> ToolOutput {
     let mut response = still_running_response(handle, elapsed, read_args, cmd).await;
+    if !register_wake {
+        return response;
+    }
     let Some(registrar) = ctx.wake_registrar() else {
         return response;
     };
@@ -2103,6 +2108,7 @@ mod tests {
         h.transition_to_terminal(
             FinalCause::Exited { exit_code: Some(0) },
             Duration::from_millis(1),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             crate::bash::handle::TOMBSTONE_TAIL_LINES,
         )
         .await;
@@ -2311,6 +2317,32 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "still_running");
         assert!(value.get("wake_registration").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_cancellation_does_not_register_durable_wake() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let mut ctx = ctx_with_registrar(
+            &WorkScope::Conversation("conv-wake".into()),
+            Some(registrar.clone()),
+        );
+        ctx.cancel = cancel;
+        let output = run_run(
+            "sleep 10",
+            None,
+            10,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        assert!(output.is_success(), "{}", output.output());
+        let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
+        assert_eq!(value["status"], "still_running");
+        assert!(value.get("wake_registration").is_none());
+        assert!(registrar.register_calls().is_empty());
     }
 
     #[tokio::test]

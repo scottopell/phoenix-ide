@@ -236,6 +236,7 @@ mod tests {
                     signal_number: Some(9),
                 },
                 Duration::from_millis(13),
+                std::time::SystemTime::now(),
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;

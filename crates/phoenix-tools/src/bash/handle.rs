@@ -329,6 +329,7 @@ impl Handle {
         &self,
         cause: FinalCause,
         duration: std::time::Duration,
+        finished_at: SystemTime,
         tombstone_tail_lines: usize,
     ) -> bool {
         let mut guard = self.state.write().await;
@@ -369,7 +370,7 @@ impl Handle {
                     exit_code,
                     signal_number,
                     duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    finished_at: SystemTime::now(),
+                    finished_at,
                     final_tail,
                     next_offset_at_exit,
                     output_bytes,
@@ -492,6 +493,7 @@ mod tests {
             .transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 Duration::from_millis(42),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(42),
                 TOMBSTONE_TAIL_LINES,
             )
             .await;
@@ -502,6 +504,10 @@ mod tests {
                 assert_eq!(t.exit_code, Some(0));
                 assert_eq!(t.duration_ms, 42);
                 assert!(matches!(t.final_cause, FinalCause::Exited { .. }));
+                assert_eq!(
+                    t.finished_at,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(42)
+                );
             }
             HandleState::Live(_) => panic!("expected tombstone"),
         }
@@ -523,6 +529,7 @@ mod tests {
             h.transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 Duration::from_millis(3),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3),
                 TOMBSTONE_TAIL_LINES,
             )
             .await
@@ -545,6 +552,7 @@ mod tests {
             h.transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 Duration::from_millis(10),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(10),
                 TOMBSTONE_TAIL_LINES,
             )
             .await
@@ -560,6 +568,7 @@ mod tests {
                     signal_number: Some(15),
                 },
                 Duration::from_millis(99),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(99),
                 TOMBSTONE_TAIL_LINES,
             )
             .await;
@@ -590,6 +599,7 @@ mod tests {
             h.transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 Duration::from_millis(10),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(10),
                 TOMBSTONE_TAIL_LINES,
             )
             .await
@@ -615,6 +625,7 @@ mod tests {
                     signal_number: Some(9),
                 },
                 Duration::from_millis(5),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(5),
                 TOMBSTONE_TAIL_LINES,
             )
             .await;
@@ -659,6 +670,7 @@ mod tests {
                     signal_number: Some(15),
                 },
                 Duration::from_millis(50),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(50),
                 TOMBSTONE_TAIL_LINES,
             )
             .await
@@ -726,6 +738,7 @@ mod tests {
             h.transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 Duration::from_millis(1),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
                 TOMBSTONE_TAIL_LINES,
             )
             .await

@@ -689,6 +689,7 @@ mod tests {
             .transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 std::time::Duration::from_millis(1),
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
@@ -848,6 +849,7 @@ mod tests {
         h.transition_to_terminal(
             FinalCause::Exited { exit_code: Some(0) },
             std::time::Duration::from_millis(1),
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             crate::bash::handle::TOMBSTONE_TAIL_LINES,
         )
         .await;
@@ -890,6 +892,7 @@ mod tests {
         h.transition_to_terminal(
             FinalCause::Exited { exit_code: Some(0) },
             std::time::Duration::from_millis(1),
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             crate::bash::handle::TOMBSTONE_TAIL_LINES,
         )
         .await;

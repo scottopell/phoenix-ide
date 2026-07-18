@@ -10145,6 +10145,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },
                 std::time::Duration::from_millis(21),
+                std::time::SystemTime::now(),
                 phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;

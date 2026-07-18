@@ -9931,6 +9931,36 @@ mod steer_drain_detector_tests {
         );
     }
 
+    #[test]
+    fn render_messages_keeps_meta_user_wake_observation_as_user_text_not_tool_result() {
+        let created_at = chrono::Utc::now();
+        let msgs = vec![crate::db::Message {
+            message_id: "wake-msg".to_string(),
+            conversation_id: "conv".to_string(),
+            sequence_id: 7,
+            message_type: crate::db::MessageType::User,
+            content: MessageContent::User(crate::db::UserContent::meta("bash finished normally")),
+            display_data: Some(serde_json::json!({"type": "wake_result"})),
+            usage_data: None,
+            created_at,
+        }];
+
+        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].role, MessageRole::User);
+        assert!(matches!(
+            rendered[0].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "bash finished normally"
+        ));
+        assert!(
+            !matches!(
+                rendered[0].content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "wake observations must not re-enter provider history as a duplicate tool_result"
+        );
+    }
+
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
     /// batch in the same awaiting-round must survive a subsequent
     /// `spawn_agents` dispatch and be delivered when the parent enters

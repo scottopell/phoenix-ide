@@ -11,7 +11,8 @@ use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
     WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
     WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
-    WakePendingDelivery, WakeRegistrationOutcome, WakeRepository, WakeTerminalEvidenceInput,
+    WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository,
+    WakeTerminalEvidenceInput,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
@@ -326,53 +327,94 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
     repo: &WakeRepository,
     now: Timestamp,
 ) -> Result<(), String> {
-    let pending = repo
-        .list_pending_global(OBSERVATION_BATCH_LIMIT)
-        .await
-        .map_err(|error| error.to_string())?;
     let mut conversations = std::collections::BTreeSet::new();
-    for row in pending {
-        let current = repo
-            .list_pending(&row.conversation_id)
+    let mut cursor = None;
+    loop {
+        let pending = repo
+            .list_pending_global(cursor, OBSERVATION_BATCH_LIMIT)
             .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|item| {
-                item.workflow_id == row.workflow_id
-                    && item.canonical_delivery.delivery_id == row.delivery_id
-            });
-        let Some(current) = current else {
-            continue;
-        };
-        let rendered = render_terminal_result(&current);
-        let display_data = serde_json::to_value(&current.receipt.terminal).ok();
-        let auto_resume = !matches!(
-            current.receipt.terminal,
-            phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
-        );
-        match repo
-            .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
-                workflow_id: current.workflow_id,
-                delivery_id: current.canonical_delivery.delivery_id,
-                conversation_id: current.conversation_id.clone(),
-                rendered_content: rendered,
-                display_data,
-                auto_resume,
-                created_at: now,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            MaterializePendingDeliveryMessageOutcome::Materialized(_)
-            | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
-                conversations.insert(current.conversation_id);
+            .map_err(|error| error.to_string())?;
+        if pending.is_empty() {
+            break;
+        }
+        let page_len = pending.len();
+        for row in pending {
+            let next_cursor = WakePendingGlobalCursor {
+                workflow_id: row.workflow_id,
+                delivery_id: row.delivery_id,
+            };
+            let current = repo
+                .list_pending(&row.conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|item| {
+                    item.workflow_id == row.workflow_id
+                        && item.canonical_delivery.delivery_id == row.delivery_id
+                });
+            let Some(current) = current else {
+                cursor = Some(next_cursor);
+                continue;
+            };
+            let rendered = render_terminal_result(&current);
+            let display_data = serde_json::to_value(&current.receipt.terminal).ok();
+            let auto_resume = !matches!(
+                current.receipt.terminal,
+                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+            );
+            let handle = match manager.try_get_handle(&current.conversation_id).await {
+                Some(handle) => {
+                    if !matches!(
+                        *handle.state_rx.borrow(),
+                        crate::state_machine::ConvState::Idle
+                    ) {
+                        cursor = Some(next_cursor);
+                        continue;
+                    }
+                    handle
+                }
+                None => manager
+                    .get_or_create(&current.conversation_id)
+                    .await
+                    .map_err(|error| error.clone())?,
+            };
+            let (sequence_guard, sequence_ids) =
+                handle.broadcast_tx.reserve_next_persisted_message_range(1);
+            let sequence_id = sequence_ids[0];
+            match repo
+                .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                    workflow_id: current.workflow_id,
+                    delivery_id: current.canonical_delivery.delivery_id,
+                    conversation_id: current.conversation_id.clone(),
+                    rendered_content: rendered,
+                    display_data,
+                    auto_resume,
+                    created_at: now,
+                    sequence_id: Some(sequence_id),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                MaterializePendingDeliveryMessageOutcome::Materialized(link)
+                | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => {
+                    let _ = handle
+                        .broadcast_tx
+                        .send_message(link.linked_message.message.clone());
+                    conversations.insert(current.conversation_id);
+                }
+                MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {}
             }
-            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {}
+            drop(sequence_guard);
+            cursor = Some(next_cursor);
+        }
+        if page_len < OBSERVATION_BATCH_LIMIT {
+            break;
         }
     }
 
@@ -395,11 +437,7 @@ async fn deliver_pending(
                     .get_or_create(&conversation_id)
                     .await
                     .map_err(|error| error.clone())?;
-                for link in adopted.links {
-                    let _ = handle
-                        .broadcast_tx
-                        .send_message(link.linked_message.message);
-                }
+                let _ = adopted.links;
                 if adopted.auto_resume {
                     handle
                         .event_tx
@@ -477,6 +515,14 @@ impl RuntimeRegistryInspector {
     }
 }
 
+fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Timestamp(seconds)
+}
+
 impl TerminalInspector for RuntimeRegistryInspector {
     fn inspect<'a>(
         &'a self,
@@ -518,7 +564,7 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                 BashTerminalEvidence {
                                     identity: identity.clone(),
                                     status,
-                                    occurred_at: observation_time,
+                                    occurred_at: system_time_to_timestamp(tomb.finished_at),
                                     exit_code: tomb.exit_code,
                                     duration_ms: Some(tomb.duration_ms),
                                     signal_number: tomb.signal_number,
@@ -1090,7 +1136,6 @@ mod tests {
             phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. }
         ));
     }
-
     #[tokio::test]
     async fn worker_retries_after_transient_inspection_error() {
         let (_db, repo) = open_repo().await;
@@ -1109,6 +1154,63 @@ mod tests {
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_pending_deliveries_preallocates_broadcaster_sequence_for_materialized_message()
+    {
+        let (db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+        let _ = handle.broadcast_tx.next_seq();
+        let _ = handle.broadcast_tx.next_seq();
+        let _ = handle.broadcast_tx.next_seq();
+
+        deliver_pending(&manager, &repo, Timestamp(20))
+            .await
+            .unwrap();
+
+        let messages = db.get_messages("conv").await.unwrap();
+        let wake = messages.last().expect("wake message persisted");
+        assert_eq!(wake.sequence_id, 4);
+        assert!(matches!(
+            &wake.content,
+            crate::db::MessageContent::User(user) if user.is_meta && user.text.contains("done")
+        ));
     }
 
     #[test]

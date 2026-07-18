@@ -850,7 +850,7 @@ impl<'a> WorkflowTx<'a> {
                 )
                 && row
                     .get::<Option<i64>, _>("lease_until")
-                    .is_none_or(|lease| lease >= i64::try_from(input.now.0).unwrap())
+                    .is_none_or(|lease| lease > i64::try_from(input.now.0).unwrap())
         });
         let insert_sql = if authoritative {
             "INSERT INTO workflow_authoritative_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
@@ -2884,6 +2884,99 @@ mod tests {
             first.list_deliveries(WorkflowId(32)).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn record_observation_rejects_exact_lease_expiry_boundary() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(321)).await;
+        install_effect_plan(
+            &repo,
+            WorkflowId(321),
+            EffectId(1),
+            ExecutionCapability::ReclaimableObservation,
+        )
+        .await;
+        let begun = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(321),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(9),
+                now: Timestamp(3),
+                lease_until: Some(LeaseExpiry(10)),
+            })
+            .await
+            .unwrap();
+        let authority = begun.authority.unwrap();
+
+        let result = repo
+            .record_observation(&RecordObservationInput {
+                authority: authority.clone(),
+                observation_id: 1,
+                now: Timestamp(10),
+                observed_at: Timestamp(9),
+                observation_codec: local_codec_owned("observation"),
+                observation_payload: vec![1],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AuthorityOutcome::StaleAuthority);
+
+        assert!(repo
+            .list_authoritative_observations(WorkflowId(321), EffectId(1))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.list_stale_observations(WorkflowId(321), EffectId(1))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_observation_accepts_before_lease_expiry_boundary() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(322)).await;
+        install_effect_plan(
+            &repo,
+            WorkflowId(322),
+            EffectId(1),
+            ExecutionCapability::ReclaimableObservation,
+        )
+        .await;
+        let begun = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(322),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(9),
+                now: Timestamp(3),
+                lease_until: Some(LeaseExpiry(10)),
+            })
+            .await
+            .unwrap();
+        let authority = begun.authority.unwrap();
+
+        let result = repo
+            .record_observation(&RecordObservationInput {
+                authority: authority.clone(),
+                observation_id: 1,
+                now: Timestamp(9),
+                observed_at: Timestamp(9),
+                observation_codec: local_codec_owned("observation"),
+                observation_payload: vec![1],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AuthorityOutcome::Authorized);
+        assert!(result
+            .observation
+            .as_ref()
+            .is_some_and(|obs| obs.authoritative));
     }
 
     #[tokio::test]

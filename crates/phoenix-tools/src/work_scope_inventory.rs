@@ -249,6 +249,7 @@ mod tests {
             .transition_to_terminal(
                 crate::bash::handle::FinalCause::Exited { exit_code: Some(0) },
                 std::time::Duration::from_millis(7),
+                std::time::SystemTime::now(),
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
@@ -291,6 +292,7 @@ mod tests {
                     signal_number: Some(9),
                 },
                 std::time::Duration::from_millis(3),
+                std::time::SystemTime::now(),
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;

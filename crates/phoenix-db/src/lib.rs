@@ -14424,7 +14424,8 @@ mod tests {
             }
             other @ (crate::workflow::wake::WakeTerminalEvidenceOutcome::StaleAttempt
             | crate::workflow::wake::WakeTerminalEvidenceOutcome::WrongResource
-            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | crate::workflow::wake::WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                 panic!("expected pending delivery, got {other:?}")
             }
         };
@@ -14438,6 +14439,7 @@ mod tests {
                     display_data: None,
                     auto_resume: true,
                     created_at: phoenix_workflow::Timestamp(50),
+                    sequence_id: None,
                 },
             )
             .await
