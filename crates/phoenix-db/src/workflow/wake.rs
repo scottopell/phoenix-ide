@@ -236,6 +236,26 @@ pub enum WakeExpireIfUnresolvedOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeForgetIfUnresolvedInput {
+    pub workflow_id: WorkflowId,
+    pub now: Timestamp,
+    pub reason: WakeForgottenReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeForgetIfUnresolvedOutcome {
+    Forgotten {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    Replayed {
+        receipt: LocalReceiptRecord,
+        delivery: WakePendingDelivery,
+    },
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeTerminalEvidenceOutcome {
     Recorded {
         receipt: LocalReceiptRecord,
@@ -1009,6 +1029,179 @@ impl WakeRepository {
             &input.evidence,
         )
         .await
+    }
+
+    pub async fn forget_if_unresolved_allocated(
+        &self,
+        input: &WakeForgetIfUnresolvedInput,
+    ) -> DbResult<WakeForgetIfUnresolvedOutcome> {
+        for _ in 0..20 {
+            match self.forget_if_unresolved_allocated_once(input).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.forget_if_unresolved_allocated_once(input).await
+    }
+
+    async fn forget_if_unresolved_allocated_once(
+        &self,
+        input: &WakeForgetIfUnresolvedInput,
+    ) -> DbResult<WakeForgetIfUnresolvedOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeForgetIfUnresolvedOutcome::Stale);
+        };
+        if let Some(existing) = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id).await?
+        {
+            let outcome = replay_terminal_projection(&mut tx, input.workflow_id, existing).await?;
+            tx.commit().await?;
+            return Ok(WakeForgetIfUnresolvedOutcome::Replayed {
+                receipt: outcome.0,
+                delivery: outcome.1,
+            });
+        }
+        let Some(head) = tx.fetch_workflow_head(input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeForgetIfUnresolvedOutcome::Stale);
+        };
+
+        let receipt_id = ReceiptId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Receipt)
+                .await?,
+        );
+        let delivery_id = DeliveryId(
+            tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Delivery)
+                .await?,
+        );
+        let terminal = WakeTerminalPayload::Forgotten {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            reason: input.reason,
+            resolved_at: input.now,
+        };
+        let next_snapshot = WakeRegistrationSnapshot {
+            contract_id: binding.contract_id.clone(),
+            resource: binding.resource.clone(),
+            registered: true,
+            terminal: Some(terminal.clone()),
+            runtime_availability: wake_profile::RuntimeAvailability::Idle,
+        };
+        let event = WakeRegistrationEvent::TerminalProjected {
+            terminal: Box::new(terminal.clone()),
+        };
+        let committed = tx
+            .commit_transition_head_cas(
+                input.workflow_id,
+                head.version,
+                head.generation,
+                WorkflowStatus::Completed,
+                &local_codec(&wake_profile::event_codec()),
+                &json_blob(&event)?,
+                &local_codec(&wake_profile::snapshot_codec()),
+                &json_blob(&next_snapshot)?,
+                TransitionId(head.version.next().0),
+                input.now,
+            )
+            .await?;
+        if !committed {
+            if let Some(existing) =
+                fetch_any_terminal_projection_tx(&mut tx, input.workflow_id).await?
+            {
+                let outcome =
+                    replay_terminal_projection(&mut tx, input.workflow_id, existing).await?;
+                tx.commit().await?;
+                return Ok(WakeForgetIfUnresolvedOutcome::Replayed {
+                    receipt: outcome.0,
+                    delivery: outcome.1,
+                });
+            }
+            tx.rollback().await?;
+            return Ok(WakeForgetIfUnresolvedOutcome::Stale);
+        }
+        sqlx::query(
+            "UPDATE workflow_attempts
+             SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query("DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(receipt_id.0, "receipt_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(to_i64(head.generation.0, "generation")?)
+            .bind(to_i64(head.version.next().0, "declared_workflow_version")?)
+            .bind(0_i64)
+            .bind("DeadlineExpiration")
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, 1, 'Pending', 'Owed', NULL, NULL)")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+            .bind(wake_profile::terminal_codec().family)
+            .bind(i64::from(wake_profile::terminal_codec().version))
+            .bind(json_blob(&terminal)?)
+            .execute(&mut *tx.tx)
+            .await?;
+        insert_terminal_receipt_projection_tx(
+            &mut tx,
+            &binding,
+            &LocalReceiptRecord {
+                receipt_id,
+                workflow_id: input.workflow_id,
+                effect_id: REGISTRATION_EFFECT_ID,
+                generation: head.generation,
+                declared_workflow_version: head.version.next(),
+                process_incarnation: ProcessIncarnation(0),
+                attempt_id: None,
+                origin: ReceiptOrigin::ForgottenInterruption,
+                receipt_codec: local_codec(&wake_profile::terminal_codec()),
+                receipt_payload: json_blob(&terminal)?,
+            },
+            &LocalDeliveryRecord {
+                delivery_id,
+                workflow_id: input.workflow_id,
+                effect_id: Some(REGISTRATION_EFFECT_ID),
+                barrier_id: None,
+                consumer_kind: "reducer".to_string(),
+                event_codec: local_codec(&wake_profile::terminal_codec()),
+                payload_kind: super::LocalDeliveryPayloadKind::Receipt,
+                payload_blob: json_blob(&terminal)?,
+                requires_runtime_acceptance: true,
+                status: phoenix_workflow::DeliveryStatus::Pending,
+                runtime_acceptance_status: Some(RuntimeAcceptanceStatus::Owed),
+                suppression_reason: None,
+                accepted_by_transition_id: None,
+            },
+            &terminal,
+        )
+        .await?;
+        let projection = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("wake forgotten projection missing after insert".to_string())
+            })?;
+        let outcome = replay_terminal_projection(&mut tx, input.workflow_id, projection).await?;
+        tx.commit().await?;
+        Ok(WakeForgetIfUnresolvedOutcome::Forgotten {
+            receipt: outcome.0,
+            delivery: outcome.1,
+        })
     }
 
     pub async fn cancel_allocated(

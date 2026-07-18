@@ -136,7 +136,14 @@ pub struct TmuxServer {
     #[allow(dead_code)]
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
+    pub generation: String,
     pub status: ServerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedWindow {
+    pub exit_code: Option<i32>,
+    pub final_tail: Vec<String>,
 }
 
 impl TmuxServer {
@@ -144,6 +151,7 @@ impl TmuxServer {
         Self {
             work_scope,
             socket_path,
+            generation: uuid::Uuid::new_v4().to_string(),
             status: ServerStatus::NotProbed,
         }
     }
@@ -623,6 +631,54 @@ impl TmuxRegistry {
         self.inner.read().await.get(&key).cloned()
     }
 
+    /// Read-only exact inspection of one window on an already-known tmux server.
+    /// Returns `None` when the scope has no in-memory entry, the server generation
+    /// does not match the entry's current incarnation, or the target window no
+    /// longer exists. Does not create registry entries or spawn/probe servers.
+    ///
+    /// # Errors
+    /// Returns [`TmuxError`] when invoking the read-only tmux inspection command
+    /// against an existing in-memory server fails.
+    pub async fn inspect_existing_window(
+        &self,
+        work_scope: &WorkScope,
+        expected_server_generation: &str,
+        window_id: &str,
+    ) -> Result<Option<ObservedWindow>, TmuxError> {
+        let Some(entry) = self.get_existing(work_scope).await else {
+            return Ok(None);
+        };
+        let server = entry.read().await;
+        if server.generation != expected_server_generation {
+            return Ok(None);
+        }
+        let socket_path = server.socket_path.clone();
+        drop(server);
+
+        let output = run_tmux_quiet_output(
+            &socket_path,
+            &["capture-pane", "-p", "-t", window_id, "-S", "-2000"],
+        )
+        .await?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let final_tail = stdout
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let exit_code = stdout.lines().rev().find_map(|line| {
+            line.trim()
+                .strip_prefix("__PHOENIX_EXIT_CODE=")
+                .and_then(|code| code.parse::<i32>().ok())
+        });
+        Ok(Some(ObservedWindow {
+            exit_code,
+            final_tail,
+        }))
+    }
+
     /// Deterministic socket path for a `WorkScope`, derived the same way
     /// `ensure_live` derives it on insertion. Used by the cascade when no
     /// registry entry is present (orphan-socket cleanup) and on the
@@ -836,6 +892,27 @@ async fn run_tmux_quiet(socket_path: &Path, args: &[&str]) {
         .stderr(Stdio::null())
         .status()
         .await;
+}
+
+async fn run_tmux_quiet_output(
+    socket_path: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, TmuxError> {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let mut full: Vec<&str> = vec!["-S", &sock];
+    full.extend_from_slice(args);
+    tokio::process::Command::new("tmux")
+        .args(&full)
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|source| TmuxError::ProbeFailed {
+            socket_path: socket_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Read one variable from a server's global environment, or `None` if unset.

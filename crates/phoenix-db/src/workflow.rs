@@ -2304,6 +2304,7 @@ fn receipt_origin_to_str(origin: ReceiptOrigin) -> &'static str {
         ReceiptOrigin::Manual => "Manual",
         ReceiptOrigin::CancellationArbitration => "CancellationArbitration",
         ReceiptOrigin::DeadlineExpiration => "DeadlineExpiration",
+        ReceiptOrigin::ForgottenInterruption => "ForgottenInterruption",
         ReceiptOrigin::ScheduleCollapse => "ScheduleCollapse",
     }
 }
@@ -2395,6 +2396,7 @@ fn parse_receipt_origin(value: &str) -> DbResult<ReceiptOrigin> {
         "Manual" => Ok(ReceiptOrigin::Manual),
         "CancellationArbitration" => Ok(ReceiptOrigin::CancellationArbitration),
         "DeadlineExpiration" => Ok(ReceiptOrigin::DeadlineExpiration),
+        "ForgottenInterruption" => Ok(ReceiptOrigin::ForgottenInterruption),
         "ScheduleCollapse" => Ok(ReceiptOrigin::ScheduleCollapse),
         other => Err(DbError::Serialization(format!(
             "unknown receipt origin: {other}"

@@ -132,6 +132,7 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
+        runtime.start_wake_worker().await;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());

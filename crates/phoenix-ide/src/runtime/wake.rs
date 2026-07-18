@@ -1,0 +1,726 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::runtime::RuntimeManager;
+use phoenix_core::work_scope::WorkScope;
+use phoenix_db::workflow::wake::{
+    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
+    WakeRepository, WakeTerminalEvidenceInput,
+};
+use phoenix_db::workflow::LocalAttemptAuthority;
+use phoenix_tools::bash::handle::{FinalCause, HandleState};
+use phoenix_workflow::wake_profile::{
+    BashTerminalEvidence, BashTerminalStatus, TmuxTerminalEvidence, TmuxTerminalStatus,
+    WakeForgottenReason, WakeResourceIdentity, WakeTerminalEvidence,
+};
+use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, Timestamp};
+use tokio::sync::watch;
+
+const OBSERVATION_BATCH_LIMIT: usize = 64;
+const EXPIRY_BATCH_LIMIT: usize = 64;
+const LEASE_DURATION: Duration = Duration::from_secs(30);
+const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u64>) {
+    let worker = WakeWorker::new(
+        WakeRepository::new(manager.db().pool().clone()),
+        Arc::new(RuntimeRegistryInspector::new(
+            manager.bash_handles().clone(),
+            manager.tmux_registry().clone(),
+        )),
+        Arc::new(SystemClock),
+        ProcessIncarnation(u64::from_le_bytes(
+            uuid::Uuid::new_v4().into_bytes()[..8]
+                .try_into()
+                .expect("UUID always contains at least eight bytes"),
+        )),
+    );
+    if let Err(error) = worker.run_loop(kick_rx).await {
+        tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WakeWorker<I: TerminalInspector, C: WakeClock> {
+    repo: WakeRepository,
+    inspector: Arc<I>,
+    clock: Arc<C>,
+    process_incarnation: ProcessIncarnation,
+}
+
+impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
+    pub(crate) fn new(
+        repo: WakeRepository,
+        inspector: Arc<I>,
+        clock: Arc<C>,
+        process_incarnation: ProcessIncarnation,
+    ) -> Self {
+        Self {
+            repo,
+            inspector,
+            clock,
+            process_incarnation,
+        }
+    }
+
+    async fn run_loop(&self, mut kick_rx: watch::Receiver<u64>) -> Result<(), String> {
+        loop {
+            let wait = self.run_once().await?;
+            let sleep = self.clock.sleep(wait);
+            tokio::pin!(sleep);
+            tokio::select! {
+                () = &mut sleep => {}
+                changed = kick_rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_once(&self) -> Result<Duration, String> {
+        let now = self.clock.now();
+        self.expire_due(now).await?;
+        self.observe_candidates(now).await
+    }
+
+    async fn expire_due(&self, now: Timestamp) -> Result<(), String> {
+        let expired = self
+            .repo
+            .list_expired_unresolved(now, EXPIRY_BATCH_LIMIT)
+            .await
+            .map_err(|e| e.to_string())?;
+        for row in expired {
+            let _ = self
+                .repo
+                .expire_if_unresolved(row.workflow_id, now)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn observe_candidates(&self, now: Timestamp) -> Result<Duration, String> {
+        let candidates = self
+            .repo
+            .list_observation_candidates(now, OBSERVATION_BATCH_LIMIT)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut next_wait = EMPTY_RESCAN_INTERVAL;
+        let mut saw_candidate = false;
+        for candidate in candidates {
+            saw_candidate = true;
+            let claim_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
+            match self
+                .repo
+                .claim_observation_if_eligible(
+                    candidate.workflow_id,
+                    self.process_incarnation,
+                    now,
+                    claim_until,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                WakeObservationOutcome::Started { canonical } => {
+                    let Some(authority) = canonical.authority else {
+                        continue;
+                    };
+                    let Some(_attempt) = canonical.attempt else {
+                        continue;
+                    };
+                    next_wait = next_wait.min(
+                        self.inspect_candidate(candidate, authority, now, claim_until)
+                            .await?,
+                    );
+                }
+                WakeObservationOutcome::Busy { lease_until } => {
+                    next_wait = next_wait.min(duration_until(now, lease_until.0));
+                }
+                WakeObservationOutcome::Ineligible => {}
+            }
+        }
+        Ok(if saw_candidate {
+            next_wait.min(LEASE_DURATION)
+        } else {
+            next_wait
+        })
+    }
+
+    async fn inspect_candidate(
+        &self,
+        candidate: WakeObservationCandidateRow,
+        authority: LocalAttemptAuthority,
+        now: Timestamp,
+        lease_until: LeaseExpiry,
+    ) -> Result<Duration, String> {
+        let Some(binding) = self
+            .repo
+            .reload_binding(candidate.workflow_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(Duration::ZERO);
+        };
+        match self
+            .inspector
+            .inspect(&binding, &authority, now)
+            .await
+            .map_err(|error| error.clone())?
+        {
+            InspectionOutcome::LiveRetry => Ok(duration_until(now, lease_until.0)),
+            InspectionOutcome::Terminal(evidence) => {
+                let _ = self
+                    .repo
+                    .record_terminal_allocated(&WakeTerminalEvidenceInput {
+                        workflow_id: candidate.workflow_id,
+                        authority,
+                        observation_time: now,
+                        evidence,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Duration::ZERO)
+            }
+            InspectionOutcome::Forgotten(reason) => {
+                let _ = self
+                    .repo
+                    .forget_if_unresolved_allocated(&WakeForgetIfUnresolvedInput {
+                        workflow_id: candidate.workflow_id,
+                        now,
+                        reason,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Duration::ZERO)
+            }
+        }
+    }
+}
+
+fn duration_until(now: Timestamp, then: u64) -> Duration {
+    Duration::from_secs(then.saturating_sub(now.0))
+}
+
+pub(crate) trait WakeClock: Send + Sync + 'static {
+    fn now(&self) -> Timestamp;
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+struct SystemClock;
+
+impl WakeClock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InspectionOutcome {
+    LiveRetry,
+    Terminal(WakeTerminalEvidence),
+    Forgotten(WakeForgottenReason),
+}
+
+pub(crate) trait TerminalInspector: Send + Sync + 'static {
+    fn inspect<'a>(
+        &'a self,
+        binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+        authority: &'a LocalAttemptAuthority,
+        observation_time: Timestamp,
+    ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>>;
+}
+
+struct RuntimeRegistryInspector {
+    bash: Arc<phoenix_tools::BashHandleRegistry>,
+    tmux: Arc<phoenix_tools::TmuxRegistry>,
+}
+
+impl RuntimeRegistryInspector {
+    fn new(
+        bash: Arc<phoenix_tools::BashHandleRegistry>,
+        tmux: Arc<phoenix_tools::TmuxRegistry>,
+    ) -> Self {
+        Self { bash, tmux }
+    }
+}
+
+impl TerminalInspector for RuntimeRegistryInspector {
+    fn inspect<'a>(
+        &'a self,
+        binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+        _authority: &'a LocalAttemptAuthority,
+        observation_time: Timestamp,
+    ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
+        Box::pin(async move {
+            match &binding.resource {
+                WakeResourceIdentity::Bash(identity) => {
+                    let scope = work_scope_from_identity(&identity.work_scope);
+                    let Some(scope_handles) = self.bash.get_existing(&scope).await else {
+                        return Ok(InspectionOutcome::Forgotten(
+                            WakeForgottenReason::PhoenixRestart,
+                        ));
+                    };
+                    let scope_handles = scope_handles.read().await;
+                    let handle_id =
+                        phoenix_tools::bash::handle::HandleId::new(identity.handle_id.clone());
+                    let Some(handle) = scope_handles.get(&handle_id) else {
+                        return Ok(InspectionOutcome::Forgotten(
+                            WakeForgottenReason::PhoenixRestart,
+                        ));
+                    };
+                    let state = handle.state().await;
+                    match state.as_ref() {
+                        HandleState::Live(_) => Ok(InspectionOutcome::LiveRetry),
+                        HandleState::Tombstoned(tomb) => {
+                            let status = match &tomb.final_cause {
+                                FinalCause::Exited { .. } => BashTerminalStatus::Exited,
+                                FinalCause::Killed { .. } => BashTerminalStatus::Killed,
+                            };
+                            let tail = tomb
+                                .final_tail
+                                .iter()
+                                .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+                                .collect();
+                            Ok(InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(
+                                BashTerminalEvidence {
+                                    identity: identity.clone(),
+                                    status,
+                                    occurred_at: observation_time,
+                                    exit_code: tomb.exit_code,
+                                    duration_ms: Some(tomb.duration_ms),
+                                    signal_number: tomb.signal_number,
+                                    kill_signal_sent: tomb
+                                        .kill_signal_sent
+                                        .map(|sig| format!("{sig:?}")),
+                                    final_tail: tail,
+                                },
+                            )))
+                        }
+                    }
+                }
+                WakeResourceIdentity::TmuxWindow(identity) => {
+                    let scope = work_scope_from_identity(&identity.work_scope);
+                    match self
+                        .tmux
+                        .inspect_existing_window(
+                            &scope,
+                            &identity.server_generation,
+                            &identity.window_id,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        Some(window) => Ok(match window.exit_code {
+                            Some(exit_code) => InspectionOutcome::Terminal(
+                                WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                                    identity: identity.clone(),
+                                    status: TmuxTerminalStatus::ExitMarkerObserved,
+                                    occurred_at: observation_time,
+                                    exit_code: Some(exit_code),
+                                    duration_ms: None,
+                                    final_tail: window.final_tail,
+                                }),
+                            ),
+                            None => InspectionOutcome::LiveRetry,
+                        }),
+                        None => Ok(InspectionOutcome::Forgotten(
+                            WakeForgottenReason::TmuxHandleMissing,
+                        )),
+                    }
+                }
+                WakeResourceIdentity::Subagent(_) => {
+                    Err("subagent wake bindings not implemented".to_string())
+                }
+            }
+        })
+    }
+}
+
+fn work_scope_from_identity(
+    scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+) -> WorkScope {
+    match scope.kind {
+        phoenix_workflow::wake_profile::WorkScopeKind::Conversation => {
+            WorkScope::Conversation(scope.stable_key.clone())
+        }
+        phoenix_workflow::wake_profile::WorkScopeKind::Worktree => {
+            WorkScope::Worktree(scope.stable_key.clone())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_db::workflow::wake::WakeRegistrationOutcome;
+    use phoenix_db::Database;
+    use phoenix_workflow::wake_profile::{
+        BashResourceIdentity, TmuxResourceIdentity, WakeRegistrationIntent, WorkScopeIdentity,
+        WorkScopeKind,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    #[derive(Clone)]
+    struct TestClock {
+        now: Arc<Mutex<Timestamp>>,
+        sleep_tx: Arc<Mutex<Option<oneshot::Sender<Duration>>>>,
+    }
+
+    impl TestClock {
+        fn new(now: u64) -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Timestamp(now))),
+                sleep_tx: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn set(&self, now: u64) {
+            *self.now.lock().unwrap() = Timestamp(now);
+        }
+
+        fn expect_sleep(&self) -> oneshot::Receiver<Duration> {
+            let (tx, rx) = oneshot::channel();
+            *self.sleep_tx.lock().unwrap() = Some(tx);
+            rx
+        }
+    }
+
+    impl WakeClock for TestClock {
+        fn now(&self) -> Timestamp {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            if let Some(tx) = self.sleep_tx.lock().unwrap().take() {
+                let _ = tx.send(duration);
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct MockInspector {
+        outcomes: Mutex<HashMap<u64, VecDeque<InspectionOutcome>>>,
+    }
+
+    impl MockInspector {
+        fn new() -> Self {
+            Self {
+                outcomes: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn push(&self, workflow_id: u64, outcome: InspectionOutcome) {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .entry(workflow_id)
+                .or_default()
+                .push_back(outcome);
+        }
+    }
+
+    impl TerminalInspector for MockInspector {
+        fn inspect<'a>(
+            &'a self,
+            binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+            _authority: &'a LocalAttemptAuthority,
+            _observation_time: Timestamp,
+        ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .get_mut(&binding.workflow_id.0)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(InspectionOutcome::LiveRetry))
+            })
+        }
+    }
+
+    async fn open_repo() -> (Database, WakeRepository) {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv", "conv", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        (db.clone(), WakeRepository::new(db.pool().clone()))
+    }
+
+    fn conv_scope() -> WorkScopeIdentity {
+        WorkScopeIdentity {
+            kind: WorkScopeKind::Conversation,
+            stable_key: "conv".to_string(),
+        }
+    }
+
+    async fn register_bash(repo: &WakeRepository, handle: &str, expires_at: u64) -> u64 {
+        let intent = WakeRegistrationIntent {
+            contract_id: format!("contract-{handle}"),
+            conversation_id: "conv".to_string(),
+            registration_scope: conv_scope(),
+            resource: WakeResourceIdentity::Bash(BashResourceIdentity {
+                work_scope: conv_scope(),
+                handle_id: handle.to_string(),
+            }),
+            registering_tool_use_id: "tool-use".to_string(),
+            registered_at: Timestamp(1),
+            expires_at: Timestamp(expires_at),
+        };
+        match repo.register(&intent, handle, Timestamp(1)).await.unwrap() {
+            WakeRegistrationOutcome::Registered { workflow_id, .. }
+            | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id.0,
+            WakeRegistrationOutcome::Conflict => panic!("unexpected conflict"),
+        }
+    }
+
+    async fn register_tmux(
+        repo: &WakeRepository,
+        generation: &str,
+        window_id: &str,
+        expires_at: u64,
+    ) -> u64 {
+        let intent = WakeRegistrationIntent {
+            contract_id: format!("contract-{window_id}"),
+            conversation_id: "conv".to_string(),
+            registration_scope: conv_scope(),
+            resource: WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                work_scope: conv_scope(),
+                server_generation: generation.to_string(),
+                window_id: window_id.to_string(),
+            }),
+            registering_tool_use_id: "tool-use".to_string(),
+            registered_at: Timestamp(1),
+            expires_at: Timestamp(expires_at),
+        };
+        match repo
+            .register(&intent, window_id, Timestamp(1))
+            .await
+            .unwrap()
+        {
+            WakeRegistrationOutcome::Registered { workflow_id, .. }
+            | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id.0,
+            WakeRegistrationOutcome::Conflict => panic!("unexpected conflict"),
+        }
+    }
+
+    async fn pending_count(repo: &WakeRepository) -> usize {
+        repo.list_pending("conv").await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn due_expiry_first_projects_terminal() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 5).await;
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(MockInspector::new()),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn fired_bash_via_mock_inspector_records_terminal() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn fired_tmux_via_mock_inspector_records_terminal() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_tmux(&repo, "g1", "w1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                identity: TmuxResourceIdentity {
+                    work_scope: conv_scope(),
+                    server_generation: "g1".to_string(),
+                    window_id: "w1".to_string(),
+                },
+                status: TmuxTerminalStatus::ExitMarkerObserved,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn forgotten_records_forgotten_terminal() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_tmux(&repo, "g1", "w1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Forgotten(WakeForgottenReason::TmuxHandleMissing),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn live_retry_leaves_unresolved_and_waits_for_lease() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 50).await;
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(MockInspector::new()),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        let wait = worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 0);
+        assert_eq!(wait, EMPTY_RESCAN_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn startup_restart_discovery_marks_missing_bash_forgotten() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "missing", 50).await;
+        let inspector = RuntimeRegistryInspector::new(
+            Arc::new(phoenix_tools::BashHandleRegistry::new()),
+            Arc::new(phoenix_tools::TmuxRegistry::new()),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(inspector),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(99),
+        );
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_process_fencing_prevents_duplicate_projection() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec![],
+            })),
+        );
+        let stale_worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        let fresh_worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(MockInspector::new()),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(2),
+        );
+        stale_worker.run_once().await.unwrap();
+        fresh_worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn kick_preempts_deadline_wait() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 50).await;
+        let clock = Arc::new(TestClock::new(10));
+        let sleep_rx = clock.expect_sleep();
+        let worker = WakeWorker::new(
+            repo,
+            Arc::new(MockInspector::new()),
+            clock,
+            ProcessIncarnation(1),
+        );
+        let (tx, rx) = watch::channel(0u64);
+        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+        let observed_sleep = sleep_rx.await.unwrap();
+        assert_eq!(observed_sleep, EMPTY_RESCAN_INTERVAL);
+        tx.send(1).unwrap();
+        join.abort();
+    }
+
+    #[tokio::test]
+    async fn deadline_advances_to_expiry() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 12).await;
+        let clock = Arc::new(TestClock::new(10));
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(MockInspector::new()),
+            clock.clone(),
+            ProcessIncarnation(1),
+        );
+        worker.run_once().await.unwrap();
+        clock.set(12);
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+}

@@ -223,6 +223,7 @@ pub enum ReceiptOrigin {
     Manual,
     CancellationArbitration,
     DeadlineExpiration,
+    ForgottenInterruption,
     ScheduleCollapse,
 }
 

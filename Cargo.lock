@@ -3132,6 +3132,7 @@ dependencies = [
  "phoenix-terminal",
  "phoenix-tls",
  "phoenix-tools",
+ "phoenix-workflow",
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",
