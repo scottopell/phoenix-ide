@@ -185,6 +185,11 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
+        .route("/api/conversations/:id/wake", get(get_wake_status))
+        .route(
+            "/api/conversations/:id/wake/:contract_id/cancel",
+            post(cancel_wake),
+        )
         // Steering queue management (task 01001)
         .route(
             "/api/conversations/:id/steering-queue/:message_id",
@@ -3529,6 +3534,89 @@ async fn send_chat(
             ))));
         }
     }))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct WakeStatusResponse {
+    pending_count: usize,
+    soonest_expires_at: Option<u64>,
+    contracts: Vec<WakeContractStatus>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct WakeContractStatus {
+    workflow_id: u64,
+    contract_id: String,
+    expires_at: u64,
+}
+
+async fn get_wake_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<WakeStatusResponse>, AppError> {
+    state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let rows = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .list_active_unresolved(1000)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let contracts: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row.conversation_id == id)
+        .map(|row| WakeContractStatus {
+            workflow_id: row.workflow_id.0,
+            contract_id: row.contract_id,
+            expires_at: row.expires_at.0,
+        })
+        .collect();
+    Ok(axum::Json(WakeStatusResponse {
+        pending_count: contracts.len(),
+        soonest_expires_at: contracts.iter().map(|row| row.expires_at).min(),
+        contracts,
+    }))
+}
+
+async fn cancel_wake(
+    State(state): State<AppState>,
+    Path((id, contract_id)): Path<(String, String)>,
+) -> Result<axum::Json<SuccessResponse>, AppError> {
+    state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let row = repo
+        .list_active_unresolved(1000)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .into_iter()
+        .find(|row| row.conversation_id == id && row.contract_id == contract_id)
+        .ok_or_else(|| AppError::NotFound("Wake contract not found".to_string()))?;
+    let outcome = repo
+        .cancel_allocated(&phoenix_db::workflow::wake::WakeCancelIfUnresolvedInput {
+            workflow_id: row.workflow_id,
+            timestamp: phoenix_workflow::Timestamp(
+                chrono::Utc::now().timestamp().max(0).cast_unsigned(),
+            ),
+            reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+        })
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if matches!(
+        outcome,
+        phoenix_db::workflow::wake::WakeCancellationOutcome::Stale
+    ) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Wake contract is already resolved",
+            "wake_already_resolved",
+        ))));
+    }
+    state.runtime.kick_wake_worker();
+    Ok(axum::Json(SuccessResponse { success: true }))
 }
 
 async fn cancel_conversation(
