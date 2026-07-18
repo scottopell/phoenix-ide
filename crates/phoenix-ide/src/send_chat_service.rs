@@ -501,6 +501,7 @@ fn transition_code(err: &TransitionError) -> &'static str {
         TransitionError::ContextExhausted => "context_exhausted",
         TransitionError::ConversationTerminal => "conversation_terminal",
         TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
+        TransitionError::AwaitingWorkToolApproval => "awaiting_work_tool_approval",
         TransitionError::AwaitingUserResponse => "awaiting_user_response",
         TransitionError::AgentBusy => "agent_busy",
         TransitionError::CancellationInProgress => "cancellation_in_progress",
