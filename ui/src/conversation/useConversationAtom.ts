@@ -65,7 +65,6 @@ export type ConversationPageView = Pick<
   | 'turnRetryContext'
   | 'transcriptGeneration'
   | 'transcriptCoverage'
-  | 'liveBashProgress'
 >;
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
@@ -83,7 +82,6 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'turnRetryContext',
   'transcriptGeneration',
   'transcriptCoverage',
-  'liveBashProgress',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -133,7 +131,6 @@ export function useConversationView(
       turnRetryContext: a.turnRetryContext,
       transcriptGeneration: a.transcriptGeneration,
       transcriptCoverage: a.transcriptCoverage,
-      liveBashProgress: a.liveBashProgress,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;
@@ -184,6 +181,21 @@ export function useLastSseEventAt(slug: string): number {
     [store, slug],
   );
 
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+const EMPTY_LIVE_BASH_PROGRESS: ConversationAtom['liveBashProgress'] = {};
+
+export function useLiveBashProgress(slug: string | null) {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => slug ? store.subscribe(slug, listener) : () => undefined,
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => slug ? store.getSnapshot(slug).liveBashProgress : EMPTY_LIVE_BASH_PROGRESS,
+    [store, slug],
+  );
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 

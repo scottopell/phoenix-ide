@@ -10,6 +10,7 @@ import {
   useImperativeHandle,
 } from 'react';
 import { useDensity } from '../hooks/useDensity';
+import { useLiveBashProgress } from '../conversation';
 import {
   FindBar,
   buildConversationSearchProjection,
@@ -102,8 +103,6 @@ const MessageSquareIcon = () => (
   </svg>
 );
 
-const EMPTY_LIVE_BASH_PROGRESS: import('../conversation/atom').ConversationAtom['liveBashProgress'] = {};
-
 interface MessageListProps {
   messages: Message[];
   pendingMessages: QueuedMessage[];
@@ -117,7 +116,6 @@ interface MessageListProps {
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
-  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   enableMessageSidepanel?: boolean | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
    *  indices currently rendered. Fired as the user scrolls. The conversation nav
@@ -350,7 +348,6 @@ function MessageListImpl({
   filePathRootDir,
   workScopeKey,
   enableMessageSidepanel = true,
-  liveBashProgress = EMPTY_LIVE_BASH_PROGRESS,
   onVisibleRangeChange,
   onChaptersChange,
   hasOlderMessages = false,
@@ -361,6 +358,7 @@ function MessageListImpl({
   transcriptPositioning,
   onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
+  const liveBashProgress = useLiveBashProgress(slug ?? null);
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
   const { pushScope, popScope } = useFocusScopeCommands();

@@ -845,6 +845,85 @@ describe('inline tool timers', () => {
     expect(document.querySelector('.compact-tool-card-summary-tail')).not.toBeNull();
   });
 
+  it('renders typed bash output with bounded log viewport, partial affordance, truncation notice, and friendly durations', () => {
+    const agent = agentMessage('agent-bash-typed-live', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'wait', handle: 'b-22', wait_seconds: 5 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'still_running',
+      handle: 'b-22',
+      label: 'fixture-vitest',
+      waited_ms: 1840,
+      truncated_before: true,
+      lines: [
+        { offset: 41, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
+        { offset: 42, bytes: ' Test Files  1 passed' },
+      ],
+      partial: 'watching for file changes',
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('still running')).toBeInTheDocument();
+    expect(screen.getByText('waited 1.8s')).toBeInTheDocument();
+    expect(screen.getByText('[older output omitted from this tail]')).toBeInTheDocument();
+    expect(screen.getByText('[final line still streaming — no newline yet]')).toBeInTheDocument();
+    expect(screen.getByText('partial')).toBeInTheDocument();
+    const log = screen.getByRole('log');
+    expect(log).toBeInTheDocument();
+    expect(log.className).toContain('bash-output-viewport');
+    expect(screen.getByText('… ✓ src/components/MessageComponents.test.tsx (68 tests)')).toBeInTheDocument();
+    expect(screen.getByText('watching for file changes')).toBeInTheDocument();
+  });
+
+  it('renders tombstone exit metadata and final duration in typed bash output', () => {
+    const agent = agentMessage('agent-bash-tombstone', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'peek', handle: 'b-24', lines: 20 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'tombstoned',
+      final_cause: 'exited normally',
+      handle: 'b-24',
+      exit_code: 17,
+      duration_ms: 30000,
+      lines: [{ offset: 1, bytes: ' archived output retained for inspection' }],
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('tombstoned · exited normally')).toBeInTheDocument();
+    expect(screen.getByText('exit 17')).toBeInTheDocument();
+    expect(screen.getByText('ran 30s')).toBeInTheDocument();
+  });
+
   it('shows a diagnostic when a historical tool_use has no paired result', () => {
     const agent = agentMessage('agent-missing-result', [
       { type: 'tool_use', id: 'tool-read', name: 'read_file', input: { path: 'missing.md' } },

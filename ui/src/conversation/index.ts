@@ -5,6 +5,7 @@ export { useCreateConversationWithStore } from './useCreateConversationWithStore
 export {
   useConversationAtom,
   useConversationView,
+  useLiveBashProgress,
   useConversationEventCursorRef,
   useLastSseEventAt,
   useLastSseEventAtRef,

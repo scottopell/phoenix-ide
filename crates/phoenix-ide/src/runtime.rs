@@ -515,6 +515,9 @@ enum RingOp {
     /// Append the event to the ring. Used for ephemeral events emitted via
     /// `send_seq` and for eager (non-persisted) Message broadcasts.
     Append,
+    /// Broadcast without consuming reconnect replay capacity. Used for
+    /// replaceable, non-authoritative progress snapshots.
+    BroadcastOnly,
 }
 
 #[derive(Debug)]
@@ -692,6 +695,7 @@ impl SseBroadcaster {
                         sequence_id: seq,
                     });
             }
+            RingOp::BroadcastOnly => {}
         }
         self.tx.send(event).map_err(|_| ())
     }
@@ -755,6 +759,14 @@ impl SseBroadcaster {
         let seq = self.next_seq();
         let event = build(seq);
         self.send_with_ring(event, seq, RingOp::Append)
+    }
+
+    /// Broadcast a replaceable live-progress event without consuming the
+    /// reconnect ring reserved for lifecycle-critical ephemeral events.
+    pub fn send_live_progress(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let seq = self.next_seq();
+        let event = build(seq);
+        self.send_with_ring(event, seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -3643,6 +3655,55 @@ mod broadcaster_tests {
         );
         assert!(events.is_empty());
         assert_eq!(b.replay_ring_bytes(), 0);
+    }
+
+    #[test]
+    fn live_progress_broadcasts_without_consuming_replay_capacity() {
+        use phoenix_core::domain::bash_progress::BashToolProgress;
+
+        let b = SseBroadcaster::new(16, 0);
+        let mut rx = b.subscribe();
+        let _ = b.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+            sequence_id,
+            tool_use_id: "tool-1".to_string(),
+            progress: BashToolProgress {
+                handle: "b-1".to_string(),
+                start_offset: 0,
+                end_offset: 0,
+                truncated_before: false,
+                lines: Vec::new(),
+                partial: None,
+            },
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SseEvent::BashToolProgress { .. })
+        ));
+        drop(rx);
+
+        for index in 0..(REPLAY_RING_CAPACITY + 9) {
+            let _ = b.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id: "tool-1".to_string(),
+                progress: BashToolProgress {
+                    handle: "b-1".to_string(),
+                    start_offset: index as u64,
+                    end_offset: index as u64,
+                    truncated_before: false,
+                    lines: Vec::new(),
+                    partial: None,
+                },
+            });
+        }
+
+        let _rx = b.subscribe();
+        let _ = b.send_seq(|sequence_id| token_event(sequence_id, "lifecycle"));
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
+        assert_eq!(anchor, 0);
+        assert!(!truncated);
+        assert_eq!(highest, i64::try_from(REPLAY_RING_CAPACITY + 11).unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], SseEvent::Token { text, .. } if text == "lifecycle"));
     }
 
     /// `send_seq` (ephemeral) appends the event to the ring.

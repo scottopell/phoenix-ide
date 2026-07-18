@@ -537,7 +537,7 @@ async fn run_run(
                     child,
                     registry.lifecycle_sink(),
                     sandbox_scratch_dir,
-                    progress_reporter.as_ref(),
+                    progress_reporter.clone(),
                 );
                 let response = race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await;
                 if let Some(reporter) = progress_reporter {
@@ -657,10 +657,22 @@ fn start_io_tasks(
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
-    progress_reporter: Option<&Arc<LiveBashProgressReporter>>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    if let Some(reporter) = progress_reporter.clone() {
+        let progress_handle = handle.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LIVE_PROGRESS_MIN_INTERVAL);
+            interval.tick().await;
+            while reporter.is_active() {
+                interval.tick().await;
+                reporter.maybe_emit_handle(&progress_handle, false).await;
+            }
+        });
+    }
 
     // Spawn the readers and capture their JoinHandles so the waiter
     // can join them between `child.wait()` and `transition_to_terminal`.
@@ -670,14 +682,14 @@ fn start_io_tasks(
     // a non-Live state and silently drops those bytes.
     let stdout_join = stdout.map(|s| {
         let h = handle.clone();
-        let reporter = progress_reporter.cloned();
+        let reporter = progress_reporter.clone();
         tokio::spawn(async move {
             read_pipe_to_ring(s, h, reporter).await;
         })
     });
     let stderr_join = stderr.map(|s| {
         let h = handle.clone();
-        let reporter = progress_reporter.cloned();
+        let reporter = progress_reporter.clone();
         tokio::spawn(async move {
             read_pipe_to_ring(s, h, reporter).await;
         })
@@ -693,6 +705,7 @@ fn start_io_tasks(
             stderr_join,
             lifecycle_sink,
             sandbox_scratch_dir,
+            progress_reporter,
         )
         .await;
     });
@@ -811,6 +824,10 @@ impl LiveBashProgressReporter {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
+    fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     async fn maybe_emit_handle(&self, handle: &Handle, force: bool) {
         let state = handle.state().await;
         if let HandleState::Live(live) = state.as_ref() {
@@ -829,9 +846,12 @@ impl LiveBashProgressReporter {
         let prior_output_bytes = self
             .last_emitted_output_bytes
             .load(std::sync::atomic::Ordering::Acquire);
-        let partial = ring
-            .partial_str()
-            .map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
+        let raw_partial = ring.partial_str();
+        let partial_was_truncated = raw_partial
+            .as_ref()
+            .is_some_and(|text| text.len() > LIVE_PROGRESS_MAX_PARTIAL_BYTES);
+        let partial =
+            raw_partial.map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
         if !force && output_bytes == prior_output_bytes {
             return;
         }
@@ -853,12 +873,15 @@ impl LiveBashProgressReporter {
         let mut remaining_bytes =
             LIVE_PROGRESS_MAX_BYTES.saturating_sub(partial.as_ref().map_or(0, String::len));
         let mut lines: Vec<BashProgressLine> = Vec::new();
+        let mut projected_lines_truncated = false;
         for line in view.lines.iter().rev() {
             if remaining_bytes == 0 {
+                projected_lines_truncated = true;
                 break;
             }
             let text = String::from_utf8_lossy(&line.bytes);
             let bounded = suffix_within_bytes(&text, remaining_bytes);
+            projected_lines_truncated |= bounded.len() < text.len();
             remaining_bytes = remaining_bytes.saturating_sub(bounded.len());
             lines.push(BashProgressLine {
                 offset: line.offset,
@@ -866,11 +889,13 @@ impl LiveBashProgressReporter {
             });
         }
         lines.reverse();
+        let projection_truncated = partial_was_truncated || projected_lines_truncated;
+        let start_offset = lines.first().map_or(end_offset, |line| line.offset);
         self.sink.emit(BashToolProgress {
             handle: handle.handle_id.to_string(),
-            start_offset: view.start_offset,
+            start_offset,
             end_offset,
-            truncated_before: view.truncated_before,
+            truncated_before: view.truncated_before || projection_truncated,
             lines,
             partial,
         });
@@ -888,6 +913,7 @@ async fn run_waiter(
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -915,6 +941,10 @@ async fn run_waiter(
         }
     };
     let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
+    if let Some(reporter) = &progress_reporter {
+        reporter.maybe_emit_handle(&handle, true).await;
+        reporter.deactivate();
+    }
 
     let elapsed = started_at.elapsed();
     if handle
@@ -1675,6 +1705,35 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         )
+    }
+
+    #[test]
+    fn progress_projection_reports_byte_budget_truncation() {
+        use std::sync::Mutex;
+
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
+            captured.lock().expect("progress lock").push(progress);
+        });
+        let reporter = LiveBashProgressReporter::new(sink);
+        let handle = live_handle();
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        ring.append(format!("{}\n", "x".repeat(LIVE_PROGRESS_MAX_BYTES + 100)).as_bytes());
+
+        reporter.maybe_emit(&handle, &ring, true);
+
+        let snapshots = emitted.lock().expect("progress lock");
+        let snapshot = snapshots.last().expect("progress snapshot");
+        assert!(snapshot.truncated_before);
+        assert!(
+            snapshot
+                .lines
+                .iter()
+                .map(|line| line.text.len())
+                .sum::<usize>()
+                <= LIVE_PROGRESS_MAX_BYTES
+        );
     }
 
     #[test]

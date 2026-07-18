@@ -2218,7 +2218,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         onOpenCommissionReview={canOpenMessageSidepanel ? handleOpenCommissionReview : undefined}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
-        liveBashProgress={atom.liveBashProgress}
         enableMessageSidepanel={canOpenMessageSidepanel}
         conversationId={conversationId}
         slug={slug}

@@ -263,14 +263,15 @@ WHEN bash is the active in-flight tool operation for a conversation turn
 THE SYSTEM SHALL make a typed, ephemeral projection of the same bounded ring-buffer state available to the conversation UI, keyed by the active `tool_use_id`
 AND SHALL include enough information for the UI to render the current operation identity, lifecycle status, elapsed time or final duration when known, complete lines, the trailing partial line when present, and whether the bounded tail truncated older output
 
-THE SYSTEM SHALL keep that live-output projection bounded and replay-safe
-AND SHALL reject stale or out-of-order updates by the same total-order sequencing rules that govern other conversation SSE events
+THE SYSTEM SHALL keep that live-output projection bounded and ordered on the live conversation stream
+AND SHALL NOT let replaceable progress snapshots consume reconnect replay capacity reserved for lifecycle-critical events
+AND SHALL reject stale or out-of-order live updates by the conversation SSE sequence
 AND SHALL clear the ephemeral projection atomically when the authoritative terminal tool result for that `tool_use_id` is applied, or when the active turn is abandoned
 
 THE SYSTEM SHALL NOT persist incremental bash progress into durable conversation message JSON
 AND SHALL treat the live bash ring buffer as the authoritative source while the process is live, with the normal persisted tool result becoming authoritative after terminal handoff
 
-**Rationale:** The ring buffer already exists for handle inspection; the conversation transcript needs the same live facts during the blocking window of a `run` or `wait` call so inline tool cards are not forced to guess or wait for terminal completion. Making the projection typed, bounded, ordered, and ephemeral preserves one durable source of truth per phase rather than inventing a second persisted copy of incremental output.
+**Rationale:** The ring buffer already exists for handle inspection; the conversation transcript needs the same live facts during the blocking window of a `run` or `wait` call so inline tool cards are not forced to guess or wait for terminal completion. Making the projection typed, bounded, live-ordered, and ephemeral preserves one durable source of truth per phase rather than inventing a second persisted copy of incremental output. Treating progress as replaceable live state also prevents noisy output from evicting lifecycle events required for reconnect reconstruction.
 
 **Rationale:** Caller-controlled offsets keep the server stateless on read
 cursors — a dropped network response, a re-asking agent, or a UI peeker do not

@@ -573,7 +573,7 @@ function tryParseJsonText(text: string): Record<string, unknown> | null {
 }
 
 function bashVisibleSearchText(
-  block: Extract<ContentBlock, { type: 'tool_use' }>,
+  block: ContentBlock,
   result: Message | undefined,
   progress: BashToolProgress | undefined,
 ): string {

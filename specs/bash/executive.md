@@ -49,7 +49,7 @@ A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
 the ring under a mutex. That same bounded state is reusable as an ephemeral UI
 projection during a blocking `run` or `wait`: the conversation layer keys live
-bash progress by `tool_use_id`, replays it through the normal total-order SSE
+bash progress by `tool_use_id`, broadcasts it as typed, live-ordered SSE without consuming lifecycle replay capacity
 machinery, and clears it atomically when the terminal tool result is applied so
 incremental output never becomes a second durable transcript representation. The
 waiter task observes process exit, swaps the handle's `RwLock<Arc<HandleState>>`

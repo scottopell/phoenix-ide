@@ -4804,11 +4804,12 @@ where
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
         let bash_progress_sink: Arc<dyn BashProgressSink> = Arc::new(move |progress| {
-            let _ = progress_broadcaster.send_seq(|sequence_id| SseEvent::BashToolProgress {
-                sequence_id,
-                tool_use_id: progress_tool_use_id.clone(),
-                progress,
-            });
+            let _ =
+                progress_broadcaster.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+                    sequence_id,
+                    tool_use_id: progress_tool_use_id.clone(),
+                    progress,
+                });
         });
         let tool_ctx = ToolContext::new(
             cancel_token,
