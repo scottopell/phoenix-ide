@@ -91,6 +91,7 @@ export function ContextExhaustedHandoff({
   const [editDraft, setEditDraft] = useState(() => loadEditDraft(parentId, generatedHandoff));
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [draftPersisted, setDraftPersisted] = useState(true);
   const hasContinuation = continuedInConvId != null;
   const editorValue = editDraft ?? generatedHandoff;
 
@@ -98,15 +99,16 @@ export function ContextExhaustedHandoff({
     setMode('reviewing');
     setEditDraft(loadEditDraft(parentId, generatedHandoff));
     setFeedback(null);
+    setDraftPersisted(true);
   }, [parentId, generatedHandoff]);
 
   const updateDraft = (text: string) => {
     setEditDraft(text === generatedHandoff ? null : text);
-    if (!saveEditDraft(parentId, generatedHandoff, text)) {
-      setFeedback('Your edit is available in this tab, but browser storage is unavailable.');
-    } else {
-      setFeedback(null);
-    }
+    const persisted = saveEditDraft(parentId, generatedHandoff, text);
+    setDraftPersisted(persisted);
+    setFeedback(
+      persisted ? null : 'Your edit is retained in this tab only; browser storage is unavailable.',
+    );
   };
 
   const submit = async (handoff: string) => {
@@ -162,8 +164,13 @@ export function ContextExhaustedHandoff({
               </button>
               <button type="button" className="context-exhausted-copy" disabled={disabled || submitting} onClick={() => setMode('editing')}>Edit first</button>
               <button type="button" className="context-exhausted-copy" disabled={submitting} onClick={() => void onCopy(generatedHandoff)}>Copy handoff</button>
-              {editDraft !== null && <span className="context-exhausted-draft-note">Local edit saved</span>}
+              {editDraft !== null && (
+                <span className="context-exhausted-draft-note">
+                  {draftPersisted ? 'Local edit saved' : 'Edit retained in this tab only'}
+                </span>
+              )}
             </div>
+            {feedback && <p className="context-exhausted-handoff-feedback" role="alert">{feedback}</p>}
             <pre className="context-exhausted-content">{generatedHandoff}</pre>
           </>
         ) : (
@@ -195,6 +202,7 @@ export function ContextExhaustedHandoff({
                     clearEditDraft(parentId);
                     setEditDraft(null);
                     setFeedback(null);
+                    setDraftPersisted(true);
                   }
                 }}
               >

@@ -181,11 +181,15 @@ export function DraftLifecycle({ slug }: { slug: string }): null {
   return null;
 }
 
+const inMemorySeedDrafts = new Map<string, string>();
+
 export function seedDraftStorageKey(conversationId: string): string {
   return `seed-draft:${conversationId}`;
 }
 
 export function readSeedDraft(conversationId: string): string {
+  const inMemory = inMemorySeedDrafts.get(conversationId);
+  if (inMemory !== undefined) return inMemory;
   try {
     return localStorage.getItem(seedDraftStorageKey(conversationId)) ?? '';
   } catch (error) {
@@ -194,19 +198,28 @@ export function readSeedDraft(conversationId: string): string {
   }
 }
 
-export function writeSeedDraft(conversationId: string, value: string): void {
+/** Keeps the seed available in this browser tab even when persistent storage is unavailable. */
+export function writeSeedDraft(conversationId: string, value: string): boolean {
+  if (value === '') {
+    inMemorySeedDrafts.delete(conversationId);
+  } else {
+    inMemorySeedDrafts.set(conversationId, value);
+  }
   try {
     if (value === '') {
       localStorage.removeItem(seedDraftStorageKey(conversationId));
     } else {
       localStorage.setItem(seedDraftStorageKey(conversationId), value);
     }
+    return true;
   } catch (error) {
     console.warn('Error saving seed draft to localStorage:', error);
+    return false;
   }
 }
 
 export function clearSeedDraft(conversationId: string): void {
+  inMemorySeedDrafts.delete(conversationId);
   try {
     localStorage.removeItem(seedDraftStorageKey(conversationId));
   } catch (error) {

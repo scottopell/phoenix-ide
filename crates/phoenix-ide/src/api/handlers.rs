@@ -3746,36 +3746,45 @@ async fn cancel_steering_message(
 ///   - 500 on DB/transaction failure
 async fn dispatch_continuation_handoff(
     state: &AppState,
-    parent_id: &str,
-    conversation_id: &str,
-    req: ContinueConversationRequest,
+    intent: crate::db::ContinuationDispatchIntent,
 ) -> (ContinueConversationStatus, Option<String>) {
+    let parent_id = intent.parent_conversation_id.clone();
+    let conversation_id = intent.successor_conversation_id.clone();
     let dispatch = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
     )
     .send(crate::send_chat_service::SendChatRequest {
-        conversation_id: conversation_id.to_string(),
-        text: req.handoff,
-        message_id: req.message_id,
+        conversation_id: conversation_id.clone(),
+        text: intent.handoff,
+        message_id: intent.message_id,
         images: Vec::new(),
         files: Vec::new(),
-        user_agent: req.user_agent,
+        user_agent: intent.user_agent,
         expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
     })
     .await;
     match dispatch {
         Ok(
             crate::send_chat_service::SendChatOutcome::Delivered
-            | crate::send_chat_service::SendChatOutcome::AlreadyPersisted,
-        ) => (ContinueConversationStatus::Accepted, None),
-        Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => (
-            ContinueConversationStatus::DispatchFailed,
-            Some(
-                "The continuation was created, but its opening handoff was unexpectedly queued."
-                    .to_string(),
-            ),
-        ),
+            | crate::send_chat_service::SendChatOutcome::AlreadyPersisted
+            | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
+        ) => match state
+            .db
+            .mark_continuation_dispatch_accepted(&parent_id)
+            .await
+        {
+            Ok(()) => (ContinueConversationStatus::Accepted, None),
+            Err(error) => {
+                tracing::warn!(
+                    parent_id,
+                    continuation_id = conversation_id,
+                    error = %error,
+                    "handoff accepted but durable intent remains pending; idempotent retry will reconcile",
+                );
+                (ContinueConversationStatus::Accepted, None)
+            }
+        },
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
             (ContinueConversationStatus::DispatchFailed, Some(message))
         }
@@ -3807,10 +3816,17 @@ async fn continue_conversation(
         ));
     }
 
-    let outcome = state
+    let (outcome, intent) = state
         .runtime
         .db()
-        .continue_conversation(&id)
+        .continue_conversation_with_intent(
+            &id,
+            crate::db::NewContinuationDispatchIntent {
+                message_id: req.message_id,
+                handoff: req.handoff,
+                user_agent: req.user_agent,
+            },
+        )
         .await
         .map_err(|e| match e {
             DbError::ConversationNotFound(msg) => AppError::NotFound(msg),
@@ -3844,8 +3860,12 @@ async fn continue_conversation(
 
             let conversation_id = new_conv.id;
             let slug = new_conv.slug;
-            let (status, error) =
-                dispatch_continuation_handoff(&state, &id, &conversation_id, req).await;
+            let Some(intent) = intent else {
+                return Err(AppError::Internal(
+                    "continuation created without a dispatch intent".to_string(),
+                ));
+            };
+            let (status, error) = dispatch_continuation_handoff(&state, intent).await;
 
             Ok(Json(ContinueConversationResponse {
                 conversation_id,
@@ -3860,6 +3880,15 @@ async fn continue_conversation(
                 existing_continuation = %existing.id,
                 "continuation already existed; returning existing id idempotently",
             );
+            if let Some(intent) = intent.filter(|intent| !intent.accepted) {
+                let (status, error) = dispatch_continuation_handoff(&state, intent).await;
+                return Ok(Json(ContinueConversationResponse {
+                    conversation_id: existing.id,
+                    slug: existing.slug,
+                    status,
+                    error,
+                }));
+            }
             Ok(Json(ContinueConversationResponse {
                 conversation_id: existing.id,
                 slug: existing.slug,

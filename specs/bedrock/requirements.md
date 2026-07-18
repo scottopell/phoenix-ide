@@ -447,12 +447,19 @@ THE SYSTEM SHALL NOT modify the generated continuation summary
 AND SHALL allow the local edit draft to be reverted to the generated handoff
 AND SHALL reject an empty or whitespace-only edited handoff before successor creation
 
-WHEN the successor is created but its opening handoff is not accepted
-THE SYSTEM SHALL return the successor identity and the failed dispatch outcome
-AND SHALL preserve the exact attempted handoff as a recoverable draft in the successor
+WHEN a continuation successor is created
+THE SYSTEM SHALL atomically persist the exact selected handoff and client message identifier as a pending dispatch intent with the successor ownership transfer
+
+WHEN a pending opening-handoff intent is retried after interruption or failed dispatch
+THE SYSTEM SHALL dispatch the original persisted handoff with its original message identifier
+AND SHALL return the successor identity and dispatch outcome
+AND SHALL NOT replace the original intent with later request text
 AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
 
-**Rationale:** Context exhaustion is a focused transfer point. Explicit unchanged, edit-first, and copy paths make the consequence of each action visible, while keeping destructive workspace actions away from the continuation controls. Separating generated content from local edits ensures the operational handoff always remains recoverable. A successor creation and message dispatch cross a failure boundary, so partial success must preserve both the successor and the user's exact text.
+WHEN opening-handoff dispatch is accepted synchronously or queued durably
+THE SYSTEM SHALL treat the handoff as accepted
+
+**Rationale:** Context exhaustion is a focused transfer point. Explicit unchanged, edit-first, and copy paths make the consequence of each action visible, while keeping destructive workspace actions away from the continuation controls. Separating generated content from local edits ensures the operational handoff always remains recoverable. A successor creation and message dispatch cross a failure boundary, so the ownership transfer must durably record dispatch intent before asynchronous acceptance begins.
 
 ---
 
