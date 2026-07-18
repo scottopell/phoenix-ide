@@ -404,9 +404,10 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             reason: "durable deployment status has no transaction ID".to_string(),
         };
     };
+    let marker = approved_marker(state, &transaction_id);
     let published = value.get("source_kind").and_then(serde_json::Value::as_str)
         == Some("published_release")
-        || approved_marker(state, &transaction_id).is_file();
+        || marker.is_file();
     if !published {
         return ReleaseTransactionStatus::None;
     }
@@ -445,7 +446,11 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
         transaction_id,
         state,
         source_commit: string("source_commit"),
-        release_tag: string("release_tag"),
+        release_tag: string("release_tag").or_else(|| {
+            fs::read_to_string(&marker)
+                .ok()
+                .and_then(|contents| contents.lines().next().map(str::to_string))
+        }),
         expected_version: string("expected_version"),
         expected_git_sha: string("expected_git_sha"),
         created_at: string("created_at"),
@@ -746,13 +751,14 @@ pub async fn approve(
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
+        let durable = read_status(&state, selected_backend);
         if let ReleaseTransactionStatus::Present {
             transaction_id: durable_id,
             state: durable_state,
             ..
-        } = read_status(&state, selected_backend)
+        } = &durable
         {
-            if durable_id == transaction_id
+            if durable_id == &transaction_id
                 && (durable_state == "activating"
                     || TERMINAL_STATUS_STATES.contains(&durable_state.as_str()))
             {
@@ -770,6 +776,22 @@ pub async fn approve(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                if status.success()
+                    && matches!(
+                        durable,
+                        ReleaseTransactionStatus::Present {
+                            transaction_id: ref durable_id,
+                            state: ref durable_state,
+                            ..
+                        } if durable_id == &transaction_id && durable_state == "prepared"
+                    )
+                {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(ApproveReleaseUpdateResponse { transaction_id }),
+                    )
+                        .into_response();
+                }
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -787,21 +809,27 @@ pub async fn approve(
                 )
                     .into_response();
             }
-            Ok(None)
-                if tokio::time::Instant::now() >= deadline
-                    && !matches!(
-                        read_status(&state, selected_backend),
-                        ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
-                            if durable_id == &transaction_id
-                    ) =>
-            {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+            Ok(None) if tokio::time::Instant::now() >= deadline => {
+                let claimed = matches!(
+                    durable,
+                    ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
+                        if durable_id == &transaction_id
+                );
+                if claimed {
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(error) = child.wait() {
+                            tracing::warn!(%error, "failed to reap timed-out release controller");
+                        }
+                    });
+                } else {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+                    }
+                    #[cfg(not(unix))]
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
-                #[cfg(not(unix))]
-                let _ = child.kill();
-                let _ = child.wait();
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     Json(serde_json::json!({

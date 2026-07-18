@@ -63,6 +63,7 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
         <div>Runtime identity: {transaction.expected_version ?? 'unknown'} <code>{transaction.expected_git_sha ?? 'unknown'}</code></div>
       )}
       {transaction.source_commit && <div>Approved source commit: <code>{transaction.source_commit}</code></div>}
+      {transaction.release_tag && <div>Approved release: <strong>{transaction.release_tag}</strong></div>}
       {transaction.updated_at && <div>Updated: {new Date(transaction.updated_at).toLocaleString()}</div>}
       {transaction.failure && <div>Failure: {transaction.failure}</div>}
       {transaction.rollback_failure && <div>Rollback failure: {transaction.rollback_failure}</div>}
