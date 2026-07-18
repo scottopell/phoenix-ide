@@ -130,7 +130,8 @@ fn ahead_behind_counts(
     head_oid: &str,
     remote_ref: &str,
 ) -> Result<(u32, u32), String> {
-    let counts = run_git(
+    const DISPLAY_SAFE_ERROR: &str = "Last-fetched remote comparison is unavailable.";
+    let counts = match run_git(
         worktree_path,
         &[
             "rev-list",
@@ -138,20 +139,23 @@ fn ahead_behind_counts(
             "--count",
             &format!("{head_oid}...{remote_ref}"),
         ],
-    )
-    .map_err(|e| format!("failed to compare HEAD to {remote_ref}: {e}"))?;
-    let mut parts = counts.split_whitespace();
-    let ahead = parts
-        .next()
-        .ok_or_else(|| format!("missing ahead count for {remote_ref}"))?
-        .parse::<u32>()
-        .map_err(|e| format!("invalid ahead count for {remote_ref}: {e}"))?;
-    let behind = parts
-        .next()
-        .ok_or_else(|| format!("missing behind count for {remote_ref}"))?
-        .parse::<u32>()
-        .map_err(|e| format!("invalid behind count for {remote_ref}: {e}"))?;
-    Ok((ahead, behind))
+    ) {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::warn!(%error, remote_ref, "failed to compare checkout with remote ref");
+            return Err(DISPLAY_SAFE_ERROR.to_string());
+        }
+    };
+    let parsed = (|| {
+        let mut parts = counts.split_whitespace();
+        let ahead = parts.next()?.parse::<u32>().ok()?;
+        let behind = parts.next()?.parse::<u32>().ok()?;
+        Some((ahead, behind))
+    })();
+    parsed.ok_or_else(|| {
+        tracing::warn!(remote_ref, output = %counts, "git returned invalid ahead/behind counts");
+        DISPLAY_SAFE_ERROR.to_string()
+    })
 }
 
 fn branch_remote_status(
@@ -249,7 +253,12 @@ fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStat
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unavailable {
             error,
             ..
-        } => CheckoutStatus::Unavailable { reason: error },
+        } => {
+            tracing::warn!(%error, "failed to observe worktree checkout");
+            CheckoutStatus::Unavailable {
+                reason: "Checkout status is unavailable.".to_string(),
+            }
+        }
     }
 }
 
@@ -291,10 +300,10 @@ fn same_checkout(left: &CheckoutStatus, right: &CheckoutStatus) -> bool {
     }
 }
 
-fn capture_with_stable_checkout<T, E>(
+fn capture_with_stable_checkout<T>(
     worktree_path: &FsPath,
-    mut capture: impl FnMut() -> Result<T, E>,
-) -> Result<(T, CheckoutStatus), E> {
+    mut capture: impl FnMut() -> Result<T, AppError>,
+) -> Result<(T, CheckoutStatus), AppError> {
     for attempt in 0..CHECKOUT_CAPTURE_ATTEMPTS {
         let before = checkout_status_from_live_observation(worktree_path);
         let captured = capture()?;
@@ -303,12 +312,10 @@ fn capture_with_stable_checkout<T, E>(
             return Ok((captured, after));
         }
         if attempt + 1 == CHECKOUT_CAPTURE_ATTEMPTS {
-            return Ok((
-                captured,
-                CheckoutStatus::Unavailable {
-                    reason: "checkout changed while the diff was captured; reload to retry"
-                        .to_string(),
-                },
+            tracing::warn!("worktree checkout changed repeatedly while capturing diff");
+            return Err(AppError::Internal(
+                "The worktree checkout changed while the diff was captured. Reload to retry."
+                    .to_string(),
             ));
         }
     }
@@ -1924,13 +1931,8 @@ pub(crate) async fn get_conversation_diff(
         }
 
         let (captured, checkout_status) = capture_with_stable_checkout(&wt, || {
-            Ok::<_, std::convert::Infallible>(capture_branch_diff(
-                &wt,
-                &base_branch,
-                MAX_DIFF_BYTES,
-            ))
-        })
-        .expect("infallible workspace diff capture");
+            Ok(capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES))
+        })?;
 
         Ok(build_diff_response(
             captured,
@@ -2799,11 +2801,12 @@ mod tests {
         else {
             panic!("expected named branch");
         };
-        assert!(matches!(
+        assert_eq!(
             remote_status,
-            BranchRemoteStatus::Unavailable { reason }
-                if reason.contains("refs/remotes/origin/feature")
-        ));
+            BranchRemoteStatus::Unavailable {
+                reason: "Last-fetched remote comparison is unavailable.".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2878,7 +2881,7 @@ mod tests {
             if captures == 1 {
                 run_git(repo.path(), &["checkout", "-q", "-b", "other"]).unwrap();
             }
-            Ok::<_, std::convert::Infallible>(captures)
+            Ok::<_, AppError>(captures)
         })
         .unwrap();
 
@@ -2890,6 +2893,57 @@ mod tests {
                 ..
             } if branch_name == "other"
         ));
+    }
+
+    #[test]
+    fn unstable_checkout_capture_returns_no_diff() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let mut captures = 0_u8;
+
+        let error = capture_with_stable_checkout(repo.path(), || {
+            captures += 1;
+            if captures == 1 {
+                run_git(repo.path(), &["checkout", "-q", "-b", "other"]).unwrap();
+            } else {
+                run_git(repo.path(), &["checkout", "-q", "main"]).unwrap();
+            }
+            Ok(captures)
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Internal(message)
+                if message == "The worktree checkout changed while the diff was captured. Reload to retry."
+        ));
+    }
+
+    #[test]
+    fn remote_comparison_error_is_display_safe() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            ahead_behind_counts(
+                repo.path(),
+                head_oid.trim(),
+                "refs/remotes/missing/private/server/path"
+            ),
+            Err("Last-fetched remote comparison is unavailable.".to_string())
+        );
+    }
+
+    #[test]
+    fn unavailable_checkout_error_is_display_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(directory.path()),
+            CheckoutStatus::Unavailable {
+                reason: "Checkout status is unavailable.".to_string(),
+            }
+        );
     }
 
     #[test]
