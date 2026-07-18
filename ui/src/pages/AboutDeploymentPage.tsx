@@ -137,6 +137,18 @@ function diskSizeLabel(size: DiskSize): string {
   }
 }
 
+function installationOwnershipText(ownership: DeploymentInfo['installation_ownership']): string {
+  switch (ownership.kind) {
+    case 'launchd_managed': return 'launchd managed';
+    case 'systemd_managed': return 'systemd managed';
+    case 'bare_supervisor_managed': return 'bare supervisor managed';
+    case 'development': return 'development';
+    case 'unmanaged': return `unmanaged — ${ownership.reason}`;
+    case 'ambiguous': return `ambiguous — ${ownership.reason}`;
+    case 'unsupported': return `unsupported on ${ownership.platform}`;
+  }
+}
+
 function resourceText(value: number | null, format: (n: number) => string): string {
   return value === null ? 'unavailable' : format(value);
 }
@@ -775,6 +787,7 @@ export function AboutDeploymentPage() {
                 <h3 className="settings-section__title">Build</h3>
                 <Row label="Version"><code>{info.build.version}</code></Row>
                 <Row label="Build"><code title="Git SHA">{info.build.git_sha}</code></Row>
+                <Row label="Runtime owner">{installationOwnershipText(info.installation_ownership)}</Row>
                 <Row label="Started">{formatDateTime(info.build.started_at)}</Row>
                 <Row label="Uptime">{formatUptime(info.build.uptime_seconds)}</Row>
               </section>

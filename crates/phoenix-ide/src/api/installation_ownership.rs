@@ -25,6 +25,29 @@ enum BareSupervisorEvidence {
     Unreadable(String),
 }
 
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct BareRuntimeIdentity {
+    version: String,
+    git_sha: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct BareChildIdentity {
+    pid: u32,
+    runtime: BareRuntimeIdentity,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+struct BareStatusResponse {
+    ok: bool,
+    protocol_version: u32,
+    supervisor_pid: u32,
+    child: Option<BareChildIdentity>,
+}
+
 pub async fn detect(runtime_env: &PhoenixRuntimeEnvironment) -> InstallationOwnership {
     let bare = probe_bare_supervisor(runtime_env).await;
     classify(
@@ -41,6 +64,10 @@ fn classify(
     activation: Activation,
     bare: BareSupervisorEvidence,
 ) -> InstallationOwnership {
+    if !production {
+        return InstallationOwnership::Development;
+    }
+
     let socket_owner = match activation {
         Activation::Launchd => Some(InstallationOwnership::LaunchdManaged),
         Activation::Systemd => Some(InstallationOwnership::SystemdManaged),
@@ -78,10 +105,6 @@ fn classify(
         (
             None,
             BareSupervisorEvidence::Absent | BareSupervisorEvidence::DoesNotOwnCurrentProcess,
-        ) if !production => InstallationOwnership::Development,
-        (
-            None,
-            BareSupervisorEvidence::Absent | BareSupervisorEvidence::DoesNotOwnCurrentProcess,
         ) => InstallationOwnership::Unmanaged {
             reason: "the running process has no supported runtime-owner evidence".to_string(),
         },
@@ -89,101 +112,72 @@ fn classify(
 }
 
 #[cfg(target_os = "linux")]
-async fn probe_bare_supervisor(runtime_env: &PhoenixRuntimeEnvironment) -> BareSupervisorEvidence {
-    use serde::Deserialize;
+fn validate_bare_socket(path: &std::path::Path) -> Result<bool, String> {
     use std::os::linux::fs::MetadataExt;
     use std::os::unix::fs::FileTypeExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_socket()
+        && metadata.st_uid() == unsafe { libc::geteuid() }
+        && metadata.st_mode().trailing_zeros() >= 6
+    {
+        Ok(true)
+    } else {
+        Err("supervisor socket is not an owner-only socket owned by the Phoenix user".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn request_bare_status(path: &std::path::Path) -> Result<(String, u32), String> {
     use std::os::unix::io::AsRawFd;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
-    use tokio::time::{timeout, Duration};
 
-    #[derive(Deserialize)]
-    struct RuntimeIdentity {
-        version: String,
-        git_sha: String,
-    }
-
-    #[derive(Deserialize)]
-    struct ChildIdentity {
-        pid: u32,
-        runtime: RuntimeIdentity,
-    }
-
-    #[derive(Deserialize)]
-    struct StatusResponse {
-        ok: bool,
-        protocol_version: u32,
-        supervisor_pid: u32,
-        child: Option<ChildIdentity>,
-    }
-
-    const PROTOCOL_VERSION: u32 = 1;
-    const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
-    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-
-    let socket_path = runtime_env.phoenix_home().join("run/supervisor.sock");
-    let metadata = match std::fs::symlink_metadata(&socket_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return BareSupervisorEvidence::Absent
-        }
-        Err(error) => return BareSupervisorEvidence::Unreadable(error.to_string()),
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
     };
-    if !metadata.file_type().is_socket()
-        || metadata.st_uid() != unsafe { libc::geteuid() }
-        || metadata.st_mode() & 0o077 != 0
-    {
-        return BareSupervisorEvidence::Unreadable(
-            "supervisor socket is not an owner-only socket owned by the Phoenix user".to_string(),
-        );
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .map_err(|error| error.to_string())?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 || credentials.uid != unsafe { libc::geteuid() } {
+        return Err("supervisor peer credentials do not match the Phoenix user".to_string());
     }
+    let peer_pid =
+        u32::try_from(credentials.pid).map_err(|_| "supervisor peer PID is invalid".to_string())?;
+    stream
+        .write_all(br#"{"protocol_version":1,"action":"status"}"#)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream.shutdown().await.map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .take(16 * 1024)
+        .read_line(&mut response)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((response, peer_pid))
+}
 
-    let probe = async {
-        let mut stream = UnixStream::connect(&socket_path).await?;
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut credentials).cast(),
-                &raw mut length,
-            )
-        };
-        if result != 0 || credentials.uid != unsafe { libc::geteuid() } {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "supervisor peer credentials do not match the Phoenix user",
-            ));
-        }
-        stream
-            .write_all(br#"{"protocol_version":1,"action":"status"}"#)
-            .await?;
-        stream.shutdown().await?;
-        let mut response = String::new();
-        BufReader::new(stream)
-            .take(MAX_RESPONSE_BYTES)
-            .read_line(&mut response)
-            .await?;
-        Ok::<_, std::io::Error>((response, credentials.pid))
-    };
-
-    let (response, peer_pid) = match timeout(PROBE_TIMEOUT, probe).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => return BareSupervisorEvidence::Unreadable(error.to_string()),
-        Err(_) => {
-            return BareSupervisorEvidence::Unreadable(
-                "supervisor status probe timed out".to_string(),
-            )
-        }
-    };
-    let status: StatusResponse = match serde_json::from_str(&response) {
+#[cfg(target_os = "linux")]
+fn bare_evidence(response: &str, peer_pid: u32) -> BareSupervisorEvidence {
+    let status: BareStatusResponse = match serde_json::from_str(response) {
         Ok(status) => status,
         Err(error) => {
             return BareSupervisorEvidence::Unreadable(format!(
@@ -192,11 +186,12 @@ async fn probe_bare_supervisor(runtime_env: &PhoenixRuntimeEnvironment) -> BareS
         }
     };
     if !status.ok
-        || status.protocol_version != PROTOCOL_VERSION
-        || status.supervisor_pid != peer_pid as u32
+        || status.protocol_version != 1
+        || status.supervisor_pid != peer_pid
+        || unsafe { libc::getppid() }.cast_unsigned() != peer_pid
     {
         return BareSupervisorEvidence::Unreadable(
-            "supervisor status did not match the authenticated protocol peer".to_string(),
+            "supervisor status did not match the authenticated direct parent".to_string(),
         );
     }
     match status.child {
@@ -210,6 +205,30 @@ async fn probe_bare_supervisor(runtime_env: &PhoenixRuntimeEnvironment) -> BareS
             }
         }
         _ => BareSupervisorEvidence::DoesNotOwnCurrentProcess,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_bare_supervisor(runtime_env: &PhoenixRuntimeEnvironment) -> BareSupervisorEvidence {
+    use tokio::time::{timeout, Duration};
+
+    let socket_path = runtime_env.phoenix_home().join("run/supervisor.sock");
+    match validate_bare_socket(&socket_path) {
+        Ok(true) => {}
+        Ok(false) => return BareSupervisorEvidence::Absent,
+        Err(reason) => return BareSupervisorEvidence::Unreadable(reason),
+    }
+    match timeout(
+        Duration::from_millis(500),
+        request_bare_status(&socket_path),
+    )
+    .await
+    {
+        Ok(Ok((response, peer_pid))) => bare_evidence(&response, peer_pid),
+        Ok(Err(reason)) => BareSupervisorEvidence::Unreadable(reason),
+        Err(_) => {
+            BareSupervisorEvidence::Unreadable("supervisor status probe timed out".to_string())
+        }
     }
 }
 
@@ -322,6 +341,24 @@ mod tests {
                 false,
                 Activation::None,
                 BareSupervisorEvidence::Absent
+            ),
+            InstallationOwnership::Development
+        );
+        assert_eq!(
+            classify(
+                "linux",
+                false,
+                Activation::Systemd,
+                BareSupervisorEvidence::Absent
+            ),
+            InstallationOwnership::Development
+        );
+        assert_eq!(
+            classify(
+                "linux",
+                false,
+                Activation::None,
+                BareSupervisorEvidence::OwnsCurrentProcess { supervisor_pid: 42 }
             ),
             InstallationOwnership::Development
         );

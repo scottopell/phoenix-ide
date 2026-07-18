@@ -215,6 +215,18 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllMocks();
   });
 
+  it('shows runtime ownership from deployment info without waiting for update discovery', async () => {
+    renderPage(deployment({
+      installation_ownership: {
+        kind: 'ambiguous',
+        reason: 'supervisor status probe timed out',
+      },
+    }));
+
+    expect(await screen.findByText('Runtime owner')).toBeInTheDocument();
+    expect(screen.getByText('ambiguous — supervisor status probe timed out')).toBeInTheDocument();
+  });
+
   it('summarizes measured, not-measured, and absent disk rows without summing overlaps', async () => {
     renderPage(deployment(), deploymentDisk({
       disk: [

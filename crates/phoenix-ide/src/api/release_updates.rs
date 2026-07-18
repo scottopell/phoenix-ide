@@ -168,6 +168,27 @@ fn backend(ownership: &InstallationOwnership) -> ReleaseUpdateBackend {
     }
 }
 
+fn transaction_backend(ownership: &InstallationOwnership) -> ReleaseUpdateBackend {
+    let managed = backend(ownership);
+    if !matches!(managed, ReleaseUpdateBackend::Unsupported) {
+        return managed;
+    }
+    match (ownership, crate::hot_restart::activation()) {
+        (InstallationOwnership::Ambiguous { .. }, crate::hot_restart::Activation::Launchd) => {
+            ReleaseUpdateBackend::Launchd
+        }
+        (InstallationOwnership::Ambiguous { .. }, crate::hot_restart::Activation::Systemd) => {
+            ReleaseUpdateBackend::Systemd
+        }
+        (InstallationOwnership::Ambiguous { .. }, crate::hot_restart::Activation::None)
+            if cfg!(target_os = "linux") =>
+        {
+            ReleaseUpdateBackend::BareLinux
+        }
+        _ => ReleaseUpdateBackend::Unsupported,
+    }
+}
+
 fn asset_name() -> Result<String, String> {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -494,6 +515,9 @@ fn authority(
     if !local {
         return ReleaseUpdateAuthority::RemoteBrowser;
     }
+    if !state.runtime_env.is_production() {
+        return ReleaseUpdateAuthority::NotProduction;
+    }
     match ownership {
         InstallationOwnership::Development => return ReleaseUpdateAuthority::NotProduction,
         InstallationOwnership::Unmanaged { reason } => {
@@ -568,7 +592,7 @@ pub async fn snapshot(
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         current_git_sha: env!("PHOENIX_GIT_SHA").to_string(),
         authority: authority(&state, local, &ownership, selected_backend, query.refresh),
-        transaction: read_status(&state, selected_backend),
+        transaction: read_status(&state, transaction_backend(&ownership)),
         preview,
         sampled_at: Utc::now(),
     })
@@ -930,6 +954,24 @@ mod tests {
             assert!(matches!(
                 backend(&ownership),
                 ReleaseUpdateBackend::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn ambiguous_bare_owner_still_selects_durable_status_backend() {
+        let ownership = InstallationOwnership::Ambiguous {
+            reason: "supervisor status probe timed out".to_string(),
+        };
+        if cfg!(target_os = "linux")
+            && matches!(
+                crate::hot_restart::activation(),
+                crate::hot_restart::Activation::None
+            )
+        {
+            assert!(matches!(
+                transaction_backend(&ownership),
+                ReleaseUpdateBackend::BareLinux
             ));
         }
     }
