@@ -2,6 +2,8 @@
 
 This directory contains **Skills** - organized packages of instructions and resources that give LLM agents specialized capabilities for specific tasks.
 
+`skills/` is the canonical source for Phoenix-maintained skills. Relative symlinks under `.agents/skills/` expose them to project-local discovery without duplicating content.
+
 ## What are Skills?
 
 Skills are an emerging standard from Anthropic for packaging procedural knowledge and organizational context for LLM agents. Think of them as "onboarding guides" that teach an agent how to perform specific tasks.
@@ -78,7 +80,8 @@ We're starting conservatively to learn how agents consume skills:
 
 | Skill | Description |
 |-------|-------------|
-| [phoenix-development](phoenix-development/SKILL.md) | Dev workflow: `./dev.py up/down/restart/check`, testing, code conventions |
+| [phoenix-development](phoenix-development/SKILL.md) | Root-cause-first Phoenix implementation loop, source-of-truth routing, validation, and specialized-skill handoffs |
+| [phoenix-explore](phoenix-explore/SKILL.md) | Breadth-first investigation of ambiguous feedback across Phoenix's easy-to-miss system boundaries |
 | [phoenix-ladle-fixture](phoenix-ladle-fixture/SKILL.md) | End-to-end workflow for adding Phoenix UI Ladle fixtures, QA capture scripts, `./dev.py qa` wiring, and fixture best practices |
 | [phoenix-extract-crate](phoenix-extract-crate/SKILL.md) | Methodology for splitting a large crate into a layered, acyclic workspace: what sinks to the base crate vs. stays, breaking cycles, sequencing incremental refactors that stay shippable |
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
