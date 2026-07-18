@@ -1,4 +1,5 @@
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
+import type { BashToolProgress } from '../../generated/sse';
 import type { StreamingBuffer } from '../../conversation/atom';
 import type { DiffSection } from '../../contexts/ReviewNotesContext';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
@@ -358,6 +359,7 @@ export interface ConversationProjectionOptions {
   streamingBuffer?: StreamingBuffer | null;
   systemPrompt?: string | null;
   systemPromptExpanded?: boolean;
+  liveBashProgress?: Readonly<Record<string, { progress: BashToolProgress }>>;
 }
 
 export function buildConversationSearchProjection(
@@ -388,7 +390,7 @@ export function buildConversationSearchProjection(
         }
         break;
       case 'agent_turn':
-        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density, unit.key === options.latestAgentKey)) {
+        for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId, density, unit.key === options.latestAgentKey, options.liveBashProgress ?? {})) {
           addConversationSource(
             sources,
             unitIndex,
@@ -561,11 +563,57 @@ function toolResultText(result: Message | undefined): string {
   return content?.content || content?.result || content?.error || '';
 }
 
+function tryParseJsonText(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function bashVisibleSearchText(
+  block: Extract<ContentBlock, { type: 'tool_use' }>,
+  result: Message | undefined,
+  progress: BashToolProgress | undefined,
+): string {
+  const parts: string[] = [];
+  if (block.display) parts.push(block.display);
+  const input = block.input as Record<string, unknown> | undefined;
+  const op = typeof input?.['op'] === 'string' ? input['op'] : null;
+  const handle = typeof input?.['handle'] === 'string' ? input['handle'] : null;
+  if (op === 'wait' && handle) parts.push(`wait ${handle}`);
+  if (op === 'peek' && handle) parts.push(`peek ${handle}`);
+  if (op === 'kill' && handle) parts.push(`kill ${handle}`);
+  const parsed = result ? tryParseJsonText(toolResultText(result)) : null;
+  if (parsed) {
+    if (typeof parsed['status'] === 'string') parts.push(String(parsed['status']).replace(/_/g, ' '));
+    if (typeof parsed['handle'] === 'string') parts.push(parsed['handle'] as string);
+    if (parsed['truncated_before'] === true) parts.push('older output omitted');
+    const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
+    for (const line of lines.slice(-2)) {
+      const text = line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
+        ? (line as { bytes: string }).bytes
+        : '';
+      if (text) parts.push(text);
+    }
+    if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) parts.push(parsed['partial']);
+    return parts.join('\n');
+  }
+  if (progress) {
+    if (progress.truncated_before) parts.push('older output omitted');
+    for (const line of progress.lines.slice(-2)) parts.push(line.text);
+    if (progress.partial) parts.push(progress.partial);
+  }
+  return parts.join('\n');
+}
+
 function agentTurnSources(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
+  liveBashProgress: Readonly<Record<string, { progress: BashToolProgress }>>,
 ): Array<{ role: string; text: string; forceExpanded?: boolean }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
@@ -579,9 +627,13 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
+      const result = toolResultsByUseId.get(block.id ?? '');
+      if (block.name === 'bash' && density === 'compact') {
+        out.push({ role: `tool-use-visible-bash-${index}`, text: bashVisibleSearchText(block, result, liveBashProgress[block.id ?? '']?.progress) });
+      }
       if (densityToolDetailsVisible(block.name, density)) {
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-        out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
+        out.push({ role: `tool-use-result-${index}`, text: toolResultText(result) });
       }
       return;
     }

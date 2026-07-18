@@ -1342,6 +1342,73 @@ function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; han
 // response. Renders a status pill, optional kill-pending badge, the line
 // tail, and (when present) the agent-supplied `label` so concurrent
 // handles are distinguishable at a glance.
+function bashStatusText(status: string, finalCause: string | null): string {
+  switch (status) {
+    case 'running': return 'running';
+    case 'still_running': return 'still running';
+    case 'kill_pending_kernel': return 'kill pending (kernel)';
+    case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
+    case 'exited': return 'exited';
+    case 'killed': return 'killed';
+    default: return status;
+  }
+}
+
+function formatBashMillis(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function summarizeBashVisibleTail(lines: string[], partial: string | null, truncatedBefore: boolean, maxLines = 8): string[] {
+  const out = lines.slice(-Math.max(0, maxLines - (partial ? 1 : 0)));
+  if (partial) out.push(partial);
+  if (truncatedBefore && out.length > 0) out[0] = `… ${out[0]}`;
+  return out;
+}
+
+function BashOutputView({
+  lines,
+  partial,
+  truncatedBefore,
+}: {
+  lines: string[];
+  partial: string | null;
+  truncatedBefore: boolean;
+}) {
+  const visible = summarizeBashVisibleTail(lines, partial, truncatedBefore);
+  if (visible.length === 0) return null;
+  return (
+    <div className="bash-output-shell">
+      {truncatedBefore && (
+        <div className="bash-truncated-notice" aria-label="Earlier bash output fell out of the bounded tail">
+          [older output omitted from this tail]
+        </div>
+      )}
+      <div className="bash-output-viewport" role="log" aria-live="polite" aria-atomic="false" aria-relevant="additions text">
+        {visible.map((line, index) => {
+          const isPartial = partial !== null && index === visible.length - 1;
+          return (
+            <div
+              key={`${index}-${line}`}
+              className={`bash-output-line${isPartial ? ' bash-output-line-partial' : ''}`}
+              title={isPartial ? 'Live trailing partial line — still being written' : undefined}
+            >
+              <span className="bash-output-line-text">{line}</span>
+              {isPartial && <span className="bash-partial-badge">partial</span>}
+            </div>
+          );
+        })}
+      </div>
+      {partial && <div className="bash-partial-affordance">[final line still streaming — no newline yet]</div>}
+    </div>
+  );
+}
+
 function BashResponseView({ response, workScopeKey }: { response: Record<string, unknown>; workScopeKey?: string | undefined }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
@@ -1366,53 +1433,29 @@ function BashResponseView({ response, workScopeKey }: { response: Record<string,
   const isExited = status === 'exited';
   const isKilled = status === 'killed';
   const isTombstone = status === 'tombstoned';
-
-  const text = lines.map((l) => l.bytes ?? '').join('\n');
+  const partial = typeof response['partial'] === 'string' ? response['partial'] : null;
+  const lineTexts = lines.map((l) => l.bytes ?? '');
+  const statusText = bashStatusText(status, finalCause);
 
   return (
     <div className="bash-response">
       <div className="bash-response-header">
-        <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>
-          {status === 'running'
-            ? 'running'
-            : status === 'still_running'
-              ? 'still running'
-              : status === 'kill_pending_kernel'
-                ? 'kill pending (kernel)'
-                : status === 'tombstoned'
-                  ? `tombstoned${finalCause ? ` · ${finalCause}` : ''}`
-                  : status === 'exited'
-                    ? 'exited'
-                    : status === 'killed'
-                      ? 'killed'
-                      : status}
-        </span>
+        <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>{statusText}</span>
         {handle && <span className="bash-handle">{handle}</span>}
         {handle && workScopeKey && <BashInspectButton workScopeKey={workScopeKey} handle={handle} />}
         {label && <span className="bash-label" title="agent-supplied handle label">{label}</span>}
         {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
-          <span className="bash-exit-code">exit code {String(exitCode)}</span>
+          <span className="bash-exit-code">exit {String(exitCode)}</span>
         )}
         {(isKilled || isTombstone) && typeof signalNumber === 'number' && (
           <span className="bash-signal-number">signal {String(signalNumber)}</span>
         )}
-        {killSignalSent && (
-          <span className="bash-kill-signal">kill: {killSignalSent}</span>
-        )}
-        {signalSent && signalSent !== killSignalSent && (
-          <span className="bash-signal-sent">signal_sent: {signalSent}</span>
-        )}
-        {waitedMs !== null && (
-          <span className="bash-duration">waited {Math.round(waitedMs)} ms</span>
-        )}
-        {durationMs !== null && (
-          <span className="bash-duration">duration {Math.round(durationMs)} ms</span>
-        )}
+        {killSignalSent && <span className="bash-kill-signal">kill {killSignalSent}</span>}
+        {signalSent && signalSent !== killSignalSent && <span className="bash-signal-sent">sent {signalSent}</span>}
+        {waitedMs !== null && <span className="bash-duration">waited {formatBashMillis(waitedMs)}</span>}
+        {durationMs !== null && <span className="bash-duration">ran {formatBashMillis(durationMs)}</span>}
       </div>
-      {truncatedBefore && (
-        <div className="bash-truncated-notice">[output truncated before this view]</div>
-      )}
-      {text && <pre className="bash-lines">{text}</pre>}
+      <BashOutputView lines={lineTexts} partial={partial} truncatedBefore={truncatedBefore} />
     </div>
   );
 }
@@ -2272,11 +2315,12 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
       {name === 'bash' && !result && liveBashProgress && (
-        <div className="tool-block-output bash-live-output" aria-live="polite">
-          {liveBashProgress.truncated_before && <div className="bash-truncated">… earlier output omitted</div>}
-          {[...liveBashProgress.lines.map((line) => line.text), ...(liveBashProgress.partial ? [liveBashProgress.partial] : [])]
-            .slice(-6)
-            .map((line, index) => <div className="bash-line" key={`${liveBashProgress.end_offset}-${index}`}>{line}</div>)}
+        <div className="tool-block-output bash-live-output">
+          <BashOutputView
+            lines={liveBashProgress.lines.map((line) => line.text)}
+            partial={liveBashProgress.partial ?? null}
+            truncatedBefore={liveBashProgress.truncated_before}
+          />
         </div>
       )}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}

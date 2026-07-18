@@ -187,10 +187,10 @@ const executionMessages: Message[] = [
     is_error: true,
     display_data: { duration_ms: 7 },
   }),
-  toolMessage(5, 'exec-bash-running', JSON.stringify({ status: 'running', handle: 'b-17', label: 'fixture-vitest', lines: bashLines([' RUN  v2.0.0 /repo/fixture-tool-results/ui', ' waiting for file watcher...']) }), {
+  toolMessage(5, 'exec-bash-running', JSON.stringify({ status: 'running', handle: 'b-17', label: 'fixture-vitest', truncated_before: true, lines: bashLines([' RUN  v2.0.0 /repo/fixture-tool-results/ui', ' waiting for file watcher...']), partial: 'rerun queued by watcher' }), {
     display_data: { duration_ms: 49 },
   }),
-  toolMessage(6, 'exec-bash-still', JSON.stringify({ status: 'still_running', handle: 'b-17', label: 'fixture-vitest', waited_ms: 30000, lines: bashLines([' RUN  v2.0.0 /repo/fixture-tool-results/ui', ' 68 tests collected']) }), {
+  toolMessage(6, 'exec-bash-still', JSON.stringify({ status: 'still_running', handle: 'b-17', label: 'fixture-vitest', waited_ms: 30000, truncated_before: true, lines: bashLines([' RUN  v2.0.0 /repo/fixture-tool-results/ui', ' 68 tests collected']), partial: 'watching for file changes' }), {
     display_data: { duration_ms: 30005 },
   }),
   toolMessage(7, 'exec-bash-kill-pending', JSON.stringify({ status: 'kill_pending_kernel', handle: 'b-17', kill_signal_sent: 'TERM', lines: bashLines([' node_modules/.bin/vitest still flushing coverage']) }), {
@@ -202,7 +202,7 @@ const executionMessages: Message[] = [
   toolMessage(9, 'exec-bash-killed', JSON.stringify({ status: 'killed', exit_code: 137, signal_number: 9, duration_ms: 901, lines: bashLines([' process killed after timeout']) }), {
     display_data: { duration_ms: 901 },
   }),
-  toolMessage(10, 'exec-bash-tombstoned', JSON.stringify({ status: 'tombstoned', final_cause: 'exited normally', exit_code: 0, handle: 'b-24', lines: bashLines([' archived output retained for inspection']) }), {
+  toolMessage(10, 'exec-bash-tombstoned', JSON.stringify({ status: 'tombstoned', final_cause: 'exited normally', exit_code: 17, handle: 'b-24', duration_ms: 30000, lines: bashLines([' archived output retained for inspection']) }), {
     display_data: { duration_ms: 12 },
   }),
   toolMessage(11, 'exec-bash-error', JSON.stringify({ error: 'handle_not_found', error_message: 'Handle b-missing does not exist in this work scope.', hint: 'A Phoenix restart clears transient bash handles.' }), {

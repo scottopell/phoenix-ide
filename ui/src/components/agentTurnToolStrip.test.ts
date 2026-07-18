@@ -153,6 +153,28 @@ describe('deriveToolStripItems', () => {
     expect(items[1]?.outputTail).toContain('third line');
   });
 
+  it('includes partial-line and truncation affordances in compact bash tails', () => {
+    const msg = agentMessage([
+      { type: 'tool_use', id: 'b1', name: 'bash', input: { op: 'wait', handle: 'b-9', wait_seconds: 5 } },
+    ]);
+    const results = new Map<string, Message>([
+      ['b1', toolResult('b1', {
+        content: JSON.stringify({
+          status: 'still_running',
+          waited_ms: 1200,
+          truncated_before: true,
+          lines: [{ offset: 7, bytes: 'settled line' }],
+          partial: 'compiling final chunk',
+        }),
+      })],
+    ]);
+
+    const items = deriveToolStripItems(msg, results);
+
+    expect(items[0]?.outputTail).toContain('… settled line');
+    expect(items[0]?.outputTail).toContain('compiling final chunk …');
+  });
+
   it('uses a scalar fallback for unknown tools instead of name-only rendering', () => {
     const msg = agentMessage([
       { type: 'tool_use', id: 'u1', name: 'future_tool', input: { target: 'alpha', nested: { ignored: true } } },

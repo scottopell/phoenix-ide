@@ -275,6 +275,32 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.matches[0]?.target.sourceId).toContain('agent-text-0');
   });
 
+  it('indexes compact-visible bash identity and tail without exposing hidden structured details', () => {
+    const units: RenderUnit[] = [
+      {
+        kind: 'agent_turn',
+        key: 'a1',
+        isFirstInTurn: true,
+        agent: agentMsg('a1', [
+          { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'pnpm vitest run ui/src/components/MessageComponents.test.tsx', input: { op: 'wait', handle: 'b-22', wait_seconds: 5, secret: 'hidden alpha payload' } },
+        ]),
+        toolResultsByUseId: new Map([
+          ['tool-1', toolMsg('t1', 'tool-1', { result: JSON.stringify({ status: 'still_running', handle: 'b-22', truncated_before: true, lines: [{ offset: 9, bytes: '68 tests collected' }], partial: 'watching for changes' }) })],
+        ]),
+      },
+    ];
+
+    const visibleProjection = buildConversationSearchProjection(units, 'watching for changes', { density: 'compact' });
+    expect(visibleProjection.matches).toHaveLength(1);
+    expect(visibleProjection.matches[0]?.target.sourceId).toContain('tool-use-visible-bash-0');
+
+    const omittedProjection = buildConversationSearchProjection(units, 'older output omitted', { density: 'compact' });
+    expect(omittedProjection.matches).toHaveLength(1);
+
+    const hiddenProjection = buildConversationSearchProjection(units, 'hidden alpha payload', { density: 'compact' });
+    expect(hiddenProjection.matches).toHaveLength(0);
+  });
+
   it('includes expanded system prompt text in transcript projection', () => {
     const projection = buildConversationSearchProjection([], 'alpha directive', {
       systemPrompt: 'alpha directive\nsecondary line',

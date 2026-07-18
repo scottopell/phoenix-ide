@@ -307,3 +307,81 @@
   color: var(--text-secondary);
   font-style: normal;
 }
+
+.bash-output-shell {
+  display: grid;
+  gap: 6px;
+}
+
+.bash-output-viewport {
+  display: grid;
+  gap: 1px;
+  max-height: 12.5rem;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--code-bg) 88%, black 12%);
+}
+
+.bash-output-line {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bash-output-line-partial {
+  color: var(--text-secondary);
+}
+
+.bash-output-line-text {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.bash-partial-badge {
+  flex: 0 0 auto;
+  align-self: start;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent-yellow) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.bash-partial-affordance {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.bash-live-output {
+  padding-top: 0;
+}
+
+.bash-response-header {
+  align-items: center;
+}
+
+.bash-status,
+.bash-handle,
+.bash-label,
+.bash-exit-code,
+.bash-signal-number,
+.bash-kill-signal,
+.bash-signal-sent,
+.bash-duration {
+  white-space: nowrap;
+}

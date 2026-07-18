@@ -240,11 +240,13 @@ function summarizeBashOutputTail(parsed: Record<string, unknown>): string | null
       ? (line as { bytes: string }).bytes
       : '')
     .filter((line) => line.trim().length > 0);
-  if (bytes.length === 0) return null;
-  const tail = bytes.slice(-2).join(' · ');
-  return truncate(tail, 140);
+  const partial = typeof parsed['partial'] === 'string' ? parsed['partial'].trim() : '';
+  const tailParts = bytes.slice(-2);
+  if (partial) tailParts.push(`${partial} …`);
+  if (tailParts.length === 0) return null;
+  const prefix = parsed['truncated_before'] === true ? '… ' : '';
+  return truncate(`${prefix}${tailParts.join(' · ')}`, 140);
 }
-
 function summarizeBashCompactCard(
   input: Record<string, unknown>,
   result: Message | undefined,
