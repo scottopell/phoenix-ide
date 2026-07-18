@@ -2500,3 +2500,42 @@ describe('conversationReducer', () => {
     });
   });
 });
+
+
+describe('bash tool progress', () => {
+  const progress = {
+    handle: 'b-1',
+    start_offset: 0,
+    end_offset: 1,
+    truncated_before: false,
+    lines: [{ offset: 0, text: 'building' }],
+    partial: null,
+  };
+
+  it('stores progress and clears it when the final tool result arrives', () => {
+    let atom = createInitialAtom();
+    atom = conversationReducer(atom, {
+      type: 'sse_bash_tool_progress', sequenceId: 1, toolUseId: 'tool-1', progress,
+    });
+    expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('building');
+
+    atom = conversationReducer(atom, {
+      type: 'sse_message',
+      sequenceId: 2,
+      message: makeMessage(2, {
+        message_type: 'tool',
+        content: { tool_use_id: 'tool-1', content: 'done', is_error: false },
+      }),
+    });
+    expect(atom.liveBashProgress['tool-1']).toBeUndefined();
+  });
+
+  it('clears progress when the agent turn completes', () => {
+    let atom = createInitialAtom();
+    atom = conversationReducer(atom, {
+      type: 'sse_bash_tool_progress', sequenceId: 1, toolUseId: 'tool-1', progress,
+    });
+    atom = conversationReducer(atom, { type: 'sse_agent_done', sequenceId: 2 });
+    expect(atom.liveBashProgress).toEqual({});
+  });
+});

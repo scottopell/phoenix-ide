@@ -33,6 +33,8 @@ export type { BashRingWindow } from './BashRingWindow';
 export type { BashRingLine } from './BashRingLine';
 export type { BashErrorResponse } from './BashErrorResponse';
 export type { BashLiveHandleSummary } from './BashLiveHandleSummary';
+export type { BashProgressLine } from './BashProgressLine';
+export type { BashToolProgress } from './BashToolProgress';
 export type { TmuxToolResponse } from './TmuxToolResponse';
 export type { TmuxErrorResponse } from './TmuxErrorResponse';
 
@@ -64,6 +66,10 @@ export type SseInitData = Omit<Extract<SseWireEvent, { type: 'init' }>, 'type'>;
 export type SseMessageData = Omit<Extract<SseWireEvent, { type: 'message' }>, 'type'>;
 export type SseMessageUpdatedData = Omit<
   Extract<SseWireEvent, { type: 'message_updated' }>,
+  'type'
+>;
+export type SseBashToolProgressData = Omit<
+  Extract<SseWireEvent, { type: 'bash_tool_progress' }>,
   'type'
 >;
 export type SseStateChangeData = Omit<

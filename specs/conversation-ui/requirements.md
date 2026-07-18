@@ -467,15 +467,12 @@ WHEN density is `compact`
 THE SYSTEM SHALL collapse each agent turn's tool calls into a single inline pill strip, one pill per tool call in invocation order, reusing the conversation's pill styling and tool-type colors
 AND for bash tool calls, preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
 AND for bash tool calls, render a bounded inline output tail from the best available live or final structured bash output, including a visible truncation indication when older output has fallen out of the bounded tail
-AND collapse each assistant text block below the significance threshold into a faded, expandable one-liner only when the one-line preview omits non-empty later lines or truncates the first non-empty line
-AND render user messages, assistant prose at or above the significance threshold, assistant prose whose compact preview contains the full text, and assistant prose with Mermaid fences at full fidelity
-AND treat density as a presentation choice only, not as permission to omit live tool facts available to the other density
+AND render every assistant text block in full without truncation or folding
+AND render user messages at full fidelity
+AND treat density as a presentation choice only, not as permission to omit assistant prose or live tool facts available to the other density
 
 WHEN a collapsed tool-call pill is clicked
 THE SYSTEM SHALL reveal the full detail for that tool call and bring it into view
-
-WHEN a collapsed assistant one-liner is activated
-THE SYSTEM SHALL expand it to the full rendered prose
 
 THE SYSTEM SHALL NOT hide any content without a visible click-to-expand affordance
 AND SHALL NOT discard any content as a result of the active density
@@ -486,20 +483,13 @@ AND MAY keep tool cards spatially compact during the active turn so long as the 
 
 **Significance threshold:** "significant" assistant prose is a text block whose
 length is at or above a single named cutoff (`SIGNIFICANCE_THRESHOLD`,
-280 characters). That cutoff governs which assistant prose is a navigable
-chapter (REQ-CONV-023) and sets the upper bound for compact prose that may fold
-into a preview. Compact density collapses only when that preview hides content:
-it omits non-empty later lines or truncates the first non-empty line. A short
-single-line text block whose preview contains the full text renders at full
-fidelity because collapsing it would add interaction and reduce contrast without
-saving meaningful space.
+280 characters). That cutoff determines which assistant prose is a navigable
+chapter (REQ-CONV-023); it does not affect prose visibility at either density.
 
 **Rationale:** Long conversations are dominated by tool calls; the user's
 prompts and the substantial assistant prose — findings, plans, summaries — get
-buried. Compact density makes the scrollback skimmable while guaranteeing no
-data loss: every collapsed element is one click from full fidelity, so a
-mis-classification is a minor inconvenience, not a transparency failure
-(transparency questions 8-10). Density changes layout, not truth: if the system
+buried. Compact density makes the scrollback skimmable by reducing tool chrome,
+not by hiding the agent's commentary. Density changes layout, not truth: if the system
 already knows which bash command is running, how long it has run, and what tail
 it has produced, compact mode must remain able to answer those questions rather
 than collapsing to a lower-information badge.

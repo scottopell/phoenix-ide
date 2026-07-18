@@ -59,6 +59,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 pub use browser::BrowserSession;
+use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
@@ -89,6 +90,19 @@ impl LlmSelector for NoLlm {
         &self,
     ) -> Option<std::sync::Arc<dyn phoenix_core::llm_service::CompletionService>> {
         None
+    }
+}
+
+pub trait BashProgressSink: Send + Sync {
+    fn emit(&self, progress: BashToolProgress);
+}
+
+impl<F> BashProgressSink for F
+where
+    F: Fn(BashToolProgress) + Send + Sync,
+{
+    fn emit(&self, progress: BashToolProgress) {
+        self(progress);
     }
 }
 
@@ -290,6 +304,9 @@ pub struct ToolContext {
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
     pub work_scope: WorkScope,
+
+    /// Optional sink for typed ephemeral bash progress snapshots.
+    bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
 }
 
 impl ToolContext {
@@ -320,7 +337,14 @@ impl ToolContext {
             tmux_registry,
             worktree_path,
             work_scope,
+            bash_progress_sink: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_bash_progress_sink(mut self, sink: Arc<dyn BashProgressSink>) -> Self {
+        self.bash_progress_sink = Some(sink);
+        self
     }
 
     #[must_use]
@@ -372,6 +396,11 @@ impl ToolContext {
     #[must_use]
     pub fn bash_handle_registry(&self) -> &Arc<BashHandleRegistry> {
         &self.bash_handles
+    }
+
+    #[must_use]
+    pub fn bash_progress_sink(&self) -> Option<Arc<dyn BashProgressSink>> {
+        self.bash_progress_sink.clone()
     }
 
     /// Get the LLM selector

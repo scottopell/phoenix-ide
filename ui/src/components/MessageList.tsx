@@ -102,6 +102,8 @@ const MessageSquareIcon = () => (
   </svg>
 );
 
+const EMPTY_LIVE_BASH_PROGRESS: import('../conversation/atom').ConversationAtom['liveBashProgress'] = {};
+
 interface MessageListProps {
   messages: Message[];
   pendingMessages: QueuedMessage[];
@@ -115,6 +117,7 @@ interface MessageListProps {
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
+  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   enableMessageSidepanel?: boolean | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
    *  indices currently rendered. Fired as the user scrolls. The conversation nav
@@ -183,6 +186,7 @@ function renderHistoricalUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
+  liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress'],
   isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   switch (unit.kind) {
@@ -226,6 +230,7 @@ function renderHistoricalUnit(
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
+          liveBashProgress={liveBashProgress}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
@@ -275,6 +280,7 @@ function renderUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
+  liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress'],
   isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   if (
@@ -283,7 +289,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
+  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, isLatestAgentMessage);
 }
 
 interface SystemPromptHeaderProps {
@@ -344,6 +350,7 @@ function MessageListImpl({
   filePathRootDir,
   workScopeKey,
   enableMessageSidepanel = true,
+  liveBashProgress = EMPTY_LIVE_BASH_PROGRESS,
   onVisibleRangeChange,
   onChaptersChange,
   hasOlderMessages = false,
@@ -1157,10 +1164,10 @@ function MessageListImpl({
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
-        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
+        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
       </div>
     ),
-    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
+    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, latestAgentKey, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

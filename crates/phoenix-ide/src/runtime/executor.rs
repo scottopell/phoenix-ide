@@ -30,7 +30,7 @@ use crate::state_machine::{
     Effect, Event, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
-use crate::tools::{BrowserSessionManager, ToolContext};
+use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
@@ -4801,6 +4801,15 @@ where
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
         let scope_worktree = self.context.work_scope_worktree.clone();
+        let progress_broadcaster = self.broadcast_tx.clone();
+        let progress_tool_use_id = tool.id.clone();
+        let bash_progress_sink: Arc<dyn BashProgressSink> = Arc::new(move |progress| {
+            let _ = progress_broadcaster.send_seq(|sequence_id| SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id: progress_tool_use_id.clone(),
+                progress,
+            });
+        });
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -4812,6 +4821,7 @@ where
             self.tmux_registry.clone(),
             scope_worktree,
         )
+        .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone());
 
         let conv_id = self.context.conversation_id.clone();

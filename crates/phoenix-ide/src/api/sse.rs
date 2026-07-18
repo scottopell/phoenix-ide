@@ -292,6 +292,16 @@ mod tests {
                 "sequence_id": sequence_id,
                 "active": active,
             }),
+            SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id,
+                progress,
+            } => json!({
+                "type": "bash_tool_progress",
+                "sequence_id": sequence_id,
+                "tool_use_id": tool_use_id,
+                "progress": progress,
+            }),
             SseEvent::SteerMessageQueued {
                 sequence_id,
                 message_id,
@@ -828,6 +838,32 @@ mod tests {
         assert_parity(&event);
         let typed = typed_sse_event_to_value(&event);
         assert_eq!(typed["active"], false);
+    }
+
+    #[test]
+    fn parity_bash_tool_progress() {
+        use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
+
+        let event = SseEvent::BashToolProgress {
+            sequence_id: 24,
+            tool_use_id: "tool-bash".to_string(),
+            progress: BashToolProgress {
+                handle: "b-1".to_string(),
+                start_offset: 3,
+                end_offset: 5,
+                truncated_before: true,
+                lines: vec![BashProgressLine {
+                    offset: 4,
+                    text: "building".to_string(),
+                }],
+                partial: Some("still running".to_string()),
+            },
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["type"], "bash_tool_progress");
+        assert_eq!(typed["tool_use_id"], "tool-bash");
+        assert_eq!(typed["progress"]["partial"], "still running");
     }
 
     #[test]

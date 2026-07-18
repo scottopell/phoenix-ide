@@ -48,6 +48,7 @@
 //! declare.
 
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::bash_progress::BashToolProgress;
 use serde::Serialize;
 use serde_json::Value;
 use ts_rs::TS;
@@ -373,13 +374,18 @@ pub enum SseWireEvent {
     /// `conversation_id` is implied by the per-conversation broadcaster
     /// scope and not re-emitted on the wire.
     BrowserSessionState { sequence_id: i64, active: bool },
+    /// Bounded ephemeral output snapshot for the active bash invocation.
+    BashToolProgress {
+        sequence_id: i64,
+        tool_use_id: String,
+        progress: BashToolProgress,
+    },
     /// A steering message was accepted and queued for later delivery.
     /// Emitted immediately when the user's message is buffered rather than
     /// processed. The UI shows the message with a "Queued" indicator.
     SteerMessageQueued {
         sequence_id: i64,
         message_id: String,
-        /// Zero-based position in the steering queue.
         queue_position: usize,
     },
     /// Mid-stream quota snapshot from the codex backend. Ephemeral.
@@ -416,6 +422,7 @@ impl SseWireEvent {
             SseWireEvent::Error { .. } => "error",
             SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
+            SseWireEvent::BashToolProgress { .. } => "bash_tool_progress",
             SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
             SseWireEvent::RateLimitSnapshot { .. } => "rate_limit_snapshot",
             SseWireEvent::WorkScopeUpdate { .. } => "work_scope_update",
@@ -564,6 +571,15 @@ impl From<SseEvent> for SseWireEvent {
             } => SseWireEvent::BrowserSessionState {
                 sequence_id,
                 active,
+            },
+            SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id,
+                progress,
+            } => SseWireEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id,
+                progress,
             },
             SseEvent::SteerMessageQueued {
                 sequence_id,

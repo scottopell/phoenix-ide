@@ -25,7 +25,7 @@ import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
 import { useIsDesktop } from '../hooks';
-import { useDensity, isSignificantText } from '../hooks/useDensity';
+import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -148,10 +148,6 @@ function usesGfmSyntax(text: string): boolean {
     || /www\.\S+/.test(text)
     || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
     || /\[\^[^\]]+\]/.test(text);
-}
-
-function containsMermaidFence(text: string): boolean {
-  return /(^|\n)```\s*mermaid(?:\s|\n|$)/i.test(text);
 }
 
 /** Format a tool execution duration for display in the tool block header.
@@ -719,35 +715,6 @@ function QueuedUserMessageImpl({
   );
 }
 
-// ============================================================================
-// Compact-density helpers
-// ============================================================================
-
-const COMPACT_TEXT_PREVIEW_LIMIT = 140;
-
-/** First non-empty line of a text block, collapsed to single-line whitespace
- *  and ellipsized — the faded one-liner shown for compact prose that hides
- *  content. */
-function firstLineSummary(text: string, maxLen = COMPACT_TEXT_PREVIEW_LIMIT): string {
-  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
-  const flat = firstLine.replace(/\s+/g, ' ').trim();
-  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
-}
-
-function shouldCollapseCompactText(text: string): boolean {
-  if (containsMermaidFence(text)) return false;
-  if (isSignificantText(text)) return false;
-
-  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
-  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
-  const fullFlat = text.replace(/\s+/g, ' ').trim();
-
-  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
-  const truncatesFirstLine = firstLineFlat.length > COMPACT_TEXT_PREVIEW_LIMIT;
-
-  return hidesAdditionalLines || truncatesFirstLine;
-}
-
 /**
  * A fully-rendered assistant prose block. Memoized so a turn's completed
  * prose is not re-parsed through ReactMarkdown every time the parent
@@ -776,55 +743,6 @@ const AgentTextBlock = memo(function AgentTextBlock({
 });
 
 /**
- * An assistant text block that, in compact mode, has content hidden by its
- * preview. Renders as a faded clickable one-liner that expands to the full
- * markdown on click — never destructive, the full text is always one click
- * away (and the title attr carries the first line for hover).
- */
-const CollapsibleText = memo(CollapsibleTextImpl);
-
-function CollapsibleTextImpl({
-  text,
-  remarkPlugins,
-  components,
-}: {
-  text: string;
-  remarkPlugins: typeof REMARK_PLUGINS;
-  components: React.ComponentProps<typeof ReactMarkdown>['components'];
-}) {
-  const [expanded, setExpanded] = useState(false);
-
-  if (expanded) {
-    return (
-      <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-          {text}
-        </ReactMarkdown>
-      </div>
-    );
-  }
-
-  const summary = firstLineSummary(text);
-  return (
-    <div
-      className="agent-text-collapsed"
-      role="button"
-      tabIndex={0}
-      title={summary}
-      onClick={() => setExpanded(true)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          setExpanded(true);
-        }
-      }}
-    >
-      {summary}
-    </div>
-  );
-}
-
-/**
  * The inline mini pill-strip a compact-mode agent turn shows in place of its
  * tool blocks. Built purely from the turn's own tool_use blocks + paired
  * results (via `deriveToolStripItems`), never from phase state.
@@ -840,6 +758,14 @@ function CompactToolStripImpl({
   items: ToolStripItem[];
   onExpand: (toolId: string) => void;
 }) {
+  const hasRunningTimer = items.some((item) => !item.hasResult && item.startedAtMs !== null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRunningTimer) return undefined;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTimer]);
+
   return (
     <div className="compact-tool-strip" role="list" aria-label="Tool calls">
       {items.map((item, i) => {
@@ -851,6 +777,9 @@ function CompactToolStripImpl({
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError ? 'failed' : item.hasResult ? 'done' : 'running';
+        const liveElapsed = !item.hasResult && item.startedAtMs !== null
+          ? ` · ${Math.max(0, Math.floor((nowMs - item.startedAtMs) / 1_000))}s`
+          : '';
         const ariaStatus = item.finalStatus ?? statusLabel;
         const ariaSummary = item.outputTail ?? summary;
         const isCompactBash = item.name === 'bash';
@@ -864,7 +793,7 @@ function CompactToolStripImpl({
           >
             <span className="compact-tool-card-header">
               <span className="compact-tool-card-name">{item.name}</span>
-              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}</span>
+              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
             </span>
             {isCompactBash ? (
               <>
@@ -897,6 +826,7 @@ interface AgentMessageProps {
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
+  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
    * to collapse repeated headers across a run of consecutive agent messages
@@ -914,7 +844,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, isLatestAgentMessage = false }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -935,8 +865,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
   // Derived purely from this turn's own content blocks + paired results — the
   // turn is the single source of truth for what it did (never phase state).
   const toolStripItems = useMemo(
-    () => deriveToolStripItems(message, toolResults),
-    [message, toolResults],
+    () => deriveToolStripItems(message, toolResults, liveBashProgress),
+    [message, toolResults, liveBashProgress],
   );
   const knownResultIds = useMemo(
     () => (import.meta.env.DEV ? Array.from(toolResults.keys()) : undefined),
@@ -1107,18 +1037,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
                 return null;
               }
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
-              // Compact: only previews that hide content fold to an expandable one-liner.
-              // Substantial prose (>= threshold) always renders full.
-              if (compact && !forceExpandedText && shouldCollapseCompactText(block.text)) {
-                return (
-                  <CollapsibleText
-                    key={i}
-                    text={block.text}
-                    remarkPlugins={remarkPlugins}
-                    components={markdownComponents}
-                  />
-                );
-              }
               return (
                 <AgentTextBlock
                   key={i}
@@ -1178,6 +1096,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
                   knownResultIds={knownResultIds}
                   toolStartedAtMs={toolStartedAtMs}
                   showMissingResult={showMissingResult}
+                  liveBashProgress={liveBashProgress[block.id || '']?.progress}
                 />
               );
             }
@@ -1252,6 +1171,7 @@ interface ToolUseBlockProps {
    *  elapsed counter that survives reconnect / reload / multi-tab. */
   toolStartedAtMs?: number | undefined;
   showMissingResult?: boolean | undefined;
+  liveBashProgress?: import('../generated/sse').BashToolProgress | undefined;
 }
 
 type ToolCardState =
@@ -2150,7 +2070,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2351,6 +2271,14 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       )}
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
+      {name === 'bash' && !result && liveBashProgress && (
+        <div className="tool-block-output bash-live-output" aria-live="polite">
+          {liveBashProgress.truncated_before && <div className="bash-truncated">… earlier output omitted</div>}
+          {[...liveBashProgress.lines.map((line) => line.text), ...(liveBashProgress.partial ? [liveBashProgress.partial] : [])]
+            .slice(-6)
+            .map((line, index) => <div className="bash-line" key={`${liveBashProgress.end_offset}-${index}`}>{line}</div>)}
+        </div>
+      )}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>

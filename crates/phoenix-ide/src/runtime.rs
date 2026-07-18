@@ -42,6 +42,7 @@ use crate::db::{ConvMode, Database};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -1133,6 +1134,15 @@ pub enum SseEvent {
     BrowserSessionState {
         sequence_id: i64,
         active: bool,
+    },
+    /// Ephemeral bounded/rate-limited live output snapshot for one in-flight
+    /// bash tool call. Replayed from the conversation ring on reconnect, keyed
+    /// by `tool_use_id` so client tool widgets can attach without parsing tool
+    /// result messages.
+    BashToolProgress {
+        sequence_id: i64,
+        tool_use_id: String,
+        progress: BashToolProgress,
     },
     /// A steering message was accepted and queued for delivery when the
     /// conversation next reaches `Idle`. The UI uses this to show the message

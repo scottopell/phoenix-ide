@@ -31,6 +31,7 @@ import type {
   SseInitData as WireInitData,
   SseMessageData as WireMessageData,
   SseMessageUpdatedData as WireMessageUpdatedData,
+  SseBashToolProgressData as WireBashToolProgressData,
   SseStateChangeData as WireStateChangeData,
   SseTokenData as WireTokenData,
   SseLlmFirstByteData as WireLlmFirstByteData,
@@ -213,6 +214,28 @@ export const SseMessageUpdatedDataSchema = v.looseObject({
   content: v.nullable(v.unknown()),
   duration_ms: v.exactOptional(v.number()),
 }) satisfies v.GenericSchema<unknown, WireMessageUpdatedData>;
+
+const BashProgressLineSchema = v.looseObject({
+  offset: v.number(),
+  text: v.string(),
+});
+
+const BashToolProgressSchema = v.looseObject({
+  handle: v.string(),
+  start_offset: v.number(),
+  end_offset: v.number(),
+  truncated_before: v.boolean(),
+  lines: v.array(BashProgressLineSchema),
+  partial: v.nullable(v.string()),
+});
+
+export const SseBashToolProgressDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  tool_use_id: v.string(),
+  progress: BashToolProgressSchema,
+}) satisfies v.GenericSchema<unknown, WireBashToolProgressData>;
+
+export type SseBashToolProgressData = v.InferOutput<typeof SseBashToolProgressDataSchema>;
 
 const ERROR_KIND_OPTIONS = [
   'auth',

@@ -65,6 +65,7 @@ export type ConversationPageView = Pick<
   | 'turnRetryContext'
   | 'transcriptGeneration'
   | 'transcriptCoverage'
+  | 'liveBashProgress'
 >;
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
@@ -82,6 +83,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'turnRetryContext',
   'transcriptGeneration',
   'transcriptCoverage',
+  'liveBashProgress',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -131,6 +133,7 @@ export function useConversationView(
       turnRetryContext: a.turnRetryContext,
       transcriptGeneration: a.transcriptGeneration,
       transcriptCoverage: a.transcriptCoverage,
+      liveBashProgress: a.liveBashProgress,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;

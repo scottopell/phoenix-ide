@@ -9,6 +9,7 @@
 // source of truth for what a turn did is the turn itself.
 
 import type { ContentBlock, Message, ToolResultContent } from '../api';
+import type { BashToolProgress } from '../generated/sse';
 
 export interface ToolStripItem {
   /** Tool name as it appears on the content block (e.g. `bash`, `patch`). */
@@ -23,6 +24,8 @@ export interface ToolStripItem {
   commandIdentity: string | null;
   /** Compact bash cards: final status/duration badge text. */
   finalStatus: string | null;
+  /** Server timestamp used to advance compact in-flight elapsed time. */
+  startedAtMs: number | null;
   /** Compact bash cards: bounded final output tail from the existing result payload. */
   outputTail: string | null;
   /** spawn_agents launches sub-agents — colored distinctly in the strip. */
@@ -245,11 +248,19 @@ function summarizeBashOutputTail(parsed: Record<string, unknown>): string | null
 function summarizeBashCompactCard(
   input: Record<string, unknown>,
   result: Message | undefined,
+  progress: BashToolProgress | undefined,
   display?: string,
 ): Pick<ToolStripItem, 'commandIdentity' | 'finalStatus' | 'outputTail'> {
   const commandIdentity = summarizeBashInputIdentity(input, display);
   if (!result) {
-    return { commandIdentity, finalStatus: null, outputTail: null };
+    const liveLines = progress?.lines.map((line) => line.text) ?? [];
+    if (progress?.partial) liveLines.push(progress.partial);
+    const liveTail = liveLines.filter((line) => line.trim()).slice(-2).join(' · ');
+    return {
+      commandIdentity,
+      finalStatus: progress ? 'running' : null,
+      outputTail: liveTail ? truncate(liveTail, 140) : null,
+    };
   }
   const text = resultText(result);
   const parsed = tryParseJson(text);
@@ -306,8 +317,10 @@ function summarizeToolResult(name: string, result: Message | undefined): string 
 export function deriveToolStripItems(
   message: Message,
   toolResultsByUseId: ReadonlyMap<string, Message>,
+  liveBashProgress: Readonly<Record<string, { progress: BashToolProgress }>> = {},
 ): ToolStripItem[] {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  const toolStarts = (message.display_data as Record<string, unknown> | undefined)?.['tool_starts'] as Record<string, unknown> | undefined;
   const items: ToolStripItem[] = [];
   for (const block of blocks) {
     if (block.type !== 'tool_use') continue;
@@ -319,7 +332,7 @@ export function deriveToolStripItems(
     const isError = !!(resultContent?.is_error || resultContent?.error);
     const input = (block.input || {}) as Record<string, unknown>;
     const bashCompact = name === 'bash'
-      ? summarizeBashCompactCard(input, result, block.display)
+      ? summarizeBashCompactCard(input, result, liveBashProgress[toolId]?.progress, block.display)
       : { commandIdentity: null, finalStatus: null, outputTail: null };
     items.push({
       name,
@@ -328,6 +341,7 @@ export function deriveToolStripItems(
       resultSummary: summarizeToolResult(name, result),
       commandIdentity: bashCompact.commandIdentity,
       finalStatus: bashCompact.finalStatus,
+      startedAtMs: typeof toolStarts?.[toolId] === 'number' ? toolStarts[toolId] : null,
       outputTail: bashCompact.outputTail,
       isSubAgent: name === 'spawn_agents',
       hasResult: result !== undefined,

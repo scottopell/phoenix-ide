@@ -1805,7 +1805,7 @@ describe('finalized code fence highlighting', () => {
     expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
-  it('collapses one-line assistant prose that exceeds the compact preview limit', () => {
+  it('renders long one-line assistant prose in full in compact mode', () => {
     mockDensity = 'compact';
     const text = 'A'.repeat(150);
 
@@ -1821,12 +1821,11 @@ describe('finalized code fence highlighting', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent(`${'A'.repeat(139)}…`);
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent(text);
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
-  it('collapses short multi-line assistant prose when later lines are omitted', () => {
+  it('renders every line of short multi-line assistant prose in compact mode', () => {
     mockDensity = 'compact';
 
     const { container } = render(
@@ -1841,9 +1840,9 @@ describe('finalized code fence highlighting', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent('First line summary.');
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent('First line summary.');
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent('Second line with more detail.');
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
   it('renders compact text fully when forceExpandedText is set', () => {

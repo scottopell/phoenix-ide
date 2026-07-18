@@ -395,7 +395,7 @@ export function buildConversationSearchProjection(
             unit.kind,
             unit.key,
             source.role,
-            visibleConversationText(source.text, density, { forceExpanded: source.forceExpanded }),
+            visibleConversationText(source.text),
           );
         }
         break;
@@ -547,36 +547,12 @@ function isHiddenSystemMessage(message: Message): boolean {
   return displayData?.hidden === true;
 }
 
-function visibleConversationText(
-  text: string,
-  density: 'full' | 'compact',
-  options: { forceExpanded?: boolean | undefined } = {},
-): string {
-  if (options.forceExpanded) return text;
-  if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
-  return firstLineSummary(text);
+function visibleConversationText(text: string): string {
+  return text;
 }
 
 function visibleStreamingText(buffer: StreamingBuffer | null | undefined): string {
   return buffer?.text ?? '';
-}
-
-function firstLineSummary(text: string, maxLen = 140): string {
-  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
-  const flat = firstLine.replace(/\s+/g, ' ').trim();
-  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
-}
-
-function shouldCollapseCompactText(text: string): boolean {
-  if (containsMermaidFence(text)) return false;
-  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
-  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
-  const fullFlat = text.replace(/\s+/g, ' ').trim();
-  const significantThreshold = 280;
-  if (text.length >= significantThreshold) return false;
-  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
-  const truncatesFirstLine = firstLineFlat.length > 140;
-  return hidesAdditionalLines || truncatesFirstLine;
 }
 
 function toolResultText(result: Message | undefined): string {
@@ -616,10 +592,6 @@ function agentTurnSources(
 function densityToolDetailsVisible(toolName: string | undefined, density: 'full' | 'compact'): boolean {
   if (toolName === 'think') return true;
   return density === 'full';
-}
-
-function containsMermaidFence(text: string): boolean {
-  return /```\s*mermaid\b/i.test(text);
 }
 
 function stableJson(value: unknown): string {

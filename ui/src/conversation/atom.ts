@@ -1,12 +1,14 @@
 import * as v from 'valibot';
 import type { ConversationState, Message, Conversation } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
+import type { BashToolProgress } from '../generated/sse';
 import type { WorkScopeInventory } from '../generated/sse';
 import {
   SseTokenDataSchema,
   SseStateChangeDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
+  SseBashToolProgressDataSchema,
   SseAgentDoneDataSchema,
   SseLlmFirstByteDataSchema,
   SseLlmAttemptDataSchema,
@@ -55,6 +57,11 @@ export interface PendingMessagePatch {
   durationMs?: number;
 }
 
+export interface LiveBashProgress {
+  sequenceId: number;
+  progress: BashToolProgress;
+}
+
 export interface PendingMessagePatchState {
   /** Highest patch event seq already materialized onto this message id, whether
    *  the patch landed live against an existing message or was replayed later
@@ -83,6 +90,8 @@ export interface ConversationAtom {
   transcriptGeneration: number | null;
   transcriptCoverage: 'tail' | 'complete';
   pendingMessagePatches: Record<string, PendingMessagePatchState>;
+  /** Bounded ephemeral bash output snapshots, removed when final results land. */
+  liveBashProgress: Record<string, LiveBashProgress>;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
   /** `Date.now()` when the current `tool_executing` phase began. Reset on
@@ -220,6 +229,13 @@ export type SSEAction =
       content?: Message['content'];
       /** Typed tool-execution duration; present only for tool-result updates. */
       durationMs?: number;
+      epoch?: number;
+    }
+  | {
+      type: 'sse_bash_tool_progress';
+      sequenceId: number;
+      toolUseId: string;
+      progress: BashToolProgress;
       epoch?: number;
     }
   | {
@@ -377,6 +393,7 @@ export function createInitialAtom(): ConversationAtom {
     transcriptGeneration: null,
     transcriptCoverage: 'tail',
     pendingMessagePatches: {},
+    liveBashProgress: {},
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
@@ -586,6 +603,21 @@ function materializeMessages(atom: ConversationAtom, messages: Message[]): Conve
   return withDerivedMessageSyncState(nextAtom, materialized);
 }
 
+function toolResultUseId(message: Message): string | null {
+  if (message.message_type !== 'tool') return null;
+  const content = message.content;
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return null;
+  const id = (content as Record<string, unknown>)['tool_use_id'];
+  return typeof id === 'string' ? id : null;
+}
+
+function withoutLiveBashProgress(atom: ConversationAtom, toolUseId: string | null): ConversationAtom {
+  if (!toolUseId || atom.liveBashProgress[toolUseId] === undefined) return atom;
+  const liveBashProgress = { ...atom.liveBashProgress };
+  delete liveBashProgress[toolUseId];
+  return { ...atom, liveBashProgress };
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -593,7 +625,10 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       if (idx >= 0) {
         return atom;
       }
-      let nextAtom: ConversationAtom = { ...atom, streamingBuffer: null };
+      let nextAtom: ConversationAtom = withoutLiveBashProgress(
+        { ...atom, streamingBuffer: null },
+        toolResultUseId(action.message),
+      );
       let nextMessage = action.message;
       ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
       return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
@@ -641,6 +676,17 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         pendingMessagePatches: nextPendingMessagePatches,
       };
     }
+    case 'sse_bash_tool_progress': {
+      const existing = atom.liveBashProgress[action.toolUseId];
+      if (existing && existing.sequenceId >= action.sequenceId) return atom;
+      return {
+        ...atom,
+        liveBashProgress: {
+          ...atom.liveBashProgress,
+          [action.toolUseId]: { sequenceId: action.sequenceId, progress: action.progress },
+        },
+      };
+    }
     case 'sse_state_change': {
       const phase =
         action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
@@ -661,6 +707,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         streamingBuffer: null,
         firstByteRequestId: null,
         turnRetryContext: null,
+        liveBashProgress: {},
       };
     case 'sse_llm_first_byte':
       return { ...atom, firstByteRequestId: action.requestId };
@@ -908,6 +955,16 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
         ...(data.content != null && { content: data.content as Message['content'] }),
         ...(data.duration_ms != null && { durationMs: data.duration_ms }),
+      });
+    }
+    case 'bash_tool_progress': {
+      const res = v.safeParse(SseBashToolProgressDataSchema, entry);
+      if (!res.success) return atom;
+      return conversationReducer(atom, {
+        type: 'sse_bash_tool_progress',
+        sequenceId: res.output.sequence_id,
+        toolUseId: res.output.tool_use_id,
+        progress: res.output.progress,
       });
     }
     case 'agent_done': {
@@ -1205,6 +1262,7 @@ export function conversationReducer(
           bufferedEventEnvelopes: {},
           eventGap: null,
           pendingMessagePatches: {},
+          liveBashProgress: {},
         };
       }
       return next;
@@ -1212,6 +1270,7 @@ export function conversationReducer(
 
     case 'sse_message':
     case 'sse_message_updated':
+    case 'sse_bash_tool_progress':
     case 'sse_state_change':
     case 'sse_agent_done':
     case 'sse_llm_first_byte':

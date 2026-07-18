@@ -47,7 +47,7 @@ describe('ToolResultsFixture', () => {
 
     expect(screen.getByText('density=compact')).toBeInTheDocument();
     expect(screen.getByText('agent-browser')).toBeInTheDocument();
-    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByText(/^running(?: · \d+(?:ms|s))?$/)).toBeInTheDocument();
     expect(screen.getByText(/This family deliberately mixes typed payloads/)).toBeInTheDocument();
     expect(screen.getByText(/without a live backend/)).toBeInTheDocument();
     expect(container.querySelectorAll('.compact-tool-card').length).toBeGreaterThan(0);

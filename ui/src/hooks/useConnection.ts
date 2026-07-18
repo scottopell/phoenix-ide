@@ -9,6 +9,7 @@ import {
   SseInitDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
+  SseBashToolProgressDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
   SseLlmFirstByteDataSchema,
@@ -366,6 +367,22 @@ export function useConnection({
               ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
               ...(data.content != null && { content: data.content as import('../api').Message['content'] }),
               ...(data.duration_ms != null && { durationMs: data.duration_ms }),
+            });
+          });
+
+          on('bash_tool_progress', (e) => {
+            const res = parseEvent(
+              SseBashToolProgressDataSchema,
+              e,
+              'bash_tool_progress',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_bash_tool_progress',
+              sequenceId: res.data.sequence_id,
+              toolUseId: res.data.tool_use_id,
+              progress: res.data.progress,
             });
           });
 

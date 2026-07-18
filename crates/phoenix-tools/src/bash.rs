@@ -314,6 +314,33 @@ mod tests {
             .any(|l| { l["bytes"].as_str().unwrap_or("") == "hello" }));
     }
 
+    #[tokio::test]
+    async fn run_emits_bounded_live_progress() {
+        use std::sync::Mutex;
+
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
+            captured.lock().expect("progress lock").push(progress);
+        });
+        let context = ctx().with_bash_progress_sink(sink);
+        let result = BashTool
+            .run(
+                json!({"op": "run", "cmd": "printf 'first\\nsecond\\n'", "wait_seconds": 5}),
+                context,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let snapshots = emitted.lock().expect("progress lock");
+        let final_snapshot = snapshots.last().expect("at least one progress snapshot");
+        assert!(final_snapshot.lines.len() <= 40);
+        assert_eq!(final_snapshot.end_offset, 2);
+        assert_eq!(
+            final_snapshot.lines.last().map(|line| line.text.as_str()),
+            Some("second")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fast_exit_preserves_trailing_output_no_reader_race() {
         // Regression for the codex review: the waiter used to call

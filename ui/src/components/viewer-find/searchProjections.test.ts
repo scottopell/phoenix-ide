@@ -260,9 +260,8 @@ describe('buildConversationSearchProjection', () => {
     expect(compactProjection.matches).toHaveLength(0);
   });
 
-  it('keeps force-expanded latest compact text searchable past the first line', () => {
+  it('keeps compact assistant text searchable past the first line', () => {
     const message = agentMsg('a1', [{ type: 'text', text: 'first line\nvisible second line alpha' }]);
-    message.display_data = { forceExpandedText: true };
     const units: RenderUnit[] = [{
       kind: 'agent_turn',
       key: 'a1',
