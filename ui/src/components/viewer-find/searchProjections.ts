@@ -582,6 +582,11 @@ function formatVisibleMillis(ms: number): string {
   return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
 }
 
+function compactBashTailText(parts: string[]): string {
+  const text = parts.join(' · ');
+  return text.length > 140 ? `${text.slice(0, 139)}…` : text;
+}
+
 function bashVisibleSearchText(
   block: ContentBlock,
   result: Message | undefined,
@@ -604,7 +609,7 @@ function bashVisibleSearchText(
       parts.push(status === 'kill_pending_kernel'
         ? 'kill pending (kernel)'
         : status === 'tombstoned' && finalCause
-          ? `finished (${finalCause.replace(/_/g, ' ')})`
+          ? `tombstoned ${finalCause.replace(/_/g, ' ')}`
           : status.replace(/_/g, ' '));
     }
     if (typeof parsed['handle'] === 'string') parts.push(parsed['handle'] as string);
@@ -616,21 +621,24 @@ function bashVisibleSearchText(
     if (parsed['truncated_before'] === true) parts.push('older output omitted');
     const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
     const visibleLines = density === 'full' ? lines : lines.slice(-2);
+    const outputParts: string[] = [];
     for (const line of visibleLines) {
       const text = line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
         ? (line as { bytes: string }).bytes
         : '';
-      if (text) parts.push(text);
+      if (text) outputParts.push(text);
     }
-    if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) parts.push(parsed['partial']);
+    if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) outputParts.push(parsed['partial']);
+    parts.push(density === 'compact' ? compactBashTailText(outputParts) : outputParts.join('\n'));
     return parts.join('\n');
   }
   if (result) parts.push(toolResultText(result));
   if (progress) {
     if (progress.truncated_before) parts.push('older output omitted');
     const visibleProgressLines = density === 'full' ? progress.lines.slice(-8) : progress.lines.slice(-2);
-    for (const line of visibleProgressLines) parts.push(line.text);
-    if (progress.partial) parts.push(progress.partial);
+    const progressParts = visibleProgressLines.map((line) => line.text);
+    if (progress.partial) progressParts.push(progress.partial);
+    parts.push(density === 'compact' ? compactBashTailText(progressParts) : progressParts.join('\n'));
   }
   return parts.join('\n');
 }

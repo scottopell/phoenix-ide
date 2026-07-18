@@ -1462,6 +1462,9 @@ function BashResponseView({ response, workScopeKey }: { response: Record<string,
         {durationMs !== null && <span className="bash-duration">ran {formatBashMillis(durationMs)}</span>}
       </div>
       <BashOutputView lines={lineTexts} partial={partial} truncatedBefore={truncatedBefore} />
+      {status === 'waiter_panicked' && typeof response['error_message'] === 'string' && (
+        <div className="bash-error-message">{response['error_message']}</div>
+      )}
     </div>
   );
 }
