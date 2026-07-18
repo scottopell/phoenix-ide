@@ -362,6 +362,33 @@ pub enum WakeResolvePendingOutcome {
     AlreadyResolved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeResolveMaterializedDecision {
+    Accept,
+    Suppress,
+}
+
+#[derive(Debug, Clone)]
+pub struct WakeMaterializedPendingDelivery {
+    pub pending: WakePendingDelivery,
+    pub link: WakeDeliveryMessageLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeResolveMaterializedPendingOutcome {
+    Resolved {
+        delivery_ids: Vec<DeliveryId>,
+        auto_resume: bool,
+    },
+    AlreadyResolved,
+    NothingPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeResolveMaterializedPendingError {
+    NotFullyMaterialized { delivery_ids: Vec<DeliveryId> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTransferInput {
     pub workflow_id: WorkflowId,
@@ -2075,6 +2102,16 @@ impl WakeRepository {
         Ok(out)
     }
 
+    pub async fn list_materialized_pending_for_workflow(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> DbResult<Vec<WakeMaterializedPendingDelivery>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let out = fetch_materialized_pending_deliveries_tx(&mut tx, workflow_id).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
         for _ in 0..5 {
             match self.transfer_once(input).await {
@@ -2187,6 +2224,33 @@ impl WakeRepository {
 
         tx.commit().await?;
         Ok(WakeTransferOutcome::Transferred)
+    }
+
+    pub async fn resolve_materialized_pending_for_workflow(
+        &self,
+        workflow_id: WorkflowId,
+        decision: WakeResolveMaterializedDecision,
+        timestamp: Timestamp,
+    ) -> DbResult<Result<WakeResolveMaterializedPendingOutcome, WakeResolveMaterializedPendingError>>
+    {
+        for _ in 0..20 {
+            match self
+                .resolve_materialized_pending_for_workflow_once(workflow_id, decision, timestamp)
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(ResolveMaterializedPendingAttempt::RetryVersionConflict) => {}
+                Ok(ResolveMaterializedPendingAttempt::Done(outcome)) => return Ok(outcome),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(DbError::Serialization(
+            "wake materialized delivery resolution exhausted concurrent retry budget".to_string(),
+        ))
     }
 
     pub async fn resolve_pending_exact(
@@ -2365,6 +2429,161 @@ impl WakeRepository {
                 tx.rollback().await?;
                 Err(DbError::Serialization(
                     "wake resolve returned unexpected codec error".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveMaterializedPendingAttempt {
+    RetryVersionConflict,
+    Done(Result<WakeResolveMaterializedPendingOutcome, WakeResolveMaterializedPendingError>),
+}
+
+impl WakeRepository {
+    async fn resolve_materialized_pending_for_workflow_once(
+        &self,
+        workflow_id: WorkflowId,
+        decision: WakeResolveMaterializedDecision,
+        timestamp: Timestamp,
+    ) -> DbResult<ResolveMaterializedPendingAttempt> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(_binding) = fetch_binding_by_workflow_tx(&mut tx, workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(ResolveMaterializedPendingAttempt::Done(Ok(
+                WakeResolveMaterializedPendingOutcome::NothingPending,
+            )));
+        };
+        let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(ResolveMaterializedPendingAttempt::Done(Ok(
+                WakeResolveMaterializedPendingOutcome::NothingPending,
+            )));
+        };
+        let pending_ids = fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+        if pending_ids.is_empty() {
+            let terminal_rows = sqlx::query(
+                "SELECT d.status
+                 FROM workflow_deliveries d
+                 JOIN wake_terminal_receipts p
+                   ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+                 WHERE d.workflow_id = ?1",
+            )
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .fetch_all(&mut *tx.tx)
+            .await?;
+            tx.rollback().await?;
+            let outcome = if terminal_rows.is_empty() {
+                WakeResolveMaterializedPendingOutcome::NothingPending
+            } else {
+                WakeResolveMaterializedPendingOutcome::AlreadyResolved
+            };
+            return Ok(ResolveMaterializedPendingAttempt::Done(Ok(outcome)));
+        }
+        let projection = fetch_any_terminal_projection_tx(&mut tx, workflow_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("wake pending delivery set missing projection".to_string())
+            })?;
+        let materialized = fetch_materialized_pending_deliveries_tx(&mut tx, workflow_id).await?;
+        let materialized_ids: std::collections::BTreeSet<_> = materialized
+            .iter()
+            .map(|item| item.pending.canonical_delivery.delivery_id)
+            .collect();
+        let missing_ids: Vec<_> = pending_ids
+            .iter()
+            .copied()
+            .filter(|delivery_id| !materialized_ids.contains(delivery_id))
+            .collect();
+        if !missing_ids.is_empty() {
+            tx.rollback().await?;
+            return Ok(ResolveMaterializedPendingAttempt::Done(Err(
+                WakeResolveMaterializedPendingError::NotFullyMaterialized {
+                    delivery_ids: missing_ids,
+                },
+            )));
+        }
+        let event = match decision {
+            WakeResolveMaterializedDecision::Accept => WakeRegistrationEvent::RuntimeAccepted {
+                terminal: Box::new(projection.terminal.clone()),
+            },
+            WakeResolveMaterializedDecision::Suppress => WakeRegistrationEvent::RuntimeSuppressed {
+                terminal: Box::new(projection.terminal.clone()),
+            },
+        };
+        let resolution_decision = match decision {
+            WakeResolveMaterializedDecision::Accept => DeliveryResolutionDecision::Accept,
+            WakeResolveMaterializedDecision::Suppress => DeliveryResolutionDecision::Suppress {
+                reason: phoenix_workflow::SuppressionReason::ReducerTerminal,
+            },
+        };
+        let event_codec = local_codec(&wake_profile::event_codec());
+        let event_payload = json_blob(&event)?;
+        let mut snapshot: WakeRegistrationSnapshot = serde_json::from_slice(&head.snapshot_payload)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        snapshot.runtime_availability = match decision {
+            WakeResolveMaterializedDecision::Accept => wake_profile::RuntimeAvailability::Accepted,
+            WakeResolveMaterializedDecision::Suppress => {
+                wake_profile::RuntimeAvailability::Suppressed
+            }
+        };
+        let next_snapshot_payload = json_blob(&snapshot)?;
+        let next_snapshot_codec = LocalCodec {
+            family: wake_profile::snapshot_codec().family.to_string(),
+            version: wake_profile::snapshot_codec().version,
+        };
+        let transition_id = TransitionId(head.version.next().0);
+        let outcome = tx
+            .resolve_deliveries_exact(DeliveryResolutionPlan {
+                workflow_id,
+                expected_version: head.version,
+                transition_id,
+                generation: head.generation,
+                next_status: head.status,
+                event_codec: &event_codec,
+                event_payload: &event_payload,
+                next_snapshot_codec: &next_snapshot_codec,
+                next_snapshot_payload: &next_snapshot_payload,
+                committed_at: timestamp,
+                exact_delivery_ids: &pending_ids,
+                decision: resolution_decision,
+            })
+            .await?;
+        match outcome {
+            CommitOutcome::Committed => {
+                #[cfg(test)]
+                maybe_fail_after_canonical_transition(self.failpoint_namespace, workflow_id)?;
+                let auto_resume = matches!(decision, WakeResolveMaterializedDecision::Accept)
+                    && materialized.iter().any(|item| item.link.auto_resume);
+                tx.commit().await?;
+                Ok(ResolveMaterializedPendingAttempt::Done(Ok(
+                    WakeResolveMaterializedPendingOutcome::Resolved {
+                        delivery_ids: pending_ids,
+                        auto_resume,
+                    },
+                )))
+            }
+            CommitOutcome::VersionConflict => {
+                tx.rollback().await?;
+                Ok(ResolveMaterializedPendingAttempt::RetryVersionConflict)
+            }
+            CommitOutcome::InvalidPlan => {
+                tx.rollback().await?;
+                let current_pending = self
+                    .list_materialized_pending_for_workflow(workflow_id)
+                    .await?;
+                let outcome = if current_pending.is_empty() {
+                    WakeResolveMaterializedPendingOutcome::AlreadyResolved
+                } else {
+                    WakeResolveMaterializedPendingOutcome::NothingPending
+                };
+                Ok(ResolveMaterializedPendingAttempt::Done(Ok(outcome)))
+            }
+            CommitOutcome::UnsupportedCodec => {
+                tx.rollback().await?;
+                Err(DbError::Serialization(
+                    "wake materialized resolve returned unexpected codec error".to_string(),
                 ))
             }
         }
@@ -3029,6 +3248,52 @@ async fn fetch_pending_terminal_delivery_ids_tx(
             )?))
         })
         .collect()
+}
+async fn fetch_materialized_pending_deliveries_tx(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<Vec<WakeMaterializedPendingDelivery>> {
+    let rows = sqlx::query(
+        "SELECT d.*, p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind,
+                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_generation,
+                p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
+                p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
+                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key,
+                l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
+                l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
+                l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
+                l.created_at AS link_created_at,
+                m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
+                m.display_data, m.usage_data, m.created_at
+         FROM workflow_deliveries d
+         JOIN wake_terminal_receipts p
+           ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+         JOIN wake_bindings b ON b.workflow_id = d.workflow_id
+         JOIN wake_delivery_messages l
+           ON l.workflow_id = d.workflow_id AND l.delivery_id = d.delivery_id
+         JOIN messages m ON m.message_id = l.message_id
+         WHERE d.workflow_id = ?1 AND d.status = 'Pending'
+         ORDER BY d.delivery_id",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_all(&mut *tx.tx)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
+        let tail = fetch_tail_lines_tx(tx, workflow_id, receipt_id).await?;
+        let pending = WakePendingDelivery {
+            workflow_id,
+            conversation_id: row.get("conversation_id"),
+            receipt: projection_from_row(&row, tail)?,
+            canonical_delivery: delivery_from_join_row(&row)?,
+        };
+        out.push(WakeMaterializedPendingDelivery {
+            pending,
+            link: delivery_message_link_from_join_row(&row)?,
+        });
+    }
+    Ok(out)
 }
 
 async fn fetch_any_terminal_projection_tx(
@@ -3930,7 +4195,11 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_unrelated_message(repo: &WakeRepository, conversation_id: &str, message_id: &str) {
+    async fn insert_unrelated_message(
+        repo: &WakeRepository,
+        conversation_id: &str,
+        message_id: &str,
+    ) {
         let content = MessageContent::system("unrelated");
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
@@ -3947,7 +4216,10 @@ mod tests {
         .unwrap();
     }
 
-    async fn fetch_conversation_messages(repo: &WakeRepository, conversation_id: &str) -> Vec<Message> {
+    async fn fetch_conversation_messages(
+        repo: &WakeRepository,
+        conversation_id: &str,
+    ) -> Vec<Message> {
         sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
@@ -4072,7 +4344,10 @@ mod tests {
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|o| matches!(o, MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_)))
+                .filter(|o| matches!(
+                    o,
+                    MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_)
+                ))
                 .count(),
             1
         );
@@ -4112,7 +4387,9 @@ mod tests {
             created_at: Timestamp(45),
         };
         assert!(matches!(
-            repo.materialize_pending_delivery_message(&missing).await.unwrap(),
+            repo.materialize_pending_delivery_message(&missing)
+                .await
+                .unwrap(),
             MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible
         ));
         assert_eq!(count_conversation_messages(&repo, "conv-1").await, 0);
@@ -4160,10 +4437,22 @@ mod tests {
             .unwrap()
             .expect("linked message after restart");
         assert_eq!(loaded.message_id, created.message_id);
-        assert_eq!(loaded.registering_tool_use_id, created.registering_tool_use_id);
-        assert_eq!(loaded.linked_message.message.message_id, created.linked_message.message.message_id);
-        assert_eq!(loaded.linked_message.message.sequence_id, created.linked_message.message.sequence_id);
-        assert_eq!(loaded.linked_message.message.display_data, created.linked_message.message.display_data);
+        assert_eq!(
+            loaded.registering_tool_use_id,
+            created.registering_tool_use_id
+        );
+        assert_eq!(
+            loaded.linked_message.message.message_id,
+            created.linked_message.message.message_id
+        );
+        assert_eq!(
+            loaded.linked_message.message.sequence_id,
+            created.linked_message.message.sequence_id
+        );
+        assert_eq!(
+            loaded.linked_message.message.display_data,
+            created.linked_message.message.display_data
+        );
     }
 
     #[tokio::test]
@@ -4189,7 +4478,10 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_id, created.message_id);
-        assert_eq!(listed[0].delivery_id, pending.canonical_delivery.delivery_id);
+        assert_eq!(
+            listed[0].delivery_id,
+            pending.canonical_delivery.delivery_id
+        );
 
         assert_eq!(
             repo.resolve_pending_exact(&resolve_input(
@@ -4207,6 +4499,211 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_materialized_pending_updates_snapshot_and_preserves_link() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(807);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        let link = materialized_outcome_link(
+            materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await,
+        );
+
+        let outcome = repo
+            .resolve_materialized_pending_for_workflow(
+                workflow_id,
+                WakeResolveMaterializedDecision::Accept,
+                Timestamp(51),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            WakeResolveMaterializedPendingOutcome::Resolved {
+                delivery_ids: vec![pending.canonical_delivery.delivery_id],
+                auto_resume: true,
+            }
+        );
+        assert_snapshot_projection_parity(
+            &repo,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Accepted,
+            false,
+            is_fired,
+        )
+        .await;
+        assert_eq!(
+            repo.get_delivery_message_link(workflow_id, pending.canonical_delivery.delivery_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_id,
+            link.message_id
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_materialized_pending_rejects_incomplete_set_without_mutation() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(808);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        let (head_before, snapshot_before) = head_snapshot(&repo, workflow_id).await;
+
+        let outcome = repo
+            .resolve_materialized_pending_for_workflow(
+                workflow_id,
+                WakeResolveMaterializedDecision::Accept,
+                Timestamp(51),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Err(WakeResolveMaterializedPendingError::NotFullyMaterialized {
+                delivery_ids: vec![pending.canonical_delivery.delivery_id],
+            })
+        );
+        let (head_after, snapshot_after) = head_snapshot(&repo, workflow_id).await;
+        assert_eq!(head_after.version, head_before.version);
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_materialized_pending_is_idempotent_across_two_repos() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(809);
+        let pending = create_pending_terminal_delivery(&first, workflow_id).await;
+        materialize_pending(&first, &pending, "wake complete", None, true, Timestamp(50)).await;
+
+        let (left, right) = tokio::join!(
+            first.resolve_materialized_pending_for_workflow(
+                workflow_id,
+                WakeResolveMaterializedDecision::Accept,
+                Timestamp(51),
+            ),
+            second.resolve_materialized_pending_for_workflow(
+                workflow_id,
+                WakeResolveMaterializedDecision::Accept,
+                Timestamp(51),
+            )
+        );
+        let outcomes = [left.unwrap().unwrap(), right.unwrap().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    WakeResolveMaterializedPendingOutcome::Resolved { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    WakeResolveMaterializedPendingOutcome::AlreadyResolved
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(count_conversation_messages(&first, "conv-1").await, 1);
+        assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_materialized_delivery_never_requests_auto_resume() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(810);
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &intent(), "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let pending = match repo
+            .cancel_allocated(&WakeCancelIfUnresolvedInput {
+                workflow_id,
+                timestamp: Timestamp(20),
+                reason: WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap()
+        {
+            WakeCancellationOutcome::Cancelled { delivery, .. }
+            | WakeCancellationOutcome::Replayed { delivery, .. } => delivery,
+            WakeCancellationOutcome::Stale => panic!("expected cancellation delivery"),
+        };
+        let link = materialized_outcome_link(
+            materialize_pending(
+                &repo,
+                &pending,
+                "wake cancelled",
+                None,
+                false,
+                Timestamp(50),
+            )
+            .await,
+        );
+        assert!(!link.auto_resume);
+
+        let outcome = repo
+            .resolve_materialized_pending_for_workflow(
+                workflow_id,
+                WakeResolveMaterializedDecision::Suppress,
+                Timestamp(51),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            WakeResolveMaterializedPendingOutcome::Resolved {
+                delivery_ids: vec![pending.canonical_delivery.delivery_id],
+                auto_resume: false,
+            }
+        );
+        assert_snapshot_projection_parity(
+            &repo,
+            workflow_id,
+            "conv-1",
+            wake_profile::RuntimeAvailability::Suppressed,
+            false,
+            is_cancelled,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn restarted_repo_finalizes_materialized_pending_delivery() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(811);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+
+        assert!(matches!(
+            restarted
+                .resolve_materialized_pending_for_workflow(
+                    workflow_id,
+                    WakeResolveMaterializedDecision::Accept,
+                    Timestamp(51),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            WakeResolveMaterializedPendingOutcome::Resolved {
+                auto_resume: true,
+                ..
+            }
+        ));
+        assert_eq!(count_conversation_messages(&restarted, "conv-1").await, 1);
+        assert!(restarted.list_pending("conv-1").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4285,8 +4782,14 @@ mod tests {
 
         assert_ne!(first_link.workflow_id, second_link.workflow_id);
         assert_ne!(first_link.message_id, second_link.message_id);
-        assert_eq!(first_link.message_id, wake_delivery_message_id(WorkflowId(805), DeliveryId(1)));
-        assert_eq!(second_link.message_id, wake_delivery_message_id(second_workflow_id, DeliveryId(2)));
+        assert_eq!(
+            first_link.message_id,
+            wake_delivery_message_id(WorkflowId(805), DeliveryId(1))
+        );
+        assert_eq!(
+            second_link.message_id,
+            wake_delivery_message_id(second_workflow_id, DeliveryId(2))
+        );
         assert_eq!(count_delivery_message_links(&repo).await, 2);
     }
 
