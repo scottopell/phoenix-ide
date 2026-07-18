@@ -469,7 +469,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps undecorated HTML source and preview ineligible while allowing rendered Markdown find', () => {
+  it('keeps HTML preview ineligible while allowing decorated HTML source and rendered Markdown find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -484,7 +484,10 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(document.querySelector('.viewer-code .viewer-find-match--active')).toHaveTextContent('alpha');
 
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
@@ -567,7 +570,7 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-find-occurrence="0"]')).toHaveTextContent('alpha');
   });
 
-  it('keeps HTML find unavailable when switching source to preview', async () => {
+  it('closes HTML source find when switching to preview', async () => {
     renderViewer({
       ...textCommon,
       kind: 'html',
@@ -576,7 +579,9 @@ describe('MetaViewer payload routing', () => {
       previewUrl: '/preview/tmp/project/thing',
     });
 
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull());
   });

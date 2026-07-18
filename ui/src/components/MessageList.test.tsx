@@ -348,6 +348,31 @@ describe('MessageList', () => {
     expect(escape.defaultPrevented).toBe(false);
   });
 
+  it('falls back to the live transcript when the find focus origin was virtualized away', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-detached"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-detached', generation: 1, transcriptGeneration: 1 } }}
+      />,
+    ));
+
+    const transcript = screen.getByTestId('mock-virtual-transcript');
+    const opener = document.createElement('button');
+    transcript.appendChild(opener);
+    opener.focus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    await screen.findByRole('textbox', { name: 'Find in viewer' });
+    opener.remove();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(transcript).toHaveFocus());
+  });
+
   it('clears an unhandled reveal request when the query clears its active match', async () => {
     agentMessageMockState.autoHandleReveal = false;
     const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'hidden alpha match' }] } as Message;

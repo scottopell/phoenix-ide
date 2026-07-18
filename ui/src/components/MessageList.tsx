@@ -491,7 +491,13 @@ function MessageListImpl({
         case 'focus-query':
           break;
         case 'restore-focus':
-          requestAnimationFrame(() => command.focusOrigin?.focus());
+          requestAnimationFrame(() => {
+            const focusTarget = command.focusOrigin?.isConnected
+              ? command.focusOrigin
+              : scrollerRef.current;
+            if (focusTarget && !focusTarget.hasAttribute('tabindex')) focusTarget.setAttribute('tabindex', '-1');
+            focusTarget?.focus();
+          });
           break;
         case 'reveal-match':
           setFindRevealVersion((version) => version + 1);
