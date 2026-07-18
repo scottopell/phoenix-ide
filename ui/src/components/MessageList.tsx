@@ -10,7 +10,7 @@ import {
   useImperativeHandle,
 } from 'react';
 import { useDensity } from '../hooks/useDensity';
-import { useLiveBashProgress } from '../conversation';
+import { useLiveBashProgressForToolIds } from '../conversation';
 import {
   FindBar,
   buildConversationSearchProjection,
@@ -175,6 +175,17 @@ function activeToolUseIdFromState(convState: ConversationState): string | undefi
   return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
+function LiveAgentTurn({ slug, message, ...props }: Omit<React.ComponentProps<typeof AgentMessage>, 'liveBashProgress' | 'message'> & { slug: string | null; message: Message }) {
+  const toolUseIds = useMemo(
+    () => (Array.isArray(message.content) ? message.content : [])
+      .filter((block) => block.type === 'tool_use' && block.name === 'bash')
+      .flatMap((block) => block.id ? [block.id] : []),
+    [message.content],
+  );
+  const liveBashProgress = useLiveBashProgressForToolIds(slug, toolUseIds);
+  return <AgentMessage message={message} liveBashProgress={liveBashProgress} {...props} />;
+}
+
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
@@ -184,7 +195,7 @@ function renderHistoricalUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
-  liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress'],
+  slug: string | null,
   isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   switch (unit.kind) {
@@ -220,7 +231,8 @@ function renderHistoricalUnit(
     }
     case 'agent_turn':
       return (
-        <AgentMessage
+        <LiveAgentTurn
+          slug={slug}
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
@@ -228,7 +240,6 @@ function renderHistoricalUnit(
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
-          liveBashProgress={liveBashProgress}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
@@ -278,7 +289,6 @@ function renderUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
-  liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress'],
   isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   if (
@@ -287,7 +297,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, isLatestAgentMessage);
+  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, slug ?? null, isLatestAgentMessage);
 }
 
 interface SystemPromptHeaderProps {
@@ -358,7 +368,6 @@ function MessageListImpl({
   transcriptPositioning,
   onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
-  const liveBashProgress = useLiveBashProgress(slug ?? null);
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
   const { pushScope, popScope } = useFocusScopeCommands();
@@ -366,6 +375,8 @@ function MessageListImpl({
   const [findOpen, setFindOpen] = useState(false);
   const [findFocusVersion, setFindFocusVersion] = useState(0);
   const [findQuery, setFindQuery] = useState('');
+  const findUsesLiveBashProgress = findOpen && findQuery.length > 0;
+  const liveBashProgress = useLiveBashProgressForToolIds(slug ?? null, findUsesLiveBashProgress ? null : []);
   const [findActiveIndex, setFindActiveIndex] = useState(0);
   const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
@@ -436,9 +447,10 @@ function MessageListImpl({
           streamingBuffer: findStreamingBuffer,
           systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
+          liveBashProgress,
         })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded],
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, liveBashProgress, systemPrompt, systemPromptExpanded],
   );
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
@@ -1162,10 +1174,10 @@ function MessageListImpl({
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
-        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
+        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
       </div>
     ),
-    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, liveBashProgress, latestAgentKey, pulseMountedRow],
+    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

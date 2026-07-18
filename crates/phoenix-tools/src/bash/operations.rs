@@ -532,6 +532,9 @@ async fn run_run(
                 let progress_reporter = ctx
                     .bash_progress_sink()
                     .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+                let _progress_lease = progress_reporter
+                    .as_ref()
+                    .map(|reporter| LiveBashProgressLease(reporter.clone()));
                 start_io_tasks(
                     &inserted,
                     child,
@@ -539,11 +542,7 @@ async fn run_run(
                     sandbox_scratch_dir,
                     progress_reporter.clone(),
                 );
-                let response = race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await;
-                if let Some(reporter) = progress_reporter {
-                    reporter.deactivate();
-                }
-                response
+                race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(e) => {
                 // Drop the allocated handle id by NOT inserting — next
@@ -790,6 +789,7 @@ const LIVE_PROGRESS_MAX_LINES: usize = 40;
 const LIVE_PROGRESS_MAX_BYTES: usize = 24 * 1024;
 const LIVE_PROGRESS_MAX_PARTIAL_BYTES: usize = 4 * 1024;
 const LIVE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(120);
+const LIVE_PROGRESS_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn suffix_within_bytes(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -800,6 +800,14 @@ fn suffix_within_bytes(text: &str, max_bytes: usize) -> String {
         start += 1;
     }
     text.get(start..).unwrap_or_default().to_string()
+}
+
+struct LiveBashProgressLease(Arc<LiveBashProgressReporter>);
+
+impl Drop for LiveBashProgressLease {
+    fn drop(&mut self) {
+        self.0.deactivate();
+    }
 }
 
 struct LiveBashProgressPoller {
@@ -882,16 +890,20 @@ impl LiveBashProgressReporter {
             .is_some_and(|text| text.len() > LIVE_PROGRESS_MAX_PARTIAL_BYTES);
         let partial =
             raw_partial.map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
-        if !force && output_bytes == prior_output_bytes {
-            return;
-        }
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let prior_at = self
             .last_emitted_at_ms
             .load(std::sync::atomic::Ordering::Acquire);
+        let output_unchanged = output_bytes == prior_output_bytes;
+        if !force
+            && output_unchanged
+            && now_ms.saturating_sub(prior_at)
+                < u64::try_from(LIVE_PROGRESS_REANNOUNCE_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+        {
+            return;
+        }
         if !force
             && prior_at != 0
             && now_ms.saturating_sub(prior_at)
@@ -919,7 +931,9 @@ impl LiveBashProgressReporter {
             });
         }
         lines.reverse();
-        let projection_truncated = partial_was_truncated || projected_lines_truncated;
+        let line_limit_truncated = ring.len() > view.lines.len();
+        let projection_truncated =
+            partial_was_truncated || projected_lines_truncated || line_limit_truncated;
         let start_offset = lines.first().map_or(end_offset, |line| line.offset);
         self.sink.emit(BashToolProgress {
             handle: handle.handle_id.to_string(),
@@ -1733,6 +1747,17 @@ mod tests {
     }
 
     #[test]
+    fn progress_lease_deactivates_reporter_on_drop() {
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(|_| {});
+        let reporter = Arc::new(LiveBashProgressReporter::new(sink));
+        {
+            let _lease = LiveBashProgressLease(reporter.clone());
+            assert!(reporter.is_active());
+        }
+        assert!(!reporter.is_active());
+    }
+
+    #[test]
     fn progress_projection_reports_byte_budget_truncation() {
         use std::sync::Mutex;
 
@@ -1759,6 +1784,30 @@ mod tests {
                 .sum::<usize>()
                 <= LIVE_PROGRESS_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn progress_projection_reports_line_limit_truncation() {
+        use std::sync::Mutex;
+
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
+            captured.lock().expect("progress lock").push(progress);
+        });
+        let reporter = LiveBashProgressReporter::new(sink);
+        let handle = live_handle();
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        for index in 0..=LIVE_PROGRESS_MAX_LINES {
+            ring.append(format!("line {index}\n").as_bytes());
+        }
+
+        reporter.maybe_emit(&handle, &ring, true);
+
+        let snapshots = emitted.lock().expect("progress lock");
+        let snapshot = snapshots.last().expect("progress snapshot");
+        assert!(snapshot.truncated_before);
+        assert_eq!(snapshot.lines.len(), LIVE_PROGRESS_MAX_LINES);
     }
 
     #[test]

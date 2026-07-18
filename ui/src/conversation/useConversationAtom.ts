@@ -187,15 +187,27 @@ export function useLastSseEventAt(slug: string): number {
 const EMPTY_LIVE_BASH_PROGRESS: ConversationAtom['liveBashProgress'] = {};
 
 export function useLiveBashProgress(slug: string | null) {
+  return useLiveBashProgressForToolIds(slug, null);
+}
+
+export function useLiveBashProgressForToolIds(slug: string | null, toolUseIds: readonly string[] | null) {
   const store = useConversationStore();
   const subscribe = useCallback(
     (listener: () => void) => slug ? store.subscribe(slug, listener) : () => undefined,
     [store, slug],
   );
-  const getSnapshot = useCallback(
-    () => slug ? store.getSnapshot(slug).liveBashProgress : EMPTY_LIVE_BASH_PROGRESS,
-    [store, slug],
-  );
+  const previousRef = useRef<ConversationAtom['liveBashProgress']>(EMPTY_LIVE_BASH_PROGRESS);
+  const getSnapshot = useCallback(() => {
+    const all = slug ? store.getSnapshot(slug).liveBashProgress : EMPTY_LIVE_BASH_PROGRESS;
+    if (toolUseIds === null) return all;
+    const selected = Object.fromEntries(toolUseIds.flatMap((id) => all[id] ? [[id, all[id]]] : []));
+    const previous = previousRef.current;
+    const same = Object.keys(selected).length === Object.keys(previous).length
+      && Object.entries(selected).every(([id, value]) => previous[id] === value);
+    if (same) return previous;
+    previousRef.current = selected;
+    return selected;
+  }, [store, slug, toolUseIds]);
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 

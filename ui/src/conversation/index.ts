@@ -6,6 +6,7 @@ export {
   useConversationAtom,
   useConversationView,
   useLiveBashProgress,
+  useLiveBashProgressForToolIds,
   useConversationEventCursorRef,
   useLastSseEventAt,
   useLastSseEventAtRef,
