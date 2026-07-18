@@ -1855,6 +1855,7 @@ impl WakeRepository {
     pub async fn list_observation_candidates(
         &self,
         now: Timestamp,
+        after_workflow_id: Option<WorkflowId>,
         limit: usize,
     ) -> DbResult<Vec<WakeObservationCandidateRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
@@ -1888,10 +1889,12 @@ impl WakeRepository {
                           AND l.lease_until <= ?1
                     )
                )
+               AND b.workflow_id > ?2
              ORDER BY b.workflow_id
-             LIMIT ?2",
+             LIMIT ?3",
         )
         .bind(to_i64(now.0, "now")?)
+        .bind(to_i64(after_workflow_id.map_or(0, |id| id.0), "after_workflow_id")?)
         .bind(to_i64(limit as u64, "limit")?)
         .fetch_all(&mut *tx.tx)
         .await?;
@@ -2384,6 +2387,22 @@ impl WakeRepository {
             .bind(&input.from_conversation_id)
             .execute(&mut *tx.tx)
             .await?;
+
+            if has_message_fts_tx(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE message_fts
+                     SET conversation_id = ?3
+                     WHERE message_id IN (
+                         SELECT l.message_id FROM wake_delivery_messages l
+                         WHERE l.workflow_id = ?1 AND l.delivery_id = ?2 AND l.conversation_id = ?3
+                     )",
+                )
+                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(delivery_id.0, "delivery_id")?)
+                .bind(&input.to_conversation_id)
+                .execute(&mut *tx.tx)
+                .await?;
+            }
         }
 
         tx.commit().await?;
@@ -2437,6 +2456,38 @@ impl WakeRepository {
         }
         self.adopt_materialized_pending_for_conversation_once(conversation_id, timestamp)
             .await
+    }
+
+    pub async fn suppress_pending_for_archived_conversation(
+        &self,
+        pending: &WakePendingDelivery,
+        timestamp: Timestamp,
+    ) -> DbResult<()> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let archived =
+            sqlx::query_scalar::<_, i64>("SELECT archived FROM conversations WHERE id = ?1")
+                .bind(&pending.conversation_id)
+                .fetch_optional(&mut *tx.tx)
+                .await?
+                .unwrap_or_default()
+                != 0;
+        let head = tx.fetch_workflow_head(pending.workflow_id).await?;
+        tx.rollback().await?;
+        if archived {
+            if let Some(head) = head {
+                let _ = self
+                    .resolve_pending_exact(&WakeResolvePendingInput {
+                        workflow_id: pending.workflow_id,
+                        expected_version: head.version,
+                        delivery_ids: vec![pending.receipt.delivery_id],
+                        decision: WakeResolveDecision::Suppress,
+                        transition_id: TransitionId(head.version.next().0),
+                        timestamp,
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn resolve_pending_exact(
@@ -7179,7 +7230,7 @@ mod tests {
             .is_none());
 
         let observation = repo
-            .list_observation_candidates(Timestamp(30), 2)
+            .list_observation_candidates(Timestamp(30), None, 2)
             .await
             .unwrap();
         assert_eq!(observation.len(), 2);
@@ -7195,7 +7246,7 @@ mod tests {
         );
 
         let observation_restarted = restarted
-            .list_observation_candidates(Timestamp(30), 5)
+            .list_observation_candidates(Timestamp(30), None, 5)
             .await
             .unwrap();
         assert_eq!(

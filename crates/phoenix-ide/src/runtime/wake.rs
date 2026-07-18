@@ -222,51 +222,59 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     }
 
     async fn observe_candidates(&self, now: Timestamp) -> Result<Duration, String> {
-        let candidates = self
-            .repo
-            .list_observation_candidates(now, OBSERVATION_BATCH_LIMIT)
-            .await
-            .map_err(|e| e.to_string())?;
         let mut next_wait = EMPTY_RESCAN_INTERVAL;
         let mut saw_candidate = false;
-        for candidate in candidates {
-            saw_candidate = true;
-            let claim_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
-            match self
+        let mut cursor = None;
+        loop {
+            let candidates = self
                 .repo
-                .claim_observation_if_eligible(
-                    candidate.workflow_id,
-                    self.process_incarnation,
-                    now,
-                    claim_until,
-                )
+                .list_observation_candidates(now, cursor, OBSERVATION_BATCH_LIMIT)
                 .await
-                .map_err(|e| e.to_string())?
-            {
-                WakeObservationOutcome::Started { canonical } => {
-                    let workflow_id = candidate.workflow_id.0;
-                    let Some(authority) = canonical.authority else {
-                        continue;
-                    };
-                    let Some(_attempt) = canonical.attempt else {
-                        continue;
-                    };
-                    match self
-                        .inspect_candidate(candidate, authority, now, claim_until)
-                        .await
-                    {
-                        Ok(wait) => {
-                            next_wait = next_wait.min(wait);
-                        }
-                        Err(error) => {
-                            tracing::warn!(workflow_id, error = %error, "wake inspection failed for one contract; continuing");
+                .map_err(|e| e.to_string())?;
+            let page_len = candidates.len();
+            for candidate in candidates {
+                cursor = Some(candidate.workflow_id);
+                saw_candidate = true;
+                let claim_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
+                match self
+                    .repo
+                    .claim_observation_if_eligible(
+                        candidate.workflow_id,
+                        self.process_incarnation,
+                        now,
+                        claim_until,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    WakeObservationOutcome::Started { canonical } => {
+                        let workflow_id = candidate.workflow_id.0;
+                        let Some(authority) = canonical.authority else {
+                            continue;
+                        };
+                        let Some(_attempt) = canonical.attempt else {
+                            continue;
+                        };
+                        match self
+                            .inspect_candidate(candidate, authority, now, claim_until)
+                            .await
+                        {
+                            Ok(wait) => {
+                                next_wait = next_wait.min(wait);
+                            }
+                            Err(error) => {
+                                tracing::warn!(workflow_id, error = %error, "wake inspection failed for one contract; continuing");
+                            }
                         }
                     }
+                    WakeObservationOutcome::Busy { lease_until } => {
+                        next_wait = next_wait.min(duration_until(now, lease_until.0));
+                    }
+                    WakeObservationOutcome::Ineligible => {}
                 }
-                WakeObservationOutcome::Busy { lease_until } => {
-                    next_wait = next_wait.min(duration_until(now, lease_until.0));
-                }
-                WakeObservationOutcome::Ineligible => {}
+            }
+            if page_len < OBSERVATION_BATCH_LIMIT {
+                break;
             }
         }
         Ok(if saw_candidate {
@@ -433,7 +441,11 @@ async fn deliver_pending(
                         | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
                     }
                 }
-                MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {}
+                MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                    repo.suppress_pending_for_archived_conversation(&current, now)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
             }
             drop(sequence_guard);
             cursor = Some(next_cursor);

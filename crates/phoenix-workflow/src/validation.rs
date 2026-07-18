@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::types::{
     BarrierId, BarrierMemberDecl, CodecRef, EffectDecl, EffectId, EffectRole, Generation,
-    ReceiptFamily, SupportedCodecRegistry, TransitionPlan, WorkflowProfile, WorkflowStatus,
+    ReceiptFamily, ScheduleId, SupportedCodecRegistry, TransitionPlan, WorkflowProfile,
+    WorkflowStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum PlanError {
     EffectIdCollision(EffectId),
     DuplicateBarrierId(BarrierId),
     BarrierIdCollision(BarrierId),
+    ScheduleIdCollision(ScheduleId),
     MissingCodec(&'static str),
     UnsupportedCodec(CodecRef),
     MissingEffectFamily(EffectId),

@@ -129,6 +129,13 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 )));
             }
         }
+        for schedule in &decision.plan.schedules {
+            if self.schedules.contains_key(&schedule.schedule_id) {
+                return Err(EngineError::InvalidPlan(PlanError::ScheduleIdCollision(
+                    schedule.schedule_id,
+                )));
+            }
+        }
 
         let transition = self.begin_transition(decision);
         self.apply_invalidations(&decision.plan.invalidations);
