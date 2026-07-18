@@ -173,7 +173,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     const onScroll = () => { lastScrollTopRef.current = el.scrollTop; };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, [content, usePierreCode]);
+  }, [content, presentation, usePierreCode]);
 
   // Persist scroll on backgrounding and unmount. Skipped for Pierre-backed
   // payloads: the wrapper persists under the same scrollKey, and the parent's

@@ -124,6 +124,44 @@ describe('MessageViewer', () => {
     expect(onPresentationChange).toHaveBeenCalledWith('pane');
   });
 
+  it('preserves message scroll position across pane and fullscreen', () => {
+    const props = {
+      sequenceId: 1,
+      messages: [agentTextMessage(1, 'Long review message')],
+      onClose: vi.fn(),
+      onSendNotes: vi.fn(),
+      canTogglePresentation: true,
+      onPresentationChange: vi.fn(),
+      inline: true,
+    };
+    const view = render(
+      <ReviewNotesProvider>
+        <MessageViewer {...props} presentation="pane" />
+      </ReviewNotesProvider>,
+    );
+    const paneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    paneContent.scrollTop = 320;
+    fireEvent.scroll(paneContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MessageViewer {...props} presentation="fullscreen" />
+      </ReviewNotesProvider>,
+    );
+    const focusedContent = document.body.querySelector('.viewer-shell--takeover .viewer-content') as HTMLDivElement;
+    expect(focusedContent.scrollTop).toBe(320);
+    focusedContent.scrollTop = 740;
+    fireEvent.scroll(focusedContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MessageViewer {...props} presentation="pane" />
+      </ReviewNotesProvider>,
+    );
+    const restoredPane = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    expect(restoredPane.scrollTop).toBe(740);
+  });
+
   it('keeps fullscreen close distinct from return-to-pane', () => {
     const onClose = vi.fn();
     const onPresentationChange = vi.fn();

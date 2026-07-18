@@ -356,6 +356,17 @@ describe('MetaViewer payload routing', () => {
 
     const focusedContent = document.body.querySelector('.viewer-shell--takeover .viewer-content') as HTMLDivElement;
     expect(focusedContent.scrollTop).toBe(420);
+    focusedContent.scrollTop = 860;
+    fireEvent.scroll(focusedContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={payload} />
+      </ReviewNotesProvider>,
+    );
+
+    const restoredPaneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    expect(restoredPaneContent.scrollTop).toBe(860);
   });
 
   it('shows fullscreen controls only for image payloads', () => {
