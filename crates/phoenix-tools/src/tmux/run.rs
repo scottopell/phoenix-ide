@@ -15,9 +15,10 @@ use crate::{
     work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
 };
 use phoenix_workflow::wake_profile::{TmuxResourceIdentity, WakeResourceIdentity};
+
+use super::parse_last_exit_marker;
 use phoenix_workflow::Timestamp;
 
-const EXIT_MARKER_PREFIX: &str = "[phoenix] process exited with code ";
 const TMUX_RUN_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TMUX_RUN_CAPTURE_START: &str = "-2000";
@@ -179,12 +180,12 @@ impl Tool for TmuxRunTool {
             }
             Err(e) => return error_envelope("tmux_server_unavailable", &e.to_string()),
         };
-        let (config_path, socket_path, server_generation) = {
+        let (config_path, socket_path, server_token) = {
             let server = server.read().await;
             (
                 ctx.tmux_registry().config_path(),
                 server.socket_path.clone(),
-                server.generation.clone(),
+                server.server_token.clone(),
             )
         };
         let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
@@ -210,7 +211,7 @@ impl Tool for TmuxRunTool {
                         .await;
                 register_tmux_wake_if_live(
                     &ctx,
-                    &server_generation,
+                    &server_token,
                     &target,
                     parsed.keep_open_on_exit,
                     response,
@@ -222,7 +223,7 @@ impl Tool for TmuxRunTool {
                     &ctx,
                     &config_path,
                     &socket_path,
-                    &server_generation,
+                    &server_token,
                     &target,
                     &cwd,
                     cmd,
@@ -393,7 +394,7 @@ async fn wait_for_text_response(
     ctx: &ToolContext,
     config_path: &Path,
     socket_path: &Path,
-    server_generation: &str,
+    server_token: &str,
     target: &TmuxRunTarget,
     cwd: &Path,
     cmd: &str,
@@ -439,7 +440,7 @@ async fn wait_for_text_response(
             } else {
                 match register_tmux_wake_if_live(
                     ctx,
-                    server_generation,
+                    server_token,
                     target,
                     !close_after_completion,
                     response,
@@ -457,6 +458,40 @@ async fn wait_for_text_response(
         }
         tokio::select! {
             () = ctx.cancel.cancelled() => {
+                let observation = observe_window(config_path, socket_path, &target.window_id, None)
+                    .await
+                    .unwrap_or_else(|stderr| RunObservation {
+                        captured_output: CapturedOutput {
+                            stdout: String::new(),
+                            stderr,
+                            truncated: false,
+                        },
+                        exit_code: None,
+                        readiness_seen: false,
+                    });
+                if observation.exit_code.is_none() {
+                    if close_after_completion {
+                        let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                    } else {
+                        let response = structured_response(
+                            "cancelled",
+                            target,
+                            cwd,
+                            cmd,
+                            None,
+                            &observation.captured_output,
+                            true,
+                        );
+                        return register_tmux_wake_if_live(
+                            ctx,
+                            server_token,
+                            target,
+                            true,
+                            response,
+                        )
+                        .await;
+                    }
+                }
                 return error_envelope("cancelled", "tmux_run cancelled while waiting for readiness");
             }
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
@@ -500,7 +535,13 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     } else {
         "exit $code"
     };
-    format!("(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}")
+    let marker_cmd = r"python3 - <<'PY'
+import time
+print(int(time.time()*1000))
+PY";
+    format!(
+        "(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
+    )
 }
 
 fn shell_quote(s: &str) -> String {
@@ -588,7 +629,8 @@ fn observation_from_bytes(
 ) -> RunObservation {
     let raw_stdout = String::from_utf8_lossy(stdout_bytes);
     let raw_stderr = String::from_utf8_lossy(stderr_bytes);
-    let exit_code = parse_exit_marker(&raw_stdout);
+    let marker = parse_last_exit_marker(&raw_stdout);
+    let exit_code = marker.as_ref().map(|m| m.exit_code);
     let readiness_seen =
         readiness_text.is_some_and(|text| raw_stdout.contains(text) || raw_stderr.contains(text));
     let (stdout, stderr, truncated) = truncate_pair(stdout_bytes, stderr_bytes);
@@ -603,14 +645,6 @@ fn observation_from_bytes(
     }
 }
 
-fn parse_exit_marker(output: &str) -> Option<i32> {
-    output.lines().rev().find_map(|line| {
-        let trimmed = line.trim();
-        let (_, code) = trimmed.rsplit_once(EXIT_MARKER_PREFIX)?;
-        code.trim().parse::<i32>().ok()
-    })
-}
-
 fn response_keeps_live_inspectable_window(response: &ToolOutput) -> bool {
     let Some(display) = response.display_data() else {
         return false;
@@ -623,7 +657,7 @@ fn response_keeps_live_inspectable_window(response: &ToolOutput) -> bool {
 
 async fn register_tmux_wake_if_live(
     ctx: &ToolContext,
-    server_generation: &str,
+    server_token: &str,
     target: &TmuxRunTarget,
     keep_open_on_exit: bool,
     mut response: ToolOutput,
@@ -643,7 +677,7 @@ async fn register_tmux_wake_if_live(
     };
     let resource = WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
         work_scope: registration_scope.clone(),
-        server_generation: server_generation.to_string(),
+        server_token: server_token.to_string(),
         window_id: target.window_id.clone(),
     });
     let contract_id = format!("tmux:{}:{}", tool_use_id, target.window_id);
@@ -920,7 +954,7 @@ mod tests {
                     "name": "tmux-run-direct-cwd",
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),
@@ -965,7 +999,7 @@ mod tests {
                     "name": "tmux-run-worktree-cwd",
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),
@@ -1008,7 +1042,7 @@ mod tests {
                     "name": "tmux-run-quick-failure",
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),
@@ -1026,7 +1060,7 @@ mod tests {
         let pane = v["captured_output"]["stdout"].as_str().unwrap();
         assert!(pane.contains("before-failure"), "pane output: {pane}");
         assert!(
-            pane.contains("[phoenix] process exited with code 7"),
+            pane.contains("__PHOENIX_EXIT__ exit_code=7"),
             "pane output: {pane}"
         );
         assert_eq!(v["captured_output"]["truncated"], false);
@@ -1182,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_uses_exact_server_generation() {
+    async fn registration_uses_exact_server_token() {
         if skip_unless_tmux() {
             return;
         }
@@ -1211,20 +1245,21 @@ mod tests {
             .get_existing(&WorkScope::Conversation("tmux-run-wake-generation".into()))
             .await
             .expect("server entry");
-        let generation = server.read().await.generation.clone();
+        let server_token = server.read().await.server_token.clone();
         let calls = registrar.register_calls();
         assert_eq!(calls.len(), 1);
         let WakeResourceIdentity::TmuxWindow(identity) = &calls[0].resource else {
             panic!("expected tmux resource");
         };
-        assert_eq!(identity.server_generation, generation);
+        assert_eq!(identity.server_token, server_token);
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-generation.sock")).await;
     }
 
     #[test]
     fn parse_exit_marker_matches_tmux_run_marker_line() {
-        let output = "bash output\n[phoenix] process exited with code 17\n$ ";
-        assert_eq!(parse_exit_marker(output), Some(17));
+        let output = "bash output\n__PHOENIX_EXIT__ exit_code=17 occurred_at_ms=1700000000000\n$ ";
+        let marker = parse_last_exit_marker(output).expect("marker should parse");
+        assert_eq!(marker.exit_code, 17);
     }
 
     #[tokio::test]
@@ -1456,7 +1491,7 @@ mod tests {
                     "name": "tmux-run-trailing-comment",
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),
@@ -1469,7 +1504,7 @@ mod tests {
         let pane = v["captured_output"]["stdout"].as_str().unwrap();
         assert!(pane.contains("trailing-comment-ok"), "pane output: {pane}");
         assert!(
-            pane.contains("[phoenix] process exited with code 0"),
+            pane.contains("__PHOENIX_EXIT__ exit_code=0"),
             "pane output: {pane}"
         );
 
@@ -1534,7 +1569,7 @@ mod tests {
                     "keep_open_on_exit": false,
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),
@@ -1613,7 +1648,7 @@ mod tests {
                     "name": "tmux-run-main-session",
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": EXIT_MARKER_PREFIX,
+                        "text": "__PHOENIX_EXIT__",
                         "timeout_seconds": 5
                     }
                 }),

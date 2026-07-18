@@ -293,7 +293,7 @@ CREATE TABLE wake_terminal_receipts (
     terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
     resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
     bash_handle_id TEXT,
-    tmux_server_generation TEXT,
+    tmux_server_token TEXT,
     tmux_window_id TEXT,
     bash_status TEXT CHECK (bash_status IN ('Exited', 'Killed', 'KillPendingKernel')),
     tmux_status TEXT CHECK (tmux_status IN ('ExitMarkerObserved', 'WindowKilled')),
@@ -310,8 +310,8 @@ CREATE TABLE wake_terminal_receipts (
     FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
     FOREIGN KEY (workflow_id) REFERENCES wake_bindings(workflow_id) ON DELETE CASCADE,
     CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
-    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_generation IS NOT NULL AND tmux_window_id IS NOT NULL)),
-    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_generation IS NOT NULL OR tmux_window_id IS NOT NULL))),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_token IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_token IS NOT NULL OR tmux_window_id IS NOT NULL))),
     CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'Bash' OR bash_status IS NOT NULL),
     CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'TmuxWindow' OR tmux_status IS NOT NULL),
     CHECK ((terminal_kind = 'Fired') = (occurred_at IS NOT NULL)),
@@ -349,7 +349,7 @@ CREATE TABLE wake_bindings (
     scope_stable_key TEXT NOT NULL CHECK (scope_stable_key <> ''),
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
     bash_handle_id TEXT,
-    tmux_server_generation TEXT,
+    tmux_server_token TEXT,
     tmux_window_id TEXT,
     registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
     expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
@@ -358,19 +358,19 @@ CREATE TABLE wake_bindings (
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
     FOREIGN KEY (workflow_id, observe_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
     CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
-    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_generation IS NOT NULL AND tmux_window_id IS NOT NULL)),
-    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_generation IS NOT NULL OR tmux_window_id IS NOT NULL)))
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_token IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_token IS NOT NULL OR tmux_window_id IS NOT NULL)))
 ) STRICT;
 
 CREATE UNIQUE INDEX wake_bindings_contract_identity
 ON wake_bindings(
     profile_kind, profile_version, conversation_id, contract_id, resource_kind,
-    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_generation, ''), COALESCE(tmux_window_id, '')
+    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_token, ''), COALESCE(tmux_window_id, '')
 );
 CREATE UNIQUE INDEX wake_bindings_resource_identity
 ON wake_bindings(
     profile_kind, profile_version, conversation_id, resource_kind,
-    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_generation, ''), COALESCE(tmux_window_id, '')
+    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_token, ''), COALESCE(tmux_window_id, '')
 );
 CREATE INDEX wake_bindings_by_conversation ON wake_bindings(conversation_id);
 CREATE INDEX wake_bindings_active_unresolved

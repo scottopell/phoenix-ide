@@ -976,6 +976,8 @@ async fn run_waiter(
         }
     };
 
+    let finished_at = SystemTime::now();
+
     // Drain the reader tasks BEFORE transitioning to terminal so the
     // ring captures any final chunk the kernel buffered between the
     // child's last write and its exit. Without this, the tombstone
@@ -995,7 +997,6 @@ async fn run_waiter(
         reporter.deactivate();
     }
 
-    let finished_at = SystemTime::now();
     let elapsed = started_at.elapsed();
     if handle
         .transition_to_terminal(cause, elapsed, finished_at, TOMBSTONE_TAIL_LINES)

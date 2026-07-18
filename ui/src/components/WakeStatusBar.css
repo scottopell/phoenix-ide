@@ -1,0 +1,59 @@
+.wake-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 28px;
+  padding: 0 0.75rem;
+  color: var(--color-warning-text, #d6a84b);
+  background: var(--color-warning-subtle, rgb(214 168 75 / 10%));
+  border-top: 1px solid rgb(214 168 75 / 25%);
+  font-size: 0.75rem;
+  overflow-x: auto;
+}
+
+.wake-status-bar--stale {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 78%, var(--color-warning-subtle, rgb(214 168 75 / 10%)) 22%);
+}
+
+.wake-status-bar__summary,
+.wake-status-bar__contracts {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wake-status-bar__summary {
+  min-width: 0;
+}
+
+.wake-status-bar__expiry,
+.wake-status-bar__stale-badge {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.wake-status-bar__stale-badge {
+  font-size: 0.7rem;
+}
+
+.wake-cancel-button {
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentcolor;
+  border-radius: 3px;
+  padding: 1px 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.wake-cancel-button:disabled {
+  opacity: 0.7;
+  cursor: progress;
+}
+
+.wake-cancel-button:hover:not(:disabled) {
+  background: rgb(214 168 75 / 15%);
+}

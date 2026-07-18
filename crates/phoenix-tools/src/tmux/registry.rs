@@ -41,7 +41,10 @@ use phoenix_core::work_scope::WorkScope;
 use thiserror::Error;
 use tokio::sync::{OnceCell, RwLock};
 
-use super::probe::{probe, ProbeResult};
+use super::{
+    parse_last_exit_marker,
+    probe::{probe, ProbeResult},
+};
 
 /// Default session name created on lazy spawn (REQ-TMUX-002 /
 /// `TMUX_DEFAULT_SESSION`).
@@ -136,13 +139,14 @@ pub struct TmuxServer {
     #[allow(dead_code)]
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
-    pub generation: String,
+    pub server_token: String,
     pub status: ServerStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedWindow {
     pub exit_code: Option<i32>,
+    pub occurred_at: Option<std::time::SystemTime>,
     pub final_tail: Vec<String>,
 }
 
@@ -151,7 +155,7 @@ impl TmuxServer {
         Self {
             work_scope,
             socket_path,
-            generation: uuid::Uuid::new_v4().to_string(),
+            server_token: uuid::Uuid::new_v4().to_string(),
             status: ServerStatus::NotProbed,
         }
     }
@@ -496,7 +500,9 @@ impl TmuxRegistry {
             }
             ProbeResult::NoSocket => {
                 spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
-                server.generation = uuid::Uuid::new_v4().to_string();
+                server.server_token = read_server_token(&server.socket_path)
+                    .await
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -509,7 +515,9 @@ impl TmuxRegistry {
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
                 spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
-                server.generation = uuid::Uuid::new_v4().to_string();
+                server.server_token = read_server_token(&server.socket_path)
+                    .await
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 server.status = ServerStatus::Live;
             }
         }
@@ -633,29 +641,43 @@ impl TmuxRegistry {
         self.inner.read().await.get(&key).cloned()
     }
 
-    /// Read-only exact inspection of one window on an already-known tmux server.
-    /// Returns `None` when the scope has no in-memory entry, the server generation
-    /// does not match the entry's current incarnation, or the target window no
-    /// longer exists. Does not create registry entries or spawn/probe servers.
+    /// Read-only exact inspection of one window on its owning tmux server.
+    /// A server absent from the in-memory registry is rediscovered by its deterministic
+    /// socket path and accepted only when its stamped token matches the persisted binding.
+    /// Returns `None` when the token differs or the exact window no longer exists.
+    /// Does not create registry entries or spawn servers.
     ///
     /// # Errors
-    /// Returns [`TmuxError`] when invoking the read-only tmux inspection command
-    /// against an existing in-memory server fails.
+    /// Returns [`TmuxError`] when invoking the read-only tmux inspection command fails.
     pub async fn inspect_existing_window(
         &self,
         work_scope: &WorkScope,
-        expected_server_generation: &str,
+        expected_server_token: &str,
         window_id: &str,
     ) -> Result<Option<ObservedWindow>, TmuxError> {
-        let Some(entry) = self.get_existing(work_scope).await else {
-            return Ok(None);
+        let socket_path = if let Some(entry) = self.get_existing(work_scope).await {
+            let server = entry.read().await;
+            if server.server_token != expected_server_token {
+                return Ok(None);
+            }
+            server.socket_path.clone()
+        } else {
+            let derived = self.derived_socket_path(work_scope);
+            match probe(&derived)
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: derived.clone(),
+                    source,
+                })? {
+                ProbeResult::Live => {
+                    if read_server_token(&derived).await.as_deref() != Some(expected_server_token) {
+                        return Ok(None);
+                    }
+                    derived
+                }
+                ProbeResult::NoSocket | ProbeResult::DeadSocket => return Ok(None),
+            }
         };
-        let server = entry.read().await;
-        if server.generation != expected_server_generation {
-            return Ok(None);
-        }
-        let socket_path = server.socket_path.clone();
-        drop(server);
 
         let output = run_tmux_quiet_output(
             &socket_path,
@@ -670,13 +692,10 @@ impl TmuxRegistry {
             .lines()
             .map(std::string::ToString::to_string)
             .collect();
-        let exit_code = stdout.lines().rev().find_map(|line| {
-            line.trim()
-                .strip_prefix("__PHOENIX_EXIT_CODE=")
-                .and_then(|code| code.parse::<i32>().ok())
-        });
+        let marker = parse_last_exit_marker(&stdout);
         Ok(Some(ObservedWindow {
-            exit_code,
+            exit_code: marker.as_ref().map(|m| m.exit_code),
+            occurred_at: marker.map(|m| m.occurred_at),
             final_tail,
         }))
     }
@@ -877,6 +896,7 @@ fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
+    cmd.env(SERVER_TOKEN_VAR, uuid::Uuid::new_v4().to_string());
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -915,6 +935,12 @@ async fn run_tmux_quiet_output(
             socket_path: socket_path.to_path_buf(),
             source,
         })
+}
+
+const SERVER_TOKEN_VAR: &str = "PHOENIX_TMUX_SERVER_TOKEN";
+
+async fn read_server_token(socket_path: &Path) -> Option<String> {
+    tmux_global_env(socket_path, SERVER_TOKEN_VAR).await
 }
 
 /// Read one variable from a server's global environment, or `None` if unset.
@@ -1348,20 +1374,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respawn_rotates_generation_to_fence_old_bindings() {
+    async fn respawn_rotates_server_token_to_fence_old_bindings() {
         if which::which("tmux").is_err() {
             return;
         }
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
-        let scope = WorkScope::Conversation("conv-rotate-generation".to_string());
+        let scope = WorkScope::Conversation("conv-rotate-server-token".to_string());
 
         let first = reg
             .ensure_live(&scope, tmp.path())
             .await
             .expect("first ensure_live should succeed");
         let socket_path = first.read().await.socket_path.clone();
-        let first_generation = first.read().await.generation.clone();
+        let first_token = first.read().await.server_token.clone();
 
         kill_socket(&socket_path).await;
 
@@ -1369,11 +1395,11 @@ mod tests {
             .ensure_live(&scope, tmp.path())
             .await
             .expect("respawn ensure_live should succeed");
-        let second_generation = second.read().await.generation.clone();
+        let second_token = second.read().await.server_token.clone();
 
         assert_ne!(
-            first_generation, second_generation,
-            "respawning a missing/dead tmux server must rotate generation so stale wake bindings are fenced"
+            first_token, second_token,
+            "respawning a missing/dead tmux server must rotate its token so stale wake bindings are fenced"
         );
         kill_socket(&socket_path).await;
     }

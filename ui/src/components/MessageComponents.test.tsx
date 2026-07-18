@@ -150,6 +150,18 @@ function systemMessage(messageId: string, text: string, sequenceId = 2): Message
   };
 }
 
+function userMessage(messageId: string, text: string, options: { sequenceId?: number; isMeta?: boolean; displayData?: Record<string, unknown> | null } = {}): Message {
+  return {
+    message_id: messageId,
+    sequence_id: options.sequenceId ?? 2,
+    conversation_id: 'agent-1',
+    message_type: 'user',
+    content: { text, ...(options.isMeta ? { is_meta: true } : {}) },
+    display_data: options.displayData ?? null,
+    created_at: '2026-01-01T00:00:01Z',
+  };
+}
+
 const baseConversation = {
   id: 'agent-1',
   slug: 'agent-1-slug',
@@ -209,6 +221,39 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('user message provenance rendering', () => {
+  it('renders wake meta messages as background task observations instead of authored user bubbles', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage
+          message={userMessage('wake-meta', 'Wake completed while you were away.', {
+            isMeta: true,
+            displayData: { type: 'wake_result' },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    const observation = screen.getByLabelText('Background task observation');
+    expect(observation).toHaveClass('message', 'meta', 'user-meta-observation');
+    expect(screen.getByText('Background task observation')).toBeInTheDocument();
+    expect(screen.queryByText('You')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
+  });
+
+  it('keeps regular user messages authored as you', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage message={userMessage('plain-user', 'Hello there')} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('You')).toBeInTheDocument();
+    expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy your message' })).toBeInTheDocument();
+  });
+});
 
 describe('commission review tool rendering', () => {
     beforeEach(() => {

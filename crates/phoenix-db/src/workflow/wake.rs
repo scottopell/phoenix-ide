@@ -677,7 +677,7 @@ impl WakeRepository {
         let row = sqlx::query(
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                     scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                    tmux_server_generation, tmux_window_id, registering_tool_use_id,
+                    tmux_server_token, tmux_window_id, registering_tool_use_id,
                     expires_at, prepared_fingerprint
              FROM wake_bindings
              WHERE conversation_id = ?1 AND contract_id = ?2
@@ -1962,44 +1962,23 @@ impl WakeRepository {
 
     pub async fn list_pending(&self, conversation_id: &str) -> DbResult<Vec<WakePendingDelivery>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
-        let rows = sqlx::query(
-            "SELECT d.workflow_id, d.delivery_id, d.effect_id, d.barrier_id, d.consumer_kind,
-                    d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
-                    d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
-                    d.suppression_reason, d.accepted_by_transition_id,
-                    p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
-                    p.resolved_at, p.bash_handle_id, p.tmux_server_generation, p.tmux_window_id,
-                    p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
-                    p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at, b.scope_kind, b.scope_stable_key
-             FROM workflow_deliveries d
-             JOIN wake_terminal_receipts p
-               ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
-             JOIN wake_bindings b ON b.workflow_id = p.workflow_id
-             WHERE p.conversation_id = ?1 AND d.status = 'Pending'
-             ORDER BY d.delivery_id"
-        )
-        .bind(conversation_id)
-        .fetch_all(&mut *tx.tx)
-        .await?;
-        let mut pending = Vec::with_capacity(rows.len());
-        for row in rows {
-            let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
-            let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
-            let projection = projection_from_row(
-                &row,
-                fetch_tail_lines_tx(&mut tx, workflow_id, receipt_id).await?,
-            )?;
-            let delivery = delivery_from_join_row(&row)?;
-            pending.push(WakePendingDelivery {
-                workflow_id,
-                conversation_id: projection.conversation_id.clone(),
-                receipt: projection,
-                canonical_delivery: delivery,
-            });
-        }
+        let out = fetch_pending_deliveries_for_conversation_tx(&mut tx, conversation_id).await?;
         tx.commit().await?;
-        Ok(pending)
+        Ok(out)
+    }
+
+    pub async fn get_pending_exact(
+        &self,
+        workflow_id: WorkflowId,
+        delivery_id: DeliveryId,
+        conversation_id: &str,
+    ) -> DbResult<Option<WakePendingDelivery>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let out =
+            fetch_pending_delivery_exact_tx(&mut tx, workflow_id, delivery_id, conversation_id)
+                .await?;
+        tx.commit().await?;
+        Ok(out)
     }
     pub async fn materialize_pending_delivery_message(
         &self,
@@ -2055,7 +2034,7 @@ impl WakeRepository {
                     d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
                     d.suppression_reason, d.accepted_by_transition_id,
                     p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
-                    p.resolved_at, p.bash_handle_id, p.tmux_server_generation, p.tmux_window_id,
+                    p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
                     p.cancelled_at, b.scope_kind, b.scope_stable_key, b.registering_tool_use_id
@@ -2615,29 +2594,16 @@ impl WakeRepository {
             return Ok(WakeAdoptMaterializedPendingOutcome::Busy(Box::new(state)));
         }
 
-        let workflow_rows = sqlx::query(
-            "SELECT DISTINCT p.workflow_id
-             FROM wake_terminal_receipts p
-             JOIN workflow_deliveries d
-               ON d.workflow_id = p.workflow_id AND d.delivery_id = p.delivery_id
-             WHERE p.conversation_id = ?1 AND d.status = 'Pending'
-             ORDER BY p.workflow_id",
-        )
-        .bind(conversation_id)
-        .fetch_all(&mut *tx.tx)
-        .await?;
-        if workflow_rows.is_empty() {
+        let batches =
+            fetch_materialized_pending_batches_for_conversation_tx(&mut tx, conversation_id)
+                .await?;
+        if batches.is_empty() {
             tx.rollback().await?;
             return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
         }
 
-        let mut batches = Vec::with_capacity(workflow_rows.len());
         let mut missing_ids = Vec::new();
-        for row in workflow_rows {
-            let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
-            let pending_ids = fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
-            let materialized =
-                fetch_materialized_pending_deliveries_tx(&mut tx, workflow_id).await?;
+        for (_workflow_id, pending_ids, materialized) in &batches {
             let materialized_ids: std::collections::BTreeSet<_> = materialized
                 .iter()
                 .map(|item| item.pending.canonical_delivery.delivery_id)
@@ -2648,7 +2614,6 @@ impl WakeRepository {
                     .copied()
                     .filter(|delivery_id| !materialized_ids.contains(delivery_id)),
             );
-            batches.push((workflow_id, pending_ids, materialized));
         }
         if !missing_ids.is_empty() {
             tx.rollback().await?;
@@ -3011,7 +2976,7 @@ fn resource_key(resource: &WakeResourceIdentity) -> String {
     match resource {
         WakeResourceIdentity::Bash(identity) => format!("bash:{}", identity.handle_id),
         WakeResourceIdentity::TmuxWindow(identity) => {
-            format!("tmux:{}:{}", identity.server_generation, identity.window_id)
+            format!("tmux:{}:{}", identity.server_token, identity.window_id)
         }
         WakeResourceIdentity::Subagent(_) => unreachable!("subagent wake bindings not implemented"),
     }
@@ -3033,13 +2998,13 @@ async fn fetch_existing_binding_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                tmux_server_generation, tmux_window_id, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
            AND contract_id = ?3 AND resource_kind = ?4
            AND COALESCE(bash_handle_id, '') = ?5
-           AND COALESCE(tmux_server_generation, '') = ?6
+           AND COALESCE(tmux_server_token, '') = ?6
            AND COALESCE(tmux_window_id, '') = ?7",
     )
     .bind(i64::from(wake_profile::PROTOCOL_VERSION))
@@ -3047,7 +3012,7 @@ async fn fetch_existing_binding_tx(
     .bind(&input.contract_id)
     .bind(resource_kind_str(&input.resource))
     .bind(bash_handle_id(&input.resource).unwrap_or_default())
-    .bind(tmux_server_generation(&input.resource).unwrap_or_default())
+    .bind(tmux_server_token(&input.resource).unwrap_or_default())
     .bind(tmux_window_id(&input.resource).unwrap_or_default())
     .fetch_optional(&mut *tx.tx)
     .await?;
@@ -3061,7 +3026,7 @@ async fn fetch_binding_by_workflow_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                tmux_server_generation, tmux_window_id, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings WHERE workflow_id = ?1",
     )
@@ -3082,7 +3047,7 @@ async fn insert_binding_tx(
         "INSERT INTO wake_bindings (
             workflow_id, conversation_id, contract_id, profile_kind, profile_version,
             scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-            tmux_server_generation, tmux_window_id, registering_tool_use_id,
+            tmux_server_token, tmux_window_id, registering_tool_use_id,
             expires_at, prepared_fingerprint, observe_effect_id, created_at
          ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )
@@ -3094,7 +3059,7 @@ async fn insert_binding_tx(
     .bind(&input.registration_scope.stable_key)
     .bind(resource_kind_str(&input.resource))
     .bind(bash_handle_id(&input.resource))
-    .bind(tmux_server_generation(&input.resource))
+    .bind(tmux_server_token(&input.resource))
     .bind(tmux_window_id(&input.resource))
     .bind(&input.registering_tool_use_id)
     .bind(i64::try_from(input.expires_at.0).map_err(|e| DbError::Serialization(e.to_string()))?)
@@ -3186,7 +3151,7 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIden
                     },
                     stable_key: row.get("scope_stable_key"),
                 },
-                server_generation: row.get::<String, _>("tmux_server_generation"),
+                server_token: row.get::<String, _>("tmux_server_token"),
                 window_id: row.get::<String, _>("tmux_window_id"),
             },
         )),
@@ -3219,9 +3184,9 @@ fn bash_handle_id(resource: &WakeResourceIdentity) -> Option<String> {
     }
 }
 
-fn tmux_server_generation(resource: &WakeResourceIdentity) -> Option<String> {
+fn tmux_server_token(resource: &WakeResourceIdentity) -> Option<String> {
     match resource {
-        WakeResourceIdentity::TmuxWindow(identity) => Some(identity.server_generation.clone()),
+        WakeResourceIdentity::TmuxWindow(identity) => Some(identity.server_token.clone()),
         WakeResourceIdentity::Bash(_) => None,
         WakeResourceIdentity::Subagent(_) => unreachable!("subagent wake bindings not implemented"),
     }
@@ -3275,7 +3240,7 @@ async fn insert_terminal_receipt_projection_tx(
         terminal_kind,
         resolved_at,
         bash_handle_id,
-        tmux_server_generation,
+        tmux_server_token,
         tmux_window_id,
         bash_status,
         tmux_status,
@@ -3292,7 +3257,7 @@ async fn insert_terminal_receipt_projection_tx(
     sqlx::query(
         "INSERT INTO wake_terminal_receipts (
             workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
-            terminal_kind, resolved_at, bash_handle_id, tmux_server_generation, tmux_window_id,
+            terminal_kind, resolved_at, bash_handle_id, tmux_server_token, tmux_window_id,
             bash_status, tmux_status, occurred_at, exit_code, duration_ms, signal_number,
             kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
@@ -3306,7 +3271,7 @@ async fn insert_terminal_receipt_projection_tx(
     .bind(terminal_kind)
     .bind(to_i64(resolved_at.0, "resolved_at")?)
     .bind(bash_handle_id)
-    .bind(tmux_server_generation)
+    .bind(tmux_server_token)
     .bind(tmux_window_id)
     .bind(bash_status)
     .bind(tmux_status)
@@ -3391,7 +3356,7 @@ fn projection_parts(
                 "Fired",
                 *resolved_at,
                 None,
-                Some(identity.server_generation.clone()),
+                Some(identity.server_token.clone()),
                 Some(identity.window_id.clone()),
                 None,
                 Some(match ev.status {
@@ -3439,7 +3404,7 @@ fn projection_parts(
                 "Expired",
                 *resolved_at,
                 None,
-                Some(identity.server_generation.clone()),
+                Some(identity.server_token.clone()),
                 Some(identity.window_id.clone()),
                 None,
                 None,
@@ -3496,7 +3461,7 @@ fn projection_parts(
                     "Forgotten",
                     *resolved_at,
                     None,
-                    Some(identity.server_generation.clone()),
+                    Some(identity.server_token.clone()),
                     Some(identity.window_id.clone()),
                     None,
                     None,
@@ -3549,7 +3514,7 @@ fn projection_parts(
                     "Cancelled",
                     *resolved_at,
                     None,
-                    Some(identity.server_generation.clone()),
+                    Some(identity.server_token.clone()),
                     Some(identity.window_id.clone()),
                     None,
                     None,
@@ -3595,13 +3560,167 @@ async fn fetch_pending_terminal_delivery_ids_tx(
         })
         .collect()
 }
+async fn fetch_pending_delivery_exact_tx(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    delivery_id: DeliveryId,
+    conversation_id: &str,
+) -> DbResult<Option<WakePendingDelivery>> {
+    let row = sqlx::query(
+        "SELECT d.workflow_id, d.delivery_id, d.effect_id, d.barrier_id, d.consumer_kind,
+                d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
+                d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
+                d.suppression_reason, d.accepted_by_transition_id,
+                p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
+                p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
+                p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
+                p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
+                p.cancelled_at, b.scope_kind, b.scope_stable_key
+         FROM workflow_deliveries d
+         JOIN wake_terminal_receipts p
+           ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+         JOIN wake_bindings b ON b.workflow_id = p.workflow_id
+         WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND p.conversation_id = ?3 AND d.status = 'Pending'"
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(delivery_id.0, "delivery_id")?)
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx.tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
+    let projection = projection_from_row(
+        &row,
+        fetch_tail_lines_tx(tx, workflow_id, receipt_id).await?,
+    )?;
+    Ok(Some(WakePendingDelivery {
+        workflow_id,
+        conversation_id: projection.conversation_id.clone(),
+        receipt: projection,
+        canonical_delivery: delivery_from_join_row(&row)?,
+    }))
+}
+
+async fn fetch_pending_deliveries_for_conversation_tx(
+    tx: &mut WorkflowTx<'_>,
+    conversation_id: &str,
+) -> DbResult<Vec<WakePendingDelivery>> {
+    let rows = sqlx::query(
+        "SELECT d.workflow_id, d.delivery_id, d.effect_id, d.barrier_id, d.consumer_kind,
+                d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
+                d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
+                d.suppression_reason, d.accepted_by_transition_id,
+                p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
+                p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
+                p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
+                p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
+                p.cancelled_at, b.scope_kind, b.scope_stable_key
+         FROM workflow_deliveries d
+         JOIN wake_terminal_receipts p
+           ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+         JOIN wake_bindings b ON b.workflow_id = p.workflow_id
+         WHERE p.conversation_id = ?1 AND d.status = 'Pending'
+         ORDER BY d.delivery_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut *tx.tx)
+    .await?;
+    let mut pending = Vec::with_capacity(rows.len());
+    for row in rows {
+        let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
+        let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
+        let projection = projection_from_row(
+            &row,
+            fetch_tail_lines_tx(tx, workflow_id, receipt_id).await?,
+        )?;
+        pending.push(WakePendingDelivery {
+            workflow_id,
+            conversation_id: projection.conversation_id.clone(),
+            receipt: projection,
+            canonical_delivery: delivery_from_join_row(&row)?,
+        });
+    }
+    Ok(pending)
+}
+
+async fn fetch_materialized_pending_batches_for_conversation_tx(
+    tx: &mut WorkflowTx<'_>,
+    conversation_id: &str,
+) -> DbResult<
+    Vec<(
+        WorkflowId,
+        Vec<DeliveryId>,
+        Vec<WakeMaterializedPendingDelivery>,
+    )>,
+> {
+    let rows = sqlx::query(
+        "SELECT d.*, p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind,
+                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
+                p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
+                p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
+                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key,
+                l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
+                l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
+                l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
+                l.created_at AS link_created_at,
+                m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
+                m.display_data, m.usage_data, m.created_at
+         FROM workflow_deliveries d
+         JOIN wake_terminal_receipts p
+           ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+         JOIN wake_bindings b ON b.workflow_id = d.workflow_id
+         LEFT JOIN wake_delivery_messages l
+           ON l.workflow_id = d.workflow_id AND l.delivery_id = d.delivery_id
+         LEFT JOIN messages m ON m.message_id = l.message_id
+         WHERE p.conversation_id = ?1 AND d.status = 'Pending'
+         ORDER BY d.workflow_id, d.delivery_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut *tx.tx)
+    .await?;
+    let mut batches: Vec<(
+        WorkflowId,
+        Vec<DeliveryId>,
+        Vec<WakeMaterializedPendingDelivery>,
+    )> = Vec::new();
+    for row in rows {
+        let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
+        let delivery_id = DeliveryId(to_u64(row.get::<i64, _>("delivery_id"), "delivery_id")?);
+        let batch = match batches.last_mut() {
+            Some(batch) if batch.0 == workflow_id => batch,
+            _ => {
+                batches.push((workflow_id, Vec::new(), Vec::new()));
+                batches.last_mut().expect("just pushed")
+            }
+        };
+        batch.1.push(delivery_id);
+        if row.get::<Option<String>, _>("link_message_id").is_some() {
+            let receipt_id = ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?);
+            let tail = fetch_tail_lines_tx(tx, workflow_id, receipt_id).await?;
+            let pending = WakePendingDelivery {
+                workflow_id,
+                conversation_id: row.get("conversation_id"),
+                receipt: projection_from_row(&row, tail)?,
+                canonical_delivery: delivery_from_join_row(&row)?,
+            };
+            batch.2.push(WakeMaterializedPendingDelivery {
+                pending,
+                link: delivery_message_link_from_join_row(&row)?,
+            });
+        }
+    }
+    Ok(batches)
+}
+
 async fn fetch_materialized_pending_deliveries_tx(
     tx: &mut WorkflowTx<'_>,
     workflow_id: WorkflowId,
 ) -> DbResult<Vec<WakeMaterializedPendingDelivery>> {
     let rows = sqlx::query(
         "SELECT d.*, p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind,
-                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_generation,
+                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
                 p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key,
@@ -3849,7 +3968,7 @@ fn resource_from_projection_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeR
                     kind: scope_kind,
                     stable_key: scope_stable_key,
                 },
-                server_generation: row.get("tmux_server_generation"),
+                server_token: row.get("tmux_server_token"),
                 window_id: row.get("tmux_window_id"),
             },
         )),
@@ -4187,7 +4306,7 @@ mod tests {
                     kind: wake_types::WorkScopeKind::Conversation,
                     stable_key: "conv-1".into(),
                 },
-                server_generation: "srv-1".into(),
+                server_token: "srv-1".into(),
                 window_id: "win-1".into(),
             }),
             registering_tool_use_id: "tool-2".into(),
@@ -4222,7 +4341,7 @@ mod tests {
                     kind: wake_types::WorkScopeKind::Conversation,
                     stable_key: "conv-1".into(),
                 },
-                server_generation: "srv-1".into(),
+                server_token: "srv-1".into(),
                 window_id: "win-1".into(),
             },
             status: wake_types::TmuxTerminalStatus::ExitMarkerObserved,
@@ -7607,6 +7726,120 @@ mod tests {
             | WakeTerminalPayload::Expired { .. }
             | WakeTerminalPayload::Forgotten { .. }) => {
                 panic!("expected fired bash receipt, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_exact_lookup_matches_owner_and_preserves_tail_projection() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let input = tmux_intent();
+        let workflow_id = next_test_workflow_id(&first).await.unwrap();
+        first
+            .register_allocated(workflow_id, &input, "fp-exact", Timestamp(10))
+            .await
+            .unwrap();
+        let started = first
+            .claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap();
+        let canonical = unwrap_started(started);
+        first
+            .record_terminal_evidence(
+                workflow_id,
+                canonical.authority.as_ref().unwrap(),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &tmux_evidence(18),
+            )
+            .await
+            .unwrap();
+
+        let exact = second
+            .get_pending_exact(workflow_id, DeliveryId(1), "conv-1")
+            .await
+            .unwrap()
+            .expect("owned pending delivery");
+        assert_eq!(exact.workflow_id, workflow_id);
+        assert_eq!(exact.canonical_delivery.delivery_id, DeliveryId(1));
+        match exact.receipt.terminal {
+            WakeTerminalPayload::Fired {
+                evidence: WakeTerminalEvidence::TmuxWindow(ref ev),
+                ..
+            } => {
+                assert_eq!(ev.final_tail, vec!["tail-1"]);
+            }
+            other @ (WakeTerminalPayload::Fired { .. }
+            | WakeTerminalPayload::Cancelled { .. }
+            | WakeTerminalPayload::Expired { .. }
+            | WakeTerminalPayload::Forgotten { .. }) => {
+                panic!("expected fired tmux receipt, got {other:?}")
+            }
+        }
+
+        assert!(second
+            .get_pending_exact(workflow_id, DeliveryId(1), "conv-2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_adoption_detects_missing_materialization_from_single_conversation_scan() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        repo.register_allocated(
+            workflow_id,
+            &intent(),
+            "fp-missing-materialized",
+            Timestamp(10),
+        )
+        .await
+        .unwrap();
+        let started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(matches!(
+            repo.record_terminal_evidence(
+                workflow_id,
+                started.authority.as_ref().unwrap(),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &bash_evidence(19),
+            )
+            .await
+            .unwrap(),
+            WakeTerminalEvidenceOutcome::Recorded { .. }
+        ));
+
+        let outcome = repo
+            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(21))
+            .await
+            .unwrap();
+        match outcome {
+            WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { delivery_ids } => {
+                assert_eq!(delivery_ids, vec![DeliveryId(1)]);
+            }
+            other @ (WakeAdoptMaterializedPendingOutcome::Adopted(_)
+            | WakeAdoptMaterializedPendingOutcome::Busy(_)
+            | WakeAdoptMaterializedPendingOutcome::NothingPending) => {
+                panic!("expected not fully materialized, got {other:?}")
             }
         }
     }

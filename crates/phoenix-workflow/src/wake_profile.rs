@@ -41,7 +41,7 @@ pub struct BashResourceIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TmuxResourceIdentity {
     pub work_scope: WorkScopeIdentity,
-    pub server_generation: String,
+    pub server_token: String,
     pub window_id: String,
 }
 

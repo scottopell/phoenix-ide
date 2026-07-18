@@ -40,6 +40,8 @@ vi.mock('../api', async () => {
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
       getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
+      getWakeStatus: vi.fn(() => Promise.resolve({ pending_count: 0, soonest_expires_at: null, contracts: [] })),
+      cancelWake: vi.fn(() => Promise.resolve({ success: true })),
     },
   };
 });

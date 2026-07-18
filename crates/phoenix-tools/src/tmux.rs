@@ -14,6 +14,49 @@ pub mod probe;
 pub mod registry;
 pub mod run;
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const EXIT_MARKER_SENTINEL: &str = "__PHOENIX_EXIT__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxExitMarker {
+    pub exit_code: i32,
+    pub occurred_at: SystemTime,
+}
+
+#[must_use]
+pub fn format_exit_marker(exit_code: i32, occurred_at: SystemTime) -> String {
+    let occurred_at_ms = occurred_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis();
+    format!("{EXIT_MARKER_SENTINEL} exit_code={exit_code} occurred_at_ms={occurred_at_ms}")
+}
+
+#[must_use]
+pub fn parse_exit_marker(line: &str) -> Option<TmuxExitMarker> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix(EXIT_MARKER_SENTINEL)?;
+    let mut exit_code = None;
+    let mut occurred_at_ms = None;
+    for part in rest.split_whitespace() {
+        if let Some(value) = part.strip_prefix("exit_code=") {
+            exit_code = value.parse::<i32>().ok();
+        } else if let Some(value) = part.strip_prefix("occurred_at_ms=") {
+            occurred_at_ms = value.parse::<u64>().ok();
+        }
+    }
+    Some(TmuxExitMarker {
+        exit_code: exit_code?,
+        occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(occurred_at_ms?))?,
+    })
+}
+
+#[must_use]
+pub fn parse_last_exit_marker(output: &str) -> Option<TmuxExitMarker> {
+    output.lines().rev().find_map(parse_exit_marker)
+}
+
 pub use registry::{TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxServer};
 pub use run::TmuxRunTool;
 
@@ -24,7 +67,7 @@ pub use run::TmuxRunTool;
 // than re-exported here.
 
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;

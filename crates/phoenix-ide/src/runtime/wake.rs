@@ -350,14 +350,9 @@ async fn deliver_pending(
                 delivery_id: row.delivery_id,
             };
             let current = repo
-                .list_pending(&row.conversation_id)
+                .get_pending_exact(row.workflow_id, row.delivery_id, &row.conversation_id)
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|item| {
-                    item.workflow_id == row.workflow_id
-                        && item.canonical_delivery.delivery_id == row.delivery_id
-                });
+                .map_err(|error| error.to_string())?;
             let Some(current) = current else {
                 cursor = Some(next_cursor);
                 continue;
@@ -583,7 +578,7 @@ impl TerminalInspector for RuntimeRegistryInspector {
                         .tmux
                         .inspect_existing_window(
                             &scope,
-                            &identity.server_generation,
+                            &identity.server_token,
                             &identity.window_id,
                         )
                         .await
@@ -594,7 +589,9 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                 WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
                                     identity: identity.clone(),
                                     status: TmuxTerminalStatus::ExitMarkerObserved,
-                                    occurred_at: observation_time,
+                                    occurred_at: window
+                                        .occurred_at
+                                        .map_or(observation_time, system_time_to_timestamp),
                                     exit_code: Some(exit_code),
                                     duration_ms: None,
                                     final_tail: window.final_tail,
@@ -798,7 +795,7 @@ mod tests {
             registration_scope: conv_scope(),
             resource: WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
                 work_scope: conv_scope(),
-                server_generation: generation.to_string(),
+                server_token: generation.to_string(),
                 window_id: window_id.to_string(),
             }),
             registering_tool_use_id: "tool-use".to_string(),
@@ -875,7 +872,7 @@ mod tests {
             InspectionOutcome::Terminal(WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
                 identity: TmuxResourceIdentity {
                     work_scope: conv_scope(),
-                    server_generation: "g1".to_string(),
+                    server_token: "g1".to_string(),
                     window_id: "w1".to_string(),
                 },
                 status: TmuxTerminalStatus::ExitMarkerObserved,
@@ -945,6 +942,67 @@ mod tests {
         );
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_restart_discovery_reuses_live_tmux_socket_without_registry_entry() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let (_db, repo) = open_repo().await;
+        let socket_tmp = tempfile::TempDir::new().unwrap();
+        let cwd_tmp = tempfile::TempDir::new().unwrap();
+        let tmux = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let scope = WorkScope::Conversation("conv".to_string());
+        let server = tmux.ensure_live(&scope, cwd_tmp.path()).await.unwrap();
+        let socket_path = server.read().await.socket_path.clone();
+        let server_token = server.read().await.server_token.clone();
+        let output = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &socket_path.to_string_lossy(),
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "bash",
+                "-lc",
+                "printf '__PHOENIX_EXIT__ exit_code=0 occurred_at_ms=1700000000000\\n'; exec ${SHELL:-/bin/bash} -i",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        drop(server);
+        let fresh_registry = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let workflow_id = register_tmux(&repo, &server_token, &window_id, 50).await;
+        let inspector = Arc::new(RuntimeRegistryInspector::new(
+            Arc::new(phoenix_tools::BashHandleRegistry::new()),
+            fresh_registry,
+        ));
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(99),
+        );
+        worker.run_once().await.unwrap();
+        let binding = repo
+            .fetch_binding(phoenix_workflow::WorkflowId(workflow_id))
+            .await
+            .unwrap();
+        assert!(binding.is_some());
+        tokio::process::Command::new("tmux")
+            .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
+            .output()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

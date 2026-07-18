@@ -1,7 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import './ConversationPage.css';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message, type WakeStatus } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -37,6 +36,7 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
 import { QuestionPanel } from '../components/QuestionPanel';
+import { WakeStatusBar } from '../components/WakeStatusBar';
 import {
   useMessageQueue,
   useConnection,
@@ -128,37 +128,6 @@ const ForkProposalReview = lazy(() =>
 
 const TERMINAL_COLLAPSED_PX = 32;
 const terminalPaneMax = () => Math.min(800, Math.floor(window.innerHeight * 0.75));
-
-function WakeStatusBar({ conversationId }: { conversationId: string }) {
-  const [status, setStatus] = useState<WakeStatus | null>(null);
-  const refresh = useCallback(() => {
-    api.getWakeStatus(conversationId).then(setStatus).catch(() => setStatus(null));
-  }, [conversationId]);
-
-  useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, 5000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
-
-  if (!status || status.pending_count === 0) return null;
-  return (
-    <div className="wake-status-bar" role="status">
-      <span>⏰ {status.pending_count} pending wake{status.pending_count === 1 ? '' : 's'}</span>
-      {status.contracts.map((contract) => (
-        <button
-          key={contract.workflow_id}
-          type="button"
-          className="wake-cancel-button"
-          title={`Cancel wake ${contract.contract_id}`}
-          onClick={() => api.cancelWake(conversationId, contract.contract_id).then(refresh)}
-        >
-          cancel {contract.contract_id}
-        </button>
-      ))}
-    </div>
-  );
-}
 
 const AlertTriangle = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

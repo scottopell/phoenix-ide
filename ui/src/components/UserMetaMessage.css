@@ -1,0 +1,20 @@
+.user-meta-observation {
+  background: color-mix(in srgb, var(--bg-secondary) 86%, var(--accent-blue, #60a5fa) 14%);
+  border: 1px dashed color-mix(in srgb, var(--border-color) 55%, var(--accent-blue, #60a5fa) 45%);
+  opacity: 1;
+}
+
+.user-meta-observation__provenance {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-secondary);
+}
+
+.user-meta-observation__provenance::before {
+  content: '↺';
+  color: var(--accent-blue, #60a5fa);
+}
