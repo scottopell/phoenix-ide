@@ -256,7 +256,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_wake_terminal_receipts",
         sql: MIGRATION_048,
     },
+    Migration {
+        version: 49,
+        name: "create_wake_delivery_messages",
+        sql: MIGRATION_049,
+    },
 ];
+
+const MIGRATION_049: &str = r"
+CREATE TABLE wake_delivery_messages (
+    workflow_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
+    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
+    auto_resume INTEGER NOT NULL CHECK (auto_resume IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    PRIMARY KEY (workflow_id, delivery_id),
+    FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES wake_bindings(workflow_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX wake_delivery_messages_by_conversation
+ON wake_delivery_messages(conversation_id, delivery_id);
+";
 
 const MIGRATION_048: &str = r"
 CREATE TABLE wake_terminal_receipts (
