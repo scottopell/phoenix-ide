@@ -353,6 +353,7 @@ CREATE TABLE wake_bindings (
     tmux_window_id TEXT,
     registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
     expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+    resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
     prepared_fingerprint TEXT NOT NULL CHECK (prepared_fingerprint <> ''),
     observe_effect_id INTEGER NOT NULL CHECK (observe_effect_id >= 1),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -371,7 +372,8 @@ CREATE UNIQUE INDEX wake_bindings_resource_identity
 ON wake_bindings(
     profile_kind, profile_version, conversation_id, resource_kind,
     COALESCE(bash_handle_id, ''), COALESCE(tmux_server_token, ''), COALESCE(tmux_window_id, '')
-);
+)
+WHERE resolved_at IS NULL;
 CREATE INDEX wake_bindings_by_conversation ON wake_bindings(conversation_id);
 CREATE INDEX wake_bindings_active_unresolved
 ON wake_bindings(expires_at, workflow_id);

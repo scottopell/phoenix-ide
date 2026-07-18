@@ -3959,6 +3959,16 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
+            crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
+                .transfer_active_for_continuation(
+                    &id,
+                    &new_conv.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             tracing::info!(
                 parent_id = %id,
                 continuation_id = %new_conv.id,
@@ -3999,6 +4009,16 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
+            crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
+                .transfer_active_for_continuation(
+                    &id,
+                    &existing.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             tracing::info!(
                 parent_id = %id,
                 existing_continuation = %existing.id,

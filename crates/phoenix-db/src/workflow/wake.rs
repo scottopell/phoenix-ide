@@ -2042,7 +2042,9 @@ impl WakeRepository {
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
              JOIN wake_bindings b ON b.workflow_id = p.workflow_id
-             WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.status = 'Pending' AND p.conversation_id = ?3"
+             JOIN conversations c ON c.id = p.conversation_id
+             WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.status = 'Pending'
+               AND p.conversation_id = ?3 AND c.archived = 0"
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.delivery_id.0, "delivery_id")?)
@@ -2184,6 +2186,43 @@ impl WakeRepository {
         let out = fetch_materialized_pending_deliveries_tx(&mut tx, workflow_id).await?;
         tx.commit().await?;
         Ok(out)
+    }
+
+    pub async fn transfer_active_for_continuation(
+        &self,
+        from_conversation_id: &str,
+        to_conversation_id: &str,
+        timestamp: Timestamp,
+    ) -> DbResult<()> {
+        let active = self
+            .list_active_unresolved_for_conversation(from_conversation_id)
+            .await?;
+        for row in active {
+            for _ in 0..20 {
+                let mut tx = self.workflow_repo.begin_tx().await?;
+                let Some(head) = tx.fetch_workflow_head(row.workflow_id).await? else {
+                    tx.rollback().await?;
+                    break;
+                };
+                let pending_delivery_ids =
+                    fetch_pending_terminal_delivery_ids_tx(&mut tx, row.workflow_id).await?;
+                tx.rollback().await?;
+                let input = WakeTransferInput {
+                    workflow_id: row.workflow_id,
+                    from_conversation_id: from_conversation_id.to_string(),
+                    to_conversation_id: to_conversation_id.to_string(),
+                    expected_version: head.version,
+                    exact_pending_delivery_ids: pending_delivery_ids,
+                    transition_id: TransitionId(head.version.next().0),
+                    timestamp,
+                };
+                match self.transfer(&input).await? {
+                    WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
+                    WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
@@ -3254,6 +3293,13 @@ async fn insert_terminal_receipt_projection_tx(
         cancelled_at,
         tail,
     ) = projection_parts(terminal);
+    sqlx::query(
+        "UPDATE wake_bindings SET resolved_at = ?2 WHERE workflow_id = ?1 AND resolved_at IS NULL",
+    )
+    .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
+    .bind(to_i64(resolved_at.0, "resolved_at")?)
+    .execute(&mut *tx.tx)
+    .await?;
     sqlx::query(
         "INSERT INTO wake_terminal_receipts (
             workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,

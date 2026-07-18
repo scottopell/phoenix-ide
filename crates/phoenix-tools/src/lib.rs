@@ -266,6 +266,14 @@ impl ToolOutput {
         self
     }
 
+    #[must_use]
+    pub fn with_output(mut self, text: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
+        }
+        self
+    }
+
     /// Attach tool-spent LLM usage for runtime accounting.
     #[must_use]
     pub fn with_llm_usage(mut self, usage: ToolLlmUsage) -> Self {

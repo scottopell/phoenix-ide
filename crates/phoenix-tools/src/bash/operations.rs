@@ -1519,7 +1519,9 @@ async fn background_run_response(
                         })
                     });
                 }
-                response = response.with_display(enriched);
+                let provider_output = serde_json::to_string(&enriched)
+                    .unwrap_or_else(|error| format!("failed to serialize bash response: {error}"));
+                response = response.with_output(provider_output).with_display(enriched);
             }
             response
         }
@@ -2208,6 +2210,8 @@ mod tests {
         assert_eq!(value["status"], "still_running");
         assert_eq!(registrar.register_calls().len(), 1);
         assert_eq!(value["wake_registration"]["workflow_id"], 42);
+        let provider_value: Value = serde_json::from_str(output.output()).expect("provider JSON");
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 42);
         assert!(value["wake_registration"]["contract_id"]
             .as_str()
             .expect("contract id")
@@ -2256,6 +2260,8 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value = output.display_data().cloned().expect("display data");
         assert_eq!(value["wake_registration"]["workflow_id"], 77);
+        let provider_value: Value = serde_json::from_str(output.output()).expect("provider JSON");
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 77);
         assert_eq!(registrar.register_calls().len(), 1);
     }
 

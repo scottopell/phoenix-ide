@@ -715,7 +715,9 @@ async fn register_tmux_wake_if_live(
                         })
                     });
                 }
-                response = response.with_display(enriched);
+                let provider_output = serde_json::to_string(&enriched)
+                    .unwrap_or_else(|error| format!("failed to serialize tmux response: {error}"));
+                response = response.with_output(provider_output).with_display(enriched);
             }
             response
         }
@@ -1100,6 +1102,8 @@ mod tests {
         let v = parse_response(&result);
         assert_eq!(v["status"], "started");
         assert_eq!(v["wake_registration"]["workflow_id"], 42);
+        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 42);
         let calls = registrar.register_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(
