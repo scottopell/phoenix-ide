@@ -105,8 +105,9 @@ class SystemdDeployCommandTests(unittest.TestCase):
                  mock.patch.object(
                      self.dev,
                      "_stage_systemd_root_handoff",
-                     side_effect=lambda _staging, _tx, helper, files: captured.update(
+                     side_effect=lambda _staging, _tx, helper, files, *, noninteractive=False: captured.update(
                          helper_text=helper.read_text(),
+                         noninteractive=noninteractive,
                          manifest=json.loads(dict(files)["manifest.json"].read_text()),
                          manifest_text=dict(files)["manifest.json"].read_text(),
                          socket_text=dict(files)["candidate.socket"].read_text(),
@@ -126,6 +127,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             self.assertEqual((ROOT / "scripts/systemd_deploy_helper.py").read_text(), captured["helper_text"])
             files = captured["files"]
             manifest = captured["manifest"]
+            self.assertFalse(captured["noninteractive"])
             self.assertNotIn("value", captured["manifest_text"])
             self.assertEqual(identity.as_dict(), manifest["expected"])
             self.assertEqual("https://localhost:9443/api/version", manifest["expected_health_url"])

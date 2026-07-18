@@ -603,6 +603,21 @@ pub async fn approve(
                 .into_response()
         }
     };
+    if !matches!(
+        preview,
+        ReleasePreview::Available {
+            newer_than_current: true,
+            ..
+        }
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "the selected stable release is not newer than the running version"
+            })),
+        )
+            .into_response();
+    }
     let ReleasePreview::Available {
         tag,
         commit,

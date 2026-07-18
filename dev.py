@@ -6237,6 +6237,8 @@ def _stage_systemd_root_handoff(
     transaction_id: str,
     helper: Path,
     files: list[tuple[str, Path]],
+    *,
+    noninteractive: bool = False,
 ) -> Path:
     bundle = staging / "bundle.json"
     _write_json_atomic(bundle, {
@@ -6248,20 +6250,22 @@ def _stage_systemd_root_handoff(
     })
     bootstrap = SYSTEMD_DEPLOY_DIR / f"bootstrap-{transaction_id}"
     root_helper = bootstrap / "helper.py"
-    subprocess.run(["sudo", "install", "-d", "-m", "0700", str(bootstrap)], check=True)
+    sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
+    subprocess.run([*sudo, "install", "-d", "-m", "0700", str(bootstrap)], check=True)
     subprocess.run([
-        "sudo", "install", "-o", "root", "-g", "root", "-m", "0700",
+                *sudo, "install", "-o", "root", "-g", "root", "-m", "0700",
+
         str(helper), str(root_helper),
     ], check=True)
     result = subprocess.run(
         [
-            "sudo", "python3", str(root_helper), "stage",
+            *sudo, "python3", str(root_helper), "stage",
             "--bundle", str(bundle), "--source-uid", str(os.getuid()),
         ],
         capture_output=True,
         text=True,
     )
-    subprocess.run(["sudo", "rm", "-rf", str(bootstrap)], check=False)
+    subprocess.run([*sudo, "rm", "-rf", str(bootstrap)], check=False)
     if result.returncode != 0:
         raise SystemExit(f"systemd handoff staging failed: {(result.stderr or result.stdout).strip()}")
     manifest_path = Path(result.stdout.strip())
@@ -6304,18 +6308,24 @@ def _systemd_installed_runtime() -> tuple["RuntimeIdentity | None", str | None]:
     return identity, _prod_api_health_url(_read_systemd_installed_env())
 
 
-def _launch_systemd_activation(transaction_id: str, root_manifest: Path) -> None:
+def _launch_systemd_activation(
+    transaction_id: str,
+    root_manifest: Path,
+    *,
+    noninteractive: bool = False,
+) -> None:
     root_transaction = root_manifest.parent
     activation_unit = f"phoenix-ide-deploy-{transaction_id}"
+    sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
     try:
         subprocess.run([
-            "sudo", "systemd-run", "--no-block", f"--unit={activation_unit}",
+            *sudo, "systemd-run", "--no-block", f"--unit={activation_unit}",
             "--property=Type=oneshot", "--",
             "python3", str(root_transaction / "helper.py"), "activate", "--manifest", str(root_manifest),
         ], check=True)
     except subprocess.CalledProcessError:
         cleanup = subprocess.run([
-            "sudo", "python3", str(root_transaction / "helper.py"),
+            *sudo, "python3", str(root_transaction / "helper.py"),
             "abandon", "--manifest", str(root_manifest),
         ], capture_output=True, text=True)
         if cleanup.returncode != 0:
@@ -6453,9 +6463,19 @@ def native_prod_deploy(
         ]
         if env_snapshot:
             files.append(("candidate.env", candidate_env))
-        root_manifest = _stage_systemd_root_handoff(staging, transaction_id, helper, files)
+        root_manifest = _stage_systemd_root_handoff(
+            staging,
+            transaction_id,
+            helper,
+            files,
+            noninteractive=controller.enabled,
+        )
 
-    _launch_systemd_activation(transaction_id, root_manifest)
+    _launch_systemd_activation(
+        transaction_id,
+        root_manifest,
+        noninteractive=controller.enabled,
+    )
     print("\n✓ Activation handed to an independent root systemd unit")
     print(f"  Transaction: {transaction_id}")
     print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
@@ -7856,7 +7876,8 @@ def launchd_prod_deploy(
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-            "transaction_id": transaction_id, "state": "preparing", "source_kind": None,
+            "transaction_id": transaction_id, "state": "preparing",
+            "source_kind": "published_release" if release else "local_head",
             "source_commit": None, "release_commit": None, "release_tag": release,
             "expected_version": None, "expected_git_sha": None,
             "created_at": claimed_at, "updated_at": claimed_at,
