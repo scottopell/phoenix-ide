@@ -772,7 +772,6 @@ pub async fn approve(
                 .into_response();
         }
     };
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let durable = read_status(&state, selected_backend);
         if let ReleaseTransactionStatus::Present {
@@ -828,36 +827,6 @@ pub async fn approve(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "error": format!("could not observe release controller: {error}")
-                    })),
-                )
-                    .into_response();
-            }
-            Ok(None) if tokio::time::Instant::now() >= deadline => {
-                let claimed = approved_marker(&state, &transaction_id).is_file()
-                    || matches!(
-                        durable,
-                        ReleaseTransactionStatus::Present { transaction_id: ref durable_id, .. }
-                            if durable_id == &transaction_id
-                    );
-                if claimed {
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(error) = child.wait() {
-                            tracing::warn!(%error, "failed to reap timed-out release controller");
-                        }
-                    });
-                } else {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(-child.id().cast_signed(), libc::SIGKILL);
-                    }
-                    #[cfg(not(unix))]
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                return (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    Json(serde_json::json!({
-                        "error": "release controller did not publish durable status within 60 seconds"
                     })),
                 )
                     .into_response();

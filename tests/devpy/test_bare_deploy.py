@@ -236,7 +236,8 @@ class BareDeployCommandTests(unittest.TestCase):
 
             staged_supervisors = []
 
-            def start(_layout, _protocol, selected_source):
+            def start(_layout, _protocol, selected_source, *, reuse_compatible=False):
+                self.assertFalse(reuse_compatible)
                 staged_supervisors.append(selected_source.read_text())
 
             with mock.patch.object(self.dev, "_bare_layout", return_value=layout), \

@@ -42,6 +42,6 @@ If the backend records rollback, rollback failure, rejection, or another non-suc
 
 The system shall preserve enough durable release-update identity to explain which preview was approved, which published tag and full commit were attempted, and which backend terminal outcome was observed after reconnect.
 
-### REQ-RU-010 — `./dev.py` remains offline/bootstrap
+### REQ-RU-010 — No checkout or operator CLI dependency
 
-The in-app release-update capability shall not require `./dev.py` to perform published-release discovery, remote release-note fetches, or online update orchestration. `./dev.py` remains a local bootstrap, development, and operator entrypoint outside the in-app release-discovery contract.
+The in-app release-update capability shall not require a source checkout or an operator-invoked deployment command. Phoenix may internally materialize and execute a source-pinned deployment controller artifact from the approved release so the established cross-platform activation engines remain authoritative. The repository `./dev.py` command remains a local bootstrap, development, offline repair, migration, and emergency-recovery entrypoint.

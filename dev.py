@@ -6750,7 +6750,13 @@ def _bare_layout() -> dict[str, Path]:
     }
 
 
-def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_source: Path) -> None:
+def _start_bare_supervisor(
+    layout: dict[str, Path],
+    protocol: str,
+    selected_source: Path,
+    *,
+    reuse_compatible: bool = False,
+) -> None:
     if layout["socket"].exists():
         running = subprocess.run(
             [sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]), "status"],
@@ -6767,6 +6773,8 @@ def _start_bare_supervisor(layout: dict[str, Path], protocol: str, selected_sour
                     "running bare supervisor uses an incompatible protocol; stop it from an external shell "
                     "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
                 )
+            if reuse_compatible:
+                return
             if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
                 return
             raise SystemExit(
@@ -6894,7 +6902,12 @@ def prod_daemon_deploy(
         if protocol != "1":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
-        _start_bare_supervisor(layout, protocol, supervisor_source)
+        _start_bare_supervisor(
+            layout,
+            protocol,
+            supervisor_source,
+            reuse_compatible=controller.enabled,
+        )
         _configure_bare_reboot_persistence(layout)
         previous_running = _bare_child_running(layout)
 
