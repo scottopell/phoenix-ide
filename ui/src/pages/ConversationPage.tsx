@@ -2595,7 +2595,7 @@ function ConversationPageContent({
         </>
       ) : null}
       {!isDesktop && terminalSplitPane}
-      <WakeStatusBar conversationId={conversationId} />
+      <WakeStatusBar conversationId={conversationId!} />
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}

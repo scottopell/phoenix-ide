@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
 use super::TmuxError;
-use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput};
+use crate::{
+    work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
+};
 use phoenix_workflow::wake_profile::{TmuxResourceIdentity, WakeResourceIdentity};
 use phoenix_workflow::Timestamp;
 
@@ -203,7 +205,9 @@ impl Tool for TmuxRunTool {
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
-                let response = return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd).await;
+                let response =
+                    return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
+                        .await;
                 register_tmux_wake_if_live(&ctx, &server_generation, &target, response).await
             }
             ValidReadiness::WaitForText { text, timeout } => {
@@ -635,7 +639,9 @@ async fn register_tmux_wake_if_live(
         prepared_fingerprint,
     };
     match registrar.register(register_input).await {
-        Ok(RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id }) => {
+        Ok(
+            RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
+        ) => {
             if let Some(display) = response.display_data().cloned() {
                 let mut enriched = display;
                 if let Value::Object(obj) = &mut enriched {
@@ -650,15 +656,13 @@ async fn register_tmux_wake_if_live(
             }
             response
         }
-        Ok(RegisteredWake::Conflict) => ToolOutput::error(
-            "durable tmux wake registration conflicted with an existing contract",
-        ),
+        Ok(RegisteredWake::Conflict) => {
+            ToolOutput::error("durable tmux wake registration conflicted with an existing contract")
+        }
         Ok(other) => ToolOutput::error(format!(
             "unexpected durable tmux wake registration outcome: {other:?}"
         )),
-        Err(error) => ToolOutput::error(format!(
-            "durable tmux wake registration failed: {error}"
-        )),
+        Err(error) => ToolOutput::error(format!("durable tmux wake registration failed: {error}")),
     }
 }
 
@@ -754,8 +758,8 @@ mod tests {
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
     use crate::{RegisterWakeInput, RegisteredWake, WakeRegistrar};
     use phoenix_core::work_scope::WorkScope;
-    use std::sync::Mutex;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -793,7 +797,10 @@ mod tests {
         }
 
         fn register_calls(&self) -> Vec<RegisterWakeInput> {
-            self.register_calls.lock().expect("register_calls lock").clone()
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .clone()
         }
     }
 
@@ -805,21 +812,18 @@ mod tests {
                 .expect("register_calls lock")
                 .push(input);
             match self.behavior.lock().expect("behavior lock").remove(0) {
-                RegistrarBehavior::Registered(id) => {
-                    Ok(RegisteredWake::Registered { workflow_id: phoenix_workflow::WorkflowId(id) })
-                }
-                RegistrarBehavior::Replayed(id) => {
-                    Ok(RegisteredWake::Replayed { workflow_id: phoenix_workflow::WorkflowId(id) })
-                }
+                RegistrarBehavior::Registered(id) => Ok(RegisteredWake::Registered {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Replayed(id) => Ok(RegisteredWake::Replayed {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
                 RegistrarBehavior::Conflict => Ok(RegisteredWake::Conflict),
                 RegistrarBehavior::Error(msg) => Err(msg.to_string()),
             }
         }
 
-        async fn cancel(
-            &self,
-            _input: crate::CancelWakeInput,
-        ) -> Result<RegisteredWake, String> {
+        async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
             Ok(RegisteredWake::CancelStale)
         }
     }
@@ -1008,7 +1012,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(42)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-immediate",
@@ -1033,7 +1039,10 @@ mod tests {
         assert_eq!(v["wake_registration"]["workflow_id"], 42);
         let calls = registrar.register_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].contract_id, format!("tmux:tool-tmux-wake:{}", v["window_id"].as_str().unwrap()));
+        assert_eq!(
+            calls[0].contract_id,
+            format!("tmux:tool-tmux-wake:{}", v["window_id"].as_str().unwrap())
+        );
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-immediate.sock")).await;
     }
 
@@ -1044,7 +1053,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(7)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-ready",
@@ -1083,7 +1094,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Error("boom")]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-error",
@@ -1094,7 +1107,10 @@ mod tests {
         );
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-error" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-error" }),
+                ctx,
+            )
             .await;
         assert!(!result.is_success());
         assert!(result
@@ -1111,7 +1127,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Replayed(77)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-replay",
@@ -1122,7 +1140,10 @@ mod tests {
         );
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-replay" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-replay" }),
+                ctx,
+            )
             .await;
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
@@ -1138,7 +1159,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(9)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-generation",
@@ -1149,7 +1172,10 @@ mod tests {
         );
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-generation" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-generation" }),
+                ctx,
+            )
             .await;
         assert!(result.is_success(), "got: {}", result.output());
         let server = registry
@@ -1173,7 +1199,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(11)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-exited",
@@ -1212,7 +1240,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let ctx = ctx_with_registrar(
             "tmux-run-wake-no-registrar",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1222,13 +1252,21 @@ mod tests {
         );
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-no-registrar" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-no-registrar" }),
+                ctx,
+            )
             .await;
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "started");
         assert!(v.get("wake_registration").is_none());
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-no-registrar.sock")).await;
+        kill_socket(
+            &socket_tmp
+                .path()
+                .join("conv-tmux-run-wake-no-registrar.sock"),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1238,7 +1276,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
         let mut ctx = ctx_with_registrar(
             "tmux-run-wake-global",
@@ -1250,10 +1290,16 @@ mod tests {
         ctx.work_scope = WorkScope::Global;
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-global" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-global" }),
+                ctx,
+            )
             .await;
         assert!(!result.is_success());
-        assert_eq!(result.output(), "global work scope cannot own a durable wake");
+        assert_eq!(
+            result.output(),
+            "global work scope cannot own a durable wake"
+        );
         assert!(registrar.register_calls().is_empty());
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-global.sock")).await;
     }
@@ -1265,7 +1311,9 @@ mod tests {
         }
         let socket_tmp = TempDir::new().unwrap();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf()));
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-conflict",
@@ -1276,7 +1324,10 @@ mod tests {
         );
 
         let result = TmuxRunTool
-            .run(json!({ "cmd": "sleep 10", "name": "tmux-run-wake-conflict" }), ctx)
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-conflict" }),
+                ctx,
+            )
             .await;
         assert!(!result.is_success());
         assert!(result

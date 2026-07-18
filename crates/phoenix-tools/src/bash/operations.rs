@@ -32,9 +32,7 @@ use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use crate::{
-    work_scope_identity, RegisterWakeInput, RegisteredWake, ToolContext, ToolOutput,
-};
+use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
@@ -1502,31 +1500,30 @@ async fn background_run_response(
     };
 
     match registrar.register(register_input).await {
-        Ok(RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id }) => {
+        Ok(
+            RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
+        ) => {
             if let Some(display) = response.display_data().cloned() {
                 let mut enriched = display;
                 if let Value::Object(obj) = &mut enriched {
-                    obj.entry("wake_registration")
-                        .or_insert_with(|| {
-                            json!({
-                                "workflow_id": workflow_id.0,
-                                "contract_id": contract_id,
-                            })
-                        });
+                    obj.entry("wake_registration").or_insert_with(|| {
+                        json!({
+                            "workflow_id": workflow_id.0,
+                            "contract_id": contract_id,
+                        })
+                    });
                 }
                 response = response.with_display(enriched);
             }
             response
         }
-        Ok(RegisteredWake::Conflict) => ToolOutput::error(
-            "durable bash wake registration conflicted with an existing contract",
-        ),
+        Ok(RegisteredWake::Conflict) => {
+            ToolOutput::error("durable bash wake registration conflicted with an existing contract")
+        }
         Ok(other) => ToolOutput::error(format!(
             "unexpected durable bash wake registration outcome: {other:?}"
         )),
-        Err(error) => ToolOutput::error(format!(
-            "durable bash wake registration failed: {error}"
-        )),
+        Err(error) => ToolOutput::error(format!("durable bash wake registration failed: {error}")),
     }
 }
 
@@ -1857,8 +1854,8 @@ mod tests {
     use super::*;
     use crate::bash::handle::{Handle, HandleId};
     use crate::bash::registry::BashLifecyclePhase;
-    use crate::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
     use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
+    use crate::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
     use phoenix_core::work_scope::WorkScope;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -1890,7 +1887,10 @@ mod tests {
         }
 
         fn register_calls(&self) -> Vec<RegisterWakeInput> {
-            self.register_calls.lock().expect("register_calls lock").clone()
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .clone()
         }
     }
 
@@ -1901,18 +1901,13 @@ mod tests {
                 .lock()
                 .expect("register_calls lock")
                 .push(input);
-            match self
-                .behavior
-                .lock()
-                .expect("behavior lock")
-                .remove(0)
-            {
-                RegistrarBehavior::Registered(id) => {
-                    Ok(RegisteredWake::Registered { workflow_id: phoenix_workflow::WorkflowId(id) })
-                }
-                RegistrarBehavior::Replayed(id) => {
-                    Ok(RegisteredWake::Replayed { workflow_id: phoenix_workflow::WorkflowId(id) })
-                }
+            match self.behavior.lock().expect("behavior lock").remove(0) {
+                RegistrarBehavior::Registered(id) => Ok(RegisteredWake::Registered {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Replayed(id) => Ok(RegisteredWake::Replayed {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
                 RegistrarBehavior::Conflict => Ok(RegisteredWake::Conflict),
                 RegistrarBehavior::Error(msg) => Err(msg.to_string()),
             }
@@ -2229,7 +2224,9 @@ mod tests {
         )
         .await;
         assert!(!output.is_success());
-        assert!(output.output().contains("durable bash wake registration failed: boom"));
+        assert!(output
+            .output()
+            .contains("durable bash wake registration failed: boom"));
         assert_eq!(registrar.register_calls().len(), 1);
     }
 
@@ -2291,7 +2288,10 @@ mod tests {
         )
         .await;
         assert!(!output.is_success());
-        assert_eq!(output.output(), "global work scope cannot own a durable wake");
+        assert_eq!(
+            output.output(),
+            "global work scope cannot own a durable wake"
+        );
         assert!(registrar.register_calls().is_empty());
     }
 

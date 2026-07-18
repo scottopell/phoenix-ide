@@ -1824,14 +1824,18 @@ export const api = {
   },
 
   async getWakeStatus(convId: string): Promise<WakeStatus> {
-    return request<WakeStatus>(`/api/conversations/${convId}/wake`);
+    const resp = await fetch(`/api/conversations/${convId}/wake`);
+    if (!resp.ok) throw new Error(await resp.text());
+    return resp.json();
   },
 
   async cancelWake(convId: string, contractId: string): Promise<{ success: boolean }> {
-    return request<{ success: boolean }>(
+    const resp = await fetch(
       `/api/conversations/${convId}/wake/${encodeURIComponent(contractId)}/cancel`,
       { method: 'POST' },
     );
+    if (!resp.ok) throw new Error(await resp.text());
+    return resp.json();
   },
 
   async cancelConversation(convId: string): Promise<{ ok: boolean }> {
