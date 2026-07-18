@@ -1245,7 +1245,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     ) -> Option<&mut EffectState<P>> {
         if matches!(
             self.status,
-            WorkflowStatus::ManualResolution | WorkflowStatus::Incompatible
+            WorkflowStatus::ManualResolution
+                | WorkflowStatus::Incompatible
+                | WorkflowStatus::Completed
+                | WorkflowStatus::Cancelled
+                | WorkflowStatus::Deleted
+                | WorkflowStatus::Failed
         ) || authority.workflow_id != self.binding.workflow_id
             || authority.generation != self.generation
             || authority.process_incarnation != self.process_incarnation

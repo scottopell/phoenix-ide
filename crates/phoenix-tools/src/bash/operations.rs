@@ -1524,13 +1524,18 @@ async fn background_run_response(
             }
             response
         }
-        Ok(RegisteredWake::Conflict) => {
-            ToolOutput::error("durable bash wake registration conflicted with an existing contract")
-        }
-        Ok(other) => ToolOutput::error(format!(
-            "unexpected durable bash wake registration outcome: {other:?}"
+        Ok(RegisteredWake::Conflict) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration conflicted; retain this handle for manual inspection",
+            response.output()
         )),
-        Err(error) => ToolOutput::error(format!("durable bash wake registration failed: {error}")),
+        Ok(other) => response.clone().with_output(format!(
+            "{}\nWARNING: unexpected durable wake registration outcome: {other:?}",
+            response.output()
+        )),
+        Err(error) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration failed: {error}; retain this handle for manual inspection",
+            response.output()
+        )),
     }
 }
 
@@ -2231,10 +2236,11 @@ mod tests {
             BashSpawnMode::Direct,
         )
         .await;
-        assert!(!output.is_success());
+        assert!(output.is_success());
         assert!(output
             .output()
-            .contains("durable bash wake registration failed: boom"));
+            .contains("durable wake registration failed: boom"));
+        assert!(output.output().contains("handle"));
         assert_eq!(registrar.register_calls().len(), 1);
     }
 
@@ -2365,10 +2371,9 @@ mod tests {
             BashSpawnMode::Direct,
         )
         .await;
-        assert!(!output.is_success());
-        assert!(output
-            .output()
-            .contains("durable bash wake registration conflicted"));
+        assert!(output.is_success());
+        assert!(output.output().contains("wake registration conflicted"));
+        assert!(output.output().contains("handle"));
         assert_eq!(registrar.register_calls().len(), 1);
     }
 

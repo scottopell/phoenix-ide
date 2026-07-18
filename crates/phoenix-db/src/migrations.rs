@@ -539,7 +539,6 @@ CREATE TABLE workflow_authoritative_observations (
     observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
     recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
     PRIMARY KEY (workflow_id, observation_id),
-    UNIQUE (workflow_id, effect_id, generation),
     FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
     FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
@@ -558,8 +557,7 @@ CREATE TABLE workflow_stale_observations (
     observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
     recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
     PRIMARY KEY (workflow_id, observation_id),
-    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
-    FOREIGN KEY (workflow_id, attempt_id) REFERENCES workflow_attempts(workflow_id, attempt_id) ON DELETE CASCADE
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE TABLE workflow_receipts (

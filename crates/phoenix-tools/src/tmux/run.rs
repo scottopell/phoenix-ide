@@ -451,7 +451,9 @@ async fn wait_for_text_response(
                     err => return err,
                 }
             };
-            if close_after_completion && (exited || status == "readiness_timed_out") {
+            if close_after_completion
+                && (exited || status == "ready" || status == "readiness_timed_out")
+            {
                 let _ = kill_window(config_path, socket_path, &target.window_id).await;
             }
             return response;
@@ -697,13 +699,18 @@ async fn register_tmux_wake_if_live(
             }
             response
         }
-        Ok(RegisteredWake::Conflict) => {
-            ToolOutput::error("durable tmux wake registration conflicted with an existing contract")
-        }
-        Ok(other) => ToolOutput::error(format!(
-            "unexpected durable tmux wake registration outcome: {other:?}"
+        Ok(RegisteredWake::Conflict) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration conflicted; retain this window for manual inspection",
+            response.output()
         )),
-        Err(error) => ToolOutput::error(format!("durable tmux wake registration failed: {error}")),
+        Ok(other) => response.clone().with_output(format!(
+            "{}\nWARNING: unexpected durable wake registration outcome: {other:?}",
+            response.output()
+        )),
+        Err(error) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration failed: {error}; retain this window for manual inspection",
+            response.output()
+        )),
     }
 }
 
@@ -1153,10 +1160,11 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(!result.is_success());
+        assert!(result.is_success());
         assert!(result
             .output()
-            .contains("durable tmux wake registration failed: boom"));
+            .contains("durable wake registration failed: boom"));
+        assert!(result.output().contains("window_id"));
         assert_eq!(registrar.register_calls().len(), 1);
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-error.sock")).await;
     }
@@ -1419,10 +1427,9 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(!result.is_success());
-        assert!(result
-            .output()
-            .contains("durable tmux wake registration conflicted"));
+        assert!(result.is_success());
+        assert!(result.output().contains("wake registration conflicted"));
+        assert!(result.output().contains("window_id"));
         assert_eq!(registrar.register_calls().len(), 1);
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-conflict.sock")).await;
     }
