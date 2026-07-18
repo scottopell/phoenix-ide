@@ -251,7 +251,62 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_wake_bindings",
         sql: MIGRATION_047,
     },
+    Migration {
+        version: 48,
+        name: "create_wake_terminal_receipts",
+        sql: MIGRATION_048,
+    },
 ];
+
+const MIGRATION_048: &str = r"
+CREATE TABLE wake_terminal_receipts (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL CHECK (contract_id <> ''),
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
+    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Expired', 'Forgotten')),
+    resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
+    bash_handle_id TEXT,
+    tmux_server_generation TEXT,
+    tmux_window_id TEXT,
+    bash_status TEXT CHECK (bash_status IN ('Exited', 'Killed', 'KillPendingKernel')),
+    tmux_status TEXT CHECK (tmux_status IN ('ExitMarkerObserved', 'WindowKilled')),
+    occurred_at INTEGER CHECK (occurred_at IS NULL OR occurred_at >= 0),
+    exit_code INTEGER,
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    signal_number INTEGER,
+    kill_signal_sent TEXT CHECK (kill_signal_sent IS NULL OR kill_signal_sent <> ''),
+    forgotten_reason TEXT CHECK (forgotten_reason IN ('PhoenixRestart', 'CascadeDestroyedHandle', 'TmuxHandleMissing')),
+    PRIMARY KEY (workflow_id, receipt_id),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES workflow_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES wake_bindings(workflow_id) ON DELETE CASCADE,
+    CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_generation IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_generation IS NOT NULL OR tmux_window_id IS NOT NULL))),
+    CHECK ((resource_kind = 'Bash') = (bash_status IS NOT NULL OR terminal_kind IN ('Expired', 'Forgotten'))),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_status IS NOT NULL OR terminal_kind IN ('Expired', 'Forgotten'))),
+    CHECK ((terminal_kind = 'Fired') = (occurred_at IS NOT NULL)),
+    CHECK ((bash_status IS NOT NULL) = (resource_kind = 'Bash' AND terminal_kind = 'Fired')),
+    CHECK ((tmux_status IS NOT NULL) = (resource_kind = 'TmuxWindow' AND terminal_kind = 'Fired')),
+    CHECK ((kill_signal_sent IS NOT NULL) <= (bash_status IS NOT NULL)),
+    CHECK ((forgotten_reason IS NOT NULL) = (terminal_kind = 'Forgotten'))
+) WITHOUT ROWID;
+
+CREATE TABLE wake_terminal_receipt_tails (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    line TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, receipt_id, ordinal),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES wake_terminal_receipts(workflow_id, receipt_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX wake_terminal_receipts_by_conversation
+ON wake_terminal_receipts(conversation_id, delivery_id);
+";
 
 const MIGRATION_047: &str = r"
 CREATE TABLE wake_bindings (

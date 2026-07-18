@@ -435,6 +435,351 @@ impl<'a> WorkflowTx<'a> {
         Ok(())
     }
 
+    pub(crate) async fn begin_attempt(
+        &mut self,
+        input: &BeginAttemptInput,
+    ) -> DbResult<BeginAttemptResult> {
+        let effect = sqlx::query(
+            "SELECT declared_workflow_version, generation, capability_kind, stable_command_id, status
+             FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some(effect) = effect else {
+            return Ok(BeginAttemptResult {
+                outcome: ClaimOutcome::Ineligible,
+                authority: None,
+                attempt: None,
+            });
+        };
+        let effect_status = parse_effect_status(&effect.get::<String, _>("status"))?;
+        if effect_status != EffectStatus::Eligible {
+            return Ok(BeginAttemptResult {
+                outcome: if effect_status == EffectStatus::Executing {
+                    ClaimOutcome::AuthorityConflict
+                } else {
+                    ClaimOutcome::Ineligible
+                },
+                authority: None,
+                attempt: None,
+            });
+        }
+        let capability = parse_capability(
+            &effect.get::<String, _>("capability_kind"),
+            effect.get::<Option<i64>, _>("stable_command_id"),
+        )?;
+        match (&capability, input.lease_until) {
+            (ExecutionCapability::ReclaimableObservation, Some(lease_until))
+                if lease_until.is_live_at(input.now) => {}
+            (ExecutionCapability::ReclaimableObservation, _) | (_, Some(_)) => {
+                return Ok(BeginAttemptResult {
+                    outcome: ClaimOutcome::AuthorityConflict,
+                    authority: None,
+                    attempt: None,
+                });
+            }
+            _ => {}
+        }
+        let claimed = sqlx::query(
+            "UPDATE workflow_effects
+             SET status = 'Executing'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Eligible'",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        if claimed == 0 {
+            return Ok(BeginAttemptResult {
+                outcome: ClaimOutcome::AuthorityConflict,
+                authority: None,
+                attempt: None,
+            });
+        }
+        let ordinal = to_u32(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_attempts WHERE workflow_id = ?1 AND effect_id = ?2",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .fetch_one(&mut *self.tx)
+        .await?, "ordinal")?;
+        let declared_workflow_version = Version(to_u64(
+            effect.get::<i64, _>("declared_workflow_version"),
+            "declared_workflow_version",
+        )?);
+        let generation = Generation(to_u64(effect.get::<i64, _>("generation"), "generation")?);
+        let insert_attempt = sqlx::query(
+            "INSERT INTO workflow_attempts (
+                workflow_id, effect_id, attempt_id, ordinal, declared_workflow_version,
+                generation, process_incarnation, status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Begun', ?8)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+        .bind(i64::from(ordinal))
+        .bind(to_i64(
+            declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(generation.0, "generation")?)
+        .bind(to_i64(input.process_incarnation.0, "process_incarnation")?)
+        .bind(to_i64(input.now.0, "created_at")?)
+        .execute(&mut *self.tx)
+        .await;
+        match insert_attempt {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error))
+                if is_sqlite_busy(error.as_ref())
+                    || is_sqlite_unique_constraint(error.as_ref())
+                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
+            {
+                return Ok(BeginAttemptResult {
+                    outcome: ClaimOutcome::AuthorityConflict,
+                    authority: None,
+                    attempt: None,
+                });
+            }
+            Err(error) => return Err(DbError::Sqlx(error)),
+        }
+        if let Some(lease_until) = input.lease_until {
+            sqlx::query("INSERT INTO workflow_reclaimable_leases (workflow_id, attempt_id, lease_until) VALUES (?1, ?2, ?3)")
+                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+                .bind(to_i64(lease_until.0, "lease_until")?)
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        let authority = LocalAttemptAuthority {
+            workflow_id: input.workflow_id,
+            declared_workflow_version,
+            generation,
+            effect_id: input.effect_id,
+            attempt_id: input.attempt_id,
+            process_incarnation: input.process_incarnation,
+        };
+        let attempt = LocalAttemptRecord {
+            id: input.attempt_id,
+            ordinal,
+            authority: authority.clone(),
+            status: AttemptStatus::Begun,
+            lease: input.lease_until.map(|lease_until| LocalReclaimableLease {
+                attempt_id: input.attempt_id,
+                lease_until,
+            }),
+        };
+        Ok(BeginAttemptResult {
+            outcome: ClaimOutcome::Started,
+            authority: Some(authority),
+            attempt: Some(attempt),
+        })
+    }
+
+    pub(crate) async fn record_observation(
+        &mut self,
+        input: &RecordObservationInput,
+    ) -> DbResult<RecordObservationResult> {
+        let row = sqlx::query("SELECT e.declared_workflow_version, e.generation, a.process_incarnation, a.status, l.lease_until FROM workflow_effects e JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id LEFT JOIN workflow_reclaimable_leases l ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id WHERE e.workflow_id = ?1 AND e.effect_id = ?2 AND a.attempt_id = ?3")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+            .fetch_optional(&mut *self.tx).await?;
+        let authoritative = row.as_ref().is_some_and(|row| {
+            row.get::<i64, _>("declared_workflow_version")
+                == i64::try_from(input.authority.declared_workflow_version.0).unwrap()
+                && row.get::<i64, _>("generation")
+                    == i64::try_from(input.authority.generation.0).unwrap()
+                && row.get::<i64, _>("process_incarnation")
+                    == i64::try_from(input.authority.process_incarnation.0).unwrap()
+                && matches!(
+                    row.get::<String, _>("status").as_str(),
+                    "Begun" | "ObservationRecorded"
+                )
+                && row
+                    .get::<Option<i64>, _>("lease_until")
+                    .is_none_or(|lease| lease >= i64::try_from(input.now.0).unwrap())
+        });
+        let insert_sql = if authoritative {
+            "INSERT INTO workflow_authoritative_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        } else {
+            "INSERT INTO workflow_stale_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        };
+        sqlx::query(insert_sql)
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.observation_id, "observation_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+            .bind(to_i64(
+                input.authority.declared_workflow_version.0,
+                "declared_workflow_version",
+            )?)
+            .bind(to_i64(input.authority.generation.0, "generation")?)
+            .bind(to_i64(
+                input.authority.process_incarnation.0,
+                "process_incarnation",
+            )?)
+            .bind(&input.observation_codec.family)
+            .bind(i64::from(input.observation_codec.version))
+            .bind(&input.observation_payload)
+            .bind(to_i64(input.observed_at.0, "observed_at")?)
+            .bind(to_i64(input.now.0, "recorded_at")?)
+            .execute(&mut *self.tx)
+            .await?;
+        if authoritative {
+            sqlx::query("UPDATE workflow_attempts SET status = 'ObservationRecorded' WHERE workflow_id = ?1 AND attempt_id = ?2")
+                .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+                .execute(&mut *self.tx).await?;
+        }
+        Ok(RecordObservationResult {
+            outcome: if authoritative {
+                AuthorityOutcome::Authorized
+            } else {
+                AuthorityOutcome::StaleAuthority
+            },
+            observation: Some(LocalObservationRecord {
+                observation_id: input.observation_id,
+                workflow_id: input.authority.workflow_id,
+                effect_id: input.authority.effect_id,
+                attempt_id: input.authority.attempt_id,
+                declared_workflow_version: input.authority.declared_workflow_version,
+                generation: input.authority.generation,
+                process_incarnation: input.authority.process_incarnation,
+                observation_codec: input.observation_codec.clone(),
+                observation_payload: input.observation_payload.clone(),
+                observed_at: input.observed_at,
+                recorded_at: input.now,
+                authoritative,
+            }),
+        })
+    }
+
+    pub(crate) async fn accept_receipt_and_delivery(
+        &mut self,
+        input: &AcceptReceiptInput,
+    ) -> DbResult<ReceiptAcceptanceResult> {
+        let effect = sqlx::query("SELECT status, generation, declared_workflow_version FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .fetch_optional(&mut *self.tx).await?;
+        let Some(effect) = effect else {
+            return Ok(ReceiptAcceptanceResult {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                delivery: None,
+            });
+        };
+        if effect.get::<String, _>("status") != "Executing"
+            || input.attempt_id != Some(input.authority.attempt_id)
+        {
+            return Ok(ReceiptAcceptanceResult {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                delivery: None,
+            });
+        }
+        let mut requires_runtime = input.receipt_event_requires_runtime_acceptance;
+        if input.origin == ReceiptOrigin::CancellationArbitration
+            && !input.request_runtime_acceptance_for_cancellation
+        {
+            requires_runtime = false;
+        }
+        let effect_updated = sqlx::query("UPDATE workflow_effects SET status = 'Receipted', pending_reconciliation = 0 WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .execute(&mut *self.tx).await?.rows_affected();
+        if effect_updated == 0 {
+            return Ok(ReceiptAcceptanceResult {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                delivery: None,
+            });
+        }
+        let receipt_insert = sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.receipt_id.0, "receipt_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .bind(to_i64(input.authority.generation.0, "generation")?)
+            .bind(to_i64(input.authority.declared_workflow_version.0, "declared_workflow_version")?)
+            .bind(to_i64(input.authority.process_incarnation.0, "process_incarnation")?)
+            .bind(input.attempt_id.and_then(|id| i64::try_from(id.0).ok()))
+            .bind(receipt_origin_to_str(input.origin))
+            .bind(&input.receipt_codec.family)
+            .bind(i64::from(input.receipt_codec.version))
+            .bind(&input.receipt_payload)
+            .execute(&mut *self.tx).await;
+        match receipt_insert {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error))
+                if is_sqlite_busy(error.as_ref())
+                    || is_sqlite_unique_constraint(error.as_ref())
+                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
+            {
+                return Ok(ReceiptAcceptanceResult {
+                    outcome: AuthorityOutcome::StaleAuthority,
+                    receipt: None,
+                    delivery: None,
+                });
+            }
+            Err(error) => return Err(DbError::Sqlx(error)),
+        }
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, ?7, 'Pending', ?8, NULL, NULL)")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+            .bind(&input.receipt_event_codec.family)
+            .bind(i64::from(input.receipt_event_codec.version))
+            .bind(&input.receipt_event_payload)
+            .bind(requires_runtime)
+            .bind(if requires_runtime { Some("Owed") } else { None })
+            .execute(&mut *self.tx).await?;
+        sqlx::query("UPDATE workflow_attempts SET status = 'ReceiptAccepted' WHERE workflow_id = ?1 AND attempt_id = ?2")
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+            .execute(&mut *self.tx).await?;
+        sqlx::query(
+            "DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1 AND attempt_id = ?2",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(ReceiptAcceptanceResult {
+            outcome: AuthorityOutcome::Authorized,
+            receipt: Some(LocalReceiptRecord {
+                receipt_id: input.receipt_id,
+                workflow_id: input.authority.workflow_id,
+                effect_id: input.authority.effect_id,
+                generation: input.authority.generation,
+                declared_workflow_version: input.authority.declared_workflow_version,
+                process_incarnation: input.authority.process_incarnation,
+                attempt_id: input.attempt_id,
+                origin: input.origin,
+                receipt_codec: input.receipt_codec.clone(),
+                receipt_payload: input.receipt_payload.clone(),
+            }),
+            delivery: Some(LocalDeliveryRecord {
+                delivery_id: input.delivery_id,
+                workflow_id: input.authority.workflow_id,
+                effect_id: Some(input.authority.effect_id),
+                barrier_id: None,
+                consumer_kind: "reducer".to_string(),
+                event_codec: input.receipt_event_codec.clone(),
+                payload_kind: LocalDeliveryPayloadKind::Receipt,
+                payload_blob: input.receipt_event_payload.clone(),
+                requires_runtime_acceptance: requires_runtime,
+                status: DeliveryStatus::Pending,
+                runtime_acceptance_status: requires_runtime
+                    .then_some(RuntimeAcceptanceStatus::Owed),
+                suppression_reason: None,
+                accepted_by_transition_id: None,
+            }),
+        })
+    }
+
     pub(crate) async fn fetch_external_acceptance_binding(
         &mut self,
         input: &CreateWorkflowWithExternalAcceptance,
@@ -916,153 +1261,14 @@ impl WorkflowRepository {
     }
 
     async fn begin_attempt_once(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
-        let mut tx = self.pool.begin().await?;
-        let effect = sqlx::query(
-            "SELECT declared_workflow_version, generation, capability_kind, stable_command_id, status
-             FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
-        )
-        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(effect) = effect else {
+        let mut tx = self.begin_tx().await?;
+        let result = tx.begin_attempt(input).await?;
+        if result.outcome == ClaimOutcome::Started {
+            tx.commit().await?;
+        } else {
             tx.rollback().await?;
-            return Ok(BeginAttemptResult {
-                outcome: ClaimOutcome::Ineligible,
-                authority: None,
-                attempt: None,
-            });
-        };
-        let effect_status = parse_effect_status(&effect.get::<String, _>("status"))?;
-        if effect_status != EffectStatus::Eligible {
-            tx.rollback().await?;
-            return Ok(BeginAttemptResult {
-                outcome: if effect_status == EffectStatus::Executing {
-                    ClaimOutcome::AuthorityConflict
-                } else {
-                    ClaimOutcome::Ineligible
-                },
-                authority: None,
-                attempt: None,
-            });
         }
-        let capability = parse_capability(
-            &effect.get::<String, _>("capability_kind"),
-            effect.get::<Option<i64>, _>("stable_command_id"),
-        )?;
-        match (&capability, input.lease_until) {
-            (ExecutionCapability::ReclaimableObservation, Some(lease_until))
-                if lease_until.is_live_at(input.now) => {}
-            (ExecutionCapability::ReclaimableObservation, _) | (_, Some(_)) => {
-                tx.rollback().await?;
-                return Ok(BeginAttemptResult {
-                    outcome: ClaimOutcome::AuthorityConflict,
-                    authority: None,
-                    attempt: None,
-                });
-            }
-            _ => {}
-        }
-        let claimed = sqlx::query(
-            "UPDATE workflow_effects
-             SET status = 'Executing'
-             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Eligible'",
-        )
-        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if claimed == 0 {
-            tx.rollback().await?;
-            return Ok(BeginAttemptResult {
-                outcome: ClaimOutcome::AuthorityConflict,
-                authority: None,
-                attempt: None,
-            });
-        }
-        let ordinal = to_u32(sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_attempts WHERE workflow_id = ?1 AND effect_id = ?2",
-        )
-        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
-        .fetch_one(&mut *tx)
-        .await?, "ordinal")?;
-        let declared_workflow_version = Version(to_u64(
-            effect.get::<i64, _>("declared_workflow_version"),
-            "declared_workflow_version",
-        )?);
-        let generation = Generation(to_u64(effect.get::<i64, _>("generation"), "generation")?);
-        let insert_attempt = sqlx::query(
-            "INSERT INTO workflow_attempts (
-                workflow_id, effect_id, attempt_id, ordinal, declared_workflow_version,
-                generation, process_incarnation, status, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Begun', ?8)",
-        )
-        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
-        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
-        .bind(i64::from(ordinal))
-        .bind(to_i64(
-            declared_workflow_version.0,
-            "declared_workflow_version",
-        )?)
-        .bind(to_i64(generation.0, "generation")?)
-        .bind(to_i64(input.process_incarnation.0, "process_incarnation")?)
-        .bind(to_i64(input.now.0, "created_at")?)
-        .execute(&mut *tx)
-        .await;
-        match insert_attempt {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(error))
-                if is_sqlite_busy(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
-                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
-            {
-                tx.rollback().await?;
-                return Ok(BeginAttemptResult {
-                    outcome: ClaimOutcome::AuthorityConflict,
-                    authority: None,
-                    attempt: None,
-                });
-            }
-            Err(error) => {
-                tx.rollback().await?;
-                return Err(DbError::Sqlx(error));
-            }
-        }
-        if let Some(lease_until) = input.lease_until {
-            sqlx::query("INSERT INTO workflow_reclaimable_leases (workflow_id, attempt_id, lease_until) VALUES (?1, ?2, ?3)")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(input.attempt_id.0, "attempt_id")?)
-                .bind(to_i64(lease_until.0, "lease_until")?)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        let authority = LocalAttemptAuthority {
-            workflow_id: input.workflow_id,
-            declared_workflow_version,
-            generation,
-            effect_id: input.effect_id,
-            attempt_id: input.attempt_id,
-            process_incarnation: input.process_incarnation,
-        };
-        let attempt = LocalAttemptRecord {
-            id: input.attempt_id,
-            ordinal,
-            authority: authority.clone(),
-            status: AttemptStatus::Begun,
-            lease: input.lease_until.map(|lease_until| LocalReclaimableLease {
-                attempt_id: input.attempt_id,
-                lease_until,
-            }),
-        };
-        Ok(BeginAttemptResult {
-            outcome: ClaimOutcome::Started,
-            authority: Some(authority),
-            attempt: Some(attempt),
-        })
+        Ok(result)
     }
 
     pub async fn renew_lease_exact(&self, input: &RenewLeaseInput) -> DbResult<AuthorityOutcome> {
@@ -1136,81 +1342,10 @@ impl WorkflowRepository {
         &self,
         input: &RecordObservationInput,
     ) -> DbResult<RecordObservationResult> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT e.declared_workflow_version, e.generation, a.process_incarnation, a.status, l.lease_until FROM workflow_effects e JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id LEFT JOIN workflow_reclaimable_leases l ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id WHERE e.workflow_id = ?1 AND e.effect_id = ?2 AND a.attempt_id = ?3")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-            .fetch_optional(&mut *tx).await?;
-        let authoritative = row.as_ref().is_some_and(|row| {
-            row.get::<i64, _>("declared_workflow_version")
-                == i64::try_from(input.authority.declared_workflow_version.0).unwrap()
-                && row.get::<i64, _>("generation")
-                    == i64::try_from(input.authority.generation.0).unwrap()
-                && row.get::<i64, _>("process_incarnation")
-                    == i64::try_from(input.authority.process_incarnation.0).unwrap()
-                && matches!(
-                    row.get::<String, _>("status").as_str(),
-                    "Begun" | "ObservationRecorded"
-                )
-                && row
-                    .get::<Option<i64>, _>("lease_until")
-                    .is_none_or(|lease| lease >= i64::try_from(input.now.0).unwrap())
-        });
-        let insert_sql = if authoritative {
-            "INSERT INTO workflow_authoritative_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-        } else {
-            "INSERT INTO workflow_stale_observations (workflow_id, observation_id, effect_id, attempt_id, declared_workflow_version, generation, process_incarnation, observation_codec_family, observation_codec_version, observation_payload, observed_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-        };
-        sqlx::query(insert_sql)
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.observation_id, "observation_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-            .bind(to_i64(
-                input.authority.declared_workflow_version.0,
-                "declared_workflow_version",
-            )?)
-            .bind(to_i64(input.authority.generation.0, "generation")?)
-            .bind(to_i64(
-                input.authority.process_incarnation.0,
-                "process_incarnation",
-            )?)
-            .bind(&input.observation_codec.family)
-            .bind(i64::from(input.observation_codec.version))
-            .bind(&input.observation_payload)
-            .bind(to_i64(input.observed_at.0, "observed_at")?)
-            .bind(to_i64(input.now.0, "recorded_at")?)
-            .execute(&mut *tx)
-            .await?;
-        if authoritative {
-            sqlx::query("UPDATE workflow_attempts SET status = 'ObservationRecorded' WHERE workflow_id = ?1 AND attempt_id = ?2")
-                .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-                .execute(&mut *tx).await?;
-        }
+        let mut tx = self.begin_tx().await?;
+        let result = tx.record_observation(input).await?;
         tx.commit().await?;
-        Ok(RecordObservationResult {
-            outcome: if authoritative {
-                AuthorityOutcome::Authorized
-            } else {
-                AuthorityOutcome::StaleAuthority
-            },
-            observation: Some(LocalObservationRecord {
-                observation_id: input.observation_id,
-                workflow_id: input.authority.workflow_id,
-                effect_id: input.authority.effect_id,
-                attempt_id: input.authority.attempt_id,
-                declared_workflow_version: input.authority.declared_workflow_version,
-                generation: input.authority.generation,
-                process_incarnation: input.authority.process_incarnation,
-                observation_codec: input.observation_codec.clone(),
-                observation_payload: input.observation_payload.clone(),
-                observed_at: input.observed_at,
-                recorded_at: input.now,
-                authoritative,
-            }),
-        })
+        Ok(result)
     }
 
     pub async fn accept_receipt(
@@ -1238,132 +1373,14 @@ impl WorkflowRepository {
         &self,
         input: &AcceptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
-        let mut tx = self.pool.begin().await?;
-        let effect = sqlx::query("SELECT status, generation, declared_workflow_version FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .fetch_optional(&mut *tx).await?;
-        let Some(effect) = effect else {
+        let mut tx = self.begin_tx().await?;
+        let result = tx.accept_receipt_and_delivery(input).await?;
+        if result.outcome == AuthorityOutcome::Authorized {
+            tx.commit().await?;
+        } else {
             tx.rollback().await?;
-            return Ok(ReceiptAcceptanceResult {
-                outcome: AuthorityOutcome::StaleAuthority,
-                receipt: None,
-                delivery: None,
-            });
-        };
-        if effect.get::<String, _>("status") != "Executing"
-            || input.attempt_id != Some(input.authority.attempt_id)
-        {
-            tx.rollback().await?;
-            return Ok(ReceiptAcceptanceResult {
-                outcome: AuthorityOutcome::StaleAuthority,
-                receipt: None,
-                delivery: None,
-            });
         }
-        let mut requires_runtime = input.receipt_event_requires_runtime_acceptance;
-        if input.origin == ReceiptOrigin::CancellationArbitration
-            && !input.request_runtime_acceptance_for_cancellation
-        {
-            requires_runtime = false;
-        }
-        let effect_updated = sqlx::query("UPDATE workflow_effects SET status = 'Receipted', pending_reconciliation = 0 WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .execute(&mut *tx).await?.rows_affected();
-        if effect_updated == 0 {
-            tx.rollback().await?;
-            return Ok(ReceiptAcceptanceResult {
-                outcome: AuthorityOutcome::StaleAuthority,
-                receipt: None,
-                delivery: None,
-            });
-        }
-        let receipt_insert = sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.receipt_id.0, "receipt_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .bind(to_i64(input.authority.generation.0, "generation")?)
-            .bind(to_i64(input.authority.declared_workflow_version.0, "declared_workflow_version")?)
-            .bind(to_i64(input.authority.process_incarnation.0, "process_incarnation")?)
-            .bind(input.attempt_id.and_then(|id| i64::try_from(id.0).ok()))
-            .bind(receipt_origin_to_str(input.origin))
-            .bind(&input.receipt_codec.family)
-            .bind(i64::from(input.receipt_codec.version))
-            .bind(&input.receipt_payload)
-            .execute(&mut *tx).await;
-        match receipt_insert {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(error))
-                if is_sqlite_busy(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
-                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
-            {
-                tx.rollback().await?;
-                return Ok(ReceiptAcceptanceResult {
-                    outcome: AuthorityOutcome::StaleAuthority,
-                    receipt: None,
-                    delivery: None,
-                });
-            }
-            Err(error) => {
-                tx.rollback().await?;
-                return Err(DbError::Sqlx(error));
-            }
-        }
-        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, ?7, 'Pending', ?8, NULL, NULL)")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.delivery_id.0, "delivery_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .bind(&input.receipt_event_codec.family)
-            .bind(i64::from(input.receipt_event_codec.version))
-            .bind(&input.receipt_event_payload)
-            .bind(requires_runtime)
-            .bind(if requires_runtime { Some("Owed") } else { None })
-            .execute(&mut *tx).await?;
-        sqlx::query("UPDATE workflow_attempts SET status = 'ReceiptAccepted' WHERE workflow_id = ?1 AND attempt_id = ?2")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-            .execute(&mut *tx).await?;
-        sqlx::query(
-            "DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1 AND attempt_id = ?2",
-        )
-        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(ReceiptAcceptanceResult {
-            outcome: AuthorityOutcome::Authorized,
-            receipt: Some(LocalReceiptRecord {
-                receipt_id: input.receipt_id,
-                workflow_id: input.authority.workflow_id,
-                effect_id: input.authority.effect_id,
-                generation: input.authority.generation,
-                declared_workflow_version: input.authority.declared_workflow_version,
-                process_incarnation: input.authority.process_incarnation,
-                attempt_id: input.attempt_id,
-                origin: input.origin,
-                receipt_codec: input.receipt_codec.clone(),
-                receipt_payload: input.receipt_payload.clone(),
-            }),
-            delivery: Some(LocalDeliveryRecord {
-                delivery_id: input.delivery_id,
-                workflow_id: input.authority.workflow_id,
-                effect_id: Some(input.authority.effect_id),
-                barrier_id: None,
-                consumer_kind: "reducer".to_string(),
-                event_codec: input.receipt_event_codec.clone(),
-                payload_kind: LocalDeliveryPayloadKind::Receipt,
-                payload_blob: input.receipt_event_payload.clone(),
-                requires_runtime_acceptance: requires_runtime,
-                status: DeliveryStatus::Pending,
-                runtime_acceptance_status: requires_runtime
-                    .then_some(RuntimeAcceptanceStatus::Owed),
-                suppression_reason: None,
-                accepted_by_transition_id: None,
-            }),
-        })
+        Ok(result)
     }
 
     pub async fn accept_or_suppress_deliveries_exact(
