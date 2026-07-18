@@ -75,6 +75,7 @@ base64 = "0.22"
 
 # Hashing (deterministic socket/session keying).
 sha2 = "0.11"
+hex = "0.4"
 
 # UUIDs for browser scratch-file paths.
 uuid = { version = "1", features = ["v4"] }

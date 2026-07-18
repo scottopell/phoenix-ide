@@ -3061,6 +3061,7 @@ dependencies = [
  "chrono",
  "futures",
  "globset",
+ "hex",
  "ignore",
  "libc",
  "nono",
