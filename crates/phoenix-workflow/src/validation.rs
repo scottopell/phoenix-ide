@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::types::{
-    BarrierId, BarrierMemberDecl, CodecRef, EffectDecl, EffectId, EffectRole, Generation,
-    ReceiptFamily, ScheduleId, SupportedCodecRegistry, TransitionPlan, WorkflowProfile,
+    BarrierId, BarrierMemberDecl, CodecRef, DeliveryDecl, EffectDecl, EffectId, EffectRole,
+    Generation, ReceiptFamily, ScheduleId, SupportedCodecRegistry, TransitionPlan, WorkflowProfile,
     WorkflowStatus,
 };
 
@@ -33,6 +33,12 @@ pub enum PlanError {
     UnknownBarrierReference(BarrierId),
     UnknownInvalidationTarget(EffectId),
     InvalidatesReceiptedEffect(EffectId),
+    EmptyDeliveryBatch,
+    DeliverySourceCount {
+        effect_id: Option<EffectId>,
+        barrier_id: Option<BarrierId>,
+    },
+    RuntimeStartNotAllowed,
     DependencyCycle,
     BarrierHasNoMembers(BarrierId),
     BarrierIncludesNonRequiredEffect {
@@ -113,6 +119,7 @@ pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     }
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;
+    validate_deliveries(plan, &effect_ids, &barrier_ids)?;
     validate_dependencies(plan, &effect_ids)?;
     let members_by_barrier = collect_barrier_members(plan, &effect_ids, &barrier_ids)?;
     validate_barrier_members(plan, &members_by_barrier)?;
@@ -233,6 +240,46 @@ fn collect_barrier_ids<P: WorkflowProfile>(
         }
     }
     Ok(barrier_ids)
+}
+
+fn validate_deliveries<P: WorkflowProfile>(
+    plan: &TransitionPlan<P>,
+    effect_ids: &BTreeSet<EffectId>,
+    barrier_ids: &BTreeSet<BarrierId>,
+) -> Result<(), PlanError> {
+    for delivery in &plan.deliveries {
+        validate_delivery_source(delivery, effect_ids, barrier_ids)?;
+        if delivery.requires_runtime_acceptance() && !P::runtime_start_allowed(&plan.snapshot) {
+            return Err(PlanError::RuntimeStartNotAllowed);
+        }
+    }
+    Ok(())
+}
+
+fn validate_delivery_source<P: WorkflowProfile>(
+    delivery: &DeliveryDecl<P>,
+    effect_ids: &BTreeSet<EffectId>,
+    barrier_ids: &BTreeSet<BarrierId>,
+) -> Result<(), PlanError> {
+    let source_count =
+        usize::from(delivery.effect_id.is_some()) + usize::from(delivery.barrier_id.is_some());
+    if source_count != 1 {
+        return Err(PlanError::DeliverySourceCount {
+            effect_id: delivery.effect_id,
+            barrier_id: delivery.barrier_id,
+        });
+    }
+    if let Some(effect_id) = delivery.effect_id {
+        if !effect_ids.contains(&effect_id) {
+            return Err(PlanError::UnknownEffectReference(effect_id));
+        }
+    }
+    if let Some(barrier_id) = delivery.barrier_id {
+        if !barrier_ids.contains(&barrier_id) {
+            return Err(PlanError::UnknownBarrierReference(barrier_id));
+        }
+    }
+    Ok(())
 }
 
 fn validate_dependencies<P: WorkflowProfile>(

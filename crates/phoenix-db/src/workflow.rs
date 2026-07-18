@@ -911,10 +911,35 @@ impl<'a> WorkflowTx<'a> {
         &mut self,
         input: &AcceptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
-        let effect = sqlx::query("SELECT status, generation, declared_workflow_version FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .fetch_optional(&mut *self.tx).await?;
+        let effect = sqlx::query(
+            "SELECT e.status, e.generation, e.declared_workflow_version,
+                    EXISTS (
+                        SELECT 1 FROM workflow_attempts a
+                        WHERE a.workflow_id = e.workflow_id
+                          AND a.effect_id = e.effect_id
+                          AND a.attempt_id = ?3
+                          AND a.declared_workflow_version = ?4
+                          AND a.generation = ?5
+                          AND a.process_incarnation = ?6
+                          AND a.status IN ('Begun', 'ObservationRecorded')
+                    ) AS owns_effect
+             FROM workflow_effects e
+             WHERE e.workflow_id = ?1 AND e.effect_id = ?2",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(
+            input.authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(input.authority.generation.0, "generation")?)
+        .bind(to_i64(
+            input.authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
+        .fetch_optional(&mut *self.tx)
+        .await?;
         let Some(effect) = effect else {
             return Ok(ReceiptAcceptanceResult {
                 outcome: AuthorityOutcome::StaleAuthority,
@@ -924,6 +949,7 @@ impl<'a> WorkflowTx<'a> {
         };
         if effect.get::<String, _>("status") != "Executing"
             || input.attempt_id != Some(input.authority.attempt_id)
+            || effect.get::<i64, _>("owns_effect") == 0
         {
             return Ok(ReceiptAcceptanceResult {
                 outcome: AuthorityOutcome::StaleAuthority,

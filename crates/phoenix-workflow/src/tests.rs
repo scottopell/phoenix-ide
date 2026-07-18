@@ -287,22 +287,63 @@ fn effect_decl(
     }
 }
 
+fn add_delivery_source(plan: &mut TransitionPlan<TestProfile>, runtime: bool) {
+    if runtime {
+        if !plan
+            .effects
+            .iter()
+            .any(|effect| effect.effect_id == EffectId(1))
+        {
+            plan.effects.push(effect_decl(
+                1,
+                EffectRole::Required,
+                ExecutionCapability::SafelyRepeatable,
+                Generation(0),
+            ));
+        }
+    } else if !plan
+        .effects
+        .iter()
+        .any(|effect| effect.effect_id == EffectId(1))
+    {
+        plan.effects.push(effect_decl(
+            1,
+            EffectRole::Required,
+            ExecutionCapability::SafelyRepeatable,
+            Generation(0),
+        ));
+    }
+}
+
 fn delivery_decl(
     payload: &'static str,
     requires_runtime_acceptance: bool,
 ) -> DeliveryDecl<TestProfile> {
     if requires_runtime_acceptance {
+        delivery_decl_with_source(payload, true, Some(EffectId(1)), None)
+    } else {
+        delivery_decl_with_source(payload, false, Some(EffectId(1)), None)
+    }
+}
+
+fn delivery_decl_with_source(
+    payload: &'static str,
+    requires_runtime_acceptance: bool,
+    effect_id: Option<EffectId>,
+    barrier_id: Option<BarrierId>,
+) -> DeliveryDecl<TestProfile> {
+    if requires_runtime_acceptance {
         DeliveryDecl::runtime_owed(
-            None,
-            None,
+            effect_id,
+            barrier_id,
             "reducer",
             codec("receipt"),
             DeliveryPayload::Receipt(payload),
         )
     } else {
         DeliveryDecl::immediate(
-            None,
-            None,
+            effect_id,
+            barrier_id,
             "reducer",
             codec("receipt"),
             DeliveryPayload::Receipt(payload),
@@ -576,6 +617,73 @@ fn barriers_require_matching_receipt_family_and_generation() {
 }
 
 #[test]
+fn delivery_validation_requires_exactly_one_source_and_runtime_gate() {
+    let mut source_ambiguous = base_plan();
+    source_ambiguous.effects.push(effect_decl(
+        1,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    source_ambiguous.deliveries.push(delivery_decl_with_source(
+        "deliver-me",
+        false,
+        Some(EffectId(1)),
+        Some(BarrierId(9)),
+    ));
+    assert_eq!(
+        validate_plan(
+            WorkflowStatus::Active,
+            &source_ambiguous,
+            &BTreeMap::new(),
+            &acceptance().supported_codecs,
+        ),
+        Err(PlanError::DeliverySourceCount {
+            effect_id: Some(EffectId(1)),
+            barrier_id: Some(BarrierId(9)),
+        })
+    );
+
+    let mut source_missing = base_plan();
+    source_missing
+        .deliveries
+        .push(delivery_decl_with_source("deliver-me", false, None, None));
+    assert_eq!(
+        validate_plan(
+            WorkflowStatus::Active,
+            &source_missing,
+            &BTreeMap::new(),
+            &acceptance().supported_codecs,
+        ),
+        Err(PlanError::DeliverySourceCount {
+            effect_id: None,
+            barrier_id: None,
+        })
+    );
+
+    let mut runtime_blocked = base_plan();
+    runtime_blocked.snapshot = "runtime-blocked";
+    runtime_blocked.effects.push(effect_decl(
+        1,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    runtime_blocked
+        .deliveries
+        .push(delivery_decl("runtime", true));
+    assert_eq!(
+        validate_plan(
+            WorkflowStatus::Active,
+            &runtime_blocked,
+            &BTreeMap::new(),
+            &acceptance().supported_codecs,
+        ),
+        Err(PlanError::RuntimeStartNotAllowed)
+    );
+}
+
+#[test]
 fn process_incarnation_and_attempt_ids_fence_authority() {
     let (mut workflow, authority) =
         begin_observation_effect(ExecutionCapability::ReclaimableObservation, Some(5));
@@ -767,6 +875,7 @@ fn receipt_and_delivery_idempotency_is_single_winner() {
 fn canonical_delivery_consumption_is_atomic_and_duplicate_safe() {
     let mut workflow = workflow();
     let mut plan = base_plan();
+    add_delivery_source(&mut plan, false);
     plan.deliveries.push(delivery_decl("deliver-me", false));
     let committed = workflow
         .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
@@ -805,9 +914,86 @@ fn canonical_delivery_consumption_is_atomic_and_duplicate_safe() {
 }
 
 #[test]
+fn delivery_consumption_rejects_empty_batch_and_applies_full_plan() {
+    let mut workflow = workflow();
+    let mut initial = base_plan();
+    initial.effects.push(effect_decl(
+        1,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    add_delivery_source(&mut initial, false);
+    initial.deliveries.push(delivery_decl("deliver-me", false));
+    workflow
+        .commit_transition(&decision(Version(0), initial), &BTreeMap::new())
+        .expect("commit");
+    let delivery = workflow
+        .deliveries
+        .values()
+        .find(|item| matches!(item.payload, DeliveryPayload::Receipt("deliver-me")))
+        .cloned()
+        .expect("delivery");
+
+    let empty = workflow.consume_deliveries(&DeliveryDecisionBinding {
+        items: vec![],
+        decision: decision(
+            workflow.version,
+            TransitionPlan {
+                event: TestEvent::Delivery("deliver-me"),
+                ..base_plan()
+            },
+        ),
+    });
+    assert_eq!(
+        empty,
+        Err(EngineError::InvalidPlan(PlanError::EmptyDeliveryBatch))
+    );
+
+    let mut consume_plan = base_plan();
+    consume_plan.event = TestEvent::Delivery("deliver-me");
+    consume_plan.effects.push(effect_decl(
+        2,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    consume_plan.deliveries.push(delivery_decl_with_source(
+        "follow-up",
+        false,
+        Some(EffectId(2)),
+        None,
+    ));
+    let consume = workflow
+        .consume_deliveries(&DeliveryDecisionBinding {
+            items: vec![delivery.clone()],
+            decision: decision(Version(1), consume_plan),
+        })
+        .expect("consume");
+    assert_eq!(consume.outcome, CommitOutcome::Committed);
+    assert_eq!(
+        workflow.deliveries[&delivery.id].status,
+        DeliveryStatus::Accepted
+    );
+    assert_eq!(
+        workflow.effects[&EffectId(1)].status,
+        EffectStatus::Eligible
+    );
+    assert_eq!(
+        workflow.effects[&EffectId(2)].status,
+        EffectStatus::Eligible
+    );
+    assert!(workflow
+        .deliveries
+        .values()
+        .any(|item| matches!(item.payload, DeliveryPayload::Receipt("follow-up"))));
+}
+
+#[test]
 fn runtime_acceptance_is_atomic_and_duplicate_safe() {
     let mut workflow = workflow();
     let mut plan = base_plan();
+    add_delivery_source(&mut plan, true);
     plan.deliveries.push(delivery_decl("runtime", true));
     let committed = workflow
         .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
@@ -853,6 +1039,7 @@ fn runtime_acceptance_is_atomic_and_duplicate_safe() {
 fn runtime_suppression_marks_each_selected_delivery() {
     let mut workflow = workflow();
     let mut plan = base_plan();
+    add_delivery_source(&mut plan, true);
     plan.deliveries.push(delivery_decl("runtime-a", true));
     plan.deliveries.push(delivery_decl("runtime-b", true));
     let committed = workflow
@@ -914,6 +1101,82 @@ fn runtime_suppression_marks_each_selected_delivery() {
         workflow.deliveries[&items[1].id].runtime_acceptance_status,
         Some(RuntimeAcceptanceStatus::Suppressed)
     );
+}
+
+#[test]
+fn runtime_acceptance_applies_plan_and_rejects_runtime_blocked_next_snapshot() {
+    let mut workflow = workflow();
+    let mut initial = base_plan();
+    initial.effects.push(effect_decl(
+        1,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    initial.deliveries.push(delivery_decl("runtime", true));
+    workflow
+        .commit_transition(&decision(Version(0), initial), &BTreeMap::new())
+        .expect("commit");
+    let item = workflow
+        .deliveries
+        .values()
+        .next()
+        .cloned()
+        .expect("delivery");
+
+    let mut blocked = base_plan();
+    blocked.snapshot = "runtime-blocked";
+    blocked.event = TestEvent::RuntimeAccept("runtime");
+    blocked.effects.push(effect_decl(
+        2,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    blocked.deliveries.push(delivery_decl_with_source(
+        "next-runtime",
+        true,
+        Some(EffectId(2)),
+        None,
+    ));
+    assert_eq!(
+        workflow.accept_runtime_delivery(item.id, &decision(Version(1), blocked), false),
+        Err(EngineError::InvalidPlan(PlanError::RuntimeStartNotAllowed))
+    );
+
+    let mut accept_plan = base_plan();
+    accept_plan.event = TestEvent::RuntimeAccept("runtime");
+    accept_plan.effects.push(effect_decl(
+        2,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    accept_plan.invalidations.push(EffectInvalidationDecl {
+        effect_id: EffectId(1),
+    });
+    accept_plan.deliveries.push(delivery_decl_with_source(
+        "follow-up",
+        false,
+        Some(EffectId(2)),
+        None,
+    ));
+    let accepted = workflow
+        .accept_runtime_delivery(item.id, &decision(Version(1), accept_plan), false)
+        .expect("accept runtime");
+    assert_eq!(accepted.outcome, CommitOutcome::Committed);
+    assert_eq!(
+        workflow.effects[&EffectId(1)].status,
+        EffectStatus::Invalidated
+    );
+    assert_eq!(
+        workflow.effects[&EffectId(2)].status,
+        EffectStatus::Eligible
+    );
+    assert!(workflow
+        .deliveries
+        .values()
+        .any(|delivery| matches!(delivery.payload, DeliveryPayload::Receipt("follow-up"))));
 }
 
 #[test]
@@ -1164,6 +1427,66 @@ fn cancellation_before_receipt_makes_receipt_stale_by_generation() {
 }
 
 #[test]
+fn cancellation_cascades_invalidations_to_current_generation_dependents() {
+    let mut workflow = workflow();
+    let mut initial = base_plan();
+    initial.effects.push(effect_decl(
+        1,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    initial.effects.push(effect_decl(
+        2,
+        EffectRole::Required,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    initial.effects.push(effect_decl(
+        3,
+        EffectRole::Compensation,
+        ExecutionCapability::SafelyRepeatable,
+        Generation(0),
+    ));
+    initial.dependencies.push(DependencyDecl {
+        effect_id: EffectId(2),
+        depends_on_effect_id: EffectId(1),
+    });
+    initial.dependencies.push(DependencyDecl {
+        effect_id: EffectId(3),
+        depends_on_effect_id: EffectId(1),
+    });
+    workflow
+        .commit_transition(&decision(Version(0), initial), &BTreeMap::new())
+        .expect("commit");
+
+    let mut compensation = base_plan();
+    compensation.next_status = WorkflowStatus::Cancelling;
+    let request = CancellationRequest {
+        expected_workflow_version: workflow.version,
+        next_snapshot: "cancel-snapshot",
+        next_snapshot_codec: codec("snapshot"),
+        event: TestEvent::Cancel,
+        event_codec: codec("event"),
+        invalidations: vec![EffectInvalidationDecl {
+            effect_id: EffectId(1),
+        }],
+        terminal_receipt: None,
+        compensation_plan: compensation,
+    };
+    workflow
+        .cancel_with_compensation(&request, &BTreeMap::new())
+        .expect("cancel");
+
+    assert_eq!(
+        workflow.effects[&EffectId(1)].status,
+        EffectStatus::Invalidated
+    );
+    assert_eq!(workflow.effects[&EffectId(2)].status, EffectStatus::Blocked);
+    assert_eq!(workflow.effects[&EffectId(3)].status, EffectStatus::Blocked);
+}
+
+#[test]
 fn manual_ambiguity_produces_resolution_and_terminal_choice_emits_receipt() {
     let (mut workflow, authority) =
         begin_observation_effect(ExecutionCapability::ManualOnAmbiguity, None);
@@ -1263,6 +1586,51 @@ fn manual_resolution_stale_version_leaves_state_unchanged() {
     );
     assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
     assert_eq!(workflow, before);
+}
+
+#[test]
+fn manual_retry_requires_retry_at_and_terminal_outcomes_block_claims() {
+    let (mut retry_workflow, authority) =
+        begin_observation_effect(ExecutionCapability::ManualOnAmbiguity, None);
+    let choices = vec![manual_choice(ManualChoiceKind::Retry)];
+    let reconciliation =
+        retry_workflow.require_manual_resolution(&authority, Timestamp(1), choices.clone());
+    let resolution = reconciliation.manual_resolution.expect("resolution");
+    let before = retry_workflow.clone();
+    let outcome = retry_workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        "reviewer",
+        &choices[0],
+        &manual_commit(WorkflowStatus::Active),
+    );
+    assert_eq!(outcome.outcome, CommitOutcome::InvalidPlan);
+    assert_eq!(retry_workflow, before);
+
+    let (mut terminal_workflow, terminal_authority) =
+        begin_observation_effect(ExecutionCapability::ManualOnAmbiguity, None);
+    let terminal_choices = vec![manual_choice(ManualChoiceKind::AcceptAsTerminal)];
+    let reconciliation = terminal_workflow.require_manual_resolution(
+        &terminal_authority,
+        Timestamp(1),
+        terminal_choices.clone(),
+    );
+    let resolution = reconciliation.manual_resolution.expect("resolution");
+    let mut commit = manual_commit(WorkflowStatus::Completed);
+    commit.retry_at = Some(Timestamp(10));
+    let outcome = terminal_workflow.resolve_manual(
+        resolution.id,
+        Version(1),
+        "reviewer",
+        &terminal_choices[0],
+        &commit,
+    );
+    assert_eq!(outcome.outcome, CommitOutcome::Committed);
+    assert_eq!(terminal_workflow.status, WorkflowStatus::Completed);
+    assert_eq!(
+        claim(&mut terminal_workflow, 1, 2, None).outcome,
+        ClaimOutcome::Ineligible
+    );
 }
 
 #[test]
@@ -1524,8 +1892,14 @@ fn external_acceptance_registry_created_replayed_conflict_and_target_independenc
 fn runtime_acceptance_can_be_suppressed_and_exactly_targets_single_item() {
     let mut first_workflow = workflow();
     let mut first_plan = base_plan();
+    add_delivery_source(&mut first_plan, true);
     first_plan.deliveries.push(delivery_decl("runtime", true));
-    first_plan.deliveries.push(delivery_decl("plain", false));
+    first_plan.deliveries.push(delivery_decl_with_source(
+        "plain",
+        false,
+        Some(EffectId(1)),
+        None,
+    ));
     first_workflow
         .commit_transition(&decision(Version(0), first_plan), &BTreeMap::new())
         .expect("commit");
@@ -1570,6 +1944,7 @@ fn runtime_acceptance_can_be_suppressed_and_exactly_targets_single_item() {
 
     let mut second_workflow = workflow();
     let mut second_plan = base_plan();
+    add_delivery_source(&mut second_plan, true);
     second_plan.deliveries.push(delivery_decl("runtime", true));
     second_workflow
         .commit_transition(&decision(Version(0), second_plan), &BTreeMap::new())

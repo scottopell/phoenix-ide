@@ -567,8 +567,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             resolution.resolved_by = Some(resolved_by);
             match choice.kind {
                 ManualChoiceKind::Retry => {
+                    let retry_at = commit.retry_at?;
                     effect.status = EffectStatus::RetryWait;
-                    effect.declaration.next_eligible_at = commit.retry_at;
+                    effect.declaration.next_eligible_at = Some(retry_at);
                     return Some(());
                 }
                 ManualChoiceKind::Compensate | ManualChoiceKind::Suppress => {
@@ -694,6 +695,17 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 deliveries: Vec::new(),
             });
         }
+        if binding.items.is_empty() {
+            return Err(EngineError::InvalidPlan(PlanError::EmptyDeliveryBatch));
+        }
+        validate_status_transition(self.status, binding.decision.plan.next_status)
+            .map_err(EngineError::InvalidPlan)?;
+        validate_plan_body(
+            &binding.decision.plan,
+            &BTreeMap::new(),
+            &self.binding.acceptance.supported_codecs,
+        )
+        .map_err(EngineError::InvalidPlan)?;
         let mut consumed_ids = Vec::new();
         for item in &binding.items {
             let Some(existing) = self.deliveries.get(&item.id) else {
@@ -707,6 +719,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             consumed_ids.push(item.id);
         }
         let transition = self.begin_transition(&binding.decision);
+        self.apply_invalidations(&binding.decision.plan.invalidations);
+        self.install_effects(&binding.decision.plan);
+        self.install_barriers(&binding.decision.plan, &BTreeMap::new())?;
         let mut items = Vec::new();
         for id in &consumed_ids {
             let item = self.deliveries.get_mut(id).expect("delivery exists");
@@ -714,6 +729,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             item.accepted_by = Some(transition.transition_id);
             items.push(item.clone());
         }
+        self.install_declared_deliveries(&binding.decision.plan);
+        self.install_schedules(&binding.decision.plan);
+        self.refresh_eligibility(Timestamp(0));
+        self.refresh_barriers();
         Ok(DeliveryConsumeResult {
             outcome: CommitOutcome::Committed,
             transition: Some(transition),
@@ -743,6 +762,14 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         {
             return Err(EngineError::InvalidInbox);
         }
+        validate_status_transition(self.status, decision.plan.next_status)
+            .map_err(EngineError::InvalidPlan)?;
+        validate_plan_body(
+            &decision.plan,
+            &BTreeMap::new(),
+            &self.binding.acceptance.supported_codecs,
+        )
+        .map_err(EngineError::InvalidPlan)?;
         let predicate = if suppress {
             P::decision_handles_runtime_suppression(&item, &decision.plan.event)
         } else {
@@ -752,26 +779,36 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             return Err(EngineError::InvalidInbox);
         }
         let transition = self.begin_transition(decision);
-        let item = self
-            .deliveries
-            .get_mut(&delivery_id)
-            .expect("delivery exists");
-        item.runtime_acceptance_status = Some(if suppress {
-            RuntimeAcceptanceStatus::Suppressed
-        } else {
-            RuntimeAcceptanceStatus::Accepted
-        });
-        if suppress {
-            item.status = DeliveryStatus::Suppressed;
-            item.suppression_reason = Some(SuppressionReason::ReducerTerminal);
-        } else {
-            item.status = DeliveryStatus::Accepted;
-        }
-        item.accepted_by = Some(transition.transition_id);
+        self.apply_invalidations(&decision.plan.invalidations);
+        self.install_effects(&decision.plan);
+        self.install_barriers(&decision.plan, &BTreeMap::new())?;
+        let accepted_item = {
+            let item = self
+                .deliveries
+                .get_mut(&delivery_id)
+                .expect("delivery exists");
+            item.runtime_acceptance_status = Some(if suppress {
+                RuntimeAcceptanceStatus::Suppressed
+            } else {
+                RuntimeAcceptanceStatus::Accepted
+            });
+            if suppress {
+                item.status = DeliveryStatus::Suppressed;
+                item.suppression_reason = Some(SuppressionReason::ReducerTerminal);
+            } else {
+                item.status = DeliveryStatus::Accepted;
+            }
+            item.accepted_by = Some(transition.transition_id);
+            item.clone()
+        };
+        self.install_declared_deliveries(&decision.plan);
+        self.install_schedules(&decision.plan);
+        self.refresh_eligibility(Timestamp(0));
+        self.refresh_barriers();
         Ok(RuntimeAcceptanceResult {
             outcome: CommitOutcome::Committed,
             transition: Some(transition),
-            delivery: Some(item.clone()),
+            delivery: Some(accepted_item),
         })
     }
 
@@ -934,7 +971,20 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     }
 
     fn apply_invalidations(&mut self, invalidations: &[EffectInvalidationDecl]) {
-        let targets: BTreeSet<EffectId> = invalidations.iter().map(|item| item.effect_id).collect();
+        let mut pending: Vec<EffectId> = invalidations.iter().map(|item| item.effect_id).collect();
+        let mut targets = BTreeSet::new();
+        while let Some(effect_id) = pending.pop() {
+            if !targets.insert(effect_id) {
+                continue;
+            }
+            for (dependent_id, effect) in &self.effects {
+                if effect.declaration.generation == self.generation
+                    && effect.dependencies.contains(&effect_id)
+                {
+                    pending.push(*dependent_id);
+                }
+            }
+        }
         for effect_id in targets {
             if let Some(effect) = self.effects.get_mut(&effect_id) {
                 if matches!(
