@@ -317,6 +317,12 @@ export function buildCommissionReviewInlineSearchFragments(
   } else if (data.reviewerSummary) {
     fragments.push({ fragmentId: 'commission-review-summary', text: data.reviewerSummary });
   }
+  if (data.retryRecommendation !== 'do_not_retry') {
+    fragments.push({
+      fragmentId: 'commission-review-retry',
+      text: `Retry guidance\n${formatCommissionReviewLabel(data.retryRecommendation)}`,
+    });
+  }
   data.warningsSummary.forEach((warning, index) => fragments.push({ fragmentId: `commission-review-warning-${index}`, text: warning }));
   (renderAllDetails ? data.unreviewed : data.unreviewed.slice(0, 3)).forEach((entry, index) => fragments.push({
     fragmentId: `commission-review-unreviewed-${index}`,

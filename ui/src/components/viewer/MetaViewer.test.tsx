@@ -506,6 +506,14 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-line="3"] .viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
+  it('marks matches in lower-level Markdown headings', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '#### lower heading alpha' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(document.querySelector('h4 .viewer-find-match--active')).toHaveTextContent('alpha');
+  });
+
   it('does not count rendered fenced-code text without an owned inline marker', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '# Title\n\n```ts\nconst hiddenNeedle = true;\n```' });
 

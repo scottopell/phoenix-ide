@@ -515,7 +515,7 @@ type HastNode = {
 
 function markdownHighlightForRange(markdown: string, start: number, end: number): MarkdownHighlight | null {
   let blockStart = 0;
-  for (const block of buildMarkdownDisplayBlocks(markdown)) {
+  for (const block of buildMarkdownDisplayBlocks(markdown).filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
     const blockEnd = blockStart + block.searchableText.length;
     if (start >= blockStart && end <= blockEnd) {
       return {

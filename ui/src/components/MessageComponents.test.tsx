@@ -1276,6 +1276,21 @@ describe('agent Markdown find activation', () => {
     expect(container.querySelector('[data-fragment-id="agent-text-0"]')).toHaveTextContent('const target = 1;');
     expect(container.querySelector('[data-fragment-id="agent-text-0"]')).not.toHaveTextContent('[object Object]');
   });
+
+  it('maps prose highlights after excluded fenced code using search offsets', () => {
+    const sourceText = '```ts\nalpha\n```\n\nbeta target';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-after-code-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start: 5, end: 11 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('target');
+  });
 });
 
 describe('TerminalToolResultHighlight', () => {

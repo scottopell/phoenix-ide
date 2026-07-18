@@ -48,6 +48,18 @@ describe('CommissionReviewSummaryCard disclosure', () => {
     expect(screen.getByText('+1 more files')).toBeInTheDocument();
   });
 
+  it('owns and marks retry-guidance search text', () => {
+    render(
+      <CommissionReviewSummaryCard
+        data={data}
+        formatDuration={() => '100ms'}
+        activeHighlight={{ fragmentId: 'commission-review-retry', start: 15, end: 22 }}
+      />,
+    );
+
+    expect(document.querySelector('[data-fragment-id="commission-review-retry"] .viewer-find-inline-match--active')).toHaveTextContent('review');
+  });
+
   it('renders every detail when no full review action is available', () => {
     render(<CommissionReviewSummaryCard data={data} formatDuration={() => '100ms'} />);
 

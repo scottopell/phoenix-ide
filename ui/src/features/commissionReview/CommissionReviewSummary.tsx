@@ -205,9 +205,10 @@ export function CommissionReviewSummaryCard({
             </div>
           )}
           {data.retryRecommendation !== 'do_not_retry' && (
-            <div className="commission-review-callout retry">
-              <div className="commission-review-callout-title">Retry guidance</div>
-              <p>{formatCommissionReviewLabel(data.retryRecommendation)}</p>
+            <div className="commission-review-callout retry" data-fragment-id="commission-review-retry">
+              {activeHighlight?.fragmentId === 'commission-review-retry'
+                ? highlightCommissionText(searchableFragments.get('commission-review-retry') ?? '', activeHighlight)
+                : <><div className="commission-review-callout-title">Retry guidance</div><p>{formatCommissionReviewLabel(data.retryRecommendation)}</p></>}
             </div>
           )}
         </div>
