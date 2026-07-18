@@ -804,6 +804,46 @@ describe('inline tool timers', () => {
 
     expect(screen.queryByText('result not received')).not.toBeInTheDocument();
   });
+  it('renders compact bash cards with identity, final status+duration, and output tail from existing results', () => {
+    mockDensity = 'compact';
+    const agent = agentMessage('agent-compact-bash', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'wait', handle: 'b-22', wait_seconds: 5 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'exited',
+      exit_code: 0,
+      duration_ms: 1840,
+      lines: [
+        { offset: 1, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
+        { offset: 2, bytes: ' Test Files  1 passed' },
+      ],
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    const compactCard = document.querySelector('.compact-tool-card');
+    expect(compactCard).not.toBeNull();
+    expect(screen.getByText('bash')).toBeInTheDocument();
+    expect(screen.getByText('exit 0 · 1.8s')).toBeInTheDocument();
+    expect(screen.getByText('wait b-22')).toBeInTheDocument();
+    expect(screen.getByText('✓ src/components/MessageComponents.test.tsx (68 tests) · Test Files 1 passed')).toBeInTheDocument();
+    expect(document.querySelector('.compact-tool-card-identity')).not.toBeNull();
+    expect(document.querySelector('.compact-tool-card-summary-tail')).not.toBeNull();
+  });
 
   it('shows a diagnostic when a historical tool_use has no paired result', () => {
     const agent = agentMessage('agent-missing-result', [
@@ -2153,10 +2193,10 @@ describe('compact tool summaries', () => {
     expect(container.querySelectorAll('.compact-tool-card')).toHaveLength(3);
     expect(screen.getByText('2 matches in 2 files')).toBeInTheDocument();
     expect(screen.getByText('2 lines')).toBeInTheDocument();
-    expect(screen.getByText('exited 0')).toBeInTheDocument();
+    expect(screen.getByText('exit 0')).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-block')).toHaveLength(0);
 
-    fireEvent.click(screen.getByRole('button', { name: /read_file: 2 lines .*expand tool detail/i }));
+    fireEvent.click(screen.getByRole('button', { name: /read_file: ui\/src\/components\/MessageComponents\.tsx:711-750 .*expand tool detail/i }));
 
     expect(container.querySelectorAll('.tool-block')).toHaveLength(3);
     expect(screen.getByText('ui/src/components/MessageComponents.tsx:711-750')).toBeInTheDocument();

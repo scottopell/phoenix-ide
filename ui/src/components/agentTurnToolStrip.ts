@@ -19,6 +19,12 @@ export interface ToolStripItem {
   inputSummary: string;
   /** Short result-derived description, when a cheap summary exists. */
   resultSummary: string | null;
+  /** Compact bash cards: operation/command identity rendered above the tail. */
+  commandIdentity: string | null;
+  /** Compact bash cards: final status/duration badge text. */
+  finalStatus: string | null;
+  /** Compact bash cards: bounded final output tail from the existing result payload. */
+  outputTail: string | null;
   /** spawn_agents launches sub-agents — colored distinctly in the strip. */
   isSubAgent: boolean;
   /** Whether a paired tool result has landed for this tool yet. */
@@ -184,6 +190,89 @@ function summarizeConsoleLogs(text: string): string | null {
     return null;
   }
 }
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 10) return `${(ms / 1000).toFixed(1)}s`;
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function summarizeBashInputIdentity(input: Record<string, unknown>, display?: string): string {
+  const op = stringInput(input, 'op');
+  if (op === 'run') return truncate(display || stringInput(input, 'cmd') || 'run');
+  if (op === 'wait') return truncate(`wait ${stringInput(input, 'handle') || '<missing handle>'}`);
+  if (op === 'peek') return truncate(`peek ${stringInput(input, 'handle') || '<missing handle>'}`);
+  if (op === 'kill') {
+    const handle = stringInput(input, 'handle') || '<missing handle>';
+    const signal = stringInput(input, 'signal') || 'TERM';
+    return truncate(`kill ${handle} (${signal})`);
+  }
+  return truncate(display || stringInput(input, 'cmd') || stringInput(input, 'command') || firstScalarInput(input).replace(/^cmd: /, ''));
+}
+
+function bashStatusLabel(parsed: Record<string, unknown>): string | null {
+  if (typeof parsed['error'] === 'string') return 'error';
+  const status = typeof parsed['status'] === 'string' ? parsed['status'] : '';
+  const exitCode = parsed['exit_code'];
+  const finalCause = stringInput(parsed, 'final_cause');
+  switch (status) {
+    case 'running': return 'running';
+    case 'still_running': return 'still running';
+    case 'kill_pending_kernel': return 'kill pending';
+    case 'exited': return exitCode == null ? 'exited' : `exit ${String(exitCode)}`;
+    case 'killed': return exitCode == null ? 'killed' : `killed ${String(exitCode)}`;
+    case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
+    default: return status ? status.replace(/_/g, ' ') : null;
+  }
+}
+
+function summarizeBashOutputTail(parsed: Record<string, unknown>): string | null {
+  const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
+  const bytes = lines
+    .map((line) => line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
+      ? (line as { bytes: string }).bytes
+      : '')
+    .filter((line) => line.trim().length > 0);
+  if (bytes.length === 0) return null;
+  const tail = bytes.slice(-2).join(' · ');
+  return truncate(tail, 140);
+}
+
+function summarizeBashCompactCard(
+  input: Record<string, unknown>,
+  result: Message | undefined,
+  display?: string,
+): Pick<ToolStripItem, 'commandIdentity' | 'finalStatus' | 'outputTail'> {
+  const commandIdentity = summarizeBashInputIdentity(input, display);
+  if (!result) {
+    return { commandIdentity, finalStatus: null, outputTail: null };
+  }
+  const text = resultText(result);
+  const parsed = tryParseJson(text);
+  if (!parsed) {
+    return {
+      commandIdentity,
+      finalStatus: null,
+      outputTail: text.trim() ? truncate(text.trim(), 140) : null,
+    };
+  }
+  const status = bashStatusLabel(parsed);
+  const displayData = result.display_data as Record<string, unknown> | undefined;
+  const durationMs = typeof parsed['duration_ms'] === 'number'
+    ? parsed['duration_ms']
+    : typeof displayData?.['duration_ms'] === 'number'
+      ? displayData['duration_ms']
+      : null;
+  return {
+    commandIdentity,
+    finalStatus: status ? `${status}${durationMs !== null ? ` · ${formatDuration(durationMs)}` : ''}` : durationMs !== null ? formatDuration(durationMs) : null,
+    outputTail: summarizeBashOutputTail(parsed),
+  };
+}
 
 function summarizeToolResult(name: string, result: Message | undefined): string | null {
   if (!result) return null;
@@ -228,11 +317,18 @@ export function deriveToolStripItems(
     const result = toolId ? toolResultsByUseId.get(toolId) : undefined;
     const resultContent = result?.content as ToolResultContent | undefined;
     const isError = !!(resultContent?.is_error || resultContent?.error);
+    const input = (block.input || {}) as Record<string, unknown>;
+    const bashCompact = name === 'bash'
+      ? summarizeBashCompactCard(input, result, block.display)
+      : { commandIdentity: null, finalStatus: null, outputTail: null };
     items.push({
       name,
       toolId,
-      inputSummary: summarizeToolInput(name, (block.input || {}) as Record<string, unknown>, block.display),
+      inputSummary: summarizeToolInput(name, input, block.display),
       resultSummary: summarizeToolResult(name, result),
+      commandIdentity: bashCompact.commandIdentity,
+      finalStatus: bashCompact.finalStatus,
+      outputTail: bashCompact.outputTail,
       isSubAgent: name === 'spawn_agents',
       hasResult: result !== undefined,
       isError,

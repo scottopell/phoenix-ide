@@ -103,6 +103,54 @@ describe('deriveToolStripItems', () => {
       '2 lines',
       'exited 0',
     ]);
+    expect(items[2]).toMatchObject({
+      commandIdentity: './dev.py check',
+      finalStatus: 'exit 0',
+      outputTail: null,
+    });
+  });
+
+  it('derives compact bash identity, final status+duration, and bounded output tail from structured results', () => {
+    const msg = agentMessage([
+      { type: 'tool_use', id: 'b1', name: 'bash', input: { op: 'wait', handle: 'b-22', wait_seconds: 5 } },
+      { type: 'tool_use', id: 'b2', name: 'bash', input: { op: 'run', cmd: 'pnpm vitest run ui/src/components/MessageComponents.test.tsx' } },
+    ]);
+    const results = new Map<string, Message>([
+      ['b1', toolResult('b1', {
+        content: JSON.stringify({
+          status: 'exited',
+          exit_code: 0,
+          duration_ms: 1840,
+          lines: [
+            { offset: 1, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
+            { offset: 2, bytes: ' Test Files  1 passed' },
+          ],
+        }),
+      })],
+      ['b2', toolResult('b2', {
+        content: JSON.stringify({
+          status: 'kill_pending_kernel',
+          lines: [
+            { offset: 1, bytes: 'first line' },
+            { offset: 2, bytes: 'second line with a lot of detail that should still be bounded when summarized into the compact card tail' },
+            { offset: 3, bytes: 'third line' },
+          ],
+        }),
+      })],
+    ]);
+
+    const items = deriveToolStripItems(msg, results);
+
+    expect(items[0]).toMatchObject({
+      commandIdentity: 'wait b-22',
+      finalStatus: 'exit 0 · 1.8s',
+      outputTail: '✓ src/components/MessageComponents.test.tsx (68 tests) · Test Files 1 passed',
+    });
+    expect(items[1]?.commandIdentity).toBe('pnpm vitest run ui/src/components/MessageComponents.test.tsx');
+    expect(items[1]?.finalStatus).toBe('kill pending');
+    expect(items[1]?.outputTail?.length).toBeLessThanOrEqual(140);
+    expect(items[1]?.outputTail).toContain('second line');
+    expect(items[1]?.outputTail).toContain('third line');
   });
 
   it('uses a scalar fallback for unknown tools instead of name-only rendering', () => {

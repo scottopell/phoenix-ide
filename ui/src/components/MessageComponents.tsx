@@ -851,19 +851,33 @@ function CompactToolStripImpl({
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError ? 'failed' : item.hasResult ? 'done' : 'running';
+        const ariaStatus = item.finalStatus ?? statusLabel;
+        const ariaSummary = item.outputTail ?? summary;
+        const isCompactBash = item.name === 'bash';
         return (
           <button
             key={item.toolId || `${item.name}-${i}`}
             type="button"
             className={classNames}
             onClick={() => onExpand(item.toolId)}
-            aria-label={`${item.name}: ${summary} (${statusLabel}) — expand tool detail`}
+            aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
           >
             <span className="compact-tool-card-header">
               <span className="compact-tool-card-name">{item.name}</span>
-              <span className="compact-tool-card-status">{statusLabel}</span>
+              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}</span>
             </span>
-            <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            {isCompactBash ? (
+              <>
+                <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
+                  {item.commandIdentity ?? item.inputSummary}
+                </span>
+                <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
+                  {item.outputTail ?? '(no output)'}
+                </span>
+              </>
+            ) : (
+              <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            )}
           </button>
         );
       })}
