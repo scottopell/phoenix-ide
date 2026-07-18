@@ -15,7 +15,7 @@ A controlled `cargo check -p phoenix-core --locked` comparison with fresh source
 
 Starting the daemon cut cold cache population by about 52% and improved the two cross-path warm samples by about 7% at the median. Key generation remained the dominant hit cost because relocated artifacts have new paths, inodes, and timestamps and must be read to prove content identity.
 
-The local fork branch `phoenix-worktree-performance` contains commit `aed4a67` adding the operational `KACHE_SOCKET_PATH` override. The commit is preserved for review/upstreaming as `patches/kache/0001-allow-short-daemon-socket-paths.patch` because `x-kache` is a separate local Git checkout.
+The local fork branch `phoenix-worktree-performance` contains commit `aed4a67` adding the operational `KACHE_SOCKET_PATH` override. The commit is preserved for review/upstreaming as `patches/kache/0001-configure-daemon-socket-path.patch` because `x-kache` is a separate local Git checkout.
 
 Phoenix `dev.py` now:
 
