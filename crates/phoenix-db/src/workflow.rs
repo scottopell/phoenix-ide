@@ -316,6 +316,28 @@ pub struct AcceptOrSuppressDeliveryInput {
     pub suppression_reason: SuppressionReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryResolutionDecision {
+    Accept,
+    Suppress { reason: SuppressionReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryResolutionPlan<'a> {
+    pub workflow_id: WorkflowId,
+    pub expected_version: Version,
+    pub transition_id: TransitionId,
+    pub generation: Generation,
+    pub next_status: WorkflowStatus,
+    pub event_codec: &'a LocalCodec,
+    pub event_payload: &'a [u8],
+    pub next_snapshot_codec: &'a LocalCodec,
+    pub next_snapshot_payload: &'a [u8],
+    pub committed_at: Timestamp,
+    pub exact_delivery_ids: &'a [DeliveryId],
+    pub decision: DeliveryResolutionDecision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualResolutionRecordRow {
     pub manual_resolution_id: ManualResolutionId,
@@ -433,6 +455,119 @@ impl<'a> WorkflowTx<'a> {
     async fn rollback(self) -> DbResult<()> {
         self.tx.rollback().await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_transition_head_cas(
+        &mut self,
+        workflow_id: WorkflowId,
+        expected_version: Version,
+        generation: Generation,
+        next_status: WorkflowStatus,
+        event_codec: &LocalCodec,
+        event_payload: &[u8],
+        next_snapshot_codec: &LocalCodec,
+        next_snapshot_payload: &[u8],
+        transition_id: TransitionId,
+        committed_at: Timestamp,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query("UPDATE workflows SET version = version + 1, generation = ?3, status = ?4, snapshot_codec_family = ?5, snapshot_codec_version = ?6, snapshot_payload = ?7, updated_at = ?8 WHERE workflow_id = ?1 AND version = ?2")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .bind(to_i64(expected_version.0, "expected_version")?)
+            .bind(to_i64(generation.0, "generation")?)
+            .bind(workflow_status_to_str(next_status))
+            .bind(&next_snapshot_codec.family)
+            .bind(i64::from(next_snapshot_codec.version))
+            .bind(next_snapshot_payload)
+            .bind(to_i64(committed_at.0, "committed_at")?)
+            .execute(&mut *self.tx).await?.rows_affected();
+        if updated == 0 {
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO workflow_transitions (workflow_id, transition_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .bind(to_i64(transition_id.0, "transition_id")?)
+            .bind(to_i64(expected_version.0, "expected_version")?)
+            .bind(to_i64(expected_version.next().0, "to_version")?)
+            .bind(to_i64(generation.0, "generation")?)
+            .bind(&event_codec.family)
+            .bind(i64::from(event_codec.version))
+            .bind(event_payload)
+            .bind(to_i64(committed_at.0, "committed_at")?)
+            .execute(&mut *self.tx).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn resolve_deliveries_exact(
+        &mut self,
+        plan: DeliveryResolutionPlan<'_>,
+    ) -> DbResult<CommitOutcome> {
+        let mut exact = BTreeSet::new();
+        for &delivery_id in plan.exact_delivery_ids {
+            if !exact.insert(delivery_id) {
+                return Ok(CommitOutcome::InvalidPlan);
+            }
+        }
+        let committed = self
+            .commit_transition_head_cas(
+                plan.workflow_id,
+                plan.expected_version,
+                plan.generation,
+                plan.next_status,
+                plan.event_codec,
+                plan.event_payload,
+                plan.next_snapshot_codec,
+                plan.next_snapshot_payload,
+                plan.transition_id,
+                plan.committed_at,
+            )
+            .await?;
+        if !committed {
+            return Ok(CommitOutcome::VersionConflict);
+        }
+        let rows = sqlx::query(
+            "SELECT delivery_id, status FROM workflow_deliveries WHERE workflow_id = ?1 ORDER BY delivery_id",
+        )
+        .bind(to_i64(plan.workflow_id.0, "workflow_id")?)
+        .fetch_all(&mut *self.tx)
+        .await?;
+        let matched: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                exact.contains(&DeliveryId(
+                    to_u64(row.get::<i64, _>("delivery_id"), "delivery_id").unwrap(),
+                ))
+            })
+            .collect();
+        if matched.len() != exact.len()
+            || matched
+                .iter()
+                .any(|r| r.get::<String, _>("status") != "Pending")
+        {
+            return Ok(CommitOutcome::InvalidPlan);
+        }
+        let (status, runtime_acceptance_status, suppression_reason) = match plan.decision {
+            DeliveryResolutionDecision::Accept => ("Accepted", "Accepted", None),
+            DeliveryResolutionDecision::Suppress { reason } => (
+                "Suppressed",
+                "Suppressed",
+                Some(suppression_reason_to_str(reason)),
+            ),
+        };
+        for &delivery_id in plan.exact_delivery_ids {
+            sqlx::query("UPDATE workflow_deliveries SET status = ?3, suppression_reason = ?4, accepted_by_transition_id = ?5, runtime_acceptance_status = CASE WHEN requires_runtime_acceptance = 1 THEN ?6 ELSE runtime_acceptance_status END WHERE workflow_id = ?1 AND delivery_id = ?2")
+                .bind(to_i64(plan.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(delivery_id.0, "delivery_id")?)
+                .bind(status)
+                .bind(suppression_reason)
+                .bind(match plan.decision {
+                    DeliveryResolutionDecision::Accept => Some(to_i64(plan.transition_id.0, "transition_id")?),
+                    DeliveryResolutionDecision::Suppress { .. } => None,
+                })
+                .bind(runtime_acceptance_status)
+                .execute(&mut *self.tx).await?;
+        }
+        Ok(CommitOutcome::Committed)
     }
 
     pub(crate) async fn fetch_workflow_head(
@@ -613,7 +748,7 @@ impl<'a> WorkflowTx<'a> {
         match insert_attempt {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy(error.as_ref())
+                if is_sqlite_busy_retryable(error.as_ref())
                     || is_sqlite_unique_constraint(error.as_ref())
                     || is_sqlite_primary_key_constraint(error.as_ref()) =>
             {
@@ -794,7 +929,7 @@ impl<'a> WorkflowTx<'a> {
         match receipt_insert {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy(error.as_ref())
+                if is_sqlite_busy_retryable(error.as_ref())
                     || is_sqlite_unique_constraint(error.as_ref())
                     || is_sqlite_primary_key_constraint(error.as_ref()) =>
             {
@@ -1004,8 +1139,8 @@ fn is_sqlite_primary_key_constraint(error: &dyn DatabaseError) -> bool {
     sqlite_error_code_is(error, SQLITE_CONSTRAINT_PRIMARYKEY)
 }
 
-fn is_sqlite_busy(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_BUSY)
+fn is_sqlite_busy_retryable(error: &dyn DatabaseError) -> bool {
+    sqlite_error_code_is(error, SQLITE_BUSY) || error.code().as_deref() == Some("517")
 }
 
 impl WorkflowRepository {
@@ -1326,7 +1461,7 @@ impl WorkflowRepository {
         for _ in 0..5 {
             match self.begin_attempt_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if is_sqlite_busy(error.as_ref()) =>
+                    if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     std::thread::yield_now();
                 }
@@ -1435,7 +1570,7 @@ impl WorkflowRepository {
         for _ in 0..5 {
             match self.accept_receipt_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if is_sqlite_busy(error.as_ref()) =>
+                    if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     std::thread::yield_now();
                 }
@@ -1467,78 +1602,42 @@ impl WorkflowRepository {
         &self,
         input: &AcceptOrSuppressDeliveryInput,
     ) -> DbResult<CommitOutcome> {
-        let mut tx = self.pool.begin().await?;
-        let ids: BTreeSet<_> = input
-            .accept_delivery_ids
-            .iter()
-            .chain(input.suppress_delivery_ids.iter())
-            .copied()
-            .collect();
-        if ids.len() != input.accept_delivery_ids.len() + input.suppress_delivery_ids.len() {
+        let mut tx = self.begin_tx().await?;
+        let mut exact_delivery_ids = input.accept_delivery_ids.clone();
+        exact_delivery_ids.extend(input.suppress_delivery_ids.iter().copied());
+        let decision = if input.suppress_delivery_ids.is_empty() {
+            DeliveryResolutionDecision::Accept
+        } else if input.accept_delivery_ids.is_empty() {
+            DeliveryResolutionDecision::Suppress {
+                reason: input.suppression_reason,
+            }
+        } else {
             tx.rollback().await?;
             return Ok(CommitOutcome::InvalidPlan);
-        }
-        let updated = sqlx::query("UPDATE workflows SET version = version + 1, generation = ?3, status = ?4, snapshot_codec_family = ?5, snapshot_codec_version = ?6, snapshot_payload = ?7, updated_at = ?8 WHERE workflow_id = ?1 AND version = ?2")
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.expected_version.0, "expected_version")?)
-            .bind(to_i64(input.generation.0, "generation")?)
-            .bind(workflow_status_to_str(input.next_status))
-            .bind(&input.next_snapshot_codec.family)
-            .bind(i64::from(input.next_snapshot_codec.version))
-            .bind(&input.next_snapshot_payload)
-            .bind(to_i64(input.committed_at.0, "committed_at")?)
-            .execute(&mut *tx).await?.rows_affected();
-        if updated == 0 {
-            tx.rollback().await?;
-            return Ok(CommitOutcome::VersionConflict);
-        }
-        let existing = sqlx::query("SELECT delivery_id, status FROM workflow_deliveries WHERE workflow_id = ?1 ORDER BY delivery_id")
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .fetch_all(&mut *tx).await?;
-        let rows: Vec<_> = existing
-            .into_iter()
-            .filter(|row| {
-                ids.contains(&DeliveryId(
-                    to_u64(row.get::<i64, _>("delivery_id"), "delivery_id").unwrap(),
-                ))
+        };
+        let outcome = tx
+            .resolve_deliveries_exact(DeliveryResolutionPlan {
+                workflow_id: input.workflow_id,
+                expected_version: input.expected_version,
+                transition_id: input.transition_id,
+                generation: input.generation,
+                next_status: input.next_status,
+                event_codec: &input.event_codec,
+                event_payload: &input.event_payload,
+                next_snapshot_codec: &input.next_snapshot_codec,
+                next_snapshot_payload: &input.next_snapshot_payload,
+                committed_at: input.committed_at,
+                exact_delivery_ids: &exact_delivery_ids,
+                decision,
             })
-            .collect();
-        if rows.len() != ids.len()
-            || rows
-                .iter()
-                .any(|r| r.get::<String, _>("status") != "Pending")
-        {
-            tx.rollback().await?;
-            return Ok(CommitOutcome::InvalidPlan);
+            .await?;
+        match outcome {
+            CommitOutcome::Committed => tx.commit().await?,
+            CommitOutcome::VersionConflict
+            | CommitOutcome::InvalidPlan
+            | CommitOutcome::UnsupportedCodec => tx.rollback().await?,
         }
-        sqlx::query("INSERT INTO workflow_transitions (workflow_id, transition_id, from_version, to_version, generation, event_codec_family, event_codec_version, event_payload, committed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.transition_id.0, "transition_id")?)
-            .bind(to_i64(input.expected_version.0, "expected_version")?)
-            .bind(to_i64(input.expected_version.next().0, "to_version")?)
-            .bind(to_i64(input.generation.0, "generation")?)
-            .bind(&input.event_codec.family)
-            .bind(i64::from(input.event_codec.version))
-            .bind(&input.event_payload)
-            .bind(to_i64(input.committed_at.0, "committed_at")?)
-            .execute(&mut *tx).await?;
-        for id in &input.accept_delivery_ids {
-            sqlx::query("UPDATE workflow_deliveries SET status = 'Accepted', accepted_by_transition_id = ?3, runtime_acceptance_status = CASE WHEN requires_runtime_acceptance = 1 THEN 'Accepted' ELSE runtime_acceptance_status END WHERE workflow_id = ?1 AND delivery_id = ?2")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(id.0, "delivery_id")?)
-                .bind(to_i64(input.transition_id.0, "transition_id")?)
-                .execute(&mut *tx).await?;
-        }
-        for id in &input.suppress_delivery_ids {
-            sqlx::query("UPDATE workflow_deliveries SET status = 'Suppressed', suppression_reason = ?3, accepted_by_transition_id = ?4, runtime_acceptance_status = CASE WHEN requires_runtime_acceptance = 1 THEN 'Suppressed' ELSE runtime_acceptance_status END WHERE workflow_id = ?1 AND delivery_id = ?2")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(id.0, "delivery_id")?)
-                .bind(suppression_reason_to_str(input.suppression_reason))
-                .bind(to_i64(input.transition_id.0, "transition_id")?)
-                .execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(CommitOutcome::Committed)
+        Ok(outcome)
     }
 
     pub async fn resolve_manual_choice(

@@ -3,8 +3,9 @@
 use super::{
     to_i64, to_u64, wake_profile, AcceptReceiptInput, BeginAttemptInput, BeginAttemptResult,
     ClaimOutcome, CommitOutcome, CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance,
-    DbError, DbResult, LocalCodec, LocalDeliveryRecord, LocalEffectDecl, LocalReceiptRecord,
-    RecordObservationInput, WorkflowRepository, WorkflowTx,
+    DbError, DbResult, DeliveryResolutionDecision, DeliveryResolutionPlan, LocalCodec,
+    LocalDeliveryRecord, LocalEffectDecl, LocalReceiptRecord, RecordObservationInput,
+    WorkflowRepository, WorkflowTx,
 };
 use phoenix_workflow::{
     wake_profile::{
@@ -35,6 +36,11 @@ pub fn fail_after_canonical_transition_once(workflow_id: WorkflowId) {
 #[cfg(test)]
 pub fn fail_after_canonical_receipt_once(workflow_id: WorkflowId) {
     FAIL_AFTER_CANONICAL_RECEIPT.store(workflow_id.0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub fn fail_after_resolve_transition_once(workflow_id: WorkflowId) {
+    FAIL_AFTER_CANONICAL_TRANSITION.store(workflow_id.0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -156,6 +162,30 @@ pub enum WakeCancellationOutcome {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeResolveDecision {
+    Accept,
+    Suppress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeResolvePendingInput {
+    pub workflow_id: WorkflowId,
+    pub expected_version: Version,
+    pub delivery_ids: Vec<DeliveryId>,
+    pub decision: WakeResolveDecision,
+    pub transition_id: TransitionId,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeResolvePendingOutcome {
+    Resolved,
+    VersionConflict,
+    SetMismatch,
+    AlreadyResolved,
+}
+
 #[derive(Debug, Clone)]
 pub struct WakeRepository {
     workflow_repo: WorkflowRepository,
@@ -182,7 +212,7 @@ impl WakeRepository {
                 .await
             {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if error.code().as_deref() == Some("5") =>
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -384,7 +414,7 @@ impl WakeRepository {
                 .await
             {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if error.code().as_deref() == Some("5") =>
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -585,7 +615,7 @@ impl WakeRepository {
         for _ in 0..20 {
             match self.cancel_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if error.code().as_deref() == Some("5") =>
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -813,6 +843,182 @@ impl WakeRepository {
         }
         tx.commit().await?;
         Ok(pending)
+    }
+
+    pub async fn resolve_pending_exact(
+        &self,
+        input: &WakeResolvePendingInput,
+    ) -> DbResult<WakeResolvePendingOutcome> {
+        for _ in 0..20 {
+            match self.resolve_pending_exact_once(input).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+        self.resolve_pending_exact_once(input).await
+    }
+
+    async fn resolve_pending_exact_once(
+        &self,
+        input: &WakeResolvePendingInput,
+    ) -> DbResult<WakeResolvePendingOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(_binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::SetMismatch);
+        };
+        let Some(head) = tx.fetch_workflow_head(input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::SetMismatch);
+        };
+        if head.version != input.expected_version {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::VersionConflict);
+        }
+
+        let current = sqlx::query(
+            "SELECT d.delivery_id, d.status
+             FROM workflow_deliveries d
+             JOIN wake_terminal_receipts p
+               ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+             WHERE d.workflow_id = ?1
+             ORDER BY d.delivery_id",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+
+        let mut pending_ids = Vec::new();
+        let mut resolved_requested = false;
+        let mut requested_counts = std::collections::BTreeMap::new();
+        for &delivery_id in &input.delivery_ids {
+            *requested_counts.entry(delivery_id).or_insert(0_usize) += 1;
+        }
+        if requested_counts.values().any(|count| *count > 1) {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::SetMismatch);
+        }
+        for row in &current {
+            let delivery_id = DeliveryId(to_u64(row.get::<i64, _>("delivery_id"), "delivery_id")?);
+            let status = row.get::<String, _>("status");
+            if status == "Pending" {
+                pending_ids.push(delivery_id);
+            } else if requested_counts.contains_key(&delivery_id) {
+                resolved_requested = true;
+            }
+        }
+        if resolved_requested {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::AlreadyResolved);
+        }
+        if pending_ids != input.delivery_ids {
+            tx.rollback().await?;
+            return Ok(WakeResolvePendingOutcome::SetMismatch);
+        }
+
+        let terminal = fetch_any_terminal_projection_tx(&mut tx, input.workflow_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("wake pending delivery set missing projection".to_string())
+            })?
+            .terminal;
+        let event = match input.decision {
+            WakeResolveDecision::Accept => WakeRegistrationEvent::RuntimeAccepted {
+                terminal: Box::new(terminal.clone()),
+            },
+            WakeResolveDecision::Suppress => WakeRegistrationEvent::RuntimeSuppressed {
+                terminal: Box::new(terminal.clone()),
+            },
+        };
+        let decision = match input.decision {
+            WakeResolveDecision::Accept => DeliveryResolutionDecision::Accept,
+            WakeResolveDecision::Suppress => DeliveryResolutionDecision::Suppress {
+                reason: phoenix_workflow::SuppressionReason::ReducerTerminal,
+            },
+        };
+        let event_codec = local_codec(&wake_profile::event_codec());
+        let event_payload = json_blob(&event)?;
+        let next_snapshot_codec = LocalCodec {
+            family: head.snapshot_codec.family.to_string(),
+            version: head.snapshot_codec.version,
+        };
+        let outcome = tx
+            .resolve_deliveries_exact(DeliveryResolutionPlan {
+                workflow_id: input.workflow_id,
+                expected_version: input.expected_version,
+                transition_id: input.transition_id,
+                generation: head.generation,
+                next_status: head.status,
+                event_codec: &event_codec,
+                event_payload: &event_payload,
+                next_snapshot_codec: &next_snapshot_codec,
+                next_snapshot_payload: &head.snapshot_payload,
+                committed_at: input.timestamp,
+                exact_delivery_ids: &input.delivery_ids,
+                decision,
+            })
+            .await?;
+        match outcome {
+            CommitOutcome::Committed => {
+                #[cfg(test)]
+                maybe_fail_after_canonical_transition(input.workflow_id)?;
+                #[cfg(not(test))]
+                maybe_fail_after_canonical_transition(input.workflow_id);
+                tx.commit().await?;
+                Ok(WakeResolvePendingOutcome::Resolved)
+            }
+            CommitOutcome::VersionConflict => {
+                tx.rollback().await?;
+                Ok(WakeResolvePendingOutcome::VersionConflict)
+            }
+            CommitOutcome::InvalidPlan => {
+                tx.rollback().await?;
+                let head = self
+                    .workflow_repo
+                    .fetch_workflow_head(input.workflow_id)
+                    .await?
+                    .ok_or_else(|| {
+                        DbError::Serialization(
+                            "wake resolve missing workflow after invalid plan".to_string(),
+                        )
+                    })?;
+                if head.version != input.expected_version {
+                    return Ok(WakeResolvePendingOutcome::VersionConflict);
+                }
+                let current = sqlx::query(
+                    "SELECT d.delivery_id, d.status
+                     FROM workflow_deliveries d
+                     JOIN wake_terminal_receipts p
+                       ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+                     WHERE d.workflow_id = ?1
+                     ORDER BY d.delivery_id",
+                )
+                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+                .fetch_all(&self.workflow_repo.pool)
+                .await?;
+                if current.iter().any(|row| {
+                    let delivery_id = DeliveryId(
+                        to_u64(row.get::<i64, _>("delivery_id"), "delivery_id").unwrap(),
+                    );
+                    row.get::<String, _>("status") != "Pending"
+                        && input.delivery_ids.contains(&delivery_id)
+                }) {
+                    Ok(WakeResolvePendingOutcome::AlreadyResolved)
+                } else {
+                    Ok(WakeResolvePendingOutcome::SetMismatch)
+                }
+            }
+            CommitOutcome::UnsupportedCodec => {
+                tx.rollback().await?;
+                Err(DbError::Serialization(
+                    "wake resolve returned unexpected codec error".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -1919,6 +2125,22 @@ mod tests {
         }
     }
 
+    fn resolve_input(
+        workflow_id: WorkflowId,
+        expected_version: Version,
+        transition_id: TransitionId,
+        delivery_ids: Vec<DeliveryId>,
+    ) -> WakeResolvePendingInput {
+        WakeResolvePendingInput {
+            workflow_id,
+            expected_version,
+            delivery_ids,
+            decision: WakeResolveDecision::Accept,
+            transition_id,
+            timestamp: Timestamp(30),
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_concurrent_registration_replays_single_winner() {
         let (_dir, first, second) = open_repo_pair().await;
@@ -2085,7 +2307,7 @@ mod tests {
     async fn cancel_vs_terminal_race_repeated_has_single_winner() {
         for run in 0..10 {
             let (_dir, first, second) = open_repo_pair().await;
-            let workflow_id = WorkflowId(200 + run);
+            let workflow_id = WorkflowId(300 + run);
             let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
             let authority = canonical.authority.unwrap();
             let evidence = bash_evidence(19);
@@ -2251,6 +2473,329 @@ mod tests {
                 panic!("expected recorded, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_accept_hides_from_list_and_preserves_no_runtime_acceptance() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(111)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(111),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(111),
+                Version(1),
+                TransitionId(2),
+                vec![DeliveryId(1)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(WorkflowId(111))
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].status,
+            phoenix_workflow::DeliveryStatus::Accepted
+        );
+        assert_eq!(deliveries[0].runtime_acceptance_status, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_suppress_sets_structural_reason() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(112)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(112),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        let mut input = resolve_input(
+            WorkflowId(112),
+            Version(1),
+            TransitionId(2),
+            vec![DeliveryId(1)],
+        );
+        input.decision = WakeResolveDecision::Suppress;
+        assert_eq!(
+            repo.resolve_pending_exact(&input).await.unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(WorkflowId(112))
+            .await
+            .unwrap();
+        assert_eq!(
+            deliveries[0].status,
+            phoenix_workflow::DeliveryStatus::Suppressed
+        );
+        assert_eq!(
+            deliveries[0].suppression_reason,
+            Some(phoenix_workflow::SuppressionReason::ReducerTerminal)
+        );
+        assert_eq!(deliveries[0].runtime_acceptance_status, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_failpoint_rolls_back_transition_and_deliveries() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(113)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(113),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        fail_after_resolve_transition_once(WorkflowId(113));
+        let input = resolve_input(
+            WorkflowId(113),
+            Version(1),
+            TransitionId(2),
+            vec![DeliveryId(1)],
+        );
+        let err = restarted.resolve_pending_exact(&input).await;
+        assert!(err.is_err());
+        let head = restarted
+            .workflow_repo
+            .fetch_workflow_head(WorkflowId(113))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.version, Version(1));
+        let deliveries = restarted
+            .workflow_repo
+            .list_deliveries(WorkflowId(113))
+            .await
+            .unwrap();
+        assert_eq!(
+            deliveries[0].status,
+            phoenix_workflow::DeliveryStatus::Pending
+        );
+        assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_restart_reload_sees_resolved_state() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(114)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(114),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(114),
+                Version(1),
+                TransitionId(2),
+                vec![DeliveryId(1)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert!(restarted.list_pending("conv-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_has_single_winner_and_version_conflict() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&first, WorkflowId(115)).await);
+        first
+            .record_terminal_evidence(
+                WorkflowId(115),
+                canonical.authority.as_ref().unwrap(),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &bash_evidence(19),
+            )
+            .await
+            .unwrap();
+        let input = resolve_input(
+            WorkflowId(115),
+            Version(1),
+            TransitionId(2),
+            vec![DeliveryId(1)],
+        );
+        let (left, right) = tokio::join!(
+            first.resolve_pending_exact(&input),
+            second.resolve_pending_exact(&input)
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, WakeResolvePendingOutcome::Resolved))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, WakeResolvePendingOutcome::VersionConflict))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_rejects_missing_extra_and_duplicate_sets() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(116)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(116),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(116),
+                Version(1),
+                TransitionId(2),
+                vec![]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::SetMismatch
+        );
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(116),
+                Version(1),
+                TransitionId(2),
+                vec![DeliveryId(1), DeliveryId(999)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::SetMismatch
+        );
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(116),
+                Version(1),
+                TransitionId(2),
+                vec![DeliveryId(1), DeliveryId(1)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::SetMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_already_resolved_and_set_mismatch_do_not_mutate() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let canonical = unwrap_started(register_and_begin(&repo, WorkflowId(117)).await);
+        repo.record_terminal_evidence(
+            WorkflowId(117),
+            canonical.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &bash_evidence(19),
+        )
+        .await
+        .unwrap();
+        let first = resolve_input(
+            WorkflowId(117),
+            Version(1),
+            TransitionId(2),
+            vec![DeliveryId(1)],
+        );
+        assert_eq!(
+            repo.resolve_pending_exact(&first).await.unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+
+        let before = repo
+            .workflow_repo
+            .fetch_workflow_head(WorkflowId(117))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(117),
+                Version(2),
+                TransitionId(3),
+                vec![DeliveryId(1)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::AlreadyResolved
+        );
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                WorkflowId(117),
+                Version(2),
+                TransitionId(3),
+                vec![DeliveryId(999)]
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::SetMismatch
+        );
+        let after = repo
+            .workflow_repo
+            .fetch_workflow_head(WorkflowId(117))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.version, after.version);
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(WorkflowId(117))
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].status,
+            phoenix_workflow::DeliveryStatus::Accepted
+        );
     }
 
     #[tokio::test]
