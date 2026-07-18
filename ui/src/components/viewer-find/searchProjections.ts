@@ -586,6 +586,7 @@ function bashVisibleSearchText(
   block: ContentBlock,
   result: Message | undefined,
   progress: BashToolProgress | undefined,
+  density: 'full' | 'compact',
 ): string {
   const parts: string[] = [];
   if (block.display) parts.push(block.display);
@@ -612,7 +613,8 @@ function bashVisibleSearchText(
     if (parsed['exit_code'] !== undefined && parsed['exit_code'] !== null) parts.push(`exit ${String(parsed['exit_code'])}`);
     if (parsed['truncated_before'] === true) parts.push('older output omitted');
     const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
-    for (const line of lines.slice(-2)) {
+    const visibleLines = density === 'full' ? lines : lines.slice(-2);
+    for (const line of visibleLines) {
       const text = line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
         ? (line as { bytes: string }).bytes
         : '';
@@ -650,7 +652,7 @@ function agentTurnSources(
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
       const result = toolResultsByUseId.get(block.id ?? '');
       if (block.name === 'bash') {
-        out.push({ role: `tool-use-visible-bash-${index}`, text: bashVisibleSearchText(block, result, liveBashProgress[block.id ?? '']?.progress) });
+        out.push({ role: `tool-use-visible-bash-${index}`, text: bashVisibleSearchText(block, result, liveBashProgress[block.id ?? '']?.progress, density) });
         if (density === 'full') out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
       } else if (densityToolDetailsVisible(block.name, density)) {
         out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });

@@ -1385,10 +1385,12 @@ function BashOutputView({
   const visible = bounded
     ? summarizeBashVisibleTail(lines, partial, truncatedBefore)
     : [...lines, ...(partial ? [partial] : [])];
+  const localTailTruncated = bounded && lines.length + (partial ? 1 : 0) > 8;
+  const outputTruncated = truncatedBefore || localTailTruncated;
   if (visible.length === 0) return null;
   return (
     <div className="bash-output-shell">
-      {truncatedBefore && (
+      {outputTruncated && (
         <div className="bash-truncated-notice" aria-label="Earlier bash output fell out of the bounded tail">
           [older output omitted from this tail]
         </div>
