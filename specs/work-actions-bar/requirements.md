@@ -32,21 +32,24 @@ It does **not** govern:
 ### REQ-WAB-001: Bar Visibility
 
 WHEN a conversation's `conv_mode_label` is `"Work"` or `"Branch"`
-AND the conversation is in a disposable, non-running condition — phase one of `idle`,
-  `error`, or `context_exhausted`
+AND the conversation is in a disposable, non-running condition — phase one of `idle`
+  or `error`
 THE SYSTEM SHALL render the work actions bar.
+
+WHEN the conversation is in `context_exhausted`
+THE SYSTEM SHALL NOT render the work actions bar
+AND SHALL reserve the focused handoff surface for continuation actions defined by bedrock REQ-BED-021.
 
 WHEN the conversation is in any other phase, or its mode is not `Work` or `Branch`
 THE SYSTEM SHALL NOT render the work actions bar.
 
-**Design:** The three eligible phases are exactly the disposable, non-running conditions of
-bedrock's `TaskResolved` rule. `idle` is the ordinary resting state; `error` and
-`context_exhausted` are stuck conditions from which the conversation cannot resume without
-user action, yet must still be disposable so the user is never forced to coax out a successful
-LLM turn just to clean up work whose outcome they already know (REQ-BED-029 for the
-terminal-on-resolution legality, REQ-BED-031 for context-exhausted disposability). Any other
-phase, or a non-Work/Branch mode, hides the bar: no terminal action is legal while the agent
-is live, and the bar's verbs have no meaning outside Work and Branch.
+**Design:** `idle` is the ordinary resting state and `error` is a stuck condition where terminal
+resolution remains directly useful. Context exhaustion has a dedicated continuation surface;
+placing cleanup beside its handoff controls makes an unrelated destructive action appear to be
+part of continuation. Bedrock REQ-BED-031 continues to govern backend disposability, but the work
+actions bar does not expose it from this focused surface. Any other phase, or a non-Work/Branch
+mode, hides the bar: no terminal action is legal while the agent is live, and the bar's verbs have
+no meaning outside Work and Branch.
 
 ---
 
@@ -148,7 +151,7 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | # | Condition | WorkDisposition | Primary verb | Secondary / suppressed |
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
-| 2 | phase ∈ {error, context_exhausted} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
+| 2 | phase = error | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
 | 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
 | 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
@@ -206,14 +209,14 @@ from the raw provider wire.
 
 ### REQ-WAB-005: RESOLVE Zone Suppressed in Stuck Phases
 
-WHEN the conversation phase is `error` or `context_exhausted`
+WHEN the conversation phase is `error`
 THE SYSTEM SHALL NOT render the RESOLVE zone (no Address feedback, no PR link).
 
 **Design:** Address feedback posts a `UserMessage` to the conversation. In `error` or
 `context_exhausted`, the conversation cannot resume a new LLM turn from a user message — the
-message would be rejected or would silently reopen a non-resumable stuck state. The only safe
-actions from a stuck conversation are terminal cleanup verbs, so RESOLVE is suppressed
-entirely rather than shown disabled (REQ-WAB-008).
+message would be rejected or would silently reopen a non-resumable stuck state. The error-state
+actions are terminal cleanup verbs, so RESOLVE is suppressed entirely rather than shown disabled
+(REQ-WAB-008). Context exhaustion does not render this bar at all (REQ-WAB-001).
 
 ---
 

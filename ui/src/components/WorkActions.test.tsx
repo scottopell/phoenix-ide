@@ -161,7 +161,7 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
     expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
   });
 
-  it.each(['idle', 'error', 'context_exhausted'] as const)(
+  it.each(['idle', 'error'] as const)(
     'is visible for a %s phase on Work',
     (phaseType) => {
       renderWithProviders(
@@ -177,6 +177,20 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
       expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
     },
   );
+
+  it('is hidden for a context_exhausted phase on Work', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="context_exhausted"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
+  });
 });
 
 describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
@@ -208,7 +222,7 @@ describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
 });
 
 describe('WorkControlBar — stuck phases suppress RESOLVE (REQ-WAB-005)', () => {
-  it.each(['error', 'context_exhausted'] as const)(
+  it.each(['error'] as const)(
     'exposes Clean up + Abandon but NO address-feedback even with an open PR (%s)',
     (phaseType) => {
       renderWithProviders(

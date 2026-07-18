@@ -180,3 +180,36 @@ export function DraftLifecycle({ slug }: { slug: string }): null {
   useDraftLifecycle(slug);
   return null;
 }
+
+export function seedDraftStorageKey(conversationId: string): string {
+  return `seed-draft:${conversationId}`;
+}
+
+export function readSeedDraft(conversationId: string): string {
+  try {
+    return localStorage.getItem(seedDraftStorageKey(conversationId)) ?? '';
+  } catch (error) {
+    console.warn('Error reading seed draft from localStorage:', error);
+    return '';
+  }
+}
+
+export function writeSeedDraft(conversationId: string, value: string): void {
+  try {
+    if (value === '') {
+      localStorage.removeItem(seedDraftStorageKey(conversationId));
+    } else {
+      localStorage.setItem(seedDraftStorageKey(conversationId), value);
+    }
+  } catch (error) {
+    console.warn('Error saving seed draft to localStorage:', error);
+  }
+}
+
+export function clearSeedDraft(conversationId: string): void {
+  try {
+    localStorage.removeItem(seedDraftStorageKey(conversationId));
+  } catch (error) {
+    console.warn('Error clearing seed draft from localStorage:', error);
+  }
+}

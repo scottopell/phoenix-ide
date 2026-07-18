@@ -2045,12 +2045,20 @@ export const api = {
    *           `error_type = "parent_not_context_exhausted"`)
    *   - other non-2xx → generic `Error`
    */
-  async continueConversation(convId: string): Promise<{
+  async continueConversation(
+    convId: string,
+    request: { handoff: string; message_id: string; user_agent?: string },
+  ): Promise<{
     conversation_id: string;
     slug?: string;
-    already_existed: boolean;
+    status: 'accepted' | 'dispatch_failed' | 'already_exists';
+    error?: string;
   }> {
-    const resp = await fetch(`/api/conversations/${convId}/continue`, { method: 'POST' });
+    const resp = await fetch(`/api/conversations/${convId}/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
     if (!resp.ok) {
       const err = await resp.json();
       if (resp.status === 409) {

@@ -434,11 +434,25 @@ THE SYSTEM SHALL reject new user messages with explanatory error
 AND display the continuation summary prominently
 AND offer action to start new conversation
 
-WHEN user starts new conversation from exhausted conversation
-THE SYSTEM SHALL optionally pre-populate with continuation summary
-AND preserve link to original conversation for reference
+WHEN the user reviews a context-exhausted conversation with no successor
+THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
+AND SHALL offer distinct actions to:
+  - create a successor and submit the generated handoff unchanged as its first user message
+  - edit a separate browser-local handoff draft before creating and starting the successor
+  - copy the generated handoff without creating a successor
+AND SHALL NOT present worktree cleanup or abandon controls on the handoff surface
 
-**Rationale:** Clear terminal state prevents confusion. Optional summary seeding enables continuity without forcing it.
+WHEN the user edits a handoff
+THE SYSTEM SHALL NOT modify the generated continuation summary
+AND SHALL allow the local edit draft to be reverted to the generated handoff
+AND SHALL reject an empty or whitespace-only edited handoff before successor creation
+
+WHEN the successor is created but its opening handoff is not accepted
+THE SYSTEM SHALL return the successor identity and the failed dispatch outcome
+AND SHALL preserve the exact attempted handoff as a recoverable draft in the successor
+AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
+
+**Rationale:** Context exhaustion is a focused transfer point. Explicit unchanged, edit-first, and copy paths make the consequence of each action visible, while keeping destructive workspace actions away from the continuation controls. Separating generated content from local edits ensures the operational handoff always remains recoverable. A successor creation and message dispatch cross a failure boundary, so partial success must preserve both the successor and the user's exact text.
 
 ---
 
@@ -691,6 +705,10 @@ THE SYSTEM SHALL transfer worktree ownership atomically in a single database tra
   - the continuation's `worktree_path` is set to the same value
   - the worktree registry's owner pointer moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
+
+WHEN a continuation successor is newly created
+THE SYSTEM SHALL submit the user-selected handoff text as the successor's first user message
+AND SHALL use a client-generated message identifier for idempotent acceptance
 
 WHEN a parent conversation already has a continuation
 THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation

@@ -21,7 +21,7 @@
 --     total over every open-PR and stuck-with-PR case.
 --   - Three-zone layout: REVIEW (View Diff), RESOLVE (push-forward), FINISH
 --     (terminal verbs Clean up and Abandon).
---   - RESOLVE suppression in stuck phases (error, context_exhausted).
+--   - RESOLVE suppression in the error phase.
 --   - Single primary across the whole bar, encoded structurally.
 --   - View Browser exclusion from this bar.
 --   - Tooltip semantics for terminal verbs.
@@ -242,9 +242,8 @@ entity WorkActionsBar {
 --
 --   phase_is_eligible(conv: bedrock/Conversation) -> Boolean
 --       True when conv.mode in { work, branch } AND the conversation is in a
---       disposable, non-running condition: conv.core_status in { idle, error }
---       or conv.parent_status = context_exhausted. Mirrors bedrock's
---       TaskResolved disposability (REQ-BED-029, REQ-BED-031).
+--       disposable, non-running condition: conv.core_status in { idle, error }.
+--       Context exhaustion uses bedrock's focused handoff surface instead.
 --
 --   conv_mode(conv: bedrock/Conversation) -> ConvMode
 --       Maps conv.mode: work -> ConvMode.work, branch -> ConvMode.branch. Not
@@ -253,7 +252,6 @@ entity WorkActionsBar {
 --   derive_bar_phase(conv: bedrock/Conversation) -> BarPhase
 --       core_status = idle  -> BarPhase.idle
 --       core_status = error -> BarPhase.error
---       parent_status = context_exhausted -> BarPhase.context_exhausted
 --       Only called when phase_is_eligible is true.
 --
 --   resolve_pr_status(conv: bedrock/Conversation) -> pra/PrStatusView?
@@ -409,14 +407,14 @@ rule DispositionContinued {
     ensures: bar.presentation.inline_note = continued_note
 }
 
--- Row 2. Stuck (error / context_exhausted): RESOLVE always suppressed
+-- Row 2. Stuck error: RESOLVE always suppressed
 -- (REQ-WAB-005); the primary collapses to a FINISH verb selected by PR state
 -- through the shared helper. View Diff and Abandon remain present.
 rule DispositionStuck {
     when: WorkActionsBarRendered(bar)
 
     requires: bar.inputs.continued_in_conv_id = null
-    requires: bar.inputs.phase in { error, context_exhausted }
+    requires: bar.inputs.phase = error
 
     ensures: bar.presentation.disposition = stuck
     ensures: bar.presentation.resolve_zone.visible = false
@@ -726,7 +724,7 @@ invariant ResolvePrimaryImpliesVisible {
 -- REQ-WAB-005: RESOLVE is invisible whenever the phase is stuck.
 invariant ResolveHiddenWhenStuck {
     for b in WorkActionsBar:
-        b.inputs.phase in { error, context_exhausted } implies
+        b.inputs.phase = error implies
             b.presentation.resolve_zone.visible = false
 }
 

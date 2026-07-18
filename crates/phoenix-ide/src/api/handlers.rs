@@ -24,8 +24,9 @@ use super::sse::sse_stream;
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
     CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
-    ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
+    CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
+    ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
+    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
@@ -3735,19 +3736,76 @@ async fn cancel_steering_message(
 /// conversation's id in the same DB transaction.
 ///
 /// Single-continuation policy: if the parent already has a continuation,
-/// the endpoint returns the existing continuation's id with `already_existed:
-/// true` (idempotent-return rather than 409 reject — friendlier to UI
-/// retries, and the UI can route directly to the existing continuation).
+/// the endpoint returns the existing successor with `already_exists` and never
+/// resends the supplied handoff. This idempotent return lets the UI resolve
+/// creation races by navigating to the durable winner.
 ///
 /// Error shape:
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
+async fn dispatch_continuation_handoff(
+    state: &AppState,
+    parent_id: &str,
+    conversation_id: &str,
+    req: ContinueConversationRequest,
+) -> (ContinueConversationStatus, Option<String>) {
+    let dispatch = crate::send_chat_service::SendChatApplicationService::new(
+        state.db.clone(),
+        state.runtime.clone(),
+    )
+    .send(crate::send_chat_service::SendChatRequest {
+        conversation_id: conversation_id.to_string(),
+        text: req.handoff,
+        message_id: req.message_id,
+        images: Vec::new(),
+        files: Vec::new(),
+        user_agent: req.user_agent,
+        expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+    })
+    .await;
+    match dispatch {
+        Ok(
+            crate::send_chat_service::SendChatOutcome::Delivered
+            | crate::send_chat_service::SendChatOutcome::AlreadyPersisted,
+        ) => (ContinueConversationStatus::Accepted, None),
+        Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => (
+            ContinueConversationStatus::DispatchFailed,
+            Some(
+                "The continuation was created, but its opening handoff was unexpectedly queued."
+                    .to_string(),
+            ),
+        ),
+        Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
+            (ContinueConversationStatus::DispatchFailed, Some(message))
+        }
+        Err(error) => {
+            tracing::warn!(
+                parent_id,
+                continuation_id = conversation_id,
+                error = %error,
+                "continuation created but opening handoff dispatch failed",
+            );
+            (
+                ContinueConversationStatus::DispatchFailed,
+                Some(error.to_string()),
+            )
+        }
+    }
+}
+
 async fn continue_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Json(req): Json<ContinueConversationRequest>,
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
+
+    if req.handoff.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Continuation handoff must not be empty.".to_string(),
+        ));
+    }
 
     let outcome = state
         .runtime
@@ -3784,10 +3842,16 @@ async fn continue_conversation(
                 }
             });
 
+            let conversation_id = new_conv.id;
+            let slug = new_conv.slug;
+            let (status, error) =
+                dispatch_continuation_handoff(&state, &id, &conversation_id, req).await;
+
             Ok(Json(ContinueConversationResponse {
-                conversation_id: new_conv.id,
-                slug: new_conv.slug,
-                already_existed: false,
+                conversation_id,
+                slug,
+                status,
+                error,
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
@@ -3799,7 +3863,8 @@ async fn continue_conversation(
             Ok(Json(ContinueConversationResponse {
                 conversation_id: existing.id,
                 slug: existing.slug,
-                already_existed: true,
+                status: ContinueConversationStatus::AlreadyExists,
+                error: None,
             }))
         }
         ContinueOutcome::ParentNotContextExhausted { state_variant } => {

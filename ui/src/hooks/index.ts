@@ -5,6 +5,10 @@ export {
   useDraftActions,
   useDraftLifecycle,
   DraftLifecycle,
+  seedDraftStorageKey,
+  readSeedDraft,
+  writeSeedDraft,
+  clearSeedDraft,
 } from './useDraft';
 export type { DraftActions } from './useDraft';
 export { FocusScopeProvider, useFocusScope, useFocusScopeCommands, useRegisterFocusScope } from './useFocusScope';

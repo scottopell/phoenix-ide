@@ -35,6 +35,7 @@ vi.mock('../api', async () => {
       getCredentialStatus: vi.fn(() => Promise.resolve('valid')),
       getConversationUsage: vi.fn(() => Promise.resolve({ total_tokens: 0, turns: [] })),
       getConversationSlug: vi.fn(),
+      continueConversation: vi.fn(),
       getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
@@ -721,6 +722,57 @@ describe('owned conversation navigation', () => {
       () => 1,
       'Failed to open work conversation',
     )).resolves.toEqual({ kind: 'found', slug: 'successor-slug' });
+  });
+});
+
+describe('ConversationPage context exhausted handoff', () => {
+  it('dispatch_failed seeds the edited handoff draft and navigates to the continuation', async () => {
+    vi.mocked(api.continueConversation).mockResolvedValue({
+      status: 'dispatch_failed',
+      conversation_id: 'successor-1',
+      slug: 'successor-1',
+      error: 'Dispatch failed upstream',
+    } as never);
+
+    renderPage(makeConversation({
+      state: { type: 'context_exhausted', summary: 'Generated summary' },
+      conv_mode_label: 'Work',
+    }));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit first' }));
+    const handoff = await screen.findByTestId('context-exhausted-handoff');
+    fireEvent.change(handoff, { target: { value: 'Edited handoff for successor' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with edits' }));
+
+    await waitFor(() => expect(api.continueConversation).toHaveBeenCalledWith(
+      conversationId,
+      expect.objectContaining({ handoff: 'Edited handoff for successor', message_id: expect.any(String) }),
+    ));
+    await waitFor(() => expect(localStorage.getItem('seed-draft:successor-1')).toBe('Edited handoff for successor'));
+  });
+
+  it('opens the existing continuation instead of re-seeding the generated summary', async () => {
+    vi.mocked(api.continueConversation).mockResolvedValue({
+      status: 'already_exists',
+      conversation_id: 'successor-2',
+      slug: 'successor-2',
+    } as never);
+
+    renderPage(makeConversation({
+      state: { type: 'context_exhausted', summary: 'Generated summary' },
+      conv_mode_label: 'Work',
+      continued_in_conv_id: 'successor-2',
+    }));
+
+    expect(await screen.findByText('Generated summary')).toBeInTheDocument();
+    expect(screen.queryByTestId('context-exhausted-handoff')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('continuation-link'));
+
+    await waitFor(() => expect(api.continueConversation).toHaveBeenCalledWith(
+      conversationId,
+      expect.objectContaining({ handoff: 'Generated summary', message_id: expect.any(String) }),
+    ));
+    expect(localStorage.getItem('seed-draft:successor-2')).toBeNull();
   });
 });
 
