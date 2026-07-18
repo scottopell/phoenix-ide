@@ -84,9 +84,7 @@ fn github_repo_identity_eq(left: &str, right: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveCheckoutObservation {
-    repository_identity: Option<String>,
     branch_name: String,
-    exact_ref: String,
     remote_status: BranchRemoteStatus,
 }
 
@@ -209,11 +207,8 @@ fn live_checkout_observation_details(
     worktree_path: &FsPath,
     branch_name: String,
     head_oid: &str,
-    repository_identity: Option<String>,
 ) -> LiveCheckoutObservation {
     LiveCheckoutObservation {
-        repository_identity,
-        exact_ref: format!("refs/heads/{branch_name}"),
         remote_status: branch_remote_status(worktree_path, &branch_name, head_oid),
         branch_name,
     }
@@ -222,21 +217,14 @@ fn live_checkout_observation_details(
 fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
     match phoenix_core::git::observe_local_git_head(worktree_path) {
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
-            repository_identity,
             branch_name,
             head_oid,
+            ..
         } => {
-            let live = live_checkout_observation_details(
-                worktree_path,
-                branch_name,
-                &head_oid,
-                Some(repository_identity),
-            );
+            let live = live_checkout_observation_details(worktree_path, branch_name, &head_oid);
             CheckoutStatus::NamedBranch {
-                repository_identity: live.repository_identity,
                 branch_name: live.branch_name,
                 head_oid,
-                exact_ref: live.exact_ref,
                 remote_status: live.remote_status,
             }
         }
@@ -248,19 +236,13 @@ fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStat
             head_oid,
         },
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unborn {
-            repository_identity,
             branch_name,
-        } => CheckoutStatus::Unborn {
-            repository_identity: Some(repository_identity),
-            branch_name,
-        },
+            ..
+        } => CheckoutStatus::Unborn { branch_name },
         phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unavailable {
-            repository_identity,
             error,
-        } => CheckoutStatus::Unavailable {
-            repository_identity,
-            reason: error,
-        },
+            ..
+        } => CheckoutStatus::Unavailable { reason: error },
     }
 }
 
@@ -302,24 +284,6 @@ fn same_checkout(left: &CheckoutStatus, right: &CheckoutStatus) -> bool {
     }
 }
 
-fn checkout_repository_identity(status: &CheckoutStatus) -> Option<&str> {
-    match status {
-        CheckoutStatus::NamedBranch {
-            repository_identity,
-            ..
-        }
-        | CheckoutStatus::Unborn {
-            repository_identity,
-            ..
-        }
-        | CheckoutStatus::Unavailable {
-            repository_identity,
-            ..
-        } => repository_identity.as_deref(),
-        CheckoutStatus::Detached { .. } => None,
-    }
-}
-
 fn capture_with_stable_checkout<T, E>(
     worktree_path: &FsPath,
     mut capture: impl FnMut() -> Result<T, E>,
@@ -335,7 +299,6 @@ fn capture_with_stable_checkout<T, E>(
             return Ok((
                 captured,
                 CheckoutStatus::Unavailable {
-                    repository_identity: checkout_repository_identity(&after).map(str::to_string),
                     reason: "checkout changed while the diff was captured; reload to retry"
                         .to_string(),
                 },
@@ -2702,12 +2665,8 @@ mod tests {
         assert_eq!(
             checkout_status_from_live_observation(clone.path()),
             CheckoutStatus::NamedBranch {
-                repository_identity: Some(
-                    phoenix_core::git::detect_git_repo_root(clone.path()).unwrap(),
-                ),
                 branch_name: "feature".to_string(),
                 head_oid: head_oid.trim().to_string(),
-                exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
                     ahead: 0,
@@ -2740,12 +2699,8 @@ mod tests {
         assert_eq!(
             checkout_status_from_live_observation(clone.path()),
             CheckoutStatus::NamedBranch {
-                repository_identity: Some(
-                    phoenix_core::git::detect_git_repo_root(clone.path()).unwrap(),
-                ),
                 branch_name: "feature/live".to_string(),
                 head_oid: head_oid.trim().to_string(),
-                exact_ref: "refs/heads/feature/live".to_string(),
                 remote_status: BranchRemoteStatus::Tracked {
                     remote_ref: "refs/remotes/fork/feature/live".to_string(),
                     ahead: 1,
@@ -2800,12 +2755,8 @@ mod tests {
         assert_eq!(
             checkout_status_from_live_observation(repo.path()),
             CheckoutStatus::NamedBranch {
-                repository_identity: Some(
-                    phoenix_core::git::detect_git_repo_root(repo.path()).unwrap()
-                ),
                 branch_name: "feature/live".to_string(),
                 head_oid: head_oid.trim().to_string(),
-                exact_ref: "refs/heads/feature/live".to_string(),
                 remote_status: BranchRemoteStatus::NoKnown,
             }
         );
@@ -2826,6 +2777,20 @@ mod tests {
                 pointing_refs: vec!["refs/heads/main".to_string(), "refs/tags/v1".to_string(),],
             }
         );
+    }
+
+    #[test]
+    fn named_branch_status_omits_server_path_and_derived_exact_ref() {
+        let status = CheckoutStatus::NamedBranch {
+            branch_name: "feature".to_string(),
+            head_oid: "abc123".to_string(),
+            remote_status: BranchRemoteStatus::NoKnown,
+        };
+        let json = serde_json::to_value(status).unwrap();
+
+        assert_eq!(json["branch_name"], "feature");
+        assert!(json.get("repository_identity").is_none());
+        assert!(json.get("exact_ref").is_none());
     }
 
     #[test]
@@ -2872,9 +2837,6 @@ mod tests {
         assert_eq!(
             checkout_status_from_live_observation(repo.path()),
             CheckoutStatus::Unborn {
-                repository_identity: Some(
-                    phoenix_core::git::detect_git_repo_root(repo.path()).unwrap()
-                ),
                 branch_name: Some("trunk".to_string()),
             }
         );
@@ -2897,10 +2859,8 @@ mod tests {
             "workspace",
             None,
             CheckoutStatus::NamedBranch {
-                repository_identity: Some("acme/repo".to_string()),
                 branch_name: "feature".to_string(),
                 head_oid: "abc123".to_string(),
-                exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
                     ahead: 0,
@@ -2911,10 +2871,8 @@ mod tests {
         assert_eq!(
             response.checkout_status,
             CheckoutStatus::NamedBranch {
-                repository_identity: Some("acme/repo".to_string()),
                 branch_name: "feature".to_string(),
                 head_oid: "abc123".to_string(),
-                exact_ref: "refs/heads/feature".to_string(),
                 remote_status: BranchRemoteStatus::Matching {
                     remote_ref: "refs/remotes/origin/feature".to_string(),
                     ahead: 0,

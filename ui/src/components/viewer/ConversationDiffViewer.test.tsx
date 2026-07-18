@@ -26,9 +26,7 @@ function payloadFor(marker: string): ConversationDiffResponse {
     checkout_status: {
       kind: 'named_branch',
       branch_name: marker.toLowerCase(),
-      exact_ref: `refs/heads/${marker.toLowerCase()}`,
       head_oid: '1234567890abcdef1234567890abcdef12345678',
-      repository_identity: null,
       remote_status: { kind: 'no_known' },
     },
   };
@@ -147,9 +145,7 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
       checkout_status: {
         kind: 'named_branch',
         branch_name: 'task-82003',
-        exact_ref: 'refs/heads/task-82003',
         head_oid: '1234567890abcdef1234567890abcdef12345678',
-        repository_identity: 'acme/phoenix',
         remote_status: {
           kind: 'tracked',
           remote_ref: 'refs/remotes/origin/task-82003',
@@ -163,7 +159,6 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
 
     const panel = await screen.findByLabelText('Checkout status');
     expect(panel).toHaveTextContent('task-82003');
-    expect(panel).toHaveTextContent('acme/phoenix');
     expect(panel).toHaveTextContent('origin/task-82003');
     expect(panel).toHaveTextContent('Last fetched 4 behind');
   });

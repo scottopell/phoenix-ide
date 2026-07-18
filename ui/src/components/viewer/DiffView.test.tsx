@@ -22,9 +22,7 @@ const COMMITTED = [
 const DEFAULT_CHECKOUT_STATUS: import('../../api').CheckoutStatus = {
   kind: 'named_branch',
   branch_name: 'main',
-  exact_ref: 'refs/heads/main',
   head_oid: '1234567890abcdef1234567890abcdef12345678',
-  repository_identity: null,
   remote_status: { kind: 'no_known' },
 };
 
@@ -593,9 +591,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     renderDiff(COMMITTED, '', {
       kind: 'named_branch',
       branch_name: 'task-82003',
-      exact_ref: 'refs/heads/task-82003',
       head_oid: '1234567890abcdef1234567890abcdef12345678',
-      repository_identity: 'acme/phoenix',
       remote_status: {
         kind: 'tracked',
         remote_ref: 'refs/remotes/origin/task-82003',
@@ -607,7 +603,6 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     const panel = screen.getByLabelText('Checkout status');
     expect(panel).toHaveTextContent(/Branch\s*task-82003/);
     expect(panel).toHaveTextContent('task-82003');
-    expect(panel).toHaveTextContent('acme/phoenix');
     expect(panel).toHaveTextContent('Tracked upstream:');
     expect(panel).toHaveTextContent('origin/task-82003');
     expect(panel).toHaveTextContent('Last fetched 2 to push');
@@ -620,9 +615,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     renderDiff('', '', {
       kind: 'named_branch',
       branch_name: 'main',
-      exact_ref: 'refs/heads/main',
       head_oid: '1234567890abcdef1234567890abcdef12345678',
-      repository_identity: null,
       remote_status: { kind: 'no_known' },
     });
 
@@ -642,9 +635,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
           checkoutStatus={{
             kind: 'named_branch',
             branch_name: 'task-82003',
-            exact_ref: 'refs/heads/task-82003',
             head_oid: '1234567890abcdef1234567890abcdef12345678',
-            repository_identity: null,
             remote_status: {
               kind: 'matching',
               remote_ref: 'refs/remotes/origin/task-82003',
@@ -693,7 +684,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
           commitLog=""
           committedDiff={COMMITTED}
           uncommittedDiff=""
-          checkoutStatus={{ kind: 'unavailable', repository_identity: null, reason: 'git status failed' }}
+          checkoutStatus={{ kind: 'unavailable', reason: 'git status failed' }}
           onClose={() => undefined}
           onSendNotes={() => undefined}
         />

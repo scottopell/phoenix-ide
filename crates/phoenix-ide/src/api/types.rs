@@ -873,10 +873,8 @@ pub enum BranchRemoteStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckoutStatus {
     NamedBranch {
-        repository_identity: Option<String>,
         branch_name: String,
         head_oid: String,
-        exact_ref: String,
         remote_status: BranchRemoteStatus,
     },
     Detached {
@@ -885,12 +883,10 @@ pub enum CheckoutStatus {
         pointing_refs: Vec<String>,
     },
     Unborn {
-        repository_identity: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         branch_name: Option<String>,
     },
     Unavailable {
-        repository_identity: Option<String>,
         reason: String,
     },
 }

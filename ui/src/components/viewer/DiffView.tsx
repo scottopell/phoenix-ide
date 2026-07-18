@@ -429,10 +429,7 @@ function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus: CheckoutStatu
       <div className="checkout-status-panel__header">
         <GitBranch size={16} aria-hidden="true" />
         <span className="checkout-status-panel__eyebrow">Branch</span>
-        <code className="checkout-status-panel__title" title={checkoutStatus.exact_ref}>{checkoutStatus.branch_name}</code>
-        {checkoutStatus.repository_identity && (
-          <span className="checkout-status-panel__repo">{checkoutStatus.repository_identity}</span>
-        )}
+        <code className="checkout-status-panel__title">{checkoutStatus.branch_name}</code>
       </div>
       <p className="checkout-status-panel__detail">{remoteSummary}</p>
     </section>

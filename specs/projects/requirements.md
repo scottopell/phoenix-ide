@@ -1210,8 +1210,6 @@ THE SYSTEM SHALL derive remote relationship data only from local Git refs while 
 AND SHALL NOT fetch or otherwise perform network I/O as part of diff review
 AND SHALL keep the worktree checkout's remote relationship distinct from the base ref used to calculate the workspace diff
 
-**Rationale:** A base comparator explains what changed, but not where the worktree is now. Live checkout identity and last-fetched remote relationship let users see whether work is on a branch, detached, unpublished, behind, or diverged without inventing provenance that Git does not retain or making review unexpectedly access the network.
-
 ---
 
 ## WorkScope Resource Ownership
