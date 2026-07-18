@@ -6275,13 +6275,14 @@ def _stage_systemd_root_handoff(
     return manifest_path
 
 
-def _read_systemd_installed_env() -> dict[str, str]:
+def _read_systemd_installed_env(*, noninteractive: bool = False) -> dict[str, str]:
     import tempfile
 
-    result = subprocess.run(["sudo", "cat", str(PROD_ENV_FILE)], capture_output=True, text=True)
+    sudo = ["sudo", "-n"] if noninteractive else ["sudo"]
+    result = subprocess.run([*sudo, "cat", str(PROD_ENV_FILE)], capture_output=True, text=True)
     if result.returncode != 0:
         missing = subprocess.run(
-            ["sudo", "test", "!", "-e", str(PROD_ENV_FILE)],
+            [*sudo, "test", "!", "-e", str(PROD_ENV_FILE)],
             capture_output=True,
             text=True,
         )
@@ -6352,7 +6353,7 @@ def native_prod_deploy(
     if not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
-    env_snapshot = _read_systemd_installed_env() if controller.enabled else {}
+    env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
     env_file_loaded = str(PROD_ENV_FILE) if controller.enabled else _load_env_file(env_snapshot)
     _preflight_prod_bind_auth(env_snapshot, socket_activated=True)
     service_user = detect_service_user()
@@ -6872,6 +6873,19 @@ def prod_daemon_deploy(
     env_snapshot.setdefault("PHOENIX_LOG_STDOUT", "false")
     _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
     transaction_id = controller.transaction_id or uuid.uuid4().hex
+
+    if controller.enabled:
+        layout["status"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        _write_json_atomic(layout["status"], {
+            "transaction_id": transaction_id,
+            "state": "preparing",
+            "source_kind": "published_release",
+            "release_tag": release,
+            "source_commit": controller.expected_full_commit,
+            "created_at": now,
+            "updated_at": now,
+        })
 
     with tempfile.TemporaryDirectory(prefix=f"phoenix-bare-{transaction_id}-") as td:
         staging = Path(td)
@@ -7845,7 +7859,9 @@ def _launchd_candidate_env(controller: "ProdDeployControllerOptions | None" = No
     env: dict[str, str] = {}
     if controller is not None and controller.enabled:
         try:
-            return _launchd_env_from_plist(LAUNCHD_PLIST_PATH), None
+            installed = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
+            installed.pop("PHOENIX_VERSION", None)
+            return installed, None
         except (OSError, plistlib.InvalidFileException, ValueError) as exc:
             raise SystemExit(
                 f"installed launchd configuration is unreadable: {type(exc).__name__}"
