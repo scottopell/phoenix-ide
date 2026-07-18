@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -19,44 +20,44 @@ pub const TERMINAL_CODEC_FAMILY: &str = "wake.terminal";
 pub const REGISTRATION_BARRIER_ID: BarrierId = BarrierId(1);
 pub const REGISTRATION_EFFECT_ID: EffectId = EffectId(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WorkScopeKind {
     Conversation,
     Worktree,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkScopeIdentity {
     pub kind: WorkScopeKind,
     pub stable_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BashResourceIdentity {
     pub work_scope: WorkScopeIdentity,
     pub handle_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TmuxResourceIdentity {
     pub work_scope: WorkScopeIdentity,
     pub server_generation: String,
     pub window_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SubagentResourceIdentity {
     pub child_conversation_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WakeResourceIdentity {
     Bash(BashResourceIdentity),
     TmuxWindow(TmuxResourceIdentity),
     Subagent(SubagentResourceIdentity),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeRegistrationIntent {
     pub contract_id: String,
     pub conversation_id: String,
@@ -67,14 +68,14 @@ pub struct WakeRegistrationIntent {
     pub expires_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveHandleIntent {
     pub contract_id: String,
     pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeRegistrationReceipt {
     pub contract_id: String,
     pub resource: WakeResourceIdentity,
@@ -82,20 +83,20 @@ pub struct WakeRegistrationReceipt {
     pub registering_tool_use_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BashTerminalStatus {
     Exited,
     Killed,
     KillPendingKernel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TmuxTerminalStatus {
     ExitMarkerObserved,
     WindowKilled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BashTerminalEvidence {
     pub identity: BashResourceIdentity,
     pub status: BashTerminalStatus,
@@ -107,7 +108,7 @@ pub struct BashTerminalEvidence {
     pub final_tail: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxTerminalEvidence {
     pub identity: TmuxResourceIdentity,
     pub status: TmuxTerminalStatus,
@@ -117,7 +118,7 @@ pub struct TmuxTerminalEvidence {
     pub final_tail: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedChildTerminalRecord(String);
 
 impl PersistedChildTerminalRecord {
@@ -128,7 +129,7 @@ impl PersistedChildTerminalRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubagentTerminalOutcome {
     SubmitResult { result: String },
     SubmitError { kind: String, error: String },
@@ -140,7 +141,7 @@ pub enum SubagentTerminalOutcome {
     TurnLimitHardStop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentTerminalEvidence {
     pub identity: SubagentResourceIdentity,
     pub occurred_at: Timestamp,
@@ -148,19 +149,19 @@ pub struct SubagentTerminalEvidence {
     pub outcome: SubagentTerminalOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeTerminalEvidence {
     Bash(BashTerminalEvidence),
     TmuxWindow(TmuxTerminalEvidence),
     Subagent(SubagentTerminalEvidence),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeCancellationReason {
     ExplicitCancel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeForgottenReason {
     PhoenixRestart,
     CascadeDestroyedHandle,
@@ -168,7 +169,7 @@ pub enum WakeForgottenReason {
     TmuxHandleMissing,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeTerminalPayload {
     Fired {
         contract_id: String,
@@ -195,19 +196,19 @@ pub enum WakeTerminalPayload {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeBarrierEvent {
     RegistrationObserved { receipt: WakeRegistrationReceipt },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeAvailability {
     Idle,
     Pending,
     TerminalDelivered,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeRegistrationSnapshot {
     pub contract_id: String,
     pub resource: WakeResourceIdentity,
@@ -216,7 +217,7 @@ pub struct WakeRegistrationSnapshot {
     pub runtime_availability: RuntimeAvailability,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeRegistrationEvent {
     Registered,
     TerminalProjected { terminal: Box<WakeTerminalPayload> },
@@ -225,7 +226,7 @@ pub enum WakeRegistrationEvent {
     CancelRequested,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeManualPayload {
     pub note: String,
 }
@@ -302,7 +303,7 @@ impl WorkflowProfile for WakeProfile {
 #[must_use]
 pub fn profile() -> ProfileRef {
     ProfileRef {
-        profile_kind: PROFILE_ID,
+        profile_kind: PROFILE_ID.to_string(),
         profile_version: PROTOCOL_VERSION,
     }
 }

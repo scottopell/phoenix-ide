@@ -169,14 +169,14 @@ impl WorkflowProfile for TestProfile {
 
 fn profile() -> ProfileRef {
     ProfileRef {
-        profile_kind: "test",
+        profile_kind: "test".to_string(),
         profile_version: 1,
     }
 }
 
 fn profile_v2() -> ProfileRef {
     ProfileRef {
-        profile_kind: "test-v2",
+        profile_kind: "test-v2".to_string(),
         profile_version: 2,
     }
 }

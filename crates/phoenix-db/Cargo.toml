@@ -46,6 +46,7 @@ tracing = "0.1"
 
 # Async trait objects for the MessageRetriever seam (Arc<dyn MessageRetriever>).
 async-trait = "0.1"
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
@@ -56,7 +57,7 @@ async-trait = "0.1"
 phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
 
 # `#[tokio::test]` runtime for the async persistence tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
 
 [lints]

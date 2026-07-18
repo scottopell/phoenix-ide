@@ -19,6 +19,11 @@ use phoenix_workflow::{
 use sqlx::{error::DatabaseError, Row, SqlitePool};
 use std::collections::BTreeSet;
 
+pub mod wake;
+
+use phoenix_workflow::wake_profile;
+use sqlx::{Sqlite, Transaction};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowHead {
     pub binding: WorkflowBinding,
@@ -383,6 +388,12 @@ pub struct WorkflowRepository {
     pool: SqlitePool,
 }
 
+impl WorkflowRepository {
+    pub(crate) async fn begin_tx(&self) -> DbResult<WorkflowTx<'_>> {
+        Ok(WorkflowTx::new(self.pool.begin().await?))
+    }
+}
+
 fn external_binding_from_input(
     input: &CreateWorkflowWithExternalAcceptance,
 ) -> ExternalAcceptanceBinding<Vec<u8>> {
@@ -400,6 +411,69 @@ fn external_binding_from_input(
             workflow_id: input.workflow_id,
             handle: input.disposition_handle.clone(),
         },
+    }
+}
+
+type SqliteTx<'a> = Transaction<'a, Sqlite>;
+
+pub(crate) struct WorkflowTx<'a> {
+    tx: SqliteTx<'a>,
+}
+
+impl<'a> WorkflowTx<'a> {
+    fn new(tx: SqliteTx<'a>) -> Self {
+        Self { tx }
+    }
+
+    async fn commit(self) -> DbResult<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+
+    async fn rollback(self) -> DbResult<()> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_external_acceptance_binding(
+        &mut self,
+        input: &CreateWorkflowWithExternalAcceptance,
+    ) -> DbResult<Option<ExternalAcceptanceBinding<Vec<u8>>>> {
+        let existing = sqlx::query(
+            "SELECT workflow_id, intent_fingerprint, receipt_handle, disposition_handle
+             FROM workflow_external_acceptance_bindings
+             WHERE profile_kind = ?1 AND profile_version = ?2 AND target_scope = ?3 AND idempotency_key = ?4",
+        )
+        .bind(&input.profile.profile_kind)
+        .bind(i64::from(input.profile.profile_version))
+        .bind(input.target_scope.as_str())
+        .bind(input.idempotency_key.as_str())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        existing
+            .map(|row| replay_binding_from_row(input, &row))
+            .transpose()
+    }
+
+    pub(crate) async fn insert_workflow(
+        &mut self,
+        input: &CreateWorkflowWithExternalAcceptance,
+    ) -> DbResult<()> {
+        insert_workflow_tx(&mut self.tx, input).await
+    }
+
+    pub(crate) async fn insert_external_acceptance_binding(
+        &mut self,
+        input: &CreateWorkflowWithExternalAcceptance,
+    ) -> DbResult<()> {
+        insert_external_acceptance_binding_tx(&mut self.tx, input).await
+    }
+
+    pub(crate) async fn commit_transition_plan(
+        &mut self,
+        input: &CommitTransitionPlanCas,
+    ) -> DbResult<CommitOutcome> {
+        WorkflowRepository::commit_transition_plan_tx(&mut self.tx, input).await
     }
 }
 
@@ -439,7 +513,7 @@ async fn insert_workflow_tx(
          ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'Active', ?6, ?7, ?8, ?9, ?9)",
     )
     .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-    .bind(input.profile.profile_kind)
+    .bind(&input.profile.profile_kind)
     .bind(i64::from(input.profile.profile_version))
     .bind(input.acceptance.runtime_acceptance_enabled())
     .bind(input.acceptance.external_acceptance_enabled())
@@ -475,7 +549,7 @@ async fn insert_external_acceptance_binding_tx(
             disposition_handle, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
-    .bind(input.profile.profile_kind)
+    .bind(&input.profile.profile_kind)
     .bind(i64::from(input.profile.profile_version))
     .bind(input.target_scope.as_str())
     .bind(input.idempotency_key.as_str())
@@ -522,21 +596,8 @@ impl WorkflowRepository {
         &self,
         input: &CreateWorkflowWithExternalAcceptance,
     ) -> DbResult<ExternalAcceptanceOutcome<Vec<u8>>> {
-        let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query(
-            "SELECT workflow_id, intent_fingerprint, receipt_handle, disposition_handle
-             FROM workflow_external_acceptance_bindings
-             WHERE profile_kind = ?1 AND profile_version = ?2 AND target_scope = ?3 AND idempotency_key = ?4",
-        )
-        .bind(input.profile.profile_kind)
-        .bind(i64::from(input.profile.profile_version))
-        .bind(input.target_scope.as_str())
-        .bind(input.idempotency_key.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(row) = existing {
-            let replay = replay_binding_from_row(input, &row)?;
+        let mut tx = self.begin_tx().await?;
+        if let Some(replay) = tx.fetch_external_acceptance_binding(input).await? {
             tx.commit().await?;
             return Ok(
                 if replay.intent_fingerprint == input.intent_fingerprint
@@ -551,8 +612,8 @@ impl WorkflowRepository {
             );
         }
 
-        insert_workflow_tx(&mut tx, input).await?;
-        insert_external_acceptance_binding_tx(&mut tx, input).await?;
+        tx.insert_workflow(input).await?;
+        tx.insert_external_acceptance_binding(input).await?;
         tx.commit().await?;
         Ok(ExternalAcceptanceOutcome::Created(
             external_binding_from_input(input),
@@ -617,24 +678,20 @@ impl WorkflowRepository {
         Ok(CommitOutcome::Committed)
     }
 
-    /// # Errors
-    ///
-    /// Returns an error when the CAS transaction or any child insert fails.
-    pub async fn commit_transition_plan(
-        &self,
+    async fn commit_transition_plan_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         input: &CommitTransitionPlanCas,
     ) -> DbResult<CommitOutcome> {
-        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflows
-             SET version = version + 1,
-                 generation = ?3,
-                 status = ?4,
-                 snapshot_codec_family = ?5,
-                 snapshot_codec_version = ?6,
-                 snapshot_payload = ?7,
-                 updated_at = ?8
-             WHERE workflow_id = ?1 AND version = ?2",
+         SET version = version + 1,
+             generation = ?3,
+             status = ?4,
+             snapshot_codec_family = ?5,
+             snapshot_codec_version = ?6,
+             snapshot_payload = ?7,
+             updated_at = ?8
+         WHERE workflow_id = ?1 AND version = ?2",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.expected_version.0, "expected_version")?)
@@ -644,18 +701,17 @@ impl WorkflowRepository {
         .bind(i64::from(input.next_snapshot_codec.version))
         .bind(&input.next_snapshot_payload)
         .bind(to_i64(input.committed_at.0, "committed_at")?)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if updated == 0 {
-            tx.rollback().await?;
             return Ok(CommitOutcome::VersionConflict);
         }
         sqlx::query(
             "INSERT INTO workflow_transitions (
-                workflow_id, transition_id, from_version, to_version, generation,
-                event_codec_family, event_codec_version, event_payload, committed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            workflow_id, transition_id, from_version, to_version, generation,
+            event_codec_family, event_codec_version, event_payload, committed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.transition_id.0, "transition_id")?)
@@ -666,17 +722,17 @@ impl WorkflowRepository {
         .bind(i64::from(input.event_codec.version))
         .bind(&input.event_payload)
         .bind(to_i64(input.committed_at.0, "committed_at")?)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         for effect in &input.effects {
             let (capability_kind, stable_command_id) = capability_to_parts(&effect.capability);
             sqlx::query(
                 "INSERT INTO workflow_effects (
-                    workflow_id, effect_id, declared_workflow_version, family, kind,
-                    intent_codec_family, intent_codec_version, intent_payload, generation,
-                    role, capability_kind, stable_command_id, next_eligible_at,
-                    destructive_resource, status, pending_reconciliation
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
+                workflow_id, effect_id, declared_workflow_version, family, kind,
+                intent_codec_family, intent_codec_version, intent_payload, generation,
+                role, capability_kind, stable_command_id, next_eligible_at,
+                destructive_resource, status, pending_reconciliation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
             )
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(effect.effect_id.0, "effect_id")?)
@@ -700,26 +756,26 @@ impl WorkflowRepository {
             )
             .bind(&effect.destructive_resource)
             .bind(effect_status_to_str(effect.status))
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         for dep in &input.dependencies {
             sqlx::query(
-                "INSERT INTO workflow_effect_dependencies (workflow_id, effect_id, depends_on_effect_id)
-                 VALUES (?1, ?2, ?3)",
-            )
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(dep.effect_id.0, "effect_id")?)
-            .bind(to_i64(dep.depends_on_effect_id.0, "depends_on_effect_id")?)
-            .execute(&mut *tx)
-            .await?;
+            "INSERT INTO workflow_effect_dependencies (workflow_id, effect_id, depends_on_effect_id)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(dep.effect_id.0, "effect_id")?)
+        .bind(to_i64(dep.depends_on_effect_id.0, "depends_on_effect_id")?)
+        .execute(&mut **tx)
+        .await?;
         }
         for barrier in &input.barriers {
             sqlx::query(
                 "INSERT INTO workflow_barriers (
-                    workflow_id, barrier_id, status, reducer_event_codec_family,
-                    reducer_event_codec_version, reducer_event_payload
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                workflow_id, barrier_id, status, reducer_event_codec_family,
+                reducer_event_codec_version, reducer_event_payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(barrier.barrier_id.0, "barrier_id")?)
@@ -727,29 +783,29 @@ impl WorkflowRepository {
             .bind(&barrier.reducer_event_codec.family)
             .bind(i64::from(barrier.reducer_event_codec.version))
             .bind(&barrier.reducer_event_payload)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         for member in &input.barrier_members {
             sqlx::query(
-                "INSERT INTO workflow_barrier_members (workflow_id, barrier_id, effect_id, receipt_family)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(member.barrier_id.0, "barrier_id")?)
-            .bind(to_i64(member.effect_id.0, "effect_id")?)
-            .bind(receipt_family_to_str(member.receipt_family))
-            .execute(&mut *tx)
-            .await?;
+            "INSERT INTO workflow_barrier_members (workflow_id, barrier_id, effect_id, receipt_family)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(member.barrier_id.0, "barrier_id")?)
+        .bind(to_i64(member.effect_id.0, "effect_id")?)
+        .bind(receipt_family_to_str(member.receipt_family))
+        .execute(&mut **tx)
+        .await?;
         }
         for delivery in &input.deliveries {
             sqlx::query(
                 "INSERT INTO workflow_deliveries (
-                    workflow_id, delivery_id, effect_id, barrier_id, consumer_kind,
-                    event_codec_family, event_codec_version, payload_kind, payload_blob,
-                    requires_runtime_acceptance, status, runtime_acceptance_status,
-                    suppression_reason, accepted_by_transition_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'Pending', ?11, NULL, NULL)",
+                workflow_id, delivery_id, effect_id, barrier_id, consumer_kind,
+                event_codec_family, event_codec_version, payload_kind, payload_blob,
+                requires_runtime_acceptance, status, runtime_acceptance_status,
+                suppression_reason, accepted_by_transition_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'Pending', ?11, NULL, NULL)",
             )
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(delivery.delivery_id.0, "delivery_id")?)
@@ -766,16 +822,16 @@ impl WorkflowRepository {
                     .runtime_acceptance_status
                     .map(runtime_acceptance_status_to_str),
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         for schedule in &input.schedules {
             sqlx::query(
                 "INSERT INTO workflow_schedules (
-                    workflow_id, schedule_id, policy, schedule_key, status, next_eligible_at,
-                    active_effect_id, due_occurrence_id, due_generation, due_at,
-                    active_occurrence_id, active_generation, active_due_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                workflow_id, schedule_id, policy, schedule_key, status, next_eligible_at,
+                active_effect_id, due_occurrence_id, due_generation, due_at,
+                active_occurrence_id, active_generation, active_due_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(schedule.schedule_id.0, "schedule_id")?)
@@ -818,11 +874,27 @@ impl WorkflowRepository {
                     .active_occurrence
                     .and_then(|o| i64::try_from(o.due_at.0).ok()),
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-        tx.commit().await?;
         Ok(CommitOutcome::Committed)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the CAS transaction or any child insert fails.
+    pub async fn commit_transition_plan(
+        &self,
+        input: &CommitTransitionPlanCas,
+    ) -> DbResult<CommitOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let outcome = Self::commit_transition_plan_tx(&mut tx, input).await?;
+        if outcome == CommitOutcome::Committed {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(outcome)
     }
 
     pub async fn begin_attempt(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
@@ -861,10 +933,15 @@ impl WorkflowRepository {
                 attempt: None,
             });
         };
-        if parse_effect_status(&effect.get::<String, _>("status"))? != EffectStatus::Eligible {
+        let effect_status = parse_effect_status(&effect.get::<String, _>("status"))?;
+        if effect_status != EffectStatus::Eligible {
             tx.rollback().await?;
             return Ok(BeginAttemptResult {
-                outcome: ClaimOutcome::Ineligible,
+                outcome: if effect_status == EffectStatus::Executing {
+                    ClaimOutcome::AuthorityConflict
+                } else {
+                    ClaimOutcome::Ineligible
+                },
                 authority: None,
                 attempt: None,
             });
@@ -1936,7 +2013,7 @@ impl WorkflowRepository {
         })?;
         let profile_kind: String = row.get("profile_kind");
         let profile = ProfileRef {
-            profile_kind: Box::leak(profile_kind.into_boxed_str()),
+            profile_kind,
             profile_version: to_u32(row.get::<i64, _>("profile_version"), "profile_version")?,
         };
         let acceptance = ErasedAcceptanceProfile::from_parts(
@@ -2293,7 +2370,7 @@ mod tests {
 
     fn profile() -> ProfileRef {
         ProfileRef {
-            profile_kind: "test",
+            profile_kind: "test".to_string(),
             profile_version: 1,
         }
     }

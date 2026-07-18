@@ -246,7 +246,49 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_workflow_foundation_tables",
         sql: MIGRATION_046,
     },
+    Migration {
+        version: 47,
+        name: "create_wake_bindings",
+        sql: MIGRATION_047,
+    },
 ];
+
+const MIGRATION_047: &str = r"
+CREATE TABLE wake_bindings (
+    workflow_id INTEGER PRIMARY KEY REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL CHECK (contract_id <> ''),
+    profile_kind TEXT NOT NULL CHECK (profile_kind = 'wake'),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('Conversation', 'Worktree')),
+    scope_stable_key TEXT NOT NULL CHECK (scope_stable_key <> ''),
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
+    bash_handle_id TEXT,
+    tmux_server_generation TEXT,
+    tmux_window_id TEXT,
+    registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
+    expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+    prepared_fingerprint TEXT NOT NULL CHECK (prepared_fingerprint <> ''),
+    observe_effect_id INTEGER NOT NULL CHECK (observe_effect_id >= 1),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    FOREIGN KEY (workflow_id, observe_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_generation IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_generation IS NOT NULL OR tmux_window_id IS NOT NULL)))
+) STRICT;
+
+CREATE UNIQUE INDEX wake_bindings_contract_identity
+ON wake_bindings(
+    profile_kind, profile_version, conversation_id, contract_id, resource_kind,
+    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_generation, ''), COALESCE(tmux_window_id, '')
+);
+CREATE UNIQUE INDEX wake_bindings_resource_identity
+ON wake_bindings(
+    profile_kind, profile_version, conversation_id, resource_kind,
+    COALESCE(bash_handle_id, ''), COALESCE(tmux_server_generation, ''), COALESCE(tmux_window_id, '')
+);
+CREATE INDEX wake_bindings_by_conversation ON wake_bindings(conversation_id);
+";
 
 const MIGRATION_046: &str = r"
 CREATE TABLE workflows (
@@ -1865,7 +1907,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != 45)
+        {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
                 .bind(migration.name)
