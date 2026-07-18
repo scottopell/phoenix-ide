@@ -48,10 +48,16 @@ _CONTROL_SEQ_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|[\x0e\x0f]")
 def _node_env() -> dict:
     """Return an env dict with the correct Node.js binary prepended to PATH.
 
-    Reads the `.node-version` file at the repo root, then searches
-    `~/.local/share/node`, `~/node`, and `/usr/local` for a matching
-    venv-style installation.  Falls back to the ambient PATH if no match
-    is found (safe: the check will simply use whatever `node` is on PATH).
+    Reads the `.node-version` file at the repo root, then prefers the
+    already-active Node/Corepack pair on PATH (for Volta/nvm/asdf shells),
+    followed by common managed installs. Falls back to the ambient PATH if no
+    explicit match is found (safe: the check will simply use whatever `node` is
+    on PATH, and the Corepack check will report a clear error if needed).
+
+    Prefer PATH/Volta before `/usr/local`: old system Node installs often carry
+    stale Corepack shims, and prepending `/usr/local/bin` can accidentally hide a
+    newer version-manager Corepack. A candidate is only accepted early when its
+    Corepack also satisfies the project minimum.
     """
     env = os.environ.copy()
     node_version_file = ROOT / ".node-version"
@@ -59,25 +65,64 @@ def _node_env() -> dict:
         return env
     requested = node_version_file.read_text().strip()  # e.g. "22" or "22.14"
     major = requested.split(".")[0]
+
+    def node_matches(node_bin: Path) -> bool:
+        try:
+            import subprocess as _sp
+            ver_out = _sp.check_output([str(node_bin), "--version"],
+                                       text=True).strip()  # e.g. "v24.1.0"
+            found_major = ver_out.lstrip("v").split(".")[0]
+            # Accept the candidate if it meets or exceeds the requested major
+            return int(found_major) >= int(major)
+        except Exception:
+            return False
+
+    def corepack_matches(path: str) -> bool:
+        """Return true when PATH resolves to a Corepack new enough for pnpm 11."""
+        try:
+            import subprocess as _sp
+            import re as _re
+            out = _sp.check_output(["corepack", "--version"], env={**env, "PATH": path},
+                                   text=True).strip()
+            match = _re.search(r"(\d+)\.(\d+)", out)
+            if not match:
+                return False
+            return (int(match.group(1)), int(match.group(2))) >= (0, 30)
+        except Exception:
+            return False
+
+    import shutil as _shutil
+    first_node_match_path: str | None = None
+
+    ambient_path = env.get("PATH", "")
+    ambient_node = _shutil.which("node", path=ambient_path)
+    if ambient_node and node_matches(Path(ambient_node)):
+        if corepack_matches(ambient_path):
+            return env
+        first_node_match_path = ambient_path
+
     candidates = [
+        Path.home() / ".volta",
         Path.home() / "node",
         Path.home() / ".local" / "share" / "node",
         Path("/usr/local"),
     ]
     for base in candidates:
         node_bin = base / "bin" / "node"
-        if node_bin.exists():
-            try:
-                import subprocess as _sp
-                ver_out = _sp.check_output([str(node_bin), "--version"],
-                                           text=True).strip()  # e.g. "v24.1.0"
-                found_major = ver_out.lstrip("v").split(".")[0]
-                # Accept the candidate if it meets or exceeds the requested major
-                if int(found_major) >= int(major):
-                    env["PATH"] = str(base / "bin") + ":" + env.get("PATH", "")
-                    return env
-            except Exception:
-                continue
+        candidate_path = str(base / "bin") + ":" + env.get("PATH", "")
+        if not node_matches(node_bin):
+            continue
+        if first_node_match_path is None:
+            first_node_match_path = candidate_path
+        if corepack_matches(candidate_path):
+            env["PATH"] = candidate_path
+            return env
+
+    # Prefer a Node-version-compatible PATH even if Corepack is stale/missing.
+    # ensure_corepack_pnpm() will then fail with its explicit Corepack upgrade
+    # guidance instead of letting UI commands run under an under-version Node.
+    if first_node_match_path is not None:
+        env["PATH"] = first_node_match_path
     return env
 
 
