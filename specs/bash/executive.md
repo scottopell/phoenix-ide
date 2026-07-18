@@ -16,9 +16,12 @@ response returns a **handle** (`status: "still_running"`) and the process keeps
 running. The handle supports `peek` (current ring buffer state),
 `wait` (block again for the existing process), and `kill` (signal exactly
 once, no auto-escalation; a `kill_pending_kernel` response covers the
-D-state-hang case). On process exit, the live ring is demoted to a compact
-in-memory tombstone retained until the conversation is hard-deleted or the
-Phoenix process exits.
+D-state-hang case). The same bounded ring-buffer facts are also projected as a
+conversation-scoped, typed ephemeral live-output feed keyed by `tool_use_id`, so
+inline conversation cards can show running bash identity, status, duration, and
+a bounded tail before the terminal tool result lands. On process exit, the live
+ring is demoted to a compact in-memory tombstone retained until the
+conversation is hard-deleted or the Phoenix process exits.
 
 A per-WorkScope cap of 8 live handles is enforced with an explicit
 `handle_cap_reached` error listing existing handles — no silent eviction.
@@ -44,12 +47,17 @@ store, no cross-restart persistence (the agent uses `tmux` for that).
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
-the ring under a mutex. The waiter task observes process exit, swaps the
-handle's `RwLock<Arc<HandleState>>` from `Live` to `Tombstoned` (preserving
-the last 2000 lines as `final_tail` and recording `FinalCause` —
-distinguishing `Exited`, `Killed` (Phoenix-initiated), `Signaled` (external
-signal), and `KillPendingKernel`). A `tokio::sync::watch::channel` carries
-the exit signal so in-flight wait calls observe the transition.
+the ring under a mutex. That same bounded state is reusable as an ephemeral UI
+projection during a blocking `run` or `wait`: the conversation layer keys live
+bash progress by `tool_use_id`, replays it through the normal total-order SSE
+machinery, and clears it atomically when the terminal tool result is applied so
+incremental output never becomes a second durable transcript representation. The
+waiter task observes process exit, swaps the handle's `RwLock<Arc<HandleState>>`
+from `Live` to `Tombstoned` (preserving the last 2000 lines as `final_tail` and
+recording `FinalCause` — distinguishing `Exited`, `Killed` (Phoenix-initiated),
+`Signaled` (external signal), and `KillPendingKernel`). A
+`tokio::sync::watch::channel` carries the exit signal so in-flight wait calls
+observe the transition.
 
 Spawn races the wait window against the exit signal in a `tokio::select!`;
 peek is a snapshot read of the current state; wait blocks the same way as
@@ -84,7 +92,7 @@ entirely.
 | **REQ-BASH-001:** Command Execution | 🔄 Rewrite | Spawn flow ports forward; capture goes to ring buffer instead of single string |
 | **REQ-BASH-002:** Wait Semantics | ❌ New | Replaces kill-on-timeout with `wait_seconds` + `still_running` handle; explicit-negation tool description |
 | **REQ-BASH-003:** Handle Operations | ❌ New | `peek` / `wait` / `kill` with handle ids; no auto-escalation; `kill_pending_kernel` for D-state |
-| **REQ-BASH-004:** Ring Buffer + Read Semantics | ❌ New | Bytes-bounded ring, per-line offsets, caller-controlled read window |
+| **REQ-BASH-004:** Ring Buffer + Read Semantics | 🔄 Rewrite | Bytes-bounded ring, per-line offsets, caller-controlled read window, plus typed ephemeral live-output projection for conversation cards with terminal handoff back to the normal tool result |
 | **REQ-BASH-005:** Live Handle Cap | ❌ New | Hard refusal with structured live-handles list |
 | **REQ-BASH-006:** Tombstones and Process Exit | ❌ New | Demote-on-exit, in-memory only, retained until conv hard-delete or Phoenix exit |
 | **REQ-BASH-007:** Child Process Reaper | ❌ New | `PR_SET_CHILD_SUBREAPER` at startup + SIGKILL kill-tree at shutdown |
@@ -100,7 +108,7 @@ entirely.
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
 | **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ❌ New | Registry keyed by `WorkScope`, not conversation id; handles survive the continuation boundary; symmetric with tmux/browser/terminal |
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
-| **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill |
+| **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 
 The branch-observation slice is implemented: bash-handle terminal completion reconciles
 WorkScope-scoped local Git state into durable observed-branch and PR-association facts, then

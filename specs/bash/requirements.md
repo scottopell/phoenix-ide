@@ -259,6 +259,19 @@ AND otherwise set it to `false`
 EVERY peek/wait/run response SHALL include `start_offset`, `end_offset`, and
 `truncated_before` for the lines returned
 
+WHEN bash is the active in-flight tool operation for a conversation turn
+THE SYSTEM SHALL make a typed, ephemeral projection of the same bounded ring-buffer state available to the conversation UI, keyed by the active `tool_use_id`
+AND SHALL include enough information for the UI to render the current operation identity, lifecycle status, elapsed time or final duration when known, complete lines, the trailing partial line when present, and whether the bounded tail truncated older output
+
+THE SYSTEM SHALL keep that live-output projection bounded and replay-safe
+AND SHALL reject stale or out-of-order updates by the same total-order sequencing rules that govern other conversation SSE events
+AND SHALL clear the ephemeral projection atomically when the authoritative terminal tool result for that `tool_use_id` is applied, or when the active turn is abandoned
+
+THE SYSTEM SHALL NOT persist incremental bash progress into durable conversation message JSON
+AND SHALL treat the live bash ring buffer as the authoritative source while the process is live, with the normal persisted tool result becoming authoritative after terminal handoff
+
+**Rationale:** The ring buffer already exists for handle inspection; the conversation transcript needs the same live facts during the blocking window of a `run` or `wait` call so inline tool cards are not forced to guess or wait for terminal completion. Making the projection typed, bounded, ordered, and ephemeral preserves one durable source of truth per phase rather than inventing a second persisted copy of incremental output.
+
 **Rationale:** Caller-controlled offsets keep the server stateless on read
 cursors — a dropped network response, a re-asking agent, or a UI peeker do not
 race each other. `truncated_before` makes information loss explicit rather than
@@ -912,8 +925,15 @@ THE SYSTEM SHALL show the operation kind and handle ID (e.g., `peek b-7`,
 `kill b-7 (TERM)`) rather than attempting to display a fictitious command
 string
 
+WHEN bash output is summarized in a compact conversation card
+THE SYSTEM SHALL preserve the operation identity (`cmd`/`display` for `run`, handle-oriented identity for `peek`/`wait`/`kill`), lifecycle status, and elapsed or final duration together with a bounded output tail
+AND SHALL indicate when the rendered tail is truncated relative to the full bounded live or final output available elsewhere in the UI
+
 **Rationale:** Unchanged for run calls. Extended for the new handle
-operations so the UI has a sensible display for non-run calls.
+operations so the UI has a sensible display for non-run calls, and for compact
+conversation rendering so density does not erase the command identity or reduce
+bash to a generic completion badge when richer structured status and output are
+already available.
 
 ---
 
