@@ -1,0 +1,27 @@
+
+.wake-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 28px;
+  padding: 0 0.75rem;
+  color: var(--color-warning-text, #d6a84b);
+  background: var(--color-warning-subtle, rgb(214 168 75 / 10%));
+  border-top: 1px solid rgb(214 168 75 / 25%);
+  font-size: 0.75rem;
+  overflow-x: auto;
+}
+
+.wake-cancel-button {
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentcolor;
+  border-radius: 3px;
+  padding: 1px 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.wake-cancel-button:hover {
+  background: rgb(214 168 75 / 15%);
+}
