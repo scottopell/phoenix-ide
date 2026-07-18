@@ -105,7 +105,7 @@ SHALL be hidden only while the Work Actions rail can represent and owns that sel
 ### REQ-WAB-003: Single Primary Across the Entire Bar
 
 THE SYSTEM SHALL render exactly one button as the glowing primary at any time across the action
-surface — or, in the continuation case, no primary at all.
+surface — or, in the predecessor case, no primary at all.
 
 WHEN `WorkDisposition` produces a RESOLVE verb (idle phase only), that verb is the primary.
 WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-forward action
@@ -129,8 +129,10 @@ available only among supporting context actions.
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
 presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
 Abandon / none), so two glowing buttons are structurally unrepresentable rather than forbidden
-by a runtime check. The secondary link is a separate, non-primary slot — present-or-absent,
-never glowing — so it cannot collapse into a second primary.
+by a runtime check. When the conversation is only a predecessor pointing at a successor, the
+honest answer is that no action belongs here, so the primary is structurally `none`. The
+secondary link is a separate, non-primary slot — present-or-absent, never glowing — so it
+cannot collapse into a second primary.
 
 ---
 
@@ -287,15 +289,17 @@ merge" control, and not a two-step enable-then-confirm toggle.
 
 ---
 
-### REQ-WAB-009: Continuation Mute
+### REQ-WAB-009: Successor-Owned Work Mute
 
 WHEN the conversation's `continued_in_conv_id` is set
 THE SYSTEM SHALL render the bar with no RESOLVE or FINISH verbs and no primary
-AND SHALL show a muted inline note: "Continued — actions belong on the continuation."
+AND SHALL show a muted inline note: "Continued — actions belong on the successor."
 
-The continuation is the live conversation; any terminal decision belongs there. bedrock
-REQ-BED-031 also forbids terminal actions on a context-exhausted parent that has a
-continuation, so the suppressed bar matches the server-side legality gate.
+A conversation with `continued_in_conv_id` is a read-only predecessor: its live work belongs to
+that successor whether the link came from context continuation or from approving a task into a
+fresh Work conversation. Any terminal or push-forward decision belongs on the successor. Bedrock
+REQ-BED-031 forbids terminal actions on a predecessor that already handed work to a successor, so
+the suppressed bar matches the server-side legality gate.
 
 ---
 

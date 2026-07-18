@@ -598,6 +598,16 @@ THE HandedOff state SHALL carry `successor_conv_id` and reject further user mess
   it represents a read-only predecessor whose live work belongs to the successor
   linked by `continued_in_conv_id`.
 
+THE task-approval surface SHALL present the two approval outcomes as distinct user
+choices:
+- continue in the current conversation
+- start a fresh Work conversation
+
+These choices are semantic handoff policies, not alternate labels for the same
+transition. The first keeps execution in the current conversation after the approval
+commit; the second creates a Work successor, links the predecessor through
+`continued_in_conv_id`, and makes the predecessor read-only as `HandedOff`.
+
 WHEN the user approves the task while in AwaitingTaskApproval with the
 `continue_in_current_conversation` handoff policy
 THE SYSTEM SHALL rename the worktree's temp branch in place to `task-{NNNN}-{slug}`
@@ -692,9 +702,10 @@ THE SYSTEM SHALL transfer worktree ownership atomically in a single database tra
   - the worktree registry's owner pointer moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
-WHEN a parent conversation already has a continuation
-THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation
-AND NOT permit creation of a second continuation from the same parent
+WHEN a predecessor conversation already has a continuation successor linked by
+`continued_in_conv_id`
+THE SYSTEM SHALL present continuation as navigation to that existing successor
+AND SHALL NOT permit creation of a second continuation successor from the same predecessor
 
 **Rationale:** When a user hits context exhaustion mid-task, the most common
 next action is to keep working on the same task with a fresh context window.
@@ -724,9 +735,9 @@ AND on abandon, apply the same worktree/branch disposition as abandon from a non
 AND on mark-as-merged, apply the same worktree/branch disposition as mark-as-merged from a non-terminal state
   (worktree removed; branch removed for Work mode, preserved for Branch mode, per work-lifecycle REQ-WL-002)
 
-WHEN a context-exhausted conversation has an existing continuation
-THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the parent
-(the continuation is the live conversation — any terminal decision belongs on the continuation)
+WHEN a predecessor conversation has an existing continuation successor
+THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the predecessor
+(the successor is the live conversation — any terminal decision belongs on the successor)
 
 WHEN the server restarts and encounters a context-exhausted conversation with a worktree
 THE SYSTEM SHALL preserve the worktree unchanged
@@ -736,12 +747,14 @@ AND NOT remove it from the worktree registry
 **Rationale:** Context exhaustion is a pause, not an end. The user may
 return hours or days later to continue the work, and a surprise cleanup
 on server restart would be data loss. Abandon must stay available on the
-parent for the case where the user decides the work isn't worth
+predecessor for the case where the user decides the work isn't worth
 continuing — without it, the only cleanup path is to create an unwanted
-continuation and then abandon that, which is clunky and produces a
-stranded continuation record. When a continuation exists, the live
-conversation is the continuation; operating on the parent would be
-ambiguous about which conversation the action affects.
+successor and then abandon that, which is clunky and produces a stranded
+continuation record. Once a successor exists, the live conversation is
+the successor; operating on the predecessor would be ambiguous about
+which conversation the action affects. The same predecessor/successor
+ownership rule also applies to a task-approval fresh handoff: once the
+new Work conversation exists, actions belong there.
 
 **Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, work-lifecycle REQ-WL-001/REQ-WL-002
 
