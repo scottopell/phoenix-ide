@@ -258,7 +258,9 @@ function summarizeBashCompactCard(
   if (!result) {
     const liveLines = progress?.lines.map((line) => line.text) ?? [];
     if (progress?.partial) liveLines.push(progress.partial);
-    const liveTail = liveLines.filter((line) => line.trim()).slice(-2).join(' · ');
+    const nonEmptyLiveLines = liveLines.filter((line) => line.trim());
+    const liveTailTruncated = progress?.truncated_before === true || nonEmptyLiveLines.length > 2;
+    const liveTail = `${liveTailTruncated ? '… ' : ''}${nonEmptyLiveLines.slice(-2).join(' · ')}`;
     return {
       commandIdentity,
       finalStatus: progress ? 'running' : null,

@@ -611,6 +611,8 @@ function bashVisibleSearchText(
     if (typeof parsed['waited_ms'] === 'number') parts.push(`waited ${formatVisibleMillis(parsed['waited_ms'])}`);
     if (typeof parsed['duration_ms'] === 'number') parts.push(`ran ${formatVisibleMillis(parsed['duration_ms'])}`);
     if (parsed['exit_code'] !== undefined && parsed['exit_code'] !== null) parts.push(`exit ${String(parsed['exit_code'])}`);
+    if (typeof parsed['error'] === 'string') parts.push(parsed['error']);
+    if (typeof parsed['error_message'] === 'string') parts.push(parsed['error_message']);
     if (parsed['truncated_before'] === true) parts.push('older output omitted');
     const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
     const visibleLines = density === 'full' ? lines : lines.slice(-2);
@@ -623,9 +625,11 @@ function bashVisibleSearchText(
     if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) parts.push(parsed['partial']);
     return parts.join('\n');
   }
+  if (result) parts.push(toolResultText(result));
   if (progress) {
     if (progress.truncated_before) parts.push('older output omitted');
-    for (const line of progress.lines.slice(-2)) parts.push(line.text);
+    const visibleProgressLines = density === 'full' ? progress.lines.slice(-8) : progress.lines.slice(-2);
+    for (const line of visibleProgressLines) parts.push(line.text);
     if (progress.partial) parts.push(progress.partial);
   }
   return parts.join('\n');
