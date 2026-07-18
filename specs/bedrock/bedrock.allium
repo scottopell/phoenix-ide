@@ -946,12 +946,6 @@ rule UserApprovesTaskFreshWorkConversation {
     ensures: conversation.successor = successor
     ensures: successor.mode = work
     ensures: LlmRequestDispatched(successor)
-
-    @guidance
-        -- This is an explicit predecessor->successor handoff, not an inline
-        -- approval. The Explore predecessor becomes read-only HandedOff and
-        -- keeps only historical context; all further work belongs to the new
-        -- Work successor identified by continued_in_conv_id.
 }
 
 rule UserProvidesFeedback {
@@ -982,9 +976,8 @@ rule CancelDuringTaskApproval {
 -- entirely in projects/ (ForkProposalApproved / ForkProposalDismissed) and
 -- produces NO transition on the originating conversation — bedrock has no
 -- resolution rule here. This is the structural difference from
--- UserApprovesTaskFreshWorkConversation, which performs an explicit
--- predecessor->successor handoff by setting the predecessor to handed_off:
--- the fork's origin keeps running, untouched, and is never notified.
+-- UserApprovesTaskFreshWorkConversation, which sets the predecessor to
+-- handed_off: the fork's origin keeps running, untouched, and is never notified.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE

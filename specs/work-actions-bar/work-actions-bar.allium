@@ -174,7 +174,7 @@ enum ConvMode {
 -- present (REQ-WAB-004). Total: every reachable combination of phase,
 -- continuation, PR state, and no-PR work-change state maps to exactly one variant via derive_disposition.
 enum WorkDisposition {
-    continued           -- continued_in_conv_id set; read-only predecessor, no primary; RESOLVE + FINISH suppressed
+    continued           -- continued_in_conv_id set; no primary; RESOLVE + FINISH suppressed
     | stuck             -- phase in {error, context_exhausted}; RESOLVE suppressed; FINISH primary
     | address_feedback  -- idle, PR open, affordance enabled (any check state); a merge_link secondary rides along when checks pass
     | merge_ready       -- idle, PR open, checks passing, affordance disabled
@@ -212,7 +212,7 @@ enum BarPrimary {
 
 -- At most one inline note is shown per render.
 enum InlineNote {
-    continued_note          -- "Continued — actions belong on the successor."
+    continued_note          -- "Continued — actions belong on the continuation."
     | pr_open_stuck_note     -- "PR #N still open — merge on GitHub, or abandon."
     | pr_closed_note        -- "PR closed — abandon to clean up."
     | gh_unavailable_note   -- "gh unavailable — manual cleanup."
@@ -395,7 +395,7 @@ rule BarHiddenWhenNotEligible {
 -- pr_open_other), then merged / closed / no-PR / gh-unavailable. There is no
 -- gap.
 
--- Row 1. Continued predecessor: no primary; RESOLVE + FINISH suppressed (REQ-WAB-009).
+-- Row 1. Continued: no primary; RESOLVE + FINISH suppressed (REQ-WAB-009).
 rule DispositionContinued {
     when: WorkActionsBarRendered(bar)
 
@@ -730,7 +730,7 @@ invariant ResolveHiddenWhenStuck {
             b.presentation.resolve_zone.visible = false
 }
 
--- REQ-WAB-009 / REQ-WAB-008: in the read-only predecessor state nothing terminal is
+-- REQ-WAB-009 / REQ-WAB-008: in the continued state nothing terminal is
 -- rendered, so there is no disabled-as-status button. (For every other
 -- disposition, a FINISH button is present exactly when its show_* flag is true,
 -- and a present button is always invocable — there is no disabled variant in
