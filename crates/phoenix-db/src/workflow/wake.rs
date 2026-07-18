@@ -2777,6 +2777,26 @@ impl WakeRepository {
             }
         }
 
+        for link in &links {
+            let mut display_data = link
+                .linked_message
+                .message
+                .display_data
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let serde_json::Value::Object(object) = &mut display_data {
+                object.insert("adopted".to_string(), serde_json::Value::Bool(true));
+            }
+            sqlx::query("UPDATE messages SET display_data = ?1 WHERE message_id = ?2")
+                .bind(
+                    serde_json::to_string(&display_data)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )
+                .bind(&link.linked_message.message.message_id)
+                .execute(&mut *tx.tx)
+                .await?;
+        }
+
         tx.commit().await?;
         Ok(WakeAdoptMaterializedPendingOutcome::Adopted(
             WakeAdoptedMaterializedPending { links, auto_resume },

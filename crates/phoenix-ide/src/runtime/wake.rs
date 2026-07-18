@@ -333,7 +333,6 @@ async fn deliver_pending(
     repo: &WakeRepository,
     now: Timestamp,
 ) -> Result<(), String> {
-    let mut conversations = std::collections::BTreeSet::new();
     let mut cursor = None;
     loop {
         let pending = repo
@@ -374,10 +373,19 @@ async fn deliver_pending(
                     }
                     handle
                 }
-                None => manager
-                    .get_or_create(&current.conversation_id)
-                    .await
-                    .map_err(|error| error.clone())?,
+                None => match manager.get_or_create(&current.conversation_id).await {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        tracing::warn!(
+                            workflow_id = current.workflow_id.0,
+                            conversation_id = %current.conversation_id,
+                            %error,
+                            "skipping wake delivery whose conversation runtime could not start"
+                        );
+                        cursor = Some(next_cursor);
+                        continue;
+                    }
+                },
             };
             let (sequence_guard, sequence_ids) =
                 handle.broadcast_tx.reserve_next_persisted_message_range(1);
@@ -401,7 +409,25 @@ async fn deliver_pending(
                     let _ = handle
                         .broadcast_tx
                         .send_message(link.linked_message.message.clone());
-                    conversations.insert(current.conversation_id);
+                    let conversation_id = current.conversation_id;
+                    match repo
+                        .adopt_materialized_pending_for_conversation(&conversation_id, now)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
+                            if adopted.auto_resume {
+                                handle
+                                    .event_tx
+                                    .send(crate::state_machine::Event::WakeBatchAdopted)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        WakeAdoptMaterializedPendingOutcome::Busy(_)
+                        | WakeAdoptMaterializedPendingOutcome::NothingPending
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                    }
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {}
             }
@@ -413,39 +439,6 @@ async fn deliver_pending(
         }
     }
 
-    for conversation_id in conversations {
-        if let Some(handle) = manager.try_get_handle(&conversation_id).await {
-            if !matches!(
-                *handle.state_rx.borrow(),
-                crate::state_machine::ConvState::Idle
-            ) {
-                continue;
-            }
-        }
-        match repo
-            .adopt_materialized_pending_for_conversation(&conversation_id, now)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
-                let handle = manager
-                    .get_or_create(&conversation_id)
-                    .await
-                    .map_err(|error| error.clone())?;
-                let _ = adopted.links;
-                if adopted.auto_resume {
-                    handle
-                        .event_tx
-                        .send(crate::state_machine::Event::WakeBatchAdopted)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-            WakeAdoptMaterializedPendingOutcome::Busy(_)
-            | WakeAdoptMaterializedPendingOutcome::NothingPending
-            | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
-        }
-    }
     Ok(())
 }
 

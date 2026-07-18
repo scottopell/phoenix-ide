@@ -689,7 +689,6 @@ async fn register_tmux_wake_if_live(
         &contract_id,
         &registration_scope,
         &resource,
-        expires_at,
     );
     let register_input = RegisterWakeInput {
         contract_id: contract_id.clone(),
@@ -738,7 +737,6 @@ fn prepare_tmux_wake_fingerprint(
     contract_id: &str,
     registration_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
     resource: &WakeResourceIdentity,
-    expires_at: Timestamp,
 ) -> String {
     let canonical = json!({
         "conversation_id": conversation_id,
@@ -747,7 +745,6 @@ fn prepare_tmux_wake_fingerprint(
         "contract_id": contract_id,
         "registration_scope": registration_scope,
         "resource": resource,
-        "expires_at": expires_at.0,
         "profile": {
             "profile_kind": phoenix_workflow::wake_profile::profile().profile_kind,
             "profile_version": phoenix_workflow::wake_profile::profile().profile_version,

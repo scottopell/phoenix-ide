@@ -115,6 +115,20 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             &self.binding.acceptance.supported_codecs,
         )
         .map_err(EngineError::InvalidPlan)?;
+        for effect in &decision.plan.effects {
+            if self.effects.contains_key(&effect.effect_id) {
+                return Err(EngineError::InvalidPlan(PlanError::EffectIdCollision(
+                    effect.effect_id,
+                )));
+            }
+        }
+        for barrier in &decision.plan.barriers {
+            if self.barriers.contains_key(&barrier.barrier_id) {
+                return Err(EngineError::InvalidPlan(PlanError::BarrierIdCollision(
+                    barrier.barrier_id,
+                )));
+            }
+        }
 
         let transition = self.begin_transition(decision);
         self.apply_invalidations(&decision.plan.invalidations);
@@ -743,6 +757,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if suppress {
             item.status = DeliveryStatus::Suppressed;
             item.suppression_reason = Some(SuppressionReason::ReducerTerminal);
+        } else {
+            item.status = DeliveryStatus::Accepted;
         }
         item.accepted_by = Some(transition.transition_id);
         Ok(RuntimeAcceptanceResult {

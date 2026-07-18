@@ -1423,6 +1423,22 @@ fn render_messages(
     for msg in db_messages {
         match &msg.content {
             MessageContent::User(user_content) => {
+                if user_content.is_meta
+                    && msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("wake_result")
+                    && !msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("adopted"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
                 let mut text_for_llm = user_content.llm_text().to_string();
@@ -9932,7 +9948,7 @@ mod steer_drain_detector_tests {
     }
 
     #[test]
-    fn render_messages_keeps_meta_user_wake_observation_as_user_text_not_tool_result() {
+    fn render_messages_withholds_unadopted_wake_observation() {
         let created_at = chrono::Utc::now();
         let msgs = vec![crate::db::Message {
             message_id: "wake-msg".to_string(),
@@ -9946,18 +9962,9 @@ mod steer_drain_detector_tests {
         }];
 
         let rendered = render_messages(&msgs, &std::collections::HashSet::new());
-        assert_eq!(rendered.len(), 1);
-        assert_eq!(rendered[0].role, MessageRole::User);
-        assert!(matches!(
-            rendered[0].content.as_slice(),
-            [ContentBlock::Text { text }] if text == "bash finished normally"
-        ));
         assert!(
-            !matches!(
-                rendered[0].content.first(),
-                Some(ContentBlock::ToolResult { .. })
-            ),
-            "wake observations must not re-enter provider history as a duplicate tool_result"
+            rendered.is_empty(),
+            "wake observations become provider-visible only through the adoption event"
         );
     }
 
