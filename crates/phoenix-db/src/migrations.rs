@@ -314,8 +314,7 @@ CREATE TABLE workflow_effects (
     )),
     pending_reconciliation INTEGER NOT NULL DEFAULT 0 CHECK (pending_reconciliation IN (0, 1)),
     PRIMARY KEY (workflow_id, effect_id),
-    CHECK ((capability_kind IN ('IdempotentSubmission', 'ObservableSubmission')) = (stable_command_id IS NOT NULL)),
-    CHECK ((status = 'Executing') <= (generation >= 1))
+    CHECK ((capability_kind IN ('IdempotentSubmission', 'ObservableSubmission')) = (stable_command_id IS NOT NULL))
 ) WITHOUT ROWID;
 
 CREATE TABLE workflow_effect_dependencies (
@@ -362,6 +361,10 @@ CREATE TABLE workflow_attempts (
     UNIQUE (workflow_id, effect_id, generation, ordinal),
     FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX workflow_attempts_one_live_per_effect
+ON workflow_attempts(workflow_id, effect_id)
+WHERE status IN ('Begun', 'ObservationRecorded');
 
 CREATE TABLE workflow_reclaimable_leases (
     workflow_id INTEGER NOT NULL,
@@ -526,7 +529,6 @@ CREATE TABLE workflow_schedules (
     PRIMARY KEY (workflow_id, schedule_id),
     UNIQUE (workflow_id, schedule_key),
     FOREIGN KEY (workflow_id, active_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE SET NULL,
-    CHECK ((status = 'Active') = (active_effect_id IS NOT NULL)),
     CHECK ((due_occurrence_id IS NULL) = (due_generation IS NULL AND due_at IS NULL)),
     CHECK ((active_occurrence_id IS NULL) = (active_generation IS NULL AND active_due_at IS NULL))
 ) WITHOUT ROWID;
