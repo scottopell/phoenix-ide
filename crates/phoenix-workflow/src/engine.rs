@@ -13,10 +13,10 @@ use crate::{
     ReceiptAcceptance, ReceiptFamily, ReceiptId, ReceiptOrigin, ReceiptRecord, ReclaimableLease,
     ReconciliationDecision, ReconciliationOutcome, ReducerDecision, RenewalResult,
     ResolutionStatus, ResourceLockGrant, RuntimeAcceptanceResult, RuntimeAcceptanceStatus,
-    ScheduleDecl, ScheduleId, SchedulePolicy, ScheduleState, ScheduleStatus,
-    StaleObservationRecord, SuppressionReason, Timestamp, TransitionId, TransitionPlan, Version,
-    WorkflowBinding, WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
-    WorkflowTransition,
+    ScheduleDecl, ScheduleId, ScheduleOccurrence, ScheduleOccurrenceId, SchedulePolicy,
+    ScheduleState, ScheduleStatus, StaleObservationRecord, SuppressionReason, Timestamp,
+    TransitionId, TransitionPlan, Version, WorkflowBinding, WorkflowId, WorkflowProfile,
+    WorkflowState, WorkflowStatus, WorkflowTransition,
 };
 
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
@@ -24,7 +24,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     pub fn new(
         workflow_id: WorkflowId,
         profile: &ProfileRef,
-        acceptance: AcceptanceProfile,
+        acceptance: AcceptanceProfile<P::RuntimeAcceptance, P::ExternalAcceptance>,
         snapshot_codec: CodecRef,
         snapshot: P::Snapshot,
     ) -> Result<Self, EngineError> {
@@ -43,7 +43,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             binding: WorkflowBinding {
                 workflow_id,
                 profile: profile.clone(),
-                acceptance,
+                acceptance: acceptance.erase(),
             },
             version: Version(0),
             generation: Generation(0),
@@ -65,6 +65,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             next_receipt_id: 1,
             next_delivery_id: 1,
             next_manual_resolution_id: 1,
+            next_schedule_occurrence_id: 1,
         })
     }
 
@@ -716,7 +717,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         let Some(item) = self.deliveries.get(&delivery_id).cloned() else {
             return Err(EngineError::InvalidInbox);
         };
-        if item.runtime_acceptance_status != Some(RuntimeAcceptanceStatus::Owed) {
+        if item.runtime_acceptance_status != Some(RuntimeAcceptanceStatus::Owed)
+            || !self.binding.acceptance.runtime_acceptance_enabled()
+        {
             return Err(EngineError::InvalidInbox);
         }
         let predicate = if suppress {
@@ -817,34 +820,73 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
         }
         self.refresh_barriers();
-        for schedule in self.schedules.values_mut() {
+        let mut due_schedule_ids = Vec::new();
+        for (schedule_id, schedule) in &self.schedules {
             if schedule.status == ScheduleStatus::Idle && schedule.next_eligible_at <= now {
-                schedule.status = ScheduleStatus::Due;
+                due_schedule_ids.push(*schedule_id);
             }
+        }
+        for schedule_id in due_schedule_ids {
+            let _ = self.reconcile_schedule_due(schedule_id, now);
         }
     }
 
-    pub fn advance_schedule(
+    pub fn reconcile_schedule_due(
         &mut self,
         schedule_id: ScheduleId,
         now: Timestamp,
-    ) -> Option<ScheduleState> {
+    ) -> Option<ScheduleOccurrence> {
         let schedule = self.schedules.get_mut(&schedule_id)?;
-        if schedule.policy != SchedulePolicy::CoalesceLatest || schedule.next_eligible_at > now {
+        if schedule.policy != SchedulePolicy::CoalesceLatest
+            || schedule.status != ScheduleStatus::Idle
+            || schedule.next_eligible_at > now
+        {
             return None;
         }
+        let occurrence = ScheduleOccurrence {
+            schedule_id,
+            occurrence_id: ScheduleOccurrenceId(self.next_schedule_occurrence_id),
+            generation: self.generation,
+            due_at: schedule.next_eligible_at,
+        };
+        self.next_schedule_occurrence_id += 1;
         schedule.status = ScheduleStatus::Due;
+        schedule.due_occurrence = Some(occurrence);
+        schedule.active_occurrence = None;
+        Some(occurrence)
+    }
+
+    pub fn start_schedule_occurrence(
+        &mut self,
+        occurrence: ScheduleOccurrence,
+        active_effect_id: Option<EffectId>,
+    ) -> Option<ScheduleState> {
+        let schedule = self.schedules.get_mut(&occurrence.schedule_id)?;
+        if schedule.status != ScheduleStatus::Due || schedule.due_occurrence != Some(occurrence) {
+            return None;
+        }
+        schedule.status = ScheduleStatus::Active;
+        schedule.active_effect_id = active_effect_id;
+        schedule.active_occurrence = Some(occurrence);
+        schedule.due_occurrence = None;
         Some(schedule.clone())
     }
 
     pub fn complete_schedule_occurrence(
         &mut self,
-        schedule_id: ScheduleId,
+        occurrence: ScheduleOccurrence,
         next_eligible_at: Timestamp,
     ) -> Option<ScheduleState> {
-        let schedule = self.schedules.get_mut(&schedule_id)?;
+        let schedule = self.schedules.get_mut(&occurrence.schedule_id)?;
+        if schedule.status != ScheduleStatus::Active
+            || schedule.active_occurrence != Some(occurrence)
+        {
+            return None;
+        }
         schedule.status = ScheduleStatus::Idle;
         schedule.active_effect_id = None;
+        schedule.active_occurrence = None;
+        schedule.due_occurrence = None;
         schedule.next_eligible_at = next_eligible_at;
         Some(schedule.clone())
     }
@@ -1082,11 +1124,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 barrier_id: declaration.barrier_id,
                 consumer_kind: declaration.consumer_kind,
                 event_codec: declaration.event_codec.clone(),
-                requires_runtime_acceptance: declaration.requires_runtime_acceptance,
+                requires_runtime_acceptance: declaration.requires_runtime_acceptance(),
                 payload: declaration.payload.clone(),
                 status: DeliveryStatus::Pending,
                 runtime_acceptance_status: declaration
-                    .requires_runtime_acceptance
+                    .requires_runtime_acceptance()
                     .then_some(RuntimeAcceptanceStatus::Owed),
                 suppression_reason: None,
                 accepted_by: None,
@@ -1115,6 +1157,8 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                     status: ScheduleStatus::Idle,
                     next_eligible_at: *next_eligible_at,
                     active_effect_id: None,
+                    due_occurrence: None,
+                    active_occurrence: None,
                 },
             );
         }

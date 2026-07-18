@@ -37,8 +37,8 @@ fn acceptance_profile_exposes_wake_codec_support() {
     assert!(acceptance.supported_codecs.supports(&snapshot_codec()));
     assert!(acceptance.supported_codecs.supports(&event_codec()));
     assert!(acceptance.supported_codecs.supports(&terminal_codec()));
-    assert!(acceptance.runtime_acceptance_enabled);
-    assert!(!acceptance.external_acceptance_enabled);
+    assert!(acceptance.runtime_acceptance_enabled());
+    assert!(!acceptance.external_acceptance_enabled());
 }
 
 #[test]

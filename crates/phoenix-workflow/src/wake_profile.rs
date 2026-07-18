@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use crate::{
     AcceptanceProfile, BarrierId, CancellationReceiptDecl, CancellationRequest, CodecRef,
     DeliveryItem, DeliveryPayload, EffectDecl, EffectId, EffectInvalidationDecl, EffectRole,
-    ExecutionCapability, Generation, ManualChoice, ManualChoiceKind, ProfileRef,
-    SupportedCodecRegistry, Timestamp, TransitionPlan, WorkflowProfile,
+    ExecutionCapability, ExternalAcceptanceDisabled, Generation, ManualChoice, ManualChoiceKind,
+    ProfileRef, RuntimeAcceptanceEnabled, SupportedCodecRegistry, Timestamp, TransitionPlan,
+    WorkflowProfile,
 };
 
 pub const PROFILE_ID: &str = "wake";
@@ -233,6 +234,8 @@ pub struct WakeManualPayload {
 pub struct WakeProfile;
 
 impl WorkflowProfile for WakeProfile {
+    type RuntimeAcceptance = RuntimeAcceptanceEnabled;
+    type ExternalAcceptance = ExternalAcceptanceDisabled;
     type Snapshot = WakeRegistrationSnapshot;
     type Event = WakeRegistrationEvent;
     type Intent = ObserveHandleIntent;
@@ -317,13 +320,9 @@ fn supported_codecs() -> SupportedCodecRegistry {
 }
 
 #[must_use]
-pub fn acceptance_profile() -> AcceptanceProfile {
-    AcceptanceProfile {
-        profile: profile(),
-        supported_codecs: supported_codecs(),
-        runtime_acceptance_enabled: true,
-        external_acceptance_enabled: false,
-    }
+pub fn acceptance_profile(
+) -> AcceptanceProfile<RuntimeAcceptanceEnabled, ExternalAcceptanceDisabled> {
+    AcceptanceProfile::new(profile(), supported_codecs())
 }
 
 #[must_use]
