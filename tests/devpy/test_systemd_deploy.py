@@ -215,6 +215,23 @@ class SystemdDeployCommandTests(unittest.TestCase):
         check.assert_not_called()
         deploy.assert_called_once_with("v2.0.0")
 
+    def test_controller_skips_host_systemd_redetection(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v2.0.0",
+            expected_full_commit="a" * 40,
+            backend="systemd",
+        )
+        with mock.patch.object(self.dev, "check_systemd_available") as available, \
+             mock.patch.object(self.dev, "_require_noninteractive_sudo_ready"), \
+             mock.patch.object(self.dev, "_read_systemd_installed_env", return_value={"PHOENIX_PASSWORD": "installed"}), \
+             mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+             mock.patch.object(self.dev, "detect_service_user", return_value="nobody"), \
+             mock.patch.object(self.dev, "_prepare_release_candidate", side_effect=SystemExit("stop here")):
+            with self.assertRaisesRegex(SystemExit, "stop here"):
+                self.dev.native_prod_deploy("v2.0.0", controller=controller)
+        available.assert_not_called()
+
     def test_controller_requires_noninteractive_sudo_before_disruption(self):
         controller = self.dev.ProdDeployControllerOptions(
             enabled=True,

@@ -6350,7 +6350,7 @@ def native_prod_deploy(
     if controller.enabled:
         release, _expected_full_commit = controller.require_exact_release(release)
         _require_noninteractive_sudo_ready()
-    if not check_systemd_available():
+    elif not check_systemd_available():
         raise SystemExit("systemd is not available on this Linux host")
 
     env_snapshot = _read_systemd_installed_env(noninteractive=True) if controller.enabled else {}
