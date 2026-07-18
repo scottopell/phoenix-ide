@@ -6,10 +6,10 @@ use super::handlers::AppError;
 use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
     ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
-    AssociatedPrSummaryResponse, CheckoutStatus, ConversationDiffResponse, GitBranchEntry,
-    GitBranchesQuery, GitBranchesResponse, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
-    PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
-    WorkChangeNeedsReviewReason, WorkChangeSummary,
+    AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConversationDiffResponse,
+    GitBranchEntry, GitBranchesQuery, GitBranchesResponse, ObservedBranchSummaryResponse,
+    PinAssociatedPrRequest, PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse,
+    PrUnavailableReason, WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -87,7 +87,7 @@ struct LiveCheckoutObservation {
     repository_identity: Option<String>,
     branch_name: String,
     exact_ref: String,
-    upstream_ref: Option<String>,
+    remote_status: BranchRemoteStatus,
 }
 
 fn exact_head_ref(worktree_path: &FsPath) -> Result<String, String> {
@@ -104,7 +104,7 @@ fn exact_head_ref(worktree_path: &FsPath) -> Result<String, String> {
     Ok(exact)
 }
 
-fn upstream_ref_for_branch(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
+fn configured_upstream_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
     run_git(
         worktree_path,
         &[
@@ -115,64 +115,162 @@ fn upstream_ref_for_branch(worktree_path: &FsPath, branch_name: &str) -> Option<
     )
     .ok()
     .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
+    .filter(|value| value.starts_with("refs/remotes/"))
+}
+
+fn fallback_remote_ref(branch_name: &str) -> String {
+    format!("refs/remotes/origin/{branch_name}")
+}
+
+fn ref_exists(worktree_path: &FsPath, git_ref: &str) -> bool {
+    run_git(
+        worktree_path,
+        &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
+    )
+    .is_ok()
+}
+
+fn ahead_behind_counts(worktree_path: &FsPath, remote_ref: &str) -> Result<(u32, u32), String> {
+    let counts = run_git(
+        worktree_path,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{remote_ref}"),
+        ],
+    )
+    .map_err(|e| format!("failed to compare HEAD to {remote_ref}: {e}"))?;
+    let mut parts = counts.split_whitespace();
+    let ahead = parts
+        .next()
+        .ok_or_else(|| format!("missing ahead count for {remote_ref}"))?
+        .parse::<u32>()
+        .map_err(|e| format!("invalid ahead count for {remote_ref}: {e}"))?;
+    let behind = parts
+        .next()
+        .ok_or_else(|| format!("missing behind count for {remote_ref}"))?
+        .parse::<u32>()
+        .map_err(|e| format!("invalid behind count for {remote_ref}: {e}"))?;
+    Ok((ahead, behind))
+}
+
+fn branch_remote_status(worktree_path: &FsPath, branch_name: &str) -> BranchRemoteStatus {
+    if let Some(remote_ref) = configured_upstream_ref(worktree_path, branch_name) {
+        return match ahead_behind_counts(worktree_path, &remote_ref) {
+            Ok((0, 0)) => BranchRemoteStatus::Matching { remote_ref },
+            Ok((ahead, behind)) => BranchRemoteStatus::Tracked {
+                remote_ref,
+                ahead,
+                behind,
+            },
+            Err(reason) => BranchRemoteStatus::Unavailable { reason },
+        };
+    }
+
+    let fallback = fallback_remote_ref(branch_name);
+    if ref_exists(worktree_path, &fallback) {
+        return match ahead_behind_counts(worktree_path, &fallback) {
+            Ok((0, 0)) => BranchRemoteStatus::Matching {
+                remote_ref: fallback,
+            },
+            Ok((ahead, behind)) => BranchRemoteStatus::Tracked {
+                remote_ref: fallback,
+                ahead,
+                behind,
+            },
+            Err(reason) => BranchRemoteStatus::Unavailable { reason },
+        };
+    }
+
+    BranchRemoteStatus::NoKnown {
+        candidate_remote_refs: vec![fallback],
+    }
+}
+
+fn detached_pointing_refs(worktree_path: &FsPath) -> Vec<String> {
+    const MAX_POINTING_REFS: usize = 8;
+    let Ok(output) = run_git(
+        worktree_path,
+        &[
+            "for-each-ref",
+            "--points-at=HEAD",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut refs = output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs.truncate(MAX_POINTING_REFS);
+    refs
 }
 
 fn live_checkout_observation_details(
     worktree_path: &FsPath,
+    branch_name: String,
+    repository_identity: Option<String>,
 ) -> Result<LiveCheckoutObservation, String> {
     let exact_ref = exact_head_ref(worktree_path)?;
-    let branch_name = exact_ref
-        .strip_prefix("refs/heads/")
-        .map(str::to_string)
-        .unwrap_or_else(|| exact_ref.clone());
     Ok(LiveCheckoutObservation {
-        repository_identity: github_repo_identifier_from_worktree(worktree_path),
-        upstream_ref: upstream_ref_for_branch(worktree_path, &branch_name),
-        branch_name,
+        repository_identity,
+        branch_name: branch_name.clone(),
         exact_ref,
+        remote_status: branch_remote_status(worktree_path, &branch_name),
     })
 }
 
-fn checkout_status_from_live_observation(
-    worktree_path: &FsPath,
-    observed_branch: Option<&crate::db::WorkScopeObservedBranch>,
-) -> CheckoutStatus {
-    let observed_branch_name = observed_branch.map(|branch| branch.branch_name.clone());
-    match exact_head_ref(worktree_path) {
-        Ok(exact_ref) if exact_ref == "HEAD" => {
-            let oid = run_git(worktree_path, &["rev-parse", "HEAD"])
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default();
-            if oid.is_empty() {
-                CheckoutStatus::Unborn {
-                    observed_branch_name,
-                }
-            } else {
-                CheckoutStatus::Detached {
-                    exact_ref: oid,
-                    observed_branch_name,
-                }
-            }
-        }
-        Ok(_) => match live_checkout_observation_details(worktree_path) {
-            Ok(live) => CheckoutStatus::LiveBranch {
+fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
+    match phoenix_core::git::observe_local_git_head(worktree_path) {
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+            repository_identity,
+            branch_name,
+            ..
+        } => match live_checkout_observation_details(
+            worktree_path,
+            branch_name,
+            Some(repository_identity.clone()),
+        ) {
+            Ok(live) => CheckoutStatus::NamedBranch {
                 repository_identity: live.repository_identity,
-                observed_matches_live: observed_branch_name.as_deref()
-                    == Some(live.branch_name.as_str()),
-                observed_branch_name,
-                upstream_ref: live.upstream_ref,
                 branch_name: live.branch_name,
                 exact_ref: live.exact_ref,
+                remote_status: live.remote_status,
             },
-            Err(reason) => CheckoutStatus::Missing {
+            Err(reason) => CheckoutStatus::Unavailable {
+                repository_identity: Some(repository_identity),
                 reason,
-                observed_branch_name,
             },
         },
-        Err(reason) => CheckoutStatus::Missing {
-            reason,
-            observed_branch_name,
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Detached {
+            head_oid,
+            ..
+        } => CheckoutStatus::Detached {
+            head_oid,
+            pointing_refs: detached_pointing_refs(worktree_path),
+        },
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unborn {
+            repository_identity,
+            branch_name,
+        } => CheckoutStatus::Unborn {
+            repository_identity: Some(repository_identity),
+            branch_name,
+        },
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unavailable {
+            repository_identity,
+            error,
+        } => CheckoutStatus::Unavailable {
+            repository_identity,
+            reason: error,
         },
     }
 }
@@ -1711,15 +1809,6 @@ pub(crate) async fn get_active_pr_diff(
         })?;
     let pr_number = active_pr.pr_number;
 
-    let observed = state
-        .runtime
-        .db()
-        .list_work_scope_observed_branches(&work_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .next();
-
     tokio::task::spawn_blocking(move || {
         let wt = PathBuf::from(&worktree_path);
         if !wt.exists() {
@@ -1728,7 +1817,7 @@ pub(crate) async fn get_active_pr_diff(
             )));
         }
 
-        let checkout_status = checkout_status_from_live_observation(&wt, observed.as_ref());
+        let checkout_status = checkout_status_from_live_observation(&wt);
         let captured = capture_active_pr_diff(&wt, &active_pr, MAX_DIFF_BYTES)?;
         Ok(build_diff_response(
             captured,
@@ -1785,19 +1874,6 @@ pub(crate) async fn get_conversation_diff(
         }
     };
 
-    let work_scope = crate::work_scope::WorkScope::resolve(
-        &id,
-        Some(std::path::Path::new(worktree_path.as_str())),
-    );
-    let observed = state
-        .runtime
-        .db()
-        .list_work_scope_observed_branches(&work_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .next();
-
     tokio::task::spawn_blocking(move || {
         let wt = PathBuf::from(&worktree_path);
         if !wt.exists() {
@@ -1806,7 +1882,7 @@ pub(crate) async fn get_conversation_diff(
             )));
         }
 
-        let checkout_status = checkout_status_from_live_observation(&wt, observed.as_ref());
+        let checkout_status = checkout_status_from_live_observation(&wt);
         let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
 
         Ok(build_diff_response(
@@ -2518,7 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_ref_for_branch_reads_tracking_ref() {
+    fn configured_upstream_ref_reads_tracking_ref() {
         let upstream = tempfile::tempdir().unwrap();
         init_repo(upstream.path());
         let clone = tempfile::tempdir().unwrap();
@@ -2530,32 +2606,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            upstream_ref_for_branch(clone.path(), "feature"),
+            configured_upstream_ref(clone.path(), "feature"),
             Some("refs/remotes/origin/feature".to_string())
         );
     }
 
     #[test]
-    fn checkout_status_live_branch_reports_observed_match_and_upstream() {
+    fn checkout_status_named_branch_reports_matching_origin_fallback() {
         let upstream = tempfile::tempdir().unwrap();
         init_repo(upstream.path());
         let clone = tempfile::tempdir().unwrap();
         clone_repo(upstream.path(), clone.path());
         run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
-        run_git(
-            clone.path(),
-            &["push", "--quiet", "-u", "origin", "feature"],
-        )
-        .unwrap();
-        let observed = crate::db::WorkScopeObservedBranch {
-            work_scope_id: 1,
-            repository_identity: "acme/repo".to_string(),
-            branch_name: "feature".to_string(),
-            first_observed_head_oid: "aaaa".to_string(),
-            last_observed_head_oid: "aaaa".to_string(),
-            first_observed_at: "2024-01-01T00:00:00Z".to_string(),
-            last_observed_at: "2024-01-01T00:00:00Z".to_string(),
-        };
+        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
         run_git(
             clone.path(),
             &[
@@ -2568,65 +2631,104 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            checkout_status_from_live_observation(clone.path(), Some(&observed)),
-            CheckoutStatus::LiveBranch {
-                repository_identity: Some("acme/repo".to_string()),
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                repository_identity: Some(
+                    phoenix_core::git::detect_git_repo_root(clone.path()).unwrap(),
+                ),
                 branch_name: "feature".to_string(),
                 exact_ref: "refs/heads/feature".to_string(),
-                upstream_ref: Some("refs/remotes/origin/feature".to_string()),
-                observed_branch_name: Some("feature".to_string()),
-                observed_matches_live: true,
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                },
             }
         );
     }
 
     #[test]
-    fn checkout_status_live_branch_reports_observed_mismatch() {
+    fn checkout_status_named_branch_prefers_configured_non_origin_upstream_and_counts() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["remote", "rename", "origin", "fork"]).unwrap();
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature/live"]).unwrap();
+        run_git(
+            clone.path(),
+            &["push", "--quiet", "-u", "fork", "feature/live"],
+        )
+        .unwrap();
+        commit_file(clone.path(), "local.txt", "L", "local ahead");
+        run_git(upstream.path(), &["checkout", "--quiet", "feature/live"]).unwrap();
+        commit_file(upstream.path(), "remote.txt", "R", "remote ahead");
+        run_git(clone.path(), &["fetch", "--quiet", "fork"]).unwrap();
+
+        assert_eq!(
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                repository_identity: Some(
+                    phoenix_core::git::detect_git_repo_root(clone.path()).unwrap(),
+                ),
+                branch_name: "feature/live".to_string(),
+                exact_ref: "refs/heads/feature/live".to_string(),
+                remote_status: BranchRemoteStatus::Tracked {
+                    remote_ref: "refs/remotes/fork/feature/live".to_string(),
+                    ahead: 1,
+                    behind: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_reports_no_known_remote_when_untracked() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         run_git(repo.path(), &["checkout", "-q", "-b", "feature/live"]).unwrap();
-        let observed = crate::db::WorkScopeObservedBranch {
-            work_scope_id: 1,
-            repository_identity: "acme/repo".to_string(),
-            branch_name: "feature/stale".to_string(),
-            first_observed_head_oid: "aaaa".to_string(),
-            last_observed_head_oid: "bbbb".to_string(),
-            first_observed_at: "2024-01-01T00:00:00Z".to_string(),
-            last_observed_at: "2024-01-01T00:00:00Z".to_string(),
-        };
+
         assert_eq!(
-            checkout_status_from_live_observation(repo.path(), Some(&observed)),
-            CheckoutStatus::LiveBranch {
-                repository_identity: None,
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::NamedBranch {
+                repository_identity: Some(
+                    phoenix_core::git::detect_git_repo_root(repo.path()).unwrap()
+                ),
                 branch_name: "feature/live".to_string(),
                 exact_ref: "refs/heads/feature/live".to_string(),
-                upstream_ref: Some("refs/heads/main".to_string()),
-                observed_branch_name: Some("feature/stale".to_string()),
-                observed_matches_live: false,
+                remote_status: BranchRemoteStatus::NoKnown {
+                    candidate_remote_refs: vec!["refs/remotes/origin/feature/live".to_string()],
+                },
             }
         );
     }
 
     #[test]
-    fn checkout_status_detached_reports_commit_oid() {
+    fn checkout_status_detached_reports_pointing_refs() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
+        run_git(repo.path(), &["tag", "v1"]).unwrap();
         let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
         run_git(repo.path(), &["checkout", "--quiet", head_oid.trim()]).unwrap();
-        let observed = crate::db::WorkScopeObservedBranch {
-            work_scope_id: 1,
-            repository_identity: "acme/repo".to_string(),
-            branch_name: "feature/stale".to_string(),
-            first_observed_head_oid: "aaaa".to_string(),
-            last_observed_head_oid: "bbbb".to_string(),
-            first_observed_at: "2024-01-01T00:00:00Z".to_string(),
-            last_observed_at: "2024-01-01T00:00:00Z".to_string(),
-        };
+
         assert_eq!(
-            checkout_status_from_live_observation(repo.path(), Some(&observed)),
+            checkout_status_from_live_observation(repo.path()),
             CheckoutStatus::Detached {
-                exact_ref: head_oid.trim().to_string(),
-                observed_branch_name: Some("feature/stale".to_string()),
+                head_oid: head_oid.trim().to_string(),
+                pointing_refs: vec!["refs/heads/main".to_string(), "refs/tags/v1".to_string(),],
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_unborn_reports_branch_name() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "trunk"]).unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::Unborn {
+                repository_identity: Some(
+                    phoenix_core::git::detect_git_repo_root(repo.path()).unwrap()
+                ),
+                branch_name: Some("trunk".to_string()),
             }
         );
     }
@@ -2647,24 +2749,24 @@ mod tests {
             "Workspace Diff".to_string(),
             "workspace",
             None,
-            CheckoutStatus::LiveBranch {
+            CheckoutStatus::NamedBranch {
                 repository_identity: Some("acme/repo".to_string()),
                 branch_name: "feature".to_string(),
                 exact_ref: "refs/heads/feature".to_string(),
-                upstream_ref: Some("refs/remotes/origin/feature".to_string()),
-                observed_branch_name: Some("feature".to_string()),
-                observed_matches_live: true,
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                },
             },
         );
         assert_eq!(
             response.checkout_status,
-            CheckoutStatus::LiveBranch {
+            CheckoutStatus::NamedBranch {
                 repository_identity: Some("acme/repo".to_string()),
                 branch_name: "feature".to_string(),
                 exact_ref: "refs/heads/feature".to_string(),
-                upstream_ref: Some("refs/remotes/origin/feature".to_string()),
-                observed_branch_name: Some("feature".to_string()),
-                observed_matches_live: true,
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                },
             }
         );
     }

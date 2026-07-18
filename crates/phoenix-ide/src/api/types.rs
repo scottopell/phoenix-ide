@@ -852,30 +852,46 @@ pub struct GitBranchesResponse {
 /// exact size, and consumers should render it as e.g. "≥X KiB".
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchRemoteStatus {
+    Tracked {
+        remote_ref: String,
+        ahead: u32,
+        behind: u32,
+    },
+    Matching {
+        remote_ref: String,
+    },
+    NoKnown {
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        candidate_remote_refs: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckoutStatus {
-    LiveBranch {
+    NamedBranch {
         repository_identity: Option<String>,
         branch_name: String,
         exact_ref: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        upstream_ref: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        observed_branch_name: Option<String>,
-        observed_matches_live: bool,
+        remote_status: BranchRemoteStatus,
     },
     Detached {
-        exact_ref: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        observed_branch_name: Option<String>,
+        head_oid: String,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pointing_refs: Vec<String>,
     },
     Unborn {
+        repository_identity: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        observed_branch_name: Option<String>,
+        branch_name: Option<String>,
     },
-    Missing {
+    Unavailable {
+        repository_identity: Option<String>,
         reason: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        observed_branch_name: Option<String>,
     },
 }
 
