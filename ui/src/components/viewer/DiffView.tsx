@@ -11,7 +11,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Columns2, Rows3 } from 'lucide-react';
+import { Columns2, GitBranch, Rows3 } from 'lucide-react';
+import type { BranchRemoteStatus, CheckoutStatus } from '../../api';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import {
@@ -32,6 +33,7 @@ import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
 import type { PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
+import './DiffView.css';
 
 export interface DiffViewProps {
   open: boolean;
@@ -46,6 +48,7 @@ export interface DiffViewProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
+  checkoutStatus?: CheckoutStatus | undefined;
   onClose: () => void;
   /** Drop the formatted review-notes pile into the chat input. Same
    *  signature as ProseReader's onSendNotes. */
@@ -78,6 +81,7 @@ export function DiffView({
   uncommittedDiff,
   uncommittedTruncatedKib,
   uncommittedSaturated,
+  checkoutStatus,
   onClose,
   onSendNotes,
   inline = false,
@@ -299,6 +303,7 @@ export function DiffView({
       }
     >
       <div className="diff-viewer-body">
+        <CheckoutStatusPanel checkoutStatus={checkoutStatus} />
         {empty ? (
           <div className="diff-viewer-empty">
             No changes vs <code>{comparator}</code>.
@@ -365,6 +370,112 @@ function stableDiffMatchIds(): (match: {
     duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
     return `${semanticSignature}:${duplicateOccurrence}`;
   };
+}
+
+function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus?: CheckoutStatus | undefined }) {
+  if (!checkoutStatus) return null;
+
+  if (checkoutStatus.kind === 'unavailable') {
+    return (
+      <section className="checkout-status-panel checkout-status-panel--warning" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">Checkout status unavailable</span>
+        </div>
+        <p className="checkout-status-panel__detail">{checkoutStatus.reason}</p>
+      </section>
+    );
+  }
+
+  if (checkoutStatus.kind === 'unborn') {
+    return (
+      <section className="checkout-status-panel" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">On an unborn branch</span>
+        </div>
+        <p className="checkout-status-panel__detail">Create the first commit to establish this branch.</p>
+      </section>
+    );
+  }
+
+  if (checkoutStatus.kind === 'detached') {
+    return (
+      <section className="checkout-status-panel checkout-status-panel--neutral" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">Detached HEAD</span>
+          <code className="checkout-status-panel__code" title={checkoutStatus.head_oid}>{abbreviateOid(checkoutStatus.head_oid)}</code>
+        </div>
+        {checkoutStatus.pointing_refs.length > 0 && (
+          <p className="checkout-status-panel__detail">
+            Pointing refs: {' '}
+            {checkoutStatus.pointing_refs.map((ref, index) => (
+              <span key={ref}>
+                {index > 0 ? ', ' : ''}
+                <code title={ref}>{shortenRef(ref)}</code>
+              </span>
+            ))}
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  const remoteSummary = describeRemoteStatus(checkoutStatus.remote_status);
+  return (
+    <section className="checkout-status-panel" aria-label="Checkout status">
+      <div className="checkout-status-panel__header">
+        <GitBranch size={16} aria-hidden="true" />
+        <span className="checkout-status-panel__title">
+          Branch <code title={checkoutStatus.exact_ref}>{checkoutStatus.branch_name}</code>
+        </span>
+        <code className="checkout-status-panel__code" title={checkoutStatus.exact_ref}>{shortenRef(checkoutStatus.exact_ref)}</code>
+        {checkoutStatus.repository_identity && (
+          <span className="checkout-status-panel__repo">{checkoutStatus.repository_identity}</span>
+        )}
+      </div>
+      <p className="checkout-status-panel__detail">{remoteSummary}</p>
+    </section>
+  );
+}
+
+function describeRemoteStatus(remoteStatus: BranchRemoteStatus): React.ReactNode {
+  if (remoteStatus.kind === 'no_known') {
+    return 'No known remote ref for this branch yet.';
+  }
+  if (remoteStatus.kind === 'unavailable') {
+    return `Last-fetched remote status unavailable: ${remoteStatus.reason}`;
+  }
+
+  const relationLabel = remoteStatus.kind === 'tracked' ? 'Tracked upstream' : 'Matching remote';
+  return (
+    <>
+      <span>{relationLabel}: </span>
+      <code title={remoteStatus.remote_ref}>{shortenRef(remoteStatus.remote_ref)}</code>
+      <span> · Last fetched </span>
+      <span>{describeAheadBehind(remoteStatus.ahead, remoteStatus.behind)}</span>
+      {remoteStatus.kind === 'matching' && <span> (not configured as upstream)</span>}
+    </>
+  );
+}
+
+function describeAheadBehind(ahead: number, behind: number): string {
+  if (ahead === 0 && behind === 0) return 'up-to-date';
+  if (ahead > 0 && behind === 0) return `${ahead} to push`;
+  if (ahead === 0 && behind > 0) return `${behind} behind`;
+  return `diverged (${ahead} to push, ${behind} behind)`;
+}
+
+function shortenRef(ref: string): string {
+  if (ref.startsWith('refs/remotes/')) return ref.slice('refs/remotes/'.length);
+  if (ref.startsWith('refs/heads/')) return ref.slice('refs/heads/'.length);
+  if (ref.startsWith('refs/tags/')) return ref.slice('refs/tags/'.length);
+  return ref;
+}
+
+function abbreviateOid(oid: string): string {
+  return oid.slice(0, 12);
 }
 
 function CommitLogSection({
@@ -452,6 +563,7 @@ interface DiffSummaryBarProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
+  checkoutStatus?: CheckoutStatus | undefined;
 }
 
 /** Section labels + truncation indicators above the diff surface. The diff
@@ -466,6 +578,7 @@ function DiffSummaryBar({
   uncommittedDiff,
   uncommittedTruncatedKib,
   uncommittedSaturated,
+  checkoutStatus,
 }: DiffSummaryBarProps) {
   return (
     <div className="diff-summary-bar">

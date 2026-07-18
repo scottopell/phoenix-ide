@@ -22,6 +22,12 @@ function payloadFor(marker: string) {
     commit_log: '',
     committed_diff: `diff --git a/${marker}.txt b/${marker}.txt\n--- a/${marker}.txt\n+++ b/${marker}.txt\n@@ -0,0 +1 @@\n+${marker}`,
     uncommitted_diff: '',
+    checkout_status: {
+      kind: 'named_branch',
+      branch_name: marker.toLowerCase(),
+      exact_ref: `refs/heads/${marker.toLowerCase()}`,
+      remote_status: { kind: 'no_known' },
+    },
   };
 }
 
@@ -128,6 +134,34 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     screen.getByText('Retry').click();
     expect(await screen.findByText('RETRY.txt')).toBeInTheDocument();
     expect(api.getActivePrDiff).toHaveBeenCalledTimes(2);
+  });
+
+
+
+  it('threads checkout status from the loader payload into DiffView', async () => {
+    (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...payloadFor('CHECKOUT'),
+      checkout_status: {
+        kind: 'named_branch',
+        branch_name: 'task-82003',
+        exact_ref: 'refs/heads/task-82003',
+        repository_identity: 'acme/phoenix',
+        remote_status: {
+          kind: 'tracked',
+          remote_ref: 'refs/remotes/origin/task-82003',
+          ahead: 0,
+          behind: 4,
+        },
+      },
+    });
+
+    renderViewer('conv-checkout');
+
+    const panel = await screen.findByLabelText('Checkout status');
+    expect(panel).toHaveTextContent('task-82003');
+    expect(panel).toHaveTextContent('acme/phoenix');
+    expect(panel).toHaveTextContent('origin/task-82003');
+    expect(panel).toHaveTextContent('Last fetched 4 behind');
   });
 
   it('renders fullscreen presentation as a takeover dialog', async () => {

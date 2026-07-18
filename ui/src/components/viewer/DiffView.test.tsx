@@ -19,7 +19,7 @@ const COMMITTED = [
   '+hello world',
 ].join('\n');
 
-function renderDiff(committed = COMMITTED, uncommitted = '') {
+function renderDiff(committed = COMMITTED, uncommitted = '', checkoutStatus?: import('../../api').CheckoutStatus) {
   return render(
     <ReviewNotesProvider>
       <DiffView
@@ -28,6 +28,7 @@ function renderDiff(committed = COMMITTED, uncommitted = '') {
         commitLog=""
         committedDiff={committed}
         uncommittedDiff={uncommitted}
+        checkoutStatus={checkoutStatus}
         onClose={() => undefined}
         onSendNotes={() => undefined}
       />
@@ -568,6 +569,118 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(codeViewMockState.scrollToCalls).toEqual([
       { type: 'line', id: 'committed:foo.txt', lineNumber: 1, side: 'additions', align: 'center', behavior: 'smooth' },
     ]);
+  });
+
+
+
+  it('shows named-branch checkout status before commits with shortened refs and last-fetched remote state', () => {
+    renderDiff(COMMITTED, '', {
+      kind: 'named_branch',
+      branch_name: 'task-82003',
+      exact_ref: 'refs/heads/task-82003',
+      repository_identity: 'acme/phoenix',
+      remote_status: {
+        kind: 'tracked',
+        remote_ref: 'refs/remotes/origin/task-82003',
+        ahead: 2,
+        behind: 0,
+      },
+    });
+
+    const panel = screen.getByLabelText('Checkout status');
+    expect(panel).toHaveTextContent('Branch task-82003');
+    expect(panel).toHaveTextContent('task-82003');
+    expect(panel).toHaveTextContent('acme/phoenix');
+    expect(panel).toHaveTextContent('Tracked upstream:');
+    expect(panel).toHaveTextContent('origin/task-82003');
+    expect(panel).toHaveTextContent('Last fetched 2 to push');
+    const summary = screen.getByText(/Committed changes \(vs origin\/main\)/);
+    expect(summary.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    expect(screen.getByTitle('refs/remotes/origin/task-82003')).toBeInTheDocument();
+  });
+
+  it('shows checkout status even when the diff is empty', () => {
+    renderDiff('', '', {
+      kind: 'named_branch',
+      branch_name: 'main',
+      exact_ref: 'refs/heads/main',
+      remote_status: { kind: 'no_known' },
+    });
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('No known remote ref for this branch yet.');
+    expect(screen.getByText(/No changes vs/)).toBeInTheDocument();
+  });
+
+  it('distinguishes matching remotes, detached heads, and unavailable checkout state', () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{
+            kind: 'named_branch',
+            branch_name: 'task-82003',
+            exact_ref: 'refs/heads/task-82003',
+            remote_status: {
+              kind: 'matching',
+              remote_ref: 'refs/remotes/origin/task-82003',
+              ahead: 1,
+              behind: 3,
+            },
+          }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Matching remote:');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('diverged (1 to push, 3 behind)');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('(not configured as upstream)');
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{
+            kind: 'detached',
+            head_oid: '1234567890abcdef1234567890abcdef12345678',
+            pointing_refs: ['refs/remotes/origin/main', 'refs/tags/v1.2.3'],
+          }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Detached HEAD');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('1234567890ab');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('origin/main, v1.2.3');
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{ kind: 'unavailable', reason: 'git status failed' }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Checkout status unavailable');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('git status failed');
   });
 
   it('shows the empty state when there are no changes', () => {

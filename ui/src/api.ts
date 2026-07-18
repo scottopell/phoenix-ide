@@ -227,6 +227,32 @@ export interface PinAssociatedPrRequest {
 
 export type ConversationDiffKind = 'workspace' | 'active_pr';
 
+export type BranchRemoteStatus =
+  | {
+    kind: 'tracked' | 'matching';
+    remote_ref: string;
+    ahead: number;
+    behind: number;
+  }
+  | { kind: 'no_known' }
+  | { kind: 'unavailable'; reason: string };
+
+export type CheckoutStatus =
+  | {
+    kind: 'named_branch';
+    branch_name: string;
+    exact_ref: string;
+    repository_identity?: string;
+    remote_status: BranchRemoteStatus;
+  }
+  | {
+    kind: 'detached';
+    head_oid: string;
+    pointing_refs: string[];
+  }
+  | { kind: 'unborn' }
+  | { kind: 'unavailable'; reason: string };
+
 export interface ConversationDiffResponse {
   comparator: string;
   commit_log: string;
@@ -236,6 +262,7 @@ export interface ConversationDiffResponse {
   uncommitted_diff: string;
   uncommitted_truncated_kib?: number;
   uncommitted_saturated?: boolean;
+  checkout_status?: CheckoutStatus;
   kind?: ConversationDiffKind;
   label?: string;
   pr_number?: number;
