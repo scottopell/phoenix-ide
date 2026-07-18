@@ -21,7 +21,105 @@ enum TestBarrierEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TestProfile;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct RuntimeOnlyProfile;
+
+impl WorkflowProfile for RuntimeOnlyProfile {
+    type RuntimeAcceptance = RuntimeAcceptanceEnabled;
+    type ExternalAcceptance = ExternalAcceptanceDisabled;
+    type Snapshot = &'static str;
+    type Event = TestEvent;
+    type Intent = &'static str;
+    type Observation = &'static str;
+    type Receipt = &'static str;
+    type ReceiptReducerEvent = &'static str;
+    type BarrierEvent = TestBarrierEvent;
+    type ManualPayload = &'static str;
+
+    fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
+        TestProfile::runtime_start_allowed(snapshot)
+    }
+    fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool {
+        TestProfile::receipt_requires_runtime_acceptance(event)
+    }
+    fn decision_handles_delivery(item: &DeliveryItem<Self>, decision_event: &Self::Event) -> bool {
+        match (&item.payload, decision_event) {
+            (DeliveryPayload::Receipt(payload), TestEvent::Delivery(expected)) => {
+                payload == expected
+            }
+            (
+                DeliveryPayload::Barrier(TestBarrierEvent::Family(payload)),
+                TestEvent::Delivery(expected),
+            ) => payload == expected,
+            _ => false,
+        }
+    }
+    fn decision_handles_runtime_acceptance(
+        item: &DeliveryItem<Self>,
+        decision_event: &Self::Event,
+    ) -> bool {
+        matches!((&item.payload, decision_event), (DeliveryPayload::Receipt(payload), TestEvent::RuntimeAccept(expected)) if payload == expected)
+    }
+    fn decision_handles_runtime_suppression(
+        item: &DeliveryItem<Self>,
+        decision_event: &Self::Event,
+    ) -> bool {
+        matches!((&item.payload, decision_event), (DeliveryPayload::Receipt(payload), TestEvent::RuntimeSuppress(expected)) if payload == expected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct NoRuntimeProfile;
+
+impl WorkflowProfile for NoRuntimeProfile {
+    type RuntimeAcceptance = RuntimeAcceptanceDisabled;
+    type ExternalAcceptance = ExternalAcceptanceEnabled;
+    type Snapshot = &'static str;
+    type Event = TestEvent;
+    type Intent = &'static str;
+    type Observation = &'static str;
+    type Receipt = &'static str;
+    type ReceiptReducerEvent = &'static str;
+    type BarrierEvent = TestBarrierEvent;
+    type ManualPayload = &'static str;
+
+    fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
+        TestProfile::runtime_start_allowed(snapshot)
+    }
+    fn receipt_requires_runtime_acceptance(event: &Self::ReceiptReducerEvent) -> bool {
+        TestProfile::receipt_requires_runtime_acceptance(event)
+    }
+    fn decision_handles_delivery(item: &DeliveryItem<Self>, decision_event: &Self::Event) -> bool {
+        match (&item.payload, decision_event) {
+            (DeliveryPayload::Receipt(payload), TestEvent::Delivery(expected)) => {
+                payload == expected
+            }
+            (
+                DeliveryPayload::Barrier(TestBarrierEvent::Family(payload)),
+                TestEvent::Delivery(expected),
+            ) => payload == expected,
+            _ => false,
+        }
+    }
+    fn decision_handles_runtime_acceptance(
+        item: &DeliveryItem<Self>,
+        decision_event: &Self::Event,
+    ) -> bool {
+        matches!((&item.payload, decision_event), (DeliveryPayload::Receipt(payload), TestEvent::RuntimeAccept(expected)) if payload == expected)
+    }
+    fn decision_handles_runtime_suppression(
+        item: &DeliveryItem<Self>,
+        decision_event: &Self::Event,
+    ) -> bool {
+        matches!((&item.payload, decision_event), (DeliveryPayload::Receipt(payload), TestEvent::RuntimeSuppress(expected)) if payload == expected)
+    }
+}
+
 impl WorkflowProfile for TestProfile {
+    type RuntimeAcceptance = RuntimeAcceptanceEnabled;
+    type ExternalAcceptance = ExternalAcceptanceEnabled;
     type Snapshot = &'static str;
     type Event = TestEvent;
     type Intent = &'static str;
@@ -87,10 +185,10 @@ fn codec(family: &'static str) -> CodecRef {
     CodecRef { family, version: 1 }
 }
 
-fn acceptance() -> AcceptanceProfile {
-    AcceptanceProfile {
-        profile: profile(),
-        supported_codecs: SupportedCodecRegistry::new([
+fn acceptance() -> AcceptanceProfile<RuntimeAcceptanceEnabled, ExternalAcceptanceEnabled> {
+    AcceptanceProfile::new(
+        profile(),
+        SupportedCodecRegistry::new([
             codec("snapshot"),
             codec("event"),
             codec("intent"),
@@ -99,9 +197,63 @@ fn acceptance() -> AcceptanceProfile {
             codec("manual"),
         ])
         .expect("codecs"),
-        runtime_acceptance_enabled: true,
-        external_acceptance_enabled: true,
-    }
+    )
+}
+
+fn runtime_only_acceptance(
+) -> AcceptanceProfile<RuntimeAcceptanceEnabled, ExternalAcceptanceDisabled> {
+    AcceptanceProfile::new(
+        profile(),
+        SupportedCodecRegistry::new([
+            codec("snapshot"),
+            codec("event"),
+            codec("intent"),
+            codec("receipt"),
+            codec("barrier"),
+            codec("manual"),
+        ])
+        .expect("codecs"),
+    )
+}
+
+fn no_runtime_acceptance() -> AcceptanceProfile<RuntimeAcceptanceDisabled, ExternalAcceptanceEnabled>
+{
+    AcceptanceProfile::new(
+        profile(),
+        SupportedCodecRegistry::new([
+            codec("snapshot"),
+            codec("event"),
+            codec("intent"),
+            codec("receipt"),
+            codec("barrier"),
+            codec("manual"),
+        ])
+        .expect("codecs"),
+    )
+}
+
+fn erased_runtime_only_acceptance() -> ErasedAcceptanceProfile {
+    runtime_only_acceptance().erase()
+}
+
+fn erased_no_runtime_acceptance() -> ErasedAcceptanceProfile {
+    no_runtime_acceptance().erase()
+}
+
+fn erased_no_acceptance() -> ErasedAcceptanceProfile {
+    AcceptanceProfile::<RuntimeAcceptanceDisabled, ExternalAcceptanceDisabled>::new(
+        profile(),
+        SupportedCodecRegistry::new([
+            codec("snapshot"),
+            codec("event"),
+            codec("intent"),
+            codec("receipt"),
+            codec("barrier"),
+            codec("manual"),
+        ])
+        .expect("codecs"),
+    )
+    .erase()
 }
 
 fn workflow() -> WorkflowState<TestProfile> {
@@ -139,13 +291,22 @@ fn delivery_decl(
     payload: &'static str,
     requires_runtime_acceptance: bool,
 ) -> DeliveryDecl<TestProfile> {
-    DeliveryDecl {
-        effect_id: None,
-        barrier_id: None,
-        consumer_kind: "reducer",
-        event_codec: codec("receipt"),
-        requires_runtime_acceptance,
-        payload: DeliveryPayload::Receipt(payload),
+    if requires_runtime_acceptance {
+        DeliveryDecl::runtime_owed(
+            None,
+            None,
+            "reducer",
+            codec("receipt"),
+            DeliveryPayload::Receipt(payload),
+        )
+    } else {
+        DeliveryDecl::immediate(
+            None,
+            None,
+            "reducer",
+            codec("receipt"),
+            DeliveryPayload::Receipt(payload),
+        )
     }
 }
 
@@ -1151,6 +1312,356 @@ fn typed_migration_preserves_incompatible_active_workflow() {
 }
 
 #[test]
+fn acceptance_capability_helpers_expose_profile_shape() {
+    let runtime_only = runtime_only_acceptance();
+    assert!(runtime_only.runtime_acceptance_enabled());
+    assert!(!runtime_only.external_acceptance_enabled());
+
+    let no_runtime = no_runtime_acceptance();
+    assert!(!no_runtime.runtime_acceptance_enabled());
+    assert!(no_runtime.external_acceptance_enabled());
+}
+
+#[test]
+fn erased_acceptance_profile_preserves_only_valid_capability_shapes() {
+    let runtime_only = erased_runtime_only_acceptance();
+    assert!(runtime_only.runtime_acceptance_enabled());
+    assert!(!runtime_only.external_acceptance_enabled());
+
+    let no_runtime = erased_no_runtime_acceptance();
+    assert!(!no_runtime.runtime_acceptance_enabled());
+    assert!(no_runtime.external_acceptance_enabled());
+
+    let no_acceptance = erased_no_acceptance();
+    assert!(!no_acceptance.runtime_acceptance_enabled());
+    assert!(!no_acceptance.external_acceptance_enabled());
+
+    let full = acceptance().erase();
+    assert!(full.runtime_acceptance_enabled());
+    assert!(full.external_acceptance_enabled());
+}
+
+fn external_binding_parts(
+    key: &NonEmptyExternalKey,
+    workflow_id: WorkflowId,
+    receipt_handle: &'static str,
+    disposition_handle: &'static str,
+) -> (
+    ExternalAcceptanceReceipt<&'static str>,
+    ExternalAcceptanceDisposition<&'static str>,
+) {
+    (
+        ExternalAcceptanceReceipt {
+            idempotency_key: key.clone(),
+            workflow_id,
+            handle: receipt_handle,
+        },
+        ExternalAcceptanceDisposition {
+            workflow_id,
+            handle: disposition_handle,
+        },
+    )
+}
+
+fn expect_created(
+    outcome: ExternalAcceptanceOutcome<&'static str>,
+) -> ExternalAcceptanceBinding<&'static str> {
+    match outcome {
+        ExternalAcceptanceOutcome::Created(binding) => binding,
+        other @ (ExternalAcceptanceOutcome::Replayed(_) | ExternalAcceptanceOutcome::Conflict) => {
+            panic!("unexpected outcome: {other:?}")
+        }
+    }
+}
+
+fn expect_replayed(
+    outcome: ExternalAcceptanceOutcome<&'static str>,
+) -> ExternalAcceptanceBinding<&'static str> {
+    match outcome {
+        ExternalAcceptanceOutcome::Replayed(binding) => binding,
+        other @ (ExternalAcceptanceOutcome::Created(_) | ExternalAcceptanceOutcome::Conflict) => {
+            panic!("unexpected outcome: {other:?}")
+        }
+    }
+}
+
+fn assert_registry_binding_shape(
+    binding: &ExternalAcceptanceBinding<&'static str>,
+    expected_scope: &ScopeId,
+    expected_key: &NonEmptyExternalKey,
+    expected_receipt: &ExternalAcceptanceReceipt<&'static str>,
+    expected_disposition: &ExternalAcceptanceDisposition<&'static str>,
+) {
+    assert_eq!(binding.profile, profile());
+    assert_eq!(&binding.target_scope, expected_scope);
+    assert_eq!(&binding.idempotency_key, expected_key);
+    assert_eq!(binding.intent_fingerprint, "fp-a");
+    assert_eq!(&binding.receipt, expected_receipt);
+    assert_eq!(&binding.disposition, expected_disposition);
+}
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn external_acceptance_registry_created_replayed_conflict_and_target_independence() {
+    let profile_acceptance = acceptance();
+    let mut registry = ExternalAcceptanceRegistry::<TestProfile, &'static str>::new();
+    let key = NonEmptyExternalKey::new("client-1").expect("key");
+    let target_scope = ScopeId::new("conversation:1").expect("scope");
+    let (receipt, disposition) =
+        external_binding_parts(&key, WorkflowId(1), "receipt", "disposition");
+
+    let created_binding = expect_created(registry.accept(
+        &profile_acceptance,
+        target_scope.clone(),
+        key.clone(),
+        "fp-a".into(),
+        receipt.clone(),
+        disposition.clone(),
+    ));
+    assert_registry_binding_shape(
+        &created_binding,
+        &target_scope,
+        &key,
+        &receipt,
+        &disposition,
+    );
+
+    let replayed_binding = expect_replayed(registry.accept(
+        &profile_acceptance,
+        target_scope.clone(),
+        key.clone(),
+        "fp-a".into(),
+        created_binding.receipt.clone(),
+        created_binding.disposition.clone(),
+    ));
+    assert_eq!(replayed_binding, created_binding);
+
+    let (receipt_conflict_receipt, _) =
+        external_binding_parts(&key, WorkflowId(2), "receipt", "disposition");
+    assert_eq!(
+        registry.accept(
+            &profile_acceptance,
+            target_scope.clone(),
+            key.clone(),
+            "fp-a".into(),
+            receipt_conflict_receipt,
+            created_binding.disposition.clone(),
+        ),
+        ExternalAcceptanceOutcome::Conflict
+    );
+
+    let (_, disposition_conflict_disposition) =
+        external_binding_parts(&key, WorkflowId(2), "receipt", "disposition");
+    assert_eq!(
+        registry.accept(
+            &profile_acceptance,
+            target_scope.clone(),
+            key.clone(),
+            "fp-a".into(),
+            created_binding.receipt.clone(),
+            disposition_conflict_disposition,
+        ),
+        ExternalAcceptanceOutcome::Conflict
+    );
+
+    assert_eq!(
+        registry.accept(
+            &profile_acceptance,
+            target_scope.clone(),
+            key.clone(),
+            "fp-b".into(),
+            created_binding.receipt.clone(),
+            created_binding.disposition.clone(),
+        ),
+        ExternalAcceptanceOutcome::Conflict
+    );
+
+    let exact = registry
+        .get_exact(&profile(), &target_scope, &key)
+        .expect("binding");
+    assert_eq!(exact, &created_binding);
+
+    let other_scope = ScopeId::new("conversation:2").expect("scope");
+    assert!(matches!(
+        registry.accept(
+            &profile_acceptance,
+            other_scope.clone(),
+            key.clone(),
+            "fp-z".into(),
+            created_binding.receipt.clone(),
+            created_binding.disposition.clone(),
+        ),
+        ExternalAcceptanceOutcome::Created(_)
+    ));
+
+    let other_key = NonEmptyExternalKey::new("client-2").expect("key");
+    let (other_receipt, other_disposition) =
+        external_binding_parts(&other_key, WorkflowId(3), "receipt-3", "disposition-3");
+    assert!(matches!(
+        registry.accept(
+            &profile_acceptance,
+            target_scope.clone(),
+            other_key,
+            "fp-c".into(),
+            other_receipt,
+            other_disposition,
+        ),
+        ExternalAcceptanceOutcome::Created(_)
+    ));
+
+    let exact_target_bindings = registry.list_for_target(&profile(), &target_scope);
+    assert_eq!(exact_target_bindings.len(), 2);
+    assert!(exact_target_bindings
+        .iter()
+        .all(|binding| binding.profile == profile()));
+    assert!(exact_target_bindings
+        .iter()
+        .all(|binding| binding.target_scope == target_scope));
+    assert_eq!(registry.list_for_target(&profile(), &other_scope).len(), 1);
+}
+
+#[test]
+fn runtime_acceptance_can_be_suppressed_and_exactly_targets_single_item() {
+    let mut first_workflow = workflow();
+    let mut first_plan = base_plan();
+    first_plan.deliveries.push(delivery_decl("runtime", true));
+    first_plan.deliveries.push(delivery_decl("plain", false));
+    first_workflow
+        .commit_transition(&decision(Version(0), first_plan), &BTreeMap::new())
+        .expect("commit");
+
+    let runtime_id = first_workflow
+        .deliveries
+        .iter()
+        .find(|(_, item)| item.runtime_acceptance_status == Some(RuntimeAcceptanceStatus::Owed))
+        .map(|(id, _)| *id)
+        .expect("runtime owed");
+    let plain_id = first_workflow
+        .deliveries
+        .iter()
+        .find(|(_, item)| item.runtime_acceptance_status.is_none())
+        .map(|(id, _)| *id)
+        .expect("plain");
+
+    let accepted = first_workflow
+        .accept_runtime_delivery(
+            runtime_id,
+            &decision(
+                Version(1),
+                TransitionPlan {
+                    event: TestEvent::RuntimeAccept("runtime"),
+                    ..base_plan()
+                },
+            ),
+            false,
+        )
+        .expect("accept");
+    assert_eq!(
+        accepted
+            .delivery
+            .expect("delivery")
+            .runtime_acceptance_status,
+        Some(RuntimeAcceptanceStatus::Accepted)
+    );
+    assert_eq!(
+        first_workflow.deliveries[&plain_id].runtime_acceptance_status,
+        None
+    );
+
+    let mut second_workflow = workflow();
+    let mut second_plan = base_plan();
+    second_plan.deliveries.push(delivery_decl("runtime", true));
+    second_workflow
+        .commit_transition(&decision(Version(0), second_plan), &BTreeMap::new())
+        .expect("commit");
+    let runtime_id = *second_workflow.deliveries.keys().next().expect("delivery");
+    let suppressed = second_workflow
+        .accept_runtime_delivery(
+            runtime_id,
+            &decision(
+                Version(1),
+                TransitionPlan {
+                    event: TestEvent::RuntimeSuppress("runtime"),
+                    ..base_plan()
+                },
+            ),
+            true,
+        )
+        .expect("suppress");
+    let delivery = suppressed.delivery.expect("delivery");
+    assert_eq!(
+        delivery.runtime_acceptance_status,
+        Some(RuntimeAcceptanceStatus::Suppressed)
+    );
+    assert_eq!(delivery.status, DeliveryStatus::Suppressed);
+}
+
+#[test]
+fn schedule_coalesces_downtime_and_rejects_stale_or_duplicate_completion() {
+    let mut workflow = workflow();
+    let mut plan = base_plan();
+    plan.schedules.push(ScheduleDecl {
+        schedule_id: ScheduleId(12),
+        policy: SchedulePolicy::CoalesceLatest,
+        next_eligible_at: Timestamp(5),
+        key: "cron-late",
+    });
+    workflow
+        .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
+        .expect("commit");
+
+    workflow.refresh_eligibility(Timestamp(100));
+    let schedule = &workflow.schedules[&ScheduleId(12)];
+    assert_eq!(schedule.status, ScheduleStatus::Due);
+    let occurrence = schedule.due_occurrence.expect("coalesced once");
+    assert_eq!(occurrence.due_at, Timestamp(5));
+    assert!(workflow
+        .reconcile_schedule_due(ScheduleId(12), Timestamp(100))
+        .is_none());
+
+    let started = workflow
+        .start_schedule_occurrence(occurrence, Some(EffectId(77)))
+        .expect("start");
+    assert_eq!(started.status, ScheduleStatus::Active);
+    assert_eq!(started.active_occurrence, Some(occurrence));
+    assert_eq!(started.active_effect_id, Some(EffectId(77)));
+    assert!(workflow
+        .complete_schedule_occurrence(occurrence, Timestamp(200))
+        .is_some());
+    let after_duplicate = workflow.clone();
+    assert!(workflow
+        .complete_schedule_occurrence(occurrence, Timestamp(300))
+        .is_none());
+    assert_eq!(workflow, after_duplicate);
+    assert_eq!(
+        workflow.schedules[&ScheduleId(12)].next_eligible_at,
+        Timestamp(200)
+    );
+
+    workflow.refresh_eligibility(Timestamp(250));
+    let newer = workflow.schedules[&ScheduleId(12)]
+        .due_occurrence
+        .expect("new due");
+    workflow
+        .start_schedule_occurrence(newer, None)
+        .expect("start newer");
+    let before_stale_completion = workflow.clone();
+    assert!(workflow
+        .complete_schedule_occurrence(occurrence, Timestamp(500))
+        .is_none());
+    assert_eq!(workflow, before_stale_completion);
+    let completed = workflow
+        .complete_schedule_occurrence(newer, Timestamp(260))
+        .expect("complete newer");
+    assert_eq!(completed.status, ScheduleStatus::Idle);
+    assert_eq!(completed.next_eligible_at, Timestamp(260));
+    assert_eq!(
+        workflow.schedules[&ScheduleId(12)].next_eligible_at,
+        Timestamp(260)
+    );
+}
+
+#[test]
 fn coalesce_latest_schedule_advances_and_resets() {
     let mut workflow = workflow();
     let mut plan = base_plan();
@@ -1164,18 +1675,51 @@ fn coalesce_latest_schedule_advances_and_resets() {
         .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
         .expect("commit");
     assert_eq!(
-        workflow.advance_schedule(ScheduleId(11), Timestamp(4)),
+        workflow.reconcile_schedule_due(ScheduleId(11), Timestamp(4)),
         None
     );
-    let due = workflow
-        .advance_schedule(ScheduleId(11), Timestamp(5))
+    let occurrence = workflow
+        .reconcile_schedule_due(ScheduleId(11), Timestamp(5))
         .expect("due");
-    assert_eq!(due.status, ScheduleStatus::Due);
+    let due = workflow
+        .start_schedule_occurrence(occurrence, None)
+        .expect("started");
+    assert_eq!(due.status, ScheduleStatus::Active);
     let reset = workflow
-        .complete_schedule_occurrence(ScheduleId(11), Timestamp(9))
+        .complete_schedule_occurrence(occurrence, Timestamp(9))
         .expect("reset");
     assert_eq!(reset.status, ScheduleStatus::Idle);
     assert_eq!(reset.next_eligible_at, Timestamp(9));
+}
+
+#[test]
+fn workflow_clone_preserves_erased_acceptance_and_schedule_occurrence_state() {
+    let mut workflow = workflow();
+    let mut plan = base_plan();
+    plan.schedules.push(ScheduleDecl {
+        schedule_id: ScheduleId(21),
+        policy: SchedulePolicy::CoalesceLatest,
+        next_eligible_at: Timestamp(5),
+        key: "cloneable-cron",
+    });
+    workflow
+        .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
+        .expect("commit");
+    workflow.refresh_eligibility(Timestamp(5));
+    let original = workflow.schedules[&ScheduleId(21)]
+        .due_occurrence
+        .expect("due occurrence");
+
+    let cloned = workflow.clone();
+    assert_eq!(cloned.binding.acceptance, workflow.binding.acceptance);
+    assert_eq!(
+        cloned.schedules[&ScheduleId(21)].due_occurrence,
+        Some(original)
+    );
+    assert_eq!(
+        cloned.next_schedule_occurrence_id,
+        workflow.next_schedule_occurrence_id
+    );
 }
 
 #[test]

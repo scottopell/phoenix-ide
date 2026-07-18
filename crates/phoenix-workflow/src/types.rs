@@ -95,6 +95,50 @@ pub struct CodecRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportedCodecRegistry(BTreeSet<CodecRef>);
 
+mod capability_seal {
+    pub trait Sealed {}
+}
+
+pub trait RuntimeAcceptanceCapability:
+    capability_seal::Sealed + Clone + Eq + std::fmt::Debug + Default
+{
+    const ENABLED: bool;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeAcceptanceEnabled;
+impl capability_seal::Sealed for RuntimeAcceptanceEnabled {}
+impl RuntimeAcceptanceCapability for RuntimeAcceptanceEnabled {
+    const ENABLED: bool = true;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeAcceptanceDisabled;
+impl capability_seal::Sealed for RuntimeAcceptanceDisabled {}
+impl RuntimeAcceptanceCapability for RuntimeAcceptanceDisabled {
+    const ENABLED: bool = false;
+}
+
+pub trait ExternalAcceptanceCapability:
+    capability_seal::Sealed + Clone + Eq + std::fmt::Debug + Default
+{
+    const ENABLED: bool;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalAcceptanceEnabled;
+impl capability_seal::Sealed for ExternalAcceptanceEnabled {}
+impl ExternalAcceptanceCapability for ExternalAcceptanceEnabled {
+    const ENABLED: bool = true;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalAcceptanceDisabled;
+impl capability_seal::Sealed for ExternalAcceptanceDisabled {}
+impl ExternalAcceptanceCapability for ExternalAcceptanceDisabled {
+    const ENABLED: bool = false;
+}
+
 impl SupportedCodecRegistry {
     #[must_use]
     pub fn new(codecs: impl IntoIterator<Item = CodecRef>) -> Option<Self> {
@@ -268,11 +312,99 @@ pub enum ExecutionCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptanceProfile {
+pub struct AcceptanceProfile<R = RuntimeAcceptanceDisabled, E = ExternalAcceptanceDisabled>
+where
+    R: RuntimeAcceptanceCapability,
+    E: ExternalAcceptanceCapability,
+{
     pub profile: ProfileRef,
     pub supported_codecs: SupportedCodecRegistry,
-    pub runtime_acceptance_enabled: bool,
-    pub external_acceptance_enabled: bool,
+    runtime_acceptance: R,
+    external_acceptance: E,
+}
+
+impl<R, E> AcceptanceProfile<R, E>
+where
+    R: RuntimeAcceptanceCapability,
+    E: ExternalAcceptanceCapability,
+{
+    #[must_use]
+    pub fn new(profile: ProfileRef, supported_codecs: SupportedCodecRegistry) -> Self {
+        Self {
+            profile,
+            supported_codecs,
+            runtime_acceptance: R::default(),
+            external_acceptance: E::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_acceptance_enabled(&self) -> bool {
+        R::ENABLED
+    }
+
+    #[must_use]
+    pub fn external_acceptance_enabled(&self) -> bool {
+        E::ENABLED
+    }
+
+    #[must_use]
+    pub fn erase(self) -> ErasedAcceptanceProfile {
+        ErasedAcceptanceProfile {
+            profile: self.profile,
+            supported_codecs: self.supported_codecs,
+            capabilities: ErasedAcceptanceCapabilities::from_flags(R::ENABLED, E::ENABLED),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErasedAcceptanceCapabilities {
+    None,
+    RuntimeOnly,
+    ExternalOnly,
+    RuntimeAndExternal,
+}
+
+impl ErasedAcceptanceCapabilities {
+    #[must_use]
+    fn from_flags(runtime_acceptance_enabled: bool, external_acceptance_enabled: bool) -> Self {
+        match (runtime_acceptance_enabled, external_acceptance_enabled) {
+            (false, false) => Self::None,
+            (true, false) => Self::RuntimeOnly,
+            (false, true) => Self::ExternalOnly,
+            (true, true) => Self::RuntimeAndExternal,
+        }
+    }
+
+    #[must_use]
+    fn runtime_acceptance_enabled(self) -> bool {
+        matches!(self, Self::RuntimeOnly | Self::RuntimeAndExternal)
+    }
+
+    #[must_use]
+    fn external_acceptance_enabled(self) -> bool {
+        matches!(self, Self::ExternalOnly | Self::RuntimeAndExternal)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasedAcceptanceProfile {
+    pub profile: ProfileRef,
+    pub supported_codecs: SupportedCodecRegistry,
+    capabilities: ErasedAcceptanceCapabilities,
+}
+
+impl ErasedAcceptanceProfile {
+    #[must_use]
+    pub fn runtime_acceptance_enabled(&self) -> bool {
+        self.capabilities.runtime_acceptance_enabled()
+    }
+
+    #[must_use]
+    pub fn external_acceptance_enabled(&self) -> bool {
+        self.capabilities.external_acceptance_enabled()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -305,32 +437,149 @@ pub struct ExternalAcceptanceReceipt<H> {
     pub handle: H,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScopeId(pub String);
+
+impl ScopeId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAcceptanceDisposition<H> {
+    pub workflow_id: WorkflowId,
+    pub handle: H,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAcceptanceBinding<H> {
     pub profile: ProfileRef,
-    pub authority_scope: NonEmptyExternalKey,
+    pub target_scope: ScopeId,
     pub idempotency_key: NonEmptyExternalKey,
     pub intent_fingerprint: String,
     pub receipt: ExternalAcceptanceReceipt<H>,
+    pub disposition: ExternalAcceptanceDisposition<H>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalAcceptanceOutcome<H> {
-    New(ExternalAcceptanceReceipt<H>),
-    Replay(ExternalAcceptanceReceipt<H>),
+    Created(ExternalAcceptanceBinding<H>),
+    Replayed(ExternalAcceptanceBinding<H>),
     Conflict,
-    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAcceptanceRegistry<P, H>
+where
+    P: WorkflowProfile<ExternalAcceptance = ExternalAcceptanceEnabled>,
+    H: Clone + Eq + std::fmt::Debug,
+{
+    bindings: BTreeMap<(ProfileRef, ScopeId, NonEmptyExternalKey), ExternalAcceptanceBinding<H>>,
+    _profile: std::marker::PhantomData<P>,
+}
+
+impl<P, H> Default for ExternalAcceptanceRegistry<P, H>
+where
+    P: WorkflowProfile<ExternalAcceptance = ExternalAcceptanceEnabled>,
+    H: Clone + Eq + std::fmt::Debug,
+{
+    fn default() -> Self {
+        Self {
+            bindings: BTreeMap::new(),
+            _profile: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P, H> ExternalAcceptanceRegistry<P, H>
+where
+    P: WorkflowProfile<ExternalAcceptance = ExternalAcceptanceEnabled>,
+    H: Clone + Eq + std::fmt::Debug,
+{
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn accept(
+        &mut self,
+        profile: &AcceptanceProfile<P::RuntimeAcceptance, P::ExternalAcceptance>,
+        target_scope: ScopeId,
+        key: NonEmptyExternalKey,
+        intent_fingerprint: String,
+        receipt: ExternalAcceptanceReceipt<H>,
+        disposition: ExternalAcceptanceDisposition<H>,
+    ) -> ExternalAcceptanceOutcome<H> {
+        let map_key = (profile.profile.clone(), target_scope.clone(), key.clone());
+        let candidate = ExternalAcceptanceBinding {
+            profile: profile.profile.clone(),
+            target_scope,
+            idempotency_key: key,
+            intent_fingerprint,
+            receipt,
+            disposition,
+        };
+        match self.bindings.get(&map_key) {
+            None => {
+                self.bindings.insert(map_key, candidate.clone());
+                ExternalAcceptanceOutcome::Created(candidate)
+            }
+            Some(existing)
+                if existing.intent_fingerprint == candidate.intent_fingerprint
+                    && existing.receipt == candidate.receipt
+                    && existing.disposition == candidate.disposition =>
+            {
+                ExternalAcceptanceOutcome::Replayed(existing.clone())
+            }
+            Some(_) => ExternalAcceptanceOutcome::Conflict,
+        }
+    }
+
+    #[must_use]
+    pub fn get_exact(
+        &self,
+        profile: &ProfileRef,
+        target_scope: &ScopeId,
+        key: &NonEmptyExternalKey,
+    ) -> Option<&ExternalAcceptanceBinding<H>> {
+        self.bindings
+            .get(&(profile.clone(), target_scope.clone(), key.clone()))
+    }
+
+    #[must_use]
+    pub fn list_for_target(
+        &self,
+        profile: &ProfileRef,
+        target_scope: &ScopeId,
+    ) -> Vec<&ExternalAcceptanceBinding<H>> {
+        self.bindings
+            .iter()
+            .filter_map(|((binding_profile, binding_scope, _), binding)| {
+                (binding_profile == profile && binding_scope == target_scope).then_some(binding)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowBinding {
     pub workflow_id: WorkflowId,
     pub profile: ProfileRef,
-    pub acceptance: AcceptanceProfile,
+    pub acceptance: ErasedAcceptanceProfile,
 }
 
 pub trait WorkflowProfile {
     type Snapshot: Clone + Eq + std::fmt::Debug;
+    type RuntimeAcceptance: RuntimeAcceptanceCapability;
+    type ExternalAcceptance: ExternalAcceptanceCapability;
     type Event: Clone + Eq + std::fmt::Debug;
     type Intent: Clone + Eq + std::fmt::Debug;
     type Observation: Clone + Eq + std::fmt::Debug;
@@ -412,8 +661,56 @@ pub struct DeliveryDecl<P: WorkflowProfile> {
     pub barrier_id: Option<BarrierId>,
     pub consumer_kind: &'static str,
     pub event_codec: CodecRef,
-    pub requires_runtime_acceptance: bool,
+    requires_runtime_acceptance: bool,
     pub payload: DeliveryPayload<P>,
+}
+
+impl<P: WorkflowProfile> DeliveryDecl<P> {
+    #[must_use]
+    pub fn immediate(
+        effect_id: Option<EffectId>,
+        barrier_id: Option<BarrierId>,
+        consumer_kind: &'static str,
+        event_codec: CodecRef,
+        payload: DeliveryPayload<P>,
+    ) -> Self {
+        Self {
+            effect_id,
+            barrier_id,
+            consumer_kind,
+            event_codec,
+            requires_runtime_acceptance: false,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn requires_runtime_acceptance(&self) -> bool {
+        self.requires_runtime_acceptance
+    }
+}
+
+impl<P> DeliveryDecl<P>
+where
+    P: WorkflowProfile<RuntimeAcceptance = RuntimeAcceptanceEnabled>,
+{
+    #[must_use]
+    pub fn runtime_owed(
+        effect_id: Option<EffectId>,
+        barrier_id: Option<BarrierId>,
+        consumer_kind: &'static str,
+        event_codec: CodecRef,
+        payload: DeliveryPayload<P>,
+    ) -> Self {
+        Self {
+            effect_id,
+            barrier_id,
+            consumer_kind,
+            event_codec,
+            requires_runtime_acceptance: true,
+            payload,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,6 +1026,17 @@ pub struct BarrierState<P: WorkflowProfile> {
     pub reducer_event: P::BarrierEvent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScheduleOccurrenceId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleOccurrence {
+    pub schedule_id: ScheduleId,
+    pub occurrence_id: ScheduleOccurrenceId,
+    pub generation: Generation,
+    pub due_at: Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleState {
     pub schedule_id: ScheduleId,
@@ -737,6 +1045,8 @@ pub struct ScheduleState {
     pub status: ScheduleStatus,
     pub next_eligible_at: Timestamp,
     pub active_effect_id: Option<EffectId>,
+    pub due_occurrence: Option<ScheduleOccurrence>,
+    pub active_occurrence: Option<ScheduleOccurrence>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -762,6 +1072,7 @@ pub struct WorkflowState<P: WorkflowProfile> {
     pub(crate) next_receipt_id: u64,
     pub(crate) next_delivery_id: u64,
     pub(crate) next_manual_resolution_id: u64,
+    pub(crate) next_schedule_occurrence_id: u64,
 }
 
 impl<P: WorkflowProfile> Clone for WorkflowState<P> {
@@ -806,6 +1117,7 @@ impl<P: WorkflowProfile> Clone for WorkflowState<P> {
             next_receipt_id: self.next_receipt_id,
             next_delivery_id: self.next_delivery_id,
             next_manual_resolution_id: self.next_manual_resolution_id,
+            next_schedule_occurrence_id: self.next_schedule_occurrence_id,
         }
     }
 }
