@@ -59,7 +59,7 @@ describe('ReleaseUpdatePanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/release-updates/approve', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ tag: 'v1.1.0', commit: snapshot.preview.commit }),
+      body: JSON.stringify({ tag: 'v1.1.0', commit: snapshot.preview.commit, asset_name: snapshot.preview.asset_name, asset_sha256: snapshot.preview.asset_sha256 }),
     })));
   });
 

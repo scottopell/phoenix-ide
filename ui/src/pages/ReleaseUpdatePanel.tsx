@@ -80,10 +80,18 @@ export function ReleaseUpdatePanel() {
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [confirmedIdentity, setConfirmedIdentity] = useState<string | null>(null);
 
   const load = useCallback(async (refresh = false) => {
     try {
       const next = await api.releaseUpdateSnapshot(refresh);
+      if (next.preview.kind === 'available') {
+        const nextIdentity = `${next.preview.tag}:${next.preview.commit}:${next.preview.asset_sha256}`;
+        if (confirmedIdentity !== null && confirmedIdentity !== nextIdentity) {
+          setConfirming(false);
+          setConfirmedIdentity(null);
+        }
+      }
       setSnapshot(next);
       setError(null);
     } catch (cause) {
@@ -91,7 +99,7 @@ export function ReleaseUpdatePanel() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [confirmedIdentity]);
 
   useEffect(() => {
     void load();
@@ -104,7 +112,12 @@ export function ReleaseUpdatePanel() {
     setApproving(true);
     setError(null);
     try {
-      await api.approveReleaseUpdate(snapshot.preview.tag, snapshot.preview.commit);
+      await api.approveReleaseUpdate(
+        snapshot.preview.tag,
+        snapshot.preview.commit,
+        snapshot.preview.asset_name,
+        snapshot.preview.asset_sha256,
+      );
       setConfirming(false);
       await load();
     } catch (cause) {
@@ -116,6 +129,7 @@ export function ReleaseUpdatePanel() {
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
+  const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
 
   return (
     <section className="settings-section release-update" aria-label="Phoenix release updates">
@@ -161,10 +175,14 @@ export function ReleaseUpdatePanel() {
                     <button type="button" className="settings-inline-btn release-update__approve" onClick={() => { void approve(); }} disabled={approving}>
                       {approving ? 'Preparing handoff…' : 'Approve and install'}
                     </button>
-                    <button type="button" className="settings-inline-btn" onClick={() => setConfirming(false)} disabled={approving}>Cancel</button>
+                    <button type="button" className="settings-inline-btn" onClick={() => { setConfirming(false); setConfirmedIdentity(null); }} disabled={approving}>Cancel</button>
                   </div>
                 ) : (
-                  <button type="button" className="settings-inline-btn release-update__approve" onClick={() => setConfirming(true)}>Review and install {snapshot.preview.tag}</button>
+                  <button type="button" className="settings-inline-btn release-update__approve" onClick={() => {
+                    if (!availablePreview) return;
+                    setConfirmedIdentity(`${availablePreview.tag}:${availablePreview.commit}:${availablePreview.asset_sha256}`);
+                    setConfirming(true);
+                  }}>Review and install {snapshot.preview.tag}</button>
                 )
               )}
             </div>

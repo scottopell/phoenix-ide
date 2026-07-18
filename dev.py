@@ -6343,7 +6343,7 @@ def native_prod_deploy(
     with tempfile.TemporaryDirectory(prefix=f"phoenix-systemd-{transaction_id}-") as temporary:
         staging = Path(temporary)
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
             else _prepare_local_candidate(target=_linux_musl_target())
         )
@@ -6848,7 +6848,7 @@ def prod_daemon_deploy(
     with tempfile.TemporaryDirectory(prefix=f"phoenix-bare-{transaction_id}-") as td:
         staging = Path(td)
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release else _prepare_local_candidate(target=_linux_musl_target())
         )
         supervisor_source = staging / "bare-supervisor.py"
@@ -7342,6 +7342,8 @@ class ProdDeployControllerOptions:
     enabled: bool = False
     exact_release_tag: str | None = None
     expected_full_commit: str | None = None
+    expected_asset_name: str | None = None
+    expected_asset_sha256: str | None = None
     transaction_id: str | None = None
 
     def require_exact_release(self, release: str | None) -> tuple[str, str]:
@@ -7554,6 +7556,8 @@ def _prepare_release_candidate(
     staging: Path,
     *,
     expected_full_commit: str | None = None,
+    expected_asset_name: str | None = None,
+    expected_asset_sha256: str | None = None,
 ) -> PreparedCandidate:
     if expected_full_commit is not None and requested == "latest":
         raise SystemExit("controller mode requires an exact release tag, not 'latest'")
@@ -7596,6 +7600,10 @@ def _prepare_release_candidate(
             )
 
     asset_name = _release_asset_name()
+    if expected_asset_name is not None and asset_name != expected_asset_name:
+        raise SystemExit(
+            f"release asset selection changed: expected {expected_asset_name}, selected {asset_name}"
+        )
     subprocess.run(
         ["gh", "release", "download", tag, "--repo", "scottopell/phoenix-ide", "--dir", str(staging),
          "--pattern", asset_name, "--pattern", "SHA256SUMS"],
@@ -7613,6 +7621,10 @@ def _prepare_release_candidate(
     expected = entries.get(asset_name)
     if not expected:
         raise SystemExit(f"SHA256SUMS has no entry for {asset_name}")
+    if expected_asset_sha256 is not None and expected.lower() != expected_asset_sha256:
+        raise SystemExit(
+            f"release checksum changed: expected {expected_asset_sha256}, published {expected.lower()}"
+        )
     if _file_sha256(binary) != expected.lower():
         raise SystemExit(f"checksum mismatch for release asset {asset_name}")
     binary.chmod(0o755)
@@ -7852,7 +7864,7 @@ def launchd_prod_deploy(
         staging.mkdir(parents=True)
         staging.chmod(0o700)
         prepared = (
-            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit)
+            _prepare_release_candidate(release, staging, expected_full_commit=controller.expected_full_commit, expected_asset_name=controller.expected_asset_name, expected_asset_sha256=controller.expected_asset_sha256)
             if release
             else _prepare_local_candidate(target=None)
         )
@@ -8416,6 +8428,8 @@ def main():
     deploy_parser.add_argument("--controller-mode", action="store_true", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-release-tag", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--controller-expected-full-commit", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--controller-expected-asset-name", help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--controller-expected-asset-sha256", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
@@ -8542,6 +8556,8 @@ def main():
                     enabled=args.controller_mode,
                     exact_release_tag=args.controller_release_tag,
                     expected_full_commit=args.controller_expected_full_commit,
+                    expected_asset_name=args.controller_expected_asset_name,
+                    expected_asset_sha256=args.controller_expected_asset_sha256,
                     transaction_id=args.transaction_id,
                 ),
             )

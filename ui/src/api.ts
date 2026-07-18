@@ -1173,11 +1173,11 @@ export const api = {
     return resp.json();
   },
 
-  async approveReleaseUpdate(tag: string, commit: string): Promise<ApproveReleaseUpdateResponse> {
+  async approveReleaseUpdate(tag: string, commit: string, assetName: string, assetSha256: string): Promise<ApproveReleaseUpdateResponse> {
     const resp = await fetch('/api/release-updates/approve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tag, commit }),
+      body: JSON.stringify({ tag, commit, asset_name: assetName, asset_sha256: assetSha256 }),
     });
     if (!resp.ok) {
       let detail = 'Failed to start release update';

@@ -112,6 +112,8 @@ pub struct ReleaseUpdateSnapshot {
 pub struct ApproveReleaseUpdateRequest {
     pub tag: String,
     pub commit: String,
+    pub asset_name: String,
+    pub asset_sha256: String,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -139,17 +141,9 @@ pub struct SnapshotQuery {
     refresh: bool,
 }
 
-fn backend(state: &AppState) -> ReleaseUpdateBackend {
+fn backend(_state: &AppState) -> ReleaseUpdateBackend {
     if cfg!(target_os = "macos") {
         ReleaseUpdateBackend::Launchd
-    } else if cfg!(target_os = "linux")
-        && state
-            .runtime_env
-            .home()
-            .join(".phoenix-ide/run/supervisor.sock")
-            .exists()
-    {
-        ReleaseUpdateBackend::BareLinux
     } else if cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() {
         ReleaseUpdateBackend::Systemd
     } else if cfg!(target_os = "linux") {
@@ -293,7 +287,9 @@ async fn cached_preview(refresh: bool) -> Result<ReleasePreview, String> {
             }
         }
     }
-    let preview = discover_release().await?;
+    let preview = discover_release()
+        .await
+        .unwrap_or_else(|reason| ReleasePreview::Unavailable { reason });
     *cache.write().expect("preview cache poisoned") = Some((Instant::now(), preview.clone()));
     Ok(preview)
 }
@@ -313,6 +309,7 @@ fn status_path(state: &AppState, backend: ReleaseUpdateBackend) -> Option<PathBu
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransactionStatus {
     let Some(path) = status_path(state, backend) else {
         return ReleaseTransactionStatus::None;
@@ -363,6 +360,13 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             }
         }
     };
+    if value
+        .get("source_kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "published_release")
+    {
+        return ReleaseTransactionStatus::None;
+    }
     let string = |name: &str| {
         value
             .get(name)
@@ -379,7 +383,14 @@ fn read_status(state: &AppState, backend: ReleaseUpdateBackend) -> ReleaseTransa
             reason: "durable deployment status has no state".to_string(),
         };
     };
-    let updated_at = string("updated_at");
+    let updated_at = string("updated_at").or_else(|| {
+        value
+            .get("updated_at")
+            .and_then(serde_json::Value::as_f64)
+            .and_then(|seconds| seconds.trunc().to_string().parse::<i64>().ok())
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+            .map(|timestamp| timestamp.to_rfc3339())
+    });
     let terminal = matches!(
         state.as_str(),
         "committed"
@@ -477,7 +488,14 @@ pub async fn snapshot(
 }
 
 fn valid_approval(request: &ApproveReleaseUpdateRequest, preview: &ReleasePreview) -> bool {
-    matches!(preview, ReleasePreview::Available { tag, commit, .. } if tag == &request.tag && commit == &request.commit)
+    matches!(
+        preview,
+        ReleasePreview::Available { tag, commit, asset_name, asset_sha256, .. }
+            if tag == &request.tag
+                && commit == &request.commit
+                && asset_name == &request.asset_name
+                && asset_sha256 == &request.asset_sha256
+    )
 }
 
 fn updater_dir(state: &AppState) -> Result<PathBuf, String> {
@@ -550,7 +568,14 @@ pub async fn approve(
                 .into_response()
         }
     };
-    let ReleasePreview::Available { tag, commit, .. } = preview else {
+    let ReleasePreview::Available {
+        tag,
+        commit,
+        asset_name,
+        asset_sha256,
+        ..
+    } = preview
+    else {
         unreachable!()
     };
     let transaction_id = Uuid::new_v4().simple().to_string();
@@ -606,6 +631,10 @@ pub async fn approve(
             &tag,
             "--controller-expected-full-commit",
             &commit,
+            "--controller-expected-asset-name",
+            &asset_name,
+            "--controller-expected-asset-sha256",
+            &asset_sha256,
             "--transaction-id",
             &transaction_id,
         ])
@@ -661,6 +690,8 @@ pub async fn approve(
                     .into_response();
             }
             Ok(None) if tokio::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     Json(serde_json::json!({
@@ -693,21 +724,27 @@ mod tests {
         assert!(valid_approval(
             &ApproveReleaseUpdateRequest {
                 tag: "v1.2.3".to_string(),
-                commit: "a".repeat(40)
+                commit: "a".repeat(40),
+                asset_name: "asset".to_string(),
+                asset_sha256: "b".repeat(64),
             },
             &preview
         ));
         assert!(!valid_approval(
             &ApproveReleaseUpdateRequest {
                 tag: "v1.2.4".to_string(),
-                commit: "a".repeat(40)
+                commit: "a".repeat(40),
+                asset_name: "asset".to_string(),
+                asset_sha256: "b".repeat(64),
             },
             &preview
         ));
         assert!(!valid_approval(
             &ApproveReleaseUpdateRequest {
                 tag: "v1.2.3".to_string(),
-                commit: "c".repeat(40)
+                commit: "c".repeat(40),
+                asset_name: "asset".to_string(),
+                asset_sha256: "b".repeat(64),
             },
             &preview
         ));

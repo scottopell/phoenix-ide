@@ -246,7 +246,13 @@ class SystemdDeployCommandTests(unittest.TestCase):
              mock.patch.object(self.dev, "_prepare_release_candidate", side_effect=SystemExit("stop here")) as prepare:
             with self.assertRaisesRegex(SystemExit, "stop here"):
                 self.dev.native_prod_deploy("v2.0.0", controller=controller)
-        prepare.assert_called_once_with("v2.0.0", mock.ANY, expected_full_commit="a" * 40)
+        prepare.assert_called_once_with(
+                "v2.0.0",
+                mock.ANY,
+                expected_full_commit="a" * 40,
+                expected_asset_name=None,
+                expected_asset_sha256=None,
+            )
 
 
 if __name__ == "__main__":
