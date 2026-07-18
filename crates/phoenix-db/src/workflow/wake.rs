@@ -8,6 +8,8 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
+use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema::{Message, MessageContent};
 use phoenix_workflow::{
     wake_profile::{
         self as wake_types, BashTerminalEvidence, ObserveHandleIntent, TmuxTerminalEvidence,
@@ -131,6 +133,42 @@ pub struct WakePendingDelivery {
     pub conversation_id: String,
     pub receipt: WakeTerminalReceiptProjection,
     pub canonical_delivery: LocalDeliveryRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializePendingDeliveryMessageInput {
+    pub workflow_id: WorkflowId,
+    pub delivery_id: DeliveryId,
+    pub conversation_id: String,
+    pub rendered_content: String,
+    pub display_data: Option<serde_json::Value>,
+    pub auto_resume: bool,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone)]
+pub enum MaterializePendingDeliveryMessageOutcome {
+    Materialized(WakeDeliveryMessageLink),
+    AlreadyMaterialized(WakeDeliveryMessageLink),
+    WrongOwnerOrIneligible,
+}
+
+#[derive(Debug, Clone)]
+pub struct WakeDeliveryLinkedMessage {
+    pub message: Message,
+}
+
+#[derive(Debug, Clone)]
+pub struct WakeDeliveryMessageLink {
+    pub workflow_id: WorkflowId,
+    pub delivery_id: DeliveryId,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub registering_tool_use_id: String,
+    pub terminal_kind: String,
+    pub auto_resume: bool,
+    pub created_at: Timestamp,
+    pub linked_message: WakeDeliveryLinkedMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1840,6 +1878,202 @@ impl WakeRepository {
         tx.commit().await?;
         Ok(pending)
     }
+    pub async fn materialize_pending_delivery_message(
+        &self,
+        input: &MaterializePendingDeliveryMessageInput,
+    ) -> DbResult<MaterializePendingDeliveryMessageOutcome> {
+        for _ in 0..20 {
+            match self.materialize_pending_delivery_message_once(input).await {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if is_unique_or_primary_constraint(error.as_ref()) =>
+                {
+                    if let Some(existing) = self
+                        .get_delivery_message_link(input.workflow_id, input.delivery_id)
+                        .await?
+                    {
+                        return Ok(
+                            MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing),
+                        );
+                    }
+                }
+                result => return result,
+            }
+        }
+        self.materialize_pending_delivery_message_once(input).await
+    }
+
+    async fn materialize_pending_delivery_message_once(
+        &self,
+        input: &MaterializePendingDeliveryMessageInput,
+    ) -> DbResult<MaterializePendingDeliveryMessageOutcome> {
+        if let Some(existing) = self
+            .get_delivery_message_link(input.workflow_id, input.delivery_id)
+            .await?
+        {
+            return Ok(MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing));
+        }
+
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        if let Some(existing) =
+            fetch_delivery_message_link_tx(&mut tx, input.workflow_id, input.delivery_id).await?
+        {
+            tx.commit().await?;
+            return Ok(MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing));
+        }
+
+        let candidate = sqlx::query(
+            "SELECT d.workflow_id, d.delivery_id, d.effect_id, d.barrier_id, d.consumer_kind,
+                    d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
+                    d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
+                    d.suppression_reason, d.accepted_by_transition_id,
+                    p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
+                    p.resolved_at, p.bash_handle_id, p.tmux_server_generation, p.tmux_window_id,
+                    p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
+                    p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
+                    p.cancelled_at, b.scope_kind, b.scope_stable_key, b.registering_tool_use_id
+             FROM workflow_deliveries d
+             JOIN wake_terminal_receipts p
+               ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
+             JOIN wake_bindings b ON b.workflow_id = p.workflow_id
+             WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.status = 'Pending' AND p.conversation_id = ?3"
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+        .bind(&input.conversation_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        let Some(row) = candidate else {
+            tx.rollback().await?;
+            return Ok(MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible);
+        };
+
+        let registering_tool_use_id: String = row.get("registering_tool_use_id");
+        let terminal_kind: String = row.get("terminal_kind");
+        let message_id = wake_delivery_message_id(input.workflow_id, input.delivery_id);
+        let sequence_id = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(&input.conversation_id)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        let content = MessageContent::tool(
+            &registering_tool_use_id,
+            input.rendered_content.clone(),
+            false,
+        );
+        let content_str = serde_json::to_string(&content.to_stored_json())
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let display_str = input
+            .display_data
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let created_at = timestamp_to_datetime(input.created_at);
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+        )
+        .bind(&message_id)
+        .bind(&input.conversation_id)
+        .bind(sequence_id)
+        .bind(content.message_type().to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(created_at.to_rfc3339())
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(created_at.to_rfc3339())
+            .bind(&input.conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
+        let message = Message {
+            message_id: message_id.clone(),
+            conversation_id: input.conversation_id.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data: input.display_data.clone(),
+            usage_data: None,
+            created_at,
+        };
+        if has_message_fts_tx(&mut tx).await? {
+            crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+        }
+        sqlx::query(
+            "INSERT INTO wake_delivery_messages (
+                workflow_id, delivery_id, conversation_id, message_id, registering_tool_use_id,
+                terminal_kind, auto_resume, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+        .bind(&input.conversation_id)
+        .bind(&message_id)
+        .bind(&registering_tool_use_id)
+        .bind(&terminal_kind)
+        .bind(input.auto_resume)
+        .bind(to_i64(input.created_at.0, "created_at")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        let linked = fetch_delivery_message_link_tx(&mut tx, input.workflow_id, input.delivery_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(
+                    "wake delivery message link missing after insert".to_string(),
+                )
+            })?;
+        tx.commit().await?;
+        Ok(MaterializePendingDeliveryMessageOutcome::Materialized(
+            linked,
+        ))
+    }
+
+    pub async fn get_delivery_message_link(
+        &self,
+        workflow_id: WorkflowId,
+        delivery_id: DeliveryId,
+    ) -> DbResult<Option<WakeDeliveryMessageLink>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let out = fetch_delivery_message_link_tx(&mut tx, workflow_id, delivery_id).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_linked_pending_delivery_messages(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeDeliveryMessageLink>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT l.workflow_id, l.delivery_id, l.conversation_id AS link_conversation_id,
+                    l.message_id AS link_message_id, l.registering_tool_use_id, l.terminal_kind,
+                    l.auto_resume, l.created_at AS link_created_at,
+                    m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
+                    m.display_data, m.usage_data, m.created_at
+             FROM wake_delivery_messages l
+             JOIN workflow_deliveries d
+               ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
+             JOIN messages m ON m.message_id = l.message_id
+             WHERE l.conversation_id = ?1 AND d.status = 'Pending'
+             ORDER BY l.delivery_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(delivery_message_link_from_join_row(&row)?);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
 
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
         for _ in 0..5 {
@@ -3180,6 +3414,103 @@ fn delivery_from_join_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<LocalDelive
     })
 }
 
+fn wake_delivery_message_id(workflow_id: WorkflowId, delivery_id: DeliveryId) -> String {
+    format!("wake-{}-{}-result", workflow_id.0, delivery_id.0)
+}
+
+fn timestamp_to_datetime(timestamp: Timestamp) -> DateTime<Utc> {
+    DateTime::from_timestamp(i64::try_from(timestamp.0).unwrap_or(0), 0)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+fn message_from_join_row(row: &sqlx::sqlite::SqliteRow) -> Result<Message, sqlx::Error> {
+    let msg_type = parse_message_type_local(&row.try_get::<String, _>("message_type")?);
+    let content_str: String = row.try_get("content")?;
+    let content_value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
+    let content = MessageContent::from_stored_json(msg_type, content_value)
+        .unwrap_or_else(|_| MessageContent::error(format!("Failed to parse {msg_type} message")));
+    Ok(Message {
+        message_id: row.try_get("message_id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        sequence_id: row.try_get("sequence_id")?,
+        message_type: msg_type,
+        content,
+        display_data: row
+            .try_get::<Option<String>, _>("display_data")?
+            .map(|s| serde_json::from_str(&s).unwrap_or_default()),
+        usage_data: row
+            .try_get::<Option<String>, _>("usage_data")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        created_at: DateTime::parse_from_rfc3339(&row.try_get::<String, _>("created_at")?)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+    })
+}
+
+fn parse_message_type_local(s: &str) -> phoenix_core::domain::db_schema::MessageType {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .unwrap_or(phoenix_core::domain::db_schema::MessageType::System)
+}
+
+fn is_unique_or_primary_constraint(error: &dyn sqlx::error::DatabaseError) -> bool {
+    let message = error.message();
+    message.contains("UNIQUE constraint failed")
+        || message.contains("PRIMARY KEY constraint failed")
+}
+
+async fn has_message_fts_tx(tx: &mut WorkflowTx<'_>) -> DbResult<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'message_fts'",
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(exists > 0)
+}
+
+async fn fetch_delivery_message_link_tx(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    delivery_id: DeliveryId,
+) -> DbResult<Option<WakeDeliveryMessageLink>> {
+    let row = sqlx::query(
+        "SELECT l.workflow_id, l.delivery_id, l.conversation_id AS link_conversation_id,
+                l.message_id AS link_message_id, l.registering_tool_use_id, l.terminal_kind,
+                l.auto_resume, l.created_at AS link_created_at,
+                m.message_id, m.conversation_id, m.sequence_id, m.message_type, m.content,
+                m.display_data, m.usage_data, m.created_at
+         FROM wake_delivery_messages l
+         JOIN messages m ON m.message_id = l.message_id
+         WHERE l.workflow_id = ?1 AND l.delivery_id = ?2",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(delivery_id.0, "delivery_id")?)
+    .fetch_optional(&mut *tx.tx)
+    .await?;
+    row.as_ref()
+        .map(delivery_message_link_from_join_row)
+        .transpose()
+}
+
+fn delivery_message_link_from_join_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<WakeDeliveryMessageLink> {
+    let message = message_from_join_row(row)?;
+    Ok(WakeDeliveryMessageLink {
+        workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
+        delivery_id: DeliveryId(to_u64(row.get::<i64, _>("delivery_id"), "delivery_id")?),
+        conversation_id: row.get("link_conversation_id"),
+        message_id: row.get("link_message_id"),
+        registering_tool_use_id: row.get("registering_tool_use_id"),
+        terminal_kind: row.get("terminal_kind"),
+        auto_resume: row.get::<i64, _>("auto_resume") != 0,
+        created_at: Timestamp(to_u64(
+            row.get::<i64, _>("link_created_at"),
+            "link_created_at",
+        )?),
+        linked_message: WakeDeliveryLinkedMessage { message },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3190,7 +3521,7 @@ mod tests {
 
     async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
         sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
-        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, conversation_id TEXT NOT NULL, message_type TEXT NOT NULL, content TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
+        sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         run_pending_migrations(pool).await.unwrap();
         sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES ('conv-1')")
             .execute(pool)
@@ -3517,6 +3848,446 @@ mod tests {
             | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id,
             WakeRegistrationOutcome::Conflict => panic!("expected registered or replayed"),
         }
+    }
+
+    async fn create_pending_terminal_delivery(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+    ) -> WakePendingDelivery {
+        let canonical = unwrap_started(register_and_begin(repo, workflow_id).await);
+        match repo
+            .record_terminal_evidence(
+                workflow_id,
+                canonical.authority.as_ref().expect("authority"),
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &bash_evidence(19),
+            )
+            .await
+            .unwrap()
+        {
+            WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
+            | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
+            other @ (WakeTerminalEvidenceOutcome::StaleAttempt
+            | WakeTerminalEvidenceOutcome::WrongResource
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+                panic!("expected recorded/replayed pending delivery, got {other:?}")
+            }
+        }
+    }
+
+    fn materialize_input(
+        pending: &WakePendingDelivery,
+        rendered_content: &str,
+        display_data: Option<serde_json::Value>,
+        auto_resume: bool,
+        created_at: Timestamp,
+    ) -> MaterializePendingDeliveryMessageInput {
+        MaterializePendingDeliveryMessageInput {
+            workflow_id: pending.workflow_id,
+            delivery_id: pending.canonical_delivery.delivery_id,
+            conversation_id: pending.conversation_id.clone(),
+            rendered_content: rendered_content.to_string(),
+            display_data,
+            auto_resume,
+            created_at,
+        }
+    }
+
+    async fn materialize_pending(
+        repo: &WakeRepository,
+        pending: &WakePendingDelivery,
+        rendered_content: &str,
+        display_data: Option<serde_json::Value>,
+        auto_resume: bool,
+        created_at: Timestamp,
+    ) -> MaterializePendingDeliveryMessageOutcome {
+        repo.materialize_pending_delivery_message(&materialize_input(
+            pending,
+            rendered_content,
+            display_data,
+            auto_resume,
+            created_at,
+        ))
+        .await
+        .unwrap()
+    }
+
+    async fn count_conversation_messages(repo: &WakeRepository, conversation_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count_delivery_message_links(repo: &WakeRepository) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wake_delivery_messages")
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_unrelated_message(repo: &WakeRepository, conversation_id: &str, message_id: &str) {
+        let content = MessageContent::system("unrelated");
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(1_i64)
+        .bind(content.message_type().to_string())
+        .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+        .bind(timestamp_to_datetime(Timestamp(11)).to_rfc3339())
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn fetch_conversation_messages(repo: &WakeRepository, conversation_id: &str) -> Vec<Message> {
+        sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .fetch_all(&repo.workflow_repo.pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| message_from_join_row(row).unwrap())
+        .collect()
+    }
+
+    fn materialized_outcome_link(
+        outcome: MaterializePendingDeliveryMessageOutcome,
+    ) -> WakeDeliveryMessageLink {
+        match outcome {
+            MaterializePendingDeliveryMessageOutcome::Materialized(link)
+            | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => link,
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                panic!("expected materialized/already-materialized link")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_pending_delivery_message_creates_exact_tool_message_shape() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(800);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        insert_unrelated_message(&repo, &pending.conversation_id, "existing-msg").await;
+        let display_data = serde_json::json!({
+            "terminal_kind": "bash",
+            "final_tail": ["done", "ok"],
+            "exit_code": 0,
+            "duration_ms": 12
+        });
+
+        let outcome = materialize_pending(
+            &repo,
+            &pending,
+            "bash finished normally",
+            Some(display_data.clone()),
+            true,
+            Timestamp(42),
+        )
+        .await;
+
+        let link = match outcome {
+            MaterializePendingDeliveryMessageOutcome::Materialized(link) => link,
+            other @ (MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_)
+            | MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible) => {
+                panic!("expected materialized, got {other:?}")
+            }
+        };
+        let expected_message_id = wake_delivery_message_id(workflow_id, DeliveryId(1));
+        assert_eq!(link.workflow_id, workflow_id);
+        assert_eq!(link.delivery_id, DeliveryId(1));
+        assert_eq!(link.conversation_id, pending.conversation_id);
+        assert_eq!(link.message_id, expected_message_id);
+        assert_eq!(link.registering_tool_use_id, "tool-1");
+        assert_eq!(link.terminal_kind, "Fired");
+        assert!(link.auto_resume);
+        assert_eq!(link.created_at, Timestamp(42));
+
+        let message = &link.linked_message.message;
+        assert_eq!(message.message_id, expected_message_id);
+        assert_eq!(message.conversation_id, "conv-1");
+        assert_eq!(message.sequence_id, 2);
+        assert_eq!(message.display_data, Some(display_data.clone()));
+        assert_eq!(message.created_at, timestamp_to_datetime(Timestamp(42)));
+        match &message.content {
+            MessageContent::Tool(tool) => {
+                assert_eq!(tool.tool_use_id, "tool-1");
+                assert_eq!(tool.content, "bash finished normally");
+                assert!(!tool.is_error);
+            }
+            other @ (MessageContent::User(_)
+            | MessageContent::Agent(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_)) => {
+                panic!("expected tool content, got {other:?}")
+            }
+        }
+
+        let messages = fetch_conversation_messages(&repo, "conv-1").await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].message_id, expected_message_id);
+        assert_eq!(messages[1].conversation_id, message.conversation_id);
+        assert_eq!(messages[1].sequence_id, message.sequence_id);
+        assert_eq!(messages[1].message_type, message.message_type);
+        assert_eq!(messages[1].display_data, message.display_data);
+    }
+
+    #[tokio::test]
+    async fn materialize_pending_delivery_message_is_idempotent_across_two_repos() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(801);
+        let pending = create_pending_terminal_delivery(&first, workflow_id).await;
+        let input = materialize_input(
+            &pending,
+            "same wake result",
+            Some(serde_json::json!({"kind": "wake"})),
+            false,
+            Timestamp(43),
+        );
+
+        let (left, right) = tokio::join!(
+            first.materialize_pending_delivery_message(&input),
+            second.materialize_pending_delivery_message(&input)
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, MaterializePendingDeliveryMessageOutcome::Materialized(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_)))
+                .count(),
+            1
+        );
+
+        let first_link = materialized_outcome_link(outcomes[0].clone());
+        let second_link = materialized_outcome_link(outcomes[1].clone());
+        assert_eq!(first_link.message_id, second_link.message_id);
+        assert_eq!(count_conversation_messages(&first, "conv-1").await, 1);
+        assert_eq!(count_delivery_message_links(&first).await, 1);
+    }
+
+    #[tokio::test]
+    async fn materialize_pending_delivery_message_rejects_wrong_owner_missing_and_resolved() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(802);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+
+        let mut wrong_owner = materialize_input(&pending, "ignored", None, false, Timestamp(44));
+        wrong_owner.conversation_id = "conv-2".into();
+        assert!(matches!(
+            repo.materialize_pending_delivery_message(&wrong_owner)
+                .await
+                .unwrap(),
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible
+        ));
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 0);
+        assert_eq!(count_delivery_message_links(&repo).await, 0);
+
+        let missing = MaterializePendingDeliveryMessageInput {
+            workflow_id,
+            delivery_id: DeliveryId(999),
+            conversation_id: "conv-1".into(),
+            rendered_content: "ignored".into(),
+            display_data: None,
+            auto_resume: false,
+            created_at: Timestamp(45),
+        };
+        assert!(matches!(
+            repo.materialize_pending_delivery_message(&missing).await.unwrap(),
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible
+        ));
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 0);
+        assert_eq!(count_delivery_message_links(&repo).await, 0);
+
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                workflow_id,
+                Version(2),
+                TransitionId(3),
+                vec![pending.canonical_delivery.delivery_id],
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert!(matches!(
+            materialize_pending(&repo, &pending, "ignored", None, false, Timestamp(46)).await,
+            MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible
+        ));
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 0);
+        assert_eq!(count_delivery_message_links(&repo).await, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_repo_get_delivery_message_link_returns_materialized_message() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = WorkflowId(803);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        let created = materialized_outcome_link(
+            materialize_pending(
+                &repo,
+                &pending,
+                "restart lookup",
+                Some(serde_json::json!({"source": "wake"})),
+                false,
+                Timestamp(47),
+            )
+            .await,
+        );
+
+        let loaded = restarted
+            .get_delivery_message_link(workflow_id, pending.canonical_delivery.delivery_id)
+            .await
+            .unwrap()
+            .expect("linked message after restart");
+        assert_eq!(loaded.message_id, created.message_id);
+        assert_eq!(loaded.registering_tool_use_id, created.registering_tool_use_id);
+        assert_eq!(loaded.linked_message.message.message_id, created.linked_message.message.message_id);
+        assert_eq!(loaded.linked_message.message.sequence_id, created.linked_message.message.sequence_id);
+        assert_eq!(loaded.linked_message.message.display_data, created.linked_message.message.display_data);
+    }
+
+    #[tokio::test]
+    async fn list_linked_pending_delivery_messages_tracks_materialized_until_resolved() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(804);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        let created = materialized_outcome_link(
+            materialize_pending(
+                &repo,
+                &pending,
+                "list pending",
+                Some(serde_json::json!({"state": "pending"})),
+                true,
+                Timestamp(48),
+            )
+            .await,
+        );
+
+        let listed = repo
+            .list_linked_pending_delivery_messages("conv-1")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_id, created.message_id);
+        assert_eq!(listed[0].delivery_id, pending.canonical_delivery.delivery_id);
+
+        assert_eq!(
+            repo.resolve_pending_exact(&resolve_input(
+                workflow_id,
+                Version(2),
+                TransitionId(3),
+                vec![pending.canonical_delivery.delivery_id],
+            ))
+            .await
+            .unwrap(),
+            WakeResolvePendingOutcome::Resolved
+        );
+        assert!(repo
+            .list_linked_pending_delivery_messages("conv-1")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn distinct_workflow_delivery_pairs_get_distinct_stable_message_ids_and_links() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let first = create_pending_terminal_delivery(&repo, WorkflowId(805)).await;
+        let mut second_intent = intent();
+        second_intent.registering_tool_use_id = "tool-2".into();
+        second_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: wake_types::WorkScopeIdentity {
+                kind: wake_types::WorkScopeKind::Conversation,
+                stable_key: "conv-1".into(),
+            },
+            handle_id: "b-2".into(),
+        });
+        let second_workflow_id = WorkflowId(806);
+        assert!(matches!(
+            repo.register_allocated(second_workflow_id, &second_intent, "fp-2", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let second_started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                second_workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        let second = match repo
+            .record_terminal_evidence(
+                second_workflow_id,
+                second_started.authority.as_ref().expect("authority"),
+                1,
+                ReceiptId(2),
+                DeliveryId(2),
+                Timestamp(20),
+                &WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                    identity: wake_types::BashResourceIdentity {
+                        work_scope: wake_types::WorkScopeIdentity {
+                            kind: wake_types::WorkScopeKind::Conversation,
+                            stable_key: "conv-1".into(),
+                        },
+                        handle_id: "b-2".into(),
+                    },
+                    status: wake_types::BashTerminalStatus::Exited,
+                    occurred_at: Timestamp(19),
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
+                    signal_number: None,
+                    kill_signal_sent: None,
+                    final_tail: vec!["done".into(), "ok".into()],
+                }),
+            )
+            .await
+            .unwrap()
+        {
+            WakeTerminalEvidenceOutcome::Recorded { delivery, .. }
+            | WakeTerminalEvidenceOutcome::Replayed { delivery, .. } => delivery,
+            other @ (WakeTerminalEvidenceOutcome::StaleAttempt
+            | WakeTerminalEvidenceOutcome::WrongResource
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation) => {
+                panic!("expected recorded/replayed second delivery, got {other:?}")
+            }
+        };
+
+        let first_link = materialized_outcome_link(
+            materialize_pending(&repo, &first, "first", None, false, Timestamp(49)).await,
+        );
+        let second_link = materialized_outcome_link(
+            materialize_pending(&repo, &second, "second", None, false, Timestamp(50)).await,
+        );
+
+        assert_ne!(first_link.workflow_id, second_link.workflow_id);
+        assert_ne!(first_link.message_id, second_link.message_id);
+        assert_eq!(first_link.message_id, wake_delivery_message_id(WorkflowId(805), DeliveryId(1)));
+        assert_eq!(second_link.message_id, wake_delivery_message_id(second_workflow_id, DeliveryId(2)));
+        assert_eq!(count_delivery_message_links(&repo).await, 2);
     }
 
     #[tokio::test]
