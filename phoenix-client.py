@@ -174,6 +174,19 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json().get('projects', [])
 
+    def get_wake_status(self, conv_id: str) -> dict:
+        """Get active durable wake contracts for a conversation."""
+        resp = self.http.get(f"{self.base_url}/api/conversations/{conv_id}/wake")
+        resp.raise_for_status()
+        return resp.json()
+
+    def cancel_wake(self, conv_id: str, contract_id: str) -> None:
+        """Cancel one active durable wake contract."""
+        resp = self.http.post(
+            f"{self.base_url}/api/conversations/{conv_id}/wake/{contract_id}/cancel"
+        )
+        resp.raise_for_status()
+
     def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
         import uuid
@@ -457,6 +470,10 @@ def format_response(data: dict) -> str:
               help='Model ID for new conversations (e.g. claude-4.5-sonnet)')
 @click.option('--list-models', is_flag=True, help='List available models and exit')
 @click.option('--list-projects', is_flag=True, help='List projects and exit')
+@click.option('--wake-status', is_flag=True,
+              help='Show active wake contracts for --conversation and exit')
+@click.option('--wake-cancel', metavar='CONTRACT_ID',
+              help='Cancel an active wake contract for --conversation and exit')
 @click.option('--suggest', 'suggest', is_flag=True,
               help='One-shot shell-command suggestion (stateless). MESSAGE may be piped on stdin. '
                    'Emits clickable run-links for the Phoenix terminal.')
@@ -467,7 +484,7 @@ def format_response(data: dict) -> str:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, suggest, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -516,6 +533,25 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             for p in projects:
                 convs = p.get('conversation_count', 0)
                 click.echo(f"  {p.get('name', p['id']):30s} {convs} conversation(s)  {p.get('repo_root', '')}")
+        return
+
+    if wake_status or wake_cancel:
+        if not conversation:
+            raise click.UsageError("--wake-status/--wake-cancel requires --conversation.")
+        conv = client.get_conversation(conversation)
+        if wake_cancel:
+            client.cancel_wake(conv['id'], wake_cancel)
+            click.echo(f"Cancelled wake contract {wake_cancel}.")
+            return
+        status = client.get_wake_status(conv['id'])
+        click.echo(f"Pending wake contracts: {status['pending_count']}")
+        if status.get('soonest_expires_at') is not None:
+            click.echo(f"Soonest expiry: {status['soonest_expires_at']}")
+        for contract in status.get('contracts', []):
+            click.echo(
+                f"  {contract['contract_id']}  workflow={contract['workflow_id']}  "
+                f"expires_at={contract['expires_at']}"
+            )
         return
 
     if suggest:
