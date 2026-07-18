@@ -36,15 +36,15 @@ export interface FileReviewNotes {
   /** Line to flash; cleared automatically after the highlight animation. */
   highlightedLine: number | null;
   highlight: (lineNumber: number) => void;
-  /** Format the entire pile, hand it to the host, and clear. No-op if empty. */
-  send: () => void;
+  /** Format the entire pile, hand it to the host, and clear after success. */
+  send: () => Promise<void>;
   clearAll: () => void;
   removeNote: (id: string) => void;
 }
 
 export function useFileReviewNotes(
   absolutePath: string,
-  onSendNotes: (notes: string) => void,
+  onSendNotes: (notes: string) => void | Promise<void>,
   patchContext?: PatchContext | undefined,
 ): FileReviewNotes {
   const commands = useReviewNotesCommands();
@@ -92,13 +92,12 @@ export function useFileReviewNotes(
   const closePanel = useCallback(() => setShowPanel(false), []);
   const highlight = useCallback((lineNumber: number) => setHighlightedLine(lineNumber), []);
 
-  const send = useCallback(() => {
+  const send = useCallback(async () => {
     const formatted = formatNotesForSend(commands.getSnapshot());
-    if (formatted) {
-      onSendNotes(formatted);
-      commands.clear();
-      setShowPanel(false);
-    }
+    if (!formatted) return;
+    await onSendNotes(formatted);
+    commands.clear();
+    setShowPanel(false);
   }, [commands, onSendNotes]);
 
   const clearAll = useCallback(() => {

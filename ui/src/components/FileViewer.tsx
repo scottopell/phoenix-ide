@@ -24,9 +24,12 @@ export interface FileViewerProps {
   filePath: string;
   rootDir: string;
   onClose: () => void;
-  onSendNotes: (notes: string) => void;
+  onSendNotes: (notes: string) => void | Promise<void>;
   patchContext?: PatchContext | undefined;
   focus?: ViewerFocus | undefined;
+  presentation?: 'pane' | 'fullscreen' | undefined;
+  canTogglePresentation?: boolean | undefined;
+  onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean | undefined;
 }
@@ -56,6 +59,9 @@ export function FileViewer({
   onSendNotes,
   patchContext,
   focus,
+  presentation,
+  canTogglePresentation,
+  onPresentationChange,
   inline,
 }: FileViewerProps) {
   const [fileData, setFileData] = useState<ReadFileResult | null>(null);
@@ -97,6 +103,9 @@ export function FileViewer({
       onSendNotes,
       ...(patchContext !== undefined ? { patchContext } : {}),
       ...(focus !== undefined ? { focus } : {}),
+      ...(presentation !== undefined ? { presentation } : {}),
+      ...(canTogglePresentation !== undefined ? { canTogglePresentation } : {}),
+      ...(onPresentationChange !== undefined ? { onPresentationChange } : {}),
       ...(inline !== undefined ? { inline } : {}),
     });
     return <MetaViewer payload={payload} />;
@@ -154,9 +163,12 @@ interface PayloadContext {
   absolutePath: string;
   fileName: string;
   onClose: () => void;
-  onSendNotes: (notes: string) => void;
+  onSendNotes: (notes: string) => void | Promise<void>;
   patchContext?: PatchContext | undefined;
   focus?: ViewerFocus | undefined;
+  presentation?: 'pane' | 'fullscreen' | undefined;
+  canTogglePresentation?: boolean | undefined;
+  onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   inline?: boolean | undefined;
 }
 
@@ -166,6 +178,9 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     absolutePath: ctx.absolutePath,
     onClose: ctx.onClose,
     onSendNotes: ctx.onSendNotes,
+    ...(ctx.presentation !== undefined ? { presentation: ctx.presentation } : {}),
+    ...(ctx.canTogglePresentation !== undefined ? { canTogglePresentation: ctx.canTogglePresentation } : {}),
+    ...(ctx.onPresentationChange !== undefined ? { onPresentationChange: ctx.onPresentationChange } : {}),
     ...(ctx.inline !== undefined ? { inline: ctx.inline } : {}),
   };
 

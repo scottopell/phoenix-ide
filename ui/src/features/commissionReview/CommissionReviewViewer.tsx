@@ -1,5 +1,6 @@
 import type { Message, ToolResultContent } from '../../api';
-import { ViewerShell } from '../../components/viewer/ViewerShell';
+import { createPortal } from 'react-dom';
+import { ViewerPresentationControl, ViewerShell } from '../../components/viewer/ViewerShell';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { CommissionReviewSummaryCard } from './CommissionReviewSummary';
 import { parseCommissionReviewResult } from './model';
@@ -9,6 +10,9 @@ interface CommissionReviewViewerProps {
   sequenceId: number;
   messages: Message[];
   onClose: () => void;
+  presentation?: 'pane' | 'fullscreen' | undefined;
+  canTogglePresentation?: boolean | undefined;
+  onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   inline?: boolean | undefined;
 }
 
@@ -18,22 +22,30 @@ interface ResolvedReview {
   resultContent: ToolResultContent | null;
 }
 
-export function CommissionReviewViewer({ sequenceId, messages, onClose, inline }: CommissionReviewViewerProps) {
+export function CommissionReviewViewer({ sequenceId, messages, onClose, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: CommissionReviewViewerProps) {
   useRegisterFocusScope('commission-review-viewer');
   const resolved = resolveCommissionReviewBySequence(sequenceId, messages);
   const rawResult = resolved?.resultContent?.content ?? resolved?.resultContent?.result ?? resolved?.resultContent?.error ?? '';
   const parsed = resolved?.resultMessage ? parseCommissionReviewResult(resolved.resultMessage.display_data, rawResult) : null;
 
-  return (
+  const focused = presentation === 'fullscreen' && canTogglePresentation;
+  const shell = (
     <ViewerShell
-      mode={inline ? 'inline' : 'overlay'}
+      mode={focused ? 'takeover' : inline ? 'inline' : 'overlay'}
       ariaLabel={`Commission review viewer: #${sequenceId}`}
       title={resolved ? `Commission review #${resolved.requestMessage.sequence_id}` : `Commission review #${sequenceId}`}
       titleTooltip={resolved?.resultMessage ? `Tool result message #${resolved.resultMessage.sequence_id}` : undefined}
+      headerExtras={canTogglePresentation && onPresentationChange ? (
+        <ViewerPresentationControl
+          fullscreen={focused}
+          onToggle={() => onPresentationChange(focused ? 'pane' : 'fullscreen')}
+        />
+      ) : null}
       noteCount={0}
       onToggleNotes={() => {}}
       onSend={() => {}}
       onClose={onClose}
+      onEscape={focused && onPresentationChange ? () => onPresentationChange('pane') : undefined}
       bodyScroll="shell"
     >
       <div className="viewer-content commission-review-viewer">
@@ -61,6 +73,7 @@ export function CommissionReviewViewer({ sequenceId, messages, onClose, inline }
       </div>
     </ViewerShell>
   );
+  return focused ? createPortal(shell, document.body) : shell;
 }
 
 function resolveCommissionReviewBySequence(sequenceId: number, messages: Message[]): ResolvedReview | null {

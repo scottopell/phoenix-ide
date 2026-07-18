@@ -27,7 +27,8 @@ import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastVi
  * correct trade: the file still opens, just without highlights.
  */
 
-export type DiffPresentation = 'fullscreen' | 'pane';
+export type ViewerPresentation = 'fullscreen' | 'pane';
+export type DiffPresentation = ViewerPresentation;
 
 export interface ProseFile {
   path: string;
@@ -39,12 +40,12 @@ export type DiffTarget = 'workspace' | 'active_pr';
 
 export type ViewerSlot =
   | { kind: 'none' }
-  | { kind: 'prose'; file: ProseFile; patchContext: PatchContext | null }
+  | { kind: 'prose'; presentation: ViewerPresentation; file: ProseFile; patchContext: PatchContext | null }
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; scopeKey: string; handleId: string }
-  | { kind: 'message'; sequenceId: number }
-  | { kind: 'commission-review'; requestSequenceId: number };
+  | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number }
+  | { kind: 'commission-review'; presentation: ViewerPresentation; requestSequenceId: number };
 
 /** The slot's imperative surface. Identity-stable across slot / browser-session
  *  changes, so a command-only consumer (a button that opens a viewer) does not
@@ -61,6 +62,8 @@ export interface ViewerSlotCommands {
   openMessage: (sequenceId: number) => void;
   /** Open a commission review request/result pair by request agent message sequence id. */
   openCommissionReview: (requestSequenceId: number) => void;
+  /** Change only the active prose/message/review presentation, preserving identity. */
+  setPresentation: (presentation: ViewerPresentation) => void;
   close: () => void;
 }
 
@@ -128,7 +131,8 @@ function deriveSlot(
   patchContext: PatchContext | null,
 ): DerivedSlot {
   const viewer = searchParams.get(VIEWER_PARAM);
-  const presentation = searchParams.get(DIFF_PRESENTATION_PARAM);
+  const presentationParam = searchParams.get(DIFF_PRESENTATION_PARAM);
+  const presentation: ViewerPresentation = presentationParam === 'fullscreen' ? 'fullscreen' : 'pane';
   const target = searchParams.get(DIFF_TARGET_PARAM);
   const file = searchParams.get(FILE_PARAM);
   const root = searchParams.get(ROOT_PARAM);
@@ -149,12 +153,12 @@ function deriveSlot(
           ? { kind: 'range', startLine: lineNumber, endLine }
           : { kind: 'line', lineNumber };
       return {
-        slot: { kind: 'prose', file: { path: file, rootDir: root, focus }, patchContext },
+        slot: { kind: 'prose', presentation, file: { path: file, rootDir: root, focus }, patchContext },
         malformed: false,
       };
     }
     case 'diff': {
-      if (presentation !== 'fullscreen' && presentation !== 'pane') {
+      if (presentationParam !== 'fullscreen' && presentationParam !== 'pane') {
         return { slot: { kind: 'none' }, malformed: true };
       }
       if (target !== null && target !== 'workspace' && target !== 'active_pr') {
@@ -173,12 +177,12 @@ function deriveSlot(
     case 'message': {
       const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
       if (sequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'message', sequenceId }, malformed: false };
+      return { slot: { kind: 'message', presentation, sequenceId }, malformed: false };
     }
     case 'commission-review': {
       const requestSequenceId = parseMessageParam(searchParams.get(REVIEW_PARAM));
       if (requestSequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'commission-review', requestSequenceId }, malformed: false };
+      return { slot: { kind: 'commission-review', presentation, requestSequenceId }, malformed: false };
     }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
@@ -248,6 +252,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       writeUrl((next) => {
         clearSlotParams(next);
         next.set(VIEWER_PARAM, 'prose');
+        next.set(DIFF_PRESENTATION_PARAM, 'pane');
         next.set(FILE_PARAM, path);
         next.set(ROOT_PARAM, rootDir);
         const lineNumber = options?.kind === 'line' ? validFocusLine(options.lineNumber) : undefined;
@@ -302,6 +307,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     writeUrl((next) => {
       clearSlotParams(next);
       next.set(VIEWER_PARAM, 'message');
+      next.set(DIFF_PRESENTATION_PARAM, 'pane');
       next.set(MESSAGE_PARAM, String(validSequenceId));
     });
   }, [setPatchContext, writeUrl]);
@@ -313,9 +319,15 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     writeUrl((next) => {
       clearSlotParams(next);
       next.set(VIEWER_PARAM, 'commission-review');
+      next.set(DIFF_PRESENTATION_PARAM, 'pane');
       next.set(REVIEW_PARAM, String(validSequenceId));
     });
   }, [setPatchContext, writeUrl]);
+
+  const setPresentation = useCallback((nextPresentation: ViewerPresentation) => {
+    if (slot.kind !== 'prose' && slot.kind !== 'message' && slot.kind !== 'commission-review') return;
+    writeUrl((next) => next.set(DIFF_PRESENTATION_PARAM, nextPresentation));
+  }, [slot.kind, writeUrl]);
 
   // Clear the URL to the empty slot. `clearStorage` distinguishes an explicit
   // user close (clears the last-viewer entry so navigating back doesn't reopen)
@@ -410,8 +422,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const commands = useMemo<ViewerSlotCommands>(
-    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, close }),
-    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, close],
+    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
+    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close],
   );
 
   return (

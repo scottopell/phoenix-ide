@@ -39,6 +39,9 @@ ImageTakeoverDark.storyName = 'image-takeover-dark';
 export const NotesPanelDark = storyFor('notes-panel-dark');
 NotesPanelDark.storyName = 'notes-panel-dark';
 
+export const FullscreenReviewDark = storyFor('fullscreen-review-dark');
+FullscreenReviewDark.storyName = 'fullscreen-review-dark';
+
 export const AnnotationDialogDark = storyFor('annotation-dialog-dark');
 AnnotationDialogDark.storyName = 'annotation-dialog-dark';
 

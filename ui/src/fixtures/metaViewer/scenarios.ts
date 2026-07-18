@@ -55,6 +55,35 @@ const NOTES_FILE = [
   '}',
 ].join('\n');
 
+const FOCUSED_REVIEW = [
+  '# Focused review',
+  '',
+  'A long Markdown document for sustained reading and annotation.',
+  '',
+  '## Implementation sketch',
+  '',
+  '```ts',
+  'const presentation = pendingNotes.length > 0 ? "resolve" : "pane";',
+  '```',
+  '',
+  '| Surface | Presentation | Notes |',
+  '| --- | --- | --- |',
+  '| File | Pane / fullscreen | Annotatable |',
+  '| Message | Pane / fullscreen | Annotatable |',
+  '| Commission review | Pane / fullscreen | Read-only |',
+  '',
+  '```mermaid',
+  'flowchart LR',
+  '  Pane --> Fullscreen',
+  '  Fullscreen --> Resolve',
+  '  Resolve --> Pane',
+  '```',
+  '',
+  '## Review details',
+  '',
+  ...Array.from({ length: 12 }, (_, index) => `Paragraph ${index + 1}: preserve identity, find state, scroll location, and pending feedback across the presentation transition.`),
+].join('\n');
+
 // Lines deliberately far wider than the viewport — including unbreakable tokens
 // — to establish the horizontal-overflow user story (does a long line wrap, get
 // a horizontal scrollbar, or clip?). Mix of normal lines for contrast.
@@ -250,6 +279,18 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
     seedNotes: [
       { lineNumber: 2, lineContent: '  const trimmed = input.trim();', body: 'Guard against non-string input before trim.' },
       { lineNumber: 5, lineContent: '  const head = parts.shift();', body: 'shift() on an empty array is undefined — document the contract.' },
+    ],
+  },
+  'fullscreen-review-dark': {
+    settleSelector: '.viewer-shell--takeover .notes-panel',
+    payload: markdownPayload('docs/focused-review.md', FOCUSED_REVIEW, {
+      presentation: 'fullscreen',
+      canTogglePresentation: true,
+      onPresentationChange: noop,
+    }),
+    seedNotes: [
+      { lineNumber: 3, lineContent: 'A long Markdown document for sustained reading and annotation.', body: 'Confirm the reading measure remains comfortable.' },
+      { lineNumber: 15, lineContent: '| Commission review | Pane / fullscreen | Read-only |', body: 'Keep this surface read-only.' },
     ],
   },
   'annotation-dialog-dark': {

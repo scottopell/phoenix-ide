@@ -32,9 +32,14 @@ interface CommonPayload {
    */
   absolutePath: string;
   onClose: () => void;
-  onSendNotes: (notes: string) => void;
+  onSendNotes: (notes: string) => void | Promise<void>;
+  /** Presentation selected by the URL-derived viewer slot. */
+  presentation?: 'pane' | 'fullscreen' | undefined;
   /** Render inline (desktop split-pane) instead of as an overlay. */
   inline?: boolean | undefined;
+  /** Whether a wide desktop pane is available as the alternate presentation. */
+  canTogglePresentation?: boolean | undefined;
+  onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
 }
 
 /** Shared shape for the four annotatable text render kinds. */

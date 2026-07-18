@@ -74,14 +74,27 @@ describe('ViewerSlot — commission-review kind', () => {
   it('opens a commission review, encoding request sequence id in the URL', () => {
     const h = renderSlot();
     act(() => { h.get().openCommissionReview(42); });
-    expect(h.get().slot).toEqual({ kind: 'commission-review', requestSequenceId: 42 });
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 42 });
     expect(h.search()).toContain('viewer=commission-review');
     expect(h.search()).toContain('review=42');
   });
 
   it('parses a commission review URL on cold entry', () => {
     const h = renderSlot('/c/conv-A?viewer=commission-review&review=7');
-    expect(h.get().slot).toEqual({ kind: 'commission-review', requestSequenceId: 7 });
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
+  });
+
+  it('restores and changes commission review presentation without changing identity', () => {
+    const h = renderSlot('/c/conv-A?viewer=commission-review&review=7&presentation=fullscreen');
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'fullscreen', requestSequenceId: 7 });
+    act(() => { h.get().setPresentation('pane'); });
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
+    expect(h.search()).toContain('review=7');
+  });
+
+  it('defaults legacy review URLs to pane', () => {
+    const h = renderSlot('/c/conv-A?viewer=commission-review&review=7');
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
   });
 
   it('normalizes commission review URLs with invalid ids to none', async () => {
@@ -182,7 +195,7 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     expect(h.search()).toContain('file=');
 
     act(() => { h.get().openCommissionReview(15); });
-    expect(h.get().slot).toEqual({ kind: 'commission-review', requestSequenceId: 15 });
+    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 15 });
     expect(h.search()).toContain('viewer=commission-review');
     expect(h.search()).toContain('review=15');
     expect(h.search()).not.toContain('file=');
@@ -242,14 +255,14 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     expect(h.search()).toContain('target=active_pr');
   });
 
-  it('removes the diff presentation param when opening prose or browser', () => {
+  it('writes canonical pane presentation for prose and clears it for browser', () => {
     const h = renderSlot();
     act(() => { h.get().openDiffFullscreen(); });
     expect(h.search()).toContain('presentation=fullscreen');
 
     act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
     expect(h.search()).toContain('viewer=prose');
-    expect(h.search()).not.toContain('presentation=');
+    expect(h.search()).toContain('presentation=pane');
 
     act(() => { h.get().openDiffFullscreen(); });
     act(() => { h.get().openBrowser(); });
@@ -261,6 +274,7 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     const range = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fsrc%2Fmain.ts&root=%2Frepo&line=40&endLine=64');
     expect(range.get().slot).toEqual({
       kind: 'prose',
+      presentation: 'pane',
       file: { path: '/repo/src/main.ts', rootDir: '/repo', focus: { kind: 'range', startLine: 40, endLine: 64 } },
       patchContext: null,
     });

@@ -32,8 +32,9 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 | **REQ-PF-014:** Open File from Patch Tool Output | ✅ Complete | PatchFileSummary with diff parsing |
 | **REQ-PF-015:** System-Triggered Prose Reader for Task Approval | ❌ Not Started | Auto-opens on AwaitingTaskApproval state entry |
 | **REQ-PF-016:** Approve, Discard, and Feedback Actions for Task Approval | ❌ Not Started | Three-action toolbar; iterative feedback loop |
+| **REQ-PF-017:** Focused Markdown Review | ✅ Complete | Wide-desktop prose/message/review takeover; bounded send/discard/keep feedback resolution |
 
-**Progress:** 14 of 16 complete
+**Progress:** 15 of 17 complete
 
 ## Prerequisites
 

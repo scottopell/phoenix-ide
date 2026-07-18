@@ -11595,6 +11595,29 @@ html * {
   z-index: 2100;
 }
 
+.viewer-shell--takeover .viewer-content > .markdown-body {
+  width: min(100%, 1100px);
+  margin-inline: auto;
+}
+
+.focused-review-exit {
+  width: min(680px, calc(100vw - 32px));
+}
+
+.focused-review-exit-actions {
+  flex-wrap: wrap;
+}
+
+.viewer-send-error {
+  color: var(--error-color, #dc2626);
+}
+
+@media (width <= 768px) {
+  .viewer-shell-icon-toggle span {
+    display: none;
+  }
+}
+
 .viewer-shell--inline {
   display: flex;
   flex-direction: column;
@@ -11764,6 +11787,10 @@ html * {
   flex-direction: column;
   z-index: 10;
   box-shadow: -4px 0 12px rgb(0 0 0 / 12%);
+}
+
+.viewer-shell--takeover .notes-panel {
+  width: min(440px, 42vw);
 }
 
 .notes-panel-header {

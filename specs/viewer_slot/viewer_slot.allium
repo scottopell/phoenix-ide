@@ -12,6 +12,9 @@
 --           that lets a cold reload (iOS PWA kill, refresh) restore the
 --           exact viewer + data the user was looking at.
 -- Excludes:
+--   - Responsive breakpoint selection. Presentation remains explicit slot data;
+--     when a pane is unavailable, the same pane state renders as an overlay and
+--     no presentation toggle is offered.
 --   - Phase-driven overlays (TaskApprovalReader, QuestionPanel,
 --     ErrorBanner, CredentialHelperPanel, ContextExhaustedBanner,
 --     TerminalBanner). These layer ON TOP of the viewer slot per
@@ -19,13 +22,9 @@
 --     mutex. See bedrock.allium for their entry/exit triggers.
 --   - The chat column itself, the conversation atom, and any phase
 --     state. See bedrock.allium / conversation_atom.allium.
---   - Responsive layout decisions (overlay vs full-screen vs
---     split-pane based on viewport). The spec governs WHAT is open;
---     CSS + ConversationPage decide HOW it's rendered. The slot is
---     the same regardless of layout.
---   - Per-viewer presentation: ProseReader's annotation/notes
---     subsystem, DiffView's commit log rendering, BrowserViewPanel's
---     CDP wire protocol. Viewers fetch their own payloads on mount.
+--   - Viewer payload rendering: Markdown layout, DiffView's commit log,
+--     and BrowserViewPanel's CDP wire protocol. Viewers fetch their own
+--     payloads on mount.
 --   - The mobile FileBrowserOverlay (a file-picker drawer that lets
 --     the user choose a file to open). It is NOT a viewer; selecting
 --     a file from it transitions the slot to prose. The drawer's open
@@ -38,12 +37,12 @@
 --   comparator" structurally unrepresentable.
 --
 --   The URL is the source of truth. Search params encode the slot:
---     ?viewer=prose&file=<absolute-path>&root=<absolute-path>
+--     ?viewer=prose&presentation=<pane|fullscreen>&file=<absolute-path>&root=<absolute-path>
 --     ?viewer=diff&presentation=<fullscreen|pane>
 --     ?viewer=browser
 --     ?viewer=inspect&scope=<scope-key>&handle=<handle-id>
---     ?viewer=message&message=<sequence-id>
---     ?viewer=commission-review&review=<request-sequence-id>
+--     ?viewer=message&presentation=<pane|fullscreen>&message=<sequence-id>
+--     ?viewer=commission-review&presentation=<pane|fullscreen>&review=<request-sequence-id>
 --   patchContext (modifiedLines: Set<Integer>) rides alongside in
 --   conversation-scoped state, not in the URL -- it is patch-
 --   provenance, not view identity. Loss on cold reload is acceptable.
@@ -144,7 +143,7 @@ value ViewerUrlSnapshot {
 -- `none` corresponds to "no ?viewer= param present."
 enum ViewerKind { none | prose | diff | browser | inspect | message | commission_review }
 
-enum DiffPresentation { fullscreen | pane }
+enum ViewerPresentation { fullscreen | pane }
 
 -- Note: ConversationEntered carries an entry-source discriminator
 -- (`cold_reload` vs `in_app`) modelled inline at the event call site
@@ -177,12 +176,15 @@ entity ViewerSlot {
     -- Non-null when the discriminator is set; the type system enforces
     -- absence otherwise.
     prose_file: ProseFile when kind = prose
-    -- Diff presentation is slot identity: fullscreen is a dismissible
-    -- takeover over app chrome; pane is the intentional split-pane surface.
-    diff_presentation: DiffPresentation when kind = diff
+    prose_presentation: ViewerPresentation when kind = prose
+    -- Presentation is slot identity: fullscreen is a dismissible takeover over
+    -- app chrome; pane is the intentional split-pane surface where available.
+    diff_presentation: ViewerPresentation when kind = diff
     inspect_handle: InspectHandle when kind = inspect
     message_ref: MessageRef when kind = message
+    message_presentation: ViewerPresentation when kind = message
     commission_review_ref: CommissionReviewRef when kind = commission_review
+    commission_review_presentation: ViewerPresentation when kind = commission_review
 
     -- The diff variant carries no payload data: the diff is identified by the
     -- conversation (conversation-keyed endpoint), and the browser
@@ -333,6 +335,7 @@ rule UserOpensProseFile {
     requires: not slot.conversation.is_terminal  -- no point opening a viewer on a terminal conversation; UI gates this too
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
+    ensures: slot.prose_presentation = pane
     ensures: slot.patch_context = patch
     -- The diff and browser variants carry no prose data, so moving to prose
     -- leaves nothing else to clear beyond the kind transition.
@@ -367,6 +370,7 @@ rule UserOpensMessageViewer {
     requires: not slot.conversation.is_terminal
     ensures: slot.kind = message
     ensures: slot.message_ref = message
+    ensures: slot.message_presentation = pane
 }
 
 rule UserOpensCommissionReviewViewer {
@@ -374,7 +378,24 @@ rule UserOpensCommissionReviewViewer {
     requires: not slot.conversation.is_terminal
     ensures: slot.kind = commission_review
     ensures: slot.commission_review_ref = review
+    ensures: slot.commission_review_presentation = pane
 }
+
+rule UserChangesContentViewerPresentation {
+    when: UserChangesViewerPresentation(slot, presentation)
+    requires: slot.kind = prose or slot.kind = message or slot.kind = commission_review
+    ensures: (slot.kind = prose) implies (slot.prose_presentation = presentation)
+    ensures: (slot.kind = message) implies (slot.message_presentation = presentation)
+    ensures: (slot.kind = commission_review) implies (slot.commission_review_presentation = presentation)
+}
+
+-- Fullscreen prose and message review is bounded: returning to pane with pending
+-- notes requires one explicit outcome. Sending returns only after success;
+-- failure preserves fullscreen and the complete note pile. Discard clears the
+-- complete pile before return. Keeping review preserves notes and inner chrome.
+-- Escape dismisses annotation, return confirmation, and find before requesting
+-- the same protected return-to-pane operation. Header close remains the viewer
+-- close operation and follows its independent unsaved-note protection.
 
 -- ===========================================================
 -- VS 2. CLOSING A VIEWER (REQ-VS-004)
@@ -411,10 +432,11 @@ rule UrlHydratesNone {
 }
 
 rule UrlHydratesProse {
-    when: UrlSlotChanged(slot, prose, file, _, _, _, _)
-    requires: file != null
+    when: UrlSlotChanged(slot, prose, file, presentation, _, _, _)
+    requires: file != null and presentation != null
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
+    ensures: slot.prose_presentation = presentation
     ensures: slot.patch_context = null
 }
 
@@ -444,17 +466,19 @@ rule UrlHydratesInspect {
 }
 
 rule UrlHydratesMessage {
-    when: UrlSlotChanged(slot, message, _, _, _, message_ref, _)
-    requires: message_ref != null
+    when: UrlSlotChanged(slot, message, _, presentation, _, message_ref, _)
+    requires: message_ref != null and presentation != null
     ensures: slot.kind = message
     ensures: slot.message_ref = message_ref
+    ensures: slot.message_presentation = presentation
 }
 
 rule UrlHydratesCommissionReview {
-    when: UrlSlotChanged(slot, commission_review, _, _, _, _, review_ref)
-    requires: review_ref != null
+    when: UrlSlotChanged(slot, commission_review, _, presentation, _, _, review_ref)
+    requires: review_ref != null and presentation != null
     ensures: slot.kind = commission_review
     ensures: slot.commission_review_ref = review_ref
+    ensures: slot.commission_review_presentation = presentation
 }
 
 -- Defensive: the URL has a viewer kind without its required params, or an
@@ -742,10 +766,13 @@ surface ConversationViewer {
     exposes:
         slot.kind
         slot.prose_file when slot.kind = prose
+        slot.prose_presentation when slot.kind = prose
         slot.diff_presentation when slot.kind = diff
         slot.inspect_handle when slot.kind = inspect
         slot.message_ref when slot.kind = message
+        slot.message_presentation when slot.kind = message
         slot.commission_review_ref when slot.kind = commission_review
+        slot.commission_review_presentation when slot.kind = commission_review
 
     provides:
         UserOpensProse(slot, file, patch?)
@@ -760,6 +787,8 @@ surface ConversationViewer {
             when not slot.conversation.is_terminal
         UserOpensCommissionReview(slot, review)
             when not slot.conversation.is_terminal
+        UserChangesViewerPresentation(slot, presentation)
+            when slot.kind = prose or slot.kind = message or slot.kind = commission_review
         UserClosesViewer(slot)
             when slot.kind != none
 }

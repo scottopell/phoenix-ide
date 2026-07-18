@@ -391,3 +391,42 @@ cycle (close, agent revises, reopen). The discard confirmation prevents accident
 of task proposals that the agent may have worked to produce.
 
 **Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028
+
+
+---
+
+### REQ-PF-017: Focused Markdown Review
+
+WHEN a Markdown file is open in an available wide-desktop pane
+THE SYSTEM SHALL offer a labeled Fullscreen action
+AND SHALL preserve the same file identity, rendered document, reading position, active find state, annotation state, notes panel state, and pending notes while entering focused review
+
+WHILE focused review is active
+THE SYSTEM SHALL render the viewer as a dismissible takeover above the conversation
+AND SHALL keep notes visible and operable
+AND SHALL offer a labeled Return to pane action
+
+WHEN the user sends feedback from focused review
+THE SYSTEM SHALL send the complete pending-note pile through the conversation feedback action
+AND SHALL return to the pane only after sending succeeds
+AND if sending fails SHALL remain in focused review, retain every pending note, and announce the failure visibly and accessibly
+
+WHEN the user requests Return to pane with no pending notes
+THE SYSTEM SHALL return immediately while preserving document, reading position, and find state
+
+WHEN the user requests Return to pane with pending notes
+THE SYSTEM SHALL offer exactly Send feedback and return, Discard notes and return, and Keep reviewing
+AND SHALL return only after successful send or explicit discard
+AND SHALL NOT silently transfer or drop pending notes into the pane session
+
+WHEN Escape is pressed in focused review
+THE SYSTEM SHALL dismiss annotation entry, return confirmation, and find in their established precedence before requesting Return to pane
+AND the header close action SHALL remain distinct from Return to pane and retain the viewer's unsaved-note protection
+
+WHEN a pane is unavailable at the active viewport width
+THE SYSTEM SHALL keep the Markdown viewer usable as an overlay
+AND SHALL NOT show a pane/fullscreen presentation control
+
+Finalized conversation-message Markdown SHALL provide the same focused-review and bounded-feedback behavior with message-scoped annotation anchors.
+Commission-review results SHALL provide the same pane/fullscreen presentation without annotation support.
+Task approval and fork-proposal review SHALL remain purpose-built decision surfaces outside this viewer-slot presentation flow.

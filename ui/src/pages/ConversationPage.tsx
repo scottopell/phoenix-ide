@@ -373,6 +373,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const messageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const messageOpen = messageSlot !== null;
   const commissionReviewSlot = viewerSlot.slot.kind === 'commission-review' ? viewerSlot.slot : null;
+  const proseSlot = viewerSlot.slot.kind === 'prose' ? viewerSlot.slot : null;
   const commissionReviewOpen = commissionReviewSlot !== null;
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
@@ -1824,6 +1825,13 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     },
     [fileExplorer, appendDraftCb, requestComposerFocus]
   );
+  const handleSendFocusedNotes = useCallback(
+    (formattedNotes: string) => {
+      appendDraftCb(formattedNotes);
+      requestComposerFocus();
+    },
+    [appendDraftCb, requestComposerFocus],
+  );
 
   const handleOpenFileFromPatch = useCallback(
     (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => {
@@ -2140,7 +2148,14 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen || commissionReviewViewerOpen);
+    && (
+      splitPanePrs !== null
+      || paneDiffOpen
+      || browserViewerOpen
+      || inspectViewerOpen
+      || messageViewerOpen
+      || commissionReviewViewerOpen
+    );
 
   const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
     <>
@@ -2760,7 +2775,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             sequenceId={messageSlot.sequenceId}
             messages={viewableMessages}
             onClose={handleCloseMessageViewer}
-            onSendNotes={handleSendNotes}
+            onSendNotes={messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+            presentation={messageSlot.presentation}
+            canTogglePresentation={isWideDesktop}
+            onPresentationChange={viewerSlot.setPresentation}
           />
         </Suspense>
       )}
@@ -2770,6 +2788,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             sequenceId={commissionReviewSlot.requestSequenceId}
             messages={viewableMessages}
             onClose={handleCloseMessageViewer}
+            presentation={commissionReviewSlot.presentation}
+            canTogglePresentation={isWideDesktop}
+            onPresentationChange={viewerSlot.setPresentation}
           />
         </Suspense>
       )}
@@ -2827,9 +2848,12 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   filePath={splitPanePrs.path}
                   rootDir={splitPanePrs.rootDir}
                   onClose={handleCloseFileViewer}
-                  onSendNotes={handleSendNotes}
+                  onSendNotes={proseSlot?.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
                   focus={splitPanePrs.focus}
+                  presentation={proseSlot?.presentation ?? 'pane'}
+                  canTogglePresentation
+                  onPresentationChange={viewerSlot.setPresentation}
                   inline
                 />
               ) : browserViewerOpen && conversationId ? (
@@ -2850,7 +2874,10 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   sequenceId={messageSlot.sequenceId}
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
-                  onSendNotes={handleSendNotes}
+                  onSendNotes={messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+                  presentation={messageSlot.presentation}
+                  canTogglePresentation
+                  onPresentationChange={viewerSlot.setPresentation}
                   inline
                 />
               ) : commissionReviewViewerOpen && commissionReviewSlot ? (
@@ -2858,6 +2885,9 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   sequenceId={commissionReviewSlot.requestSequenceId}
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
+                  presentation={commissionReviewSlot.presentation}
+                  canTogglePresentation
+                  onPresentationChange={viewerSlot.setPresentation}
                   inline
                 />
               ) : null}

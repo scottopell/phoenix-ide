@@ -1,25 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { Message } from '../api';
 import { useMessageReviewNotesData, useReviewNotesCommands } from '../contexts/ReviewNotesContext';
 import type { ReviewNote } from '../contexts/ReviewNotesContext';
 import { getMessageMarkdown } from '../utils/messageCopy';
-import { ViewerShell } from './viewer/ViewerShell';
+import { FocusedReviewExitDialog, ViewerPresentationControl, ViewerShell } from './viewer/ViewerShell';
 import { MarkdownViewerBody } from './viewer/MarkdownViewerBody';
 import { NotesPanel } from './viewer/NotesPanel';
 import { AnnotationDialog } from './viewer/AnnotationDialog';
 import { CopyButton } from './CopyButton';
 import { formatNotesForSend } from './viewer/formatNotes';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { useFocusedReviewExit } from './viewer/useFocusedReviewExit';
 
 interface MessageViewerProps {
   sequenceId: number;
   messages: Message[];
   onClose: () => void;
-  onSendNotes: (notes: string) => void;
+  onSendNotes: (notes: string) => void | Promise<void>;
+  presentation?: 'pane' | 'fullscreen' | undefined;
+  canTogglePresentation?: boolean | undefined;
+  onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   inline?: boolean | undefined;
 }
 
-export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inline }: MessageViewerProps) {
+export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
   useRegisterFocusScope('message-viewer');
   const message = useMemo(
     () => messages.find((m) => m.sequence_id === sequenceId) ?? null,
@@ -29,6 +34,14 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
   const content = message ? getMessageMarkdown(message) : '';
   const title = message ? messageTitle(message) : `Message #${sequenceId}`;
   const notes = useMessageReviewNotes(sequenceId, message?.message_id, onSendNotes);
+  const focused = presentation === 'fullscreen' && canTogglePresentation;
+  const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
+  const focusedExit = useFocusedReviewExit({
+    noteCount: notes.messageNotes.length,
+    send: notes.send,
+    discard: notes.clearAll,
+    returnToPane,
+  });
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const lineRefsSequenceId = useRef(sequenceId);
   if (lineRefsSequenceId.current !== sequenceId) {
@@ -55,20 +68,29 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
   );
 
   const headerExtras = message && content ? (
-    <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy message markdown" />
+    <>
+      <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy message markdown" />
+      {canTogglePresentation && onPresentationChange && (
+        <ViewerPresentationControl
+          fullscreen={focused}
+          onToggle={focused ? focusedExit.requestReturn : () => onPresentationChange('fullscreen')}
+        />
+      )}
+    </>
   ) : null;
 
-  return (
+  const shell = (
     <ViewerShell
-      mode={inline ? 'inline' : 'overlay'}
+      mode={focused ? 'takeover' : inline ? 'inline' : 'overlay'}
       ariaLabel={`Message viewer: ${title}`}
       title={title}
       titleTooltip={message ? `Conversation message #${sequenceId}` : undefined}
       headerExtras={headerExtras}
       noteCount={notes.messageNotes.length}
       onToggleNotes={notes.togglePanel}
-      onSend={notes.send}
-      onClose={onClose}
+      onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
+      onClose={focused ? focusedExit.requestReturn : onClose}
+      onEscape={focused ? focusedExit.requestReturn : undefined}
       bodyScroll="shell"
       panel={
         notes.showPanel ? (
@@ -77,7 +99,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
             onJumpTo={handleJumpTo}
             onRemove={notes.removeNote}
             onClearAll={notes.clearAll}
-            onSend={notes.send}
+            onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
             onClose={notes.closePanel}
           />
         ) : null
@@ -92,6 +114,15 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
           />
         ) : null
       }
+      confirm={focusedExit.promptOpen ? (
+        <FocusedReviewExitDialog
+          sending={focusedExit.sending}
+          error={focusedExit.error}
+          onSend={() => { void focusedExit.sendAndReturn(); }}
+          onDiscard={focusedExit.discardAndReturn}
+          onKeepReviewing={focusedExit.keepReviewing}
+        />
+      ) : null}
     >
       <div className="viewer-content">
         {message && content ? (
@@ -111,6 +142,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
       </div>
     </ViewerShell>
   );
+  return focused ? createPortal(shell, document.body) : shell;
 }
 
 const EMPTY_SET: Set<number> = new Set();
@@ -124,7 +156,7 @@ function messageTitle(message: Message): string {
 function useMessageReviewNotes(
   sequenceId: number,
   messageId: string | undefined,
-  onSendNotes: (notes: string) => void,
+  onSendNotes: (notes: string) => void | Promise<void>,
 ) {
   const commands = useReviewNotesCommands();
   const messageNotes = useMessageReviewNotesData(sequenceId);
@@ -166,13 +198,12 @@ function useMessageReviewNotes(
     [annotating, commands, messageId, sequenceId],
   );
 
-  const send = useCallback(() => {
+  const send = useCallback(async () => {
     const formatted = formatNotesForSend(commands.getSnapshot());
-    if (formatted) {
-      onSendNotes(formatted);
-      commands.clear();
-      setShowPanel(false);
-    }
+    if (!formatted) return;
+    await onSendNotes(formatted);
+    commands.clear();
+    setShowPanel(false);
   }, [commands, onSendNotes]);
 
   const togglePanel = useCallback(() => setShowPanel((v) => !v), []);

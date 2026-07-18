@@ -89,6 +89,66 @@ describe('MessageViewer', () => {
     expect(screen.getByText('Second proposal line')).toBeInTheDocument();
   });
 
+  it('bounds fullscreen feedback until it is sent or discarded', async () => {
+    const onPresentationChange = vi.fn();
+    const onSendNotes = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Review this line')]}
+          onClose={vi.fn()}
+          onSendNotes={onSendNotes}
+          presentation="fullscreen"
+          canTogglePresentation
+          onPresentationChange={onPresentationChange}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByRole('dialog', { name: /Message viewer/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Please revise' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Return to pane' }));
+
+    expect(screen.getByRole('dialog', { name: 'Resolve feedback before returning' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send feedback and return' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard notes and return' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep reviewing' }));
+    expect(onPresentationChange).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send notes' }));
+    await waitFor(() => expect(onSendNotes).toHaveBeenCalledTimes(1));
+    expect(onPresentationChange).toHaveBeenCalledWith('pane');
+  });
+
+  it('keeps fullscreen notes and announces a send failure', async () => {
+    const onPresentationChange = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Review this line')]}
+          onClose={vi.fn()}
+          onSendNotes={vi.fn().mockRejectedValue(new Error('Network unavailable'))}
+          presentation="fullscreen"
+          canTogglePresentation
+          onPresentationChange={onPresentationChange}
+        />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Please revise' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send notes' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Network unavailable');
+    expect(screen.getByRole('button', { name: '1 notes' })).toBeInTheDocument();
+    expect(onPresentationChange).not.toHaveBeenCalled();
+  });
+
   it('keeps line refs registered so note jumps can highlight the target line', async () => {
     Element.prototype.scrollIntoView = vi.fn();
     const messages = [agentTextMessage(1, 'First proposal line')];

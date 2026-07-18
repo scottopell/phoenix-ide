@@ -39,6 +39,7 @@ export const metaViewerScenarioDefinitions = [
   { id: 'html-preview-dark', title: 'HTML sandboxed preview', theme: 'dark', interaction: 'html-preview' },
   { id: 'image-takeover-dark', title: 'Image fullscreen takeover', theme: 'dark', interaction: 'image-takeover' },
   { id: 'notes-panel-dark', title: 'Review notes panel populated', theme: 'dark', interaction: 'open-notes' },
+  { id: 'fullscreen-review-dark', title: 'Focused Markdown review with notes', theme: 'dark', interaction: 'open-notes' },
   { id: 'annotation-dialog-dark', title: 'Annotation dialog open', theme: 'dark', interaction: 'open-annotation' },
   { id: 'loading-dark', title: 'Loader: loading spinner', theme: 'dark', interaction: 'none' },
   { id: 'error-dark', title: 'Loader: read error (cannot render)', theme: 'dark', interaction: 'none' },

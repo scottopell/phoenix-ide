@@ -315,7 +315,7 @@ describe('commission review tool rendering', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open full review' }));
 
     await waitFor(() => {
-      expect(screen.getByTestId('location-search')).toHaveTextContent('?viewer=commission-review&review=1');
+      expect(screen.getByTestId('location-search')).toHaveTextContent('?viewer=commission-review&presentation=pane&review=1');
     });
   });
 
