@@ -49,8 +49,8 @@ export function installGroundingPanelFixtureFetch(
         },
         counts: { changed_paths: 2, staged_paths: 0, unstaged_paths: 1, untracked_paths: 1, conflicted_paths: 0 },
         changed_paths: [
-          { kind: 'ordinary', path: 'src/components/GroundingPanel.tsx', index_status: 'unmodified', worktree_status: 'modified' },
-          { kind: 'untracked', path: 'notes/git-status.md' },
+          { kind: 'ordinary', path: 'examples/nested/child-file.ts', index_status: 'unmodified', worktree_status: 'modified' },
+          { kind: 'untracked', path: 'root-file.ts' },
         ],
       });
     }
