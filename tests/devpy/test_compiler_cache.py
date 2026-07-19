@@ -29,6 +29,14 @@ class CompilerCacheTests(unittest.TestCase):
             selected = self.dev._configure_compiler_cache(requested)
             return selected, os.environ.copy()
 
+    def test_all_cargo_lanes_enable_compiler_cache_setup(self):
+        for lane in ("rust", "clippy", "e2e"):
+            with self.subTest(lane=lane):
+                self.assertTrue(self.dev._cargo_check_active({lane}))
+
+    def test_non_cargo_lane_skips_compiler_cache_setup(self):
+        self.assertFalse(self.dev._cargo_check_active({"vitest"}))
+
     def test_explicit_rustc_wrapper_wins(self):
         selected, env = self.configure("kache", env={"RUSTC_WRAPPER": "custom"})
         self.assertEqual("explicit", selected)

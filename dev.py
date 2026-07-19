@@ -3930,6 +3930,13 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     return backend
 
 
+_CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
+
+
+def _cargo_check_active(active: set[str]) -> bool:
+    return bool(active & _CARGO_CHECK_LANES)
+
+
 def cmd_check(
     gate: bool = True,
     lanes: str | None = None,
@@ -3974,11 +3981,11 @@ def cmd_check(
             reporter.lane_skipped(lane, skipped[lane])
 
     # Lane groups whose shared, expensive setup is gated below. UI lanes need
-    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
+    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the compiler-cache env
     # and the env-classification probes. Only `rust` consumes the nextest
     # probe + thread sizing + codegen commands.
     ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
-    cargo_active = bool(active & {"rust", "e2e"})
+    cargo_active = _cargo_check_active(active)
 
     # Stage 3 / per-crate gating: when the rust lane runs under gating, try to
     # narrow clippy + test to the changed crate(s) and their reverse-dep
