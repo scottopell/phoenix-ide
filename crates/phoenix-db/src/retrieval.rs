@@ -445,10 +445,10 @@ pub async fn fts_upsert_conn(
     .bind(&message.conversation_id)
     .bind(message.message_type.to_string())
     .bind(message.created_at.to_rfc3339())
-    .bind(fingerprint)
+    .bind(&fingerprint)
     .execute(&mut *conn)
     .await?;
-    record_fts_row(conn, inserted.last_insert_rowid(), message).await?;
+    record_fts_row(conn, inserted.last_insert_rowid(), message, &fingerprint).await?;
     Ok(())
 }
 
@@ -462,8 +462,9 @@ async fn delete_message_rows(
             .fetch_all(&mut *conn)
             .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1 AND message_id = ?2")
             .bind(rowid)
+            .bind(message_id)
             .execute(&mut *conn)
             .await?;
     }
@@ -478,6 +479,7 @@ async fn record_fts_row(
     conn: &mut sqlx::SqliteConnection,
     fts_rowid: i64,
     message: &Message,
+    fingerprint: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
@@ -486,7 +488,7 @@ async fn record_fts_row(
     .bind(fts_rowid)
     .bind(&message.message_id)
     .bind(&message.conversation_id)
-    .bind(content_fingerprint(&index_text(message)))
+    .bind(fingerprint)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -526,8 +528,13 @@ pub async fn fts_reconcile_upsert(
         .fetch_all(&mut *tx)
         .await?;
         let deleted = rowids.len();
-        for rowid in rowids {
-            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+        for rowid in &rowids {
+            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1 AND message_id = ?2")
+                .bind(rowid)
+                .bind(&message.message_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
                 .bind(rowid)
                 .execute(&mut *tx)
                 .await?;
@@ -536,10 +543,6 @@ pub async fn fts_reconcile_upsert(
             tx.rollback().await?;
             return Ok(false);
         }
-        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
-            .bind(&message.message_id)
-            .execute(&mut *tx)
-            .await?;
     } else {
         // Insert an absent row only while it is still absent.
         let existing: i64 =
@@ -561,10 +564,10 @@ pub async fn fts_reconcile_upsert(
     .bind(&message.conversation_id)
     .bind(message.message_type.to_string())
     .bind(message.created_at.to_rfc3339())
-    .bind(fingerprint)
+    .bind(&fingerprint)
     .execute(&mut *tx)
     .await?;
-    record_fts_row(&mut tx, inserted.last_insert_rowid(), message).await?;
+    record_fts_row(&mut tx, inserted.last_insert_rowid(), message, &fingerprint).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -613,8 +616,9 @@ pub async fn fts_delete_conversation_conn(
             .fetch_all(&mut *conn)
             .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1 AND conversation_id = ?2")
             .bind(rowid)
+            .bind(conversation_id)
             .execute(&mut *conn)
             .await?;
     }
@@ -962,6 +966,72 @@ mod tests {
             "{}",
             locator_plan.join("\n")
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_replaces_only_the_observed_locator_set() {
+        let db = seed().await;
+        let stale = db
+            .add_message(
+                "m-cas",
+                "c-a",
+                &MessageContent::user("stale source"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stale_hash = content_fingerprint(&index_text(&stale));
+
+        let current_text = "current concurrent row";
+        let current_hash = content_fingerprint(current_text);
+        let current_insert = sqlx::query(
+            "INSERT INTO message_fts
+             (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+             VALUES (?1, 'm-cas', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', ?2)",
+        )
+        .bind(current_text)
+        .bind(&current_hash)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let current_rowid = current_insert.last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO message_fts_rows
+             (fts_rowid, message_id, conversation_id, content_hash)
+             VALUES (?1, 'm-cas', 'c-a', ?2)",
+        )
+        .bind(current_rowid)
+        .bind(&current_hash)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let snapshot = Message {
+            content: MessageContent::user("reconciled snapshot"),
+            ..stale
+        };
+        assert!(
+            fts_reconcile_upsert(db.pool(), &snapshot, Some(&stale_hash))
+                .await
+                .unwrap()
+        );
+
+        let current_fts_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM message_fts WHERE rowid = ?1 AND message_id = 'm-cas'",
+        )
+        .bind(current_rowid)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let current_locator_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE fts_rowid = ?1")
+                .bind(current_rowid)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(current_fts_rows, 1);
+        assert_eq!(current_locator_rows, 1);
     }
 
     #[tokio::test]

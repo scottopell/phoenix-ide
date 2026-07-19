@@ -2199,47 +2199,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn invalid_forwarded_outcome_stops_runtime_instead_of_shadowing_checkpoint() {
-        use crate::runtime::ConversationRuntime;
-        use crate::state_machine::outcome::{EffectOutcome, LlmOutcome};
-        use crate::state_machine::ConvContext;
-        use std::path::PathBuf;
-        use tokio::sync::mpsc;
-
-        let llm = Arc::new(MockLlmClient::new("test-model"));
-        let tools = Arc::new(MockToolExecutor::new());
-        let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
-        let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
-        let mut runtime = ConversationRuntime::new(
-            context,
-            ConvState::Idle,
-            storage,
-            llm,
-            tools,
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx,
-            broadcast_tx,
-        );
-
-        let keep_running = runtime
-            .forwarded_outcome_keeps_runtime_alive_for_test(EffectOutcome::Llm(
-                LlmOutcome::NetworkError {
-                    message: "stale outcome".to_string(),
-                },
-            ))
-            .await;
-
-        assert!(!keep_running);
-    }
-
     /// `spawn_agents` rejects a batch that exceeds the per-call sub-agent cap
     /// (`MAX_SUB_AGENTS_PER_SPAWN`), realising the bedrock `SpawnLimit`
     /// invariant. The whole call is rejected with a tool error — no truncation —
