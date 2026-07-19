@@ -435,7 +435,8 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            let response = if exited {
+            let response = if exited || (close_after_completion && status == "readiness_timed_out")
+            {
                 response
             } else {
                 match register_tmux_wake_if_live(ctx, server_token, target, true, response).await {

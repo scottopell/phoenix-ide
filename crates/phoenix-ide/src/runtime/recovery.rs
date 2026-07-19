@@ -88,6 +88,21 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         // Treat it as a settled Idle, never an interrupted tool turn.
         return RecoveryDecision::idle(reason);
     }
+    if last_msg
+        .display_data
+        .as_ref()
+        .and_then(|data| data.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("wake_result")
+        && last_msg
+            .display_data
+            .as_ref()
+            .and_then(|data| data.get("adopted"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return RecoveryDecision::auto_continue();
+    }
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
         return RecoveryDecision::idle(RecoveryReason::LastMessageNotTool);

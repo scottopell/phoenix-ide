@@ -718,6 +718,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             &self.binding.acceptance.supported_codecs,
         )
         .map_err(EngineError::InvalidPlan)?;
+        self.validate_plan_collisions(&binding.decision.plan)?;
         let mut consumed_ids = Vec::new();
         for item in &binding.items {
             let Some(existing) = self.deliveries.get(&item.id) else {
@@ -782,6 +783,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             &self.binding.acceptance.supported_codecs,
         )
         .map_err(EngineError::InvalidPlan)?;
+        self.validate_plan_collisions(&decision.plan)?;
         let predicate = if suppress {
             P::decision_handles_runtime_suppression(&item, &decision.plan.event)
         } else {
@@ -961,6 +963,31 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         schedule.due_occurrence = None;
         schedule.next_eligible_at = next_eligible_at;
         Some(schedule.clone())
+    }
+
+    fn validate_plan_collisions(&self, plan: &TransitionPlan<P>) -> Result<(), EngineError> {
+        for effect in &plan.effects {
+            if self.effects.contains_key(&effect.effect_id) {
+                return Err(EngineError::InvalidPlan(PlanError::EffectIdCollision(
+                    effect.effect_id,
+                )));
+            }
+        }
+        for barrier in &plan.barriers {
+            if self.barriers.contains_key(&barrier.barrier_id) {
+                return Err(EngineError::InvalidPlan(PlanError::BarrierIdCollision(
+                    barrier.barrier_id,
+                )));
+            }
+        }
+        for schedule in &plan.schedules {
+            if self.schedules.contains_key(&schedule.schedule_id) {
+                return Err(EngineError::InvalidPlan(PlanError::ScheduleIdCollision(
+                    schedule.schedule_id,
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn begin_transition(&mut self, decision: &ReducerDecision<P>) -> WorkflowTransition<P::Event> {

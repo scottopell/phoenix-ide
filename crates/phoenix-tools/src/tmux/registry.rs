@@ -495,13 +495,21 @@ impl TmuxRegistry {
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
-                server.server_token =
-                    read_server_token(&server.socket_path)
-                        .await
-                        .ok_or_else(|| TmuxError::ProbeFailed {
-                            socket_path: server.socket_path.clone(),
-                            source: std::io::Error::other("live tmux server has no stamped token"),
-                        })?;
+                match read_server_token(&server.socket_path).await {
+                    Some(token) => server.server_token = token,
+                    None => {
+                        run_tmux_quiet(
+                            &server.socket_path,
+                            &[
+                                "set-environment",
+                                "-g",
+                                SERVER_TOKEN_VAR,
+                                &server.server_token,
+                            ],
+                        )
+                        .await;
+                    }
+                }
                 server.status = ServerStatus::Live;
                 reused_live = true;
             }
