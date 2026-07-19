@@ -117,7 +117,7 @@ flowchart TD
     REG --> MODEL["Model-visible tool definitions"]
     REG --> EXEC["Tool implementation and execution policy"]
 
-    ROLE["parent id / Coordinator relation"] --> EXCEPTIONS["is_sub_agent and is_coordinator branches"]
+    ROLE["parent id / legacy Coordinator relation"] --> EXCEPTIONS["is_sub_agent and is_coordinator branches"]
     EXCEPTIONS --> REG
     EXCEPTIONS --> PROMPT
 
@@ -278,7 +278,7 @@ This is not a configurable per-tool token list. The enum variants and their capa
 - history normalization policy;
 - user-facing posture projection.
 
-Coordinator cardinality remains enforced by the `coordinator` relation. Coordinator runtime behavior becomes an intentional `EffectiveRuntimePosture::Coordinator` match rather than scattered `if is_coordinator` overrides.
+Coordinator cardinality becomes enforced by the normalized `runtime_role` partial unique index. Coordinator runtime behavior becomes an intentional `EffectiveRuntimePosture::Coordinator` match rather than scattered `if is_coordinator` overrides; the legacy `coordinator` relation is removed in the coordinated migration.
 
 ### Authority semantics
 
@@ -334,7 +334,28 @@ CREATE TABLE work_scopes (
 work_scope_id TEXT REFERENCES work_scopes(id) ON DELETE RESTRICT
 ```
 
-`conversations.work_scope_id` is non-null for every ordinary user transcript and sub-agent after backfill. It is null only for structurally non-work-scope roles such as the singleton Coordinator. That conditional requirement is enforced by creation APIs plus migration/property checks until role identity itself is normalized into a shape that SQLite can constrain directly.
+Normalize runtime role in the same migration so scope presence is enforced by SQLite rather than constructors:
+
+```sql
+runtime_role TEXT NOT NULL
+    CHECK (runtime_role IN ('user', 'sub_agent', 'coordinator')),
+work_scope_id TEXT REFERENCES work_scopes(id) ON DELETE RESTRICT,
+CHECK (
+    (runtime_role = 'coordinator' AND work_scope_id IS NULL)
+    OR
+    (runtime_role IN ('user', 'sub_agent') AND work_scope_id IS NOT NULL)
+)
+```
+
+`conversations.work_scope_id` is therefore non-null for every user transcript and sub-agent and null only for the Coordinator. Replace the existing `coordinator` relation rather than retain a parallel role representation:
+
+```sql
+CREATE UNIQUE INDEX one_coordinator_runtime
+    ON conversations(runtime_role)
+    WHERE runtime_role = 'coordinator';
+```
+
+The partial unique index enforces at most one Coordinator; the existing transactional get-or-create path queries/inserts that role and ensures one is available when the product initializes it. Coordinator still uses ordinary conversation transcript/state/runtime persistence. `runtime_role` is the sole behavioral and identity discriminator, not a cache of a second relation.
 
 A separate child-only relation stores only the fact that is not derivable from conversation scope or parentage:
 
@@ -347,7 +368,7 @@ CREATE TABLE sub_agent_authority (
 );
 ```
 
-The child obtains `work_scope_id` directly from its conversation row, parent identity through the existing parent relation, and environment from the WorkScope. This avoids an attachment aggregate containing copies of the same values.
+The child obtains `work_scope_id` directly from its conversation row, parent identity through the existing parent-conversation relation, and environment from the WorkScope. This avoids an attachment aggregate containing copies of the same values.
 
 Rules:
 
@@ -404,6 +425,20 @@ CREATE TABLE work_scope_environments (
 ```
 
 The `none` kind is supported structurally from introduction even though pure-chat product creation is deferred. The migration removes environment fields from `ConvMode` after backfill and cuts all environment readers over in the same suite. Branches, task files, and PRs remain child observations/artifacts rather than environment identity.
+
+### Resource ownership, actor authorization, and delivery ownership
+
+Three identities have deliberately non-overlapping contracts:
+
+```text
+WorkScopeId    -> owns environment, authority, resources, tasks, branches, and PR associations
+ConversationId -> identifies the requesting actor and receives one canonical user-visible delivery
+ResourceId     -> identifies the concrete Bash/tmux/browser/workflow resource
+```
+
+A resource registry lookup by `WorkScopeId` is never authorization. Every Bash/tmux/browser operation carries the requesting `ConversationId`/runtime role and its `EffectiveCapabilities`; execution verifies the actor may inspect/control that resource before operating on the scope-owned entry. Restricted children therefore cannot gain Work resource control merely by sharing the parent's scope. Do not add a general per-resource ACL unless a resource family has genuinely narrower sharing semantics; authority capabilities are the common enforcement source.
+
+Durable workflow delivery remains conversation-addressed. A wake resource and its observation workflow may be owned by stable WorkScope/Resource IDs, while each pending canonical delivery has exactly one current `destination_conversation_id`. Continuation atomically retargets only unaccepted conversation deliveries to the successor; it leaves resource identity, workflow evidence, deadlines, and scope ownership unchanged. Accepted deliveries remain linked to their original transcript message. This preserves #532's distinction between durable work ownership and the transcript that receives its result.
 
 ### Authority requests
 
@@ -545,6 +580,8 @@ A concurrent decision uses the request row and state CAS. The winner commits one
 A blocking authority decision rejects manual continuation/chat just like other blocking decisions. Context-threshold handling occurs before parking, so normal threshold continuation does not have to transfer a pending request.
 
 Granted authority is inherited automatically because the successor carries the same `work_scope_id`. No authority copy occurs and there is no parent/successor race over two columns. Deleting, archiving, or continuing a conversation must not delete the scope authority row. WorkScope resolution/abandonment is the only lifecycle allowed to retire it.
+
+WorkScope retirement is an explicit durable operation, not a consequence of deleting or terminalizing a transcript. Its transaction may mark the scope retired only after proving there is no current successor/user owner, active sub-agent, pending canonical delivery or workflow obligation, or live registered resource requiring preservation. Historical tasks, branches, PR associations, and accepted delivery links may remain attached to a retired scope for read-only history. Cleanup consumes the committed retirement fact; conversation cleanup never infers scope abandonment on its own.
 
 If a future product path permits continuation while a request is pending, it must atomically retarget `requesting_conversation_id` or introduce a separate current-presentation owner relation in the same continuation transaction. That behavior is not included in the first implementation.
 
@@ -728,7 +765,7 @@ Grant and rejection each create a durable conversation message/context event bef
 | Events | `sm_event.rs` decision event/outcome | Exact request ID and grant/reject outcome; stale decisions typed. |
 | State transition | special-tool interception and approval-state arms in `transition.rs` | Sole-call validation, context threshold ordering, blocking chat conflict, decision transition. |
 | Effects/checkpoint | `effect.rs`, checkpoint persistence executor | One request transaction and one decision transaction; no generic `PersistState` sequence that exposes partial success. |
-| DB schema/repository | migrations, `reset_all_to_idle`, conversation creation/continuation/sub-agent transactions | Stable WorkScope FK/environment/authority, request ledger, delegated child authority, atomic CAS APIs, preserved state. |
+| DB schema/repository | migrations, `reset_all_to_idle`, conversation creation/continuation/sub-agent transactions | Constrained runtime role, stable WorkScope FK/environment/authority/lifecycle, request ledger, delegated child authority, delivery destination, atomic CAS APIs, preserved state. |
 | Runtime derivation | `runtime.rs::conv_mode_to_context`, registry construction, `ConvContext`, `ToolContext` | Replace authority/environment inference with shared capability/posture derivation; `ConvMode` supplies lifecycle phase only. |
 | Tool executor | `ToolRegistryExecutor::swap_registry`, `upgrade_to_work_mode`, MCP merge | Rename/generalize to apply derived posture; refresh cached clearable names and prompt context. |
 | LLM request | `RuntimeExecutor` request assembly, `strip_unavailable_tool_blocks` | Prompt/tools/history from one posture; loss-preserving normalization. |
@@ -744,7 +781,9 @@ Grant and rejection each create a durable conversation message/context event bef
 | Stable outcomes | `drive_turn.rs::StableOutcome` and tests | `AwaitingAuthorityDecision`; no timeout loop. |
 | Analytics/deployment | exhaustive state matches in `analytics.rs`, deployment/global state formatters | Name/classify new state rather than wildcarding. |
 | Sub-agents | spawn schema/validation, child persistence, fresh/resume registry | Explicit delegated authority and inherited `work_scope_id`. |
-| Work resources | `WorkScope`, Bash/tmux/browser registries, inventory/resource monitor, PR association | Key by opaque stable WorkScope ID, not transcript/path-derived fallback. |
+| Work resources | `WorkScope`, Bash/tmux/browser registries, inventory/resource monitor, PR association | Key ownership by opaque stable WorkScope ID; authorize each requesting actor from `EffectiveCapabilities`; never use lookup identity as permission. |
+| Durable delivery | workflow delivery/binding rows, continuation transfer, exact message links | Keep one destination `ConversationId`; continuation retargets only pending delivery while preserving WorkScope/resource/workflow identity. |
+| Cleanup/retirement | terminal cleanup cascades, resource lifecycle, worktree reclamation | Consume explicit WorkScope retirement; never infer retirement from one transcript becoming terminal. |
 | Specs | permissions, projects, bedrock, subagents, chains, PR association, Coordinator, durable workflows | Update exact authority/lifecycle/environment contracts and cross-spec enumerations. |
 
 ## Specifications and ADR work
@@ -759,7 +798,7 @@ Create `specs/conversation-authority/requirements.md`, an Allium spec, and `exec
 - sole typed request call and malformed input;
 - pending decision and chat conflict;
 - grant/reject transactions;
-- work-stream lifetime/inheritance;
+- WorkScope lifetime/inheritance and explicit retirement;
 - phase versus authority distinction;
 - child delegation ceiling;
 - prompt/tool/execution agreement;
@@ -773,7 +812,7 @@ Allium is warranted because this is a multi-step blocking lifecycle with crash a
 Write ADRs for:
 
 1. stable WorkScope identity independent from transcript, branch, task, path, and `ConvMode`;
-2. operational authority as a durable work-stream fact and `EffectiveRuntimePosture` as a derived projection;
+2. operational authority as a durable WorkScope fact and `EffectiveRuntimePosture` as a derived projection;
 3. authority decisions remaining product semantic transactions rather than a bespoke durable-workflow profile, with future reuse of direct-turn acceptance when that profile lands.
 
 Do not rewrite accepted durable-workflow ADR history.
@@ -788,8 +827,11 @@ Update:
 - `specs/subagents`: delegated authority no greater than parent, fresh/resume parity, WorkScope/environment inheritance, current writer cardinality remains coordination policy.
 - `specs/chains`: WorkScope is the durable unit; transcript chain is lineage; branches/tasks/PRs are artifacts/projections.
 - `specs/pr-association`: replace old path-derived WorkScope FK/key with stable WorkScope identity without changing plural active-PR semantics.
-- `specs/global-recall`: Coordinator role remains singleton/bounded; current-work projection reports the new decision state and uses stable work-stream identity.
+- `specs/global-recall`: Coordinator role remains singleton/bounded; current-work projection reports the new decision state and uses stable WorkScope identity.
 - `specs/durable-workflows`: no new profile required; add the authority decision as an explicit non-adoption example if useful, and reference future direct-turn acceptance reuse.
+- durable workflow/wake specs: distinguish stable WorkScope/resource ownership from one conversation delivery destination; continuation retargets only unaccepted delivery.
+- resource specs (`bash`, `tmux-integration`, browser): scope lookup never grants actor access; require capability checks and delete continuation-rekey semantics.
+- lifecycle/cleanup specs: define explicit WorkScope retirement predicate and historical retention.
 
 ## Implementation sequence
 
@@ -800,22 +842,31 @@ Each slice must be independently reviewable and leave one authority source.
 Deliver as one coordinated migration suite:
 
 - authority spec, Allium, ADRs, and cross-spec terminology;
-- reconstruct `work_scopes` around opaque `WorkScopeId` and `authority_kind`;
-- add/backfill `conversations.work_scope_id` for top-level chains, continuations, and sub-agents;
+- reconstruct `work_scopes` around opaque `WorkScopeId`, `authority_kind`, and explicit lifecycle/retirement state;
+- add/backfill constrained `conversations.runtime_role` and `work_scope_id` for top-level chains, continuations, sub-agents, and Coordinator;
+- replace the singleton `coordinator` relation with the partial-unique normalized role and update get-or-create/query paths;
 - add/backfill the discriminated `work_scope_environments` relation and remove environment fields from `ConvMode`;
 - add child delegated-authority storage;
 - migrate PR association/feedback/observed-branch/active-selection FKs;
 - make creation, continuation, fork, and sub-agent transactions assign scope/environment atomically;
 - key Bash/tmux/browser/inventory/resource-monitor ownership by WorkScopeId;
+- require requesting actor identity plus `EffectiveCapabilities` on every shared-scope resource operation;
+- preserve conversation-addressed canonical delivery and retarget pending delivery destinations—not resource owners—on continuation;
+- add explicit WorkScope retirement CAS/predicate and make cleanup consume it;
+- delete Direct-continuation `rekey_scope` calls, persisted `conversation:<id>` rewrites, parent-scope fallback scans, and tests that expect registry movement;
 - update `work_scope_key` APIs/wire semantics to opaque WorkScope handles with an explicit legacy-handle migration policy;
 - remove `WorkScope::Conversation(id)`, `WorkScope::Worktree(path)`, and every path/transcript-derived identity fallback.
 
 Verification:
 
 - migration fixtures for Direct, managed Explore, Work/Branch, continuation chains, sub-agents, Coordinator, existing PR history, and all environment kinds;
-- property: every ordinary conversation has exactly one scope, all continuation members and children share it, and Coordinator—explicitly not a user work stream—has none;
+- property: every ordinary conversation has exactly one scope, all continuation members and children share it, Coordinator—explicitly not a user work stream—has none, and at most one conversation has Coordinator role;
 - schema admits and constrains exactly one allocated-worktree, unowned-cwd, or no-environment descriptor per WorkScope;
 - Direct continuation can inspect/control existing Bash/tmux/browser resources without rekey;
+- stronger invariant: Direct parent and successor resolve the same `WorkScopeId`, and continuation performs no Bash/tmux/browser registry mutation;
+- restricted child sharing a scope cannot inspect/control Work-only resources;
+- pending delivery destination transfers once to the successor while resource/workflow owner IDs remain byte-for-byte unchanged;
+- scope retirement fails while any live transcript/child, pending obligation, or live resource remains;
 - cleanup/inventory and all work-scope UI/API routes agree before and after continuation;
 - PR history and active selection survive migration;
 - repository search finds no production owner or environment inference from transcript ID/path/`ConvMode`;
@@ -959,7 +1010,7 @@ Rejected because request and decision each complete as local product-semantic tr
 
 ### Key authority by continuation root ID
 
-Rejected because fork/continuation topology and work identity are distinct, sub-agents participate in the same work stream, and Direct resource continuity should not require scanning or rewriting transcript lineage.
+Rejected because fork/continuation topology and work identity are distinct, sub-agents participate in the same WorkScope, and Direct resource continuity should not require scanning or rewriting transcript lineage.
 
 ### Rekey Direct resources during every continuation
 
