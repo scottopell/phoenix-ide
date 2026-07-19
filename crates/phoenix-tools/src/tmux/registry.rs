@@ -678,20 +678,39 @@ impl TmuxRegistry {
             server.socket_path.clone()
         } else {
             let derived = self.derived_socket_path(work_scope);
-            match probe(&derived)
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: derived.clone(),
-                    source,
-                })? {
-                ProbeResult::Live => {
-                    if read_server_token(&derived).await.as_deref() != Some(expected_server_token) {
-                        return Ok(None);
+            let mut candidates = vec![derived.clone()];
+            if let Ok(mut entries) = tokio::fs::read_dir(&self.socket_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path != derived
+                        && path.extension().and_then(|ext| ext.to_str()) == Some("sock")
+                    {
+                        candidates.push(path);
                     }
-                    derived
                 }
-                ProbeResult::NoSocket | ProbeResult::DeadSocket => return Ok(None),
             }
+            let mut matched = None;
+            for candidate in candidates {
+                match probe(&candidate)
+                    .await
+                    .map_err(|source| TmuxError::ProbeFailed {
+                        socket_path: candidate.clone(),
+                        source,
+                    })? {
+                    ProbeResult::Live
+                        if read_server_token(&candidate).await.as_deref()
+                            == Some(expected_server_token) =>
+                    {
+                        matched = Some(candidate);
+                        break;
+                    }
+                    ProbeResult::Live | ProbeResult::NoSocket | ProbeResult::DeadSocket => {}
+                }
+            }
+            let Some(matched) = matched else {
+                return Ok(None);
+            };
+            matched
         };
 
         let output = run_tmux_quiet_output(

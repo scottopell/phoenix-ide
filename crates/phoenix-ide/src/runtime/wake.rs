@@ -364,6 +364,7 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
+            let _chat_acceptance = manager.lock_chat_acceptance().await;
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
                 "type": "wake_result",
