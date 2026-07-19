@@ -233,11 +233,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
   const activeWorkScopeKey = activeConversationReadOnly ? undefined : activeConversation?.work_scope_key;
   const activeLiveWorkScope = activeConversationReadOnly ? undefined : liveWorkScope;
-  const browserSessionActive = activeConversation === null
-    ? undefined
-    : activeConversation.archived
-      ? false
-      : activeConversation.browser_session_active;
+  const browserSessionActive = activeConversation?.archived === true
+    ? false
+    : activeConversation !== null
+        && readinessConversationId === activeConversation.id
+        && confirmedLive
+      ? activeConversation.browser_session_active
+      : undefined;
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer

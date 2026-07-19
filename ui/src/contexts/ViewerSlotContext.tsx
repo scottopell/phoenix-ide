@@ -435,7 +435,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     }
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
-    if (prev === false && browserSessionActive === true && slotKind === 'none') {
+    if (prev !== true && browserSessionActive === true && slotKind === 'none') {
       openBrowser();
     } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
       // Browser snapshots are only useful while their server-owned session is

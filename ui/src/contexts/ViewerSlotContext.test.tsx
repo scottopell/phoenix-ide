@@ -367,6 +367,41 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(getLastViewer('conv-A')).toBeNull();
   });
 
+  it('preserves a stored browser viewer while session truth is unknown, then discards it when confirmed inactive', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function BrowserDestination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<BrowserDestination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+
+    act(() => { setActive!(false); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
   it('restores a stored browser viewer only after loaded session truth is active', () => {
     setLastViewer('conv-A', 'viewer=browser');
     let latest: ViewerSlotValue | null = null;
@@ -397,6 +432,31 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(latest!.slot.kind).toBe('none');
     expect(getLastViewer('conv-A')).toContain('viewer=browser');
 
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
+  });
+
+  it('auto-opens when loaded session truth rises from unknown to active in the same conversation', () => {
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function Harness() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(latest!.slot.kind).toBe('none');
     act(() => { setActive!(true); });
     expect(latest!.slot.kind).toBe('browser');
   });
