@@ -39,7 +39,7 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-CONV-001:** Conversation List | ✅ Complete | List with slug, cwd, timestamps |
-| **REQ-CONV-002:** Chat View | ✅ Complete | Messages, markdown, tool grouping, invisible reader-proximity history acquisition with localized retry; raw and Markdown-encoded local file paths share one classifier and open through the conversation file viewer (`linkifyText`, `ConversationMarkdownAnchor`, `MessageComponents.test.tsx`) |
+| **REQ-CONV-002:** Chat View | ✅ Complete | Messages, markdown, tool grouping, invisible reader-proximity history acquisition with localized retry; raw and Markdown-encoded local file paths share one classifier and open through the conversation file viewer; browser screenshot attachment URIs render inline through a filename- and canonicalization-confined preview path (`linkifyText`, `ConversationMarkdownAnchor`, `resolveConversationMarkdownImageSrc`, `MessageComponents.test.tsx`) |
 | **REQ-CONV-003:** Message Composition | ✅ Complete | Auto-resize and draft persistence; Enter/Shift+Enter and IME-safe submission; non-overlapping responsive controls; concurrent Stop and steering Queue actions while busy |
 | **REQ-CONV-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry; accepted steering entries reconcile by authoritative message ID, compact from local storage, and surface a recoverable inconsistency if later authoritative idle evidence still lacks the message |
 | **REQ-CONV-005:** Connection Status | ✅ Complete | Reconnection with backoff |

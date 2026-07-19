@@ -90,6 +90,12 @@ THE SYSTEM SHALL preserve ordinary safe browser-link behavior
 
 The local-path shapes recognized in raw text and Markdown destinations SHALL be identical. Path-shape recognition only identifies a file candidate; the server-side viewer-openability classification defined by `specs/file-explorer/requirements.md` remains authoritative for the resolved content.
 
+WHEN agent Markdown embeds an image using the browser screenshot attachment URI produced for a `/tmp/phoenix-screenshot-<uuid>.png` artifact
+THE SYSTEM SHALL render that screenshot inline in both streaming and finalized prose
+AND SHALL NOT extend attachment-URI rendering to arbitrary temporary files
+
+The screenshot preview transport SHALL admit only regular browser screenshot artifacts with that exact filename shape directly under the server's temporary directory. It SHALL canonicalize the requested file before admission so a matching symlink cannot expose a file outside that directory.
+
 **Rationale:** Users need to read the conversation history and understand tool execution. Long transcripts must not delay access to the newest activity, and transcript batching must not interrupt continuous reading.
 
 ---

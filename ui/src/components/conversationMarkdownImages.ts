@@ -3,6 +3,12 @@ import { defaultUrlTransform, type Components } from 'react-markdown';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:png|jpe?g|gif|webp|bmp|avif);base64,/i;
+const BROWSER_SCREENSHOT_ATTACHMENT = /^attachment:\/\/\/(tmp\/phoenix-screenshot-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.png)$/i;
+
+function browserScreenshotPreviewUrl(src: string): string | undefined {
+  const match = BROWSER_SCREENSHOT_ATTACHMENT.exec(src);
+  return match?.[1] ? `/preview/${match[1]}` : undefined;
+}
 
 function trimTrailingSlash(path: string): string {
   return path.endsWith('/') ? path.slice(0, -1) : path;
@@ -22,7 +28,11 @@ function encodedPreviewUrlForAbsolutePath(path: string): string {
 
 function conversationMarkdownUrlTransform(url: string, key: string): string | null | undefined {
   const trimmed = url.trim();
-  if (key === 'src' && (/^blob:/i.test(trimmed) || SAFE_DATA_IMAGE.test(trimmed))) {
+  if (key === 'src' && (
+    /^blob:/i.test(trimmed)
+    || SAFE_DATA_IMAGE.test(trimmed)
+    || browserScreenshotPreviewUrl(trimmed)
+  )) {
     return trimmed;
   }
   return defaultUrlTransform(url);
@@ -32,6 +42,9 @@ export function resolveConversationMarkdownImageSrc(src: string | undefined, roo
   if (!src) return src;
   const trimmed = src.trim();
   if (!trimmed) return undefined;
+
+  const screenshotPreview = browserScreenshotPreviewUrl(trimmed);
+  if (screenshotPreview) return screenshotPreview;
 
   if (/^(?:https?:|blob:)/i.test(trimmed) || trimmed.startsWith('//') || SAFE_DATA_IMAGE.test(trimmed)) {
     return trimmed;

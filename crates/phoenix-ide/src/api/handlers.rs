@@ -5664,6 +5664,25 @@ async fn read_file(
     }))
 }
 
+fn is_browser_screenshot_preview(requested: &FsPath, canonical: &FsPath) -> bool {
+    let Some(filename) = requested.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(uuid) = filename
+        .strip_prefix("phoenix-screenshot-")
+        .and_then(|name| name.strip_suffix(".png"))
+    else {
+        return false;
+    };
+    if requested.parent() != Some(FsPath::new("/tmp")) || uuid::Uuid::parse_str(uuid).is_err() {
+        return false;
+    }
+    canonical.is_file()
+        && fs::canonicalize("/tmp")
+            .map(|tmp| tmp.join(filename) == canonical)
+            .unwrap_or(false)
+}
+
 /// Serve a file from an absolute path with native Content-Type.
 /// Used by "Open in browser" for HTML preview -- the path-based URL means
 /// relative references (CSS, JS, images) resolve correctly against the
@@ -5695,7 +5714,7 @@ async fn serve_preview_file(
     let roots = read_root_allowlist(&state, query.cwd.as_deref()).await;
     let within_roots = |p: &std::path::Path| roots.iter().any(|root| p.starts_with(root));
 
-    if !within_roots(&path) {
+    if !within_roots(&path) && !is_browser_screenshot_preview(&requested, &path) {
         return Err(AppError::NotFound("File does not exist".to_string()));
     }
 
@@ -12630,6 +12649,62 @@ mod file_read_tests {
             preview_url_for_path(path),
             "/preview/tmp/screens/a%20%231%3Fraw%25.png"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_serves_only_browser_screenshot_artifacts_from_tmp() {
+        let root = tempfile::tempdir().expect("root");
+        let screenshot = std::path::PathBuf::from(format!(
+            "/tmp/phoenix-screenshot-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&screenshot, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("screenshot");
+
+        let response = preview_file(state_with_root(root.path()).await, &screenshot, None)
+            .await
+            .expect("browser screenshot is previewable");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        std::fs::remove_file(&screenshot).expect("remove screenshot");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_rejects_other_tmp_images_and_screenshot_symlinks() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.png");
+        std::fs::write(&secret, [0x89, b'P', b'N', b'G']).expect("secret");
+
+        let ordinary = std::path::PathBuf::from("/tmp/not-a-phoenix-screenshot.png");
+        std::fs::write(&ordinary, [0x89, b'P', b'N', b'G']).expect("ordinary tmp image");
+        let err = preview_file(state_with_root(root.path()).await, &ordinary, None)
+            .await
+            .expect_err("ordinary tmp image must remain private");
+        assert!(matches!(err, AppError::NotFound(_)));
+        std::fs::remove_file(&ordinary).expect("remove ordinary image");
+
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/phoenix-screenshot-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("screenshot-shaped directory");
+        let err = preview_file(state_with_root(root.path()).await, &directory, None)
+            .await
+            .expect_err("screenshot-shaped directory must remain private");
+        assert!(matches!(err, AppError::NotFound(_)));
+        std::fs::remove_dir(&directory).expect("remove directory");
+
+        let symlink = std::path::PathBuf::from(format!(
+            "/tmp/phoenix-screenshot-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        std::os::unix::fs::symlink(&secret, &symlink).expect("screenshot symlink");
+        let err = preview_file(state_with_root(root.path()).await, &symlink, None)
+            .await
+            .expect_err("screenshot symlink escape must remain private");
+        assert!(matches!(err, AppError::NotFound(_)));
+        std::fs::remove_file(&symlink).expect("remove symlink");
     }
 
     /// Helper: request `dir` (a directory) through `serve_preview_file`, which

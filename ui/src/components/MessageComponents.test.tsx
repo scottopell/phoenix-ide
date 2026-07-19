@@ -1921,6 +1921,41 @@ describe('conversation markdown links', () => {
     expect(image).toHaveAttribute('loading', 'lazy');
   });
 
+  it('renders finalized browser screenshot attachment images through the bounded preview path', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-screenshot-attachment', [{
+            type: 'text',
+            text: '![New conversation](attachment:///tmp/phoenix-screenshot-300d30a2-b105-4ebb-87d0-7222336b9197.png)',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'New conversation' })).toHaveAttribute(
+      'src',
+      '/preview/tmp/phoenix-screenshot-300d30a2-b105-4ebb-87d0-7222336b9197.png',
+    );
+  });
+
+  it('rejects arbitrary attachment image paths', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-unsafe-attachment', [{
+            type: 'text',
+            text: '![secret](attachment:///tmp/secret.png)',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'secret' })).toHaveAttribute('src', '');
+  });
+
   it('keeps finalized agent remote Markdown image URLs unchanged', () => {
     render(
       <MemoryRouter>
@@ -2095,6 +2130,28 @@ describe('conversation markdown links', () => {
       expect(screen.getByRole('img', { name: 'capture' })).toHaveAttribute(
         'src',
         '/preview/repo/project/ui/qa-artifacts/capture.png',
+      );
+    });
+  });
+
+  it('renders streaming browser screenshot attachment images through the bounded preview path', async () => {
+    render(
+      <MemoryRouter>
+        <StreamingMessageView
+          buffer={{
+            text: '![Work conversation](attachment:///tmp/phoenix-screenshot-d2b6f83a-d023-441a-90cb-67d9c77dc5fc.png)',
+            lastSequence: 1,
+            startedAt: Date.now(),
+            requestId: 'test-req-id',
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'Work conversation' })).toHaveAttribute(
+        'src',
+        '/preview/tmp/phoenix-screenshot-d2b6f83a-d023-441a-90cb-67d9c77dc5fc.png',
       );
     });
   });
