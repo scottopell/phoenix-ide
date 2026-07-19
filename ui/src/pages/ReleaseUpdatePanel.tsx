@@ -83,7 +83,8 @@ export function ReleaseUpdatePanel({
   onDeploymentChange?: (snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => void;
 }) {
   const [snapshot, setSnapshot] = useState<ReleaseUpdateSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [transactionError, setTransactionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -91,7 +92,11 @@ export function ReleaseUpdatePanel({
   const [discoveryCheckedAt, setDiscoveryCheckedAt] = useState<string | null>(null);
   const loadInFlight = useRef(false);
   const mounted = useRef(false);
-  const discoveryRecorded = useRef(false);
+  const snapshotRef = useRef<ReleaseUpdateSnapshot | null>(null);
+  const confirmedIdentityRef = useRef<string | null>(null);
+  const committedRefreshRef = useRef<string | null>(null);
+  snapshotRef.current = snapshot;
+  confirmedIdentityRef.current = confirmedIdentity;
 
   const load = useCallback(async (refresh = false) => {
     if (loadInFlight.current) return;
@@ -101,25 +106,27 @@ export function ReleaseUpdatePanel({
       if (!mounted.current) return;
       if (next.preview.kind === 'available') {
         const nextIdentity = `${next.preview.tag}:${next.preview.commit}:${next.preview.asset_sha256}`;
-        if (confirmedIdentity !== null && confirmedIdentity !== nextIdentity) {
+        if (confirmedIdentityRef.current !== null && confirmedIdentityRef.current !== nextIdentity) {
           setConfirming(false);
           setConfirmedIdentity(null);
         }
-      }
-      if (refresh || !discoveryRecorded.current) {
-        discoveryRecorded.current = true;
         setDiscoveryCheckedAt(next.sampled_at);
+        setDiscoveryError(null);
+        setSnapshot(next);
+      } else {
+        setDiscoveryError(next.preview.reason);
+        setSnapshot((current) => current?.preview.kind === 'available'
+          ? { ...current, transaction: next.transaction, authority: next.authority }
+          : next);
       }
-      setSnapshot(next);
       onDeploymentChange?.(next);
-      setError(null);
     } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setDiscoveryError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       if (mounted.current) setLoading(false);
       loadInFlight.current = false;
     }
-  }, [confirmedIdentity, onDeploymentChange]);
+  }, [onDeploymentChange]);
 
   useEffect(() => {
     mounted.current = true;
@@ -129,21 +136,38 @@ export function ReleaseUpdatePanel({
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
+  const shouldPollTransaction = snapshot?.transaction.kind === 'none' || active;
 
   useEffect(() => {
-    if (!active) return;
+    if (!shouldPollTransaction) return;
     let cancelled = false;
     let timer: number | null = null;
     const poll = async () => {
       try {
         const transaction = await api.releaseUpdateTransaction();
         if (!cancelled && mounted.current) {
-          setSnapshot((current) => current ? { ...current, transaction } : current);
-          setError(null);
+          const current = snapshotRef.current;
+          if (transaction.kind === 'present') {
+            setSnapshot((value) => value ? { ...value, transaction } : value);
+            setTransactionError(null);
+            if (
+              transaction.state === 'committed'
+              && committedRefreshRef.current !== transaction.transaction_id
+            ) {
+              committedRefreshRef.current = transaction.transaction_id;
+              await load();
+            }
+          } else if (current?.transaction.kind === 'present') {
+            setTransactionError(transaction.kind === 'unreadable'
+              ? transaction.reason
+              : 'Durable transaction status temporarily disappeared');
+          } else {
+            setTransactionError(transaction.kind === 'unreadable' ? transaction.reason : null);
+          }
         }
       } catch (cause) {
         if (!cancelled && mounted.current) {
-          setError(cause instanceof Error ? cause.message : String(cause));
+          setTransactionError(cause instanceof Error ? cause.message : String(cause));
         }
       }
       if (!cancelled) timer = window.setTimeout(() => { void poll(); }, POLL_MS);
@@ -153,7 +177,7 @@ export function ReleaseUpdatePanel({
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [active]);
+  }, [load, shouldPollTransaction]);
 
   const approve = useCallback(async () => {
     if (!snapshot || snapshot.preview.kind !== 'available') return;
@@ -161,11 +185,11 @@ export function ReleaseUpdatePanel({
     if (confirmedIdentity !== currentIdentity) {
       setConfirming(false);
       setConfirmedIdentity(null);
-      setError('The release preview changed. Review the new identity before approving.');
+      setDiscoveryError('The release preview changed. Review the new identity before approving.');
       return;
     }
     setApproving(true);
-    setError(null);
+    setDiscoveryError(null);
     try {
       await api.approveReleaseUpdate(
         snapshot.preview.tag,
@@ -176,7 +200,7 @@ export function ReleaseUpdatePanel({
       if (mounted.current) setConfirming(false);
       await load();
     } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setDiscoveryError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       if (mounted.current) setApproving(false);
     }
@@ -187,7 +211,16 @@ export function ReleaseUpdatePanel({
       && TERMINAL_STATES.has(snapshot.transaction.state)
       && snapshot.transaction.state !== 'activation_failed_rollback_failed');
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
-  const discoveryFreshness = error && snapshot ? 'stale' : loading ? 'loading' : snapshot ? 'current' : 'unavailable';
+  const committedReleaseIsPreview = snapshot?.transaction.kind === 'present'
+    && snapshot.transaction.state === 'committed'
+    && availablePreview?.tag === snapshot.transaction.release_tag;
+  const discoveryFreshness = discoveryError && snapshot?.preview.kind === 'available'
+    ? 'stale'
+    : loading
+      ? 'loading'
+      : snapshot?.preview.kind === 'available'
+        ? 'current'
+        : 'unavailable';
 
   return (
     <section className="settings-section release-update" aria-label="Phoenix release updates">
@@ -207,10 +240,15 @@ export function ReleaseUpdatePanel({
         </button>
       </div>
 
-      {error && (
+      {discoveryError && (
         <div className="settings-section__error">
-          {snapshot ? `Update information is stale — ${error}` : `Update information unavailable — ${error}`}
+          {snapshot?.preview.kind === 'available'
+            ? `Release information is stale — ${discoveryError}`
+            : `Release information unavailable — ${discoveryError}`}
         </div>
+      )}
+      {transactionError && (
+        <div className="settings-section__error">Transaction status is stale — {transactionError}</div>
       )}
       {!snapshot && loading && <div className="settings-section__hint">Resolving the latest stable published release…</div>}
 
@@ -236,7 +274,7 @@ export function ReleaseUpdatePanel({
               </div>
               {snapshot.preview.notes && <details><summary>Release notes</summary><pre>{snapshot.preview.notes}</pre></details>}
               {authorityText(snapshot.authority) && <div className="release-update__hint">{authorityText(snapshot.authority)}</div>}
-              {snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && (
+              {snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && !committedReleaseIsPreview && (
                 confirming ? (
                   <div className="release-update__confirm">
                     <span>Install {snapshot.preview.tag}? Phoenix will reconnect after backend-owned verification or rollback.</span>

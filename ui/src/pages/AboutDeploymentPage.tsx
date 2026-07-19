@@ -391,7 +391,7 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
         <div>
           <h3 className="settings-section__title">Resources</h3>
           <Freshness
-            state={state.error && state.sample ? 'stale' : state.loading ? 'loading' : state.sample ? 'current' : 'unavailable'}
+            state={state.stale && state.sample ? 'stale' : state.loading ? 'loading' : state.sample ? 'current' : 'unavailable'}
             sampledAt={state.sample?.sampled_at}
           />
           <div className="settings-section__hint">Refreshes automatically while this page is visible.</div>

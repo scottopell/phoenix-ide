@@ -60,7 +60,7 @@ describe('ReleaseUpdatePanel', () => {
   it('distinguishes unavailable discovery from stale last-good release information', async () => {
     const fetchMock = vi.mocked(fetch).mockRejectedValue(new Error('GitHub unavailable'));
     const first = render(<ReleaseUpdatePanel />);
-    expect(await screen.findByText(/update information unavailable/i)).toBeInTheDocument();
+    expect(await screen.findByText(/release information unavailable/i)).toBeInTheDocument();
     expect(screen.getByText('Unavailable')).toBeInTheDocument();
     first.unmount();
 
@@ -72,9 +72,43 @@ describe('ReleaseUpdatePanel', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
     });
-    expect(await screen.findByText(/update information is stale/i)).toBeInTheDocument();
+    expect(await screen.findByText(/release information is stale/i)).toBeInTheDocument();
     expect(screen.getByText(/^Stale ·/)).toBeInTheDocument();
     expect(screen.getByText('v1.1.0')).toBeInTheDocument();
+  });
+
+  it('preserves the last-good candidate when discovery returns unavailable', async () => {
+    const unavailable = {
+      ...snapshot,
+      preview: { kind: 'unavailable' as const, reason: 'GitHub unavailable' },
+      sampled_at: '2026-06-01T00:05:00Z',
+    };
+    vi.mocked(fetch)
+      .mockImplementationOnce(() => json(snapshot))
+      .mockImplementationOnce(() => json(unavailable));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText('v1.1.0')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    });
+
+    expect(await screen.findByText(/release information is stale — GitHub unavailable/i)).toBeInTheDocument();
+    expect(screen.getByText('v1.1.0')).toBeInTheDocument();
+    expect(screen.getByText(/^Stale ·/)).toBeInTheDocument();
+  });
+
+  it('does not rediscover releases when confirmation state changes', async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    });
+    expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('posts the approved tag and full commit', async () => {
@@ -142,13 +176,48 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('does not poll release discovery while no deployment is active', async () => {
-    const fetchMock = vi.mocked(fetch);
+  it('polls durable status from none without rediscovering releases', async () => {
+    const fetchMock = vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      return json(url.endsWith('/transaction') ? { kind: 'none' } : snapshot);
+    });
     render(<ReleaseUpdatePanel />);
     await screen.findByText('v1.1.0');
 
     await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/transaction'))).toHaveLength(3);
+  });
+
+  it('keeps polling across unreadable samples and refreshes the full snapshot after commit', async () => {
+    const activeTransaction = {
+      kind: 'present' as const,
+      transaction_id: 'tx-active', state: 'activating', source_commit: null,
+      release_tag: 'v1.1.0', expected_version: '1.1.0', expected_git_sha: snapshot.preview.commit,
+      created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+    };
+    const committed = { ...activeTransaction, state: 'committed' };
+    const afterCommit = {
+      ...snapshot,
+      current_version: '1.1.0',
+      preview: { ...snapshot.preview, newer_than_current: false },
+      transaction: committed,
+    };
+    const responses = [snapshot, activeTransaction, { kind: 'unreadable', reason: 'locked' }, committed, afterCommit];
+    const fetchMock = vi.mocked(fetch).mockImplementation(() => json(responses.shift()));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(screen.getByText(/transaction status is stale — locked/i)).toBeInTheDocument();
+    expect(screen.getByText(/activating and verifying/i)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(await screen.findByText(/update committed/i)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
   it('distinguishes verified rollback from rollback failure', async () => {

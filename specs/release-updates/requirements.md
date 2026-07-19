@@ -23,14 +23,16 @@ The system shall allow installation approval only from a same-host browser sessi
 The update surface shall treat browser locality as an approval constraint
 separate from runtime ownership and release eligibility; the deployment summary
 shall provide the primary local-or-remote access explanation.
-Release discovery shall refresh only on initial load or an explicit operator
-check. While a deployment transaction is active, the surface shall poll its
-durable status independently and shall stop polling after a terminal outcome or
-when the surface is unmounted.
-WHEN release discovery fails after a successful snapshot, THE SYSTEM SHALL keep
-the last good candidate visible and label its discovery state stale with the
-last successful check time. WHEN no successful snapshot exists, THE SYSTEM SHALL
-label release information unavailable.
+Release discovery shall refresh only on initial load, an explicit operator
+check, or once after a committed transaction so running identity and eligibility
+can reconcile. The surface shall poll durable transaction status from both the
+no-transaction state and active states, retain the last authoritative active
+status across transient unreadable or absent samples, and stop polling after a
+terminal outcome or when the surface is unmounted.
+WHEN release discovery fails or returns unavailable after a successful snapshot,
+THE SYSTEM SHALL keep the last good candidate visible and label its discovery
+state stale with the last successful check time. WHEN no successful snapshot
+exists, THE SYSTEM SHALL label release information unavailable.
 
 ### REQ-RU-004 — Production deployment remains the installation authority
 
