@@ -760,6 +760,7 @@ impl LlmService for MockLlmService {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
+            stream_telemetry: crate::ProviderStreamTelemetry::non_streaming(),
         })
     }
 
@@ -822,6 +823,7 @@ impl LlmService for MockLlmService {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
+            stream_telemetry: crate::ProviderStreamTelemetry::non_streaming(),
         })
     }
 

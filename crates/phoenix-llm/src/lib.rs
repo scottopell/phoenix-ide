@@ -78,6 +78,8 @@ pub use service::LlmServiceImpl;
 // and `phoenix_llm::X` paths resolve for downstream consumers.
 pub use phoenix_core::domain::llm_types::{self as types, *};
 
+mod stream_telemetry;
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -258,7 +260,74 @@ impl LoggingService {
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
             error.kind = tracing::field::Empty,
+            stream.first_provider_event_ms = tracing::field::Empty,
+            stream.first_generation_event_ms = tracing::field::Empty,
+            stream.first_visible_text_ms = tracing::field::Empty,
+            stream.provider_event_count = tracing::field::Empty,
+            stream.generation_event_count = tracing::field::Empty,
+            stream.visible_text_event_count = tracing::field::Empty,
+            stream.max_provider_gap_ms = tracing::field::Empty,
+            stream.max_generation_gap_ms = tracing::field::Empty,
+            stream.output_kind = tracing::field::Empty,
+            stream.completed = tracing::field::Empty,
         )
+    }
+
+    fn record_stream_telemetry(span: &tracing::Span, telemetry: &ProviderStreamTelemetry) {
+        span.record(
+            "stream.first_provider_event_ms",
+            tracing::field::display(
+                telemetry
+                    .dispatch_to_first_provider_event_ms
+                    .map_or_else(String::new, |v| v.to_string()),
+            ),
+        );
+        span.record(
+            "stream.first_generation_event_ms",
+            tracing::field::display(
+                telemetry
+                    .dispatch_to_first_generation_event_ms
+                    .map_or_else(String::new, |v| v.to_string()),
+            ),
+        );
+        span.record(
+            "stream.first_visible_text_ms",
+            tracing::field::display(
+                telemetry
+                    .dispatch_to_first_visible_text_ms
+                    .map_or_else(String::new, |v| v.to_string()),
+            ),
+        );
+        span.record(
+            "stream.provider_event_count",
+            telemetry.provider_event_count,
+        );
+        span.record(
+            "stream.generation_event_count",
+            telemetry.generation_event_count,
+        );
+        span.record(
+            "stream.visible_text_event_count",
+            telemetry.visible_text_event_count,
+        );
+        span.record(
+            "stream.max_provider_gap_ms",
+            tracing::field::display(
+                telemetry
+                    .max_provider_gap_ms
+                    .map_or_else(String::new, |v| v.to_string()),
+            ),
+        );
+        span.record(
+            "stream.max_generation_gap_ms",
+            tracing::field::display(
+                telemetry
+                    .max_generation_gap_ms
+                    .map_or_else(String::new, |v| v.to_string()),
+            ),
+        );
+        span.record("stream.output_kind", format!("{:?}", telemetry.output_kind));
+        span.record("stream.completed", telemetry.completed);
     }
 
     fn record_outcome(span: &tracing::Span, result: &Result<LlmResponse, LlmError>) {
@@ -271,6 +340,7 @@ impl LoggingService {
                     "cache_creation_tokens",
                     response.usage.cache_creation_tokens,
                 );
+                Self::record_stream_telemetry(span, &response.stream_telemetry);
             }
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
@@ -340,6 +410,16 @@ impl LlmService for LoggingService {
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
+                    first_provider_event_ms = response.stream_telemetry.dispatch_to_first_provider_event_ms,
+                    first_generation_event_ms = response.stream_telemetry.dispatch_to_first_generation_event_ms,
+                    first_visible_text_ms = response.stream_telemetry.dispatch_to_first_visible_text_ms,
+                    provider_event_count = response.stream_telemetry.provider_event_count,
+                    generation_event_count = response.stream_telemetry.generation_event_count,
+                    visible_text_event_count = response.stream_telemetry.visible_text_event_count,
+                    max_provider_gap_ms = response.stream_telemetry.max_provider_gap_ms,
+                    max_generation_gap_ms = response.stream_telemetry.max_generation_gap_ms,
+                    output_kind = ?response.stream_telemetry.output_kind,
+                    stream_completed = response.stream_telemetry.completed,
                     "LLM streaming request completed"
                 );
             }
@@ -349,6 +429,7 @@ impl LlmService for LoggingService {
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error_kind = ?e.kind,
+                    stream_failure_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM streaming request failed"

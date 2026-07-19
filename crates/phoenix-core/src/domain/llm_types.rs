@@ -89,7 +89,6 @@ pub struct ProviderStreamTelemetry {
     pub max_generation_gap_ms: Option<u64>,
     pub output_kind: StreamTelemetryOutputKind,
     pub completed: bool,
-    pub failure_kind: Option<String>,
 }
 
 impl ProviderStreamTelemetry {
@@ -106,7 +105,6 @@ impl ProviderStreamTelemetry {
             max_generation_gap_ms: None,
             output_kind: StreamTelemetryOutputKind::None,
             completed: false,
-            failure_kind: None,
         }
     }
 }

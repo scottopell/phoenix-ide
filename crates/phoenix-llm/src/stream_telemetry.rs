@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::LlmError;
 use crate::{LlmResponse, ProviderStreamTelemetry, StreamTelemetryOutputKind};
 use std::time::Instant;
 
@@ -85,15 +83,10 @@ impl StreamTelemetryRecorder {
     }
 
     pub(crate) fn finish_success(self) -> ProviderStreamTelemetry {
-        self.finish(true, None)
+        self.finish(true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn finish_error(self, error: &LlmError) -> ProviderStreamTelemetry {
-        self.finish(false, Some(format!("{:?}", error.kind)))
-    }
-
-    fn finish(self, completed: bool, failure_kind: Option<String>) -> ProviderStreamTelemetry {
+    fn finish(self, completed: bool) -> ProviderStreamTelemetry {
         ProviderStreamTelemetry {
             dispatch_to_first_provider_event_ms: self
                 .first_provider_event_at
@@ -116,7 +109,6 @@ impl StreamTelemetryRecorder {
                 self.saw_structured,
             ),
             completed,
-            failure_kind,
         }
     }
 
@@ -179,16 +171,5 @@ mod tests {
         assert_eq!(snapshot.max_generation_gap_ms, Some(16));
         assert_eq!(snapshot.output_kind, StreamTelemetryOutputKind::Mixed);
         assert!(snapshot.completed);
-        assert_eq!(snapshot.failure_kind, None);
-    }
-
-    #[test]
-    fn recorder_reports_failure_without_content() {
-        let start = Instant::now();
-        let recorder = StreamTelemetryRecorder::new(start);
-        let snapshot = recorder.finish_error(&LlmError::network("boom"));
-        assert!(!snapshot.completed);
-        assert_eq!(snapshot.output_kind, StreamTelemetryOutputKind::None);
-        assert_eq!(snapshot.failure_kind.as_deref(), Some("Network"));
     }
 }
