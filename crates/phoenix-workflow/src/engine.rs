@@ -142,7 +142,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
         }
         for schedule in &decision.plan.schedules {
-            if self.schedules.contains_key(&schedule.schedule_id) {
+            if self.schedules.contains_key(&schedule.schedule_id)
+                || self
+                    .schedules
+                    .values()
+                    .any(|existing| existing.key == schedule.key)
+            {
                 return Err(EngineError::InvalidPlan(PlanError::ScheduleIdCollision(
                     schedule.schedule_id,
                 )));
@@ -366,7 +371,19 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         receipt_event_codec: CodecRef,
         receipt_event: P::ReceiptReducerEvent,
     ) -> ReceiptAcceptance<P> {
-        if receipt_codec.family.is_empty() || receipt_event_codec.family.is_empty() {
+        if receipt_codec.family.is_empty()
+            || receipt_event_codec.family.is_empty()
+            || !self
+                .binding
+                .acceptance
+                .supported_codecs
+                .supports(&receipt_codec)
+            || !self
+                .binding
+                .acceptance
+                .supported_codecs
+                .supports(&receipt_event_codec)
+        {
             return stale_receipt();
         }
         let receipt_id = ReceiptId(self.next_receipt_id);
@@ -991,7 +1008,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             }
         }
         for schedule in &plan.schedules {
-            if self.schedules.contains_key(&schedule.schedule_id) {
+            if self.schedules.contains_key(&schedule.schedule_id)
+                || self
+                    .schedules
+                    .values()
+                    .any(|existing| existing.key == schedule.key)
+            {
                 return Err(EngineError::InvalidPlan(PlanError::ScheduleIdCollision(
                     schedule.schedule_id,
                 )));

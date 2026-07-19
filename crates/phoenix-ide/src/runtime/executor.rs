@@ -2543,6 +2543,7 @@ where
     }
 
     async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
+        self.parent_tool_cycle_count = 0;
         if !matches!(self.state, ConvState::Idle) {
             tracing::debug!(
                 conv_id = %self.context.conversation_id,

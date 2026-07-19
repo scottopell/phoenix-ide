@@ -104,9 +104,8 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
             .display_data
             .as_ref()
             .and_then(|data| data.get("terminal"))
-            .and_then(|terminal| terminal.get("kind"))
-            .and_then(serde_json::Value::as_str)
-            != Some("cancelled")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|terminal| !terminal.contains_key("Cancelled"))
     {
         return RecoveryDecision::auto_continue();
     }

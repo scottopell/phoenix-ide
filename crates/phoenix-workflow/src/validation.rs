@@ -40,6 +40,14 @@ pub enum PlanError {
     },
     RuntimeStartNotAllowed,
     DependencyCycle,
+    DuplicateDependency {
+        effect_id: EffectId,
+        depends_on_effect_id: EffectId,
+    },
+    DuplicateBarrierMember {
+        barrier_id: BarrierId,
+        effect_id: EffectId,
+    },
     BarrierHasNoMembers(BarrierId),
     BarrierIncludesNonRequiredEffect {
         barrier_id: BarrierId,
@@ -120,8 +128,12 @@ pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;
     let mut schedule_ids = BTreeSet::new();
+    let mut schedule_keys = BTreeSet::new();
     for schedule in &plan.schedules {
         if !schedule_ids.insert(schedule.schedule_id) {
+            return Err(PlanError::ScheduleIdCollision(schedule.schedule_id));
+        }
+        if !schedule_keys.insert(schedule.key) {
             return Err(PlanError::ScheduleIdCollision(schedule.schedule_id));
         }
     }
@@ -292,7 +304,15 @@ fn validate_dependencies<P: WorkflowProfile>(
     plan: &TransitionPlan<P>,
     effect_ids: &BTreeSet<EffectId>,
 ) -> Result<(), PlanError> {
+    let mut dependency_pairs = BTreeSet::new();
     for dependency in &plan.dependencies {
+        let pair = (dependency.effect_id, dependency.depends_on_effect_id);
+        if !dependency_pairs.insert(pair) {
+            return Err(PlanError::DuplicateDependency {
+                effect_id: dependency.effect_id,
+                depends_on_effect_id: dependency.depends_on_effect_id,
+            });
+        }
         if !effect_ids.contains(&dependency.effect_id) {
             return Err(PlanError::UnknownEffectReference(dependency.effect_id));
         }
@@ -328,6 +348,19 @@ fn collect_barrier_members<P: WorkflowProfile>(
 ) -> Result<BTreeMap<BarrierId, Vec<BarrierMemberDecl>>, PlanError> {
     let mut members_by_barrier: BTreeMap<BarrierId, Vec<BarrierMemberDecl>> = BTreeMap::new();
     for member in &plan.barrier_members {
+        if members_by_barrier
+            .get(&member.barrier_id)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|existing| existing.effect_id == member.effect_id)
+            })
+        {
+            return Err(PlanError::DuplicateBarrierMember {
+                barrier_id: member.barrier_id,
+                effect_id: member.effect_id,
+            });
+        }
         if !barrier_ids.contains(&member.barrier_id) {
             return Err(PlanError::UnknownBarrierReference(member.barrier_id));
         }

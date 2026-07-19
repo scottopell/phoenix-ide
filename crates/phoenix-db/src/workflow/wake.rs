@@ -795,8 +795,14 @@ impl WakeRepository {
         }
 
         let attempt_id = AttemptId(
-            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Attempt)
-                .await?,
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(attempt_id), 0) + 1 FROM workflow_attempts WHERE workflow_id = ?1",
+            )
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .fetch_one(&mut *tx.tx)
+            .await?
+            .try_into()
+            .map_err(|error| DbError::Serialization(format!("attempt_id: {error}")))?,
         );
         let result = tx
             .begin_attempt(&BeginAttemptInput {

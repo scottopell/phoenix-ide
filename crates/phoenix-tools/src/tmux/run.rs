@@ -438,6 +438,9 @@ async fn wait_for_text_response(
             let response = if exited || (close_after_completion && status == "readiness_timed_out")
             {
                 response
+            } else if close_after_completion && status == "ready" {
+                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                return response;
             } else {
                 match register_tmux_wake_if_live(ctx, server_token, target, true, response).await {
                     ok if ok.is_success() => ok,
@@ -1302,7 +1305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_only_live_window_registers_until_completion() {
+    async fn readiness_only_close_after_exit_skips_durable_registration() {
         if skip_unless_tmux() {
             return;
         }
@@ -1338,8 +1341,8 @@ mod tests {
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ready");
-        assert!(v.get("wake_registration").is_some());
-        assert_eq!(registrar.register_calls().len(), 1);
+        assert!(v.get("wake_registration").is_none());
+        assert!(registrar.register_calls().is_empty());
         kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
     }
 

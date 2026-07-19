@@ -201,7 +201,6 @@ pub struct LocalAttemptRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkflowSequenceName {
-    Attempt,
     Observation,
     Receipt,
     Delivery,
@@ -749,11 +748,13 @@ impl<'a> WorkflowTx<'a> {
             });
         }
         let ordinal = to_u32(
-            to_i64(
-                self.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Attempt)
-                    .await?,
-                "attempt_ordinal",
-            )? - 1,
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM workflow_attempts WHERE workflow_id = ?1 AND effect_id = ?2",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.effect_id.0, "effect_id")?)
+            .fetch_one(&mut *self.tx)
+            .await?,
             "ordinal",
         )?;
         let declared_workflow_version = Version(to_u64(
@@ -2267,7 +2268,6 @@ fn parse_workflow_status(value: &str) -> DbResult<WorkflowStatus> {
 
 fn workflow_sequence_name_str(sequence: WorkflowSequenceName) -> &'static str {
     match sequence {
-        WorkflowSequenceName::Attempt => "attempt",
         WorkflowSequenceName::Observation => "observation",
         WorkflowSequenceName::Receipt => "receipt",
         WorkflowSequenceName::Delivery => "delivery",

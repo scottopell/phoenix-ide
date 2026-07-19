@@ -324,12 +324,13 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         {
             InspectionOutcome::LiveRetry => Ok(LEASE_DURATION),
             InspectionOutcome::Terminal(evidence) => {
+                let observation_time = self.clock.now();
                 let _ = self
                     .repo
                     .record_terminal_allocated(&WakeTerminalEvidenceInput {
                         workflow_id: candidate.workflow_id,
                         authority,
-                        observation_time: now,
+                        observation_time,
                         evidence,
                     })
                     .await
