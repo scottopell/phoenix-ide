@@ -2163,9 +2163,8 @@ where
                         return;
                     }
                     if let Err(e) = self.process_event(event).await {
-                        // process_event already broadcast a typed
-                        // SseEvent::Error at the source if appropriate
-                        // (task 24682). No double-broadcast here.
+                        // process_event broadcasts a typed SseEvent::Error at the
+                        // source when the failure is user-facing.
                         tracing::error!(error = %e, "Error handling event");
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
@@ -2193,10 +2192,11 @@ where
                             state = self.state.variant_name(),
                             "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
                         );
-                    } else if let Err(e) =
-                        self.process_outcome(EffectOutcome::Llm(llm_outcome)).await
+                    } else if !self
+                        .apply_forwarded_outcome(EffectOutcome::Llm(llm_outcome), "llm")
+                        .await
                     {
-                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                        return;
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2225,10 +2225,11 @@ where
                             state = self.state.variant_name(),
                             "Ignoring stale tool outcome — task superseded (abort/new dispatch)"
                         );
-                    } else if let Err(e) =
-                        self.process_outcome(EffectOutcome::Tool(tool_outcome)).await
+                    } else if !self
+                        .apply_forwarded_outcome(EffectOutcome::Tool(tool_outcome), "tool")
+                        .await
                     {
-                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                        return;
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2257,10 +2258,14 @@ where
                             state = self.state.variant_name(),
                             "Ignoring stale RetryTimeout — timer superseded (cancel/new dispatch)"
                         );
-                    } else if let Err(e) =
-                        self.process_outcome(EffectOutcome::RetryTimeout { attempt }).await
+                    } else if !self
+                        .apply_forwarded_outcome(
+                            EffectOutcome::RetryTimeout { attempt },
+                            "retry_timeout",
+                        )
+                        .await
                     {
-                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                        return;
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2472,6 +2477,31 @@ where
     /// matches and is honored; only genuinely superseded fires are discarded.
     fn retry_timeout_is_stale(&self, generation: u64) -> bool {
         generation != self.retry_generation
+    }
+
+    async fn apply_forwarded_outcome(
+        &mut self,
+        outcome: EffectOutcome,
+        outcome_kind: &'static str,
+    ) -> bool {
+        if let Err(error) = self.process_outcome(outcome).await {
+            tracing::error!(
+                conv_id = %self.context.conversation_id,
+                error = %error,
+                outcome_kind,
+                "Outcome failed; stopping runtime at durable checkpoint"
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) async fn forwarded_outcome_keeps_runtime_alive_for_test(
+        &mut self,
+        outcome: EffectOutcome,
+    ) -> bool {
+        self.apply_forwarded_outcome(outcome, "test").await
     }
 
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {

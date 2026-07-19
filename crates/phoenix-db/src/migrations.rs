@@ -266,6 +266,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_tmux_completion_policy",
         sql: MIGRATION_050,
     },
+    Migration {
+        version: 51,
+        name: "index_message_fts_row_locations",
+        sql: MIGRATION_051,
+    },
 ];
 
 const MIGRATION_050: &str = r"
@@ -809,6 +814,21 @@ WHEN NOT (
 BEGIN
     SELECT RAISE(ABORT, 'workflow_schedules occurrence shape mismatch');
 END;
+";
+
+const MIGRATION_051: &str = r"
+CREATE TABLE message_fts_rows (
+    fts_rowid INTEGER PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL
+);
+CREATE INDEX idx_message_fts_rows_message_id
+    ON message_fts_rows(message_id);
+CREATE INDEX idx_message_fts_rows_conversation_id
+    ON message_fts_rows(conversation_id);
+INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
+SELECT rowid, message_id, conversation_id, content_hash FROM message_fts;
 ";
 
 const MIGRATION_044: &str = r"
@@ -2078,6 +2098,38 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_051_backfills_fts_row_locators() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_018).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO message_fts
+             (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+             VALUES ('needle', 'm-1', 0, 'c-1', 'user', '2026-01-01T00:00:00Z', 'hash-1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_051).execute(&pool).await.unwrap();
+
+        let locator: (i64, String, String, String) = sqlx::query_as(
+            "SELECT fts_rowid, message_id, conversation_id, content_hash
+             FROM message_fts_rows",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let fts_rowid: i64 = sqlx::query_scalar("SELECT rowid FROM message_fts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            locator,
+            (fts_rowid, "m-1".into(), "c-1".into(), "hash-1".into())
+        );
     }
 
     #[tokio::test]

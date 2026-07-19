@@ -152,6 +152,28 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
+        let mut locator_tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM message_fts_rows
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM message_fts
+                 WHERE rowid = message_fts_rows.fts_rowid
+                   AND message_id = message_fts_rows.message_id
+                   AND conversation_id = message_fts_rows.conversation_id
+                   AND content_hash = message_fts_rows.content_hash
+             )",
+        )
+        .execute(&mut *locator_tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_fts_rows
+             (fts_rowid, message_id, conversation_id, content_hash)
+             SELECT rowid, message_id, conversation_id, content_hash FROM message_fts",
+        )
+        .execute(&mut *locator_tx)
+        .await?;
+        locator_tx.commit().await?;
+
         // Physical index rows. We track a per-id row count alongside a sample
         // hash so a *duplicate* physical row for one message_id (which a plain
         // map would collapse) is detected and repaired — otherwise
@@ -219,6 +241,12 @@ impl Fts5Retriever {
         // orphans from the live table removes any such re-inserted row.
         let pruned = sqlx::query(
             "DELETE FROM message_fts WHERE message_id NOT IN (SELECT message_id FROM messages)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM message_fts_rows
+             WHERE fts_rowid NOT IN (SELECT rowid FROM message_fts)",
         )
         .execute(&self.pool)
         .await?;
@@ -407,11 +435,8 @@ pub async fn fts_upsert_conn(
 ) -> Result<(), sqlx::Error> {
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    sqlx::query("DELETE FROM message_fts WHERE message_id = ?1")
-        .bind(&message.message_id)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query(
+    delete_message_rows(conn, &message.message_id).await?;
+    let inserted = sqlx::query(
         "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
          VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
     )
@@ -421,6 +446,47 @@ pub async fn fts_upsert_conn(
     .bind(message.message_type.to_string())
     .bind(message.created_at.to_rfc3339())
     .bind(fingerprint)
+    .execute(&mut *conn)
+    .await?;
+    record_fts_row(conn, inserted.last_insert_rowid(), message).await?;
+    Ok(())
+}
+
+async fn delete_message_rows(
+    conn: &mut sqlx::SqliteConnection,
+    message_id: &str,
+) -> Result<(), sqlx::Error> {
+    let rowids: Vec<i64> =
+        sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = ?1")
+            .bind(message_id)
+            .fetch_all(&mut *conn)
+            .await?;
+    for rowid in rowids {
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+            .bind(rowid)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
+        .bind(message_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn record_fts_row(
+    conn: &mut sqlx::SqliteConnection,
+    fts_rowid: i64,
+    message: &Message,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(fts_rowid)
+    .bind(&message.message_id)
+    .bind(&message.conversation_id)
+    .bind(content_fingerprint(&index_text(message)))
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -451,21 +517,33 @@ pub async fn fts_reconcile_upsert(
     let mut tx = pool.begin().await?;
     if let Some(prev) = observed {
         // Replace a stale row only while it still carries the observed hash.
-        let deleted =
-            sqlx::query("DELETE FROM message_fts WHERE message_id = ?1 AND content_hash = ?2")
-                .bind(&message.message_id)
-                .bind(prev)
+        let rowids: Vec<i64> = sqlx::query_scalar(
+            "SELECT fts_rowid FROM message_fts_rows
+             WHERE message_id = ?1 AND content_hash = ?2",
+        )
+        .bind(&message.message_id)
+        .bind(prev)
+        .fetch_all(&mut *tx)
+        .await?;
+        let deleted = rowids.len();
+        for rowid in rowids {
+            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                .bind(rowid)
                 .execute(&mut *tx)
-                .await?
-                .rows_affected();
+                .await?;
+        }
         if deleted == 0 {
             tx.rollback().await?;
             return Ok(false);
         }
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
+            .bind(&message.message_id)
+            .execute(&mut *tx)
+            .await?;
     } else {
         // Insert an absent row only while it is still absent.
         let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE message_id = ?1")
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE message_id = ?1")
                 .bind(&message.message_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -474,7 +552,7 @@ pub async fn fts_reconcile_upsert(
             return Ok(false);
         }
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
          VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
     )
@@ -486,6 +564,7 @@ pub async fn fts_reconcile_upsert(
     .bind(fingerprint)
     .execute(&mut *tx)
     .await?;
+    record_fts_row(&mut tx, inserted.last_insert_rowid(), message).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -495,10 +574,9 @@ pub async fn fts_reconcile_upsert(
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete fails.
 pub async fn fts_delete_message(pool: &SqlitePool, message_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM message_fts WHERE message_id = ?1")
-        .bind(message_id)
-        .execute(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    delete_message_rows(&mut tx, message_id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -511,10 +589,9 @@ pub async fn fts_delete_conversation(
     pool: &SqlitePool,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM message_fts WHERE conversation_id = ?1")
-        .bind(conversation_id)
-        .execute(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    fts_delete_conversation_conn(&mut tx, conversation_id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -530,7 +607,18 @@ pub async fn fts_delete_conversation_conn(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM message_fts WHERE conversation_id = ?1")
+    let rowids: Vec<i64> =
+        sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .fetch_all(&mut *conn)
+            .await?;
+    for rowid in rowids {
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+            .bind(rowid)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
         .bind(conversation_id)
         .execute(&mut *conn)
         .await?;
@@ -842,6 +930,38 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_replacement_has_an_indexed_rowid_locator() {
+        let db = seed().await;
+        db.add_message(
+            "m-plan",
+            "c-a",
+            &MessageContent::user("indexed locator"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let locator_plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT fts_rowid FROM message_fts_rows WHERE message_id = 'm-plan'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        assert!(
+            locator_plan
+                .join("\n")
+                .contains("idx_message_fts_rows_message_id"),
+            "{}",
+            locator_plan.join("\n")
+        );
     }
 
     #[tokio::test]

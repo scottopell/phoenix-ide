@@ -32,11 +32,14 @@ The index is an SQLite FTS5 virtual table populated from message text
 extracted from the typed `MessageContent` of each message (not raw
 JSON), with `conversation_id`, `message_id`, `message_type`, and
 `created_at` carried as unindexed columns so scope filtering happens
-inside the query. The index is a **derived cache** over the `messages`
-table (the source of truth): it is kept current by indexing on message
-persist and reconciled by an idempotent startup backfill, and it can be
-rebuilt from `messages` at any time. The FTS5 table and its backfill
-are introduced through a migration.
+inside the query. An ordinary indexed `message_fts_rows` table maps
+message and conversation identities to FTS rowids; maintenance resolves
+rows through that B-tree and updates FTS by rowid instead of scanning the
+virtual table's unindexed provenance columns. Both tables are a single
+**derived cache** over the `messages` table (the source of truth): they
+are kept current atomically on message persistence, reconciled by an
+idempotent startup backfill, and can be rebuilt from `messages` at any
+time. Their schema and backfills are introduced through migrations.
 
 Retrieval is exposed behind a `MessageRetriever` trait. The first
 backend is FTS5/BM25 (lexical), chosen because the bundled SQLite ships
@@ -68,7 +71,7 @@ tracks implementation status.
 |---|---|---|
 | **REQ-RET-001:** Scope-Filtered Retrieval Primitive | ✅ Complete | `Fts5Retriever::retrieve` over `RetrievalScope` |
 | **REQ-RET-002:** One Index Over All Conversation Messages | ✅ Complete | Single `message_fts` table over all messages |
-| **REQ-RET-003:** Index Is a Rebuildable Derived Cache | ✅ Complete | Migration-introduced FTS5 table + idempotent `Fts5Retriever::reconcile` backfill |
+| **REQ-RET-003:** Index Is a Rebuildable Derived Cache | ✅ Complete | Migration-introduced FTS5 table and indexed row locator + idempotent `Fts5Retriever::reconcile` backfill |
 | **REQ-RET-004:** Text Extracted From Typed Message Content | ✅ Complete | Shared `ContentBlock::render_text` extraction, also used by the chain-qa read path |
 | **REQ-RET-005:** Retrieval Backend Is Swappable | ✅ Complete | FTS5/BM25 behind the `MessageRetriever` trait; vector/hybrid drop in behind it |
 | **REQ-RET-006:** Results Carry Provenance | ✅ Complete | `RetrievedChunk` carries conversation/message/type/timestamp |
@@ -77,13 +80,10 @@ tracks implementation status.
 
 ## Scope
 
-The MVP ships REQ-RET-001 through REQ-RET-008 with the FTS5/BM25
-backend and one consumer (chain Q&A, `specs/chains/` REQ-CHN-009).
-REQ-RET-008 (host-bound tool scope) is in MVP scope precisely because
-chain Q&A is: it is the requirement that makes REQ-CHN-009's
-"agent cannot widen past its chain" structural. The application-wide
-Q&A surface that motivates the `Global` scope is a separate spec; this
-primitive is built to serve it but does not depend on it.
+The implemented scope is REQ-RET-001 through REQ-RET-008 with the
+FTS5/BM25 backend and chain Q&A as a consumer. REQ-RET-008 (host-bound
+tool scope) makes REQ-CHN-009's "agent cannot widen past its chain"
+structural. Application-wide Q&A uses the same `Global` retrieval scope.
 
 ## Out of Scope (Tracked for Future)
 
