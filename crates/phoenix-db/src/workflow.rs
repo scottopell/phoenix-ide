@@ -688,8 +688,12 @@ impl<'a> WorkflowTx<'a> {
         input: &BeginAttemptInput,
     ) -> DbResult<BeginAttemptResult> {
         let effect = sqlx::query(
-            "SELECT declared_workflow_version, generation, capability_kind, stable_command_id, status
-             FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
+            "SELECT e.declared_workflow_version, e.generation, e.capability_kind,
+                    e.stable_command_id, e.status
+             FROM workflow_effects e
+             JOIN workflows w ON w.workflow_id = e.workflow_id
+             WHERE e.workflow_id = ?1 AND e.effect_id = ?2
+               AND w.status IN ('Active', 'Cancelling')",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.effect_id.0, "effect_id")?)
@@ -733,7 +737,12 @@ impl<'a> WorkflowTx<'a> {
         let claimed = sqlx::query(
             "UPDATE workflow_effects
              SET status = 'Executing'
-             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Eligible'",
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Eligible'
+               AND EXISTS (
+                   SELECT 1 FROM workflows w
+                   WHERE w.workflow_id = workflow_effects.workflow_id
+                     AND w.status IN ('Active', 'Cancelling')
+               )",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.effect_id.0, "effect_id")?)
@@ -923,7 +932,17 @@ impl<'a> WorkflowTx<'a> {
                           AND a.generation = ?5
                           AND a.process_incarnation = ?6
                           AND a.status IN ('Begun', 'ObservationRecorded')
-                    ) AS owns_effect
+                    ) AS owns_effect,
+                    EXISTS (
+                        SELECT 1 FROM workflow_supported_codecs c
+                        WHERE c.workflow_id = e.workflow_id
+                          AND c.codec_family = ?7 AND c.codec_version = ?8
+                    ) AS supports_receipt_codec,
+                    EXISTS (
+                        SELECT 1 FROM workflow_supported_codecs c
+                        WHERE c.workflow_id = e.workflow_id
+                          AND c.codec_family = ?9 AND c.codec_version = ?10
+                    ) AS supports_receipt_event_codec
              FROM workflow_effects e
              WHERE e.workflow_id = ?1 AND e.effect_id = ?2",
         )
@@ -939,6 +958,10 @@ impl<'a> WorkflowTx<'a> {
             input.authority.process_incarnation.0,
             "process_incarnation",
         )?)
+        .bind(&input.receipt_codec.family)
+        .bind(i64::from(input.receipt_codec.version))
+        .bind(&input.receipt_event_codec.family)
+        .bind(i64::from(input.receipt_event_codec.version))
         .fetch_optional(&mut *self.tx)
         .await?;
         let Some(effect) = effect else {
@@ -951,6 +974,8 @@ impl<'a> WorkflowTx<'a> {
         if effect.get::<String, _>("status") != "Executing"
             || input.attempt_id != Some(input.authority.attempt_id)
             || effect.get::<i64, _>("owns_effect") == 0
+            || effect.get::<i64, _>("supports_receipt_codec") == 0
+            || effect.get::<i64, _>("supports_receipt_event_codec") == 0
         {
             return Ok(ReceiptAcceptanceResult {
                 outcome: AuthorityOutcome::StaleAuthority,
@@ -1845,7 +1870,7 @@ impl WorkflowRepository {
         input: &StartScheduleOccurrenceInput,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query("UPDATE workflow_schedules SET status = 'Active', active_effect_id = ?3, active_occurrence_id = ?4, active_generation = ?5, active_due_at = ?6, due_occurrence_id = NULL, due_generation = NULL, due_at = NULL WHERE workflow_id = ?1 AND schedule_id = ?2 AND status = 'Due' AND due_occurrence_id = ?4")
+        let updated = sqlx::query("UPDATE workflow_schedules SET status = 'Active', active_effect_id = ?3, active_occurrence_id = ?4, active_generation = ?5, active_due_at = ?6, due_occurrence_id = NULL, due_generation = NULL, due_at = NULL WHERE workflow_id = ?1 AND schedule_id = ?2 AND status = 'Due' AND due_occurrence_id = ?4 AND due_generation = ?5 AND due_at = ?6")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.occurrence.schedule_id.0, "schedule_id")?)
             .bind(input.active_effect_id.and_then(|id| i64::try_from(id.0).ok()))
@@ -2587,7 +2612,8 @@ mod tests {
     fn acceptance() -> ErasedAcceptanceProfile {
         ErasedAcceptanceProfile::from_parts(
             profile(),
-            SupportedCodecRegistry::new([codec("snapshot"), codec("event")]).unwrap(),
+            SupportedCodecRegistry::new([codec("snapshot"), codec("event"), codec("receipt")])
+                .unwrap(),
             true,
             true,
         )
@@ -2854,6 +2880,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_attempt_rejects_eligible_effect_on_terminal_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(311)).await;
+        install_effect_plan(
+            &repo,
+            WorkflowId(311),
+            EffectId(1),
+            ExecutionCapability::SafelyRepeatable,
+        )
+        .await;
+        sqlx::query("UPDATE workflows SET status = 'Completed' WHERE workflow_id = ?1")
+            .bind(311_i64)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let result = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(311),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(7),
+                now: Timestamp(3),
+                lease_until: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Ineligible);
+        assert!(repo
+            .list_attempts(WorkflowId(311), EffectId(1))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn accept_receipt_allows_single_winner_across_connections() {
         let (_dir, first, second) = open_repo_pair().await;
         create_workflow(&first, WorkflowId(32)).await;
@@ -2915,6 +2978,61 @@ mod tests {
             first.list_deliveries(WorkflowId(32)).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn accept_receipt_rejects_unsupported_persisted_codec() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(323)).await;
+        install_effect_plan(
+            &repo,
+            WorkflowId(323),
+            EffectId(1),
+            ExecutionCapability::SafelyRepeatable,
+        )
+        .await;
+        let authority = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(323),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(3),
+                lease_until: None,
+            })
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+
+        let result = repo
+            .accept_receipt(&AcceptReceiptInput {
+                authority,
+                receipt_id: ReceiptId(1),
+                delivery_id: DeliveryId(1),
+                attempt_id: Some(AttemptId(1)),
+                origin: ReceiptOrigin::Execution,
+                receipt_codec: local_codec_owned("unsupported"),
+                receipt_payload: vec![1],
+                receipt_event_codec: local_codec_owned("event"),
+                receipt_event_payload: vec![2],
+                receipt_event_requires_runtime_acceptance: false,
+                request_runtime_acceptance_for_cancellation: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, AuthorityOutcome::StaleAuthority);
+        assert!(repo
+            .list_receipts(WorkflowId(323))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .list_deliveries(WorkflowId(323))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3125,6 +3243,28 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(!repo
+            .start_schedule_occurrence_exact(&StartScheduleOccurrenceInput {
+                workflow_id: WorkflowId(34),
+                occurrence: ScheduleOccurrence {
+                    generation: Generation(occ.generation.0 + 1),
+                    ..occ
+                },
+                active_effect_id: None
+            })
+            .await
+            .unwrap());
+        assert!(!repo
+            .start_schedule_occurrence_exact(&StartScheduleOccurrenceInput {
+                workflow_id: WorkflowId(34),
+                occurrence: ScheduleOccurrence {
+                    due_at: Timestamp(occ.due_at.0 + 1),
+                    ..occ
+                },
+                active_effect_id: None
+            })
+            .await
+            .unwrap());
         assert!(repo
             .start_schedule_occurrence_exact(&StartScheduleOccurrenceInput {
                 workflow_id: WorkflowId(34),

@@ -2317,19 +2317,58 @@ impl WakeRepository {
             .collect()
     }
 
+    pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let predecessors = sqlx::query_scalar::<_, String>(
+            "SELECT c.id
+             FROM conversations c
+             WHERE c.continued_in_conv_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM wake_bindings b
+                   LEFT JOIN workflow_deliveries d ON d.workflow_id = b.workflow_id
+                   WHERE b.conversation_id = c.id
+                     AND (b.resolved_at IS NULL OR d.status = 'Pending')
+               )
+             ORDER BY c.id",
+        )
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        tx.commit().await?;
+
+        let mut repaired = 0;
+        for predecessor in predecessors {
+            if self
+                .recover_continuation_transfer(&predecessor, timestamp)
+                .await?
+            {
+                repaired += 1;
+            }
+        }
+        Ok(repaired)
+    }
+
     pub async fn recover_continuation_transfer(
         &self,
         from_conversation_id: &str,
         timestamp: Timestamp,
     ) -> DbResult<bool> {
         let mut tx = self.workflow_repo.begin_tx().await?;
-        let continuation = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT continued_in_conv_id FROM conversations WHERE id = ?1",
+        let continuation = sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE continuation_chain(id, continued_in_conv_id, depth) AS (
+                 SELECT id, continued_in_conv_id, 0 FROM conversations WHERE id = ?1
+                 UNION ALL
+                 SELECT c.id, c.continued_in_conv_id, chain.depth + 1
+                 FROM conversations c
+                 JOIN continuation_chain chain ON c.id = chain.continued_in_conv_id
+                 WHERE chain.depth < 100
+             )
+             SELECT id FROM continuation_chain
+             WHERE continued_in_conv_id IS NULL AND depth > 0
+             ORDER BY depth DESC LIMIT 1",
         )
         .bind(from_conversation_id)
         .fetch_optional(&mut *tx.tx)
-        .await?
-        .flatten();
+        .await?;
         tx.commit().await?;
         let Some(continuation) = continuation else {
             return Ok(false);
@@ -6429,6 +6468,47 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].conversation_id, "conv-2");
         assert_eq!(pending[0].receipt.conversation_id, "conv-2");
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_repairs_continuation_transfer_after_restart() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-3").await;
+        let workflow_id = WorkflowId(1191);
+        create_pending_terminal_delivery(&repo, workflow_id).await;
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'conv-2' WHERE id = 'conv-1'")
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'conv-3' WHERE id = 'conv-2'")
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
+
+        assert_eq!(
+            restarted
+                .reconcile_continuation_transfers(Timestamp(30))
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(restarted.list_pending("conv-1").await.unwrap().is_empty());
+        assert!(restarted.list_pending("conv-2").await.unwrap().is_empty());
+        let pending = restarted.list_pending("conv-3").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].conversation_id, "conv-3");
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            "conv-3"
+        );
     }
 
     #[tokio::test]

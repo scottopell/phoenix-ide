@@ -12,7 +12,7 @@ use phoenix_db::workflow::wake::{
     WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
     WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
     WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository,
-    WakeTerminalEvidenceInput,
+    WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
@@ -155,6 +155,10 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Arc<RuntimeManager>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), String> {
+        self.repo
+            .reconcile_continuation_transfers(self.clock.now())
+            .await
+            .map_err(|error| error.to_string())?;
         self.run_once().await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         let _ = ready_tx.send(());
@@ -325,16 +329,25 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             InspectionOutcome::LiveRetry => Ok(LEASE_DURATION),
             InspectionOutcome::Terminal(evidence) => {
                 let observation_time = self.clock.now();
-                let _ = self
+                let outcome = self
                     .repo
                     .record_terminal_allocated(&WakeTerminalEvidenceInput {
                         workflow_id: candidate.workflow_id,
                         authority,
                         observation_time,
-                        evidence,
+                        evidence: evidence.clone(),
                     })
                     .await
                     .map_err(|e| e.to_string())?;
+                if matches!(
+                    outcome,
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                        | WakeTerminalEvidenceOutcome::Replayed { .. }
+                ) {
+                    self.inspector
+                        .cleanup_after_commit(&binding, &evidence)
+                        .await?;
+                }
                 Ok(Duration::ZERO)
             }
             InspectionOutcome::Forgotten(reason) => {
@@ -435,11 +448,31 @@ async fn deliver_pending(
                 .await
                 .map_err(|error| error.to_string())?
             {
-                MaterializePendingDeliveryMessageOutcome::Materialized(link)
-                | MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => {
+                MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
                     let _ = handle
                         .broadcast_tx
                         .send_message(link.linked_message.message.clone());
+                    let conversation_id = current.conversation_id;
+                    match repo
+                        .adopt_materialized_pending_for_conversation(&conversation_id, now)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
+                            if adopted.auto_resume {
+                                handle
+                                    .event_tx
+                                    .send(crate::state_machine::Event::WakeBatchAdopted)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        WakeAdoptMaterializedPendingOutcome::Busy(_)
+                        | WakeAdoptMaterializedPendingOutcome::NothingPending
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                    }
+                }
+                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
                     let conversation_id = current.conversation_id;
                     match repo
                         .adopt_materialized_pending_for_conversation(&conversation_id, now)
@@ -522,6 +555,14 @@ pub(crate) trait TerminalInspector: Send + Sync + 'static {
         authority: &'a LocalAttemptAuthority,
         observation_time: Timestamp,
     ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>>;
+
+    fn cleanup_after_commit<'a>(
+        &'a self,
+        _binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+        _evidence: &'a WakeTerminalEvidence,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct RuntimeRegistryInspector {
@@ -613,24 +654,18 @@ impl TerminalInspector for RuntimeRegistryInspector {
                         .map_err(|error| error.to_string())?
                     {
                         Some(window) => Ok(match window.exit_code {
-                            Some(exit_code) => {
-                                let _ = self
-                                    .tmux
-                                    .kill_exact_window(&scope, &identity.window_id)
-                                    .await;
-                                InspectionOutcome::Terminal(WakeTerminalEvidence::TmuxWindow(
-                                    TmuxTerminalEvidence {
-                                        identity: identity.clone(),
-                                        status: TmuxTerminalStatus::ExitMarkerObserved,
-                                        occurred_at: window
-                                            .occurred_at
-                                            .map_or(observation_time, system_time_to_timestamp),
-                                        exit_code: Some(exit_code),
-                                        duration_ms: None,
-                                        final_tail: window.final_tail,
-                                    },
-                                ))
-                            }
+                            Some(exit_code) => InspectionOutcome::Terminal(
+                                WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                                    identity: identity.clone(),
+                                    status: TmuxTerminalStatus::ExitMarkerObserved,
+                                    occurred_at: window
+                                        .occurred_at
+                                        .map_or(observation_time, system_time_to_timestamp),
+                                    exit_code: Some(exit_code),
+                                    duration_ms: None,
+                                    final_tail: window.final_tail,
+                                }),
+                            ),
                             None => InspectionOutcome::LiveRetry,
                         }),
                         None => Ok(InspectionOutcome::Forgotten(
@@ -642,6 +677,23 @@ impl TerminalInspector for RuntimeRegistryInspector {
                     Err("subagent wake bindings not implemented".to_string())
                 }
             }
+        })
+    }
+
+    fn cleanup_after_commit<'a>(
+        &'a self,
+        _binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+        evidence: &'a WakeTerminalEvidence,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if let WakeTerminalEvidence::TmuxWindow(evidence) = evidence {
+                let scope = work_scope_from_identity(&evidence.identity.work_scope);
+                let _ = self
+                    .tmux
+                    .kill_exact_window(&scope, &evidence.identity.window_id)
+                    .await;
+            }
+            Ok(())
         })
     }
 }
@@ -713,6 +765,7 @@ mod tests {
 
     struct MockInspector {
         outcomes: Mutex<HashMap<u64, VecDeque<InspectionOutcome>>>,
+        cleanup_calls: AtomicUsize,
     }
 
     struct FlakyInspector {
@@ -723,6 +776,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 outcomes: Mutex::new(HashMap::new()),
+                cleanup_calls: AtomicUsize::new(0),
             }
         }
 
@@ -733,6 +787,10 @@ mod tests {
                 .entry(workflow_id)
                 .or_default()
                 .push_back(outcome);
+        }
+
+        fn cleanup_calls(&self) -> usize {
+            self.cleanup_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -760,6 +818,15 @@ mod tests {
                     .and_then(VecDeque::pop_front)
                     .unwrap_or(InspectionOutcome::LiveRetry))
             })
+        }
+
+        fn cleanup_after_commit<'a>(
+            &'a self,
+            _binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+            _evidence: &'a WakeTerminalEvidence,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -918,12 +985,13 @@ mod tests {
         );
         let worker = WakeWorker::new(
             repo.clone(),
-            inspector,
+            inspector.clone(),
             Arc::new(TestClock::new(10)),
             ProcessIncarnation(1),
         );
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
+        assert_eq!(inspector.cleanup_calls(), 1);
     }
 
     #[tokio::test]
@@ -1302,6 +1370,93 @@ mod tests {
         assert!(matches!(
             &wake.content,
             crate::db::MessageContent::User(user) if user.is_meta && user.text.contains("done")
+        ));
+    }
+
+    #[tokio::test]
+    async fn already_materialized_wake_does_not_reset_newer_replay_events() {
+        let (db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let pending = repo.list_pending("conv").await.unwrap().pop().unwrap();
+        let materialized = repo
+            .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                workflow_id: phoenix_workflow::WorkflowId(workflow_id),
+                delivery_id: pending.canonical_delivery.delivery_id,
+                conversation_id: "conv".to_string(),
+                rendered_content: render_terminal_result(&pending),
+                display_data: Some(serde_json::json!({
+                    "type": "wake_result",
+                    "adopted": false,
+                    "terminal": &pending.receipt.terminal,
+                })),
+                auto_resume: true,
+                created_at: Timestamp(20),
+                sequence_id: Some(1),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            materialized,
+            MaterializePendingDeliveryMessageOutcome::Materialized(_)
+        ));
+
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+        handle
+            .broadcast_tx
+            .send_seq(|sequence_id| crate::runtime::SseEvent::Token {
+                sequence_id,
+                text: "newer".to_string(),
+                request_id: "request".to_string(),
+            })
+            .ok();
+        let before = handle.broadcast_tx.snapshot_pending();
+        assert_eq!(before.3.len(), 1);
+
+        deliver_pending(&manager, &repo, Timestamp(21))
+            .await
+            .unwrap();
+
+        let after = handle.broadcast_tx.snapshot_pending();
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.3.len(), 1);
+        assert!(matches!(
+            &after.3[0],
+            crate::runtime::SseEvent::Token { text, .. } if text == "newer"
         ));
     }
 
