@@ -29,8 +29,8 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
   const [announcement, setAnnouncement] = useState<WakeAnnouncement | null>(null);
   const requestGeneration = useRef(0);
 
-  const refresh = useCallback(async (): Promise<WakeStatus | undefined> => {
-    const generation = requestGeneration.current;
+  const refresh = useCallback(async (expectedGeneration = requestGeneration.current): Promise<WakeStatus | undefined> => {
+    const generation = expectedGeneration;
     try {
       const next = await api.getWakeStatus(conversationId);
       if (generation === requestGeneration.current) {
@@ -91,11 +91,13 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
               disabled={fetchFailed || cancellingContractId !== null}
               aria-busy={cancelling}
               onClick={async () => {
+                const actionGeneration = requestGeneration.current;
                 setCancellingContractId(contract.contract_id);
                 setAnnouncement(null);
                 try {
                   await api.cancelWake(conversationId, contract.contract_id);
-                  const next = await refresh();
+                  const next = await refresh(actionGeneration);
+                  if (actionGeneration !== requestGeneration.current) return;
                   const resolved = next?.contracts.every((entry) => entry.contract_id !== contract.contract_id);
                   setAnnouncement({
                     kind: 'success',
@@ -104,7 +106,8 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
                       : `Cancel requested for wake ${contract.contract_id}.`,
                   });
                 } catch {
-                  const next = await refresh();
+                  const next = await refresh(actionGeneration);
+                  if (actionGeneration !== requestGeneration.current) return;
                   const alreadyResolved = next?.contracts.every((entry) => entry.contract_id !== contract.contract_id);
                   setAnnouncement({
                     kind: alreadyResolved ? 'success' : 'error',
@@ -113,7 +116,7 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
                       : `Could not cancel wake ${contract.contract_id}. Wake status ${next ? 'refreshed' : 'unavailable'}.`,
                   });
                 } finally {
-                  setCancellingContractId(null);
+                  if (actionGeneration === requestGeneration.current) setCancellingContractId(null);
                 }
               }}
             >

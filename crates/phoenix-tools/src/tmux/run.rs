@@ -660,6 +660,9 @@ async fn register_tmux_wake_if_live(
         &registration_scope,
         &resource,
     );
+    if ctx.cancel.is_cancelled() {
+        return response;
+    }
     let register_input = RegisterWakeInput {
         contract_id: contract_id.clone(),
         conversation_id: ctx.conversation_id.clone(),
@@ -670,7 +673,25 @@ async fn register_tmux_wake_if_live(
         expires_at,
         prepared_fingerprint,
     };
-    match registrar.register(register_input).await {
+    let registration = registrar.register(register_input).await;
+    if ctx.cancel.is_cancelled() {
+        if let Ok(registered) = &registration {
+            if let Some(workflow_id) = registered.workflow_id() {
+                let _ = registrar
+                    .cancel(crate::CancelWakeInput {
+                        workflow_id,
+                        timestamp: Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                        reason:
+                            phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                    })
+                    .await;
+            }
+        }
+        return response;
+    }
+    match registration {
         Ok(
             RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
         ) => {

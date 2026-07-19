@@ -688,7 +688,8 @@ CREATE TABLE workflow_schedules (
 CREATE TRIGGER workflow_receipts_origin_attempt_shape
 BEFORE INSERT ON workflow_receipts
 FOR EACH ROW
-WHEN ((NEW.origin = 'Execution') <> (NEW.attempt_id IS NOT NULL))
+WHEN (NEW.origin = 'Execution' AND NEW.attempt_id IS NULL)
+   OR (NEW.origin NOT IN ('Execution', 'CancellationArbitration') AND NEW.attempt_id IS NOT NULL)
 BEGIN
     SELECT RAISE(ABORT, 'workflow_receipts origin/attempt mismatch');
 END;
