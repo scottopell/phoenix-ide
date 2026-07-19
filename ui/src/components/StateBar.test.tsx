@@ -957,6 +957,56 @@ describe('StateBar working-phase indicators', () => {
   });
 });
 
+describe('StateBar desktop identity layout', () => {
+  it('shows human conversation and project identity with explicit branch labels and PR authority', async () => {
+    renderStateBar({
+      prStatus: mockPrStatus({
+        found: true,
+        number: 12,
+        title: 'Desktop identity redesign',
+        url: 'https://github.com/scottopell/phoenix-ide/pull/12',
+        state: 'OPEN',
+        draft: false,
+        base: 'main',
+        head: 'task-123-pr-status',
+        display_state: 'open',
+        check_state: 'passing',
+      }),
+    });
+
+    expect(screen.getByText('Track PR status')).toBeInTheDocument();
+    expect(screen.getByText('Work')).toBeInTheDocument();
+    expect(screen.queryByText('phoenix-ide')).not.toBeInTheDocument();
+    expect(screen.getByText('Task branch')).toBeInTheDocument();
+    expect(screen.getAllByText('Branch')).toHaveLength(1);
+    expect(screen.getByText('task-123-pr-status')).toBeInTheDocument();
+    expect(screen.getByText('from')).toBeInTheDocument();
+    expect(screen.getByText('main')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /#12 checks ✓/i })).toBeInTheDocument();
+    expect(screen.getByText('track-pr-status')).toBeInTheDocument();
+  });
+
+  it('normalizes mode and model casing for desktop branch conversations', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        slug: 'feature-followup',
+        task_title: 'Tidy follow-up',
+        conv_mode_label: 'bRaNcH',
+        model: 'Claude-Sonnet-5',
+        branch_name: 'feature/existing-branch',
+        base_branch: 'develop',
+        cwd: '/Users/scott/projects/phoenix-ide',
+      }),
+    });
+
+    expect(screen.getAllByText('Branch')).toHaveLength(2);
+    expect(screen.getByText('Existing branch')).toBeInTheDocument();
+    expect(screen.getByText('Claude-Sonnet-5')).toBeInTheDocument();
+    expect(screen.getByText('feature/existing-branch')).toBeInTheDocument();
+    expect(screen.getByText('develop')).toBeInTheDocument();
+  });
+});
+
 describe('StateBar mobile layout', () => {
   beforeEach(() => {
     setMobileViewport(true);

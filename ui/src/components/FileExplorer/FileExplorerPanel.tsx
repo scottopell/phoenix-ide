@@ -16,6 +16,8 @@ import { useSeededLiveCount } from '../useWorkScopeSeed';
 import { workScopeLiveCount } from '../workScopeHelpers';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import type { SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
+import { getConversationProjectLabel } from '../../utils/conversationIdentity';
+import './FileExplorerPanel.css';
 
 interface Props {
   collapsed: boolean;
@@ -76,7 +78,9 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
   const hasFileRoot = !!rootPath;
-  const projectName = rootPath ? (rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath) : 'Read-only';
+  const projectName = rootPath
+    ? getConversationProjectLabel({ project_name: null, worktree_path: null, cwd: rootPath }) ?? rootPath
+    : 'Read-only';
 
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
@@ -134,7 +138,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         <div className="fe-title-stack">
           <span className="fe-title">Grounding</span>
           <span className="fe-subtitle" title={rootPath ?? undefined}>
-            {rootPath ? `${projectName} · ${branchName ?? 'no branch'}` : 'Read-only history'}
+            {rootPath ? `Files in ${projectName}` : 'Read-only history'}
           </span>
         </div>
         {hasFileRoot && (

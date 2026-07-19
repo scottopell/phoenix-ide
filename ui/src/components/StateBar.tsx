@@ -21,6 +21,9 @@ import type { ConversationPrStatusHandle } from "../hooks/useConversationPrStatu
 import type { ConnectionState } from "../hooks";
 import { useIsMobile } from "../hooks";
 import { getStateDescription, isAgentWorking } from "../utils";
+import {
+  getConversationIdentity,
+} from '../utils/conversationIdentity';
 import { ContextIndicator } from "./ContextIndicator";
 import "./StateBar.css";
 import { setActivePrSelectorIntent, type ActivePrSelectorIntent } from './activePrSelectorIntent';
@@ -160,55 +163,6 @@ function abbreviateModel(model: string): string {
   return inner;
 }
 
-/** Extract project name from cwd, project_name field, or worktree path */
-function getProjectName(conversation: Conversation): string | null {
-  // Prefer explicit project_name from backend
-  if (conversation.project_name) return conversation.project_name;
-
-  // For non-work modes, extract from cwd
-  const cwd = conversation.cwd;
-  if (!cwd) return null;
-
-  // Skip worktree UUIDs -- they're meaningless
-  if (cwd.includes(".phoenix/worktrees/")) return null;
-
-  const parts = cwd.replace(/\/$/, "").split("/");
-  return parts[parts.length - 1] || null;
-}
-
-function summarizePath(path: string | null | undefined): string {
-  if (!path) return "—";
-  const trimmed = path.replace(/\/$/, "");
-  const parts = trimmed.split("/").filter(Boolean);
-  if (parts.length <= 2) return path;
-  return `…/${parts.slice(-2).join("/")}`;
-}
-
-function modeTitle(
-  mode: string | undefined,
-  isExplore: boolean,
-  isWork: boolean,
-  isBranchMode: boolean,
-): string {
-  if (isExplore) return "Explore mode: read-only git project";
-  if (isWork) return "Work mode: task branch";
-  if (isBranchMode) return "Branch mode: existing branch";
-  if (mode === "direct") return "Direct mode: full access";
-  return "Full access";
-}
-
-function modeMeaning(
-  mode: string | undefined,
-  isExplore: boolean,
-  isWork: boolean,
-  isBranchMode: boolean,
-): string {
-  if (isExplore) return "Read-only git project";
-  if (isWork) return "Task branch";
-  if (isBranchMode) return "Existing branch";
-  if (mode === "direct") return "Full access";
-  return "Full access";
-}
 
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   if (!pr.url) return null;
@@ -915,17 +869,17 @@ export function StateBar({
     continuation?.phase === "idle" ? continuation.onTrigger : undefined;
 
   // Derived display values
-  const mode = conversation?.conv_mode_label?.toLowerCase();
+  const identity = conversation ? getConversationIdentity(conversation) : null;
+  const mode = identity?.mode.key ?? conversation?.conv_mode_label?.toLowerCase() ?? 'unknown';
   const isWork = mode === "work";
   const isExplore = mode === "explore";
   const isBranchMode = mode === "branch";
-  const modeLabel = conversation?.conv_mode_label;
+  const modeLabel = identity?.mode.label ?? null;
   const modeSuffix = isExplore ? " (read-only)" : "";
   const modeClass = `statebar-mode statebar-mode--${mode}`;
-  const modelAbbrev = conversation
-    ? abbreviateModel(conversation.model ?? "")
+  const modelAbbrev = identity
+    ? abbreviateModel(identity.modelLabel ?? "")
     : "";
-  const projectName = conversation ? getProjectName(conversation) : null;
 
   // Model picker: available when no operation is in flight (idle or error)
   // and we have models and a callback. Error-state switch lets the user
@@ -963,9 +917,10 @@ export function StateBar({
     onUpgradeModel(modelId);
   };
 
-  const baseBranch = conversation?.base_branch;
-  const branchName = conversation?.branch_name;
-  const taskTitle = conversation?.task_title;
+  const baseBranch = identity?.branch.base ?? null;
+  const branchName = identity?.branch.active ?? null;
+  const taskTitle = identity?.taskTitle ?? null;
+  const projectName = identity?.projectLabel ?? null;
   const prStatus =
     prStatusHandle?.state.status === "ready" ? prStatusHandle.state.prStatus : null;
   const prLoading = prStatusHandle?.state.status === "loading";
@@ -983,9 +938,9 @@ export function StateBar({
     && prRailAvailability?.shouldRender
   );
 
-  const cwdSummary = summarizePath(conversation?.cwd);
-  const modeHelp = modeTitle(mode, isExplore, isWork, isBranchMode);
-  const modeDetail = modeMeaning(mode, isExplore, isWork, isBranchMode);
+  const cwdSummary = identity?.path.summary ?? '—';
+  const modeHelp = identity?.mode.title ?? 'Full access';
+  const modeDetail = identity?.mode.detail ?? 'Full access';
 
   const prStatusContent = (
     <>
@@ -1285,129 +1240,47 @@ export function StateBar({
                 {modeLabel && (
                   <span
                     className={modeClass}
-                    title={
-                      isExplore
-                        ? "Read-only mode (git project)"
-                        : isWork
-                          ? "Write mode (task branch)"
-                          : isBranchMode
-                            ? "Branch mode (existing branch)"
-                            : "Full access (no git workflow)"
-                    }
+                    title={modeHelp}
                   >
                     {modeLabel}
                     {modeSuffix}
                   </span>
                 )}
-                <span className="conv-model-wrapper" ref={pickerRef}>
-                  {canPickModel ? (
-                    <button
-                      className="conv-model conv-model--button"
-                      title={`Model: ${conversation.model ?? "default"} (click to change)`}
-                      onClick={handleModelTriggerClick}
-                      aria-haspopup="listbox"
-                      aria-expanded={pickerOpen}
-                    >
-                      {modelAbbrev}
-                      <span className="conv-model-caret" aria-hidden="true">
-                        &#9662;
-                      </span>
-                    </button>
-                  ) : (
-                    <span
-                      className="conv-model"
-                      title={`Model: ${conversation.model ?? "default"}`}
-                    >
-                      {modelAbbrev}
-                    </span>
-                  )}
-                  {pickerOpen && canPickModel && (
-                    <div
-                      className="model-picker"
-                      role="listbox"
-                      aria-label="Select model"
-                    >
-                      <div className="model-picker-list">
-                        {pickerModels.map((m) => {
-                          const selected = m.id === currentModel;
-                          return (
-                            <button
-                              key={m.id}
-                              type="button"
-                              role="option"
-                              aria-selected={selected}
-                              className={
-                                "model-picker-item" +
-                                (selected ? " model-picker-item--selected" : "")
-                              }
-                              onClick={() => handleSelectModel(m.id)}
-                              title={m.description || m.id}
-                            >
-                              <span
-                                className="model-picker-item-check"
-                                aria-hidden="true"
-                              >
-                                {selected ? <CheckIcon /> : null}
-                              </span>
-                              <span className="model-picker-item-id">
-                                {m.id}
-                              </span>
-                              <span className="model-picker-item-ctx">
-                                {formatContextWindow(m.context_window)}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                      <label className="model-picker-show-all-toggle">
-                        <input
-                          type="checkbox"
-                          checked={pickerShowAll}
-                          onChange={(e) => setPickerShowAll(e.target.checked)}
-                        />
-                        <span>Show all models</span>
-                      </label>
-                    </div>
-                  )}
+                <span className="statebar-desktop-heading" title={identity?.title ?? conversation.slug}>
+                  {identity?.title ?? conversation.slug}
                 </span>
+                {projectName && (
+                  <span className="statebar-project" title={identity?.path.full ?? conversation.cwd}>
+                    {projectName}
+                  </span>
+                )}
+                <span className="statebar-desktop-mode-detail" title={modeHelp}>{modeDetail}</span>
+                {renderModelControl("desktop")}
               </div>
 
-              {/* Line 2: task title (Work) + git info, or project name */}
-              {(taskTitle || branchName || projectName) && (
+              {(taskTitle || branchName || prStatusContent) && (
                 <div className="statebar-line2">
-                  {taskTitle && (
+                  {taskTitle && taskTitle !== identity?.title && (
                     <span
                       className="statebar-task-title"
-                      title={branchName ? `Branch: ${branchName}` : undefined}
+                      title={taskTitle}
                     >
                       {taskTitle}
                     </span>
                   )}
-                  {branchName && baseBranch && (
-                    <span
-                      className={`git-flow${taskTitle ? " git-flow--secondary" : ""}`}
-                      title={`${baseBranch} <- ${branchName}`}
-                    >
-                      <span className="git-base">{baseBranch}</span>
-                      <span className="git-arrow">&larr;</span>
+                  {branchName && (
+                    <span className="git-branch-block" title={branchName}>
+                      <span className="git-label">Branch</span>
                       <span className="git-branch">{branchName}</span>
-                      {prStatusContent}
                     </span>
                   )}
-                  {branchName && !baseBranch && (
-                    <span
-                      className="git-branch-solo"
-                      title={`Branch: ${branchName}`}
-                    >
-                      {branchName}
-                      {prStatusContent}
+                  {branchName && baseBranch && (
+                    <span className="git-base-block" title={baseBranch}>
+                      <span className="git-label">from</span>
+                      <span className="git-base">{baseBranch}</span>
                     </span>
                   )}
-                  {projectName && (
-                    <span className="statebar-project" title={conversation.cwd}>
-                      {projectName}
-                    </span>
-                  )}
+                  <span className="statebar-pr-slot">{prStatusContent}</span>
                 </div>
               )}
             </>

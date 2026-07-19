@@ -123,6 +123,13 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     });
   });
 
+  it('shows a shared human project subtitle instead of repeating branch identity', async () => {
+    renderPanel();
+
+    expect(await screen.findByText('Files in repo')).toBeInTheDocument();
+    expect(screen.queryByText(/main/)).not.toBeInTheDocument();
+  });
+
   it('keeps Tasks expanded and preserves task group state after Back', async () => {
     renderPanel();
 

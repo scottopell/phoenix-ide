@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import type { Conversation, Project } from '../api';
 import {
   getConversationDisplayTitle,
+  getConversationIdentity,
   getConversationIdentityDisplay,
   getConversationProjectLabel,
   getProjectDisplayLabel,
+  summarizeConversationPath,
 } from './conversationIdentity';
 
 function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
@@ -82,5 +84,38 @@ describe('conversationIdentity', () => {
       title: 'Readable task title',
       projectLabel: 'Phoenix IDE',
     });
+  });
+
+  it('builds a shared typed identity payload for desktop and mobile consumers', () => {
+    expect(getConversationIdentity(makeConversation({
+      slug: '123e4567-e89b-12d3-a456-426614174000',
+      task_title: 'Readable task title',
+      project_name: 'Phoenix IDE',
+      branch_name: 'task-78001-redesign-state-bar',
+      base_branch: 'main',
+      conv_mode_label: 'wOrK',
+      model: 'claude-sonnet-5',
+      cwd: '/Users/scott/projects/phoenix-ide',
+    }))).toEqual({
+      title: 'Readable task title',
+      projectLabel: 'Phoenix IDE',
+      taskTitle: 'Readable task title',
+      branch: { active: 'task-78001-redesign-state-bar', base: 'main' },
+      path: { full: '/Users/scott/projects/phoenix-ide', summary: '…/projects/phoenix-ide' },
+      mode: {
+        key: 'work',
+        label: 'Work',
+        title: 'Work mode: task branch',
+        detail: 'Task branch',
+        desktopDetail: 'task branch',
+      },
+      modelLabel: 'claude-sonnet-5',
+    });
+  });
+
+  it('summarizes conversation paths for mobile cwd display', () => {
+    expect(summarizeConversationPath('/Users/scott/projects/phoenix-ide')).toBe('…/projects/phoenix-ide');
+    expect(summarizeConversationPath('/repo')).toBe('/repo');
+    expect(summarizeConversationPath(null)).toBe('—');
   });
 });
