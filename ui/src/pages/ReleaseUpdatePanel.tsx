@@ -78,9 +78,9 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
 }
 
 export function ReleaseUpdatePanel({
-  onRunningIdentityChange,
+  onDeploymentChange,
 }: {
-  onRunningIdentityChange?: (version: string, gitSha: string) => void;
+  onDeploymentChange?: (snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => void;
 }) {
   const [snapshot, setSnapshot] = useState<ReleaseUpdateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -103,7 +103,7 @@ export function ReleaseUpdatePanel({
         }
       }
       setSnapshot(next);
-      onRunningIdentityChange?.(next.current_version, next.current_git_sha);
+      onDeploymentChange?.(next);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -111,7 +111,7 @@ export function ReleaseUpdatePanel({
       setLoading(false);
       loadInFlight.current = false;
     }
-  }, [confirmedIdentity, onRunningIdentityChange]);
+  }, [confirmedIdentity, onDeploymentChange]);
 
   useEffect(() => {
     void load();

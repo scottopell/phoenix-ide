@@ -280,6 +280,38 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
   });
 
+  it('refreshes the summary when ownership changes without a build change', async () => {
+    const initial = deployment({
+      installation_ownership: { kind: 'ambiguous', reason: 'supervisor busy' },
+    });
+    const managed = deployment({
+      installation_ownership: { kind: 'systemd_managed' },
+    });
+    apiMock.deploymentInfo
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(managed);
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    apiMock.releaseUpdateSnapshot.mockResolvedValueOnce({
+      installation_ownership: { kind: 'systemd_managed' },
+      current_version: initial.build.version,
+      current_git_sha: initial.build.git_sha,
+      preview: { kind: 'unavailable', reason: 'not checked' },
+      transaction: { kind: 'none' },
+      authority: { kind: 'allowed' },
+      sampled_at: '2026-06-01T00:00:04Z',
+    });
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('Runtime manager is ambiguous')).toBeInTheDocument();
+    expect(await screen.findByText('Managed by systemd')).toBeInTheDocument();
+    expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
+  });
+
   it('uses non-alarming language for local development instances', async () => {
     renderPage(deployment({ local_access: true }));
 
@@ -306,6 +338,8 @@ describe('AboutDeploymentPage disk usage health', () => {
     renderPage(deployment({ local_access: false }));
 
     expect(await screen.findByText(/reveal actions require viewing this page on the Phoenix host/i)).toBeInTheDocument();
+    expect(screen.getByText(/cleanup availability is shown separately per worktree/i)).toBeInTheDocument();
+    expect(screen.queryByText(/remote browser remains read-only/i)).not.toBeInTheDocument();
   });
 
   it('summarizes measured, not-measured, and absent disk rows without summing overlaps', async () => {

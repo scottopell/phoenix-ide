@@ -15,6 +15,7 @@ import {
 import { api } from '../api';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
+import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
 import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
@@ -675,12 +676,16 @@ export function AboutDeploymentPage() {
     });
   }, []);
 
-  const refreshDeploymentIdentity = useCallback((version: string, gitSha: string) => {
-    const identity = `${version}:${gitSha}`;
+  const refreshDeployment = useCallback((snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => {
+    const identity = `${snapshot.current_version}:${snapshot.current_git_sha}:${JSON.stringify(snapshot.installation_ownership)}`;
     const current = infoRef.current;
     if (
       !current
-      || (current.build.version === version && current.build.git_sha === gitSha)
+      || (
+        current.build.version === snapshot.current_version
+        && current.build.git_sha === snapshot.current_git_sha
+        && JSON.stringify(current.installation_ownership) === JSON.stringify(snapshot.installation_ownership)
+      )
       || identityRefreshRef.current === identity
     ) return;
     identityRefreshRef.current = identity;
@@ -860,7 +865,7 @@ export function AboutDeploymentPage() {
             <>
               <DeploymentSummary info={info} />
 
-              <ReleaseUpdatePanel onRunningIdentityChange={refreshDeploymentIdentity} />
+              <ReleaseUpdatePanel onDeploymentChange={refreshDeployment} />
 
               <section className="settings-section">
                 <h3 className="settings-section__title">Network &amp; TLS</h3>
@@ -1015,7 +1020,7 @@ export function AboutDeploymentPage() {
                       {cleanupError && <div className="settings-section__error">{cleanupError}</div>}
                       {!info.local_access && (
                         <div className="settings-section__hint">
-                          Reveal actions require viewing this page on the Phoenix host; this remote browser remains read-only.
+                          Reveal actions require viewing this page on the Phoenix host. Cleanup availability is shown separately per worktree.
                         </div>
                       )}
                       <div className="settings-section__hint">Disk sampled at {formatDateTime(diskInfo.sampled_at)}</div>
