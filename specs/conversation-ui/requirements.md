@@ -198,10 +198,11 @@ AND NOT show duplicate messages
 ### REQ-CONV-007: Agent Activity Indicators
 
 The live "is the agent working right now" indicator is owned by the StateBar
-and nothing else. The top horizontal slot above the message list is the
-Conversation Navigation strip (REQ-CONV-023), not a live-activity trail and not
-a per-turn step trail; it carries whole-conversation chapters whose role is
-fixed across cold load and streaming.
+and nothing else. No other conversation surface may duplicate, summarize, or
+compete with that live-activity answer. The top horizontal slot above the
+message list is the Conversation Navigation strip (REQ-CONV-023), not a
+live-activity trail and not a per-turn step trail; it carries whole-
+conversation chapters whose role is fixed across cold load and streaming.
 
 WHEN agent is working
 THE SYSTEM SHALL show the activity indicator (yellow pulsing dot) in the StateBar
@@ -522,7 +523,8 @@ AND assign the strip a single fixed role that does not change between cold load 
 
 THE SYSTEM SHALL treat as a chapter every user prompt, and every assistant text block at or above the significance threshold (REQ-CONV-022)
 AND render each chapter as a type-styled pill distinguishing a user prompt from assistant prose
-AND label each pill with the truncated prompt or the first line of the prose
+AND label each pill with human-meaningful conversation text — the truncated prompt or the first line of the prose
+AND NOT expose opaque internal display identifiers, render-unit keys, sequence numbers, or placeholder IDs as the chapter label
 
 WHEN a chapter pill is clicked
 THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the loaded target is outside the rendered window
@@ -544,6 +546,10 @@ long scrollback — it answers "what happened, and how do I get back to it"
 (transparency questions 4, 8, 11-12). Sharing the significance threshold with
 the compact-density upper bound (REQ-CONV-022) keeps a single definition of
 "significant," so a prompt or substantial finding is exactly the content the
-user can both skim to and jump to. A fixed role — navigation always, on cold
-load and while streaming — avoids the ambiguity of a slot that means different
-things at different moments; live activity is the StateBar's job (REQ-CONV-007).
+user can both skim to and jump to. The chapter label must be human-meaningful
+because the strip is a reading/navigation aid, not a debugger surface; showing
+an opaque internal identifier would force the user to decode implementation
+state instead of recognizing the moment they want. A fixed role — navigation
+always, on cold load and while streaming — avoids the ambiguity of a slot that
+means different things at different moments; live activity is the StateBar's
+job (REQ-CONV-007).

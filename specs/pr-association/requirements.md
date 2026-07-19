@@ -62,13 +62,15 @@ This targeting contract uses an explicit active PR rather than a hidden singular
 - A compatibility primary-PR projection may exist for singular compatibility consumers, but it is
   not the hidden authority for active multi-PR actions.
 
-- The **StateBar** renders the **PR badge / PR identity link** (`StateBarPrBadge`) — the PR
-  number, title, and state. This is a StateBar concern.
+- The **StateBar** renders the **PR badge / PR identity link** (`StateBarPrBadge`) — the full
+  human-facing PR identity and status for the active PR: number, title, and state. This is a
+  StateBar concern.
 - The **work actions bar** renders the **Address-CI auto-fix affordance**
   (`WorkActions.tsx` → `PrRemediationActions`). The StateBar has no auto-fix logic.
 
 Both must target the **same** explicit active PR. The advisory freshness marker (REQ-PRA-001)
-lives next to the Address-CI action on the work actions bar, not on the StateBar PR badge.
+lives next to the Address-CI action on the work actions bar, not on the StateBar PR badge, and it
+must remain an actionability cue rather than a second branch-health or status surface.
 
 ---
 
@@ -141,11 +143,14 @@ actionable PRs remain plausible, silence is safer than a wrong silent retarget.
 
 WHEN Phoenix renders or executes a PR-specific surface for a Work or Branch conversation
 THE SYSTEM SHALL target the same explicit active PR across:
-- the StateBar PR identity
+- the StateBar PR identity and status
 - PR-specific status and check-state reads
 - PR feedback freshness and coverage reads
 - the `Address CI & comments` / `Address feedback` action
 - any PR-specific link-out or diff surface added by sibling specs
+
+THE SYSTEM SHALL keep StateBar PR identity/status and work-actions freshness/coverage as distinct
+surface roles even when they target the same PR
 
 THE SYSTEM SHALL carry complete repository-plus-PR-number identity for that target
 AND SHALL NOT persist or route a bare PR number as the full PR identity
@@ -184,9 +189,10 @@ THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based 
   freshness
 
 **Design:** Fresh review activity is useful exactly where the user asks the agent to address
-feedback — beside the Address-CI action on the work actions bar. It is not branch health (PR
-merge state, owned by `work-lifecycle`, is) and it carries no lifecycle authority: it never
-gates cleanup, abandon, or ordinary use.
+feedback — beside the Address-CI action on the work actions bar. It is not branch health, not PR
+identity, and not PR status. PR merge/state signals stay on the StateBar and sibling cleanup
+surfaces, while freshness stays an actionability cue for whether Phoenix may need fresh review
+context. It carries no lifecycle authority: it never gates cleanup, abandon, or ordinary use.
 
 ---
 

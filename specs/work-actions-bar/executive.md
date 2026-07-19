@@ -41,23 +41,24 @@ It does **not** own:
 ## User Need
 
 A developer who has finished (or got stuck on) a Work or Branch conversation needs to know, at
-a glance, what to do next. Status is shown in the StateBar (the PR badge). The work actions bar
-is pure verbs: each button does one fixed thing when clicked, present only when that thing is
-safe to do. No button is disabled and used as a status display; no button requires a second
-click to arm.
+a glance, what to do next. Stable PR identity and status are shown in the StateBar (the PR badge /
+selector), while the work actions bar carries only action-facing context such as freshness or
+coverage around Address feedback. The work actions bar is pure verbs: each button does one fixed
+thing when clicked, present only when that thing is safe to do. No button is disabled and used as
+a status display; no button requires a second click to arm.
 
 ## Requirements Summary
 
 | ID | Summary |
 |----|---------|
 | REQ-WAB-001 | Bar visibility: Work/Branch mode AND phase ∈ {idle, error, context_exhausted} |
-| REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups |
+| REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups; freshness stays an actionability cue, not PR status |
 | REQ-WAB-003 | Exactly one primary (glowing) verb across the bar — or none, in the continuation case |
 | REQ-WAB-004 | WorkDisposition derivation: a single derived state, total over every open-PR and stuck-with-PR case |
 | REQ-WAB-005 | RESOLVE zone suppressed in stuck phases (error, context_exhausted) |
 | REQ-WAB-006 | View Browser is not in this bar; the browser session affordance belongs to the work scope, surfaced via the viewer slot |
 | REQ-WAB-007 | Clean up and Abandon: info-icon tooltips explain intent and the diff-snapshot/confirm difference, mode-sensitive |
-| REQ-WAB-008 | No disabled-as-status buttons; no two-step toggle affordances |
+| REQ-WAB-008 | No disabled-as-status buttons; StateBar owns stable PR identity/status; no two-step toggle affordances |
 | REQ-WAB-009 | Continuation mute: when continued_in_conv_id is set, RESOLVE and FINISH are suppressed and there is no primary |
 | REQ-WAB-010 | PR link verbs (Merge / Open PR) are GitHub links; Phoenix has no merge API |
 | REQ-WAB-011 | Mobile rail shows actionable PR status/freshness and expands one active PR without parallel selection state |

@@ -89,6 +89,8 @@ PR number, title, branch, open-or-draft status, review state, and actionable fee
 Review state SHALL use the same approved and in-progress symbols and accessible labels as the
 conversation sidebar. Review state SHALL appear on every PR entry, independently of which PR is
 active and independently of fresh-comment counts.
+THE SYSTEM SHALL treat review state as stable PR identity/status context and feedback freshness as a
+separate actionability advisory; freshness SHALL NOT replace, restyle, or masquerade as PR status
 WHEN a desktop conversation has fewer than two actionable associated PRs, its active PR cannot be
 represented by the PR-selector rail, or PR metadata is still loading
 THE SYSTEM SHALL preserve the StateBar active-PR selector fallback and present the derived Work
@@ -273,9 +275,12 @@ effects differ between the two verbs.
 THE SYSTEM SHALL NOT render a disabled button as a status display.
 
 A disabled button reads as "this action is temporarily unavailable — try again later or fix a
-prerequisite." Status belongs in the StateBar (the PR badge and phase indicator), never in the
-work actions bar as a ghosted, un-clickable control. Every button the bar renders is enabled
-and invocable; a verb that does not apply to the current state is absent, not disabled.
+prerequisite." Stable status belongs in the StateBar (the PR badge / identity and the conversation
+phase indicator), never in the work actions bar as a ghosted, un-clickable control. The work
+actions bar may carry only action-adjacent PR context such as freshness or coverage signals, and
+those signals SHALL remain clearly subordinate to the StateBar's identity/status ownership. Every
+button the bar renders is enabled and invocable; a verb that does not apply to the current state is
+absent, not disabled.
 
 THE SYSTEM SHALL NOT use a click-to-enable-then-click-again affordance for any work actions
 bar verb.
