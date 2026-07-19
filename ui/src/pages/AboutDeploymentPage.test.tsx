@@ -13,6 +13,7 @@ const { apiMock } = vi.hoisted(() => ({
     cleanupManagedWorktree: vi.fn(),
     revealPath: vi.fn(),
     releaseUpdateSnapshot: vi.fn(),
+    releaseUpdateTransaction: vi.fn(),
     approveReleaseUpdate: vi.fn(),
   },
 }));
@@ -212,6 +213,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentResources.mockReset();
     apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
+    apiMock.releaseUpdateTransaction.mockReset().mockResolvedValue({ kind: 'none' });
     apiMock.releaseUpdateSnapshot.mockReset().mockResolvedValue({
       installation_ownership: { kind: 'development' },
       current_version: '0.1.0',

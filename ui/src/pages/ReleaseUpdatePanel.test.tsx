@@ -180,8 +180,7 @@ describe('ReleaseUpdatePanel', () => {
   it('treats post-handoff refresh failure as stale status, not approval failure', async () => {
     const fetchMock = vi.mocked(fetch)
       .mockImplementationOnce(() => json(snapshot))
-      .mockImplementationOnce(() => json({ accepted: true, transaction_id: 'tx-handoff' }))
-      .mockRejectedValueOnce(new Error('server restarting'));
+      .mockImplementationOnce(() => json({ accepted: true, transaction_id: 'tx-handoff' }));
     render(<ReleaseUpdatePanel />);
     await screen.findByText('v1.1.0');
     await act(async () => {
@@ -192,10 +191,10 @@ describe('ReleaseUpdatePanel', () => {
     });
 
     expect(await screen.findByText(/approval handed off/i)).toBeInTheDocument();
-    expect(screen.getByText(/release information is stale — server restarting/i)).toBeInTheDocument();
     expect(screen.queryByText(/update approval failed/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(1);
   });
 
   it('preserves active status when unavailable discovery also has unreadable status', async () => {
@@ -322,6 +321,25 @@ describe('ReleaseUpdatePanel', () => {
     view.unmount();
 
     await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries an unreadable transaction baseline until status becomes readable', async () => {
+    const unreadable = { ...snapshot, transaction: { kind: 'unreadable' as const, reason: 'locked' } };
+    const active = {
+      kind: 'present' as const, transaction_id: 'tx-active', state: 'activating', source_commit: null,
+      release_tag: 'v1.1.0', expected_version: '1.1.0', expected_git_sha: snapshot.preview.commit,
+      created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+    };
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(unreadable))
+      .mockImplementationOnce(() => json(active));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/locked/i)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

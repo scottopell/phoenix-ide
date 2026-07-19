@@ -168,7 +168,9 @@ export function ReleaseUpdatePanel({
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
-  const shouldPollTransaction = snapshot?.transaction.kind === 'none' || active;
+  const shouldPollTransaction = snapshot?.transaction.kind === 'none'
+    || snapshot?.transaction.kind === 'unreadable'
+    || active;
 
   useEffect(() => {
     if (!shouldPollTransaction) return;
@@ -240,10 +242,9 @@ export function ReleaseUpdatePanel({
     if (mounted.current) {
       setConfirming(false);
       setHandoffPending(true);
+      setApproving(false);
     }
-    await load();
-    if (mounted.current) setApproving(false);
-  }, [confirmedIdentity, discoveryError, load, snapshot]);
+  }, [confirmedIdentity, discoveryError, snapshot]);
 
   const approvalStatusSafe = !handoffPending && transactionError === null && (snapshot?.transaction.kind === 'none'
     || (snapshot?.transaction.kind === 'present'
