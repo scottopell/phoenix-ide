@@ -184,12 +184,6 @@
   overflow: hidden;
 }
 
-@media (width >= 1025px) {
-  .statebar-slug {
-    display: none;
-  }
-}
-
 .statebar-slug {
   display: inline-flex;
   align-items: center;
@@ -215,6 +209,12 @@
 .statebar-slug .slug-text {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@media (width >= 1025px) {
+  #state-bar .statebar-slug {
+    display: none;
+  }
 }
 
 .statebar-desktop-heading {

@@ -2,7 +2,7 @@ import { useId, useRef, useState, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { LlmStatusBanner } from './LlmStatusBanner';
-import { getPathDisplayLabel } from '../utils/conversationIdentity';
+import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import type { GitBranchEntry, ModelsResponse, TaskEntry } from '../api';
@@ -214,6 +214,8 @@ export function ConversationSettings({
     return <LlmStatusBanner models={models} />;
   }
 
+  const projectDirLabels = projectDirs ? getDisambiguatedPathLabels(projectDirs) : null;
+
   return (
     <>
       <LlmStatusBanner models={models} />
@@ -222,7 +224,7 @@ export function ConversationSettings({
       {projectDirs && projectDirs.length > 0 && (
         <div className="new-conv-recent" aria-label="Suggested projects">
           {projectDirs.map(dir => {
-            const label = getPathDisplayLabel(dir) || 'Project';
+            const label = projectDirLabels?.get(dir) || 'Project';
             const isSelected = cwd.trim() === dir;
             return (
               <button

@@ -1140,6 +1140,19 @@ describe('StateBar mobile layout', () => {
     expect(screen.queryByText('Direct Project')).not.toBeInTheDocument();
   });
 
+  it('does not mount an empty desktop secondary row', () => {
+    const { container } = renderStateBar({
+      conversation: makeConversation({
+        conv_mode_label: 'Direct',
+        branch_name: null,
+        base_branch: null,
+        task_title: null,
+      }),
+    });
+
+    expect(container.querySelector('.statebar-line2')).toBeNull();
+  });
+
   it('keeps active-PR selection in StateBar when the terminal active PR cannot be represented by the rail', () => {
     const selection = makeSelection({
       active_pr: {

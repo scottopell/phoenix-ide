@@ -37,8 +37,9 @@ export interface ConversationIdentity {
   modelLabel: string;
 }
 
-const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
-const LONG_HEX_TOKEN_PATTERN = /(?:^|[-_])[0-9a-f]{24,}(?:$|[-_])/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LONG_HEX_TOKEN_PATTERN = /^[0-9a-f]{24,}$/i;
+const GENERATED_PATH_LEAF_PATTERN = /(?:^|[-_])[0-9a-f]{24,}$/i;
 const PHOENIX_WORKTREE_SEGMENT = '/.phoenix/worktrees/';
 const PHOENIX_SEED_WORKTREE_SEGMENT = '/.phoenix/seed-worktrees/';
 
@@ -93,9 +94,7 @@ function modeIdentity(mode: string | null | undefined): ConversationModeIdentity
 export function isLowValueIdentifier(value: string | null | undefined): boolean {
   const normalized = value?.trim();
   if (!normalized) return true;
-  return UUID_PATTERN.test(normalized)
-    || /^[0-9a-f]{24,}$/i.test(normalized)
-    || LONG_HEX_TOKEN_PATTERN.test(normalized);
+  return UUID_PATTERN.test(normalized) || LONG_HEX_TOKEN_PATTERN.test(normalized);
 }
 
 export function getPathDisplayLabel(path: string | null | undefined): string | null {
@@ -113,7 +112,37 @@ export function getPathDisplayLabel(path: string | null | undefined): string | n
     ? normalized.slice(0, managedWorktreeIndex)
     : normalized;
   const leaf = pathLeaf(identityPath);
-  return isLowValueIdentifier(leaf) ? null : leaf;
+  return isLowValueIdentifier(leaf) || GENERATED_PATH_LEAF_PATTERN.test(leaf || '') ? null : leaf;
+}
+
+function meaningfulPathSegments(path: string): string[] {
+  return path.split('/').filter((segment) => segment && segment !== '.phoenix' && segment !== 'worktrees' && segment !== 'seed-worktrees' && !isLowValueIdentifier(segment));
+}
+
+export function getDisambiguatedPathLabels(paths: readonly string[]): Map<string, string> {
+  const baseLabels = paths.map((path) => getPathDisplayLabel(path) || 'Project');
+  const counts = new Map<string, number>();
+  for (const label of baseLabels) counts.set(label, (counts.get(label) || 0) + 1);
+
+  const candidates = paths.map((path, index) => {
+    const base = baseLabels[index]!;
+    if ((counts.get(base) || 0) < 2) return base;
+    const segments = meaningfulPathSegments(path.replace(/\/+$/, ''));
+    const baseIndex = segments.lastIndexOf(base);
+    const parent = baseIndex > 0 ? segments[baseIndex - 1] : null;
+    return parent && parent !== base ? `${parent}/${base}` : base;
+  });
+  const candidateCounts = new Map<string, number>();
+  for (const label of candidates) candidateCounts.set(label, (candidateCounts.get(label) || 0) + 1);
+  const occurrences = new Map<string, number>();
+
+  return new Map(paths.map((path, index) => {
+    const candidate = candidates[index]!;
+    if ((candidateCounts.get(candidate) || 0) < 2) return [path, candidate];
+    const occurrence = (occurrences.get(candidate) || 0) + 1;
+    occurrences.set(candidate, occurrence);
+    return [path, `${candidate} · ${occurrence}`];
+  }));
 }
 
 export function getProjectDisplayLabel(project: Pick<Project, 'canonical_path'>): string | null {

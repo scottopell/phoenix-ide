@@ -942,6 +942,16 @@ export function StateBar({
   const modeHelp = identity?.mode.title ?? 'Full access';
   const modeDetail = identity?.mode.detail ?? 'Full access';
 
+  const selectorHasContent = Boolean(
+    prStatusHandle
+    && (
+      prStatusHandle.activePrSummary
+      || prStatusHandle.ambiguous
+      || prStatusHandle.activeSelection?.associated_prs.some(
+        (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+      )
+    ),
+  );
   const prStatusContent = (
     <>
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
@@ -955,6 +965,11 @@ export function StateBar({
         </span>
       )}
     </>
+  );
+  const hasPrContent = Boolean(
+    (prStatus?.found && prStatus.url)
+    || (!workActionsPrRailOwnsSelection && selectorHasContent)
+    || (prHint && !prLoading),
   );
 
   const renderModelControl = (variant: "desktop" | "mobile" = "desktop") => (
@@ -1258,7 +1273,7 @@ export function StateBar({
                 {renderModelControl("desktop")}
               </div>
 
-              {(taskTitle || branchName || prStatusContent) && (
+              {(taskTitle || branchName || hasPrContent) && (
                 <div className="statebar-line2">
                   {taskTitle && taskTitle !== identity?.title && (
                     <span
@@ -1280,7 +1295,7 @@ export function StateBar({
                       <span className="git-base">{baseBranch}</span>
                     </span>
                   )}
-                  <span className="statebar-pr-slot">{prStatusContent}</span>
+                  {hasPrContent && <span className="statebar-pr-slot">{prStatusContent}</span>}
                 </div>
               )}
             </>

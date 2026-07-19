@@ -7,6 +7,7 @@ import {
   getConversationProjectLabel,
   getProjectDisplayLabel,
   getPathDisplayLabel,
+  getDisambiguatedPathLabels,
   summarizeConversationPath,
 } from './conversationIdentity';
 
@@ -66,6 +67,28 @@ describe('conversationIdentity', () => {
   it('derives semantic labels for managed and seeded worktree paths', () => {
     expect(getPathDisplayLabel('/Users/scott/phoenix-ide/.phoenix/worktrees/123e4567-e89b-12d3-a456-426614174000')).toBe('phoenix-ide');
     expect(getPathDisplayLabel('/Users/scott/phoenix-ide/.phoenix/seed-worktrees/grounding-panel-qa')).toBe('grounding-panel-qa');
+  });
+
+  it('disambiguates colliding project labels with meaningful parents and stable ordinals', () => {
+    const labels = getDisambiguatedPathLabels([
+      '/Users/scott/client-a/app',
+      '/Users/scott/client-b/app',
+      '/Users/scott/repo/.phoenix/worktrees/11111111-1111-4111-8111-111111111111',
+      '/Users/scott/repo/.phoenix/worktrees/22222222-2222-4222-8222-222222222222',
+    ]);
+    expect(labels.get('/Users/scott/client-a/app')).toBe('client-a/app');
+    expect(labels.get('/Users/scott/client-b/app')).toBe('client-b/app');
+    expect(labels.get('/Users/scott/repo/.phoenix/worktrees/11111111-1111-4111-8111-111111111111')).toBe('scott/repo · 1');
+    expect(labels.get('/Users/scott/repo/.phoenix/worktrees/22222222-2222-4222-8222-222222222222')).toBe('scott/repo · 2');
+  });
+
+  it('keeps meaningful titles that contain UUIDs or long hashes', () => {
+    expect(getConversationDisplayTitle(makeConversation({
+      task_title: 'Investigate 123e4567-e89b-12d3-a456-426614174000 failure',
+    }))).toBe('Investigate 123e4567-e89b-12d3-a456-426614174000 failure');
+    expect(getConversationDisplayTitle(makeConversation({
+      task_title: 'Review commit 9d1b4cc93b7845228e4fdbe566761f44',
+    }))).toBe('Review commit 9d1b4cc93b7845228e4fdbe566761f44');
   });
 
   it('falls back to semantic title sources when slug is guid-like', () => {
