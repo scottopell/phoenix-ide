@@ -3929,6 +3929,7 @@ fn existing_continuation_status(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn continue_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,

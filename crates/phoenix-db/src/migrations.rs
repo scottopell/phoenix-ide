@@ -2020,7 +2020,7 @@ mod tests {
             .unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|migration| migration.version != 45)
+            .filter(|migration| migration.version != 46)
         {
             sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
                 .bind(migration.version)
@@ -2174,7 +2174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_045_creates_workflow_foundation_tables_and_invariants() {
+    async fn migration_046_creates_workflow_foundation_tables_and_invariants() {
         let pool = test_pool().await;
         setup_workflow_only_schema(&pool).await;
 
