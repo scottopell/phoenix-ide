@@ -1417,6 +1417,43 @@ impl WakeRepository {
             tx.rollback().await?;
             return Ok(WakeExpireIfUnresolvedOutcome::NotDue);
         }
+        let live_attempt = sqlx::query(
+            "SELECT a.attempt_id, l.lease_until
+             FROM workflow_attempts a
+             JOIN workflow_reclaimable_leases l
+               ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+             WHERE a.workflow_id = ?1 AND a.effect_id = ?2
+               AND a.status IN ('Begun', 'ObservationRecorded')
+             ORDER BY a.attempt_id LIMIT 1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        if let Some(lease) = live_attempt {
+            let lease_until = phoenix_workflow::LeaseExpiry(to_u64(
+                lease.get::<i64, _>("lease_until"),
+                "lease_until",
+            )?);
+            if lease_until.is_live_at(now) {
+                tx.rollback().await?;
+                return Ok(WakeExpireIfUnresolvedOutcome::NotDue);
+            }
+            let expired = expire_observation_lease_in_tx(
+                &mut tx,
+                &ExpireLeaseInput {
+                    workflow_id,
+                    effect_id: REGISTRATION_EFFECT_ID,
+                    attempt_id: AttemptId(to_u64(lease.get::<i64, _>("attempt_id"), "attempt_id")?),
+                    now,
+                },
+            )
+            .await?;
+            if expired != AuthorityOutcome::Authorized {
+                tx.rollback().await?;
+                return Ok(WakeExpireIfUnresolvedOutcome::Stale);
+            }
+        }
         if let Some(existing) = fetch_any_terminal_projection_tx(&mut tx, workflow_id).await? {
             let outcome = replay_terminal_projection(&mut tx, workflow_id, existing).await?;
             tx.commit().await?;
@@ -4362,6 +4399,7 @@ fn delivery_from_join_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<LocalDelive
         requires_runtime_acceptance: row.get("requires_runtime_acceptance"),
         status: match row.get::<String, _>("status").as_str() {
             "Pending" => phoenix_workflow::DeliveryStatus::Pending,
+            "Deferred" => phoenix_workflow::DeliveryStatus::Deferred,
             "Accepted" => phoenix_workflow::DeliveryStatus::Accepted,
             "Suppressed" => phoenix_workflow::DeliveryStatus::Suppressed,
             other => {

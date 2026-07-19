@@ -2434,6 +2434,7 @@ fn parse_delivery_status(value: &str) -> DbResult<DeliveryStatus> {
     match value {
         "Pending" => Ok(DeliveryStatus::Pending),
         "Accepted" => Ok(DeliveryStatus::Accepted),
+        "Deferred" => Ok(DeliveryStatus::Deferred),
         "Suppressed" => Ok(DeliveryStatus::Suppressed),
         other => Err(DbError::Serialization(format!(
             "unknown delivery status: {other}"

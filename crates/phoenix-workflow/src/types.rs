@@ -264,6 +264,7 @@ pub struct RenewalResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
     Pending,
+    Deferred,
     Accepted,
     Suppressed,
 }

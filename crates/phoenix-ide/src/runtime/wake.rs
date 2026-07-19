@@ -306,7 +306,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         candidate: WakeObservationCandidateRow,
         authority: LocalAttemptAuthority,
         now: Timestamp,
-        lease_until: LeaseExpiry,
+        _lease_until: LeaseExpiry,
     ) -> Result<Duration, String> {
         let Some(binding) = self
             .repo
@@ -322,7 +322,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.clone())?
         {
-            InspectionOutcome::LiveRetry => Ok(duration_until(now, lease_until.0)),
+            InspectionOutcome::LiveRetry => Ok(LEASE_DURATION),
             InspectionOutcome::Terminal(evidence) => {
                 let _ = self
                     .repo
@@ -1179,7 +1179,7 @@ mod tests {
             ProcessIncarnation(1),
         );
         worker.run_once().await.unwrap();
-        clock.set(12);
+        clock.set(13);
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
     }

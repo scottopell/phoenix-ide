@@ -732,8 +732,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             let Some(existing) = self.deliveries.get(&item.id) else {
                 return Err(EngineError::InvalidInbox);
             };
-            if existing.status != DeliveryStatus::Pending
-                || !P::decision_handles_delivery(existing, &binding.decision.plan.event)
+            if !matches!(
+                existing.status,
+                DeliveryStatus::Pending | DeliveryStatus::Deferred
+            ) || !P::decision_handles_delivery(existing, &binding.decision.plan.event)
             {
                 return Err(EngineError::InvalidInbox);
             }

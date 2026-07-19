@@ -2038,21 +2038,22 @@ impl RuntimeManager {
         let _ = self.wake_kick_tx.send(next);
     }
 
-    pub async fn start_wake_worker(self: &Arc<Self>) {
+    pub async fn start_wake_worker(self: &Arc<Self>) -> Result<(), String> {
         let rx = self.wake_kick_rx.write().await.take();
         let Some(rx) = rx else {
             tracing::debug!("wake worker already started; skipping");
-            return;
+            return Ok(());
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             crate::runtime::wake::run(manager, rx, ready_tx).await;
         });
-        if ready_rx.await.is_err() {
-            tracing::warn!("wake worker stopped before startup reconciliation completed");
-        }
+        ready_rx.await.map_err(|_| {
+            "wake worker stopped before startup reconciliation completed".to_string()
+        })?;
         self.kick_wake_worker();
+        Ok(())
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

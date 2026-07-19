@@ -116,7 +116,7 @@ impl AppState {
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path.
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
@@ -132,7 +132,10 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
-        runtime.start_wake_worker().await;
+        runtime
+            .start_wake_worker()
+            .await
+            .map_err(std::io::Error::other)?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());
@@ -173,7 +176,7 @@ impl AppState {
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
         let resource_monitor = resource_monitor::ResourceMonitor::new();
-        Self {
+        Ok(Self {
             runtime,
             llm_registry,
             db,
@@ -192,6 +195,6 @@ impl AppState {
             suggest_token,
             discovery,
             resource_monitor,
-        }
+        })
     }
 }

@@ -592,7 +592,7 @@ CREATE TABLE workflow_deliveries (
     payload_kind TEXT NOT NULL CHECK (payload_kind IN ('Receipt', 'Barrier')),
     payload_blob BLOB NOT NULL,
     requires_runtime_acceptance INTEGER NOT NULL CHECK (requires_runtime_acceptance IN (0, 1)),
-    status TEXT NOT NULL CHECK (status IN ('Pending', 'Accepted', 'Suppressed')),
+    status TEXT NOT NULL CHECK (status IN ('Pending', 'Deferred', 'Accepted', 'Suppressed')),
     runtime_acceptance_status TEXT CHECK (runtime_acceptance_status IN ('Owed', 'Accepted', 'Suppressed')),
     suppression_reason TEXT CHECK (suppression_reason IN ('Cancelled', 'Superseded', 'LifecycleTerminal', 'ReducerTerminal')),
     accepted_by_transition_id INTEGER,

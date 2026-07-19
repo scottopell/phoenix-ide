@@ -3996,8 +3996,13 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
-            transfer_direct_work_scope(&state.runtime, &parent, &new_conv).await?;
-            crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
+            let wake_repo =
+                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let had_owed_work = wake_repo
+                .has_owed_work_for_conversation(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            wake_repo
                 .transfer_active_for_continuation(
                     &id,
                     &new_conv.id,
@@ -4007,6 +4012,9 @@ async fn continue_conversation(
                 )
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
+            if had_owed_work {
+                transfer_direct_work_scope(&state.runtime, &parent, &new_conv).await?;
+            }
             tracing::info!(
                 parent_id = %id,
                 continuation_id = %new_conv.id,
@@ -4047,8 +4055,13 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
-            transfer_direct_work_scope(&state.runtime, &parent, &existing).await?;
-            crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
+            let wake_repo =
+                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let had_owed_work = wake_repo
+                .has_owed_work_for_conversation(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            wake_repo
                 .transfer_active_for_continuation(
                     &id,
                     &existing.id,
@@ -4058,6 +4071,9 @@ async fn continue_conversation(
                 )
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
+            if had_owed_work {
+                transfer_direct_work_scope(&state.runtime, &parent, &existing).await?;
+            }
             tracing::info!(
                 parent_id = %id,
                 existing_continuation = %existing.id,
