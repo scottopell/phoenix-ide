@@ -79,6 +79,17 @@ THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
+WHEN agent prose contains a recognized local file path as raw text
+OR a Markdown link has that same recognized local file path as its destination
+THE SYSTEM SHALL present the reference as an in-application file action
+AND SHALL open the path through the conversation's file viewer when activated
+AND SHALL preserve the Markdown label as the visible link text when one is present
+
+WHEN a Markdown link destination is not a recognized local file path
+THE SYSTEM SHALL preserve ordinary safe browser-link behavior
+
+The local-path shapes recognized in raw text and Markdown destinations SHALL be identical. Path-shape recognition only identifies a file candidate; the server-side viewer-openability classification defined by `specs/file-explorer/requirements.md` remains authoritative for the resolved content.
+
 **Rationale:** Users need to read the conversation history and understand tool execution. Long transcripts must not delay access to the newest activity, and transcript batching must not interrupt continuous reading.
 
 ---

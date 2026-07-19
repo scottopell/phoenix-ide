@@ -901,7 +901,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
       p: ({ children }: { children?: React.ReactNode }) => <p>{processChildren(children)}</p>,
       // Custom list item rendering with clickable file paths
       li: ({ children }: { children?: React.ReactNode }) => <li>{processChildren(children)}</li>,
-      a: ConversationMarkdownAnchor,
+      a: (props) => (
+        <ConversationMarkdownAnchor
+          {...props}
+          onFileClick={fileClickHandler}
+          filePathCopyContext={filePathCopyContext}
+        />
+      ),
       table: MarkdownTable,
       img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
         <ConversationMarkdownImage

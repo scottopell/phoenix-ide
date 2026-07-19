@@ -6,7 +6,7 @@
  */
 
 import React from 'react';
-import { resolveFilePathCopyValues } from './filePathCopy';
+import { FilePathLink } from './FilePathLink';
 
 // Regex for matching URLs (http:// and https://)
 // Avoids matching trailing punctuation that's likely not part of the URL
@@ -29,8 +29,7 @@ const FILE_EXTENSIONS = 'md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|t
 //   2. Relative/project paths (./foo, src/foo): Require a recognized extension to
 //      avoid false positives on plain words containing slashes.
 // Note: Uses lookbehind for proper word boundary detection
-const FILE_PATH_REGEX = new RegExp(
-  '(?:^|(?<=[\\s`"\'(\\[]))' +
+const FILE_PATH_PATTERN =
   '(?:' +
     // Absolute paths: /foo/bar (at least two segments, no extension required)
     '(?:\\/[\\w.-]+(?:\\/[\\w.-]+)+)' +
@@ -40,10 +39,22 @@ const FILE_PATH_REGEX = new RegExp(
     '|' +
     // Project paths with extension: src/api/mod.rs
     '(?:[\\w.-]+\\/[\\w./-]+)\\.(?:' + FILE_EXTENSIONS + ')' +
-  ')' +
-  '(?=[\\s`"\'\\)\\],:;!?]|$)',
+  ')';
+
+const FILE_PATH_REGEX = new RegExp(
+  '(?:^|(?<=[\\s`"\'(\\[]))' + FILE_PATH_PATTERN + '(?=[\\s`"\'\\)\\],:;!?]|$)',
   'g'
 );
+const WHOLE_FILE_PATH_REGEX = new RegExp(`^${FILE_PATH_PATTERN}$`);
+
+/**
+ * Whether a complete string has one of the local-path shapes recognized in
+ * conversation prose. This is syntax detection only; the server remains the
+ * authority on whether the resolved file is viewer-openable.
+ */
+export function isConversationFilePath(value: string): boolean {
+  return WHOLE_FILE_PATH_REGEX.test(value);
+}
 
 export interface LinkifySegment {
   type: 'text' | 'link' | 'file';
@@ -188,42 +199,16 @@ export function linkifyText(
         </a>
       );
     }
-    if (segment.type === 'file' && onFileClick) {
-      const copyValues = filePathCopyContext
-        ? resolveFilePathCopyValues(segment.filePath!, filePathCopyContext.rootDir)
-        : undefined;
+    if (segment.type === 'file') {
       return (
-        <span
+        <FilePathLink
           key={index}
-          role="button"
-          tabIndex={0}
-          onClick={() => onFileClick(segment.filePath!)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              onFileClick(segment.filePath!);
-            }
-          }}
-          className="file-path-link"
-          title={`Open ${segment.filePath}`}
-          data-file-path={segment.filePath}
-          {...(copyValues
-            ? {
-                'data-file-absolute-path': copyValues.absolutePath,
-                'data-file-relative-path': copyValues.relativePath,
-              }
-            : {})}
+          filePath={segment.filePath!}
+          onFileClick={onFileClick}
+          filePathCopyContext={filePathCopyContext}
         >
           {segment.content}
-        </span>
-      );
-    }
-    if (segment.type === 'file') {
-      // No click handler provided, render as styled but non-interactive
-      return (
-        <span key={index} className="file-path-text">
-          {segment.content}
-        </span>
+        </FilePathLink>
       );
     }
     return <React.Fragment key={index}>{segment.content}</React.Fragment>;

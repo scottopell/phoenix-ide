@@ -56,11 +56,16 @@ export function resolveConversationMarkdownImageSrc(src: string | undefined, roo
 
 export interface ConversationMarkdownContext {
   rootDir?: string | undefined;
+  onFileClick?: ((filePath: string) => void) | undefined;
 }
 
 export function createConversationMarkdownComponents(ctx: ConversationMarkdownContext = {}): Components {
   return {
-    a: ConversationMarkdownAnchor,
+    a: (props) => createElement(ConversationMarkdownAnchor, {
+      ...props,
+      onFileClick: ctx.onFileClick,
+      filePathCopyContext: ctx.rootDir ? { rootDir: ctx.rootDir } : undefined,
+    }),
     img: ({ src, ...props }) => createElement(ConversationMarkdownImage, {
       ...props,
       src: resolveConversationMarkdownImageSrc(src, ctx.rootDir),

@@ -27,11 +27,18 @@ function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
 
 type StreamingMarkdownComponentsContext = {
   rootDir?: string | undefined;
+  onFileClick?: ((filePath: string) => void) | undefined;
 };
 
-function createStreamingMarkdownComponents({ rootDir }: StreamingMarkdownComponentsContext) {
+function createStreamingMarkdownComponents({ rootDir, onFileClick }: StreamingMarkdownComponentsContext) {
   return {
-    a: ConversationMarkdownAnchor,
+    a: (props: React.ComponentPropsWithoutRef<'a'> & { node?: unknown }) => (
+      <ConversationMarkdownAnchor
+        {...props}
+        onFileClick={onFileClick}
+        filePathCopyContext={rootDir ? { rootDir } : undefined}
+      />
+    ),
     table: MarkdownTable,
     img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
       <ConversationMarkdownImage
@@ -50,9 +57,19 @@ const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
  * re-render only this component — `<MessageList>` and its
  * `<MessageListBody>` are untouched by token churn (REQ-MLRU-010).
  */
-export function StreamingMessage({ slug, isFirstInTurn, rootDir }: { slug: string; isFirstInTurn: boolean; rootDir?: string | undefined }) {
+export function StreamingMessage({
+  slug,
+  isFirstInTurn,
+  rootDir,
+  onOpenFile,
+}: {
+  slug: string;
+  isFirstInTurn: boolean;
+  rootDir?: string | undefined;
+  onOpenFile?: ((filePath: string) => void) | undefined;
+}) {
   const buffer = useStreamingBuffer(slug);
-  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} rootDir={rootDir} />;
+  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} rootDir={rootDir} onOpenFile={onOpenFile} />;
 }
 
 interface StreamingMessageViewProps {
@@ -62,6 +79,7 @@ interface StreamingMessageViewProps {
   // (shifting content down) on finalize. Defaults true for tests/standalone use.
   isFirstInTurn?: boolean;
   rootDir?: string | undefined;
+  onOpenFile?: ((filePath: string) => void) | undefined;
 }
 
 /**
@@ -83,7 +101,7 @@ interface StreamingMessageViewProps {
  * - Open code fence → <pre><code className="streaming-code"> with matching
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
-export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir }: StreamingMessageViewProps) {
+export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir, onOpenFile }: StreamingMessageViewProps) {
   if (!buffer) return null;
   const startedAtIso = new Date(buffer.startedAt).toISOString();
   return (
@@ -97,7 +115,7 @@ export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir }: 
         </div>
       )}
       <div className="message-content">
-        <StreamingBlocks text={buffer.text ?? ''} rootDir={rootDir} />
+        <StreamingBlocks text={buffer.text ?? ''} rootDir={rootDir} onOpenFile={onOpenFile} />
       </div>
       <span className="streaming-cursor" aria-hidden="true" />
     </div>
@@ -111,7 +129,15 @@ export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir }: 
  * growing tail rather than re-parsing the whole buffer every token (REQ-MLRU-010).
  * Caller supplies the wrapping chrome (cursor, container classes).
  */
-export function StreamingBlocks({ text, rootDir }: { text: string; rootDir?: string | undefined }) {
+export function StreamingBlocks({
+  text,
+  rootDir,
+  onOpenFile,
+}: {
+  text: string;
+  rootDir?: string | undefined;
+  onOpenFile?: ((filePath: string) => void) | undefined;
+}) {
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   // rAF-gated display buffer: accumulates incoming text and flushes once per frame.
@@ -149,8 +175,10 @@ export function StreamingBlocks({ text, rootDir }: { text: string; rootDir?: str
   // Parse once per text change, not on theme-only re-renders.
   const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
   const markdownComponents = useMemo(
-    () => (rootDir ? createStreamingMarkdownComponents({ rootDir }) : MARKDOWN_COMPONENTS),
-    [rootDir],
+    () => (rootDir || onOpenFile
+      ? createStreamingMarkdownComponents({ rootDir, onFileClick: onOpenFile })
+      : MARKDOWN_COMPONENTS),
+    [rootDir, onOpenFile],
   );
 
   return (

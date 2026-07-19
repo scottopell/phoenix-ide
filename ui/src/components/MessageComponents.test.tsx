@@ -1608,6 +1608,25 @@ describe('agent message file paths', () => {
     expect(onOpenFile).toHaveBeenCalledWith('src/main.rs', new Set(), 0);
   });
 
+  it('opens a raw dot-relative file path on left click', () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-dot-relative-file-click', [{
+            type: 'text',
+            text: 'Review ./specs/AUTHORING.md before editing.',
+          }])}
+          toolResults={new Map()}
+          onOpenFile={onOpenFile}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: './specs/AUTHORING.md' }));
+    expect(onOpenFile).toHaveBeenCalledWith('./specs/AUTHORING.md', new Set(), 0);
+  });
+
   it('copies absolute and relative paths from the file path context menu', () => {
     const onOpenFile = vi.fn();
     render(
@@ -1734,6 +1753,68 @@ describe('agent message file paths', () => {
 
 
 describe('conversation markdown links', () => {
+  it('opens a dot-relative Markdown file href through the conversation file viewer', () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-markdown-file-link', [{
+            type: 'text',
+            text: 'Review [AUTHORING.md](./specs/AUTHORING.md) before editing.',
+          }])}
+          toolResults={new Map()}
+          onOpenFile={onOpenFile}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    const fileLink = screen.getByRole('button', { name: 'AUTHORING.md' });
+    expect(fileLink).not.toHaveAttribute('href');
+    expect(fileLink).not.toHaveAttribute('target');
+    fireEvent.click(fileLink);
+
+    expect(onOpenFile).toHaveBeenCalledWith('./specs/AUTHORING.md', new Set(), 0);
+    expect(fileLink).toHaveAttribute('data-file-absolute-path', '/repo/project/specs/AUTHORING.md');
+  });
+
+  it('opens a project-relative Markdown file href through the conversation file viewer', () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-project-file-link', [{
+            type: 'text',
+            text: 'Review [the guide](specs/AUTHORING.md).',
+          }])}
+          toolResults={new Map()}
+          onOpenFile={onOpenFile}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'the guide' }));
+    expect(onOpenFile).toHaveBeenCalledWith('specs/AUTHORING.md', new Set(), 0);
+  });
+
+  it('does not classify fragments or extensionless relative web routes as files', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-relative-web-links', [{
+            type: 'text',
+            text: '[section](#details) and [settings](settings/profile)',
+          }])}
+          toolResults={new Map()}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'section' })).toHaveAttribute('href', '#details');
+    expect(screen.getByRole('link', { name: 'settings' })).toHaveAttribute('href', 'settings/profile');
+    expect(screen.queryByRole('button', { name: /section|settings/ })).not.toBeInTheDocument();
+  });
   it('opens finalized agent Markdown links in a new tab with safe rel attributes', () => {
     render(
       <MemoryRouter>
@@ -1925,6 +2006,29 @@ describe('conversation markdown links', () => {
       expect(link).toHaveAttribute('target', '_blank');
       expect(link).toHaveAttribute('rel', 'noopener noreferrer');
     });
+  });
+
+  it('opens streaming local Markdown links through the same file callback as finalized messages', async () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <StreamingMessageView
+          buffer={{
+            text: 'Streaming [AUTHORING.md](./specs/AUTHORING.md) now.',
+            lastSequence: 1,
+            startedAt: Date.now(),
+            requestId: 'test-req-id',
+          }}
+          rootDir="/repo/project"
+          onOpenFile={onOpenFile}
+        />
+      </MemoryRouter>,
+    );
+
+    const fileLink = await screen.findByRole('button', { name: 'AUTHORING.md' });
+    expect(fileLink).not.toHaveAttribute('href');
+    fireEvent.click(fileLink);
+    expect(onOpenFile).toHaveBeenCalledWith('./specs/AUTHORING.md');
   });
 
   it('renders streaming agent local Markdown images through the preview allowlist path', async () => {
