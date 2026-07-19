@@ -776,7 +776,13 @@ function CompactToolStripImpl({
           !item.hasResult ? 'pending' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
-        const statusLabel = item.isError ? 'failed' : item.hasResult ? 'done' : 'running';
+        const statusLabel = item.isError
+          ? 'failed'
+          : item.hasResult
+            ? 'done'
+            : item.startedAtMs !== null || item.finalStatus === 'running'
+              ? 'running'
+              : 'queued';
         const liveElapsed = !item.hasResult && item.startedAtMs !== null
           ? ` · ${Math.max(0, Math.floor((nowMs - item.startedAtMs) / 1_000))}s`
           : '';
