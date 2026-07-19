@@ -247,7 +247,10 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         let Some(existing) = &mut effect.reclaimable_lease else {
             return stale_renewal();
         };
-        if new_lease_until <= existing.lease_until || !new_lease_until.is_live_at(now) {
+        if !existing.lease_until.is_live_at(now)
+            || new_lease_until <= existing.lease_until
+            || !new_lease_until.is_live_at(now)
+        {
             return stale_renewal();
         }
         existing.lease_until = new_lease_until;

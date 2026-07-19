@@ -4235,6 +4235,17 @@ async fn archive_conversation(
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .list_active_unresolved_for_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_empty()
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation has pending background work",
+            "pending_wake",
+        ))));
+    }
     let conv = state
         .runtime
         .db()
@@ -4508,6 +4519,17 @@ async fn delete_conversation(
 /// (see `Internal` variant) — bash / tmux / projects cleanup failures
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .list_active_unresolved_for_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_empty()
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation has pending background work",
+            "pending_wake",
+        ))));
+    }
     // Step 1: reject-if-busy. Read the conversation's persisted state
     // (the DB is updated before any side effect per persist-before-broadcast,
     // so DB state is the authoritative answer to "is this conversation busy?").

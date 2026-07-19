@@ -371,6 +371,19 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .list_active_unresolved_for_conversation(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_empty()
+    {
+        return Err(AppError::Conflict(Box::new(
+            crate::api::ConflictErrorResponse::new(
+                "Conversation has pending background work",
+                "pending_wake",
+            ),
+        )));
+    }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
     let conv = state
         .runtime
@@ -656,6 +669,19 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .list_active_unresolved_for_conversation(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_empty()
+    {
+        return Err(AppError::Conflict(Box::new(
+            crate::api::ConflictErrorResponse::new(
+                "Conversation has pending background work",
+                "pending_wake",
+            ),
+        )));
+    }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state
     let conv = state
         .runtime

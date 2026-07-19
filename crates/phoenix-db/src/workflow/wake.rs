@@ -2247,6 +2247,28 @@ impl WakeRepository {
             .collect()
     }
 
+    pub async fn recover_continuation_transfer(
+        &self,
+        from_conversation_id: &str,
+        timestamp: Timestamp,
+    ) -> DbResult<bool> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let continuation = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT continued_in_conv_id FROM conversations WHERE id = ?1",
+        )
+        .bind(from_conversation_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        .flatten();
+        tx.commit().await?;
+        let Some(continuation) = continuation else {
+            return Ok(false);
+        };
+        self.transfer_active_for_continuation(from_conversation_id, &continuation, timestamp)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn transfer_active_for_continuation(
         &self,
         from_conversation_id: &str,
