@@ -127,6 +127,23 @@ release-update prerequisites.
 
 ---
 
+### REQ-DEPLOY-002B: Present deployment identity and browser access context
+
+THE SYSTEM SHALL present one primary deployment summary containing the running
+version and commit, authoritative runtime ownership, and whether the current
+browser is viewing Phoenix locally or remotely.
+
+THE SYSTEM SHALL present runtime ownership, browser locality, and action
+eligibility as separate facts. A remote browser shall retain read-only
+diagnostics while the summary explains that host-local actions are unavailable
+from that browser.
+
+THE SYSTEM SHALL describe development and unmanaged runtimes without implying a
+deployment failure, while preserving ambiguity and unsupported-platform details
+needed for diagnosis.
+
+---
+
 ### REQ-DEPLOY-003: Report network binding and TLS configuration
 
 THE SYSTEM SHALL display the address and port the server is bound to

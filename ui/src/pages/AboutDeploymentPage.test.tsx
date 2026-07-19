@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
@@ -148,6 +148,10 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
   };
 }
 
+function LocationProbe() {
+  return <output aria-label="Current route">{useLocation().pathname}</output>;
+}
+
 function renderPage(info: DeploymentInfo, disk: DeploymentDiskInfo = deploymentDisk()) {
   apiMock.deploymentInfo.mockResolvedValue(info);
   apiMock.deploymentDiskInfo.mockResolvedValue(disk);
@@ -215,16 +219,50 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllMocks();
   });
 
-  it('shows runtime ownership from deployment info without waiting for update discovery', async () => {
+  it('presents running identity, ownership, and remote access as separate primary facts', async () => {
     renderPage(deployment({
       installation_ownership: {
         kind: 'ambiguous',
         reason: 'supervisor status probe timed out',
       },
+      local_access: false,
     }));
 
-    expect(await screen.findByText('Runtime owner')).toBeInTheDocument();
-    expect(screen.getByText('ambiguous — supervisor status probe timed out')).toBeInTheDocument();
+    const summary = await screen.findByRole('region', { name: 'Version 0.1.0' });
+    expect(within(summary).getByLabelText('Running git commit abc123')).toHaveAttribute('title', 'abc123');
+    expect(within(summary).getByText('Runtime manager is ambiguous')).toBeInTheDocument();
+    expect(within(summary).getByText('supervisor status probe timed out')).toBeInTheDocument();
+    expect(within(summary).getByText('Viewing remotely')).toBeInTheDocument();
+    expect(within(summary).getByText(/host-local actions are unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Build' })).not.toBeInTheDocument();
+  });
+
+  it('uses non-alarming language for local development instances', async () => {
+    renderPage(deployment({ local_access: true }));
+
+    const summary = await screen.findByRole('region', { name: 'Version 0.1.0' });
+    expect(within(summary).getByText('Development instance')).toBeInTheDocument();
+    expect(within(summary).getByText(/production service management does not apply/i)).toBeInTheDocument();
+    expect(within(summary).getByText('Viewing locally')).toBeInTheDocument();
+  });
+
+  it.each([
+    [{ kind: 'launchd_managed' } as const, 'Managed by launchd'],
+    [{ kind: 'systemd_managed' } as const, 'Managed by systemd'],
+    [{ kind: 'bare_supervisor_managed', supervisor_pid: 42 } as const, 'Managed by Phoenix supervisor'],
+    [{ kind: 'unmanaged', reason: 'started manually' } as const, 'Running without a proven manager'],
+    [{ kind: 'unsupported', platform: 'windows' } as const, 'Runtime manager unsupported'],
+  ])('renders truthful ownership copy for %s', async (installation_ownership, label) => {
+    renderPage(deployment({ installation_ownership }));
+
+    const summary = await screen.findByRole('region', { name: 'Version 0.1.0' });
+    expect(within(summary).getByText(label)).toBeInTheDocument();
+  });
+
+  it('explains missing reveal actions at the disk table for remote viewers', async () => {
+    renderPage(deployment({ local_access: false }));
+
+    expect(await screen.findByText(/reveal actions require viewing this page on the Phoenix host/i)).toBeInTheDocument();
   });
 
   it('summarizes measured, not-measured, and absent disk rows without summing overlaps', async () => {
@@ -258,6 +296,21 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText('chromium')).toBeInTheDocument();
     expect(screen.getByText('Managed CPU over time')).toBeInTheDocument();
     expect(screen.getByText('Managed memory over time')).toBeInTheDocument();
+  });
+
+  it('navigates to the deterministic conversations destination', async () => {
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    render(
+      <MemoryRouter initialEntries={['/about']}>
+        <AboutDeploymentPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Conversations' }));
+    expect(screen.getByLabelText('Current route')).toHaveTextContent('/');
   });
 
   it('page refresh supersedes an in-flight resource request while visible', async () => {

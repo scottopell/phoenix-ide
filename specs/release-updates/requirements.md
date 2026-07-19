@@ -13,10 +13,16 @@ The system shall discover in-app update candidates only from stable published re
 ### REQ-RU-002 — One immutable preview per discovered release
 
 When the system offers an update, it shall create an immutable preview that resolves one stable published release to one tag, one full source commit, one host-target asset, and one release summary visible to the operator. The install action shall refer to that exact preview rather than re-resolving release identity at click time.
+The surface shall refer to the primary running-deployment summary when
+presenting that candidate, without repeating the running version and commit as a
+second primary identity presentation.
 
 ### REQ-RU-003 — Explicit same-host approval bound to exact identity
 
 The system shall allow installation approval only from a same-host browser session and shall bind that approval to the preview's exact release tag and full source commit. If the offered release identity changes or the preview becomes stale, the system shall require a fresh preview and a fresh approval.
+The update surface shall treat browser locality as an approval constraint
+separate from runtime ownership and release eligibility; the deployment summary
+shall provide the primary local-or-remote access explanation.
 
 ### REQ-RU-004 — Production deployment remains the installation authority
 

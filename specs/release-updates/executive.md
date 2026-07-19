@@ -13,8 +13,8 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 | Requirement | Implementation / verification |
 | --- | --- |
 | REQ-RU-001 | `release_updates::discover_release` accepts GitHub's stable latest release and rejects prereleases. |
-| REQ-RU-002 | `ReleasePreview` and `ReleaseUpdatePanel` present tag, full commit, asset, checksum, notes, and running identity before approval. |
-| REQ-RU-003 | `client_is_local`, `valid_approval`, and controller exact-tag/full-commit validation enforce same-host, preview-bound approval. |
+| REQ-RU-002 | `ReleaseUpdatePanel` presents tag, full commit, asset, checksum, and notes before approval while referring to the primary running-deployment summary rather than duplicating it. |
+| REQ-RU-003 | `client_is_local`, `valid_approval`, and controller exact-tag/full-commit validation enforce same-host, preview-bound approval; the deployment summary presents locality independently from ownership and update authority. |
 | REQ-RU-004 | The pinned `dev.py` controller delegates to the existing launchd/systemd/bare activation owners. |
 | REQ-RU-004A | `api::installation_ownership` is shared by `/api/deployment` and `release_updates`; `release_updates::backend` internally maps only proven managed owners to update backends without exporting a parallel ownership value, and controller mode receives that selected backend instead of re-detecting from the host. |
 | REQ-RU-005 | `release_updates::approve` launches the controller independently and returns only after durable backend handoff. |

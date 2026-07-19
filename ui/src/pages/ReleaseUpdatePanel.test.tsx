@@ -47,6 +47,14 @@ describe('ReleaseUpdatePanel', () => {
     expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
   });
 
+  it('does not repeat the running deployment identity', async () => {
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText('v1.1.0')).toBeInTheDocument();
+    expect(screen.queryByText('1.0.0')).not.toBeInTheDocument();
+    expect(screen.queryByText(snapshot.current_git_sha)).not.toBeInTheDocument();
+    expect(screen.getByText(/running deployment summary/i)).toBeInTheDocument();
+  });
+
   it('posts the approved tag and full commit', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
@@ -69,7 +77,7 @@ describe('ReleaseUpdatePanel', () => {
       authority: { kind: 'remote_browser' },
     }));
     render(<ReleaseUpdatePanel />);
-    expect(await screen.findByText(/approval is available only from a browser on the Phoenix host/i)).toBeInTheDocument();
+    expect(await screen.findByText(/approval is unavailable from this remote browser/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
     expect(screen.getByText(snapshot.preview.commit)).toBeInTheDocument();
   });

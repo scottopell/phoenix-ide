@@ -1,3 +1,104 @@
+.about-deployment-summary {
+  display: grid;
+  gap: 16px;
+}
+
+.about-deployment-summary__identity {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.about-deployment-summary__eyebrow {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.about-deployment-summary__identity h3 {
+  margin: 4px 0 0;
+  font-size: 1.35rem;
+}
+
+.about-deployment-summary__identity code {
+  max-width: min(50%, 420px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.about-deployment-summary__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.about-deployment-summary__fact {
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  background: var(--panel-bg, rgb(255 255 255 / 3%));
+}
+
+.about-deployment-summary__fact p {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
+.about-deployment-summary__badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+}
+
+.about-deployment-summary__badge--managed,
+.about-deployment-summary__badge--local {
+  color: var(--accent-green);
+  background: color-mix(in srgb, var(--accent-green) 14%, transparent);
+}
+
+.about-deployment-summary__badge--warning {
+  color: #d99a32;
+  background: color-mix(in srgb, #d99a32 14%, transparent);
+}
+
+.about-deployment-summary__badge--remote {
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
+}
+
+.about-deployment-summary__runtime {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 0.86rem;
+}
+
+@media (width <= 640px) {
+  .about-deployment-summary__identity {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .about-deployment-summary__identity code {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .about-deployment-summary__facts {
+    grid-template-columns: 1fr;
+  }
+}
+
 .about-resources-section {
   display: flex;
   flex-direction: column;
