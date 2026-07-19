@@ -635,6 +635,9 @@ export function AboutDeploymentPage() {
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
   const resourcesGenerationRef = useRef(0);
+  const identityRefreshRef = useRef<string | null>(null);
+  const infoRef = useRef<DeploymentInfo | null>(null);
+  infoRef.current = info;
   const activeResourceRequestRef = useRef<ActiveResourceRequest | null>(null);
 
   const invalidateActiveResourceRequest = useCallback(() => {
@@ -670,6 +673,23 @@ export function AboutDeploymentPage() {
     api.revealPath(path).catch((e) => {
       setRevealError(e instanceof Error ? e.message : String(e));
     });
+  }, []);
+
+  const refreshDeploymentIdentity = useCallback((version: string, gitSha: string) => {
+    const identity = `${version}:${gitSha}`;
+    const current = infoRef.current;
+    if (
+      !current
+      || (current.build.version === version && current.build.git_sha === gitSha)
+      || identityRefreshRef.current === identity
+    ) return;
+    identityRefreshRef.current = identity;
+    api.deploymentInfo()
+      .then((data) => setInfo(data))
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => {
+        if (identityRefreshRef.current === identity) identityRefreshRef.current = null;
+      });
   }, []);
 
   const loadDisk = useCallback(() => {
@@ -840,7 +860,7 @@ export function AboutDeploymentPage() {
             <>
               <DeploymentSummary info={info} />
 
-              <ReleaseUpdatePanel />
+              <ReleaseUpdatePanel onRunningIdentityChange={refreshDeploymentIdentity} />
 
               <section className="settings-section">
                 <h3 className="settings-section__title">Network &amp; TLS</h3>

@@ -12,6 +12,8 @@ const { apiMock } = vi.hoisted(() => ({
     deploymentResources: vi.fn(),
     cleanupManagedWorktree: vi.fn(),
     revealPath: vi.fn(),
+    releaseUpdateSnapshot: vi.fn(),
+    approveReleaseUpdate: vi.fn(),
   },
 }));
 
@@ -210,6 +212,16 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentResources.mockReset();
     apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
+    apiMock.releaseUpdateSnapshot.mockReset().mockResolvedValue({
+      installation_ownership: { kind: 'development' },
+      current_version: '0.1.0',
+      current_git_sha: 'abc123',
+      preview: { kind: 'unavailable', reason: 'not checked' },
+      transaction: { kind: 'none' },
+      authority: { kind: 'not_production' },
+      sampled_at: '2026-06-01T00:00:04Z',
+    });
+    apiMock.approveReleaseUpdate.mockReset();
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
   });
 
@@ -235,6 +247,37 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(within(summary).getByText('Viewing remotely')).toBeInTheDocument();
     expect(within(summary).getByText(/host-local actions are unavailable/i)).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Build' })).not.toBeInTheDocument();
+  });
+
+  it('refreshes the single deployment summary when updates report a different running identity', async () => {
+    const initial = deployment();
+    const restarted = deployment({
+      build: { ...initial.build, version: '1.1.0', git_sha: 'def456' },
+    });
+    apiMock.deploymentInfo
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(restarted);
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    apiMock.releaseUpdateSnapshot.mockResolvedValueOnce({
+      installation_ownership: { kind: 'development' },
+      current_version: '1.1.0',
+      current_git_sha: 'def456',
+      preview: { kind: 'unavailable', reason: 'not checked' },
+      transaction: { kind: 'none' },
+      authority: { kind: 'not_production' },
+      sampled_at: '2026-06-01T00:00:04Z',
+    });
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('Version 0.1.0')).toBeInTheDocument();
+    expect(await screen.findByText('Version 1.1.0')).toBeInTheDocument();
+    expect(screen.getByLabelText('Running git commit def456')).toBeInTheDocument();
+    expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
   });
 
   it('uses non-alarming language for local development instances', async () => {

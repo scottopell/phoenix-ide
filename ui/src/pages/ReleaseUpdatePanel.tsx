@@ -77,7 +77,11 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
   );
 }
 
-export function ReleaseUpdatePanel() {
+export function ReleaseUpdatePanel({
+  onRunningIdentityChange,
+}: {
+  onRunningIdentityChange?: (version: string, gitSha: string) => void;
+}) {
   const [snapshot, setSnapshot] = useState<ReleaseUpdateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -99,6 +103,7 @@ export function ReleaseUpdatePanel() {
         }
       }
       setSnapshot(next);
+      onRunningIdentityChange?.(next.current_version, next.current_git_sha);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -106,7 +111,7 @@ export function ReleaseUpdatePanel() {
       setLoading(false);
       loadInFlight.current = false;
     }
-  }, [confirmedIdentity]);
+  }, [confirmedIdentity, onRunningIdentityChange]);
 
   useEffect(() => {
     void load();
