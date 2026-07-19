@@ -15,30 +15,57 @@
   outline: none;
 }
 
-.git-grounding-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
+.git-status-details {
+  padding: 9px 12px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
-.git-grounding-row {
+.git-status-checkout {
+  overflow: hidden;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-status-clean {
+  margin-top: 7px;
+  color: var(--accent-green);
+}
+
+.git-status-groups {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.git-status-group {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
-  font-size: 12px;
+  gap: 10px;
 }
 
-.git-grounding-row:last-child {
-  border-bottom: 0;
+.git-status-group span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.git-grounding-row span {
-  color: var(--text-muted);
-}
-
-.git-grounding-row strong {
-  color: var(--text-primary);
-  font-family: var(--font-mono);
+.git-status-group strong {
+  flex: 0 0 auto;
   font-weight: 600;
+}
+
+.git-status-group--staged {
+  color: var(--accent-green);
+}
+
+.git-status-group--unstaged,
+.git-status-group--untracked {
+  color: var(--accent-orange);
+}
+
+.git-status-group--conflicted {
+  color: var(--accent-red);
 }

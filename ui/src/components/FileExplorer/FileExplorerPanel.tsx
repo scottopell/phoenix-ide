@@ -72,6 +72,49 @@ function describeGitSummary(status: ConversationGitStatusResponse | null | undef
   }
 }
 
+function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusResponse, { kind: 'snapshot' }> }) {
+  const checkout = status.checkout_status.kind === 'named_branch'
+    ? `On branch ${status.checkout_status.branch_name}`
+    : status.checkout_status.kind === 'detached'
+      ? 'HEAD detached'
+      : status.checkout_status.kind === 'unborn'
+        ? `On branch ${status.checkout_status.branch_name}`
+        : 'Checkout unavailable';
+  const { counts } = status;
+
+  return (
+    <div className="git-status-details" aria-label="Git grounding details">
+      <div className="git-status-checkout">{checkout}</div>
+      {counts.changed_paths === 0 ? (
+        <div className="git-status-clean">nothing to commit, working tree clean</div>
+      ) : (
+        <div className="git-status-groups">
+          {counts.staged_paths > 0 && (
+            <div className="git-status-group git-status-group--staged">
+              <span>Changes to be committed</span><strong>{counts.staged_paths}</strong>
+            </div>
+          )}
+          {counts.unstaged_paths > 0 && (
+            <div className="git-status-group git-status-group--unstaged">
+              <span>Changes not staged for commit</span><strong>{counts.unstaged_paths}</strong>
+            </div>
+          )}
+          {counts.untracked_paths > 0 && (
+            <div className="git-status-group git-status-group--untracked">
+              <span>Untracked files</span><strong>{counts.untracked_paths}</strong>
+            </div>
+          )}
+          {counts.conflicted_paths > 0 && (
+            <div className="git-status-group git-status-group--conflicted">
+              <span>Unmerged paths</span><strong>{counts.conflicted_paths}</strong>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const { openDiffFullscreen } = useViewerSlotCommands();
@@ -249,13 +292,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               )}
             >
               {gitStatus?.kind === 'snapshot' ? (
-                <div className="git-grounding-body" aria-label="Git grounding details">
-                  <div className="git-grounding-row"><span>Checkout</span><strong>{gitStatus.checkout_status.kind === 'named_branch' ? gitStatus.checkout_status.branch_name : gitStatus.checkout_status.kind.replace('_', ' ')}</strong></div>
-                  <div className="git-grounding-row"><span>Changed paths</span><strong>{gitStatus.counts.changed_paths}</strong></div>
-                  <div className="git-grounding-row"><span>Staged</span><strong>{gitStatus.counts.staged_paths}</strong></div>
-                  <div className="git-grounding-row"><span>Unstaged</span><strong>{gitStatus.counts.unstaged_paths}</strong></div>
-                  <div className="git-grounding-row"><span>Untracked</span><strong>{gitStatus.counts.untracked_paths}</strong></div>
-                </div>
+                <GitStatusDetails status={gitStatus} />
               ) : gitStatus?.kind === 'non_git' ? (
                 <GroundingState>Git status is unavailable because this root is not in a repository.</GroundingState>
               ) : gitStatus?.kind === 'unavailable' ? (
