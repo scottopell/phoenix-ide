@@ -216,6 +216,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
           commitLog=""
           committedDiff={base}
           uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           onClose={() => undefined}
           onSendNotes={() => undefined}
         />
@@ -238,6 +239,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
           commitLog=""
           committedDiff={insertedBefore}
           uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           onClose={() => undefined}
           onSendNotes={() => undefined}
         />
