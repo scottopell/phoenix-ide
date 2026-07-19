@@ -2775,7 +2775,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             sequenceId={messageSlot.sequenceId}
             messages={viewableMessages}
             onClose={handleCloseMessageViewer}
-            onSendNotes={messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+            onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
             presentation={messageSlot.presentation}
             canTogglePresentation={isWideDesktop}
             onPresentationChange={viewerSlot.setPresentation}
@@ -2848,7 +2848,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   filePath={splitPanePrs.path}
                   rootDir={splitPanePrs.rootDir}
                   onClose={handleCloseFileViewer}
-                  onSendNotes={proseSlot?.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+                  onSendNotes={isWideDesktop && proseSlot?.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
                   focus={splitPanePrs.focus}
                   presentation={proseSlot?.presentation ?? 'pane'}
@@ -2874,7 +2874,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
                   sequenceId={messageSlot.sequenceId}
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
-                  onSendNotes={messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+                  onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
                   presentation={messageSlot.presentation}
                   canTogglePresentation
                   onPresentationChange={viewerSlot.setPresentation}

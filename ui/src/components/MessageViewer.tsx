@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Message } from '../api';
 import { useMessageReviewNotesData, useReviewNotesCommands } from '../contexts/ReviewNotesContext';
 import type { ReviewNote } from '../contexts/ReviewNotesContext';
@@ -44,31 +43,11 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
     closeViewer: onClose,
   });
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
-  const contentRef = useRef<HTMLDivElement>(null);
-  const lastScrollTopRef = useRef(0);
-  const previousPresentationRef = useRef(presentation);
   const lineRefsSequenceId = useRef(sequenceId);
   if (lineRefsSequenceId.current !== sequenceId) {
     lineRefs.current.clear();
     lineRefsSequenceId.current = sequenceId;
-    lastScrollTopRef.current = 0;
-    previousPresentationRef.current = presentation;
   }
-
-  useLayoutEffect(() => {
-    if (previousPresentationRef.current === presentation) return;
-    previousPresentationRef.current = presentation;
-    const el = contentRef.current;
-    if (el) el.scrollTop = lastScrollTopRef.current;
-  }, [presentation]);
-
-  useEffect(() => {
-    const el = contentRef.current;
-    if (!el) return;
-    const onScroll = () => { lastScrollTopRef.current = el.scrollTop; };
-    el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
-  }, [presentation, sequenceId]);
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
     if (el) lineRefs.current.set(lineNumber, el);
@@ -146,7 +125,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
         />
       ) : null}
     >
-      <div className="viewer-content" ref={contentRef}>
+      <div className="viewer-content">
         {message && content ? (
           <MarkdownViewerBody
             content={content}
@@ -164,7 +143,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, pres
       </div>
     </ViewerShell>
   );
-  return focused ? createPortal(shell, document.body) : shell;
+  return shell;
 }
 
 const EMPTY_SET: Set<number> = new Set();

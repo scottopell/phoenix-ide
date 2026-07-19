@@ -89,7 +89,6 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const lastScrollTopRef = useRef(0);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
-  const previousPresentationRef = useRef(presentation);
   const findSurfaceShape = htmlPreview
     ? 'html-preview'
     : rangeSource
@@ -110,13 +109,6 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     if (el) lineRefs.current.set(lineNumber, el);
     else lineRefs.current.delete(lineNumber);
   }, []);
-
-  useLayoutEffect(() => {
-    if (usePierreCode || previousPresentationRef.current === presentation) return;
-    previousPresentationRef.current = presentation;
-    const el = contentRef.current;
-    if (el) el.scrollTop = lastScrollTopRef.current;
-  }, [presentation, usePierreCode]);
 
   // New file → new restoration target.
   useEffect(() => {
@@ -173,7 +165,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     const onScroll = () => { lastScrollTopRef.current = el.scrollTop; };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, [content, presentation, usePierreCode]);
+  }, [content, usePierreCode]);
 
   // Persist scroll on backgrounding and unmount. Skipped for Pierre-backed
   // payloads: the wrapper persists under the same scrollKey, and the parent's
@@ -595,7 +587,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </ViewerShell>
   );
 
-  return focused || (payload.kind === 'image' && imageTakeover) ? createPortal(shell, document.body) : shell;
+  return payload.kind === 'image' && imageTakeover ? createPortal(shell, document.body) : shell;
 }
 
 const EMPTY_FIND_SESSION_MATCHES: readonly FindSessionMatch<FileSearchMatchTarget>[] = [];

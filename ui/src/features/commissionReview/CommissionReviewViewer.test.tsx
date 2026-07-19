@@ -24,6 +24,30 @@ const request: Message = {
 };
 
 describe('CommissionReviewViewer', () => {
+  it('keeps the same scroll surface across pane and fullscreen presentation', () => {
+    const props = {
+      sequenceId: 7,
+      messages: [request],
+      onClose: () => {},
+      canTogglePresentation: true,
+      onPresentationChange: () => {},
+      inline: true,
+    };
+    const view = render(<CommissionReviewViewer {...props} presentation="pane" />);
+    const paneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    paneContent.scrollTop = 480;
+
+    view.rerender(<CommissionReviewViewer {...props} presentation="fullscreen" />);
+    const focusedContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    expect(focusedContent).toBe(paneContent);
+    expect(focusedContent.scrollTop).toBe(480);
+
+    focusedContent.scrollTop = 760;
+    view.rerender(<CommissionReviewViewer {...props} presentation="pane" />);
+    expect(view.container.querySelector('.viewer-content')).toBe(paneContent);
+    expect(paneContent.scrollTop).toBe(760);
+  });
+
   it('owns the active focus scope while mounted', async () => {
     render(
       <FocusScopeProvider>

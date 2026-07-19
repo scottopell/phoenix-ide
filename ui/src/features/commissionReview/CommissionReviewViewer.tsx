@@ -1,5 +1,4 @@
 import type { Message, ToolResultContent } from '../../api';
-import { createPortal } from 'react-dom';
 import { ViewerPresentationControl, ViewerShell } from '../../components/viewer/ViewerShell';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { CommissionReviewSummaryCard } from './CommissionReviewSummary';
@@ -73,7 +72,7 @@ export function CommissionReviewViewer({ sequenceId, messages, onClose, presenta
       </div>
     </ViewerShell>
   );
-  return focused ? createPortal(shell, document.body) : shell;
+  return shell;
 }
 
 function resolveCommissionReviewBySequence(sequenceId: number, messages: Message[]): ResolvedReview | null {
