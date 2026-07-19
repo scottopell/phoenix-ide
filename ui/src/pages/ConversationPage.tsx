@@ -2040,6 +2040,7 @@ function ConversationPageContent({
               conversationId={conversationId}
               onClose={handleCloseBrowserView}
               inline
+              takeover
             />
           </Suspense>
         </div>

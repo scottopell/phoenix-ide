@@ -12712,7 +12712,8 @@ html * {
   height: 100%;
 }
 
-.browser-view-overlay .browser-view-panel__header {
+.browser-view-overlay .browser-view-panel__header,
+.browser-view-panel--takeover .browser-view-panel__header {
   min-height: calc(44px + env(safe-area-inset-top, 0));
   height: auto;
   padding-top: env(safe-area-inset-top, 0);

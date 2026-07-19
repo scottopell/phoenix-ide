@@ -50,14 +50,18 @@ interface BrowserViewPanelProps {
   conversationId: string;
   /** Click handler for the close button in the header. */
   onClose?: () => void;
-  /** When true, render with the inline split-pane chrome (no overlay). */
+  /** When true, render without overlay positioning. */
   inline?: boolean;
+  /** Inline narrow-layout takeover: use full-screen navigation chrome rather
+   *  than the compact split-pane close control. */
+  takeover?: boolean;
 }
 
 export function BrowserViewPanel({
   conversationId,
   onClose,
   inline,
+  takeover,
 }: BrowserViewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -170,10 +174,14 @@ export function BrowserViewPanel({
       } else if (tag === TAG_STATUS) {
         const text = new TextDecoder('utf-8').decode(data.subarray(1));
         if (text === 'no-session') {
+          stoppingRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'no-session' });
         } else if (text === 'started') {
           setStatus({ kind: 'live' });
         } else if (text === 'ended') {
+          stoppingRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'ended' });
         } else if (text.startsWith('error:')) {
           setStatus({ kind: 'error', message: text.slice(6).trim() });
@@ -228,11 +236,11 @@ export function BrowserViewPanel({
 
   return (
     <div
-      className={`browser-view-panel${inline ? ' browser-view-panel--inline' : ''}`}
+      className={`browser-view-panel${inline ? ' browser-view-panel--inline' : ''}${takeover ? ' browser-view-panel--takeover' : ''}`}
       data-testid="browser-view-panel"
     >
       <div className="browser-view-panel__header">
-        {onClose && !inline && (
+        {onClose && (!inline || takeover) && (
           <button
             type="button"
             className="browser-view-panel__back"
@@ -280,7 +288,7 @@ export function BrowserViewPanel({
         >
           {stopping ? 'Stopping…' : 'Stop browser'}
         </button>
-        {onClose && inline && (
+        {onClose && inline && !takeover && (
           <button
             type="button"
             className="browser-view-panel__close"

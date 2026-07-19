@@ -13,6 +13,16 @@ vi.mock('../api', async (importOriginal) => {
 
 const stopBrowser = vi.mocked(api.stopConversationBrowserSession);
 
+const sockets: MockWebSocket[] = [];
+
+function statusMessage(status: string): MessageEvent<ArrayBuffer> {
+  const text = new TextEncoder().encode(status);
+  const payload = new Uint8Array(text.length + 1);
+  payload[0] = 0x02;
+  payload.set(text, 1);
+  return { data: payload.buffer } as MessageEvent<ArrayBuffer>;
+}
+
 class MockWebSocket {
   binaryType = 'arraybuffer';
   onopen: (() => void) | null = null;
@@ -20,7 +30,9 @@ class MockWebSocket {
   onerror: (() => void) | null = null;
   onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null = null;
 
-  constructor(public readonly url: string) {}
+  constructor(public readonly url: string) {
+    sockets.push(this);
+  }
 
   close() {
     this.onclose?.();
@@ -32,6 +44,7 @@ describe('BrowserViewPanel stop-session control', () => {
 
   beforeEach(() => {
     stopBrowser.mockReset();
+    sockets.length = 0;
     globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
   });
 
@@ -55,6 +68,13 @@ describe('BrowserViewPanel stop-session control', () => {
     expect(screen.queryByLabelText('Back to conversation')).toBeNull();
   });
 
+  it('uses the large back control for an inline narrow-layout takeover', () => {
+    render(<BrowserViewPanel conversationId="conv-1" onClose={() => {}} inline takeover />);
+
+    expect(screen.getByLabelText('Back to conversation')).toBeTruthy();
+    expect(screen.queryByLabelText('Close browser view')).toBeNull();
+  });
+
   it('clicking stop calls the conversation browser-session endpoint', async () => {
     stopBrowser.mockResolvedValue({ success: true });
     render(<BrowserViewPanel conversationId="conv-1" />);
@@ -68,6 +88,22 @@ describe('BrowserViewPanel stop-session control', () => {
     expect(screen.getByLabelText('Stop browser session')).toBeDisabled();
     expect(screen.getByLabelText('Browser view status: stopping')).toBeTruthy();
     expect(screen.getByRole('status').textContent).toBe('Stopping browser…');
+  });
+
+  it.each(['no-session', 'ended'])('settles pending stop when websocket reports %s', async (terminalStatus) => {
+    stopBrowser.mockResolvedValue({ success: true });
+    render(<BrowserViewPanel conversationId="conv-1" />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Stop browser session'));
+      await Promise.resolve();
+    });
+    expect(screen.getByLabelText('Stop browser session')).toBeDisabled();
+
+    act(() => { sockets[0]!.onmessage?.(statusMessage(terminalStatus)); });
+
+    expect(screen.getByLabelText('Stop browser session')).not.toBeDisabled();
+    expect(screen.queryByText('Stopping browser…')).toBeNull();
   });
 
   it('back to conversation remains available while teardown is pending', async () => {
