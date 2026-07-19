@@ -172,11 +172,10 @@ pub(crate) fn validate_status_transition(
                 | WorkflowStatus::Completed
                 | WorkflowStatus::Failed
         ),
-        WorkflowStatus::Incompatible
-        | WorkflowStatus::Cancelled
-        | WorkflowStatus::Deleted
-        | WorkflowStatus::Completed
-        | WorkflowStatus::Failed => false,
+        WorkflowStatus::Cancelled | WorkflowStatus::Failed => {
+            next_status == WorkflowStatus::DeletionPending
+        }
+        WorkflowStatus::Incompatible | WorkflowStatus::Deleted | WorkflowStatus::Completed => false,
         WorkflowStatus::DeletionPending => matches!(next_status, WorkflowStatus::Deleted),
     };
     if valid {

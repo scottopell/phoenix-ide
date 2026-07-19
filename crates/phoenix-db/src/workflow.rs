@@ -1730,6 +1730,10 @@ impl WorkflowRepository {
             return Ok(CommitOutcome::InvalidPlan);
         };
         let kind = parse_manual_choice_kind(&choice.get::<String, _>("kind"))?;
+        if kind == ManualChoiceKind::Retry && input.retry_at.is_none() {
+            tx.rollback().await?;
+            return Ok(CommitOutcome::InvalidPlan);
+        }
         let updated = sqlx::query("UPDATE workflows SET version = version + 1, generation = ?3, status = ?4, snapshot_codec_family = ?5, snapshot_codec_version = ?6, snapshot_payload = ?7, updated_at = ?8 WHERE workflow_id = ?1 AND version = ?2")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.expected_version.0, "expected_version")?)

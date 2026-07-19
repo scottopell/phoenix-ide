@@ -865,6 +865,22 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 deliveries: Vec::new(),
             });
         }
+        if matches!(
+            self.status,
+            WorkflowStatus::Completed
+                | WorkflowStatus::Cancelled
+                | WorkflowStatus::Failed
+                | WorkflowStatus::Incompatible
+                | WorkflowStatus::Deleted
+                | WorkflowStatus::DeletionPending
+        ) {
+            return Err(EngineError::InvalidPlan(
+                PlanError::InvalidStatusTransition {
+                    current: self.status,
+                    next: WorkflowStatus::Cancelling,
+                },
+            ));
+        }
         let mut staged = self.clone();
         staged.generation = staged.generation.next();
         staged.status = WorkflowStatus::Cancelling;

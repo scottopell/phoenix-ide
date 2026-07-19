@@ -613,18 +613,24 @@ impl TerminalInspector for RuntimeRegistryInspector {
                         .map_err(|error| error.to_string())?
                     {
                         Some(window) => Ok(match window.exit_code {
-                            Some(exit_code) => InspectionOutcome::Terminal(
-                                WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
-                                    identity: identity.clone(),
-                                    status: TmuxTerminalStatus::ExitMarkerObserved,
-                                    occurred_at: window
-                                        .occurred_at
-                                        .map_or(observation_time, system_time_to_timestamp),
-                                    exit_code: Some(exit_code),
-                                    duration_ms: None,
-                                    final_tail: window.final_tail,
-                                }),
-                            ),
+                            Some(exit_code) => {
+                                let _ = self
+                                    .tmux
+                                    .kill_exact_window(&scope, &identity.window_id)
+                                    .await;
+                                InspectionOutcome::Terminal(WakeTerminalEvidence::TmuxWindow(
+                                    TmuxTerminalEvidence {
+                                        identity: identity.clone(),
+                                        status: TmuxTerminalStatus::ExitMarkerObserved,
+                                        occurred_at: window
+                                            .occurred_at
+                                            .map_or(observation_time, system_time_to_timestamp),
+                                        exit_code: Some(exit_code),
+                                        duration_ms: None,
+                                        final_tail: window.final_tail,
+                                    },
+                                ))
+                            }
                             None => InspectionOutcome::LiveRetry,
                         }),
                         None => Ok(InspectionOutcome::Forgotten(

@@ -734,6 +734,20 @@ impl TmuxRegistry {
         }))
     }
 
+    /// Kill one exact window after its durable terminal marker has been observed.
+    ///
+    /// # Errors
+    /// Returns [`TmuxError`] if the registry cannot derive or invoke the scoped tmux server.
+    pub async fn kill_exact_window(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<(), TmuxError> {
+        let socket_path = self.derived_socket_path(work_scope);
+        run_tmux_quiet(&socket_path, &["kill-window", "-t", window_id]).await;
+        Ok(())
+    }
+
     /// Deterministic socket path for a `WorkScope`, derived the same way
     /// `ensure_live` derives it on insertion. Used by the cascade when no
     /// registry entry is present (orphan-socket cleanup) and on the
