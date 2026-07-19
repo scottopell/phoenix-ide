@@ -173,15 +173,28 @@ WHEN an LLM request executes
 THE SYSTEM SHALL emit bounded structured telemetry containing model, provider, transport, duration, token counts, retry attempt, a request identifier, conversation identifiers when conversation context exists, and classified failure reason when applicable
 AND SHALL keep human-readable log filtering independent from exported trace filtering
 
+WHEN the system measures provider time to first token (TTFT)
+THE SYSTEM SHALL measure from the request transmission or dispatch boundary on the selected transport to the first provider event that carries generated model output
+AND SHALL count generated text deltas, reasoning deltas, tool-call deltas, and other generated structured-output deltas as generation-bearing events
+AND SHALL NOT count acknowledgements, pings, keepalives, metadata-only events, usage-only events, or terminal events as TTFT-bearing events
+
+WHEN the system records or aggregates TTFT
+THE SYSTEM SHALL preserve provider, model, and transport as first-class dimensions
+AND SHALL support aggregate analysis by those dimensions
+
 WHEN traces are exported
 THE SYSTEM SHALL export only explicitly designated Phoenix spans
 AND SHALL NOT export tracing events, dependency diagnostics, prompts, conversation content, tool schemas or arguments, authorization credentials or headers, raw provider payloads, WebSocket frames, SSE deltas, or parser buffers
 AND SHALL enforce finite span attribute, event, and link limits before export
 
 WHEN provider streaming diagnostics are logged locally
-THE SYSTEM SHALL log only content-free structural metadata such as event type, byte count, parser counters, transport transition, and classified error code
+THE SYSTEM SHALL log only content-free structural metadata such as event type, byte count, parser counters, transport transition, classified error code, and timing milestones
 
-**Rationale:** Operators need request latency, usage, correlation, retry, failure, and transport visibility without turning long-lived LLM spans into unbounded payload stores or exposing user content and credentials.
+WHEN request observability is persisted, exported, or surfaced for aggregate analysis
+THE SYSTEM SHALL keep TTFT telemetry content-free and privacy-preserving
+AND SHALL NOT include prompts, generated content, tool arguments, or any raw provider event payload needed only to reconstruct user-visible content
+
+**Rationale:** Operators need request latency, TTFT, usage, correlation, retry, failure, and transport visibility without turning long-lived LLM spans into unbounded payload stores or exposing user content and credentials. Provider-centric TTFT must reflect provider generation onset rather than client-visible wording so that queueing, scheduling, prefill, and transport behavior remain comparable across providers and transports.
 
 ---
 
