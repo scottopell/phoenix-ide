@@ -190,6 +190,44 @@ AND close the file browser overlay
 
 ---
 
+### REQ-FE-012: Live Git Status Grounding
+
+WHEN a conversation working directory is a Git worktree
+THE SYSTEM SHALL obtain a read-only, conversation-scoped status snapshot from the live checkout
+AND preserve index and working-tree status as distinct typed values
+AND represent modified, added, deleted, renamed, copied, type-changed, untracked, and unmerged paths without parsing ambiguity
+AND exclude ignored paths from changed-path totals
+AND SHALL NOT fetch remote state or mutate the index
+
+WHEN the file tree displays a path present in the status snapshot
+THE SYSTEM SHALL show a conventional compact Git decoration
+AND expose the status in accessible text rather than color alone
+
+WHEN changed paths exist beneath a displayed directory
+THE SYSTEM SHALL decorate that directory with an aggregate changed-descendant count
+EVEN IF the directory is collapsed or its children have not been loaded
+
+WHEN Git status changes outside Phoenix
+THE SYSTEM SHALL refresh the snapshot with the file tree's existing open, manual refresh, and visible-page refresh cycle
+AND one refresh owner SHALL provide the snapshot to the summary and tree consumers
+AND a stale or failed snapshot SHALL NOT be presented as clean
+
+WHEN the desktop file explorer is expanded
+THE SYSTEM SHALL show a compact Git grounding section with live checkout identity, changed-path count, and locally known upstream relationship
+AND activating it SHALL open Workspace Diff
+
+WHEN the mobile file browser overlay is open
+THE SYSTEM SHALL show the same compact Git grounding summary in its header
+AND activating it SHALL close the file browser and open Workspace Diff
+
+WHEN the path is not a Git worktree or Git observation is unavailable
+THE SYSTEM SHALL keep file browsing operational
+AND show a neutral non-Git or unavailable state instead of a clean claim
+
+**Rationale:** Inline decorations make worktree state visible at the point of file navigation, while Workspace Diff remains the single detailed review surface. Live checkout identity follows `specs/projects/requirements.md` REQ-PROJ-038.
+
+---
+
 ### REQ-FE-011: File Tree Context Menu, Drag-and-Drop, and Keyboard Navigation
 
 WHEN user right-clicks a text file in the file tree

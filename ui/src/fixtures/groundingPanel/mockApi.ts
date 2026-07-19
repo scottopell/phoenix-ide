@@ -37,6 +37,23 @@ export function installGroundingPanelFixtureFetch(
       if (scenario.kind === 'errors') return json({ error: 'mcp unavailable' }, { status: 500 });
       return json(scenario.kind === 'empty' ? [] : data.mcp);
     }
+    if (url === `/api/conversations/${scenario.conversationId}/git-status`) {
+      if (scenario.kind === 'errors') return json({ kind: 'unavailable', reason: 'Git status unavailable' });
+      if (scenario.kind === 'empty') return json({ kind: 'non_git' });
+      return json({
+        kind: 'snapshot',
+        checkout_status: {
+          kind: 'named_branch',
+          branch_name: scenario.branchName,
+          remote_status: { kind: 'no_remote_branch' },
+        },
+        counts: { changed_paths: 2, staged_paths: 0, unstaged_paths: 1, untracked_paths: 1, conflicted_paths: 0 },
+        changed_paths: [
+          { kind: 'ordinary', path: 'src/components/GroundingPanel.tsx', index_status: 'unmodified', worktree_status: 'modified' },
+          { kind: 'untracked', path: 'notes/git-status.md' },
+        ],
+      });
+    }
     if (url === `/api/conversations/${scenario.conversationId}/skills`) {
       if (scenario.kind === 'errors') return json({ error: 'skills unavailable' }, { status: 500 });
       return json({ skills: scenario.kind === 'empty' ? [] : data.skills });

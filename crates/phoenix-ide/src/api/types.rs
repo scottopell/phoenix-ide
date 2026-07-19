@@ -903,6 +903,69 @@ pub enum CheckoutStatus {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitFileStatus {
+    Unmodified,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitChangedPath {
+    Ordinary {
+        path: String,
+        index_status: GitFileStatus,
+        worktree_status: GitFileStatus,
+    },
+    Renamed {
+        path: String,
+        previous_path: String,
+        index_status: GitFileStatus,
+        worktree_status: GitFileStatus,
+    },
+    Untracked {
+        path: String,
+    },
+    Unmerged {
+        path: String,
+        index_status: GitFileStatus,
+        worktree_status: GitFileStatus,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_field_names)]
+pub struct GitStatusCounts {
+    pub changed_paths: u32,
+    pub staged_paths: u32,
+    pub unstaged_paths: u32,
+    pub untracked_paths: u32,
+    pub conflicted_paths: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConversationGitStatusResponse {
+    Snapshot {
+        checkout_status: CheckoutStatus,
+        counts: GitStatusCounts,
+        changed_paths: Vec<GitChangedPath>,
+    },
+    NonGit,
+    Unavailable {
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkout_status: Option<CheckoutStatus>,
+    },
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConversationDiffResponse {
     /// The ref used as the comparator — e.g. `"origin/main"` when the

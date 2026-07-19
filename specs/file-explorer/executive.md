@@ -2,11 +2,11 @@
 
 ## Requirements Summary
 
-The File Explorer Panel provides persistent file browsing on desktop viewports. It adds a third column to the desktop layout, sitting between the conversation sidebar and main content area. Users see a tree view of the current conversation's working directory, with expandable folders and clickable files. Clicking a text file opens it in the prose reader, which renders in the main content area (replacing the conversation view temporarily). Both the sidebar and file explorer support independent collapse/expand, with the collapsed file explorer showing recent file icons for quick re-access. All panel states persist to localStorage. The feature builds on existing FileBrowser and ProseReader components, adapting them for persistent panel display rather than modal overlays. Mobile behavior remains unchanged.
+The File Explorer Panel provides persistent browsing and live Git grounding on desktop, while the mobile file overlay reuses the same tree. Users see the conversation's working directory with expandable folders, clickable files, compact Git decorations, and aggregate dirty counts on ancestor folders. A Git grounding summary shows the live checkout and changed-path count and opens the existing Workspace Diff surface. Mobile presents that summary in the file-browser header. File selection continues to open the prose reader inline on desktop and as an overlay on mobile.
 
 ## Technical Summary
 
-Extends DesktopLayout to three columns with CSS flexbox. FileExplorerPanel component manages collapse state and renders either the full FileTree or a RecentFilesStrip. FileTree refactors logic from existing FileBrowser overlay, removing navigation chrome and adding active-file highlighting. Recent files tracked per-conversation in localStorage (max 5 files). FileExplorerContext provides communication between file tree and main content area for opening files in prose reader. ProseReader renders inline in main content area on desktop instead of as overlay. Panel widths are fixed (sidebar ~280px, file explorer ~250px) with main content taking remaining space (min 400px).
+`FileExplorerPanel` and `FileBrowserOverlay` share `FileTree`. A conversation-scoped endpoint captures bounded porcelain-v2 status without network access or index mutation, while the checkout model is shared with Workspace Diff. `FileTree` owns the existing visible-page refresh cadence and refreshes the Git snapshot through the same tick. Typed path states preserve index and worktree semantics; the UI derives one compact file badge and ancestor counts. Viewer-slot commands open Workspace Diff from desktop and mobile grounding summaries.
 
 ## Status Summary
 
@@ -23,5 +23,6 @@ Extends DesktopLayout to three columns with CSS flexbox. FileExplorerPanel compo
 | **REQ-FE-009:** Visual Feedback | ✅ Complete | Active file highlight + loading spinners |
 | **REQ-FE-010:** Mobile File Browser Overlay | ✅ Complete | FileBrowserOverlay hosts FileTree |
 | **REQ-FE-011:** Context Menu, Drag-and-Drop, Keyboard Nav | ✅ Complete | FileTreeContextMenu + custom drag type + focus scope |
+| **REQ-FE-012:** Live Git Status Grounding | ✅ Complete | Typed status snapshot, tree badges, ancestor counts, desktop/mobile summaries |
 
-**Progress:** 11 of 11 complete
+**Progress:** 12 of 12 complete

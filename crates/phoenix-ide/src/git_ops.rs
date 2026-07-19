@@ -93,7 +93,7 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 ///   `diff.dstPrefix=b/`: force standard `a/`/`b/` path prefixes. A user with
 ///   `diff.mnemonicPrefix=true` otherwise gets `c/`/`w/` on `git diff HEAD`,
 ///   which the UI diff parser rejects (it only recognises `a/`/`b/`).
-fn git_command() -> std::process::Command {
+pub(crate) fn git_command() -> std::process::Command {
     phoenix_core::git::command_with_config(&[
         ("diff.noprefix", "false"),
         ("diff.mnemonicPrefix", "false"),
@@ -173,6 +173,40 @@ pub(crate) fn run_git_with_env(
 ///
 /// `max_bytes == 0` returns an empty string but still drains/counts the
 /// stream up to the hard limit.
+pub(crate) fn read_child_stdout_bounded(
+    child: &mut std::process::Child,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label} child had no stdout"))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{label} read failed: {e}"));
+            }
+        };
+        let remaining = max_bytes.saturating_sub(buf.len());
+        if n > remaining {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label} output exceeded {max_bytes} bytes"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 pub(crate) fn run_git_capped(
     cwd: &Path,
     args: &[&str],

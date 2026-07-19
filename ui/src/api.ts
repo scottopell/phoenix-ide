@@ -714,6 +714,63 @@ export interface FileSearchEntry {
   viewer: FileViewerKind;
 }
 
+export type GitFileStatus =
+  | 'unmodified'
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'type_changed'
+  | 'unmerged';
+
+export type GitChangedPath =
+  | {
+    kind: 'ordinary';
+    path: string;
+    index_status: GitFileStatus;
+    worktree_status: GitFileStatus;
+  }
+  | {
+    kind: 'renamed';
+    path: string;
+    previous_path: string;
+    index_status: GitFileStatus;
+    worktree_status: GitFileStatus;
+  }
+  | {
+    kind: 'untracked';
+    path: string;
+  }
+  | {
+    kind: 'unmerged';
+    path: string;
+    index_status: GitFileStatus;
+    worktree_status: GitFileStatus;
+  };
+
+export interface GitStatusCounts {
+  changed_paths: number;
+  staged_paths: number;
+  unstaged_paths: number;
+  untracked_paths: number;
+  conflicted_paths: number;
+}
+
+export type ConversationGitStatusResponse =
+  | {
+    kind: 'snapshot';
+    checkout_status: CheckoutStatus;
+    counts: GitStatusCounts;
+    changed_paths: GitChangedPath[];
+  }
+  | { kind: 'non_git' }
+  | {
+    kind: 'unavailable';
+    reason: string;
+    checkout_status?: CheckoutStatus;
+  };
+
 export interface CodeSearchEntry {
   path: string;
   line_number: number;
@@ -2029,6 +2086,12 @@ export const api = {
   async getPrStatus(conversationId: string): Promise<PrStatusResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/pr-status`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR status'); }
+    return resp.json();
+  },
+
+  async getConversationGitStatus(conversationId: string, signal?: AbortSignal): Promise<ConversationGitStatusResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/git-status`, signal ? { signal } : undefined);
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to fetch git status'); }
     return resp.json();
   },
 

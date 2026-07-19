@@ -7,7 +7,8 @@ use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
     ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
     AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConversationDiffResponse,
-    GitBranchEntry, GitBranchesQuery, GitBranchesResponse, ObservedBranchSummaryResponse,
+    ConversationGitStatusResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+    GitChangedPath, GitFileStatus, GitStatusCounts, ObservedBranchSummaryResponse,
     PinAssociatedPrRequest, PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse,
     PrUnavailableReason, WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
@@ -89,6 +90,13 @@ struct LiveCheckoutObservation {
 }
 
 const CHECKOUT_CAPTURE_ATTEMPTS: usize = 2;
+const GIT_STATUS_MAX_OUTPUT_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStatusSnapshot {
+    counts: GitStatusCounts,
+    changed_paths: Vec<GitChangedPath>,
+}
 
 fn configured_upstream_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
     run_git(
@@ -223,6 +231,182 @@ fn live_checkout_observation_details(
         remote_status: branch_remote_status(worktree_path, &branch_name, head_oid),
         branch_name,
     }
+}
+
+fn git_status_file_state(code: u8) -> Option<GitFileStatus> {
+    match code {
+        b'.' => Some(GitFileStatus::Unmodified),
+        b'M' => Some(GitFileStatus::Modified),
+        b'A' => Some(GitFileStatus::Added),
+        b'D' => Some(GitFileStatus::Deleted),
+        b'R' => Some(GitFileStatus::Renamed),
+        b'C' => Some(GitFileStatus::Copied),
+        b'T' => Some(GitFileStatus::TypeChanged),
+        b'U' => Some(GitFileStatus::Unmerged),
+        _ => None,
+    }
+}
+
+fn parse_porcelain_v2_status_record(
+    record: &[u8],
+    rename_source: Option<&[u8]>,
+) -> Result<Option<GitChangedPath>, String> {
+    if record.is_empty() {
+        return Ok(None);
+    }
+    match record[0] {
+        b'1' | b'2' | b'u' => {
+            if record.len() < 4 || record[1] != b' ' {
+                return Err("invalid porcelain v2 record".to_string());
+            }
+            let xy = &record[2..4];
+            let index_status = git_status_file_state(xy[0])
+                .ok_or_else(|| "invalid porcelain v2 index status".to_string())?;
+            let worktree_status = git_status_file_state(xy[1])
+                .ok_or_else(|| "invalid porcelain v2 worktree status".to_string())?;
+            let field_count = match record[0] {
+                b'1' => 9,
+                b'2' => 10,
+                b'u' => 11,
+                _ => unreachable!(),
+            };
+            let path = record
+                .splitn(field_count, |byte| *byte == b' ')
+                .nth(field_count - 1)
+                .ok_or_else(|| "invalid porcelain v2 path record".to_string())?;
+            let path = String::from_utf8(path.to_vec())
+                .map_err(|_| "invalid utf-8 in git status path".to_string())?;
+            Ok(Some(match record[0] {
+                b'1' => GitChangedPath::Ordinary {
+                    path,
+                    index_status,
+                    worktree_status,
+                },
+                b'2' => {
+                    let previous_path = String::from_utf8(
+                        rename_source
+                            .ok_or_else(|| "rename record missing source path".to_string())?
+                            .to_vec(),
+                    )
+                    .map_err(|_| "invalid utf-8 in git rename source".to_string())?;
+                    GitChangedPath::Renamed {
+                        path,
+                        previous_path,
+                        index_status,
+                        worktree_status,
+                    }
+                }
+                b'u' => GitChangedPath::Unmerged {
+                    path,
+                    index_status,
+                    worktree_status,
+                },
+                _ => unreachable!(),
+            }))
+        }
+        b'?' => {
+            if record.len() < 3 || record[1] != b' ' {
+                return Err("invalid porcelain v2 untracked record".to_string());
+            }
+            let path = String::from_utf8(record[2..].to_vec())
+                .map_err(|_| "invalid utf-8 in git status path".to_string())?;
+            Ok(Some(GitChangedPath::Untracked { path }))
+        }
+        b'!' | b'#' => Ok(None),
+        _ => Err("unsupported porcelain v2 record".to_string()),
+    }
+}
+
+fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, String> {
+    let mut changed_paths = Vec::new();
+    let mut parts = output.split(|byte| *byte == 0).peekable();
+    let mut counts = GitStatusCounts::default();
+    while let Some(record) = parts.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let rename_source = if record.first() == Some(&b'2') {
+            Some(
+                parts
+                    .next()
+                    .ok_or_else(|| "rename record missing source path".to_string())?,
+            )
+        } else {
+            None
+        };
+        let Some(changed_path) = parse_porcelain_v2_status_record(record, rename_source)? else {
+            continue;
+        };
+        match &changed_path {
+            GitChangedPath::Ordinary {
+                index_status,
+                worktree_status,
+                ..
+            }
+            | GitChangedPath::Renamed {
+                index_status,
+                worktree_status,
+                ..
+            }
+            | GitChangedPath::Unmerged {
+                index_status,
+                worktree_status,
+                ..
+            } => {
+                counts.changed_paths += 1;
+                if *index_status != GitFileStatus::Unmodified {
+                    counts.staged_paths += 1;
+                }
+                if *worktree_status != GitFileStatus::Unmodified {
+                    counts.unstaged_paths += 1;
+                }
+                if matches!(changed_path, GitChangedPath::Unmerged { .. }) {
+                    counts.conflicted_paths += 1;
+                }
+            }
+            GitChangedPath::Untracked { .. } => {
+                counts.changed_paths += 1;
+                counts.untracked_paths += 1;
+                counts.unstaged_paths += 1;
+            }
+        }
+        changed_paths.push(changed_path);
+    }
+    Ok(GitStatusSnapshot {
+        counts,
+        changed_paths,
+    })
+}
+
+fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapshot, String> {
+    let mut cmd = crate::git_ops::git_command();
+    cmd.current_dir(worktree_path)
+        .args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("git status failed to start: {error}"))?;
+    let stdout = crate::git_ops::read_child_stdout_bounded(
+        &mut child,
+        GIT_STATUS_MAX_OUTPUT_BYTES,
+        "git status",
+    )?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("git status failed: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git status failed: {stderr}"));
+    }
+    parse_git_status_porcelain_v2(&stdout)
 }
 
 fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
@@ -1947,6 +2131,61 @@ pub(crate) async fn get_conversation_diff(
     .map(Json)
 }
 
+pub(crate) async fn get_conversation_git_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationGitStatusResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let file_root = std::path::PathBuf::from(conv.file_root());
+    tokio::task::spawn_blocking(move || {
+        if !file_root.exists() {
+            return Err(AppError::NotFound(format!(
+                "Conversation file root no longer exists: {}",
+                file_root.display()
+            )));
+        }
+        let checkout_status = checkout_status_from_live_observation(&file_root);
+        match capture_git_status_snapshot(&file_root) {
+            Ok(snapshot) => match checkout_status {
+                CheckoutStatus::NamedBranch { .. }
+                | CheckoutStatus::Detached { .. }
+                | CheckoutStatus::Unborn { .. } => Ok(ConversationGitStatusResponse::Snapshot {
+                    checkout_status,
+                    counts: snapshot.counts,
+                    changed_paths: snapshot.changed_paths,
+                }),
+                CheckoutStatus::Unavailable { ref reason } => {
+                    Ok(ConversationGitStatusResponse::Unavailable {
+                        reason: reason.clone(),
+                        checkout_status: Some(checkout_status),
+                    })
+                }
+            },
+            Err(error) => {
+                let lower = error.to_ascii_lowercase();
+                if lower.contains("not a git repository") || lower.contains("outside repository") {
+                    Ok(ConversationGitStatusResponse::NonGit)
+                } else {
+                    tracing::warn!(%error, path = %file_root.display(), "failed to capture git status snapshot");
+                    Ok(ConversationGitStatusResponse::Unavailable {
+                        reason: "Git status is unavailable.".to_string(),
+                        checkout_status: Some(checkout_status),
+                    })
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
 /// Convert the streamed-capture metadata into the wire `Option<u32>`:
 /// `None` when the diff fit under the cap, otherwise the total stdout
 /// size in KiB. When `saturated` is true the returned value is a lower
@@ -2173,6 +2412,147 @@ mod tests {
         run_git(dest, &["clone", "--quiet", source.to_str().unwrap(), "."]).unwrap();
         run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
         run_git(dest, &["config", "user.name", "probe"]).unwrap();
+    }
+
+    #[test]
+    fn parses_porcelain_v2_records_and_counts() {
+        let output = concat!(
+            "1 MM N... 100644 100644 100644 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 src/lib.rs\0",
+            "1 D. N... 100644 000000 000000 2222222222222222222222222222222222222222 0000000000000000000000000000000000000000 deleted.txt\0",
+            "2 R. N... 100644 100644 100644 3333333333333333333333333333333333333333 3333333333333333333333333333333333333333 R100 renamed new.txt\0old name.txt\0",
+            "u UU N... 100644 100644 100644 100644 4444444444444444444444444444444444444444 5555555555555555555555555555555555555555 6666666666666666666666666666666666666666 conflicted.txt\0",
+            "? untracked/é.txt\0",
+            "! ignored.tmp\0"
+        )
+        .as_bytes();
+
+        let parsed = parse_git_status_porcelain_v2(output).unwrap();
+        assert_eq!(parsed.counts.changed_paths, 5);
+        assert_eq!(parsed.counts.staged_paths, 4);
+        assert_eq!(parsed.counts.unstaged_paths, 3);
+        assert_eq!(parsed.counts.untracked_paths, 1);
+        assert_eq!(parsed.counts.conflicted_paths, 1);
+        assert!(matches!(
+            &parsed.changed_paths[2],
+            GitChangedPath::Renamed {
+                path,
+                previous_path,
+                index_status: GitFileStatus::Renamed,
+                worktree_status: GitFileStatus::Unmodified,
+            } if path == "renamed new.txt" && previous_path == "old name.txt"
+        ));
+    }
+
+    #[test]
+    fn snapshot_excludes_ignored_and_keeps_all_untracked_files() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(
+            repo.path().join(".gitignore"),
+            "ignored-dir/\nignored.log\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", ".gitignore"]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "ignore"]).unwrap();
+        std::fs::create_dir_all(repo.path().join("untracked-dir")).unwrap();
+        std::fs::write(repo.path().join("untracked-dir/a.txt"), "a").unwrap();
+        std::fs::write(repo.path().join("untracked-dir/b.txt"), "b").unwrap();
+        std::fs::create_dir_all(repo.path().join("ignored-dir")).unwrap();
+        std::fs::write(repo.path().join("ignored-dir/c.txt"), "c").unwrap();
+        std::fs::write(repo.path().join("ignored.log"), "log").unwrap();
+
+        let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
+        assert_eq!(snapshot.counts.changed_paths, 2);
+        assert_eq!(snapshot.counts.untracked_paths, 2);
+        assert_eq!(
+            snapshot
+                .changed_paths
+                .iter()
+                .filter_map(|entry| match entry {
+                    GitChangedPath::Untracked { path } => Some(path.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["untracked-dir/a.txt", "untracked-dir/b.txt"]
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_real_repo_status_semantics() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        std::fs::write(repo.path().join("rename old é.txt"), "rename\n").unwrap();
+        std::fs::write(repo.path().join("delete.txt"), "delete\n").unwrap();
+        run_git(
+            repo.path(),
+            &["add", "tracked.txt", "rename old é.txt", "delete.txt"],
+        )
+        .unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "files"]).unwrap();
+
+        std::fs::write(repo.path().join("tracked.txt"), "worktree change\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]).unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "worktree plus index\n").unwrap();
+        std::fs::rename(
+            repo.path().join("rename old é.txt"),
+            repo.path().join("rename new é.txt"),
+        )
+        .unwrap();
+        run_git(
+            repo.path(),
+            &["add", "rename old é.txt", "rename new é.txt"],
+        )
+        .unwrap();
+        std::fs::remove_file(repo.path().join("delete.txt")).unwrap();
+        run_git(repo.path(), &["rm", "--cached", "delete.txt"]).unwrap();
+        std::fs::write(repo.path().join("delete.txt"), "back as untracked\n").unwrap();
+        std::fs::write(repo.path().join("new file.txt"), "new\n").unwrap();
+        run_git(repo.path(), &["add", "new file.txt"]).unwrap();
+        std::fs::write(repo.path().join("scratch.txt"), "scratch\n").unwrap();
+
+        let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
+        assert!(snapshot.changed_paths.iter().any(|entry| matches!(entry,
+            GitChangedPath::Ordinary {
+                path,
+                index_status: GitFileStatus::Modified,
+                worktree_status: GitFileStatus::Modified,
+            } if path == "tracked.txt"
+        )));
+        assert!(snapshot.changed_paths.iter().any(|entry| matches!(entry,
+            GitChangedPath::Renamed {
+                path,
+                previous_path,
+                index_status: GitFileStatus::Renamed,
+                worktree_status: GitFileStatus::Unmodified,
+            } if path == "rename new é.txt" && previous_path == "rename old é.txt"
+        )));
+        assert!(snapshot.changed_paths.iter().any(|entry| matches!(entry,
+            GitChangedPath::Ordinary {
+                path,
+                index_status: GitFileStatus::Deleted,
+                worktree_status: GitFileStatus::Unmodified,
+            } if path == "delete.txt"
+        )));
+        assert!(snapshot.changed_paths.iter().any(|entry| matches!(entry,
+            GitChangedPath::Ordinary {
+                path,
+                index_status: GitFileStatus::Added,
+                worktree_status: GitFileStatus::Unmodified,
+            } if path == "new file.txt"
+        )));
+        assert!(snapshot.changed_paths.iter().any(|entry| matches!(entry,
+            GitChangedPath::Untracked { path } if path == "scratch.txt"
+        )));
+    }
+
+    #[test]
+    fn capture_checkout_status_reports_non_git_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            checkout_status_from_live_observation(dir.path()),
+            CheckoutStatus::Unavailable { .. }
+        ));
     }
 
     #[test]

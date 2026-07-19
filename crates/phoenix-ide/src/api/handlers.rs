@@ -10,10 +10,9 @@ use super::chains::{
 };
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
-    get_conversation_pr_status, list_git_branches, pin_associated_pr,
+    get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
     resume_associated_pr_inference,
 };
-
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
@@ -358,6 +357,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Per-conversation worktree diff and PR state
         .route("/api/conversations/:id/diff", get(get_conversation_diff))
+        .route(
+            "/api/conversations/:id/git-status",
+            get(get_conversation_git_status),
+        )
         .route(
             "/api/conversations/:id/active-pr/diff",
             get(get_active_pr_diff),

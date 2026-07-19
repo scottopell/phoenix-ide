@@ -20,6 +20,8 @@ import {
 import { computeAncestors, isUnderRoot } from './computeAncestors';
 import { useFocusScopeCommands } from '../../hooks/useFocusScope';
 import type { FileViewerKind } from '../../generated/FileViewerKind';
+import type { ConversationGitStatusResponse, GitChangedPath, GitFileStatus } from '../../api';
+import './FileTree.css';
 
 /** Custom drag type for file-tree → composer drag-and-drop. The InputArea
  *  drop handler checks this before the OS `Files` type so the two drop
@@ -55,10 +57,55 @@ type TreeRowView = {
   disabled: boolean;
   active: boolean;
   dimmed: boolean;
+  gitStatusLabel: string | null;
+  gitStatusClass: string | null;
+  gitChangedDescendants: number;
 };
 
 function treeRowIndentPx(depth: number): number {
   return TREE_ROW_BASE_INDENT_PX + depth * TREE_ROW_DEPTH_STEP_PX;
+}
+
+type GitDecoration = { status: GitFileStatus | 'untracked' | 'unmerged'; descendants: number };
+
+function gitStatusLabel(status: GitDecoration['status'] | null): string | null {
+  switch (status) {
+    case 'modified': return 'M';
+    case 'added': return 'A';
+    case 'deleted': return 'D';
+    case 'renamed': return 'R';
+    case 'copied': return 'C';
+    case 'type_changed': return 'T';
+    case 'untracked': return 'U';
+    case 'unmerged': return '!';
+    default: return null;
+  }
+}
+
+function changedPathStatus(entry: GitChangedPath): GitDecoration['status'] {
+  if (entry.kind === 'untracked') return 'untracked';
+  if (entry.kind === 'unmerged') return 'unmerged';
+  return entry.worktree_status !== 'unmodified' ? entry.worktree_status : entry.index_status;
+}
+
+function gitDecorations(rootPath: string, status: ConversationGitStatusResponse | null | undefined): Map<string, GitDecoration> {
+  const result = new Map<string, GitDecoration>();
+  if (status?.kind !== 'snapshot') return result;
+  const root = rootPath.replace(/\/$/, '');
+  for (const entry of status.changed_paths) {
+    const path = `${root}/${entry.path}`;
+    result.set(path, { status: changedPathStatus(entry), descendants: 0 });
+    const segments = entry.path.split('/');
+    for (let index = 1; index < segments.length; index += 1) {
+      const ancestor = `${root}/${segments.slice(0, index).join('/')}`;
+      const current = result.get(ancestor);
+      result.set(ancestor, {
+        status: current?.status ?? 'modified',
+        descendants: (current?.descendants ?? 0) + 1,
+      });
+    }
+  }
+  return result;
 }
 
 function buildTreeRowView(
@@ -67,6 +114,7 @@ function buildTreeRowView(
   isExpanded: boolean,
   isLoadingChildren: boolean,
   isActive: boolean,
+  decoration?: GitDecoration,
 ): TreeRowView {
   const adornment: TreeRowAdornment = item.is_directory
     ? isLoadingChildren
@@ -85,6 +133,9 @@ function buildTreeRowView(
     disabled: !item.is_directory && item.viewer.kind === 'opaque',
     active: isActive,
     dimmed: item.is_gitignored,
+    gitStatusLabel: gitStatusLabel(decoration?.status ?? null),
+    gitStatusClass: decoration?.status ?? null,
+    gitChangedDescendants: decoration?.descendants ?? 0,
   };
 }
 
@@ -111,6 +162,8 @@ interface FileTreeProps {
   activeFile?: string | null | undefined;
   conversationId?: string | undefined;
   refreshKey?: number;
+  gitStatus?: ConversationGitStatusResponse | null | undefined;
+  onRefreshTick?: (() => void) | undefined;
 }
 
 function extensionColor(name: string): string | undefined {
@@ -231,6 +284,7 @@ interface FileTreeItemProps {
   expandedPaths: Set<string>;
   loadingPaths: Set<string>;
   activeFile: string | null | undefined;
+  decorations: Map<string, GitDecoration>;
   onItemClick: (item: FileItem) => void;
 }
 
@@ -246,9 +300,10 @@ const FileTreeItem = memo(function FileTreeItem({
   expandedPaths,
   loadingPaths,
   activeFile,
+  decorations,
   onItemClick,
 }: FileTreeItemProps) {
-  const row = buildTreeRowView(item, depth, isExpanded, isLoadingChildren, isActive);
+  const row = buildTreeRowView(item, depth, isExpanded, isLoadingChildren, isActive, decorations.get(item.path));
   const className = [
     'ft-item',
     row.disabled && 'ft-item--disabled',
@@ -292,6 +347,24 @@ const FileTreeItem = memo(function FileTreeItem({
           {renderAdornment(row.adornment, item.name)}
         </span>
         <span className={`ft-name ${item.is_directory ? 'ft-name--folder' : ''}`}>{row.label}</span>
+        {row.gitChangedDescendants > 0 && (
+          <span
+            className="ft-aggregate"
+            aria-label={`${row.gitChangedDescendants} changed descendant${row.gitChangedDescendants === 1 ? '' : 's'}`}
+            title={`${row.gitChangedDescendants} changed descendant${row.gitChangedDescendants === 1 ? '' : 's'}`}
+          >
+            {row.gitChangedDescendants}
+          </span>
+        )}
+        {row.gitStatusLabel && row.gitStatusClass && (
+          <span
+            className={`ft-git-status ft-git-status--${row.gitStatusClass.replace('_', '-')}`}
+            aria-label={`Git status ${row.gitStatusClass.replace('_', ' ')}`}
+            title={`Git status ${row.gitStatusClass.replace('_', ' ')}`}
+          >
+            {row.gitStatusLabel}
+          </span>
+        )}
       </div>
       {item.is_directory && isExpanded && (
         <div
@@ -328,6 +401,7 @@ const FileTreeItem = memo(function FileTreeItem({
                   expandedPaths={expandedPaths}
                   loadingPaths={loadingPaths}
                   activeFile={activeFile}
+                  decorations={decorations}
                   onItemClick={onItemClick}
                 />
               );
@@ -348,6 +422,7 @@ function areFileTreeItemPropsEqual(prev: FileTreeItemProps, next: FileTreeItemPr
     prev.isLoadingChildren !== next.isLoadingChildren ||
     prev.isActive !== next.isActive ||
     prev.visibleChildren !== next.visibleChildren ||
+    prev.decorations !== next.decorations ||
     prev.onItemClick !== next.onItemClick
   ) {
     return false;
@@ -382,7 +457,7 @@ function hasVisibleSubtreeStateChange(
   return false;
 }
 
-export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, refreshKey }: FileTreeProps) {
+export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, refreshKey, gitStatus, onRefreshTick }: FileTreeProps) {
   const [items, setItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -636,47 +711,6 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     return () => controller.abort();
   }, [rootPath, refreshKey]);
 
-  // Auto-refresh every ~10s while page is visible. Only `setItems` if the
-  // fingerprint changes — otherwise a tree of unchanged files would re-render
-  // the entire subtree every 10 seconds for no reason.
-  //
-  // The `cancelled` flag prevents a timer leak: without it, an async callback
-  // that is mid-execution when the cleanup runs would call `scheduleRefresh()`
-  // and create a new timer that the cleanup can't cancel — an infinite chain
-  // of leaked timers that survive unmount and eventually exhaust the heap.
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    let requestController: AbortController | undefined;
-    function scheduleRefresh() {
-      const jitter = Math.random() * 4000 - 2000; // +/- 2s
-      timer = setTimeout(async () => {
-        if (cancelled) return;
-        if (document.visibilityState === 'visible') {
-          try {
-            requestController = new AbortController();
-            const result = await listFiles(rootPath, requestController.signal);
-            if (cancelled) return;
-            setItems(prev => {
-              if (fingerprintFiles(prev) === fingerprintFiles(result)) {
-                return prev; // unchanged — skip re-render
-              }
-              return result;
-            });
-          } catch { /* silent -- next tick will retry */ }
-        }
-        if (cancelled) return;
-        scheduleRefresh();
-      }, 10000 + jitter);
-    }
-    scheduleRefresh();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-      requestController?.abort();
-    };
-  }, [rootPath]);
-
   // Load children for an expanded folder. One request owns each path; replacing
   // it aborts the older request so a rapid refresh cannot restore stale data.
   const loadChildren = useCallback(async (path: string) => {
@@ -703,15 +737,52 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     }
   }, []);
 
-  // An explicit refresh reloads every expanded directory that is currently
-  // visible. Descendants of collapsed directories remain cached and untouched.
+  // The panel owns the timer cadence; the tree exposes one stable refresh entry
+  // point that reloads the root and any visible expanded descendants.
+  const refreshVisibleTree = useCallback(async () => {
+    if (document.visibilityState !== 'visible') return;
+    try {
+      const result = await listFiles(rootPath);
+      setItems(prev => {
+        if (fingerprintFiles(prev) === fingerprintFiles(result)) {
+          return prev;
+        }
+        return result;
+      });
+      for (const path of visibleExpandedDirectories(items, childItems, expandedPaths)) {
+        void loadChildren(path);
+      }
+    } catch {
+      // silent — next scheduled refresh or manual retry will try again
+    }
+  }, [rootPath, items, childItems, expandedPaths, loadChildren]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    function scheduleRefresh() {
+      const jitter = Math.random() * 4000 - 2000;
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        await refreshVisibleTree();
+        if (!cancelled) onRefreshTick?.();
+        if (!cancelled) scheduleRefresh();
+      }, 10000 + jitter);
+    }
+    scheduleRefresh();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [refreshVisibleTree, onRefreshTick]);
+
+  // An explicit refresh now routes through the shared panel owner. The tree
+  // still tracks refreshKey so legacy callers continue to trigger a refresh.
   useEffect(() => {
     if (previousRefreshKeyRef.current === refreshKey) return;
     previousRefreshKeyRef.current = refreshKey;
-    for (const path of visibleExpandedDirectories(items, childItems, expandedPaths)) {
-      void loadChildren(path);
-    }
-  }, [refreshKey, items, childItems, expandedPaths, loadChildren]);
+    void refreshVisibleTree();
+  }, [refreshKey, refreshVisibleTree]);
 
   // Auto-load children for restored expanded paths. The request registry
   // deduplicates in-flight loads without making request completion an effect
@@ -770,6 +841,8 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const dirLabel = useMemo(() => computeDirLabel(rootPath), [rootPath]);
 
 
+  const decorations = useMemo(() => gitDecorations(rootPath, gitStatus), [rootPath, gitStatus]);
+
   if (loading) {
     return (
       <div className="ft-status">
@@ -826,6 +899,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
             expandedPaths={expandedPaths}
             loadingPaths={loadingPaths}
             activeFile={activeFile}
+            decorations={decorations}
             onItemClick={handleItemClick}
           />
         );
