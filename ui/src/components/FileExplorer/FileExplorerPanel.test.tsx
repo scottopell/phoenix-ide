@@ -117,11 +117,14 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     });
     renderPanel();
 
-    expect(await screen.findByText('On branch feature')).toBeInTheDocument();
-    expect(screen.getByText('Changes not staged for commit')).toBeInTheDocument();
+    expect(await screen.findByText('Changes not staged for commit')).toBeInTheDocument();
+    expect(screen.queryByText('On branch feature')).not.toBeInTheDocument();
     expect(screen.getByText('Untracked files')).toBeInTheDocument();
     expect(screen.queryByText('Changes to be committed')).not.toBeInTheDocument();
     expect(screen.queryByText('Unmerged paths')).not.toBeInTheDocument();
+    const gitHeader = screen.getByText('Git').closest('button');
+    expect(gitHeader).not.toHaveTextContent('changed');
+    expect(screen.getByRole('button', { name: 'Open Git diff' })).toBeInTheDocument();
   });
 
   it('renders the standard clean working tree message', async () => {

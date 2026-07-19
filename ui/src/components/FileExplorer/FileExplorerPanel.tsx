@@ -73,18 +73,10 @@ function describeGitSummary(status: ConversationGitStatusResponse | null | undef
 }
 
 function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusResponse, { kind: 'snapshot' }> }) {
-  const checkout = status.checkout_status.kind === 'named_branch'
-    ? `On branch ${status.checkout_status.branch_name}`
-    : status.checkout_status.kind === 'detached'
-      ? 'HEAD detached'
-      : status.checkout_status.kind === 'unborn'
-        ? `On branch ${status.checkout_status.branch_name}`
-        : 'Checkout unavailable';
   const { counts } = status;
 
   return (
     <div className="git-status-details" aria-label="Git grounding details">
-      <div className="git-status-checkout">{checkout}</div>
       {counts.changed_paths === 0 ? (
         <div className="git-status-clean">nothing to commit, working tree clean</div>
       ) : (
@@ -271,7 +263,6 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             <GroundingSection
               icon="Δ"
               title="Git"
-              summary={gitSummary.summary}
               {...(gitSummary.count !== undefined ? { count: gitSummary.count } : {})}
               attention={gitSummary.attention}
               expanded={gitExpanded}

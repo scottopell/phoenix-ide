@@ -21,22 +21,14 @@
   font-size: 11px;
 }
 
-.git-status-checkout {
-  overflow: hidden;
-  color: var(--text-primary);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .git-status-clean {
-  margin-top: 7px;
   color: var(--accent-green);
 }
 
 .git-status-groups {
   display: grid;
   gap: 5px;
-  margin-top: 8px;
+  margin-top: 0;
 }
 
 .git-status-group {
