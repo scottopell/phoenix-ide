@@ -2556,6 +2556,19 @@ it('replaces bash progress at the same sequence when output advances', () => {
   expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('second');
 });
 
+it('rejects delayed bash progress below the applied sequence floor', () => {
+  const atom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
+  const next = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 4, toolUseId: 'completed-tool',
+    progress: {
+      handle: 'b-1', start_offset: 0, end_offset: 1, truncated_before: false,
+      lines: [{ offset: 0, text: 'stale' }], partial: null,
+    },
+  });
+  expect(next).toBe(atom);
+  expect(next.liveBashProgress).toEqual({});
+});
+
 it('applies replaceable bash progress without advancing the replay sequence floor', () => {
   const progress = {
     handle: 'b-1',

@@ -810,6 +810,7 @@ function applyContiguousWireAction(
   const sequenceId = action.sequenceId;
   if (sequenceId === undefined) return applyWireActionBody(atom, action as SSEAction);
   if (action.type === 'sse_bash_tool_progress') {
+    if (sequenceId < atom.lastAppliedEventSeq) return atom;
     return applyWireActionBody(atom, action as SSEAction);
   }
   const mutatesOnlyIfConversationPresent = action.type === 'sse_browser_session_state';
