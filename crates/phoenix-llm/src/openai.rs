@@ -6,6 +6,7 @@ use super::rate_limit::{
     parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
     QuotaDetails,
 };
+use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
 use super::LlmError;
 use chrono::{DateTime, Utc};
@@ -215,10 +216,11 @@ struct ResponsesStreamAccumulator {
     /// otherwise opaque — capturing one example per stream is enough to
     /// classify the wire shape next time the success path stops working.
     logged_empty_dispatch: bool,
+    telemetry: StreamTelemetryRecorder,
 }
 
 impl ResponsesStreamAccumulator {
-    fn new() -> Self {
+    fn new(dispatch_at: Instant) -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
@@ -227,6 +229,7 @@ impl ResponsesStreamAccumulator {
             output_items: Vec::new(),
             done: false,
             logged_empty_dispatch: false,
+            telemetry: StreamTelemetryRecorder::new(dispatch_at),
         }
     }
 
@@ -237,6 +240,8 @@ impl ResponsesStreamAccumulator {
         data: &str,
         emit: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     ) -> Result<(), LlmError> {
+        let now = Instant::now();
+        self.telemetry.record_provider_event_at(now);
         // Sentinel — not valid JSON, nothing to do.
         if data == "[DONE]" {
             return Ok(());
@@ -255,9 +260,16 @@ impl ResponsesStreamAccumulator {
             "response.output_text.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
                     if !delta.is_empty() {
+                        self.telemetry
+                            .record_generation_event_at(now, GenerationKind::Text);
+                        self.telemetry.record_visible_text_at(now);
                         let _ = emit.send(super::TokenChunk::Text(delta.to_string())).await;
                     }
                 }
+            }
+            "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Reasoning);
             }
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
@@ -267,6 +279,18 @@ impl ResponsesStreamAccumulator {
                                 output_type = %output.r#type,
                                 "responses_api output item collected"
                             );
+                            match output.r#type.as_str() {
+                                "function_call" => self
+                                    .telemetry
+                                    .record_generation_event_at(now, GenerationKind::Tool),
+                                "reasoning" => self
+                                    .telemetry
+                                    .record_generation_event_at(now, GenerationKind::Reasoning),
+                                "message" => self
+                                    .telemetry
+                                    .record_generation_event_at(now, GenerationKind::Structured),
+                                _ => {}
+                            }
                             self.output_items.push(output);
                         }
                         Err(e) => {
@@ -450,7 +474,8 @@ impl ResponsesStreamAccumulator {
             output_tokens = self.output_tokens,
             "responses_api stream accumulator finalizing"
         );
-        normalize_responses_api_response(ResponsesApiResponse {
+        let telemetry = self.telemetry;
+        let mut response = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: self.output_items,
             usage: ResponsesApiUsage {
@@ -461,7 +486,9 @@ impl ResponsesStreamAccumulator {
                     cache_write_tokens: self.cache_write_tokens,
                 },
             },
-        })
+        })?;
+        telemetry.attach_success(&mut response);
+        Ok(response)
     }
 }
 
@@ -945,7 +972,7 @@ async fn complete_codex_websocket(
         .await
         .map_err(|_| CodexWsError::fallback(LlmError::network("WebSocket send timeout")))?
         .map_err(|e| CodexWsError::fallback(LlmError::network(format!("WebSocket send: {e}"))))?;
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let mut response_id = None;
         let mut server_output = Vec::new();
         loop {
@@ -1234,7 +1261,7 @@ pub async fn complete_streaming(
         }
     }
 
-    let mut acc = ResponsesStreamAccumulator::new();
+    let mut acc = ResponsesStreamAccumulator::new(Instant::now());
     let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
@@ -1654,24 +1681,20 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         )));
     }
 
-    Ok(LlmResponse {
-        content,
-        end_turn,
-        usage: {
-            // Both detail buckets are subsets of OpenAI's inclusive
-            // `input_tokens`. Split them out so Phoenix's additive Usage shape
-            // preserves the provider-reported context total.
-            let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
-            let written = u64::from(resp.usage.input_tokens_details.cache_write_tokens);
-            Usage {
-                input_tokens: u64::from(resp.usage.input_tokens)
-                    .saturating_sub(cached.saturating_add(written)),
-                output_tokens: u64::from(resp.usage.output_tokens),
-                cache_creation_tokens: written,
-                cache_read_tokens: cached,
-            }
-        },
-    })
+    Ok(LlmResponse::non_streaming(content, end_turn, {
+        // Both detail buckets are subsets of OpenAI's inclusive
+        // `input_tokens`. Split them out so Phoenix's additive Usage shape
+        // preserves the provider-reported context total.
+        let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
+        let written = u64::from(resp.usage.input_tokens_details.cache_write_tokens);
+        Usage {
+            input_tokens: u64::from(resp.usage.input_tokens)
+                .saturating_sub(cached.saturating_add(written)),
+            output_tokens: u64::from(resp.usage.output_tokens),
+            cache_creation_tokens: written,
+            cache_read_tokens: cached,
+        }
+    }))
 }
 
 // ===========================================================================
@@ -2311,7 +2334,9 @@ mod tests {
         state.http_requests.fetch_add(1, Ordering::SeqCst);
         (
             [("content-type", "text/event-stream")],
-            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"http-1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"http-answer\"}]}]}}\n\n",
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"http-answer\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"http-1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"http-answer\"}]}]}}\n\n",
         )
     }
 
@@ -2410,6 +2435,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_reuses_connection_continues_resets_and_falls_back_safely() {
+        // also covers HTTP fallback path: the mock HTTP SSE stream emits control + text + terminal.
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -2499,7 +2525,6 @@ mod tests {
             let pool = sessions.lock().await;
             pool.cooldown.lock().unwrap().reset();
         }
-        sessions.lock().await.by_cache_key.clear();
         // Reconnect after failure, but a terminal model error is returned as-is
         // rather than changing semantics by replaying it over HTTP.
         let err = call(request_with(&[("terminal", MessageRole::User)]))
@@ -2676,6 +2701,8 @@ mod tests {
     #[tokio::test]
     async fn websocket_preserves_beta_headers_forwards_quota_and_does_not_fallback_backend_errors()
     {
+        // quota/control frames must not become first-generation events.
+        // also exercise the plain HTTP/SSE path, which has no WebSocket-specific rate-limit frame.
         let (url, state) = mock_server().await;
         let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -2704,6 +2731,39 @@ mod tests {
             })
             .expect("rate-limit snapshot");
         assert!((snapshot.primary.unwrap().used_percent - 42.0).abs() < f64::EPSILON);
+        let text_response = complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers,
+            &BTreeMap::new(),
+            &request_with(&[("healthy", MessageRole::User)]),
+            &tx,
+            true,
+            Some(&sessions),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text_response.stream_telemetry.generation_event_count, 0);
+        assert_eq!(text_response.stream_telemetry.visible_text_event_count, 0);
+
+        let http_only = complete_streaming(
+            &codex_spec(),
+            "secret",
+            Some(&url),
+            &headers,
+            &BTreeMap::new(),
+            &request_with(&[("plain-http", MessageRole::User)]),
+            &tx,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(http_only.text(), "http-answer");
+        assert_eq!(http_only.stream_telemetry.provider_event_count, 3);
+        assert_eq!(http_only.stream_telemetry.generation_event_count, 1);
+        assert_eq!(http_only.stream_telemetry.visible_text_event_count, 1);
         let received = state.ws_headers.lock().await;
         assert_eq!(
             received[0]["openai-beta"],
@@ -2727,7 +2787,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind, crate::LlmErrorKind::RateLimit);
-        assert_eq!(state.http_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3354,7 +3414,7 @@ mod tests {
     async fn process_event_returns_err_on_top_level_error() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
         let err = acc.process_event("error", data, &tx).await.unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
@@ -3365,7 +3425,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let err = acc.process_event("", "{ not json", &tx).await.unwrap_err();
         assert!(
             err.message.contains("Failed to parse SSE data"),
@@ -3377,7 +3437,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_done_sentinel_is_ignored() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         // The `[DONE]` sentinel is not JSON; it must be a no-op, not a parse error.
         acc.process_event("", "[DONE]", &tx).await.unwrap();
         assert!(
@@ -3389,7 +3449,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_unknown_dispatch_type_is_ignored() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         acc.process_event("", r#"{"type":"response.in_progress"}"#, &tx)
             .await
             .unwrap();
@@ -3398,7 +3458,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_empty_dispatch_type_is_ignored_and_logged_once() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         // An event whose embedded `type` is empty has nothing to dispatch on; it
         // must be tolerated (logged exactly once), never erroring the stream.
         assert!(!acc.logged_empty_dispatch);
@@ -3413,7 +3473,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_assembles_message_text_from_output_item_done() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         // The primary (non-fallback) assembly path: a completed message item.
         let data = r#"{
             "type":"response.output_item.done",
@@ -3440,7 +3500,7 @@ mod tests {
     async fn process_event_handles_codex_nested_error_shape() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         // Real codex/ChatGPT-backend payload captured 2026-05-11 via WARN log.
         let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
         let err = acc.process_event("error", data, &tx).await.unwrap_err();
@@ -3454,7 +3514,7 @@ mod tests {
     async fn process_event_returns_err_on_response_failed() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let data = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream"}}}"#;
         let err = acc
             .process_event("response.failed", data, &tx)
@@ -3467,7 +3527,7 @@ mod tests {
     async fn process_event_returns_err_on_response_incomplete_max_tokens() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
         let err = acc
             .process_event("response.incomplete", data, &tx)
@@ -3485,7 +3545,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_recovers_output_from_response_completed_when_no_item_done() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -3515,7 +3575,7 @@ mod tests {
     #[tokio::test]
     async fn responses_api_cache_details_are_threaded_without_double_counting() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -3770,7 +3830,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_fallback_skips_when_output_items_already_captured() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new();
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
         let item_done = r#"{
             "type":"response.output_item.done",
             "item":{"type":"message","role":"assistant","content":[

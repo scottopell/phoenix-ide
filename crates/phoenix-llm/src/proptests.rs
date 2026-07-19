@@ -606,16 +606,16 @@ proptest! {
     fn prop_tool_uses_only_returns_tool_use(
         blocks in proptest::collection::vec(arb_content_block(), 0..20)
     ) {
-        let response = super::types::LlmResponse {
-            content: blocks,
-            end_turn: false,
-            usage: super::types::Usage {
+        let response = super::types::LlmResponse::non_streaming(
+            blocks,
+            false,
+            super::types::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
-        };
+        );
         for (id, _name, _input) in response.tool_uses() {
             prop_assert!(
                 !id.starts_with("srvtoolu_"),

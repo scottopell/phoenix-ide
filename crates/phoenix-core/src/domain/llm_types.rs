@@ -64,6 +64,53 @@ pub struct LlmRequestTelemetry {
     pub retry_attempt: u32,
 }
 
+/// Content-free summary of a provider streaming attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTelemetryOutputKind {
+    None,
+    Text,
+    Reasoning,
+    Tool,
+    Structured,
+    Mixed,
+}
+
+/// Final, content-free snapshot of provider stream timing and shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStreamTelemetry {
+    pub dispatch_to_first_provider_event_ms: Option<u64>,
+    pub dispatch_to_first_generation_event_ms: Option<u64>,
+    pub dispatch_to_first_visible_text_ms: Option<u64>,
+    pub provider_event_count: u32,
+    pub generation_event_count: u32,
+    pub visible_text_event_count: u32,
+    pub max_provider_gap_ms: Option<u64>,
+    pub max_generation_gap_ms: Option<u64>,
+    pub output_kind: StreamTelemetryOutputKind,
+    pub completed: bool,
+    pub failure_kind: Option<String>,
+}
+
+impl ProviderStreamTelemetry {
+    #[must_use]
+    pub const fn non_streaming() -> Self {
+        Self {
+            dispatch_to_first_provider_event_ms: None,
+            dispatch_to_first_generation_event_ms: None,
+            dispatch_to_first_visible_text_ms: None,
+            provider_event_count: 0,
+            generation_event_count: 0,
+            visible_text_event_count: 0,
+            max_provider_gap_ms: None,
+            max_generation_gap_ms: None,
+            output_kind: StreamTelemetryOutputKind::None,
+            completed: false,
+            failure_kind: None,
+        }
+    }
+}
+
 /// LLM request
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
@@ -337,9 +384,26 @@ pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
     pub end_turn: bool,
     pub usage: Usage,
+    pub stream_telemetry: ProviderStreamTelemetry,
 }
 
 impl LlmResponse {
+    #[must_use]
+    pub fn non_streaming(content: Vec<ContentBlock>, end_turn: bool, usage: Usage) -> Self {
+        Self {
+            content,
+            end_turn,
+            usage,
+            stream_telemetry: ProviderStreamTelemetry::non_streaming(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_stream_telemetry(mut self, stream_telemetry: ProviderStreamTelemetry) -> Self {
+        self.stream_telemetry = stream_telemetry;
+        self
+    }
+
     /// Extract all tool use requests from the response
     #[must_use]
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
