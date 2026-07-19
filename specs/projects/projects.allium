@@ -17,13 +17,6 @@
 --   - .gitignore management (handled by git_ops module)
 --   - Diff snapshot capture (implementation detail of abandon)
 --
--- Implementation notes (not normative):
---   Git operations consolidated in src/git_ops.rs (materialize_branch,
---   create_worktree, check_branch_conflict). API handlers split across
---   src/api/handlers.rs, src/api/git_handlers.rs, src/api/lifecycle_handlers.rs.
---   State machine uses CoreState/ParentState/SubAgentState wrapper pattern
---   (see bedrock.allium task 02668 for spec alignment).
---
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
 -- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037 (task forks +
 -- Request Changes promotion)
@@ -132,7 +125,7 @@ entity Project {
 -- Phoenix allocates no ID; it parses id/priority/status/slug back out of the
 -- filename.
 --
--- task 13009: `propose_task` may also point at a *plain-markdown* file (any
+-- `propose_task` may also point at a *plain-markdown* file (any
 -- other `.md` file inside the worktree — e.g. `docs/plan.md`, `README.md`).
 -- A plain brief carries no structured metadata: the display title is the
 -- body's `# H1` (falling back to the file stem), priority defaults to `p2`,
@@ -581,7 +574,7 @@ rule MaterializeBranch {
 -- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
 --
 -- This rule models the taskmd-filename case (the default). For a
--- plain-markdown brief (task 13009) the shape is the same except: the branch
+-- plain-markdown brief the shape is the same except: the branch
 -- is `task-{sanitized-stem}-{conversation-id-prefix}` (the conv-id prefix is
 -- the uniquifier — the approval mutex serializes but does not uniquify),
 -- there is no `...-ready--` -> `...-in-progress--` rename, the file is
@@ -1446,9 +1439,9 @@ rule ExploreSubAgentDirectory {
 -- status to idle) with project-level cleanup: detect orphaned worktrees
 -- and mark affected conversations as Terminal.
 --
--- REQ-PROJ-015 descoped the dedicated registry, but acknowledged that
--- startup reconciliation handles orphan detection via ConvMode::Work
--- queries. This rule models that existing behaviour.
+-- REQ-PROJ-015 descoped the dedicated registry; startup reconciliation
+-- instead reasons from persisted conversation ownership and on-disk
+-- worktree state. This rule models that behavior.
 --
 -- Orphan detection: worktree is orphaned if worktree_path is empty,
 -- base_branch is empty, or the path does not exist on disk.

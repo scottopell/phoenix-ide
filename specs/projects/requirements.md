@@ -114,7 +114,7 @@ The recommended form is the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, s
 one of `ready` / `in-progress` / `brainstorming`) — taskmd-named files additionally
 yield id/priority/status/slug and a `ready` → `in-progress` rename on approval
 (REQ-PROJ-006) and **must live under the project's tasks directory**. Any other `.md`
-file is also accepted as a plain task brief (task 13009) — no structured metadata, no
+file is also accepted as a plain task brief — no structured metadata, no
 status rename — and may live anywhere in the worktree
 
 WHEN agent calls the `propose_task` tool with a `task_file` path to a markdown file
@@ -311,10 +311,10 @@ the branch self-contained — no commits to main (which may be protected), no tw
 commit logic. taskmd 1.0's filename-is-truth model means there's nothing for Phoenix to
 keep in sync — no authoritative frontmatter, no ID allocation step on the Phoenix side;
 the agent owns the filename (including the `done` rename) the same way it owns the code.
-taskmd is the default but not a hard dependency (task 13009): pointing `propose_task` at
-a plain `.md` file works too — the `TaskSource` seam (`crate::task_source`) picks taskmd
-when the filename parses, plain-markdown otherwise. A future explicit "task source"
-backend (beads, etc.) would slot in behind the same seam; that is out of scope for v1.
+taskmd is the default but not a hard dependency: pointing `propose_task` at a plain
+`.md` file works too — the `TaskSource` seam (`crate::task_source`) picks taskmd when
+the filename parses, plain-markdown otherwise. A future explicit "task source" backend
+would slot in behind the same seam; that is outside this spec's current behavior.
 
 ---
 
@@ -389,7 +389,7 @@ WHICH accepts: `task_file` (required string) — a path, relative to the agent's
   filename (`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` /
   `brainstorming`, **required to be under the project's tasks directory**) additionally
   derives id/priority/status/slug from the name; any other `.md` file is accepted as a
-  plain task brief (REQ-PROJ-006, task 13009) and may live anywhere in the worktree
+  plain task brief (REQ-PROJ-006) and may live anywhere in the worktree
 
 WHEN agent is in a writing mode (Work, Branch, or Direct-in-a-git-repo)
 THE SYSTEM SHALL **also** provide `propose_task` (same `task_file` input), there serving

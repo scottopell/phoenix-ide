@@ -69,24 +69,24 @@ network access.
 
 | Requirement | Status | Notes |
 |-------------|--------|-----------|
-| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Git-backed directories resolve to a project at the repository root and start in Explore only when the user explicitly chooses Managed mode |
 | **REQ-PROJ-001A:** Suggest Known Projects for New Conversations | ✅ Complete | `/new` consumes `/api/projects`, ranks by active conversation count then project recency, and offers canonical paths as quick selections |
-| **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
-| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_task tool; task 13009 — `task_file` may be any `.md` file, taskmd naming is one accepted form (`crate::task_source::TaskSource`) |
+| **REQ-PROJ-002:** Default Conversation Mode Selection | ✅ Complete | Direct is the default for every new conversation; Managed is opt-in for git repositories and Branch requires an explicit existing branch |
+| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | `propose_task` is intercepted, not executed as a side-effecting tool; the proposed file may be taskmd-named or any other markdown brief inside the worktree |
 | **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch to the chosen execution branch, promote+commit the agent's task file on it |
-| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
+| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Worktree paths are derived from the conversation id under `.phoenix/worktrees/`, making collisions structural rather than lock-coordinated |
 | **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the execution branch, not main (work-lifecycle REQ-WL-002). A plain `.md` file (no taskmd metadata, no on-approve status rename, desired branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
-| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
+| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Work mode enables writes only inside the conversation worktree; writes outside it are rejected descriptively |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Mode parameter, model override, max_turns, one-writer constraint, MCP access, cwd-scoping guard all implemented; spec normative in `specs/subagents/subagents.allium`. Explore-search-restricted MCP subset stays deferred (see subagents executive.md). |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | Moved | Relocated to work-lifecycle REQ-WL-001 |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | Relocated to work-lifecycle REQ-WL-003 |
-| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
+| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore, Work, Branch, and Direct-in-a-git-repo expose `propose_task` per the requirements, but only the Explore parking gateway is implemented; the writing-mode fork flow remains spec-only |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` plus network-block enforcement probing to decide whether top-level Explore can expose sandboxed bash |
-| **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
+| **REQ-PROJ-014:** Project UI | ✅ Complete | The UI exposes project grouping, mode badges, and task/worktree context without collapsing Direct, Managed, and Branch into one undifferentiated state |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | `ConvMode` paths form the de facto registry; `conversation_owns_work_scope`, lifecycle cleanup, deployment disk accounting, and startup reconciliation share persisted owner semantics. Clean unowned scopes are reclaimed; dirty/unreadable scopes are retained. |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |
-| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Task 08603 (M3). ConvMode::Work stores base_branch |
+| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Work and Branch modes persist `base_branch`; Work additionally persists `task_id` and `task_title`, while Explore and Direct keep their narrower shapes |
 | **REQ-PROJ-018:** Direct Mode | ✅ Complete | Default for all conversations |
 | **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete | Mode/project filters, auto-archive |
 | **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker with search, staleness counts, recency sort |
@@ -109,11 +109,7 @@ network access.
 | **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
 | **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Diff endpoints observe live named/detached/unborn/unavailable checkout state; named branches show last-fetched upstream/matching-remote ahead and behind counts, and the shared diff viewer presents this context independently of its comparator |
 
-**Progress:** of 35 active requirements, 29 complete, 1 partial (REQ-PROJ-012 — its
-Explore gateway ships but the writing-mode fork path is spec-only), and 5 (REQ-PROJ-033..037,
-task forks + fork-proposal Request Changes) specified but not yet implemented.
-REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
-REQ-PROJ-018.
+Of 35 active requirements, 29 are complete, REQ-PROJ-012 is partially implemented because the Explore parking gateway ships while the writing-mode fork flow does not, and REQ-PROJ-033 through REQ-PROJ-037 remain specified but unimplemented. REQ-PROJ-009 and REQ-PROJ-023 are removed, REQ-PROJ-015 is descoped, and REQ-PROJ-016 is superseded by REQ-PROJ-018.
 
 ## Dependencies
 
