@@ -23,7 +23,7 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
 
 /// Estimated USD cost for a token aggregate. `estimated_usd` includes only rows
@@ -306,6 +306,69 @@ pub struct HistogramBucket {
     pub count: f64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, TS, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum TtftAttemptScope {
+    FirstAttempt,
+    Retry,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct TtftPercentiles {
+    pub p50_ms: Option<f64>,
+    pub p75_ms: Option<f64>,
+    pub p90_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct TtftThresholdStat {
+    pub threshold_ms: f64,
+    pub exceeded_count: f64,
+    pub exceeded_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct TtftSummaryRow {
+    pub attempt_scope: TtftAttemptScope,
+    pub provider: String,
+    pub model: Option<String>,
+    pub transport: Option<String>,
+    pub sample_count: f64,
+    pub no_token_success_count: f64,
+    pub error_count: f64,
+    pub percentiles: TtftPercentiles,
+    pub thresholds: Vec<TtftThresholdStat>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct DailyTtftTrendRow {
+    pub day: String,
+    pub attempt_scope: TtftAttemptScope,
+    pub sample_count: f64,
+    pub no_token_success_count: f64,
+    pub error_count: f64,
+    pub percentiles: TtftPercentiles,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct TtftWindowSummary {
+    pub window_days: f64,
+    pub sample_count: f64,
+    pub no_token_success_count: f64,
+    pub error_count: f64,
+    pub provider_rows: Vec<TtftSummaryRow>,
+    pub grouped_rows: Vec<TtftSummaryRow>,
+    pub daily_trend: Vec<DailyTtftTrendRow>,
+}
+
 /// The full `/api/usage` payload.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -318,6 +381,7 @@ pub struct UsageOverview {
     pub by_project: Vec<ProjectUsage>,
     pub conversations: Vec<ConversationUsageRow>,
     pub turn_token_histogram: Vec<HistogramBucket>,
+    pub ttft: TtftWindowSummary,
 }
 
 /// One turn in the per-conversation drill-down.
@@ -383,6 +447,199 @@ fn build_histogram(per_turn_totals: &[i64]) -> Vec<HistogramBucket> {
     buckets
 }
 
+const TTFT_WINDOW_DAYS: i64 = 14;
+const TTFT_ROW_LIMIT: i64 = 20_000;
+const TTFT_THRESHOLDS_MS: &[u64] = &[2_000, 5_000, 10_000, 30_000];
+
+#[derive(Debug, Clone, Default)]
+struct TtftAccumulator {
+    sample_ms: Vec<u64>,
+    no_token_success_count: u64,
+    error_count: u64,
+}
+
+impl TtftAccumulator {
+    fn observe(&mut self, outcome: &phoenix_core::domain::llm_types::LlmAttemptOutcome, ttft_ms: Option<u64>) {
+        match (outcome, ttft_ms) {
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, Some(ms)) => self.sample_ms.push(ms),
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => self.no_token_success_count += 1,
+            (_, _) => self.error_count += 1,
+        }
+    }
+
+    fn to_summary_row(
+        mut self,
+        attempt_scope: TtftAttemptScope,
+        provider: String,
+        model: Option<String>,
+        transport: Option<String>,
+    ) -> TtftSummaryRow {
+        self.sample_ms.sort_unstable();
+        TtftSummaryRow {
+            attempt_scope,
+            provider,
+            model,
+            transport,
+            sample_count: self.sample_ms.len() as f64,
+            no_token_success_count: self.no_token_success_count as f64,
+            error_count: self.error_count as f64,
+            percentiles: ttft_percentiles(&self.sample_ms),
+            thresholds: ttft_thresholds(&self.sample_ms),
+        }
+    }
+
+    fn to_daily_row(mut self, day: String, attempt_scope: TtftAttemptScope) -> DailyTtftTrendRow {
+        self.sample_ms.sort_unstable();
+        DailyTtftTrendRow {
+            day,
+            attempt_scope,
+            sample_count: self.sample_ms.len() as f64,
+            no_token_success_count: self.no_token_success_count as f64,
+            error_count: self.error_count as f64,
+            percentiles: ttft_percentiles(&self.sample_ms),
+        }
+    }
+}
+
+fn ttft_percentile(sorted: &[u64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+    Some(sorted[idx] as f64)
+}
+
+fn ttft_percentiles(sorted: &[u64]) -> TtftPercentiles {
+    TtftPercentiles {
+        p50_ms: ttft_percentile(sorted, 0.50),
+        p75_ms: ttft_percentile(sorted, 0.75),
+        p90_ms: ttft_percentile(sorted, 0.90),
+        p95_ms: ttft_percentile(sorted, 0.95),
+        p99_ms: ttft_percentile(sorted, 0.99),
+    }
+}
+
+fn ttft_thresholds(sorted: &[u64]) -> Vec<TtftThresholdStat> {
+    let denom = sorted.len() as f64;
+    TTFT_THRESHOLDS_MS
+        .iter()
+        .map(|&threshold| {
+            let exceeded = sorted.iter().filter(|&&ms| ms > threshold).count() as f64;
+            TtftThresholdStat {
+                threshold_ms: threshold as f64,
+                exceeded_count: exceeded,
+                exceeded_rate: (denom > 0.0).then_some(exceeded / denom),
+            }
+        })
+        .collect()
+}
+
+fn attempt_scope(retry_attempt: u32) -> TtftAttemptScope {
+    if retry_attempt <= 1 {
+        TtftAttemptScope::FirstAttempt
+    } else {
+        TtftAttemptScope::Retry
+    }
+}
+
+fn empty_ttft_summary() -> TtftWindowSummary {
+    TtftWindowSummary {
+        window_days: TTFT_WINDOW_DAYS as f64,
+        sample_count: 0.0,
+        no_token_success_count: 0.0,
+        error_count: 0.0,
+        provider_rows: Vec::new(),
+        grouped_rows: Vec::new(),
+        daily_trend: Vec::new(),
+    }
+}
+
+fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWindowSummary {
+    if rows.is_empty() {
+        return empty_ttft_summary();
+    }
+
+    let mut provider_map: BTreeMap<(TtftAttemptScope, String), TtftAccumulator> = BTreeMap::new();
+    let mut grouped_map: BTreeMap<(TtftAttemptScope, String, String, String), TtftAccumulator> =
+        BTreeMap::new();
+    let mut daily_map: BTreeMap<(String, TtftAttemptScope), TtftAccumulator> = BTreeMap::new();
+    let mut totals = TtftAccumulator {
+        sample_ms: Vec::new(),
+        no_token_success_count: 0,
+        error_count: 0,
+    };
+    let mut seen_days = BTreeSet::new();
+
+    for row in rows {
+        let scope = attempt_scope(row.retry_attempt);
+        let ttft_ms = row.dispatch_to_first_generation_event_ms;
+        let outcome = row.outcome;
+        let provider = row.provider;
+        let model = row.model;
+        let transport = row.transport.as_str().to_string();
+        let day = row.created_at.chars().take(10).collect::<String>();
+        seen_days.insert(day.clone());
+
+        totals.observe(&outcome, ttft_ms);
+        provider_map
+            .entry((scope, provider.clone()))
+            .or_default()
+            .observe(&outcome, ttft_ms);
+        grouped_map
+            .entry((scope, provider.clone(), model.clone(), transport.clone()))
+            .or_default()
+            .observe(&outcome, ttft_ms);
+        daily_map
+            .entry((day, scope))
+            .or_default()
+            .observe(&outcome, ttft_ms);
+    }
+
+    let mut provider_rows: Vec<_> = provider_map
+        .into_iter()
+        .map(|((scope, provider), acc)| acc.to_summary_row(scope, provider, None, None))
+        .collect();
+    provider_rows.sort_by(|a, b| {
+        b.sample_count
+            .total_cmp(&a.sample_count)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.attempt_scope.cmp(&b.attempt_scope))
+    });
+
+    let mut grouped_rows: Vec<_> = grouped_map
+        .into_iter()
+        .map(|((scope, provider, model, transport), acc)| {
+            acc.to_summary_row(scope, provider, Some(model), Some(transport))
+        })
+        .collect();
+    grouped_rows.sort_by(|a, b| {
+        b.sample_count
+            .total_cmp(&a.sample_count)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.transport.cmp(&b.transport))
+            .then_with(|| a.attempt_scope.cmp(&b.attempt_scope))
+    });
+
+    let mut daily_trend: Vec<_> = Vec::new();
+    for day in seen_days {
+        for scope in [TtftAttemptScope::FirstAttempt, TtftAttemptScope::Retry] {
+            let acc = daily_map.remove(&(day.clone(), scope)).unwrap_or_default();
+            daily_trend.push(acc.to_daily_row(day.clone(), scope));
+        }
+    }
+
+    TtftWindowSummary {
+        window_days: TTFT_WINDOW_DAYS as f64,
+        sample_count: totals.sample_ms.len() as f64,
+        no_token_success_count: totals.no_token_success_count as f64,
+        error_count: totals.error_count as f64,
+        provider_rows,
+        grouped_rows,
+        daily_trend,
+    }
+}
+
 /// Cap on the number of conversations returned (highest token use first).
 const MAX_CONVERSATIONS: usize = 200;
 
@@ -422,6 +679,20 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
     };
 
     let now = Utc::now();
+    let ttft_since = (now - Duration::days(TTFT_WINDOW_DAYS - 1)).date_naive();
+    let ttft_rows = match state
+        .db
+        .usage_recent_llm_metrics(&format!("{}T00:00:00+00:00", ttft_since), TTFT_ROW_LIMIT)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "usage_recent_llm_metrics failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
+        }
+    };
+    let ttft = build_ttft_summary(ttft_rows);
+
     let today = now.format("%Y-%m-%d").to_string();
     let week_start = (now - Duration::days(6)).format("%Y-%m-%d").to_string();
     let month_start = (now - Duration::days(29)).format("%Y-%m-%d").to_string();
@@ -574,6 +845,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         by_project,
         conversations,
         turn_token_histogram: build_histogram(&per_turn),
+        ttft,
     };
 
     Json(overview).into_response()
@@ -756,5 +1028,101 @@ mod tests {
         assert_eq!(totals.cost.estimated_usd, 7.0);
         assert_eq!(totals.cost.unknown_turns, 0.0);
         assert!(totals.cost.pricing_known);
+    }
+
+    #[test]
+    fn ttft_summary_separates_first_attempts_retries_and_non_samples() {
+        use phoenix_core::domain::llm_types::{LlmAttemptOutcome, LlmTransport};
+        use phoenix_db::UsageRecentLlmMetricRow;
+
+        let summary = build_ttft_summary(vec![
+            UsageRecentLlmMetricRow {
+                request_id: "req-1".to_string(),
+                retry_attempt: 1,
+                created_at: "2025-08-10T01:00:00+00:00".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-5".to_string(),
+                transport: LlmTransport::HttpSse,
+                outcome: LlmAttemptOutcome::Success,
+                dispatch_to_first_generation_event_ms: Some(800),
+            },
+            UsageRecentLlmMetricRow {
+                request_id: "req-2".to_string(),
+                retry_attempt: 1,
+                created_at: "2025-08-10T02:00:00+00:00".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-5".to_string(),
+                transport: LlmTransport::HttpSse,
+                outcome: LlmAttemptOutcome::Success,
+                dispatch_to_first_generation_event_ms: None,
+            },
+            UsageRecentLlmMetricRow {
+                request_id: "req-3".to_string(),
+                retry_attempt: 2,
+                created_at: "2025-08-10T03:00:00+00:00".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-5".to_string(),
+                transport: LlmTransport::HttpSse,
+                outcome: LlmAttemptOutcome::Success,
+                dispatch_to_first_generation_event_ms: Some(6_000),
+            },
+            UsageRecentLlmMetricRow {
+                request_id: "req-4".to_string(),
+                retry_attempt: 2,
+                created_at: "2025-08-11T03:00:00+00:00".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5.6-sol".to_string(),
+                transport: LlmTransport::HttpJson,
+                outcome: LlmAttemptOutcome::ServerError,
+                dispatch_to_first_generation_event_ms: None,
+            },
+        ]);
+
+        assert_eq!(summary.sample_count, 2.0);
+        assert_eq!(summary.no_token_success_count, 1.0);
+        assert_eq!(summary.error_count, 1.0);
+        assert_eq!(summary.provider_rows.len(), 3.0 as usize);
+
+        let first_attempt = summary
+            .provider_rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.attempt_scope == TtftAttemptScope::FirstAttempt)
+            .expect("first attempt provider row");
+        assert_eq!(first_attempt.sample_count, 1.0);
+        assert_eq!(first_attempt.no_token_success_count, 1.0);
+        assert_eq!(first_attempt.error_count, 0.0);
+        assert_eq!(first_attempt.percentiles.p50_ms, Some(800.0));
+        assert_eq!(first_attempt.thresholds[0].exceeded_count, 0.0);
+
+        let retry = summary
+            .provider_rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.attempt_scope == TtftAttemptScope::Retry)
+            .expect("retry provider row");
+        assert_eq!(retry.sample_count, 1.0);
+        assert_eq!(retry.percentiles.p95_ms, Some(6_000.0));
+        assert_eq!(retry.thresholds[0].exceeded_count, 1.0);
+        assert_eq!(retry.thresholds[0].exceeded_rate, Some(1.0));
+        assert_eq!(retry.thresholds[1].exceeded_count, 1.0);
+        assert_eq!(retry.thresholds[2].exceeded_count, 0.0);
+
+        let retry_error = summary
+            .provider_rows
+            .iter()
+            .find(|row| row.provider == "openai" && row.attempt_scope == TtftAttemptScope::Retry)
+            .expect("retry error provider row");
+        assert_eq!(retry_error.sample_count, 0.0);
+        assert_eq!(retry_error.error_count, 1.0);
+        assert_eq!(retry_error.percentiles.p50_ms, None);
+        assert_eq!(retry_error.thresholds[0].exceeded_rate, None);
+
+        assert_eq!(summary.daily_trend.len(), 4);
+        let retry_day = summary
+            .daily_trend
+            .iter()
+            .find(|row| row.day == "2025-08-11" && row.attempt_scope == TtftAttemptScope::Retry)
+            .expect("daily retry row");
+        assert_eq!(retry_day.error_count, 1.0);
+        assert_eq!(retry_day.sample_count, 0.0);
     }
 }

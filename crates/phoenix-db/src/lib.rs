@@ -24,6 +24,10 @@ pub use schema::*;
 pub use workflow::*;
 
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::llm_types::{
+    LlmAttemptMetrics, LlmAttemptOutcome, LlmTransport, ProviderStreamTelemetry,
+    StreamTelemetryOutputKind,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
@@ -335,6 +339,26 @@ pub struct WorkScopeActivePrSelectionRow {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmRequestMetricsRow {
+    pub request_id: String,
+    pub retry_attempt: u32,
+    pub created_at: String,
+    pub metrics: LlmAttemptMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRecentLlmMetricRow {
+    pub request_id: String,
+    pub retry_attempt: u32,
+    pub created_at: String,
+    pub provider: String,
+    pub model: String,
+    pub transport: LlmTransport,
+    pub outcome: LlmAttemptOutcome,
+    pub dispatch_to_first_generation_event_ms: Option<u64>,
+}
+
 fn pr_display_state_db(
     state: &phoenix_core::domain::pr_display_state::PrDisplayState,
 ) -> &'static str {
@@ -389,6 +413,192 @@ fn row_to_work_scope_observed_branch(row: &SqliteRow) -> WorkScopeObservedBranch
         first_observed_at: row.get("first_observed_at"),
         last_observed_at: row.get("last_observed_at"),
     }
+}
+
+fn u64_to_i64(value: u64) -> DbResult<i64> {
+    i64::try_from(value).map_err(|_| {
+        DbError::Serialization(format!("value out of range for SQLite INTEGER: {value}"))
+    })
+}
+
+fn opt_u64_to_i64(value: Option<u64>) -> DbResult<Option<i64>> {
+    value.map(u64_to_i64).transpose()
+}
+
+fn i64_to_u64(value: i64, field: &str) -> DbResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| DbError::Serialization(format!("negative {field} in database: {value}")))
+}
+
+fn llm_transport_from_db(value: &str) -> DbResult<LlmTransport> {
+    match value {
+        "http_sse" => Ok(LlmTransport::HttpSse),
+        "websocket" => Ok(LlmTransport::Websocket),
+        "in_process" => Ok(LlmTransport::InProcess),
+        "http_json" => Ok(LlmTransport::HttpJson),
+        other => Err(DbError::Serialization(format!(
+            "invalid llm transport in database: {other}"
+        ))),
+    }
+}
+
+fn stream_output_kind_db(value: StreamTelemetryOutputKind) -> &'static str {
+    match value {
+        StreamTelemetryOutputKind::None => "none",
+        StreamTelemetryOutputKind::Text => "text",
+        StreamTelemetryOutputKind::Reasoning => "reasoning",
+        StreamTelemetryOutputKind::Tool => "tool",
+        StreamTelemetryOutputKind::Structured => "structured",
+        StreamTelemetryOutputKind::Mixed => "mixed",
+    }
+}
+
+fn stream_output_kind_from_db(value: &str) -> DbResult<StreamTelemetryOutputKind> {
+    match value {
+        "none" => Ok(StreamTelemetryOutputKind::None),
+        "text" => Ok(StreamTelemetryOutputKind::Text),
+        "reasoning" => Ok(StreamTelemetryOutputKind::Reasoning),
+        "tool" => Ok(StreamTelemetryOutputKind::Tool),
+        "structured" => Ok(StreamTelemetryOutputKind::Structured),
+        "mixed" => Ok(StreamTelemetryOutputKind::Mixed),
+        other => Err(DbError::Serialization(format!(
+            "invalid stream output kind in database: {other}"
+        ))),
+    }
+}
+
+fn llm_attempt_outcome_db(value: &LlmAttemptOutcome) -> &'static str {
+    match value {
+        LlmAttemptOutcome::Success => "success",
+        LlmAttemptOutcome::RateLimited => "rate_limited",
+        LlmAttemptOutcome::UsageLimitReached => "usage_limit_reached",
+        LlmAttemptOutcome::ServerError => "server_error",
+        LlmAttemptOutcome::InvalidResponse => "invalid_response",
+        LlmAttemptOutcome::ServerOverloaded => "server_overloaded",
+        LlmAttemptOutcome::NetworkError => "network_error",
+        LlmAttemptOutcome::TokenBudgetExceeded => "token_budget_exceeded",
+        LlmAttemptOutcome::AuthError => "auth_error",
+        LlmAttemptOutcome::RequestRejected => "request_rejected",
+        LlmAttemptOutcome::Cancelled => "cancelled",
+    }
+}
+
+fn llm_attempt_outcome_from_db(value: &str) -> DbResult<LlmAttemptOutcome> {
+    match value {
+        "success" => Ok(LlmAttemptOutcome::Success),
+        "rate_limited" => Ok(LlmAttemptOutcome::RateLimited),
+        "usage_limit_reached" => Ok(LlmAttemptOutcome::UsageLimitReached),
+        "server_error" => Ok(LlmAttemptOutcome::ServerError),
+        "invalid_response" => Ok(LlmAttemptOutcome::InvalidResponse),
+        "server_overloaded" => Ok(LlmAttemptOutcome::ServerOverloaded),
+        "network_error" => Ok(LlmAttemptOutcome::NetworkError),
+        "token_budget_exceeded" => Ok(LlmAttemptOutcome::TokenBudgetExceeded),
+        "auth_error" => Ok(LlmAttemptOutcome::AuthError),
+        "request_rejected" => Ok(LlmAttemptOutcome::RequestRejected),
+        "cancelled" => Ok(LlmAttemptOutcome::Cancelled),
+        other => Err(DbError::Serialization(format!(
+            "invalid llm attempt outcome in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_llm_request_metrics(row: &SqliteRow) -> DbResult<LlmRequestMetricsRow> {
+    let request_id: String = row.try_get("request_id")?;
+    let retry_attempt_i64: i64 = row.try_get("retry_attempt")?;
+    let retry_attempt = u32::try_from(retry_attempt_i64).map_err(|_| {
+        DbError::Serialization(format!(
+            "retry_attempt out of range in database: {retry_attempt_i64}"
+        ))
+    })?;
+    let total_duration_ms = i64_to_u64(row.try_get("total_duration_ms")?, "total_duration_ms")?;
+    Ok(LlmRequestMetricsRow {
+        request_id: request_id.clone(),
+        retry_attempt,
+        created_at: row.try_get("created_at")?,
+        metrics: LlmAttemptMetrics {
+            conversation_id: row.try_get("conversation_id")?,
+            root_conversation_id: row.try_get("root_conversation_id")?,
+            request_id,
+            retry_attempt,
+            provider: row.try_get("provider")?,
+            model: row.try_get("model")?,
+            transport: llm_transport_from_db(&row.try_get::<String, _>("transport")?)?,
+            total_duration_ms,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: opt_u64_from_db(
+                    row.try_get("dispatch_to_first_provider_event_ms")?,
+                    "dispatch_to_first_provider_event_ms",
+                )?,
+                dispatch_to_first_generation_event_ms: opt_u64_from_db(
+                    row.try_get("dispatch_to_first_generation_event_ms")?,
+                    "dispatch_to_first_generation_event_ms",
+                )?,
+                dispatch_to_first_visible_text_ms: opt_u64_from_db(
+                    row.try_get("dispatch_to_first_visible_text_ms")?,
+                    "dispatch_to_first_visible_text_ms",
+                )?,
+                provider_event_count: u32::try_from(row.try_get::<i64, _>("provider_event_count")?)
+                    .map_err(|_| {
+                        DbError::Serialization(
+                            "provider_event_count out of range in database".to_string(),
+                        )
+                    })?,
+                generation_event_count: u32::try_from(
+                    row.try_get::<i64, _>("generation_event_count")?,
+                )
+                .map_err(|_| {
+                    DbError::Serialization(
+                        "generation_event_count out of range in database".to_string(),
+                    )
+                })?,
+                visible_text_event_count: u32::try_from(
+                    row.try_get::<i64, _>("visible_text_event_count")?,
+                )
+                .map_err(|_| {
+                    DbError::Serialization(
+                        "visible_text_event_count out of range in database".to_string(),
+                    )
+                })?,
+                max_provider_gap_ms: opt_u64_from_db(
+                    row.try_get("max_provider_gap_ms")?,
+                    "max_provider_gap_ms",
+                )?,
+                max_generation_gap_ms: opt_u64_from_db(
+                    row.try_get("max_generation_gap_ms")?,
+                    "max_generation_gap_ms",
+                )?,
+                output_kind: stream_output_kind_from_db(&row.try_get::<String, _>("output_kind")?)?,
+                completed: row.try_get("stream_completed")?,
+            },
+            outcome: llm_attempt_outcome_from_db(&row.try_get::<String, _>("outcome")?)?,
+        },
+    })
+}
+
+fn row_to_usage_recent_llm_metric(row: &SqliteRow) -> DbResult<UsageRecentLlmMetricRow> {
+    let retry_attempt_i64: i64 = row.try_get("retry_attempt")?;
+    let retry_attempt = u32::try_from(retry_attempt_i64).map_err(|_| {
+        DbError::Serialization(format!(
+            "retry_attempt out of range in database: {retry_attempt_i64}"
+        ))
+    })?;
+    Ok(UsageRecentLlmMetricRow {
+        request_id: row.try_get("request_id")?,
+        retry_attempt,
+        created_at: row.try_get("created_at")?,
+        provider: row.try_get("provider")?,
+        model: row.try_get("model")?,
+        transport: llm_transport_from_db(&row.try_get::<String, _>("transport")?)?,
+        outcome: llm_attempt_outcome_from_db(&row.try_get::<String, _>("outcome")?)?,
+        dispatch_to_first_generation_event_ms: opt_u64_from_db(
+            row.try_get("dispatch_to_first_generation_event_ms")?,
+            "dispatch_to_first_generation_event_ms",
+        )?,
+    })
+}
+
+fn opt_u64_from_db(value: Option<i64>, field: &str) -> DbResult<Option<u64>> {
+    value.map(|v| i64_to_u64(v, field)).transpose()
 }
 
 fn active_pr_provenance_from_db(
@@ -6944,6 +7154,102 @@ impl Database {
             }
         }
         Ok(transcript_generation)
+    }
+
+    /// Upsert one finalized `llm_request_metrics` row keyed by `(request_id, retry_attempt)`.
+    pub async fn upsert_llm_request_metrics(&self, metrics: &LlmAttemptMetrics) -> DbResult<()> {
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO llm_request_metrics (\
+             request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
+             dispatch_to_first_provider_event_ms, dispatch_to_first_generation_event_ms, dispatch_to_first_visible_text_ms, \
+             provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
+             output_kind, stream_completed, outcome, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
+             ON CONFLICT(request_id, retry_attempt) DO UPDATE SET \
+             conversation_id = excluded.conversation_id, \
+             root_conversation_id = excluded.root_conversation_id, \
+             provider = excluded.provider, \
+             model = excluded.model, \
+             transport = excluded.transport, \
+             total_duration_ms = excluded.total_duration_ms, \
+             dispatch_to_first_provider_event_ms = excluded.dispatch_to_first_provider_event_ms, \
+             dispatch_to_first_generation_event_ms = excluded.dispatch_to_first_generation_event_ms, \
+             dispatch_to_first_visible_text_ms = excluded.dispatch_to_first_visible_text_ms, \
+             provider_event_count = excluded.provider_event_count, \
+             generation_event_count = excluded.generation_event_count, \
+             visible_text_event_count = excluded.visible_text_event_count, \
+             max_provider_gap_ms = excluded.max_provider_gap_ms, \
+             max_generation_gap_ms = excluded.max_generation_gap_ms, \
+             output_kind = excluded.output_kind, \
+             stream_completed = excluded.stream_completed, \
+             outcome = excluded.outcome, \
+             created_at = excluded.created_at"
+        )
+        .bind(&metrics.request_id)
+        .bind(i64::from(metrics.retry_attempt))
+        .bind(&metrics.conversation_id)
+        .bind(&metrics.root_conversation_id)
+        .bind(&metrics.provider)
+        .bind(&metrics.model)
+        .bind(metrics.transport.as_str())
+        .bind(u64_to_i64(metrics.total_duration_ms)?)
+        .bind(opt_u64_to_i64(metrics.stream.dispatch_to_first_provider_event_ms)?)
+        .bind(opt_u64_to_i64(metrics.stream.dispatch_to_first_generation_event_ms)?)
+        .bind(opt_u64_to_i64(metrics.stream.dispatch_to_first_visible_text_ms)?)
+        .bind(i64::from(metrics.stream.provider_event_count))
+        .bind(i64::from(metrics.stream.generation_event_count))
+        .bind(i64::from(metrics.stream.visible_text_event_count))
+        .bind(opt_u64_to_i64(metrics.stream.max_provider_gap_ms)?)
+        .bind(opt_u64_to_i64(metrics.stream.max_generation_gap_ms)?)
+        .bind(stream_output_kind_db(metrics.stream.output_kind))
+        .bind(metrics.stream.completed)
+        .bind(llm_attempt_outcome_db(&metrics.outcome))
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn llm_request_metrics_for_request(
+        &self,
+        request_id: &str,
+    ) -> DbResult<Vec<LlmRequestMetricsRow>> {
+        let rows = sqlx::query(
+            "SELECT request_id, retry_attempt, conversation_id, root_conversation_id, provider, model, transport, total_duration_ms, \
+             dispatch_to_first_provider_event_ms, dispatch_to_first_generation_event_ms, dispatch_to_first_visible_text_ms, \
+             provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
+             output_kind, stream_completed, outcome, created_at \
+             FROM llm_request_metrics WHERE request_id = ?1 ORDER BY retry_attempt ASC"
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| row_to_llm_request_metrics(&r))
+            .collect()
+    }
+
+    pub async fn usage_recent_llm_metrics(
+        &self,
+        since_rfc3339: &str,
+        limit: i64,
+    ) -> DbResult<Vec<UsageRecentLlmMetricRow>> {
+        let rows = sqlx::query(
+            "SELECT request_id, retry_attempt, provider, model, transport, \
+             dispatch_to_first_generation_event_ms, outcome, created_at \
+             FROM llm_request_metrics \
+             WHERE created_at >= ?1 \
+             ORDER BY created_at ASC, request_id ASC, retry_attempt ASC \
+             LIMIT ?2"
+        )
+        .bind(since_rfc3339)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| row_to_usage_recent_llm_metric(&r))
+            .collect()
     }
 
     /// Insert one row into `turn_usage` for token accounting.
@@ -14608,6 +14914,86 @@ mod tests {
             Some("fp-tr"),
             "ack must carry the fork_proposal_id handle"
         );
+    }
+
+    #[tokio::test]
+    async fn usage_recent_llm_metrics_returns_bounded_recent_rows() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-ttft", "slug-ttft", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.upsert_llm_request_metrics(&LlmAttemptMetrics {
+            conversation_id: "conv-ttft".to_string(),
+            root_conversation_id: "conv-ttft".to_string(),
+            request_id: "req-1".to_string(),
+            retry_attempt: 1,
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            transport: LlmTransport::HttpSse,
+            total_duration_ms: 4_000,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: Some(100),
+                dispatch_to_first_generation_event_ms: Some(900),
+                dispatch_to_first_visible_text_ms: Some(950),
+                provider_event_count: 1,
+                generation_event_count: 1,
+                visible_text_event_count: 1,
+                max_provider_gap_ms: Some(100),
+                max_generation_gap_ms: Some(100),
+                output_kind: StreamTelemetryOutputKind::Text,
+                completed: true,
+            },
+            outcome: LlmAttemptOutcome::Success,
+        })
+        .await
+        .unwrap();
+        db.upsert_llm_request_metrics(&LlmAttemptMetrics {
+            conversation_id: "conv-ttft".to_string(),
+            root_conversation_id: "conv-ttft".to_string(),
+            request_id: "req-2".to_string(),
+            retry_attempt: 2,
+            provider: "openai".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            transport: LlmTransport::HttpJson,
+            total_duration_ms: 8_000,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: Some(150),
+                dispatch_to_first_generation_event_ms: None,
+                dispatch_to_first_visible_text_ms: None,
+                provider_event_count: 1,
+                generation_event_count: 0,
+                visible_text_event_count: 0,
+                max_provider_gap_ms: Some(150),
+                max_generation_gap_ms: None,
+                output_kind: StreamTelemetryOutputKind::None,
+                completed: false,
+            },
+            outcome: LlmAttemptOutcome::ServerError,
+        })
+        .await
+        .unwrap();
+
+        let rows = db
+            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00", 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "limit should bound returned rows");
+        assert_eq!(rows[0].request_id, "req-1");
+        assert_eq!(rows[0].retry_attempt, 1);
+        assert_eq!(rows[0].provider, "anthropic");
+        assert_eq!(rows[0].model, "claude-sonnet-5");
+        assert_eq!(rows[0].transport, LlmTransport::HttpSse);
+        assert_eq!(rows[0].dispatch_to_first_generation_event_ms, Some(900));
+        assert_eq!(rows[0].outcome, LlmAttemptOutcome::Success);
+
+        let all_rows = db
+            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00", 10)
+            .await
+            .unwrap();
+        assert_eq!(all_rows.len(), 2);
+        assert_eq!(all_rows[1].retry_attempt, 2);
+        assert_eq!(all_rows[1].transport, LlmTransport::HttpJson);
+        assert_eq!(all_rows[1].outcome, LlmAttemptOutcome::ServerError);
     }
 
     #[tokio::test]
