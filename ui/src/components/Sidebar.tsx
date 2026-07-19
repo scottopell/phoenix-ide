@@ -1,7 +1,7 @@
 import { useState, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
-import type { ChainView, Conversation } from '../api';
+import type { ChainView, Conversation, Project } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ChainDeleteConfirm } from './ChainDeleteConfirm';
