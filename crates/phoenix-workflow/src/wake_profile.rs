@@ -38,11 +38,18 @@ pub struct BashResourceIdentity {
     pub handle_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TmuxCompletionPolicy {
+    KeepOpen,
+    CloseAfterCompletion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TmuxResourceIdentity {
     pub work_scope: WorkScopeIdentity,
     pub server_token: String,
     pub window_id: String,
+    pub completion_policy: TmuxCompletionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

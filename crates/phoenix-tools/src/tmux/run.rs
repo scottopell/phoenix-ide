@@ -14,7 +14,9 @@ use super::TmuxError;
 use crate::{
     work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
 };
-use phoenix_workflow::wake_profile::{TmuxResourceIdentity, WakeResourceIdentity};
+use phoenix_workflow::wake_profile::{
+    TmuxCompletionPolicy, TmuxResourceIdentity, WakeResourceIdentity,
+};
 
 use super::parse_last_exit_marker;
 use phoenix_workflow::Timestamp;
@@ -209,14 +211,18 @@ impl Tool for TmuxRunTool {
                 let response =
                     return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
                         .await;
-                register_tmux_wake_if_live(
-                    &ctx,
-                    &server_token,
-                    &target,
-                    parsed.keep_open_on_exit,
-                    response,
-                )
-                .await
+                if parsed.keep_open_on_exit {
+                    register_tmux_wake_if_live(
+                        &ctx,
+                        &server_token,
+                        &target,
+                        TmuxCompletionPolicy::KeepOpen,
+                        response,
+                    )
+                    .await
+                } else {
+                    response
+                }
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -439,7 +445,20 @@ async fn wait_for_text_response(
             {
                 response
             } else {
-                match register_tmux_wake_if_live(ctx, server_token, target, true, response).await {
+                let completion_policy = if close_after_completion {
+                    TmuxCompletionPolicy::CloseAfterCompletion
+                } else {
+                    TmuxCompletionPolicy::KeepOpen
+                };
+                match register_tmux_wake_if_live(
+                    ctx,
+                    server_token,
+                    target,
+                    completion_policy,
+                    response,
+                )
+                .await
+                {
                     ok if ok.is_success() => ok,
                     err => return err,
                 }
@@ -629,10 +648,10 @@ async fn register_tmux_wake_if_live(
     ctx: &ToolContext,
     server_token: &str,
     target: &TmuxRunTarget,
-    keep_open_on_exit: bool,
+    completion_policy: TmuxCompletionPolicy,
     mut response: ToolOutput,
 ) -> ToolOutput {
-    if !keep_open_on_exit || !response_keeps_live_inspectable_window(&response) {
+    if !response_keeps_live_inspectable_window(&response) {
         return response;
     }
     let Some(registrar) = ctx.wake_registrar() else {
@@ -649,6 +668,7 @@ async fn register_tmux_wake_if_live(
         work_scope: registration_scope.clone(),
         server_token: server_token.to_string(),
         window_id: target.window_id.clone(),
+        completion_policy,
     });
     let contract_id = format!("tmux:{}:{}", tool_use_id, target.window_id);
     let expires_at = now_timestamp().saturating_add_duration(TMUX_WAKE_EXPIRY);
@@ -1144,6 +1164,13 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert_eq!(v["wake_registration"]["workflow_id"], 7);
         assert_eq!(registrar.register_calls().len(), 1);
+        assert!(matches!(
+            registrar.register_calls()[0].resource,
+            WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                completion_policy: TmuxCompletionPolicy::KeepOpen,
+                ..
+            })
+        ));
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-ready.sock")).await;
     }
 
@@ -1340,6 +1367,13 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert!(v.get("wake_registration").is_some());
         assert_eq!(registrar.register_calls().len(), 1);
+        assert!(matches!(
+            registrar.register_calls()[0].resource,
+            WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                completion_policy: TmuxCompletionPolicy::CloseAfterCompletion,
+                ..
+            })
+        ));
         kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
     }
 

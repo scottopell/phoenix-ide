@@ -18,8 +18,8 @@ use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
 use phoenix_tools::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
 use phoenix_workflow::wake_profile::{
-    BashTerminalEvidence, BashTerminalStatus, TmuxTerminalEvidence, TmuxTerminalStatus,
-    WakeForgottenReason, WakeResourceIdentity, WakeTerminalEvidence,
+    BashTerminalEvidence, BashTerminalStatus, TmuxCompletionPolicy, TmuxTerminalEvidence,
+    TmuxTerminalStatus, WakeForgottenReason, WakeResourceIdentity, WakeTerminalEvidence,
 };
 use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
@@ -687,11 +687,14 @@ impl TerminalInspector for RuntimeRegistryInspector {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             if let WakeTerminalEvidence::TmuxWindow(evidence) = evidence {
-                let scope = work_scope_from_identity(&evidence.identity.work_scope);
-                let _ = self
-                    .tmux
-                    .kill_exact_window(&scope, &evidence.identity.window_id)
-                    .await;
+                if evidence.identity.completion_policy == TmuxCompletionPolicy::CloseAfterCompletion
+                {
+                    let scope = work_scope_from_identity(&evidence.identity.work_scope);
+                    let _ = self
+                        .tmux
+                        .kill_exact_window(&scope, &evidence.identity.window_id)
+                        .await;
+                }
             }
             Ok(())
         })
@@ -898,6 +901,7 @@ mod tests {
                 work_scope: conv_scope(),
                 server_token: generation.to_string(),
                 window_id: window_id.to_string(),
+                completion_policy: TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-use".to_string(),
             registered_at: Timestamp(1),
@@ -975,6 +979,7 @@ mod tests {
                     work_scope: conv_scope(),
                     server_token: "g1".to_string(),
                     window_id: "w1".to_string(),
+                    completion_policy: TmuxCompletionPolicy::KeepOpen,
                 },
                 status: TmuxTerminalStatus::ExitMarkerObserved,
                 occurred_at: Timestamp(10),

@@ -261,7 +261,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_wake_delivery_messages",
         sql: MIGRATION_049,
     },
+    Migration {
+        version: 50,
+        name: "add_tmux_completion_policy",
+        sql: MIGRATION_050,
+    },
 ];
+
+const MIGRATION_050: &str = r"
+ALTER TABLE wake_bindings
+ADD COLUMN tmux_completion_policy TEXT NOT NULL DEFAULT 'KeepOpen'
+CHECK (tmux_completion_policy IN ('KeepOpen', 'CloseAfterCompletion'));
+";
 
 const MIGRATION_049: &str = r"
 CREATE TABLE wake_delivery_messages (

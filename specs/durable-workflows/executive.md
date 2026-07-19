@@ -23,10 +23,19 @@ Allium package, and a superseding ADR now remove permanent selector,
 shadow-authority, rollback, exact-drain, and universal-lease machinery from the
 steady-state contract.
 
-Implementation code has not yet been rewritten to match this contract. Existing
-merged and in-flight durable-workflow code still reflects the earlier universal-
-lease and permanent migration-lifecycle design. This executive therefore records
-normative direction, not implementation completion.
+The normalized foundation and wake vertical slice implement the one-scheduler
+SQLite contract. Workflow attempts, receipts, deliveries, schedules, wake
+bindings, terminal evidence, and message links have normalized persisted
+authorities. Attempt authority is universally fenced, leases are limited to
+reclaimable observation, canonical delivery and runtime acceptance are atomic,
+and incompatible persisted work is explicit.
+
+Wake is implemented end to end for durable Bash and tmux obligations:
+registration precedes acknowledgement, observation and deadline arbitration are
+restart-safe, terminal results materialize once as linked conversation messages,
+adoption atomically resolves exact delivery sets, and auto-resume is coalesced
+through durable runtime acceptance. Direct chat and conversation creation remain
+specified profiles without matching vertical-slice implementations.
 
 ## Normative Shape
 
@@ -62,13 +71,13 @@ These artifacts now state:
 
 | Requirement group | Status | Notes |
 | --- | --- | --- |
-| REQ-DWF-001–005 reducer authority, normalized ownership, atomic plans, DAGs, barriers | Specified, not implemented to new shape | Existing code still includes superseded permanent migration machinery and older entity shapes. |
-| REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Specified, not implemented to new shape | Current implementation still assumes universal claimed-step leasing. |
-| REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Specified, not implemented to new shape | Existing code still reflects the superseded selector/shadow/drain worldview in adjacent spec and implementation history. |
-| REQ-DWF-029–042 externally retryable acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Specified only | These are normative requirements without matching implementation on this branch. |
-| REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | New normative profile for target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out; no matching implementation on this branch. |
-| REQ-DWF-WAKE-001–005 wake profile | Partially implemented under superseded architecture | Wake code exists, but not yet under the narrowed canonical-delivery and optional-lease contract. |
-| REQ-DWF-CREATE-001–005 creation profile | Specified only under new architecture | Earlier shadow and cutover machinery is superseded normatively; implementation has not been rewritten. |
+| REQ-DWF-001–005 reducer authority, normalized ownership, atomic plans, DAGs, barriers | Implemented | The pure engine validates typed transition plans; SQLite persists normalized workflow, effect, dependency, barrier, receipt, delivery, and schedule state atomically. |
+| REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Implemented | Persisted attempt/process authority fences every execution; only reclaimable observations receive renewable leases; cancellation and manual outcomes use typed transitions. |
+| REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Implemented | Capability classes, supported codecs, profile/version compatibility, incompatible status, transactional failpoints, concurrency tests, and restart tests cover the implemented foundation. |
+| REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. Direct-turn profile behavior remains specified only. |
+| REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
+| REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
+| REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
 
 ## Relationship to Historical ADRs
 
@@ -79,21 +88,17 @@ normative work without rewriting those historical records.
 
 ## Verification Expectations
 
-This normative rewrite is complete only at the specification layer. Matching
-implementation work still owes:
+The implemented foundation and wake profile are covered by pure-engine,
+repository, migration, concurrency, restart, failpoint, runtime-recovery, and
+tool-registration tests. Full project validation checks Rust, TypeScript, E2E,
+code generation, specification shape, and Allium consistency.
 
-- pure-engine model updates for attempt authority plus optional reclaimable lease
-  authority;
-- repository reshaping to one canonical delivery lifecycle;
-- typed migration and incompatible-work handling in place of permanent selector
-  and drain machinery;
-- direct-chat acceptance/replay/conflict implementation against the new target-
-  bound exact-ID, immutable prepared-payload, and target-local runtime
-  arbitration contract;
-- wake vertical-slice repairs under the new contract;
-- creation-profile implementation against the new contract;
-- Allium, spec-shape, and timeless-language validation on every further spec
-  edit.
+Remaining profile work is:
+
+- direct-chat acceptance, replay, conflict, exact-ID reconciliation, and
+  target-local runtime arbitration;
+- conversation-creation execution and compensation against the normalized
+  foundation.
 
 ## Related Decisions
 

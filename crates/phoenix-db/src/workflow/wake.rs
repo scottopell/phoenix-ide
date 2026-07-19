@@ -680,7 +680,7 @@ impl WakeRepository {
         let row = sqlx::query(
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                     scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                    tmux_server_token, tmux_window_id, registering_tool_use_id,
+                    tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                     expires_at, prepared_fingerprint
              FROM wake_bindings
              WHERE conversation_id = ?1 AND contract_id = ?2
@@ -2144,7 +2144,7 @@ impl WakeRepository {
                     p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at, b.scope_kind, b.scope_stable_key, b.registering_tool_use_id
+                    p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy, b.registering_tool_use_id
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -3306,7 +3306,7 @@ async fn fetch_existing_binding_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
@@ -3334,7 +3334,7 @@ async fn fetch_binding_by_workflow_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings WHERE workflow_id = ?1",
     )
@@ -3355,9 +3355,9 @@ async fn insert_binding_tx(
         "INSERT INTO wake_bindings (
             workflow_id, conversation_id, contract_id, profile_kind, profile_version,
             scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-            tmux_server_token, tmux_window_id, registering_tool_use_id,
+            tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
             expires_at, prepared_fingerprint, observe_effect_id, created_at
-         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(&input.conversation_id)
@@ -3369,6 +3369,7 @@ async fn insert_binding_tx(
     .bind(bash_handle_id(&input.resource))
     .bind(tmux_server_token(&input.resource))
     .bind(tmux_window_id(&input.resource))
+    .bind(tmux_completion_policy(&input.resource))
     .bind(&input.registering_tool_use_id)
     .bind(i64::try_from(input.expires_at.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(prepared_fingerprint)
@@ -3461,6 +3462,9 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIden
                 },
                 server_token: row.get::<String, _>("tmux_server_token"),
                 window_id: row.get::<String, _>("tmux_window_id"),
+                completion_policy: parse_tmux_completion_policy(
+                    &row.get::<String, _>("tmux_completion_policy"),
+                )?,
             },
         )),
         other => Err(DbError::Serialization(format!(
@@ -3497,6 +3501,27 @@ fn tmux_server_token(resource: &WakeResourceIdentity) -> Option<String> {
         WakeResourceIdentity::TmuxWindow(identity) => Some(identity.server_token.clone()),
         WakeResourceIdentity::Bash(_) => None,
         WakeResourceIdentity::Subagent(_) => unreachable!("subagent wake bindings not implemented"),
+    }
+}
+
+fn tmux_completion_policy(resource: &WakeResourceIdentity) -> &'static str {
+    match resource {
+        WakeResourceIdentity::TmuxWindow(identity) => match identity.completion_policy {
+            wake_types::TmuxCompletionPolicy::KeepOpen => "KeepOpen",
+            wake_types::TmuxCompletionPolicy::CloseAfterCompletion => "CloseAfterCompletion",
+        },
+        WakeResourceIdentity::Bash(_) => "KeepOpen",
+        WakeResourceIdentity::Subagent(_) => unreachable!("subagent wake bindings not implemented"),
+    }
+}
+
+fn parse_tmux_completion_policy(value: &str) -> DbResult<wake_types::TmuxCompletionPolicy> {
+    match value {
+        "KeepOpen" => Ok(wake_types::TmuxCompletionPolicy::KeepOpen),
+        "CloseAfterCompletion" => Ok(wake_types::TmuxCompletionPolicy::CloseAfterCompletion),
+        other => Err(DbError::Serialization(format!(
+            "unknown tmux completion policy: {other}"
+        ))),
     }
 }
 
@@ -3890,7 +3915,7 @@ async fn fetch_pending_delivery_exact_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.scope_kind, b.scope_stable_key
+                p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -3931,7 +3956,7 @@ async fn fetch_pending_deliveries_for_conversation_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.scope_kind, b.scope_stable_key
+                p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -3975,7 +4000,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key,
+                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4038,7 +4063,7 @@ async fn fetch_materialized_pending_deliveries_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key,
+                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4081,7 +4106,7 @@ async fn fetch_any_terminal_projection_tx(
     workflow_id: WorkflowId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key
+        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN wake_bindings b ON b.workflow_id = p.workflow_id
          WHERE p.workflow_id = ?1
@@ -4132,7 +4157,7 @@ async fn fetch_projection_by_receipt_tx(
     receipt_id: ReceiptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key
+        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN wake_bindings b ON b.workflow_id = p.workflow_id
          WHERE p.workflow_id = ?1 AND p.receipt_id = ?2",
@@ -4154,7 +4179,7 @@ async fn fetch_projection_for_attempt_tx(
     attempt_id: AttemptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key
+        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN workflow_receipts r
            ON r.workflow_id = p.workflow_id AND r.receipt_id = p.receipt_id
@@ -4285,6 +4310,9 @@ fn resource_from_projection_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeR
                 },
                 server_token: row.get("tmux_server_token"),
                 window_id: row.get("tmux_window_id"),
+                completion_policy: parse_tmux_completion_policy(
+                    &row.get::<String, _>("tmux_completion_policy"),
+                )?,
             },
         )),
         other => Err(DbError::Serialization(format!(
@@ -4636,6 +4664,7 @@ mod tests {
                 },
                 server_token: "srv-1".into(),
                 window_id: "win-1".into(),
+                completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-2".into(),
             registered_at: Timestamp(10),
@@ -4671,6 +4700,7 @@ mod tests {
                 },
                 server_token: "srv-1".into(),
                 window_id: "win-1".into(),
+                completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
             },
             status: wake_types::TmuxTerminalStatus::ExitMarkerObserved,
             occurred_at: Timestamp(occurred_at),
@@ -8112,6 +8142,15 @@ mod tests {
             .register_allocated(workflow_id, &input, "fp-exact", Timestamp(10))
             .await
             .unwrap();
+        assert_eq!(
+            second
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .resource,
+            input.resource
+        );
         let started = first
             .claim_observation_if_eligible(
                 workflow_id,
