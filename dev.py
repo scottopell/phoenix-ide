@@ -24,6 +24,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -3868,25 +3869,44 @@ def _kache_binary() -> str | None:
     return shutil.which("kache")
 
 
-def _ensure_kache_daemon(binary: str) -> None:
-    cache_dir = os.environ.get("KACHE_CACHE_DIR")
-    if cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
-        # macOS limits Unix socket paths to 103 bytes. Phoenix worktree paths are
-        # intentionally long, so give the local fork a short, stable socket path.
-        digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
-        os.environ["KACHE_SOCKET_PATH"] = f"/tmp/kache-{digest}.sock"
+def _private_kache_socket_dir() -> Path:
+    uid = os.getuid()
+    directory = Path(tempfile.gettempdir()) / f"phoenix-kache-{uid}"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = directory.lstat()
+    if not directory.is_dir() or directory.is_symlink() or info.st_uid != uid:
+        raise OSError(f"unsafe kache socket directory: {directory}")
+    directory.chmod(0o700)
+    return directory
 
-    result = subprocess.run(
-        [binary, "daemon", "start"],
-        capture_output=True,
-        text=True,
-        env=os.environ,
-        timeout=10,
-        check=False,
-    )
+
+def _ensure_kache_daemon(binary: str) -> str | None:
+    cache_dir = os.environ.get("KACHE_CACHE_DIR")
+    if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
+        digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
+        try:
+            socket_dir = _private_kache_socket_dir()
+        except OSError as error:
+            return str(error)
+        os.environ["KACHE_SOCKET_PATH"] = str(socket_dir / f"{digest}.sock")
+
+    try:
+        result = subprocess.run(
+            [binary, "daemon", "start"],
+            capture_output=True,
+            text=True,
+            env=os.environ,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise SystemExit(f"kache daemon failed to start: {detail}")
+        return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+    return None
 
 
 def _configure_compiler_cache(requested: str | None = None) -> str:
@@ -3904,8 +3924,9 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     if backend == "none":
         return "none"
 
+    automatic = backend == "auto"
     kache_binary = _kache_binary()
-    if backend == "auto":
+    if automatic:
         if shutil.which("sccache"):
             backend = "sccache"
         elif kache_binary:
@@ -3924,7 +3945,16 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     assert wrapper is not None
     os.environ["RUSTC_WRAPPER"] = wrapper
     if backend == "kache":
-        _ensure_kache_daemon(wrapper)
+        generated_socket = "KACHE_SOCKET_PATH" not in os.environ
+        daemon_error = _ensure_kache_daemon(wrapper)
+        if daemon_error:
+            if not automatic:
+                raise SystemExit(f"kache daemon failed to start: {daemon_error}")
+            os.environ.pop("RUSTC_WRAPPER", None)
+            if generated_socket:
+                os.environ.pop("KACHE_SOCKET_PATH", None)
+            print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
+            return "none"
     elif backend == "sccache":
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
     return backend
