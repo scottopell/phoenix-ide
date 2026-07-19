@@ -618,12 +618,21 @@ function withoutLiveBashProgress(atom: ConversationAtom, toolUseId: string | nul
   return { ...atom, liveBashProgress };
 }
 
+function clearProgressForMaterializedResults(
+  live: ConversationAtom['liveBashProgress'],
+  messages: readonly Message[],
+): ConversationAtom['liveBashProgress'] {
+  const completed = new Set(messages.map(toolResultUseId).filter((id): id is string => id !== null));
+  if (completed.size === 0) return live;
+  return Object.fromEntries(Object.entries(live).filter(([id]) => !completed.has(id)));
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
       const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
       if (idx >= 0) {
-        return atom;
+        return withoutLiveBashProgress(atom, toolResultUseId(action.message));
       }
       let nextAtom: ConversationAtom = withoutLiveBashProgress(
         { ...atom, streamingBuffer: null },
@@ -1270,10 +1279,13 @@ export function conversationReducer(
           bufferedEventEnvelopes: {},
           eventGap: null,
           pendingMessagePatches: {},
-          liveBashProgress: {},
+          liveBashProgress: clearProgressForMaterializedResults(next.liveBashProgress, mergedMessages),
         };
       }
-      return next;
+      return {
+        ...next,
+        liveBashProgress: clearProgressForMaterializedResults(next.liveBashProgress, mergedMessages),
+      };
     }
 
     case 'sse_message':

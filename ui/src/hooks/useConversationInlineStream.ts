@@ -13,6 +13,7 @@ import {
   SseBrowserSessionStateDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
+  SseBashToolProgressDataSchema,
   SseStateChangeDataSchema,
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
@@ -198,6 +199,22 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
             ...(data.content != null && { content: data.content as Message['content'] }),
             ...(data.duration_ms != null && { durationMs: data.duration_ms }),
+          },
+        });
+      });
+
+      source.addEventListener('bash_tool_progress', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseBashToolProgressDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_bash_tool_progress',
+            sequenceId: res.output.sequence_id,
+            toolUseId: res.output.tool_use_id,
+            progress: res.output.progress,
           },
         });
       });

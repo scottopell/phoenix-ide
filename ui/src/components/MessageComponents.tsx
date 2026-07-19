@@ -2517,12 +2517,15 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
   return <XIcon />;
 }
 
-function ChildToolActivity({ block, result }: { block: ContentBlock; result: Message | undefined }) {
+function ChildToolActivity({ block, result, liveProgress }: { block: ContentBlock; result: Message | undefined; liveProgress?: import('../generated/sse').BashToolProgress | undefined }) {
   const name = block.name || 'tool';
   const input = (block.input || {}) as Record<string, unknown>;
   const output = getToolResultText(result);
   const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
-  const outputPreview = firstOutputLine ? truncate(firstOutputLine, 140) : result ? '(empty)' : 'running…';
+  const liveOutput = liveProgress
+    ? [...liveProgress.lines.map((line) => line.text), ...(liveProgress.partial ? [liveProgress.partial] : [])].slice(-2).join(' · ')
+    : '';
+  const outputPreview = firstOutputLine ? truncate(firstOutputLine, 140) : liveOutput ? truncate(liveOutput, 140) : result ? '(empty)' : 'running…';
   const outputClass = firstOutputLine ? '' : result ? 'empty' : 'pending';
   const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
 
@@ -2544,7 +2547,7 @@ function ChildToolActivity({ block, result }: { block: ContentBlock; result: Mes
 // `toolResults` map are referentially stable across token-only atom updates, so
 // a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
 // memoization for the same re-parse-on-unchanged-content problem.
-const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, markdownComponents }: { message: Message; toolResults: Map<string, Message>; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: Map<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -2564,6 +2567,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
               key={block.id || `${message.message_id}-tool-${idx}`}
               block={block}
               result={toolResults.get(block.id || '')}
+              liveProgress={liveBashProgress[block.id || '']?.progress}
             />
           );
         }
@@ -2621,7 +2625,7 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
         <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
       )}
       {visibleAgentMessages.map((message) => (
-        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} markdownComponents={markdownComponents} />
+        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">

@@ -563,6 +563,9 @@ impl Drop for ReservedBroadcastRange {
 ///    closure so the caller cannot forget to insert it. These append to
 ///    the `ReplayRing` so a reconnect mid-turn can replay them.
 ///
+/// Live bash progress is the exception: it is replaceable UI state broadcast
+/// with the current sequence witness and is intentionally not replayed.
+///
 /// 2. **Persisted `Message` events** already carry a `message.sequence_id`
 ///    allocated by `add_message` in the DB layer. Use
 ///    [`SseBroadcaster::send_persisted_message`], which reuses that id,

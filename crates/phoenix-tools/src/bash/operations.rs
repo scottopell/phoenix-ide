@@ -878,18 +878,10 @@ impl LiveBashProgressReporter {
         if !self.active.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let view = ring.tail(LIVE_PROGRESS_MAX_LINES);
-        let end_offset = view.end_offset;
         let output_bytes = ring.output_bytes();
         let prior_output_bytes = self
             .last_emitted_output_bytes
             .load(std::sync::atomic::Ordering::Acquire);
-        let raw_partial = ring.partial_str();
-        let partial_was_truncated = raw_partial
-            .as_ref()
-            .is_some_and(|text| text.len() > LIVE_PROGRESS_MAX_PARTIAL_BYTES);
-        let partial =
-            raw_partial.map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -911,6 +903,15 @@ impl LiveBashProgressReporter {
         {
             return;
         }
+
+        let view = ring.tail(LIVE_PROGRESS_MAX_LINES);
+        let end_offset = view.end_offset;
+        let raw_partial = ring.partial_str();
+        let partial_was_truncated = raw_partial
+            .as_ref()
+            .is_some_and(|text| text.len() > LIVE_PROGRESS_MAX_PARTIAL_BYTES);
+        let partial =
+            raw_partial.map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
 
         let mut remaining_bytes =
             LIVE_PROGRESS_MAX_BYTES.saturating_sub(partial.as_ref().map_or(0, String::len));
