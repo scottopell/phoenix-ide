@@ -239,8 +239,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         </div>
       </header>
 
-      {error && <div className="coordinator-error">{error}</div>}
-      {loading ? <div className="coordinator-muted">Loading…</div> : null}
+      {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
+      {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
       <section
         className="coordinator-conversation"

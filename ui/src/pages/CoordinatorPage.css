@@ -287,6 +287,14 @@
     grid-row: 1;
   }
 
+  .coordinator-page-status {
+    z-index: 1;
+    grid-row: 2;
+    grid-column: 1;
+    align-self: start;
+    margin: 12px;
+  }
+
   .coordinator-conversation {
     height: 100%;
   }

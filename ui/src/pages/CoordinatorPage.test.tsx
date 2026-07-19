@@ -139,6 +139,24 @@ describe('CoordinatorPage', () => {
     });
   });
 
+  it('marks bootstrap loading and errors for placement inside the compact content row', async () => {
+    let resolveCoordinator!: (value: { conversation: Conversation }) => void;
+    apiMock.ensureGlobalCoordinator.mockReturnValueOnce(new Promise((resolve) => {
+      resolveCoordinator = resolve;
+    }));
+
+    const { unmount } = renderPage();
+    expect(screen.getByText('Loading…')).toHaveClass('coordinator-page-status');
+
+    resolveCoordinator({ conversation: coordinatorConversation() });
+    await screen.findByText('Shared conversation runtime /global');
+    unmount();
+
+    apiMock.ensureGlobalCoordinator.mockRejectedValueOnce(new Error('Coordinator unavailable'));
+    renderPage();
+    expect(await screen.findByText('Coordinator unavailable')).toHaveClass('coordinator-page-status');
+  });
+
   it('keeps an applied find-work query stable without rerunning bootstrap', async () => {
     renderPage();
     await screen.findByText('Shared conversation runtime /global');
