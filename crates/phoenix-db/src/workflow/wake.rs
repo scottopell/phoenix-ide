@@ -345,6 +345,8 @@ pub enum WakeCancellationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeCancelIfUnresolvedInput {
     pub workflow_id: WorkflowId,
+    pub expected_conversation_id: Option<String>,
+    pub expected_contract_id: Option<String>,
     pub timestamp: Timestamp,
     pub reason: WakeCancellationReason,
 }
@@ -1331,6 +1333,22 @@ impl WakeRepository {
             tx.rollback().await?;
             return Ok(WakeCancellationOutcome::Stale);
         };
+        let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        };
+        if input
+            .expected_conversation_id
+            .as_deref()
+            .is_some_and(|expected| expected != binding.conversation_id)
+            || input
+                .expected_contract_id
+                .as_deref()
+                .is_some_and(|expected| expected != binding.contract_id)
+        {
+            tx.rollback().await?;
+            return Ok(WakeCancellationOutcome::Stale);
+        }
         let receipt_id = ReceiptId(
             tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Receipt)
                 .await?,
@@ -2016,6 +2034,22 @@ impl WakeRepository {
         &self,
         input: &MaterializePendingDeliveryMessageInput,
     ) -> DbResult<MaterializePendingDeliveryMessageOutcome> {
+        let mut eligibility_tx = self.workflow_repo.begin_tx().await?;
+        let eligible = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM wake_bindings b
+             JOIN conversations c ON c.id = b.conversation_id
+             WHERE b.workflow_id = ?1 AND b.conversation_id = ?2 AND c.archived = 0",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(&input.conversation_id)
+        .fetch_one(&mut *eligibility_tx.tx)
+        .await?
+            > 0;
+        eligibility_tx.commit().await?;
+        if !eligible {
+            return Ok(MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible);
+        }
+
         if let Some(existing) = self
             .get_delivery_message_link(input.workflow_id, input.delivery_id)
             .await?
@@ -5253,6 +5287,8 @@ mod tests {
         let pending = match repo
             .cancel_allocated(&WakeCancelIfUnresolvedInput {
                 workflow_id,
+                expected_conversation_id: None,
+                expected_contract_id: None,
                 timestamp: Timestamp(20),
                 reason: WakeCancellationReason::ExplicitCancel,
             })
@@ -5441,6 +5477,8 @@ mod tests {
         let pending = match repo
             .cancel_allocated(&WakeCancelIfUnresolvedInput {
                 workflow_id,
+                expected_conversation_id: None,
+                expected_contract_id: None,
                 timestamp: Timestamp(20),
                 reason: WakeCancellationReason::ExplicitCancel,
             })

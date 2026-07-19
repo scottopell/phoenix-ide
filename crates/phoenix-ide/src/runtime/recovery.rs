@@ -100,6 +100,13 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
             .and_then(|data| data.get("adopted"))
             .and_then(serde_json::Value::as_bool)
             == Some(true)
+        && last_msg
+            .display_data
+            .as_ref()
+            .and_then(|data| data.get("terminal"))
+            .and_then(|terminal| terminal.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("cancelled")
     {
         return RecoveryDecision::auto_continue();
     }

@@ -553,10 +553,15 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         }
         let resolution = self.manual_resolutions.get(&resolution_id)?.clone();
         (resolution.status == ResolutionStatus::Required
-            && resolution
-                .permitted_choices
-                .iter()
-                .any(|candidate| candidate.kind == choice.kind && candidate.codec == choice.codec))
+            && resolution.permitted_choices.iter().any(|candidate| {
+                candidate.kind == choice.kind
+                    && candidate.codec == choice.codec
+                    && candidate.payload == choice.payload
+                    && candidate.receipt_codec == choice.receipt_codec
+                    && candidate.receipt == choice.receipt
+                    && candidate.receipt_event_codec == choice.receipt_event_codec
+                    && candidate.receipt_event == choice.receipt_event
+            }))
         .then_some(resolution)
     }
 

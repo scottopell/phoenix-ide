@@ -3596,6 +3596,8 @@ async fn cancel_wake(
     let outcome = repo
         .cancel_allocated(&phoenix_db::workflow::wake::WakeCancelIfUnresolvedInput {
             workflow_id: row.workflow_id,
+            expected_conversation_id: Some(id.clone()),
+            expected_contract_id: Some(contract_id.clone()),
             timestamp: phoenix_workflow::Timestamp(
                 chrono::Utc::now().timestamp().max(0).cast_unsigned(),
             ),

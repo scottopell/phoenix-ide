@@ -88,6 +88,8 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             .repo
             .cancel_allocated(&WakeCancelIfUnresolvedInput {
                 workflow_id: input.workflow_id,
+                expected_conversation_id: None,
+                expected_contract_id: None,
                 timestamp: input.timestamp,
                 reason: input.reason,
             })

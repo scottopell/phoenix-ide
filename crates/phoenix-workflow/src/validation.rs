@@ -119,6 +119,12 @@ pub(crate) fn validate_plan_body<P: WorkflowProfile>(
     }
     let effect_ids = collect_effect_ids(plan)?;
     let barrier_ids = collect_barrier_ids(plan, barrier_events)?;
+    let mut schedule_ids = BTreeSet::new();
+    for schedule in &plan.schedules {
+        if !schedule_ids.insert(schedule.schedule_id) {
+            return Err(PlanError::ScheduleIdCollision(schedule.schedule_id));
+        }
+    }
     validate_deliveries(plan, &effect_ids, &barrier_ids)?;
     validate_dependencies(plan, &effect_ids)?;
     let members_by_barrier = collect_barrier_members(plan, &effect_ids, &barrier_ids)?;
