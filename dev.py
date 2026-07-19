@@ -2,6 +2,8 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
+#   "opentelemetry-sdk>=1.39,<2",
 #   "taskmd>=1.0,<2",
 # ]
 # ///
@@ -44,6 +46,158 @@ LOG_FILE = ROOT / "phoenix.log"
 # SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
 # captured subprocess output before it is buffered and reprinted.
 _CONTROL_SEQ_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|[\x0e\x0f]")
+
+_DEV_TRACE_ENDPOINT_ENV = "PHOENIX_DEV_TRACE_ENDPOINT"
+_DEFAULT_DEV_TRACE_ENDPOINT = (
+    "http://127.0.0.1:10428/insert/opentelemetry/v1/traces"
+)
+_DEV_TRACING = None
+
+
+class _NoopSpan:
+    def set_attribute(self, _name, _value) -> None:
+        pass
+
+    def set_status(self, _status) -> None:
+        pass
+
+    def end(self) -> None:
+        pass
+
+
+_NOOP_SPAN = _NoopSpan()
+
+
+class _DevTracing:
+    def __init__(self, provider, tracer, trace_api, status_api):
+        self.provider = provider
+        self.tracer = tracer
+        self.trace_api = trace_api
+        self.status_api = status_api
+        self.command_span = None
+        self.command_started_at = None
+
+    def start_span(self, name: str, attributes: dict | None = None):
+        context = None
+        if self.command_span is not None:
+            context = self.trace_api.set_span_in_context(self.command_span)
+        return self.tracer.start_span(name, context=context, attributes=attributes)
+
+    def finish_span(self, span, attributes: dict, failed: bool = False) -> None:
+        for name, value in attributes.items():
+            span.set_attribute(name, value)
+        code = self.status_api.StatusCode.ERROR if failed else self.status_api.StatusCode.OK
+        span.set_status(self.status_api.Status(code))
+        span.end()
+
+    def shutdown(self) -> None:
+        self.provider.shutdown()
+
+
+def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    configured = env.get(_DEV_TRACE_ENDPOINT_ENV)
+    if configured is not None:
+        value = configured.strip()
+        return None if value.lower() in {"", "off", "none", "0"} else value
+    if env.get("CI"):
+        return None
+    return _DEFAULT_DEV_TRACE_ENDPOINT
+
+
+def _init_dev_tracing(environ: dict[str, str] | None = None):
+    endpoint = _dev_trace_endpoint(environ)
+    if endpoint is None:
+        return None
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.trace import status
+
+        exporter = OTLPSpanExporter(endpoint=endpoint, timeout=1.0)
+        provider = TracerProvider(resource=Resource.create({"service.name": "phoenix-dev"}))
+        provider.add_span_processor(BatchSpanProcessor(
+            exporter,
+            schedule_delay_millis=60_000,
+            export_timeout_millis=1_000,
+        ))
+        return _DevTracing(provider, provider.get_tracer("phoenix-dev"), trace, status)
+    except Exception as error:
+        print(f"  ⚠ dev tracing disabled: {error}", file=sys.stderr)
+        return None
+
+
+def _start_dev_command_tracing(command: str) -> None:
+    global _DEV_TRACING
+    _DEV_TRACING = _init_dev_tracing()
+    if _DEV_TRACING is None:
+        return
+    _DEV_TRACING.command_started_at = time.monotonic()
+    _DEV_TRACING.command_span = _DEV_TRACING.tracer.start_span(
+        "dev.command", attributes={"dev.command": command}
+    )
+
+
+def _shutdown_dev_tracing(error: BaseException | None) -> None:
+    global _DEV_TRACING
+    tracing = _DEV_TRACING
+    _DEV_TRACING = None
+    if tracing is None:
+        return
+    try:
+        failed = error is not None
+        if isinstance(error, SystemExit):
+            failed = error.code not in (None, 0)
+        if tracing.command_span is not None:
+            elapsed = max(0.0, time.monotonic() - tracing.command_started_at)
+            tracing.finish_span(tracing.command_span, {
+                "dev.elapsed_seconds": elapsed,
+                "dev.success": not failed,
+            }, failed=failed)
+            tracing.command_span = None
+        tracing.shutdown()
+    except Exception as shutdown_error:
+        print(f"  ⚠ dev trace export failed: {shutdown_error}", file=sys.stderr)
+
+
+def _begin_dev_span(name: str, attributes: dict | None = None):
+    if _DEV_TRACING is None:
+        return _NOOP_SPAN
+    return _DEV_TRACING.start_span(name, attributes)
+
+
+def _finish_dev_span(span, attributes: dict, failed: bool = False) -> None:
+    if span is _NOOP_SPAN or _DEV_TRACING is None:
+        return
+    try:
+        _DEV_TRACING.finish_span(span, attributes, failed)
+    except Exception as error:
+        print(f"  ⚠ dev span recording failed: {error}", file=sys.stderr)
+
+
+@dataclasses.dataclass
+class CargoLockWaitTimer:
+    started_at: float
+    wait_seconds: float = 0.0
+    blocked_at: float | None = None
+
+    def observe_line(self, line: str, now: float) -> None:
+        if self.blocked_at is not None:
+            self.wait_seconds += max(0.0, now - self.blocked_at)
+            self.blocked_at = None
+        if "Blocking waiting for file lock" in line:
+            self.blocked_at = now
+
+    def finish(self, now: float) -> float:
+        if self.blocked_at is not None:
+            self.wait_seconds += max(0.0, now - self.blocked_at)
+            self.blocked_at = None
+        elapsed = max(0.0, now - self.started_at)
+        self.wait_seconds = min(max(0.0, self.wait_seconds), elapsed)
+        return self.wait_seconds
 
 
 def _node_env() -> dict:
@@ -1121,6 +1275,37 @@ def ensure_ui_deps():
     (UI_DIR / "dist").mkdir(exist_ok=True)
 
 
+def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
+    started_at = time.monotonic()
+    lock_timer = CargoLockWaitTimer(started_at)
+    span = _begin_dev_span("dev.build", {"build.profile": profile})
+    returncode = 1
+    try:
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            lock_timer.observe_line(_CONTROL_SEQ_RE.sub("", line), time.monotonic())
+            print(line, end="", file=sys.stderr, flush=True)
+        proc.stderr.close()
+        returncode = proc.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, args)
+    finally:
+        finished_at = time.monotonic()
+        lock_wait = lock_timer.finish(finished_at)
+        _finish_dev_span(span, {
+            "build.elapsed_seconds": max(0.0, finished_at - started_at),
+            "cargo.lock_wait_seconds": lock_wait,
+            "process.exit_code": returncode,
+        }, failed=returncode != 0)
+
+
 def build_rust(release: bool = True):
     """Build the Rust backend."""
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
@@ -1131,7 +1316,7 @@ def build_rust(release: bool = True):
     if release:
         args.append("--release")
     print("Building Rust backend...")
-    subprocess.run(args, check=True, cwd=ROOT)
+    _run_cargo_build(args, ROOT, "release" if release else "debug")
 
 
 def tls_enabled_from_env(env: dict[str, str]) -> bool:
@@ -3967,6 +4152,22 @@ def _cargo_check_active(active: set[str]) -> bool:
     return bool(active & _CARGO_CHECK_LANES)
 
 
+def _finish_check_step_span(
+    span,
+    *,
+    elapsed: float,
+    timed_out: bool,
+    lock_wait: float,
+    returncode: int,
+) -> None:
+    _finish_dev_span(span, {
+        "check.elapsed_seconds": elapsed,
+        "check.timed_out": timed_out,
+        "cargo.lock_wait_seconds": lock_wait,
+        "process.exit_code": returncode,
+    }, failed=returncode != 0)
+
+
 def cmd_check(
     gate: bool = True,
     lanes: str | None = None,
@@ -4075,9 +4276,12 @@ def cmd_check(
         # Cargo target-lock telemetry: cargo prints "Blocking waiting for
         # file lock on <what>" the moment it blocks, and the next output line
         # marks acquisition. Accumulating the gaps separates lock-wait from
-        # build time in the step's elapsed figure (see tasks/76001).
-        lock_wait = 0.0
-        lock_t0: float | None = None
+        # build time in the step's elapsed figure.
+        lock_timer = CargoLockWaitTimer(t0)
+        span = _begin_dev_span("dev.check.step", {
+            "check.lane": lane,
+            "check.step": name,
+        })
 
         proc = subprocess.Popen(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -4085,13 +4289,10 @@ def cmd_check(
         )
 
         def reader():
-            nonlocal truncated, lock_wait, lock_t0
+            nonlocal truncated
             assert proc.stdout is not None
             for line in proc.stdout:
                 now = time.monotonic()
-                if lock_t0 is not None:
-                    lock_wait += now - lock_t0
-                    lock_t0 = None
                 if len(buf) == buf.maxlen:
                     truncated = True
                 # Strip terminal control sequences before buffering. The env
@@ -4100,8 +4301,7 @@ def cmd_check(
                 # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
                 # tool-agnostic backstop so the reprinted buffer stays clean.
                 clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
-                if "Blocking waiting for file lock" in clean:
-                    lock_t0 = now
+                lock_timer.observe_line(clean, now)
                 buf.append(clean)
             proc.stdout.close()
 
@@ -4127,10 +4327,9 @@ def cmd_check(
                 rc = proc.wait(timeout=5)
         # Reader exits when stdout closes (proc termination drops the pipe).
         rt.join(timeout=5)
-        elapsed = time.monotonic() - t0
-        # Still-open block (process killed while waiting): count to the end.
-        if lock_t0 is not None:
-            lock_wait += elapsed - (lock_t0 - t0)
+        finished_at = time.monotonic()
+        elapsed = finished_at - t0
+        lock_wait = lock_timer.finish(finished_at)
         if lock_wait >= 1.0:
             reporter.info(
                 f"{name}: {lock_wait:.1f}s of {elapsed:.1f}s spent blocked "
@@ -4150,6 +4349,13 @@ def cmd_check(
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
+        _finish_check_step_span(
+            span,
+            elapsed=elapsed,
+            timed_out=timed_out,
+            lock_wait=lock_wait,
+            returncode=rc,
+        )
         return rc
 
     def lane_rust():
@@ -8693,6 +8899,8 @@ def main():
     if pretty:
         _bootstrap_rich()
 
+    _start_dev_command_tracing(args.command)
+
     if args.command == "up":
         cmd_up(
             phoenix_port=args.port,
@@ -8814,13 +9022,23 @@ def main():
 
 
 if __name__ == "__main__":
+    failure = None
+    failed_command_exit = None
     try:
         main()
-    except subprocess.CalledProcessError as e:
-        cmd = " ".join(str(a) for a in e.cmd)
-        print(f"ERROR: command failed (exit {e.returncode}): {cmd}", file=sys.stderr)
-        if e.stderr:
-            stderr = e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace")
+    except subprocess.CalledProcessError as error:
+        failure = error
+        failed_command_exit = error.returncode
+        cmd = " ".join(str(a) for a in error.cmd)
+        print(f"ERROR: command failed (exit {error.returncode}): {cmd}", file=sys.stderr)
+        if error.stderr:
+            stderr = error.stderr if isinstance(error.stderr, str) else error.stderr.decode(errors="replace")
             print(stderr, file=sys.stderr, end="")
-        sys.exit(e.returncode)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        _shutdown_dev_tracing(failure)
+    if failed_command_exit is not None:
+        sys.exit(failed_command_exit)
 

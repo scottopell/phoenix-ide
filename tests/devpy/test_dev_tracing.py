@@ -1,0 +1,202 @@
+import importlib.util
+import io
+import subprocess
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_devpy():
+    spec = importlib.util.spec_from_file_location("devpy_tracing_under_test", ROOT / "dev.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeSpan:
+    pass
+
+
+class FakeTracing:
+    def __init__(self):
+        self.started = []
+        self.finished = []
+
+    def start_span(self, name, attributes=None):
+        span = FakeSpan()
+        self.started.append((name, attributes, span))
+        return span
+
+    def finish_span(self, span, attributes, failed=False):
+        self.finished.append((span, attributes, failed))
+
+
+class FakeProcess:
+    def __init__(self, lines, returncode=0):
+        self.stderr = io.StringIO("".join(lines))
+        self.returncode = returncode
+
+    def wait(self):
+        return self.returncode
+
+
+class DevTracingTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def test_trace_endpoint_defaults_locally_and_is_off_in_ci(self):
+        self.assertEqual(
+            self.dev._DEFAULT_DEV_TRACE_ENDPOINT,
+            self.dev._dev_trace_endpoint({}),
+        )
+        self.assertIsNone(self.dev._dev_trace_endpoint({"CI": "1"}))
+        self.assertEqual(
+            "http://collector.test/v1/traces",
+            self.dev._dev_trace_endpoint({
+                "CI": "1",
+                "PHOENIX_DEV_TRACE_ENDPOINT": "http://collector.test/v1/traces",
+            }),
+        )
+        for value in ("", "off", "none", "0"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.dev._dev_trace_endpoint({
+                    "PHOENIX_DEV_TRACE_ENDPOINT": value,
+                }))
+
+    def test_cargo_lock_timer_accumulates_multiple_intervals(self):
+        timer = self.dev.CargoLockWaitTimer(started_at=10.0)
+
+        timer.observe_line("Blocking waiting for file lock on build directory", 11.0)
+        timer.observe_line("Compiling one", 13.5)
+        timer.observe_line("Blocking waiting for file lock on package cache", 14.0)
+        timer.observe_line("Compiling two", 15.25)
+
+        self.assertEqual(3.75, timer.finish(18.0))
+
+    def test_cargo_lock_timer_closes_open_interval_and_bounds_wait(self):
+        timer = self.dev.CargoLockWaitTimer(started_at=10.0)
+        timer.observe_line("Blocking waiting for file lock on build directory", 11.0)
+
+        self.assertEqual(2.0, timer.finish(13.0))
+        self.assertEqual(2.0, timer.finish(14.0))
+
+        skewed = self.dev.CargoLockWaitTimer(started_at=20.0)
+        skewed.observe_line("Blocking waiting for file lock", 19.0)
+        self.assertEqual(0.0, skewed.finish(19.5))
+
+    def test_cargo_build_emits_timing_and_lock_wait_span(self):
+        tracing = FakeTracing()
+        process = FakeProcess([
+            "Blocking waiting for file lock on build directory\n",
+            "Compiling phoenix\n",
+        ])
+        clock = iter([10.0, 11.0, 13.0, 16.0])
+        self.dev._DEV_TRACING = tracing
+
+        with (
+            mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch("builtins.print"),
+        ):
+            self.dev._run_cargo_build(["cargo", "build", "--release"], ROOT, "release")
+
+        self.assertEqual("dev.build", tracing.started[0][0])
+        self.assertEqual({"build.profile": "release"}, tracing.started[0][1])
+        _, attributes, failed = tracing.finished[0]
+        self.assertFalse(failed)
+        self.assertEqual(6.0, attributes["build.elapsed_seconds"])
+        self.assertEqual(2.0, attributes["cargo.lock_wait_seconds"])
+        self.assertEqual(0, attributes["process.exit_code"])
+
+    def test_cargo_build_failure_preserves_exit_and_marks_span_failed(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        process = FakeProcess(["compile error\n"], returncode=7)
+
+        with (
+            mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0, 12.0]),
+            mock.patch("builtins.print"),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                self.dev._run_cargo_build(["cargo", "build"], ROOT, "debug")
+
+        self.assertEqual(7, raised.exception.returncode)
+        self.assertTrue(tracing.finished[0][2])
+        self.assertEqual(7, tracing.finished[0][1]["process.exit_code"])
+
+    def test_check_step_span_records_timeout_and_lock_wait(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        span = FakeSpan()
+
+        self.dev._finish_check_step_span(
+            span,
+            elapsed=8.5,
+            timed_out=True,
+            lock_wait=2.25,
+            returncode=1,
+        )
+
+        self.assertEqual(span, tracing.finished[0][0])
+        self.assertEqual({
+            "check.elapsed_seconds": 8.5,
+            "check.timed_out": True,
+            "cargo.lock_wait_seconds": 2.25,
+            "process.exit_code": 1,
+        }, tracing.finished[0][1])
+        self.assertTrue(tracing.finished[0][2])
+
+    def test_span_recording_failure_does_not_mask_command_result(self):
+        class BrokenTracing:
+            def finish_span(self, *_args, **_kwargs):
+                raise RuntimeError("span processor failed")
+
+        self.dev._DEV_TRACING = BrokenTracing()
+        with mock.patch("builtins.print") as printed:
+            self.dev._finish_dev_span(FakeSpan(), {"value": 1})
+
+        self.assertIn("dev span recording failed", printed.call_args.args[0])
+
+    def test_shutdown_marks_root_failure_without_masking_it(self):
+        class CommandTracing(FakeTracing):
+            def __init__(self):
+                super().__init__()
+                self.command_span = FakeSpan()
+                self.command_started_at = 10.0
+                self.shutdown_called = False
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        tracing = CommandTracing()
+        self.dev._DEV_TRACING = tracing
+        error = SystemExit(3)
+        with mock.patch.object(self.dev.time, "monotonic", return_value=12.5):
+            self.dev._shutdown_dev_tracing(error)
+
+        self.assertTrue(tracing.shutdown_called)
+        self.assertEqual(2.5, tracing.finished[0][1]["dev.elapsed_seconds"])
+        self.assertFalse(tracing.finished[0][1]["dev.success"])
+        self.assertTrue(tracing.finished[0][2])
+
+    def test_shutdown_export_failure_does_not_mask_command_result(self):
+        class BrokenTracing:
+            command_span = None
+
+            def shutdown(self):
+                raise RuntimeError("collector unavailable")
+
+        self.dev._DEV_TRACING = BrokenTracing()
+        with mock.patch("builtins.print") as printed:
+            self.dev._shutdown_dev_tracing(None)
+
+        self.assertIsNone(self.dev._DEV_TRACING)
+        self.assertIn("dev trace export failed", printed.call_args.args[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
