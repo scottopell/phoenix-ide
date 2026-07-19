@@ -98,6 +98,12 @@ export function ReleaseUpdatePanel({
   snapshotRef.current = snapshot;
   confirmedIdentityRef.current = confirmedIdentity;
 
+  const markDiscoveryStale = useCallback((reason: string) => {
+    setDiscoveryError(reason);
+    setConfirming(false);
+    setConfirmedIdentity(null);
+  }, []);
+
   const load = useCallback(async (refresh = false) => {
     if (loadInFlight.current) return;
     loadInFlight.current = true;
@@ -112,21 +118,23 @@ export function ReleaseUpdatePanel({
         }
         setDiscoveryCheckedAt(next.sampled_at);
         setDiscoveryError(null);
+        if (next.transaction.kind !== 'unreadable') setTransactionError(null);
         setSnapshot(next);
       } else {
-        setDiscoveryError(next.preview.reason);
+        markDiscoveryStale(next.preview.reason);
+        if (next.transaction.kind !== 'unreadable') setTransactionError(null);
         setSnapshot((current) => current?.preview.kind === 'available'
           ? { ...current, transaction: next.transaction, authority: next.authority }
           : next);
       }
       onDeploymentChange?.(next);
     } catch (cause) {
-      if (mounted.current) setDiscoveryError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) markDiscoveryStale(cause instanceof Error ? cause.message : String(cause));
     } finally {
       if (mounted.current) setLoading(false);
       loadInFlight.current = false;
     }
-  }, [onDeploymentChange]);
+  }, [markDiscoveryStale, onDeploymentChange]);
 
   useEffect(() => {
     mounted.current = true;
@@ -180,7 +188,7 @@ export function ReleaseUpdatePanel({
   }, [load, shouldPollTransaction]);
 
   const approve = useCallback(async () => {
-    if (!snapshot || snapshot.preview.kind !== 'available') return;
+    if (!snapshot || snapshot.preview.kind !== 'available' || discoveryError !== null) return;
     const currentIdentity = `${snapshot.preview.tag}:${snapshot.preview.commit}:${snapshot.preview.asset_sha256}`;
     if (confirmedIdentity !== currentIdentity) {
       setConfirming(false);
@@ -204,7 +212,7 @@ export function ReleaseUpdatePanel({
     } finally {
       if (mounted.current) setApproving(false);
     }
-  }, [confirmedIdentity, load, snapshot]);
+  }, [confirmedIdentity, discoveryError, load, snapshot]);
 
   const approvalStatusSafe = snapshot?.transaction.kind === 'none'
     || (snapshot?.transaction.kind === 'present'
@@ -274,7 +282,7 @@ export function ReleaseUpdatePanel({
               </div>
               {snapshot.preview.notes && <details><summary>Release notes</summary><pre>{snapshot.preview.notes}</pre></details>}
               {authorityText(snapshot.authority) && <div className="release-update__hint">{authorityText(snapshot.authority)}</div>}
-              {snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && !committedReleaseIsPreview && (
+              {discoveryFreshness === 'current' && snapshot.authority.kind === 'allowed' && snapshot.preview.newer_than_current && approvalStatusSafe && !committedReleaseIsPreview && (
                 confirming ? (
                   <div className="release-update__confirm">
                     <span>Install {snapshot.preview.tag}? Phoenix will reconnect after backend-owned verification or rollback.</span>
