@@ -26,6 +26,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowLeft } from 'lucide-react';
 import { api } from '../api';
 
 const TAG_FRAME = 0x00;
@@ -71,18 +72,32 @@ export function BrowserViewPanel({
   /** Bumping this triggers the connect effect to retear and reconnect. */
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const [stopping, setStopping] = useState(false);
+  const stoppingRef = useRef(false);
   const [stopError, setStopError] = useState<string | null>(null);
+
+  useEffect(() => {
+    stoppingRef.current = false;
+    setStopping(false);
+    setStopError(null);
+  }, [conversationId]);
 
   const stopBrowserSession = useCallback(async () => {
     if (stopping) return;
+    stoppingRef.current = true;
     setStopping(true);
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     setStopError(null);
     try {
       await api.stopConversationBrowserSession(conversationId);
+      // A successful response only means teardown was queued. Keep presenting
+      // the pending state until server lifecycle truth unmounts this viewer.
     } catch (err) {
-      setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
-    } finally {
+      stoppingRef.current = false;
       setStopping(false);
+      setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
     }
   }, [conversationId, stopping]);
 
@@ -146,7 +161,9 @@ export function BrowserViewPanel({
         drawJpeg(jpeg);
         // Receiving a frame implies the screencast is live, regardless of
         // what status arrived earlier (or didn't).
-        setStatus((prev) => (prev.kind === 'live' ? prev : { kind: 'live' }));
+        if (!stoppingRef.current) {
+          setStatus((prev) => (prev.kind === 'live' ? prev : { kind: 'live' }));
+        }
       } else if (tag === TAG_URL) {
         const text = new TextDecoder('utf-8').decode(data.subarray(1));
         setUrl(text);
@@ -178,7 +195,7 @@ export function BrowserViewPanel({
       // race against that signal. Status stays at whatever the WS last
       // reported so the overlay doesn't flicker back to "Connecting…".
       const wasLive = statusRef.current.kind === 'live';
-      if (wasLive) {
+      if (wasLive && !stoppingRef.current) {
         setStatus({ kind: 'ended' });
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
@@ -215,12 +232,25 @@ export function BrowserViewPanel({
       data-testid="browser-view-panel"
     >
       <div className="browser-view-panel__header">
+        {onClose && !inline && (
+          <button
+            type="button"
+            className="browser-view-panel__back"
+            onClick={onClose}
+            aria-label="Back to conversation"
+            title="Back to conversation"
+          >
+            <ArrowLeft size={20} aria-hidden="true" />
+          </button>
+        )}
         <span
           className="browser-view-panel__status"
-          data-status={status.kind}
-          aria-label={`Browser view status: ${status.kind}`}
+          data-status={stopping ? 'stopping' : status.kind}
+          aria-label={`Browser view status: ${stopping ? 'stopping' : status.kind}`}
           title={
-            status.kind === 'error'
+            stopping
+              ? 'Stopping browser…'
+              : status.kind === 'error'
               ? `Error: ${status.message}`
               : status.kind === 'no-session'
                 ? 'Agent has not opened the browser yet'
@@ -250,7 +280,7 @@ export function BrowserViewPanel({
         >
           {stopping ? 'Stopping…' : 'Stop browser'}
         </button>
-        {onClose && (
+        {onClose && inline && (
           <button
             type="button"
             className="browser-view-panel__close"
@@ -276,10 +306,11 @@ export function BrowserViewPanel({
           // tooltip explains why.
           style={{ pointerEvents: 'none' }}
         />
-        {status.kind !== 'live' && (
+        {(stopping || status.kind !== 'live') && (
           <div className="browser-view-panel__overlay" role="status">
-            {status.kind === 'connecting' && 'Connecting…'}
-            {status.kind === 'no-session' && (
+            {stopping && 'Stopping browser…'}
+            {!stopping && status.kind === 'connecting' && 'Connecting…'}
+            {!stopping && status.kind === 'no-session' && (
               <>
                 <div>No browser yet.</div>
                 <div className="browser-view-panel__overlay-sub">
@@ -287,8 +318,8 @@ export function BrowserViewPanel({
                 </div>
               </>
             )}
-            {status.kind === 'ended' && 'Browser session ended.'}
-            {status.kind === 'error' && `Error: ${status.message}`}
+            {!stopping && status.kind === 'ended' && 'Browser session ended.'}
+            {!stopping && status.kind === 'error' && `Error: ${status.message}`}
           </div>
         )}
       </div>

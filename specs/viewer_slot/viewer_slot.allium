@@ -449,12 +449,10 @@ rule UrlHydratesDiff {
 
 rule UrlHydratesBrowser {
     when: UrlSlotChanged(slot, browser, _, _, _, _, _)
-    -- No requires on browser_session_active here: the URL might
-    -- restore ?viewer=browser after the session has died. The viewer
-    -- mount path renders an "ended" state when active=false; spec'd
-    -- as: the slot kind reflects URL truth even if the underlying
-    -- session is gone. The auto-close rule (REQ-VS-009) catches the
-    -- subsequent server signal.
+    -- Explicit URL truth is independent of browser_session_active: a cold
+    -- reload or shared link may name the browser viewer after its session has
+    -- died. Lifecycle-aware convenience storage is handled separately and
+    -- never synthesizes this URL for an inactive session.
     ensures: slot.kind = browser
 }
 
@@ -526,6 +524,7 @@ rule BrowserSessionFellAutoClosesSlot {
     when: BrowserSessionActiveFell(slot)
     requires: slot.kind = browser
     ensures: slot.kind = none
+    ensures: ViewerSnapshotCleared(slot.conversation.slug)
 }
 
 -- @guidance: the falling edge source is intentionally opaque to the slot:
@@ -566,7 +565,7 @@ rule ConversationChangeResetsSlot {
 --   case: when the user navigates back TO a conversation they
 --   previously had a viewer open in, restore that viewer.
 --
---   Two design decisions are baked in:
+--   Two storage boundaries apply:
 --
 --   (D1) Cold reload does NOT restore. A user who reloaded the tab
 --        with a bare URL gets a bare URL back. Only in-app navigation
@@ -578,8 +577,8 @@ rule ConversationChangeResetsSlot {
 --
 --   (D2) Storage is localStorage (matches the per-file scroll-restore
 --        tier in ProseReader). Survives reload but is per-tab-group;
---        cross-tab races are best-effort last-writer-wins. Acceptable
---        for v1 -- same semantics as the scroll restore.
+--        cross-tab races are best-effort last-writer-wins, matching
+--        the scroll-restore semantics.
 --
 --   The persistence layer sits BELOW the URL but ABOVE the slot:
 --   in-app navigation reads storage and decorates the URL before
@@ -646,6 +645,7 @@ rule UrlHydratesDiffWritesStorage {
 
 rule UrlHydratesBrowserWritesStorage {
     when: UrlSlotChanged(slot, browser, _, _, _, _, _)
+    requires: slot.conversation.browser_session_active
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -679,24 +679,21 @@ rule UserClosesClearsStorage {
     ensures: ViewerSnapshotCleared(slot.conversation.slug)
 }
 
--- The restore rule. Fires only on in-app entry to a conversation
--- whose URL has no viewer params. Implementation reads
--- localStorage["phoenix:lastviewer:<slug>"] when handling the
--- emitted UrlRestorationRequested event; if absent or empty, the
--- effect is a no-op and the slot stays none. Modelling the
--- localStorage read as a `requires:` would tie the spec to
--- implementation; emitting the event unconditionally and letting the
--- handler short-circuit on empty storage keeps the slot rules pure.
+-- The restore rule. Fires only on in-app entry to a conversation whose URL
+-- has no viewer params. The restoration boundary validates ephemeral browser
+-- snapshots against loaded server liveness: an inactive browser snapshot is
+-- discarded and leaves the slot none; an active browser snapshot and every
+-- durable viewer snapshot may decorate the URL. Explicit URL hydration above
+-- remains independent of this convenience-storage policy.
 rule InAppNavigationRestoresFromStorage {
     when: ConversationEntered(slot, in_app)
     requires: slot.kind = none
     ensures: UrlRestorationRequested(slot)
-    -- Effect: handler reads storage, calls setSearchParams(stored,
-    -- { replace: true }) if any. On the next render the existing
-    -- UrlHydratesProse / UrlHydratesDiff / UrlHydratesBrowser rules
-    -- fire and the slot reaches the restored kind. Two render
-    -- cycles: this rule emits the request, URL update fires the
-    -- hydration rule, slot updates.
+    -- Effect: after conversation truth loads, the handler reads storage. If
+    -- the snapshot names browser while browser_session_active=false, it clears
+    -- that snapshot and does not update the URL. Otherwise it calls
+    -- setSearchParams(stored, { replace: true }) and the matching UrlHydrates*
+    -- rule applies on the next render.
 }
 
 -- @guidance: cold-reload entry is intentionally NOT covered by a

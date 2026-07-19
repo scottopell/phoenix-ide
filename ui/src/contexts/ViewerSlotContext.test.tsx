@@ -5,11 +5,12 @@
 // URL normalization, and the browser-session edges.
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { render, act, waitFor } from '@testing-library/react';
+import { render, act, waitFor, fireEvent } from '@testing-library/react';
 import { useEffect, useState } from 'react';
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { ViewerSlotProvider, useViewerSlot } from './ViewerSlotContext';
 import type { ViewerSlotValue } from './ViewerSlotContext';
+import { getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
 beforeEach(() => { localStorage.clear(); });
 
@@ -330,12 +331,74 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(h.get().slot.kind).toBe('prose');
   });
 
-  it('falling edge auto-closes the browser viewer', () => {
+  it('falling edge auto-closes the browser viewer and invalidates its snapshot', () => {
     const h = renderWithFlag();
     act(() => { h.setActive(true); });
     expect(h.get().slot.kind).toBe('browser');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
     act(() => { h.setActive(false); });
     expect(h.get().slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('discards an inactive stored browser viewer on in-app entry', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={(
+            <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+              <Capture onCtx={(ctx) => { latest = ctx; }} />
+            </ViewerSlotProvider>
+          )} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('restores a stored browser viewer only after loaded session truth is active', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function BrowserDestination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<BrowserDestination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
   });
 
   it('entering a conversation whose session is already active is NOT a rising edge', () => {

@@ -39,12 +39,20 @@ describe('BrowserViewPanel stop-session control', () => {
     globalThis.WebSocket = originalWebSocket;
   });
 
-  it('renders close-view and stop-session as separate controls', () => {
+  it('renders mobile back-to-conversation and stop-session as separate controls', () => {
     render(<BrowserViewPanel conversationId="conv-1" onClose={() => {}} />);
 
-    expect(screen.getByLabelText('Close browser view')).toBeTruthy();
+    expect(screen.getByLabelText('Back to conversation')).toBeTruthy();
+    expect(screen.queryByLabelText('Close browser view')).toBeNull();
     expect(screen.getByLabelText('Stop browser session')).toBeTruthy();
     expect(screen.getByText('Stop browser')).toBeTruthy();
+  });
+
+  it('keeps the compact close control for inline panels', () => {
+    render(<BrowserViewPanel conversationId="conv-1" onClose={() => {}} inline />);
+
+    expect(screen.getByLabelText('Close browser view')).toBeTruthy();
+    expect(screen.queryByLabelText('Back to conversation')).toBeNull();
   });
 
   it('clicking stop calls the conversation browser-session endpoint', async () => {
@@ -57,9 +65,26 @@ describe('BrowserViewPanel stop-session control', () => {
     });
 
     expect(stopBrowser).toHaveBeenCalledWith('conv-1');
+    expect(screen.getByLabelText('Stop browser session')).toBeDisabled();
+    expect(screen.getByLabelText('Browser view status: stopping')).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe('Stopping browser…');
   });
 
-  it('stop failure is rendered visibly', async () => {
+  it('back to conversation remains available while teardown is pending', async () => {
+    const onClose = vi.fn();
+    stopBrowser.mockResolvedValue({ success: true });
+    render(<BrowserViewPanel conversationId="conv-1" onClose={onClose} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Stop browser session'));
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByLabelText('Back to conversation'));
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('stop failure is rendered visibly and allows retry', async () => {
     stopBrowser.mockRejectedValue(new Error('stop failed'));
     render(<BrowserViewPanel conversationId="conv-1" />);
 
@@ -69,5 +94,6 @@ describe('BrowserViewPanel stop-session control', () => {
     });
 
     expect(screen.getByRole('alert').textContent).toContain('stop failed');
+    expect(screen.getByLabelText('Stop browser session')).not.toBeDisabled();
   });
 });

@@ -213,8 +213,9 @@ interface ViewerSlotProviderProps {
   /** Active conversation slug — scopes patchContext and per-conversation
    *  last-viewer storage. */
   scopeKey?: string | undefined;
-  /** Server-authoritative live-session flag; pass false when no atom yet. */
-  browserSessionActive: boolean;
+  /** Server-authoritative live-session flag. Undefined means conversation truth
+   *  has not loaded yet, so lifecycle-aware restoration must wait. */
+  browserSessionActive: boolean | undefined;
 }
 
 export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }: ViewerSlotProviderProps) {
@@ -329,10 +330,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     writeUrl((next) => next.set(DIFF_PRESENTATION_PARAM, nextPresentation));
   }, [slot.kind, writeUrl]);
 
-  // Clear the URL to the empty slot. `clearStorage` distinguishes an explicit
-  // user close (clears the last-viewer entry so navigating back doesn't reopen)
-  // from a system-driven close like the browser-session falling edge (which
-  // leaves storage intact — see REQ-VS-009 vs the user-close storage rule).
+  // Clear the URL to the empty slot. `clearStorage` distinguishes closes that
+  // invalidate the last-viewer entry from normalization-only URL cleanup.
   const clearSlot = useCallback(
     (clearStorage: boolean) => {
       setPatchContext(null);
@@ -358,8 +357,9 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   useEffect(() => {
     if (!scopeKey) return;
     if (slot.kind === 'none') return;
+    if (slot.kind === 'browser' && browserSessionActive !== true) return;
     setLastViewer(scopeKey, searchString);
-  }, [scopeKey, slot.kind, searchString]);
+  }, [scopeKey, slot.kind, searchString, browserSessionActive]);
 
   // REQ-VS-014: restore the last viewer on in-app *entry* to a conversation.
   // Entry is a scopeKey change (the user navigated to a different conversation),
@@ -373,10 +373,15 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   const enteredScopeRef = useRef<string | undefined | typeof UNSET_SCOPE>(UNSET_SCOPE);
   useEffect(() => {
     const isEntry = enteredScopeRef.current !== scopeKey;
-    enteredScopeRef.current = scopeKey;
     if (!isEntry) return;
-    if (!scopeKey) return;
-    if (location.key === 'default') return;
+    if (!scopeKey) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
+    if (location.key === 'default') {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
     if (
       searchParams.has(VIEWER_PARAM)
       || searchParams.has(FILE_PARAM)
@@ -385,16 +390,32 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       || searchParams.has(DIFF_TARGET_PARAM)
       || searchParams.has(MESSAGE_PARAM)
       || searchParams.has(REVIEW_PARAM)
-    ) return;
+    ) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
     const stored = getLastViewer(scopeKey);
-    if (!stored) return;
-    setSearchParams(new URLSearchParams(stored), { replace: true });
-  }, [scopeKey, location.key, searchParams, setSearchParams]);
+    if (!stored) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
+    const storedParams = new URLSearchParams(stored);
+    if (storedParams.get(VIEWER_PARAM) === 'browser') {
+      if (browserSessionActive === undefined) return;
+      if (!browserSessionActive) {
+        clearLastViewer(scopeKey);
+        enteredScopeRef.current = scopeKey;
+        return;
+      }
+    }
+    enteredScopeRef.current = scopeKey;
+    setSearchParams(storedParams, { replace: true });
+  }, [scopeKey, browserSessionActive, location.key, searchParams, setSearchParams]);
 
   // REQ-VS-008 / REQ-VS-009: browser-session edges. Rising edge auto-opens the
   // browser viewer only when the slot is empty (never steals prose/diff);
-  // falling edge auto-closes only when the browser viewer is showing, without
-  // clearing storage (a system close, not a user close).
+  // falling edge auto-closes only when the browser viewer is showing and
+  // invalidates its ephemeral snapshot so a dead viewer cannot be restored.
   //
   // The provider is mounted once in DesktopLayout and lives across conversation
   // switches, so the edge tracker is scoped: on a scopeKey change (conversation
@@ -414,10 +435,13 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     }
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
-    if (!prev && browserSessionActive && slotKind === 'none') {
+    if (prev === false && browserSessionActive === true && slotKind === 'none') {
       openBrowser();
-    } else if (prev && !browserSessionActive && slotKind === 'browser') {
-      clearSlot(false);
+    } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
+      // Browser snapshots are only useful while their server-owned session is
+      // live. Keeping one here would restore a dead full-screen viewer on the
+      // next in-app entry, where no new falling edge exists to close it.
+      clearSlot(true);
     }
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
@@ -429,7 +453,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   return (
     <ViewerSlotCommandsContext.Provider value={commands}>
       <ViewerSlotDataContext.Provider value={slot}>
-        <ViewerSlotBrowserActiveContext.Provider value={browserSessionActive}>
+        <ViewerSlotBrowserActiveContext.Provider value={browserSessionActive === true}>
           {children}
         </ViewerSlotBrowserActiveContext.Provider>
       </ViewerSlotDataContext.Provider>
