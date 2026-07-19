@@ -177,6 +177,57 @@ describe('ReleaseUpdatePanel', () => {
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
+  it('treats post-handoff refresh failure as stale status, not approval failure', async () => {
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(snapshot))
+      .mockImplementationOnce(() => json({ accepted: true, transaction_id: 'tx-handoff' }))
+      .mockRejectedValueOnce(new Error('server restarting'));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
+    });
+
+    expect(await screen.findByText(/approval handed off/i)).toBeInTheDocument();
+    expect(screen.getByText(/release information is stale — server restarting/i)).toBeInTheDocument();
+    expect(screen.queryByText(/update approval failed/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('preserves active status when unavailable discovery also has unreadable status', async () => {
+    const active = {
+      ...snapshot,
+      transaction: {
+        kind: 'present' as const, transaction_id: 'tx-active', state: 'activating',
+        source_commit: null, release_tag: 'v1.1.0', expected_version: '1.1.0',
+        expected_git_sha: snapshot.preview.commit, created_at: null, updated_at: null,
+        failure: null, rollback_failure: null, stale: false,
+      },
+    };
+    const unavailable = {
+      ...snapshot,
+      preview: { kind: 'unavailable' as const, reason: 'GitHub unavailable' },
+      transaction: { kind: 'unreadable' as const, reason: 'status locked' },
+    };
+    vi.mocked(fetch)
+      .mockImplementationOnce(() => json(active))
+      .mockImplementationOnce(() => json(unavailable));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    });
+
+    expect(screen.getByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.getByText(/transaction status is stale — status locked/i)).toBeInTheDocument();
+    expect(screen.getByText(/release information is stale — GitHub unavailable/i)).toBeInTheDocument();
+  });
+
   it('keeps approval failures separate from discovery freshness', async () => {
     const fetchMock = vi.mocked(fetch)
       .mockImplementationOnce(() => json(snapshot))

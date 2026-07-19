@@ -86,6 +86,7 @@ export function ReleaseUpdatePanel({
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [transactionError, setTransactionError] = useState<string | null>(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [handoffPending, setHandoffPending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -105,6 +106,27 @@ export function ReleaseUpdatePanel({
     setConfirmedIdentity(null);
   }, []);
 
+  const mergeFullSnapshot = useCallback((
+    current: ReleaseUpdateSnapshot | null,
+    next: ReleaseUpdateSnapshot,
+  ): ReleaseUpdateSnapshot => {
+    if (
+      current?.transaction.kind === 'present'
+      && !TERMINAL_STATES.has(current.transaction.state)
+      && next.transaction.kind !== 'present'
+    ) {
+      setTransactionError(next.transaction.kind === 'unreadable'
+        ? next.transaction.reason
+        : 'Durable transaction status temporarily disappeared');
+      return { ...next, transaction: current.transaction };
+    }
+    if (next.transaction.kind !== 'unreadable') {
+      setTransactionError(null);
+      if (next.transaction.kind === 'present') setHandoffPending(false);
+    }
+    return next;
+  }, []);
+
   const load = useCallback(async (refresh = false) => {
     if (loadInFlight.current) return;
     loadInFlight.current = true;
@@ -119,26 +141,15 @@ export function ReleaseUpdatePanel({
         }
         setDiscoveryCheckedAt(next.sampled_at);
         setDiscoveryError(null);
-        if (next.transaction.kind !== 'unreadable') setTransactionError(null);
-        setSnapshot((current) => {
-          if (
-            current?.transaction.kind === 'present'
-            && !TERMINAL_STATES.has(current.transaction.state)
-            && next.transaction.kind !== 'present'
-          ) {
-            setTransactionError(next.transaction.kind === 'unreadable'
-              ? next.transaction.reason
-              : 'Durable transaction status temporarily disappeared');
-            return { ...next, transaction: current.transaction };
-          }
-          return next;
-        });
+        setSnapshot((current) => mergeFullSnapshot(current, next));
       } else {
         markDiscoveryStale(next.preview.reason);
-        if (next.transaction.kind !== 'unreadable') setTransactionError(null);
-        setSnapshot((current) => current?.preview.kind === 'available'
-          ? { ...current, transaction: next.transaction, authority: next.authority }
-          : next);
+        setSnapshot((current) => mergeFullSnapshot(
+          current,
+          current?.preview.kind === 'available'
+            ? { ...next, preview: current.preview }
+            : next,
+        ));
       }
       onDeploymentChange?.(next);
     } catch (cause) {
@@ -147,7 +158,7 @@ export function ReleaseUpdatePanel({
       if (mounted.current) setLoading(false);
       loadInFlight.current = false;
     }
-  }, [markDiscoveryStale, onDeploymentChange]);
+  }, [markDiscoveryStale, mergeFullSnapshot, onDeploymentChange]);
 
   useEffect(() => {
     mounted.current = true;
@@ -171,6 +182,7 @@ export function ReleaseUpdatePanel({
           if (transaction.kind === 'present') {
             setSnapshot((value) => value ? { ...value, transaction } : value);
             setTransactionError(null);
+            setHandoffPending(false);
             if (
               transaction.state === 'committed'
               && committedRefreshRef.current !== transaction.transaction_id
@@ -218,16 +230,22 @@ export function ReleaseUpdatePanel({
         snapshot.preview.asset_name,
         snapshot.preview.asset_sha256,
       );
-      if (mounted.current) setConfirming(false);
-      await load();
     } catch (cause) {
-      if (mounted.current) setApprovalError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (mounted.current) setApproving(false);
+      if (mounted.current) {
+        setApprovalError(cause instanceof Error ? cause.message : String(cause));
+        setApproving(false);
+      }
+      return;
     }
+    if (mounted.current) {
+      setConfirming(false);
+      setHandoffPending(true);
+    }
+    await load();
+    if (mounted.current) setApproving(false);
   }, [confirmedIdentity, discoveryError, load, snapshot]);
 
-  const approvalStatusSafe = transactionError === null && (snapshot?.transaction.kind === 'none'
+  const approvalStatusSafe = !handoffPending && transactionError === null && (snapshot?.transaction.kind === 'none'
     || (snapshot?.transaction.kind === 'present'
       && TERMINAL_STATES.has(snapshot.transaction.state)
       && snapshot.transaction.state !== 'activation_failed_rollback_failed'));
@@ -273,6 +291,9 @@ export function ReleaseUpdatePanel({
       )}
       {approvalError && (
         <div className="settings-section__error">Update approval failed — {approvalError}</div>
+      )}
+      {handoffPending && (
+        <div className="release-update__hint">Approval handed off. Waiting for durable deployment status…</div>
       )}
       {!snapshot && loading && <div className="settings-section__hint">Resolving the latest stable published release…</div>}
 
