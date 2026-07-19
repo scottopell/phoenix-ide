@@ -356,13 +356,14 @@ impl MessageRetriever for Fts5Retriever {
         // user/skill message carrying files would read as permanently stale.
         crate::hydrate_attachments(&self.pool, &mut messages).await?;
 
-        // Indexed content fingerprints for these conversations.
-        // Physical index rows for these conversations (one row per chunk). We
-        // keep the raw Vec — not just a deduplicated map — so a duplicate
-        // physical row for the same message_id is counted, not collapsed.
+        // Indexed content fingerprints for these conversations. The ordinary
+        // locator table makes this metadata-only scope check a B-tree lookup;
+        // filtering the FTS5 virtual table by its UNINDEXED conversation_id
+        // would scan the entire corpus. Keep the raw Vec — not just a
+        // deduplicated map — so duplicate physical rows remain visible.
         let indexed_rows: Vec<(String, String)> = {
             let sql = format!(
-                "SELECT message_id, content_hash FROM message_fts WHERE conversation_id IN ({placeholders})"
+                "SELECT message_id, content_hash FROM message_fts_rows WHERE conversation_id IN ({placeholders})"
             );
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for id in conversation_ids {
@@ -969,6 +970,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freshness_scope_uses_the_conversation_locator_index() {
+        let db = seed().await;
+        let locator_plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT message_id, content_hash
+             FROM message_fts_rows
+             WHERE conversation_id IN ('c-a')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        assert!(
+            locator_plan
+                .join("\n")
+                .contains("idx_message_fts_rows_conversation_id"),
+            "{}",
+            locator_plan.join("\n")
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_replaces_only_the_observed_locator_set() {
         let db = seed().await;
         let stale = db
@@ -1081,13 +1106,29 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sqlx::query("UPDATE message_fts_rows SET content_hash = 'stale' WHERE message_id = 'm1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(
             !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
             "a stale-content index row must report as not fresh",
         );
 
         // Missing row: a message with no index row at all.
-        sqlx::query("DELETE FROM message_fts WHERE message_id = 'm1'")
+        let rowids: Vec<i64> =
+            sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = 'm1'")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        for rowid in rowids {
+            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                .bind(rowid)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = 'm1'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -1113,10 +1154,18 @@ mod tests {
         // (e.g. a failed delete hook). Every current message is still present
         // and fresh, but the orphan could surface deleted content in search, so
         // freshness must report false until the row is pruned.
-        sqlx::query(
+        let orphan = sqlx::query(
             "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
              VALUES ('ghost', 'orphan-1', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', 'h')",
         )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
+             VALUES (?1, 'orphan-1', 'c-a', 'h')",
+        )
+        .bind(orphan.last_insert_rowid())
         .execute(db.pool())
         .await
         .unwrap();
@@ -1146,10 +1195,19 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        sqlx::query(
+        let duplicate = sqlx::query(
             "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
              VALUES ('dup', 'm1', 1, 'c-a', 'user', '2026-01-01T00:00:00Z', ?1)",
         )
+        .bind(&fresh_hash)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
+             VALUES (?1, 'm1', 'c-a', ?2)",
+        )
+        .bind(duplicate.last_insert_rowid())
         .bind(&fresh_hash)
         .execute(db.pool())
         .await
