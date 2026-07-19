@@ -268,12 +268,36 @@
 }
 
   .coordinator-page {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow: hidden;
   }
 
   .coordinator-conversation,
   .coordinator-work-pane {
+    grid-row: 2;
     grid-column: 1;
+    min-height: 0;
+  }
+
+  .coordinator-header {
+    grid-row: 1;
+  }
+
+  .coordinator-conversation {
+    height: 100%;
+  }
+
+  .coordinator-conversation #app {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .coordinator-work-pane {
+    overflow-y: auto;
   }
 
   .coordinator-header .coordinator-view-switch {
@@ -282,6 +306,7 @@
 
   .coordinator-mobile-nav {
     grid-column: 1;
+    grid-row: 3;
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
