@@ -155,20 +155,13 @@ impl Fts5Retriever {
         let mut locator_tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM message_fts_rows
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM message_fts
-                 WHERE rowid = message_fts_rows.fts_rowid
-                   AND message_id = message_fts_rows.message_id
-                   AND conversation_id = message_fts_rows.conversation_id
-                   AND content_hash = message_fts_rows.content_hash
-             )",
+             WHERE fts_rowid NOT IN (SELECT rowid FROM message_fts)",
         )
         .execute(&mut *locator_tx)
         .await?;
         sqlx::query(
-            "INSERT OR IGNORE INTO message_fts_rows
-             (fts_rowid, message_id, conversation_id, content_hash)
-             SELECT rowid, message_id, conversation_id, content_hash FROM message_fts",
+            "DELETE FROM message_fts
+             WHERE rowid NOT IN (SELECT fts_rowid FROM message_fts_rows)",
         )
         .execute(&mut *locator_tx)
         .await?;
@@ -180,7 +173,7 @@ impl Fts5Retriever {
         // `is_fresh_for` would reject the scope forever and chain Q&A would keep
         // disabling search after every restart.
         let existing_rows: Vec<(String, String)> =
-            sqlx::query("SELECT message_id, content_hash FROM message_fts")
+            sqlx::query("SELECT message_id, content_hash FROM message_fts_rows")
                 .try_map(|row: sqlx::sqlite::SqliteRow| {
                     Ok((
                         row.try_get::<String, _>("message_id")?,
@@ -240,19 +233,26 @@ impl Fts5Retriever {
         // re-insert the deleted message from its stale snapshot. Re-deriving
         // orphans from the live table removes any such re-inserted row.
         let mut prune_tx = self.pool.begin().await?;
-        let pruned = sqlx::query(
-            "DELETE FROM message_fts WHERE message_id NOT IN (SELECT message_id FROM messages)",
+        let orphan_rowids: Vec<i64> = sqlx::query_scalar(
+            "SELECT fts_rowid FROM message_fts_rows
+             WHERE message_id NOT IN (SELECT message_id FROM messages)",
         )
-        .execute(&mut *prune_tx)
+        .fetch_all(&mut *prune_tx)
         .await?;
+        for rowid in &orphan_rowids {
+            sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                .bind(rowid)
+                .execute(&mut *prune_tx)
+                .await?;
+        }
         sqlx::query(
             "DELETE FROM message_fts_rows
-             WHERE fts_rowid NOT IN (SELECT rowid FROM message_fts)",
+             WHERE message_id NOT IN (SELECT message_id FROM messages)",
         )
         .execute(&mut *prune_tx)
         .await?;
         prune_tx.commit().await?;
-        stats.pruned = usize::try_from(pruned.rows_affected()).unwrap_or(usize::MAX);
+        stats.pruned = orphan_rowids.len();
 
         self.reconciled.store(true, Ordering::Release);
         Ok(stats)
@@ -286,19 +286,20 @@ impl MessageRetriever for Fts5Retriever {
         };
 
         let mut sql = String::from(
-            "SELECT message_fts.message_id, message_fts.chunk_ordinal, message_fts.conversation_id, \
-             message_fts.message_type, message_fts.created_at, \
+            "SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
+             meta.message_type, meta.created_at, \
              snippet(message_fts, 0, '', '', '…', 24) AS snippet, bm25(message_fts) AS score \
              FROM message_fts \
-             JOIN messages source ON source.message_id = message_fts.message_id \
+             JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
+             JOIN messages source ON source.message_id = meta.message_id \
              WHERE message_fts MATCH ? \
                AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
         );
         if !scope_ids.is_empty() {
             if excluding {
-                sql.push_str(" AND message_fts.conversation_id NOT IN (");
+                sql.push_str(" AND meta.conversation_id NOT IN (");
             } else {
-                sql.push_str(" AND message_fts.conversation_id IN (");
+                sql.push_str(" AND meta.conversation_id IN (");
             }
             for i in 0..scope_ids.len() {
                 if i > 0 {
@@ -365,11 +366,7 @@ impl MessageRetriever for Fts5Retriever {
         // deduplicated map — so duplicate physical rows remain visible.
         let indexed_rows: Vec<(String, String, bool)> = {
             let sql = format!(
-                "SELECT r.message_id, r.content_hash,
-                        f.rowid IS NOT NULL
-                        AND f.message_id = r.message_id
-                        AND f.conversation_id = r.conversation_id
-                        AND f.content_hash = r.content_hash AS physical_match
+                "SELECT r.message_id, r.content_hash, f.rowid IS NOT NULL AS physical_match
                  FROM message_fts_rows r
                  LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
                  WHERE r.conversation_id IN ({placeholders})"
@@ -450,18 +447,10 @@ pub async fn fts_upsert_conn(
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
     delete_message_rows(conn, &message.message_id).await?;
-    let inserted = sqlx::query(
-        "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
-         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
-    )
-    .bind(text)
-    .bind(&message.message_id)
-    .bind(&message.conversation_id)
-    .bind(message.message_type.to_string())
-    .bind(message.created_at.to_rfc3339())
-    .bind(&fingerprint)
-    .execute(&mut *conn)
-    .await?;
+    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+        .bind(text)
+        .execute(&mut *conn)
+        .await?;
     record_fts_row(conn, inserted.last_insert_rowid(), message, &fingerprint).await?;
     Ok(())
 }
@@ -476,9 +465,8 @@ async fn delete_message_rows(
             .fetch_all(&mut *conn)
             .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1 AND message_id = ?2")
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
             .bind(rowid)
-            .bind(message_id)
             .execute(&mut *conn)
             .await?;
     }
@@ -496,12 +484,15 @@ async fn record_fts_row(
     fingerprint: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO message_fts_rows
+         (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
     )
     .bind(fts_rowid)
     .bind(&message.message_id)
     .bind(&message.conversation_id)
+    .bind(message.message_type.to_string())
+    .bind(message.created_at.to_rfc3339())
     .bind(fingerprint)
     .execute(&mut *conn)
     .await?;
@@ -534,11 +525,7 @@ pub async fn fts_reconcile_upsert(
     if let Some(prev) = observed {
         // Replace a stale row only while it still carries the observed hash.
         let candidates: Vec<(i64, bool)> = sqlx::query(
-            "SELECT r.fts_rowid,
-                    f.rowid IS NOT NULL
-                    AND f.message_id = r.message_id
-                    AND f.conversation_id = r.conversation_id
-                    AND f.content_hash = r.content_hash AS physical_match
+            "SELECT r.fts_rowid, f.rowid IS NOT NULL AS physical_match
              FROM message_fts_rows r
              LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
              WHERE r.message_id = ?1 AND r.content_hash = ?2",
@@ -558,17 +545,10 @@ pub async fn fts_reconcile_upsert(
             return Ok(false);
         }
         for (rowid, _) in &candidates {
-            let deleted = sqlx::query(
-                "DELETE FROM message_fts
-                 WHERE rowid = ?1 AND message_id = ?2
-                   AND conversation_id = ?3 AND content_hash = ?4",
-            )
-            .bind(rowid)
-            .bind(&message.message_id)
-            .bind(&message.conversation_id)
-            .bind(prev)
-            .execute(&mut *tx)
-            .await?;
+            let deleted = sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                .bind(rowid)
+                .execute(&mut *tx)
+                .await?;
             if deleted.rows_affected() != 1 {
                 tx.rollback().await?;
                 return Ok(false);
@@ -590,18 +570,10 @@ pub async fn fts_reconcile_upsert(
             return Ok(false);
         }
     }
-    let inserted = sqlx::query(
-        "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
-         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
-    )
-    .bind(text)
-    .bind(&message.message_id)
-    .bind(&message.conversation_id)
-    .bind(message.message_type.to_string())
-    .bind(message.created_at.to_rfc3339())
-    .bind(&fingerprint)
-    .execute(&mut *tx)
-    .await?;
+    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+        .bind(text)
+        .execute(&mut *tx)
+        .await?;
     record_fts_row(&mut tx, inserted.last_insert_rowid(), message, &fingerprint).await?;
     tx.commit().await?;
     Ok(true)
@@ -651,9 +623,8 @@ pub async fn fts_delete_conversation_conn(
             .fetch_all(&mut *conn)
             .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1 AND conversation_id = ?2")
+        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
             .bind(rowid)
-            .bind(conversation_id)
             .execute(&mut *conn)
             .await?;
     }
@@ -763,6 +734,36 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    async fn insert_index_row(
+        pool: &SqlitePool,
+        text: &str,
+        message_id: &str,
+        chunk_ordinal: i64,
+        conversation_id: &str,
+        content_hash: &str,
+    ) -> i64 {
+        let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+            .bind(text)
+            .execute(pool)
+            .await
+            .unwrap();
+        let rowid = inserted.last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO message_fts_rows
+             (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+             VALUES (?1, ?2, ?3, ?4, 'user', '2026-01-01T00:00:00Z', ?5)",
+        )
+        .bind(rowid)
+        .bind(message_id)
+        .bind(chunk_ordinal)
+        .bind(conversation_id)
+        .bind(content_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+        rowid
     }
 
     #[tokio::test]
@@ -943,13 +944,11 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
-             VALUES ('ghost', 'gone', 0, 'c-a', 'user', '2026-01-01T00:00:00+00:00', 'x')",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "x").await;
 
         let stats = r.reconcile().await.unwrap();
         assert_eq!(stats.indexed, 1);
@@ -974,22 +973,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_rolls_back_physical_prune_when_locator_prune_fails() {
         let db = seed().await;
-        let orphan = sqlx::query(
-            "INSERT INTO message_fts
-             (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
-             VALUES ('ghost', 'gone', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', 'hash')",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
-             VALUES (?1, 'gone', 'c-a', 'hash')",
-        )
-        .bind(orphan.last_insert_rowid())
-        .execute(db.pool())
-        .await
-        .unwrap();
+        let orphan = insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
         sqlx::query(
             "CREATE TRIGGER fail_orphan_locator_delete
              BEFORE DELETE ON message_fts_rows
@@ -1005,13 +989,13 @@ mod tests {
         let r = Fts5Retriever::new(db.pool().clone());
         assert!(r.reconcile().await.is_err());
         let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")
-            .bind(orphan.last_insert_rowid())
+            .bind(orphan)
             .fetch_one(db.pool())
             .await
             .unwrap();
         let locator: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE fts_rowid = ?1")
-                .bind(orphan.last_insert_rowid())
+                .bind(orphan)
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
@@ -1055,11 +1039,7 @@ mod tests {
         let db = seed().await;
         let locator_plan: Vec<String> = sqlx::query(
             "EXPLAIN QUERY PLAN
-             SELECT r.message_id, r.content_hash,
-                    f.rowid IS NOT NULL
-                    AND f.message_id = r.message_id
-                    AND f.conversation_id = r.conversation_id
-                    AND f.content_hash = r.content_hash
+             SELECT r.message_id, r.content_hash, f.rowid IS NOT NULL
              FROM message_fts_rows r
              LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
              WHERE r.conversation_id IN ('c-a')",
@@ -1096,27 +1076,8 @@ mod tests {
 
         let current_text = "current concurrent row";
         let current_hash = content_fingerprint(current_text);
-        let current_insert = sqlx::query(
-            "INSERT INTO message_fts
-             (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
-             VALUES (?1, 'm-cas', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', ?2)",
-        )
-        .bind(current_text)
-        .bind(&current_hash)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let current_rowid = current_insert.last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO message_fts_rows
-             (fts_rowid, message_id, conversation_id, content_hash)
-             VALUES (?1, 'm-cas', 'c-a', ?2)",
-        )
-        .bind(current_rowid)
-        .bind(&current_hash)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        let current_rowid =
+            insert_index_row(db.pool(), current_text, "m-cas", 0, "c-a", &current_hash).await;
 
         let snapshot = Message {
             content: MessageContent::user("reconciled snapshot"),
@@ -1128,13 +1089,12 @@ mod tests {
                 .unwrap()
         );
 
-        let current_fts_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM message_fts WHERE rowid = ?1 AND message_id = 'm-cas'",
-        )
-        .bind(current_rowid)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let current_fts_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")
+                .bind(current_rowid)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let current_locator_rows: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE fts_rowid = ?1")
                 .bind(current_rowid)
@@ -1146,45 +1106,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_cas_rejects_locator_and_physical_hash_divergence() {
+    async fn fts_stores_only_searchable_text() {
         let db = seed().await;
-        let stale = db
-            .add_message(
-                "m-diverged",
-                "c-a",
-                &MessageContent::user("stale source"),
-                None,
-                None,
-            )
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(message_fts)")
+            .fetch_all(db.pool())
             .await
-            .unwrap();
-        let stale_hash = content_fingerprint(&index_text(&stale));
-        let newer_hash = content_fingerprint("newer physical row");
-        sqlx::query(
-            "UPDATE message_fts SET text = 'newer physical row', content_hash = ?1
-             WHERE message_id = 'm-diverged'",
-        )
-        .bind(&newer_hash)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        let snapshot = Message {
-            content: MessageContent::user("reconciled snapshot"),
-            ..stale
-        };
-        assert!(
-            !fts_reconcile_upsert(db.pool(), &snapshot, Some(&stale_hash))
-                .await
-                .unwrap()
-        );
-        let physical_hash: String = sqlx::query_scalar(
-            "SELECT content_hash FROM message_fts WHERE message_id = 'm-diverged'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(physical_hash, newer_hash);
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        assert_eq!(columns, vec!["text"]);
     }
 
     #[tokio::test]
@@ -1230,10 +1161,6 @@ mod tests {
 
         // Stale row: index text no longer matches the source (simulate a
         // swallowed best-effort reindex by corrupting the stored content_hash).
-        sqlx::query("UPDATE message_fts SET content_hash = 'stale' WHERE message_id = 'm1'")
-            .execute(db.pool())
-            .await
-            .unwrap();
         sqlx::query("UPDATE message_fts_rows SET content_hash = 'stale' WHERE message_id = 'm1'")
             .execute(db.pool())
             .await
@@ -1270,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_fresh_for_rejects_missing_or_mismatched_physical_rows() {
+    async fn is_fresh_for_rejects_missing_physical_rows() {
         let db = seed().await;
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
@@ -1281,13 +1208,6 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-
-        sqlx::query("UPDATE message_fts SET content_hash = 'physical-only' WHERE rowid = ?1")
-            .bind(rowid)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert!(!r.is_fresh_for(&["c-a".into()]).await.unwrap());
 
         sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
             .bind(rowid)
@@ -1310,21 +1230,7 @@ mod tests {
         // (e.g. a failed delete hook). Every current message is still present
         // and fresh, but the orphan could surface deleted content in search, so
         // freshness must report false until the row is pruned.
-        let orphan = sqlx::query(
-            "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
-             VALUES ('ghost', 'orphan-1', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', 'h')",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
-             VALUES (?1, 'orphan-1', 'c-a', 'h')",
-        )
-        .bind(orphan.last_insert_rowid())
-        .execute(db.pool())
-        .await
-        .unwrap();
+        insert_index_row(db.pool(), "ghost", "orphan-1", 0, "c-a", "h").await;
         assert!(
             !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
             "an orphaned index row must report as not fresh",
@@ -1347,27 +1253,11 @@ mod tests {
         // would collapse the two rows and miss this; the physical-row count
         // catches it.
         let fresh_hash: String =
-            sqlx::query_scalar("SELECT content_hash FROM message_fts WHERE message_id = 'm1'")
+            sqlx::query_scalar("SELECT content_hash FROM message_fts_rows WHERE message_id = 'm1'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        let duplicate = sqlx::query(
-            "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
-             VALUES ('dup', 'm1', 1, 'c-a', 'user', '2026-01-01T00:00:00Z', ?1)",
-        )
-        .bind(&fresh_hash)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO message_fts_rows (fts_rowid, message_id, conversation_id, content_hash)
-             VALUES (?1, 'm1', 'c-a', ?2)",
-        )
-        .bind(duplicate.last_insert_rowid())
-        .bind(&fresh_hash)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        insert_index_row(db.pool(), "dup", "m1", 1, "c-a", &fresh_hash).await;
         assert!(
             !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
             "a duplicate physical row must report as not fresh",

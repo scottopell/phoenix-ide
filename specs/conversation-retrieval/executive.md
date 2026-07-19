@@ -28,15 +28,13 @@ strategy.
 
 ## Technical Summary
 
-The index is an SQLite FTS5 virtual table populated from message text
+The index stores searchable text in an SQLite FTS5 virtual table,
 extracted from the typed `MessageContent` of each message (not raw
-JSON), with `conversation_id`, `message_id`, `message_type`, and
-`created_at` carried as unindexed columns so scope filtering happens
-inside the query. An ordinary indexed `message_fts_rows` table maps
-message and conversation identities to FTS rowids; maintenance resolves
-rows through that B-tree and updates FTS by rowid instead of scanning the
-virtual table's unindexed provenance columns. Both tables are a single
-**derived cache** over the `messages` table (the source of truth): they
+JSON). An ordinary indexed `message_fts_rows` table is the sole owner of
+chunk provenance and content fingerprints and maps them to FTS rowids;
+scope filtering and maintenance use its B-tree indexes while ranking and
+snippets use FTS text. Both tables form a single **derived cache** over
+the `messages` table (the source of truth): they
 are kept current atomically on message persistence, reconciled by an
 idempotent startup backfill, and can be rebuilt from `messages` at any
 time. Their schema and backfills are introduced through migrations.

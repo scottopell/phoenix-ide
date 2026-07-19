@@ -2566,21 +2566,6 @@ impl WakeRepository {
 
             if has_message_fts_tx(&mut tx).await? {
                 sqlx::query(
-                    "UPDATE message_fts
-                     SET conversation_id = ?3
-                     WHERE rowid IN (
-                         SELECT r.fts_rowid
-                         FROM message_fts_rows r
-                         JOIN wake_delivery_messages l ON l.message_id = r.message_id
-                         WHERE l.workflow_id = ?1 AND l.delivery_id = ?2 AND l.conversation_id = ?3
-                     )",
-                )
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(delivery_id.0, "delivery_id")?)
-                .bind(&input.to_conversation_id)
-                .execute(&mut *tx.tx)
-                .await?;
-                sqlx::query(
                     "UPDATE message_fts_rows
                      SET conversation_id = ?3
                      WHERE message_id IN (
@@ -8071,20 +8056,9 @@ mod tests {
         .fetch_one(&repo.workflow_repo.pool)
         .await
         .unwrap();
-        let fts_owner: String = sqlx::query_scalar(
-            "SELECT f.conversation_id
-             FROM message_fts f
-             JOIN message_fts_rows r ON r.fts_rowid = f.rowid
-             WHERE r.message_id = ?1",
-        )
-        .bind(&linked.linked_message.message.message_id)
-        .fetch_one(&repo.workflow_repo.pool)
-        .await
-        .unwrap();
         assert_eq!(link_owner, "conv-2");
         assert_eq!(message_owner, "conv-2");
         assert_eq!(locator_owner, "conv-2");
-        assert_eq!(fts_owner, "conv-2");
     }
 
     #[tokio::test]
