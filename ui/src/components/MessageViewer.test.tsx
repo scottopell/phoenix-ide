@@ -211,6 +211,36 @@ describe('MessageViewer', () => {
     expect(onPresentationChange).not.toHaveBeenCalled();
   });
 
+  it('locks destructive resolution while feedback is sending', async () => {
+    let rejectSend: ((reason: Error) => void) | undefined;
+    const onPresentationChange = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Review this line')]}
+          onClose={vi.fn()}
+          onSendNotes={() => new Promise<void>((_, reject) => { rejectSend = reject; })}
+          presentation="fullscreen"
+          canTogglePresentation
+          onPresentationChange={onPresentationChange}
+        />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Please revise' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Return to pane' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send feedback and return' }));
+
+    expect(screen.getByRole('button', { name: 'Discard notes and return' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Keep reviewing' })).toBeDisabled();
+    rejectSend?.(new Error('Network unavailable'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Network unavailable');
+    expect(screen.getByRole('button', { name: '1 notes' })).toBeInTheDocument();
+    expect(onPresentationChange).not.toHaveBeenCalled();
+  });
+
   it('keeps fullscreen notes and announces a send failure', async () => {
     const onPresentationChange = vi.fn();
     render(

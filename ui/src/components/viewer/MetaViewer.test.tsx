@@ -334,6 +334,22 @@ describe('MetaViewer payload routing', () => {
     expect(img).toHaveAttribute('src', '/preview/tmp/project/thing.png');
   });
 
+  it('normalizes unsupported prose fullscreen presentation back to pane', async () => {
+    const onPresentationChange = vi.fn();
+    renderViewer({
+      ...textCommon,
+      kind: 'text',
+      content: 'plain text',
+      presentation: 'fullscreen',
+      canTogglePresentation: true,
+      onPresentationChange,
+    });
+
+    await waitFor(() => expect(onPresentationChange).toHaveBeenCalledWith('pane'));
+    expect(screen.queryByRole('button', { name: 'Return to pane' })).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /File viewer/ })).not.toHaveClass('viewer-shell--takeover');
+  });
+
   it('preserves Markdown scroll position across presentation changes', () => {
     const payload: MetaViewerPayload = {
       ...textCommon,

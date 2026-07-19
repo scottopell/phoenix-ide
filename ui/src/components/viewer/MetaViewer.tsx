@@ -61,7 +61,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const focusRange = focus?.kind === 'range' ? focus : undefined;
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
-  const focused = presentation === 'fullscreen' && canTogglePresentation;
+  const supportsFocusedReview = payload.kind === 'markdown';
+  const focused = supportsFocusedReview && presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
     noteCount: notes.fileNotes.length,
@@ -70,6 +71,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     returnToPane,
     closeViewer: onClose,
   });
+
+  useEffect(() => {
+    if (presentation === 'fullscreen' && canTogglePresentation && !supportsFocusedReview) {
+      onPresentationChange?.('pane');
+    }
+  }, [canTogglePresentation, onPresentationChange, presentation, supportsFocusedReview]);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
   const [imageTakeover, setImageTakeover] = useState(false);
@@ -424,7 +431,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         </button>
       )}
       <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
-      {payload.kind === 'markdown' && canTogglePresentation && onPresentationChange && (
+      {supportsFocusedReview && canTogglePresentation && onPresentationChange && (
         <ViewerPresentationControl
           fullscreen={focused}
           onToggle={focused ? focusedExit.requestReturn : () => onPresentationChange('fullscreen')}

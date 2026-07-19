@@ -231,8 +231,8 @@ export function FocusedReviewExitDialog({
         <p>Pending notes belong to this full-screen review. Send or discard them before {destination}.</p>
         {error && <p className="viewer-send-error" role="alert">{error}</p>}
         <div className="modal-actions focused-review-exit-actions">
-          <button className="btn-secondary" type="button" onClick={onKeepReviewing}>Keep reviewing</button>
-          <button className="btn-danger" type="button" onClick={onDiscard}>{discardLabel}</button>
+          <button className="btn-secondary" type="button" onClick={onKeepReviewing} disabled={sending}>Keep reviewing</button>
+          <button className="btn-danger" type="button" onClick={onDiscard} disabled={sending}>{discardLabel}</button>
           <button className="btn-primary" type="button" onClick={onSend} disabled={sending}>
             {sending ? 'Sending…' : sendLabel}
           </button>

@@ -39,12 +39,13 @@ export function useFocusedReviewExit({
   }, [sending]);
 
   const discardAndReturn = useCallback(() => {
+    if (sending) return;
     discard();
     setExitTarget(null);
     setError(null);
     if (exitTarget === 'closed') closeViewer();
     else returnToPane();
-  }, [closeViewer, discard, exitTarget, returnToPane]);
+  }, [closeViewer, discard, exitTarget, returnToPane, sending]);
 
   const sendAndReturn = useCallback(async () => {
     if (sending) return;
