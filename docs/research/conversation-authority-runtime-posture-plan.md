@@ -90,7 +90,17 @@ The new model must not restore branch or task identity as a proxy for work-strea
 
 ### Production traces
 
-A bounded seven-day TraceQL query for the current task-approval and continuation HTTP route templates returned no samples. No production behavior was inferred from absent data. Code, normative specs, accepted ADRs, and PR evidence remain the basis for this plan.
+A second bounded TraceQL investigation found the original query error: Phoenix records Axum route templates with `:id`, while the first query used `{id}`. VictoriaTraces was healthy and contained current `phoenix-ide` data.
+
+Over a bounded 30-day window:
+
+- `{ resource.service.name = "phoenix-ide" && span.http.route = "/api/conversations/:id/approve-task" }` returned 11 traces. All were HTTP 200; duration ranged from 0.299 ms to 4.55 ms, with a 0.795 ms median.
+- `{ resource.service.name = "phoenix-ide" && span.http.route = "/api/conversations/:id/continue" }` returned 8 traces. All were HTTP 200; duration ranged from 4.07 ms to 15.352 ms, with an 8.553 ms median.
+- The equivalent rejection query returned no traces in the bounded window.
+
+Full traces for the identified IDs contain only the top-level HTTP span and route/status/code-location attributes; they do not contain nested reducer, SQLite transaction, executor, or runtime-dispatch spans. Therefore traces cannot establish internal effect order or crash consistency. They do establish an important current behavioral distinction: task-approval HTTP requests return in sub-5-ms time consistent with state-gated event enqueueing rather than waiting for Git/mode/state completion, while continuation performs its durable successor/dispatch-intent work within the request and takes measurably longer.
+
+The target authority endpoint must not copy task approval's early-acknowledgement boundary. Grant/reject success is returned only after the atomic decision/authority/message/accepted-turn transaction commits. Future implementation should add child spans around lifecycle CAS, SQLite commit, posture application, and runtime dispatch so production traces can verify the intended ordering instead of only endpoint latency.
 
 ## Current-state architecture map
 
