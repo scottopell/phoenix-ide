@@ -1,7 +1,7 @@
 import { useState, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
-import type { ChainView, Conversation, Project } from '../api';
+import type { ChainView, Conversation } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ChainDeleteConfirm } from './ChainDeleteConfirm';
@@ -12,13 +12,10 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
+import { getProjectDisplayLabel } from '../utils/conversationIdentity';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 const COLLAPSED_DOT_LIMIT = 9;
-
-function projectLabel(project: Project): string {
-  return project.canonical_path.split('/').filter(Boolean).pop() || project.canonical_path;
-}
 
 function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
   if (projectId === null) return conversations.length;
@@ -174,7 +171,7 @@ export function Sidebar({
   }, [archivedConversations, activeProjectId]);
 
   const activeProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) ?? null : null;
-  const activeProjectLabel = activeProject ? projectLabel(activeProject) : null;
+  const activeProjectLabel = activeProject ? getProjectDisplayLabel(activeProject) : null;
   const scopedActiveCount = filteredConversations.length;
   const scopedArchivedCount = filteredArchivedConversations.length;
 
@@ -457,7 +454,7 @@ export function Sidebar({
               <span className="project-tab-count">{conversations.length}</span>
             </button>
             {projects.map(p => {
-              const label = projectLabel(p);
+              const label = getProjectDisplayLabel(p) ?? p.canonical_path;
               return (
                 <button
                   key={p.id}

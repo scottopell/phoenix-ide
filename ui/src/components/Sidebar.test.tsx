@@ -299,4 +299,33 @@ describe('Sidebar — active conversation project filter', () => {
     });
     expect(queryByLabelText('Global Recall')).toBeNull();
   });
+
+  it('uses human project labels from canonical paths and rejects generated leaves', async () => {
+    apiMock.getProjects.mockResolvedValue([
+      makeProject('proj-human', '/Users/scott/phoenix-ide'),
+      makeProject('proj-generated', '/repo/.phoenix/worktrees/9d1b4cc93b7845228e4fdbe566761f44'),
+    ]);
+
+    const { getByRole, queryByRole } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[
+            makeConv('c1', 'c1', { project_id: 'proj-human' }),
+            makeConv('c2', 'c2', { project_id: 'proj-generated' }),
+          ]}
+          archivedConversations={[]}
+          activeSlug={null}
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(getByRole('button', { name: /phoenix-ide 1/i })).not.toBeNull();
+    });
+    expect(queryByRole('button', { name: /^9d1b4cc93b7845228e4fdbe566761f44 1$/i })).toBeNull();
+    expect(getByRole('button', { name: /\/repo\/\.phoenix\/worktrees\/9d1b4cc93b7845228e4fdbe566761f44 1/i })).not.toBeNull();
+  });
 });

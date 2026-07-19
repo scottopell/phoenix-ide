@@ -12,6 +12,11 @@ import {
 } from '../utils/chains';
 
 import { useKeyboardNav } from '../hooks';
+import {
+  getConversationDisplayTitle,
+  getConversationProjectLabel,
+  isLowValueIdentifier,
+} from '../utils/conversationIdentity';
 import './ConversationList.css';
 
 
@@ -136,32 +141,8 @@ function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?
   );
 }
 
-function compactContextLabel(conv: Conversation): string | null {
-  if (conv.project_name) return conv.project_name;
-  const path = conv.worktree_path || conv.cwd;
-  const leaf = path?.split('/').filter(Boolean).pop();
-  return leaf || null;
-}
-
-const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
-const LONG_HEX_TOKEN_PATTERN = /(?:^|[-_])[0-9a-f]{24,}(?:$|[-_])/i;
-
-function isLowValueIdentifier(value: string | null | undefined): boolean {
-  const normalized = value?.trim();
-  if (!normalized) return true;
-  return UUID_PATTERN.test(normalized)
-    || /^[0-9a-f]{24,}$/i.test(normalized)
-    || LONG_HEX_TOKEN_PATTERN.test(normalized);
-}
-
 function displayTitleFromConversation(conv: Conversation, fallback = 'Untitled conversation'): string {
-  const candidates = [
-    conv.slug,
-    conv.task_title,
-    conv.branch_name,
-    compactContextLabel(conv),
-  ];
-  return candidates.find((candidate) => !isLowValueIdentifier(candidate))?.trim() || fallback;
+  return getConversationDisplayTitle(conv, fallback);
 }
 
 function displayTitleFromChain(item: Extract<SidebarItem, { kind: 'chain' }>): string {
@@ -170,7 +151,7 @@ function displayTitleFromChain(item: Extract<SidebarItem, { kind: 'chain' }>): s
     item.displayName,
     root?.task_title,
     root?.branch_name,
-    root ? compactContextLabel(root) : null,
+    root ? getConversationProjectLabel(root) : null,
   ];
   return candidates.find((candidate) => !isLowValueIdentifier(candidate))?.trim() || 'Untitled chain';
 }
@@ -244,7 +225,7 @@ export const ConversationRow = memo(function ConversationRow({
     }
   })();
 
-  const contextLabel = compactContextLabel(conv);
+  const contextLabel = getConversationProjectLabel(conv);
   const displayTitle = displayTitleFromConversation(conv);
   const shouldShowMobileChainTitle = isMobileList
     && isChainMember
@@ -452,7 +433,7 @@ export const ChainBlock = memo(function ChainBlock({
   const latestMember = item.members.find((m) => m.id === item.latestMemberId) ?? item.members[item.members.length - 1];
   const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
   const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
-  const latestContext = latestMember ? compactContextLabel(latestMember) : null;
+  const latestContext = latestMember ? getConversationProjectLabel(latestMember) : null;
   const chainDisplayTitle = displayTitleFromChain(item);
   const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Latest conversation';
   return (
