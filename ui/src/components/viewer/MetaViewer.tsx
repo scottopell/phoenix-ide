@@ -13,7 +13,6 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { createPortal } from 'react-dom';
 import { Maximize2, Minimize2 } from 'lucide-react';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { FocusedReviewExitDialog, ViewerPresentationControl, ViewerShell } from './ViewerShell';
@@ -594,7 +593,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </ViewerShell>
   );
 
-  return payload.kind === 'image' && imageTakeover ? createPortal(shell, document.body) : shell;
+  return shell;
 }
 
 const EMPTY_FIND_SESSION_MATCHES: readonly FindSessionMatch<FileSearchMatchTarget>[] = [];

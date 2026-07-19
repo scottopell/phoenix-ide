@@ -38,7 +38,7 @@ describe('CommissionReviewViewer', () => {
     paneContent.scrollTop = 480;
 
     view.rerender(<CommissionReviewViewer {...props} presentation="fullscreen" />);
-    const focusedContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    const focusedContent = document.body.querySelector('.viewer-shell--takeover .viewer-content') as HTMLDivElement;
     expect(focusedContent).toBe(paneContent);
     expect(focusedContent.scrollTop).toBe(480);
 

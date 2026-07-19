@@ -401,11 +401,13 @@ describe('MetaViewer payload routing', () => {
     );
 
     expect(screen.getByRole('link', { name: 'Open in new tab' })).toHaveAttribute('href', '/preview/tmp/project/thing.png');
+    const imageSurface = screen.getByTestId('image-preview-surface');
     const fullscreen = screen.getByRole('button', { name: 'Open fullscreen image viewer' });
     expect(fullscreen).toBeInTheDocument();
     fireEvent.click(fullscreen);
     expect(screen.getByRole('button', { name: 'Exit fullscreen image viewer' })).toBeInTheDocument();
     expect(document.body.querySelector('.viewer-shell--takeover')).not.toBeNull();
+    expect(screen.getByTestId('image-preview-surface')).toBe(imageSurface);
 
     rerender(
       <ReviewNotesProvider>
