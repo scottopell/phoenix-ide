@@ -388,6 +388,19 @@ pub async fn archive_chain_handler(
             ))));
         }
     }
+    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    for id in &member_ids {
+        if wake_repo
+            .has_owed_work_for_conversation(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!("Cannot archive chain: member {id} has pending background work."),
+                "pending_wake",
+            ))));
+        }
+    }
 
     // TOCTOU note: the busy precheck is best-effort. Same shape as the
     // delete-chain handler — a member can transition to busy after the
@@ -431,6 +444,19 @@ pub async fn delete_chain_handler(
                      operation first, then retry.",
                 ),
                 "cancel_first",
+            ))));
+        }
+    }
+    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    for id in &member_ids {
+        if wake_repo
+            .has_owed_work_for_conversation(id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+        {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!("Cannot delete chain: member {id} has pending background work."),
+                "pending_wake",
             ))));
         }
     }
