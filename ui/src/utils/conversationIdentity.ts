@@ -39,7 +39,8 @@ export interface ConversationIdentity {
 
 const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
 const LONG_HEX_TOKEN_PATTERN = /(?:^|[-_])[0-9a-f]{24,}(?:$|[-_])/i;
-const PHOENIX_WORKTREE_SEGMENT = '.phoenix/worktrees/';
+const PHOENIX_WORKTREE_SEGMENT = '/.phoenix/worktrees/';
+const PHOENIX_SEED_WORKTREE_SEGMENT = '/.phoenix/seed-worktrees/';
 
 function pathLeaf(path: string | null | undefined): string | null {
   const normalized = path?.trim().replace(/\/+$/, '');
@@ -97,20 +98,31 @@ export function isLowValueIdentifier(value: string | null | undefined): boolean 
     || LONG_HEX_TOKEN_PATTERN.test(normalized);
 }
 
-function projectLabelFromPath(path: string | null | undefined): string | null {
-  const normalized = path?.trim();
-  if (!normalized || normalized.includes(PHOENIX_WORKTREE_SEGMENT)) return null;
-  const leaf = pathLeaf(normalized);
+export function getPathDisplayLabel(path: string | null | undefined): string | null {
+  const normalized = path?.trim().replace(/\/+$/, '');
+  if (!normalized) return null;
+
+  const seedWorktreeIndex = normalized.lastIndexOf(PHOENIX_SEED_WORKTREE_SEGMENT);
+  if (seedWorktreeIndex >= 0) {
+    const seedLeaf = pathLeaf(normalized.slice(seedWorktreeIndex + PHOENIX_SEED_WORKTREE_SEGMENT.length));
+    if (!isLowValueIdentifier(seedLeaf)) return seedLeaf;
+  }
+
+  const managedWorktreeIndex = normalized.indexOf(PHOENIX_WORKTREE_SEGMENT);
+  const identityPath = managedWorktreeIndex >= 0
+    ? normalized.slice(0, managedWorktreeIndex)
+    : normalized;
+  const leaf = pathLeaf(identityPath);
   return isLowValueIdentifier(leaf) ? null : leaf;
 }
 
 export function getProjectDisplayLabel(project: Pick<Project, 'canonical_path'>): string | null {
-  return projectLabelFromPath(project.canonical_path);
+  return getPathDisplayLabel(project.canonical_path);
 }
 
 export function getConversationProjectLabel(conversation: Pick<Conversation, 'project_name' | 'worktree_path' | 'cwd'>): string | null {
   if (!isLowValueIdentifier(conversation.project_name)) return conversation.project_name!.trim();
-  return projectLabelFromPath(conversationRootPath(conversation));
+  return getPathDisplayLabel(conversationRootPath(conversation));
 }
 
 export function summarizeConversationPath(path: string | null | undefined): string {

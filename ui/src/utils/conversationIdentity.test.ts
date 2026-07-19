@@ -6,6 +6,7 @@ import {
   getConversationIdentityDisplay,
   getConversationProjectLabel,
   getProjectDisplayLabel,
+  getPathDisplayLabel,
   summarizeConversationPath,
 } from './conversationIdentity';
 
@@ -48,7 +49,7 @@ describe('conversationIdentity', () => {
     expect(getConversationProjectLabel(makeConversation({
       project_name: null,
       cwd: '/repo/.phoenix/worktrees/123e4567-e89b-12d3-a456-426614174000',
-    }))).toBeNull();
+    }))).toBe('repo');
 
     expect(getConversationProjectLabel(makeConversation({
       project_name: null,
@@ -58,8 +59,13 @@ describe('conversationIdentity', () => {
 
   it('derives a readable project label from canonical project paths only', () => {
     expect(getProjectDisplayLabel(makeProject({ canonical_path: '/Users/scott/phoenix-ide' }))).toBe('phoenix-ide');
-    expect(getProjectDisplayLabel(makeProject({ canonical_path: '/repo/.phoenix/worktrees/task-123' }))).toBeNull();
+    expect(getProjectDisplayLabel(makeProject({ canonical_path: '/repo/.phoenix/worktrees/task-123' }))).toBe('repo');
     expect(getProjectDisplayLabel(makeProject({ canonical_path: '/tmp/9d1b4cc93b7845228e4fdbe566761f44' }))).toBeNull();
+  });
+
+  it('derives semantic labels for managed and seeded worktree paths', () => {
+    expect(getPathDisplayLabel('/Users/scott/phoenix-ide/.phoenix/worktrees/123e4567-e89b-12d3-a456-426614174000')).toBe('phoenix-ide');
+    expect(getPathDisplayLabel('/Users/scott/phoenix-ide/.phoenix/seed-worktrees/grounding-panel-qa')).toBe('grounding-panel-qa');
   });
 
   it('falls back to semantic title sources when slug is guid-like', () => {

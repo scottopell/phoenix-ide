@@ -1183,7 +1183,7 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('[data-id="project-context"] .conv-project-label')?.textContent).toBe('phoenix-ide');
   });
 
-  it('hides generated worktree project labels on mobile rows', () => {
+  it('uses the repository label instead of a generated worktree identifier on mobile rows', () => {
     const conv = makeConv('generated-project-context', 'generated-project-context', {
       project_name: null,
       cwd: '/repo/.phoenix/worktrees/123e4567-e89b-12d3-a456-426614174000',
@@ -1195,7 +1195,7 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('[data-id="generated-project-context"] .conv-project-label')).toBeNull();
+    expect(container.querySelector('[data-id="generated-project-context"] .conv-project-label')?.textContent).toBe('repo');
   });
 
   it('uses semantic chain and latest-title fallbacks in collapsed mobile chain summaries', () => {

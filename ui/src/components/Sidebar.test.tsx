@@ -300,7 +300,7 @@ describe('Sidebar — active conversation project filter', () => {
     expect(queryByLabelText('Global Recall')).toBeNull();
   });
 
-  it('uses human project labels from canonical paths and rejects generated leaves', async () => {
+  it('uses human project labels from canonical paths and replaces generated leaves with repository names', async () => {
     apiMock.getProjects.mockResolvedValue([
       makeProject('proj-human', '/Users/scott/phoenix-ide'),
       makeProject('proj-generated', '/repo/.phoenix/worktrees/9d1b4cc93b7845228e4fdbe566761f44'),
@@ -326,6 +326,6 @@ describe('Sidebar — active conversation project filter', () => {
       expect(getByRole('button', { name: /phoenix-ide 1/i })).not.toBeNull();
     });
     expect(queryByRole('button', { name: /^9d1b4cc93b7845228e4fdbe566761f44 1$/i })).toBeNull();
-    expect(getByRole('button', { name: /\/repo\/\.phoenix\/worktrees\/9d1b4cc93b7845228e4fdbe566761f44 1/i })).not.toBeNull();
+    expect(getByRole('button', { name: /^repo 1$/i })).not.toBeNull();
   });
 });
