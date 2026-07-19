@@ -1,3 +1,30 @@
+.about-page-freshness {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -8px 0 12px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.about-freshness {
+  display: inline-block;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.about-freshness--current {
+  color: var(--accent-green);
+}
+
+.about-freshness--stale {
+  color: #d99a32;
+}
+
+.about-freshness--unavailable {
+  color: var(--accent-red);
+}
+
 .about-deployment-summary {
   display: grid;
   gap: 16px;

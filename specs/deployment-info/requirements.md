@@ -144,6 +144,21 @@ needed for diagnosis.
 
 ---
 
+### REQ-DEPLOY-002C: Make diagnostic freshness and refresh scope explicit
+
+THE SYSTEM SHALL identify the freshness and sample time of deployment facts,
+resource observations, disk inventory, and release information independently.
+
+WHEN a refresh fails after a successful sample, THE SYSTEM SHALL retain the last
+good value and label it stale rather than removing it. WHEN no successful sample
+exists, THE SYSTEM SHALL label that diagnostic domain unavailable.
+
+THE SYSTEM SHALL label manual refresh controls by scope. Resource observations
+shall continue refreshing only while the page is visible; deployment facts and
+disk inventory shall refresh only on their corresponding explicit actions.
+
+---
+
 ### REQ-DEPLOY-003: Report network binding and TLS configuration
 
 THE SYSTEM SHALL display the address and port the server is bound to

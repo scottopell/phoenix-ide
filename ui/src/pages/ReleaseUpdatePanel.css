@@ -10,6 +10,35 @@
   font-size: 0.86rem;
 }
 
+.release-update__freshness-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.release-update__freshness {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.release-update__freshness--current {
+  color: var(--accent-green);
+}
+
+.release-update__freshness--stale {
+  color: #d99a32;
+}
+
+.release-update__freshness--unavailable {
+  color: var(--accent-red);
+}
+
+.release-update__freshness-row .release-update__hint {
+  margin-top: 0;
+}
+
 .release-update__candidate {
   padding: 14px;
   border: 1px solid var(--border-color);

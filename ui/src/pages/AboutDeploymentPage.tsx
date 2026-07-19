@@ -207,6 +207,21 @@ function DeploymentSummary({ info }: { info: DeploymentInfo }) {
   );
 }
 
+function Freshness({
+  state,
+  sampledAt,
+}: {
+  state: 'loading' | 'current' | 'stale' | 'unavailable';
+  sampledAt: string | undefined;
+}) {
+  const label = state === 'loading' ? 'Loading' : state === 'current' ? 'Current' : state === 'stale' ? 'Stale' : 'Unavailable';
+  return (
+    <span className={`about-freshness about-freshness--${state}`} title={sampledAt ? `Sampled ${formatDateTime(sampledAt)}` : undefined}>
+      {label}{sampledAt ? ` · ${formatDateTime(sampledAt)}` : ''}
+    </span>
+  );
+}
+
 function resourceText(value: number | null, format: (n: number) => string): string {
   return value === null ? 'unavailable' : format(value);
 }
@@ -373,14 +388,20 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
   return (
     <section className="settings-section about-resources-section">
       <div className="settings-section__title-row">
-        <h3 className="settings-section__title">Resources</h3>
+        <div>
+          <h3 className="settings-section__title">Resources</h3>
+          <Freshness
+            state={state.error && state.sample ? 'stale' : state.loading ? 'loading' : state.sample ? 'current' : 'unavailable'}
+            sampledAt={state.sample?.sampled_at}
+          />
+          <div className="settings-section__hint">Refreshes automatically while this page is visible.</div>
+        </div>
         <button
           type="button"
           className="settings-inline-btn"
           onClick={refresh}
-          disabled={state.loading}
         >
-          {state.loading ? 'Refreshing resources…' : 'Refresh resources'}
+          {state.loading ? 'Refresh resources now' : 'Refresh resources'}
         </button>
       </div>
       {state.error && (
@@ -808,19 +829,15 @@ export function AboutDeploymentPage() {
       .finally(() => setCleanupPath(null));
   }, [loadDisk]);
 
-  const load = useCallback(() => {
+  const loadDeployment = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetchResources(true);
-    return Promise.all([
-      api
-        .deploymentInfo()
-        .then((data) => setInfo(data))
-        .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-        .finally(() => setLoading(false)),
-      loadDisk(),
-    ]);
-  }, [fetchResources, loadDisk]);
+    return api
+      .deploymentInfo()
+      .then((data) => setInfo(data))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -847,10 +864,10 @@ export function AboutDeploymentPage() {
               <button
                 type="button"
                 className="settings-inline-btn"
-                onClick={() => { void load(); }}
+                onClick={() => { void loadDeployment(); }}
                 disabled={loading}
               >
-                {loading ? 'Refreshing…' : 'Refresh'}
+                {loading ? 'Refreshing deployment facts…' : 'Refresh deployment facts'}
               </button>
               <button type="button" className="settings-inline-btn" onClick={() => navigate('/')}>
                 Conversations
@@ -858,12 +875,20 @@ export function AboutDeploymentPage() {
             </div>
           </div>
 
-          {error && <div className="settings-section__error">{error}</div>}
+          {error && (
+            <div className="settings-section__error">
+              {info ? `Deployment facts are stale — ${error}` : `Deployment facts unavailable — ${error}`}
+            </div>
+          )}
           {!info && loading && <div className="settings-section__hint">Loading…</div>}
 
           {info && (
             <>
               <DeploymentSummary info={info} />
+              <div className="about-page-freshness" aria-label="Diagnostics freshness">
+                <Freshness state={error ? 'stale' : loading ? 'loading' : 'current'} sampledAt={info.sampled_at} />
+                <span>Deployment facts</span>
+              </div>
 
               <ReleaseUpdatePanel onDeploymentChange={refreshDeployment} />
 
@@ -896,7 +921,13 @@ export function AboutDeploymentPage() {
 
               <section className="settings-section">
                 <div className="settings-section__title-row">
-                  <h3 className="settings-section__title">On disk</h3>
+                  <div>
+                    <h3 className="settings-section__title">On disk</h3>
+                    <Freshness
+                      state={diskError && diskInfo ? 'stale' : diskLoading ? 'loading' : diskInfo ? 'current' : 'unavailable'}
+                      sampledAt={diskInfo?.sampled_at}
+                    />
+                  </div>
                   <button
                     type="button"
                     className="settings-inline-btn"
@@ -906,7 +937,11 @@ export function AboutDeploymentPage() {
                     {diskLoading ? 'Refreshing disk…' : 'Refresh disk'}
                   </button>
                 </div>
-                {diskError && <div className="settings-section__error">{diskError}</div>}
+                {diskError && (
+                  <div className="settings-section__error">
+                    {diskInfo ? `Disk inventory is stale — ${diskError}` : `Disk inventory unavailable — ${diskError}`}
+                  </div>
+                )}
                 {!diskInfo && diskLoading && <div className="settings-section__hint">Loading disk usage…</div>}
                 {diskInfo && (() => {
                   const summary = diskSummary(diskInfo.disk);
@@ -1023,7 +1058,6 @@ export function AboutDeploymentPage() {
                           Reveal actions require viewing this page on the Phoenix host. Cleanup availability is shown separately per worktree.
                         </div>
                       )}
-                      <div className="settings-section__hint">Disk sampled at {formatDateTime(diskInfo.sampled_at)}</div>
                     </>
                   );
                 })()}

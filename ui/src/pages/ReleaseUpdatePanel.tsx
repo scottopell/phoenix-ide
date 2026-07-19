@@ -88,13 +88,17 @@ export function ReleaseUpdatePanel({
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [confirmedIdentity, setConfirmedIdentity] = useState<string | null>(null);
+  const [discoveryCheckedAt, setDiscoveryCheckedAt] = useState<string | null>(null);
   const loadInFlight = useRef(false);
+  const mounted = useRef(false);
+  const discoveryRecorded = useRef(false);
 
   const load = useCallback(async (refresh = false) => {
     if (loadInFlight.current) return;
     loadInFlight.current = true;
     try {
       const next = await api.releaseUpdateSnapshot(refresh);
+      if (!mounted.current) return;
       if (next.preview.kind === 'available') {
         const nextIdentity = `${next.preview.tag}:${next.preview.commit}:${next.preview.asset_sha256}`;
         if (confirmedIdentity !== null && confirmedIdentity !== nextIdentity) {
@@ -102,22 +106,54 @@ export function ReleaseUpdatePanel({
           setConfirmedIdentity(null);
         }
       }
+      if (refresh || !discoveryRecorded.current) {
+        discoveryRecorded.current = true;
+        setDiscoveryCheckedAt(next.sampled_at);
+      }
       setSnapshot(next);
       onDeploymentChange?.(next);
       setError(null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
       loadInFlight.current = false;
     }
   }, [confirmedIdentity, onDeploymentChange]);
 
   useEffect(() => {
+    mounted.current = true;
     void load();
-    const timer = window.setInterval(() => { void load(); }, POLL_MS);
-    return () => window.clearInterval(timer);
+    return () => { mounted.current = false; };
   }, [load]);
+
+  const active = snapshot?.transaction.kind === 'present'
+    && !TERMINAL_STATES.has(snapshot.transaction.state);
+
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const transaction = await api.releaseUpdateTransaction();
+        if (!cancelled && mounted.current) {
+          setSnapshot((current) => current ? { ...current, transaction } : current);
+          setError(null);
+        }
+      } catch (cause) {
+        if (!cancelled && mounted.current) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      }
+      if (!cancelled) timer = window.setTimeout(() => { void poll(); }, POLL_MS);
+    };
+    timer = window.setTimeout(() => { void poll(); }, POLL_MS);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [active]);
 
   const approve = useCallback(async () => {
     if (!snapshot || snapshot.preview.kind !== 'available') return;
@@ -137,36 +173,45 @@ export function ReleaseUpdatePanel({
         snapshot.preview.asset_name,
         snapshot.preview.asset_sha256,
       );
-      setConfirming(false);
+      if (mounted.current) setConfirming(false);
       await load();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setApproving(false);
+      if (mounted.current) setApproving(false);
     }
   }, [confirmedIdentity, load, snapshot]);
 
-  const active = snapshot?.transaction.kind === 'present'
-    && !TERMINAL_STATES.has(snapshot.transaction.state);
   const approvalStatusSafe = snapshot?.transaction.kind === 'none'
     || (snapshot?.transaction.kind === 'present'
       && TERMINAL_STATES.has(snapshot.transaction.state)
       && snapshot.transaction.state !== 'activation_failed_rollback_failed');
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
+  const discoveryFreshness = error && snapshot ? 'stale' : loading ? 'loading' : snapshot ? 'current' : 'unavailable';
 
   return (
     <section className="settings-section release-update" aria-label="Phoenix release updates">
       <div className="settings-section__title-row">
         <div>
           <h3 className="settings-section__title">Phoenix updates</h3>
-          <div className="release-update__hint">Review the latest stable release against the running deployment summary.</div>
+          <div className="release-update__freshness-row">
+            <span className={`release-update__freshness release-update__freshness--${discoveryFreshness}`}>
+              {discoveryFreshness === 'loading' ? 'Loading' : discoveryFreshness === 'current' ? 'Current' : discoveryFreshness === 'stale' ? 'Stale' : 'Unavailable'}
+              {discoveryCheckedAt && ` · ${new Date(discoveryCheckedAt).toLocaleString()}`}
+            </span>
+            <span className="release-update__hint">Release discovery changes only when you check.</span>
+          </div>
         </div>
         <button type="button" className="settings-inline-btn" onClick={() => { setLoading(true); void load(true); }} disabled={loading}>
           {loading ? 'Checking…' : 'Check for updates'}
         </button>
       </div>
 
-      {error && <div className="settings-section__error">{error}</div>}
+      {error && (
+        <div className="settings-section__error">
+          {snapshot ? `Update information is stale — ${error}` : `Update information unavailable — ${error}`}
+        </div>
+      )}
       {!snapshot && loading && <div className="settings-section__hint">Resolving the latest stable published release…</div>}
 
       {snapshot && (
@@ -210,7 +255,7 @@ export function ReleaseUpdatePanel({
               )}
             </div>
           )}
-          {active && <div className="release-update__hint">An approved update is in progress. Phoenix may disconnect while the native backend activates, verifies, or rolls back; this status restores after reconnect.</div>}
+          {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect while the native backend activates, verifies, or rolls back.</div>}
           <TransactionStatus transaction={snapshot.transaction} />
         </>
       )}

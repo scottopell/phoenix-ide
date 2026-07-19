@@ -429,6 +429,10 @@ pub fn create_router(state: AppState) -> Router {
             get(super::release_updates::snapshot),
         )
         .route(
+            "/api/release-updates/transaction",
+            get(super::release_updates::transaction_status),
+        )
+        .route(
             "/api/release-updates/approve",
             post(super::release_updates::approve),
         )

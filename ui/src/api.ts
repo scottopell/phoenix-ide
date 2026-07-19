@@ -5,6 +5,7 @@ import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
+import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
 import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
@@ -1175,6 +1176,12 @@ export const api = {
   async releaseUpdateSnapshot(refresh = false): Promise<ReleaseUpdateSnapshot> {
     const resp = await fetch(`/api/release-updates${refresh ? '?refresh=true' : ''}`);
     if (!resp.ok) throw new Error('Failed to load release update status');
+    return resp.json();
+  },
+
+  async releaseUpdateTransaction(): Promise<ReleaseTransactionStatus> {
+    const resp = await fetch('/api/release-updates/transaction');
+    if (!resp.ok) throw new Error('Failed to load release transaction status');
     return resp.json();
   },
 

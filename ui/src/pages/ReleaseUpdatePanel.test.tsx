@@ -43,7 +43,9 @@ describe('ReleaseUpdatePanel', () => {
     expect(screen.getByText(snapshot.preview.asset_sha256)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Approve and install' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    });
     expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
   });
 
@@ -52,7 +54,27 @@ describe('ReleaseUpdatePanel', () => {
     expect(await screen.findByText('v1.1.0')).toBeInTheDocument();
     expect(screen.queryByText('1.0.0')).not.toBeInTheDocument();
     expect(screen.queryByText(snapshot.current_git_sha)).not.toBeInTheDocument();
-    expect(screen.getByText(/running deployment summary/i)).toBeInTheDocument();
+    expect(screen.getByText(/release discovery changes only when you check/i)).toBeInTheDocument();
+  });
+
+  it('distinguishes unavailable discovery from stale last-good release information', async () => {
+    const fetchMock = vi.mocked(fetch).mockRejectedValue(new Error('GitHub unavailable'));
+    const first = render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/update information unavailable/i)).toBeInTheDocument();
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+    first.unmount();
+
+    fetchMock
+      .mockImplementationOnce(() => json(snapshot))
+      .mockRejectedValueOnce(new Error('GitHub unavailable'));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText('v1.1.0')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    });
+    expect(await screen.findByText(/update information is stale/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Stale ·/)).toBeInTheDocument();
+    expect(screen.getByText('v1.1.0')).toBeInTheDocument();
   });
 
   it('posts the approved tag and full commit', async () => {
@@ -93,6 +115,42 @@ describe('ReleaseUpdatePanel', () => {
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
+  it('polls transaction status only while a deployment is active', async () => {
+    const active = {
+      ...snapshot,
+      transaction: {
+        kind: 'present' as const,
+        transaction_id: 'tx-active', state: 'activating', source_commit: null,
+        release_tag: 'v1.1.0', expected_version: '1.1.0', expected_git_sha: snapshot.preview.commit,
+        created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+      },
+    };
+    const fetchMock = vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      return json(url.endsWith('/transaction') ? active.transaction : active);
+    });
+    const view = render(<ReleaseUpdatePanel />);
+    await screen.findByText(/activating and verifying/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/release-updates/transaction');
+    view.unmount();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not poll release discovery while no deployment is active', async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('distinguishes verified rollback from rollback failure', async () => {
     const rolledBack = {
       ...snapshot,
@@ -111,8 +169,10 @@ describe('ReleaseUpdatePanel', () => {
       ...rolledBack,
       transaction: { ...rolledBack.transaction, state: 'activation_failed_rollback_failed', rollback_failure: 'old runtime unhealthy' },
     }));
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
-    expect(await screen.findByText(/offline recovery required/i)).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    });
+    expect(await screen.findByText(/activation and rollback failed/i)).toBeInTheDocument();
     expect(screen.getByText(/claim remains retained/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
     view.unmount();

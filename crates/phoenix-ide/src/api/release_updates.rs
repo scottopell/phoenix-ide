@@ -586,6 +586,11 @@ fn authority(
     ReleaseUpdateAuthority::Allowed
 }
 
+pub async fn transaction_status(State(state): State<AppState>) -> Json<ReleaseTransactionStatus> {
+    let ownership = installation_ownership::detect(&state.runtime_env).await;
+    Json(read_status(&state, transaction_backend(&ownership)))
+}
+
 pub async fn snapshot(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
