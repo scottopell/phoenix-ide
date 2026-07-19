@@ -817,6 +817,22 @@ Write ADRs for:
 
 Do not rewrite accepted durable-workflow ADR history.
 
+### Legacy spEARS v1 migration gate and order
+
+PR #532 must merge before migrating any legacy design domain whose behavior it changes. It is still open and changes the workflow engine, wake profile, persistence, continuation delivery, runtime recovery, and Bash/tmux resource behavior. Migrating those domains first would encode a moving pre-landing implementation as timeless v2 behavior.
+
+After #532 lands and this branch rebases onto it, migrate the load-bearing legacy domains in bounded commits using the spEARS v2 migration workflow. These migrations are part of the implementation program, not this planning PR:
+
+1. **Projects** (`specs/projects/design.md`, 725 lines) during the WorkScope/environment schema slice. Move WorkScope ownership and environment behavior to requirements/Allium, durable identity rationale to the new ADRs, status to executive, then delete the design doc.
+2. **Permissions** (`specs/permissions/design.md`, 176 lines) during `AuthorityKind`/`EffectiveCapabilities`. Preserve the intent-agnostic deny floor and formalize authority-derived capability behavior without inventing a general token system.
+3. **Bedrock** (`specs/bedrock/design.md`, 1,859 lines) immediately before the new blocking state and decision transitions. This large domain must remain its own bounded migration commit after #532 so wake/delivery/recovery behavior is read from landed code.
+4. **Subagents** (`specs/subagents/design.md`, 252 lines) with delegated authority and WorkScope inheritance. Update active task `13038` so it no longer treats the removed design doc as authority.
+5. **PR association** (`specs/pr-association/design.md`, 129 lines) with the WorkScope FK cutover and plural PR history migration.
+
+For each domain, read requirements/design/executive/Allium and ADR index together, classify every load-bearing paragraph, resolve ambiguities before editing, remove active `design.md` references from code/specs/tasks, delete the migrated design doc, and run the spec authoring pre-flight plus `./dev.py check --lanes spec-shape,allium,spec-anchors,fast`.
+
+Necessary normative edits to Chains, tmux, browser, wake, or other consumers still land with their owning implementation slice, but retiring their large legacy design docs is separately scoped unless that design doc is the only source of a changed invariant. This prevents the WorkScope migration from silently becoming a wholesale migration of every resource/UI spec.
+
 ### Existing normative specs
 
 Update:
@@ -837,7 +853,11 @@ Update:
 
 Each slice must be independently reviewable and leave one authority source.
 
+**Landing gate:** begin implementation only after PR #532 merges and the implementation branch rebases onto its durable-workflow/wake schema. The profile contract and canonical delivery columns from landed main—not this plan's snapshot of the open PR—are authoritative.
+
 ### Slice 1: WorkScope and environment schema replacement
+
+Start with the bounded Projects v2 migration described above; keep it as a distinct commit in this slice so behavioral/spec migration is reviewable independently from schema mechanics.
 
 Deliver as one coordinated migration suite:
 
@@ -876,6 +896,8 @@ This slice is a prerequisite. Implementing authority first would persist a WorkS
 
 ### Slice 2: Runtime role and EffectiveRuntimePosture derivation
 
+Start with the bounded Permissions v2 migration described above.
+
 Deliver:
 
 - typed role contexts;
@@ -894,6 +916,8 @@ Verification:
 - Nono/no-Nono Explore cases remain enforced.
 
 ### Slice 3: Durable authority request and decision backend
+
+Start with the bounded Bedrock v2 migration against landed #532 behavior.
 
 Deliver:
 
@@ -916,6 +940,8 @@ Verification:
 - transcript remains provider-valid in every parked/resumed state.
 
 ### Slice 4: Sub-agent authority and environment parity
+
+Start with the bounded Subagents v2 migration and remove/update active design-doc references.
 
 Deliver:
 
