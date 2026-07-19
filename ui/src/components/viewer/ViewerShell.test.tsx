@@ -1,4 +1,5 @@
 import { render, screen } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { ViewerShell } from './ViewerShell';
 
@@ -40,6 +41,30 @@ describe('ViewerShell mounting boundary', () => {
       'title',
       '/tmp/A deliberately long Markdown filename that must yield to viewer actions.md',
     );
+  });
+
+  it.each(['inline', 'takeover'] as const)('connects %s children before their layout effects run', (mode) => {
+    const connectivity = vi.fn();
+    function LayoutProbe() {
+      useLayoutEffect(() => connectivity(document.querySelector('[data-layout-probe]')?.isConnected), []);
+      return <div data-layout-probe />;
+    }
+
+    render(
+      <ViewerShell
+        mode={mode}
+        ariaLabel="measured viewer"
+        title="Document"
+        noteCount={0}
+        onToggleNotes={vi.fn()}
+        onSend={vi.fn()}
+        onClose={vi.fn()}
+      >
+        <LayoutProbe />
+      </ViewerShell>,
+    );
+
+    expect(connectivity).toHaveBeenCalledWith(true);
   });
 
   it('preserves the scrolled, focused content tree in both presentation directions', () => {
