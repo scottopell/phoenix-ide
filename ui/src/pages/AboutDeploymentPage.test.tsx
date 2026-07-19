@@ -390,6 +390,25 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByLabelText('Current route')).toHaveTextContent('/');
   });
 
+  it('renders independent diagnostics when deployment facts are unavailable', async () => {
+    apiMock.deploymentInfo.mockRejectedValue(new Error('facts offline'));
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk({
+      disk: [{ category: 'database', label: 'Database', path: '/tmp/phoenix.db', size: { kind: 'measured', bytes: 128 } }],
+    }));
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/deployment facts unavailable — facts offline/i)).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Phoenix release updates' })).toBeInTheDocument();
+    expect(await screen.findByText('Managed CPU over time')).toBeInTheDocument();
+    expect(await screen.findByText('Database')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Network & TLS' })).not.toBeInTheDocument();
+  });
+
   it('retains last-good deployment and disk snapshots when scoped refreshes fail', async () => {
     renderPage(deployment(), deploymentDisk({
       disk: [{

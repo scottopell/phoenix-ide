@@ -651,6 +651,7 @@ export function AboutDeploymentPage() {
   const [diskLoading, setDiskLoading] = useState(true);
   const [expandedWorktrees, setExpandedWorktrees] = useState(false);
   const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const [pendingDeploymentSignal, setPendingDeploymentSignal] = useState(0);
   const [cleanupPath, setCleanupPath] = useState<string | null>(null);
   const [resources, setResources] = useState<ResourceState>(EMPTY_RESOURCES);
   const resourcesInFlightRef = useRef(false);
@@ -659,6 +660,7 @@ export function AboutDeploymentPage() {
   const resourcesGenerationRef = useRef(0);
   const identityRefreshRef = useRef<string | null>(null);
   const infoRef = useRef<DeploymentInfo | null>(null);
+  const pendingDeploymentRefreshRef = useRef<Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'> | null>(null);
   infoRef.current = info;
   const activeResourceRequestRef = useRef<ActiveResourceRequest | null>(null);
 
@@ -700,9 +702,13 @@ export function AboutDeploymentPage() {
   const refreshDeployment = useCallback((snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => {
     const identity = `${snapshot.current_version}:${snapshot.current_git_sha}:${JSON.stringify(snapshot.installation_ownership)}`;
     const current = infoRef.current;
+    if (!current) {
+      pendingDeploymentRefreshRef.current = snapshot;
+      setPendingDeploymentSignal((value) => value + 1);
+      return;
+    }
     if (
-      !current
-      || (
+      (
         current.build.version === snapshot.current_version
         && current.build.git_sha === snapshot.current_git_sha
         && JSON.stringify(current.installation_ownership) === JSON.stringify(snapshot.installation_ownership)
@@ -717,6 +723,13 @@ export function AboutDeploymentPage() {
         if (identityRefreshRef.current === identity) identityRefreshRef.current = null;
       });
   }, []);
+
+  useEffect(() => {
+    if (!info || !pendingDeploymentRefreshRef.current) return;
+    const pending = pendingDeploymentRefreshRef.current;
+    pendingDeploymentRefreshRef.current = null;
+    refreshDeployment(pending);
+  }, [info, pendingDeploymentSignal, refreshDeployment]);
 
   const loadDisk = useCallback(() => {
     setDiskLoading(true);
@@ -882,18 +895,22 @@ export function AboutDeploymentPage() {
           )}
           {!info && loading && <div className="settings-section__hint">Loading…</div>}
 
-          {info && (
-            <>
-              <DeploymentSummary info={info} />
-              <div className="about-page-freshness" aria-label="Diagnostics freshness">
-                <Freshness state={error ? 'stale' : loading ? 'loading' : 'current'} sampledAt={info.sampled_at} />
-                <span>Deployment facts</span>
-              </div>
+          <>
+              {info && (
+                <>
+                  <DeploymentSummary info={info} />
+                  <div className="about-page-freshness" aria-label="Diagnostics freshness">
+                    <Freshness state={error ? 'stale' : loading ? 'loading' : 'current'} sampledAt={info.sampled_at} />
+                    <span>Deployment facts</span>
+                  </div>
+                </>
+              )}
 
               <ReleaseUpdatePanel onDeploymentChange={refreshDeployment} />
 
-              <section className="settings-section">
-                <h3 className="settings-section__title">Network &amp; TLS</h3>
+              {info && (
+                <section className="settings-section">
+                  <h3 className="settings-section__title">Network &amp; TLS</h3>
                 <Row label="Bind address"><code>{info.network.bind_address}</code></Row>
                 <Row label="Socket activated">{info.network.socket_activated ? 'yes' : 'no'}</Row>
                 {info.network.tls.enabled ? (
@@ -915,7 +932,8 @@ export function AboutDeploymentPage() {
                 ) : (
                   <Row label="TLS">disabled — serving plain HTTP</Row>
                 )}
-              </section>
+                </section>
+              )}
 
               <ResourceMonitor state={resources} refresh={() => { fetchResources(true); }} />
 
@@ -1000,7 +1018,7 @@ export function AboutDeploymentPage() {
                                         {expandedWorktrees ? 'Hide worktrees' : 'Show worktrees'}
                                       </button>
                                     )}
-                                    {info.local_access && isRevealable(entry.path, entry.size) && (
+                                    {info?.local_access && isRevealable(entry.path, entry.size) && (
                                       <button
                                         type="button"
                                         className="deploy-reveal-btn"
@@ -1053,7 +1071,7 @@ export function AboutDeploymentPage() {
                       </table>
                       {revealError && <div className="settings-section__error">{revealError}</div>}
                       {cleanupError && <div className="settings-section__error">{cleanupError}</div>}
-                      {!info.local_access && (
+                      {info && !info.local_access && (
                         <div className="settings-section__hint">
                           Reveal actions require viewing this page on the Phoenix host. Cleanup availability is shown separately per worktree.
                         </div>
@@ -1063,8 +1081,9 @@ export function AboutDeploymentPage() {
                 })()}
               </section>
 
-              <section className="settings-section">
-                <h3 className="settings-section__title">Logs</h3>
+              {info && (
+                <section className="settings-section">
+                  <h3 className="settings-section__title">Logs</h3>
                 <Row label="stdout">
                   {info.log.stdout ? 'on (captured by the supervising process)' : 'off'}
                 </Row>
@@ -1076,13 +1095,15 @@ export function AboutDeploymentPage() {
                 {!info.log.stdout && !info.log.file && (
                   <div className="settings-section__hint">No log output configured.</div>
                 )}
-              </section>
+                </section>
+              )}
 
-              <div className="settings-section__hint">
-                Sampled at {formatDateTime(info.sampled_at)}
-              </div>
+              {info && (
+                <div className="settings-section__hint">
+                  Sampled at {formatDateTime(info.sampled_at)}
+                </div>
+              )}
             </>
-          )}
         </section>
       </main>
     </div>

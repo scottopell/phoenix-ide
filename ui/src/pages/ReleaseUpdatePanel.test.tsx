@@ -152,6 +152,63 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/release-updates') && !String(input).endsWith('/transaction'))).toHaveLength(2);
   });
 
+  it('keeps active transaction state when a full snapshot transiently reports none', async () => {
+    const active = {
+      ...snapshot,
+      transaction: {
+        kind: 'present' as const, transaction_id: 'tx-active', state: 'activating',
+        source_commit: null, release_tag: 'v1.1.0', expected_version: '1.1.0',
+        expected_git_sha: snapshot.preview.commit, created_at: null, updated_at: null,
+        failure: null, rollback_failure: null, stale: false,
+      },
+    };
+    vi.mocked(fetch)
+      .mockImplementationOnce(() => json(active))
+      .mockImplementationOnce(() => json(snapshot));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }));
+    });
+
+    expect(screen.getByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.getByText(/transaction status is stale/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps approval failures separate from discovery freshness', async () => {
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(snapshot))
+      .mockRejectedValueOnce(new Error('controller handoff failed'));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
+    });
+
+    expect(await screen.findByText(/update approval failed — controller handoff failed/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Current ·/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and install' })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('blocks approval while durable transaction status is stale', async () => {
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      return json(url.endsWith('/transaction') ? { kind: 'unreadable', reason: 'locked' } : snapshot);
+    });
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByText(/transaction status is stale — locked/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+  });
+
   it('posts the approved tag and full commit', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
