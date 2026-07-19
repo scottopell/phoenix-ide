@@ -1261,7 +1261,7 @@ impl WakeRepository {
             .bind(to_i64(head.generation.0, "generation")?)
             .bind(to_i64(head.version.next().0, "declared_workflow_version")?)
             .bind(0_i64)
-            .bind("DeadlineExpiration")
+            .bind("ForgottenInterruption")
             .bind(wake_profile::terminal_codec().family)
             .bind(i64::from(wake_profile::terminal_codec().version))
             .bind(json_blob(&terminal)?)
@@ -4217,6 +4217,7 @@ async fn fetch_receipt_tx(
             "Manual" => ReceiptOrigin::Manual,
             "CancellationArbitration" => ReceiptOrigin::CancellationArbitration,
             "DeadlineExpiration" => ReceiptOrigin::DeadlineExpiration,
+            "ForgottenInterruption" => ReceiptOrigin::ForgottenInterruption,
             "ScheduleCollapse" => ReceiptOrigin::ScheduleCollapse,
             other => {
                 return Err(DbError::Serialization(format!(
@@ -4238,11 +4239,13 @@ async fn fetch_pending_delivery_by_delivery_id_tx(
     workflow_id: WorkflowId,
     delivery_id: DeliveryId,
 ) -> DbResult<Option<LocalDeliveryRecord>> {
-    let row = sqlx::query("SELECT * FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = ?2 AND status = 'Pending'")
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .bind(to_i64(delivery_id.0, "delivery_id")?)
-        .fetch_optional(&mut *tx.tx)
-        .await?;
+    let row = sqlx::query(
+        "SELECT * FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = ?2",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(delivery_id.0, "delivery_id")?)
+    .fetch_optional(&mut *tx.tx)
+    .await?;
     row.as_ref().map(delivery_from_join_row).transpose()
 }
 
@@ -4263,7 +4266,16 @@ fn delivery_from_join_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<LocalDelive
         payload_kind: super::LocalDeliveryPayloadKind::Receipt,
         payload_blob: row.get("payload_blob"),
         requires_runtime_acceptance: row.get("requires_runtime_acceptance"),
-        status: phoenix_workflow::DeliveryStatus::Pending,
+        status: match row.get::<String, _>("status").as_str() {
+            "Pending" => phoenix_workflow::DeliveryStatus::Pending,
+            "Accepted" => phoenix_workflow::DeliveryStatus::Accepted,
+            "Suppressed" => phoenix_workflow::DeliveryStatus::Suppressed,
+            other => {
+                return Err(DbError::Serialization(format!(
+                    "unknown delivery status: {other}"
+                )))
+            }
+        },
         runtime_acceptance_status: match row
             .get::<Option<String>, _>("runtime_acceptance_status")
             .as_deref()

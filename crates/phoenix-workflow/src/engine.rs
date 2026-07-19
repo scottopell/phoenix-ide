@@ -115,6 +115,18 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             &self.binding.acceptance.supported_codecs,
         )
         .map_err(EngineError::InvalidPlan)?;
+        for invalidation in &decision.plan.invalidations {
+            let Some(effect) = self.effects.get(&invalidation.effect_id) else {
+                return Err(EngineError::InvalidPlan(
+                    PlanError::UnknownInvalidationTarget(invalidation.effect_id),
+                ));
+            };
+            if effect.receipt.is_some() {
+                return Err(EngineError::InvalidPlan(
+                    PlanError::InvalidatesReceiptedEffect(invalidation.effect_id),
+                ));
+            }
+        }
         for effect in &decision.plan.effects {
             if self.effects.contains_key(&effect.effect_id) {
                 return Err(EngineError::InvalidPlan(PlanError::EffectIdCollision(
