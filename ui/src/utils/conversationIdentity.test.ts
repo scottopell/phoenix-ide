@@ -113,6 +113,20 @@ describe('conversationIdentity', () => {
     });
   });
 
+  it('prefers worktree_path over cwd for shared path identity', () => {
+    expect(getConversationIdentity(makeConversation({
+      slug: 'task-conversation',
+      project_name: null,
+      worktree_path: '/repo/.phoenix/worktrees/task-78001-redesign-state-bar',
+      cwd: '/repo/.phoenix/worktrees/conv-1',
+    }))).toMatchObject({
+      path: {
+        full: '/repo/.phoenix/worktrees/task-78001-redesign-state-bar',
+        summary: '…/worktrees/task-78001-redesign-state-bar',
+      },
+    });
+  });
+
   it('summarizes conversation paths for mobile cwd display', () => {
     expect(summarizeConversationPath('/Users/scott/projects/phoenix-ide')).toBe('…/projects/phoenix-ide');
     expect(summarizeConversationPath('/repo')).toBe('/repo');

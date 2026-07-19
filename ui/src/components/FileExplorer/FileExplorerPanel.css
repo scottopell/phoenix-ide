@@ -53,6 +53,7 @@
   white-space: nowrap;
   font-size: 11px;
   color: var(--text-muted);
+  font-family: var(--font-mono);
 }
 
 .fe-toggle {

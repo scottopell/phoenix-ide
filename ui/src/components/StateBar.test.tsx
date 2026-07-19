@@ -1005,6 +1005,21 @@ describe('StateBar desktop identity layout', () => {
     expect(screen.getByText('feature/existing-branch')).toBeInTheDocument();
     expect(screen.getByText('develop')).toBeInTheDocument();
   });
+  it('prefers worktree_path for desktop project tooltip metadata', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        slug: 'proj-slug',
+        task_title: null,
+        branch_name: null,
+        base_branch: null,
+        cwd: '/repo/.phoenix/worktrees/conv-1',
+        worktree_path: '/Users/scott/projects/phoenix-ide',
+        project_name: null,
+      }),
+    });
+
+    expect(screen.getByText('phoenix-ide')).toHaveAttribute('title', '/Users/scott/projects/phoenix-ide');
+  });
 });
 
 describe('StateBar mobile layout', () => {
@@ -1022,6 +1037,7 @@ describe('StateBar mobile layout', () => {
         slug: 'explore-long-project',
         conv_mode_label: 'Explore',
         cwd: '/Users/scott/projects/phoenix-ide',
+        worktree_path: null,
         branch_name: null,
         base_branch: 'main',
         task_title: null,
@@ -1107,6 +1123,7 @@ describe('StateBar mobile layout', () => {
       conversation: makeConversation({
         conv_mode_label: 'Direct',
         cwd: '/Users/scott/projects/direct-project',
+        worktree_path: null,
         branch_name: null,
         base_branch: null,
         task_title: null,

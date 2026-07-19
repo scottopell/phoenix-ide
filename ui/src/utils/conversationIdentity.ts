@@ -23,6 +23,10 @@ export interface ConversationPathIdentity {
   summary: string;
 }
 
+function conversationRootPath(conversation: Pick<Conversation, 'worktree_path' | 'cwd'>): string | null {
+  return conversation.worktree_path?.trim() || conversation.cwd?.trim() || null;
+}
+
 export interface ConversationIdentity {
   title: string;
   projectLabel: string | null;
@@ -106,7 +110,7 @@ export function getProjectDisplayLabel(project: Pick<Project, 'canonical_path'>)
 
 export function getConversationProjectLabel(conversation: Pick<Conversation, 'project_name' | 'worktree_path' | 'cwd'>): string | null {
   if (!isLowValueIdentifier(conversation.project_name)) return conversation.project_name!.trim();
-  return projectLabelFromPath(conversation.worktree_path || conversation.cwd);
+  return projectLabelFromPath(conversationRootPath(conversation));
 }
 
 export function summarizeConversationPath(path: string | null | undefined): string {
@@ -153,8 +157,8 @@ export function getConversationIdentity(
       base: conversation.base_branch?.trim() || null,
     },
     path: {
-      full: conversation.cwd?.trim() || null,
-      summary: summarizeConversationPath(conversation.cwd),
+      full: conversationRootPath(conversation),
+      summary: summarizeConversationPath(conversationRootPath(conversation)),
     },
     mode: modeIdentity(conversation.conv_mode_label),
     modelLabel: conversation.model,
