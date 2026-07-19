@@ -9873,6 +9873,9 @@ html * {
 /* Rich HUD (OSC 133 detected) — inline spans inside .terminal-panel-prompt */
 .terminal-hud-cwd {
   color: var(--accent-blue, #58a6ff);
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .terminal-hud-sep {
