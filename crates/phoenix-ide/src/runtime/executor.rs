@@ -1674,8 +1674,10 @@ where
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
-    /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
+    /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection.
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Active provider attempt retained outside the task for cancellation metrics.
+    active_llm_attempt: Option<phoenix_llm::LlmAttemptCapture>,
     /// Abort handle for the in-flight retry-backoff timer spawned by
     /// `Effect::ScheduleRetry`. Kept so a transition out of the
     /// retry-scheduling state can proactively abort the timer task before it
@@ -1929,6 +1931,7 @@ where
             broadcast_tx,
             tool_cancel_token: None,
             llm_task_handle: None,
+            active_llm_attempt: None,
             retry_timer_handle: None,
             turn_span: None,
             turn_trigger: super::TurnTriggerSlot::default(),
@@ -2180,6 +2183,8 @@ where
                     }
                 }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                    self.llm_task_handle = None;
+                    self.active_llm_attempt = None;
                     // Generation guard for the LLM request, mirroring the
                     // `RetryTimeout` guard above. A `forward_llm_outcome` send
                     // whose generation has been superseded (by a later dispatch
@@ -4097,6 +4102,14 @@ where
                 if let Some(handle) = self.llm_task_handle.take() {
                     handle.abort();
                 }
+                if let Some(capture) = self.active_llm_attempt.take() {
+                    if let Some(metrics) = capture.finalize_cancelled() {
+                        if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await
+                        {
+                            tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics");
+                        }
+                    }
+                }
                 Ok(None)
             }
 
@@ -4507,6 +4520,21 @@ where
             }
         });
 
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+        let task_attempt_capture = attempt_capture.clone();
+        let pending_telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: conv_id.clone(),
+            root_conversation_id: root_conv_id.clone(),
+            request_id: request_id.clone(),
+            retry_attempt,
+            attempt_capture: attempt_capture.clone(),
+        };
+        attempt_capture.begin(
+            &pending_telemetry,
+            "unknown",
+            &model_id,
+            phoenix_llm::LlmTransport::HttpSse,
+        );
         let forwarder_abort = forwarder_handle.abort_handle();
         let handle = tokio::spawn(async move {
             // Tokio cancellation is not recursive. Aborting the request must
@@ -4598,7 +4626,7 @@ where
                 system.push(SystemContent::new(capsule));
             }
 
-            let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+            let attempt_capture = task_attempt_capture;
             let request = LlmRequest {
                 system,
                 messages,
@@ -4725,6 +4753,7 @@ where
 
             let _ = llm_tx.send(llm_outcome);
         }.instrument(turn_span));
+        self.active_llm_attempt = Some(attempt_capture);
         self.llm_task_handle = Some(handle);
 
         // Forward the typed outcome, generation-tagged — a dropped sender
@@ -5368,6 +5397,7 @@ where
                 content: vec![ContentBlock::text(&continuation_prompt)],
             });
 
+            let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
             // Build a tool-less request
             let request = LlmRequest {
                 messages,
@@ -5381,7 +5411,7 @@ where
                     root_conversation_id: root_conv_id,
                     request_id,
                     retry_attempt: 1,
-                    attempt_capture: phoenix_llm::LlmAttemptCapture::new(),
+                    attempt_capture: attempt_capture.clone(),
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
@@ -5389,7 +5419,14 @@ where
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
 
-            match llm_client.complete(&request).await {
+            let result = llm_client.complete(&request).await;
+            if let Some(metrics) = attempt_capture.finalized() {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
+                }
+            }
+
+            match result {
                 Ok(response) => {
                     // Extract the text content as summary
                     let summary = response

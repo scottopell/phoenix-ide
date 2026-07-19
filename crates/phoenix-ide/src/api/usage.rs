@@ -449,7 +449,6 @@ fn build_histogram(per_turn_totals: &[i64]) -> Vec<HistogramBucket> {
 }
 
 const TTFT_WINDOW_DAYS: i64 = 14;
-const TTFT_ROW_LIMIT: i64 = 20_000;
 const TTFT_THRESHOLDS_MS: &[u64] = &[2_000, 5_000, 10_000, 30_000];
 
 #[derive(Debug, Clone, Default)]
@@ -692,7 +691,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
     let ttft_since = (now - Duration::days(TTFT_WINDOW_DAYS - 1)).date_naive();
     let ttft_rows = match state
         .db
-        .usage_recent_llm_metrics(&format!("{ttft_since}T00:00:00+00:00"), TTFT_ROW_LIMIT)
+        .usage_recent_llm_metrics(&format!("{ttft_since}T00:00:00+00:00"))
         .await
     {
         Ok(r) => r,

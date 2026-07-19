@@ -186,12 +186,19 @@ function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
   const firstAttemptRows = data.provider_rows.filter((row) => row.attempt_scope === 'first_attempt');
   const retryRows = data.provider_rows.filter((row) => row.attempt_scope === 'retry');
   const groupedRows = data.grouped_rows;
-  const trend = data.daily_trend.map((row) => ({
-    day: row.day,
-    scope: attemptScopeLabel(row.attempt_scope),
-    p50: row.percentiles.p50_ms,
-    samples: row.sample_count,
-  }));
+  const trend = Array.from(new Set(data.daily_trend.map((row) => row.day))).map((day) => {
+    const firstAttempt = data.daily_trend.find(
+      (row) => row.day === day && row.attempt_scope === 'first_attempt',
+    );
+    const retry = data.daily_trend.find((row) => row.day === day && row.attempt_scope === 'retry');
+    return {
+      day,
+      firstAttemptP50: firstAttempt?.percentiles.p50_ms ?? null,
+      firstAttemptSamples: firstAttempt?.sample_count ?? 0,
+      retryP50: retry?.percentiles.p50_ms ?? null,
+      retrySamples: retry?.sample_count ?? 0,
+    };
+  });
   const topFirstAttempt = firstAttemptRows[0] ?? null;
   const topRetry = retryRows[0] ?? null;
   const observed = data.sample_count + data.no_token_success_count + data.error_count;
@@ -254,11 +261,39 @@ function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
                 <XAxis dataKey="day" {...AXIS} minTickGap={32} />
                 <YAxis tickFormatter={(v: number) => fmtLatency(v)} width={56} {...AXIS} />
                 <Tooltip
-                  formatter={(v: unknown, name: unknown, item: { payload?: { samples?: number } }) => [fmtLatency(numOf(v)), `${String(name)} · ${Math.round(item.payload?.samples ?? 0)} samples`]}
+                  formatter={(
+                    v: unknown,
+                    name: unknown,
+                    item: {
+                      dataKey?: unknown;
+                      payload?: { firstAttemptSamples?: number; retrySamples?: number };
+                    },
+                  ) => {
+                    const samples =
+                      item.dataKey === 'retryP50'
+                        ? item.payload?.retrySamples
+                        : item.payload?.firstAttemptSamples;
+                    return [fmtLatency(numOf(v)), `${String(name)} · ${Math.round(samples ?? 0)} samples`];
+                  }}
                   contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
                 />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="p50" name="Median TTFT" stroke="var(--accent-blue)" dot={false} connectNulls />
+                <Line
+                  type="monotone"
+                  dataKey="firstAttemptP50"
+                  name="First attempt"
+                  stroke="var(--accent-blue)"
+                  dot={false}
+                  connectNulls
+                />
+                <Line
+                  type="monotone"
+                  dataKey="retryP50"
+                  name="Retry"
+                  stroke="var(--accent-yellow)"
+                  dot={false}
+                  connectNulls
+                />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -626,11 +661,12 @@ export function UsagePage() {
 
           {error && <div className="settings-section__error">{error}</div>}
           {!data && loading && <div className="settings-section__hint">Loading…</div>}
-          {empty && <div className="settings-section__hint">No usage recorded yet.</div>}
+          {empty && <div className="settings-section__hint">No token usage recorded yet.</div>}
+
+          {data && <TtftHero data={data.ttft} />}
 
           {data && !empty && (
             <>
-              <TtftHero data={data.ttft} />
 
               <div className="usage-kpis">
                 <KpiCard label="Today" totals={data.windows.today} />

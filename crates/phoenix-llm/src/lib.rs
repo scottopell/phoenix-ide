@@ -399,6 +399,14 @@ impl LoggingService {
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, false);
+        if let Some(telemetry) = &request.telemetry {
+            telemetry.attempt_capture.begin(
+                telemetry,
+                self.provider,
+                &self.model_id,
+                self.fallback_transport_for(false),
+            );
+        }
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
@@ -438,6 +446,14 @@ impl LlmService for LoggingService {
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, true);
+        if let Some(telemetry) = &request.telemetry {
+            telemetry.attempt_capture.begin(
+                telemetry,
+                self.provider,
+                &self.model_id,
+                self.fallback_transport_for(true),
+            );
+        }
         let start = std::time::Instant::now();
 
         let result = self

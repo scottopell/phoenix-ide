@@ -117,7 +117,30 @@ describe('UsagePage TTFT hero', () => {
     expect(screen.getByText('Best-covered first-attempt provider')).toBeInTheDocument();
     expect(screen.getByText('Retry behavior')).toBeInTheDocument();
     expect(screen.getByText('Provider / model / transport comparison')).toBeInTheDocument();
+    expect(screen.getAllByText('First attempt').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Retry').length).toBeGreaterThan(0);
     expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
+  });
+
+  it('renders TTFT observations when token usage is empty', async () => {
+    vi.mocked(api.usageOverview).mockResolvedValue({
+      ...overview,
+      windows: {
+        ...overview.windows,
+        all: { ...overview.windows.all, total_tokens: 0, turns: 0 },
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <UsagePage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Time to first token')).toBeInTheDocument());
+    expect(screen.getByText('No token usage recorded yet.')).toBeInTheDocument();
+    expect(screen.getByText('TTFT samples')).toBeInTheDocument();
+    expect(screen.getByText('No-token success')).toBeInTheDocument();
   });
 
   it('shows request failures', async () => {

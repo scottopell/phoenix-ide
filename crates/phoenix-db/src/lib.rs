@@ -7239,7 +7239,7 @@ impl Database {
             .collect()
     }
 
-    /// Returns the newest provider-attempt analytics rows within a bounded window.
+    /// Returns every provider-attempt analytics row in the requested time window.
     ///
     /// # Errors
     ///
@@ -7247,18 +7247,15 @@ impl Database {
     pub async fn usage_recent_llm_metrics(
         &self,
         since_rfc3339: &str,
-        limit: i64,
     ) -> DbResult<Vec<UsageRecentLlmMetricRow>> {
         let rows = sqlx::query(
             "SELECT request_id, retry_attempt, provider, model, transport, \
              dispatch_to_first_generation_event_ms, outcome, created_at \
              FROM llm_request_metrics \
              WHERE created_at >= ?1 \
-             ORDER BY created_at DESC, request_id DESC, retry_attempt DESC \
-             LIMIT ?2",
+             ORDER BY created_at DESC, request_id DESC, retry_attempt DESC",
         )
         .bind(since_rfc3339)
-        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -14930,8 +14927,9 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn usage_recent_llm_metrics_returns_bounded_recent_rows() {
+    async fn usage_recent_llm_metrics_returns_all_window_rows() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-ttft", "slug-ttft", "/tmp", true, None, None)
             .await
@@ -15013,28 +15011,38 @@ mod tests {
         db.upsert_llm_request_metrics(&replacement).await.unwrap();
 
         let rows = db
-            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00", 1)
+            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00")
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "limit should bound returned rows");
-        assert_eq!(rows[0].request_id, "req-1");
-        assert_eq!(rows[0].retry_attempt, 1);
-        assert_eq!(rows[0].provider, "anthropic");
-        assert_eq!(rows[0].model, "claude-sonnet-5");
-        assert_eq!(rows[0].transport, LlmTransport::HttpSse);
-        assert_eq!(rows[0].dispatch_to_first_generation_event_ms, Some(910));
-        assert_eq!(rows[0].outcome, LlmAttemptOutcome::Success);
+        assert_eq!(
+            rows.len(),
+            2,
+            "all rows in the analytics window are returned"
+        );
+        let updated = rows
+            .iter()
+            .find(|row| row.request_id == "req-1")
+            .expect("updated request row");
+        assert_eq!(updated.retry_attempt, 1);
+        assert_eq!(updated.provider, "anthropic");
+        assert_eq!(updated.model, "claude-sonnet-5");
+        assert_eq!(updated.transport, LlmTransport::HttpSse);
+        assert_eq!(updated.dispatch_to_first_generation_event_ms, Some(910));
+        assert_eq!(updated.outcome, LlmAttemptOutcome::Success);
 
         let all_rows = db
-            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00", 10)
+            .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00")
             .await
             .unwrap();
         assert_eq!(all_rows.len(), 2);
-        assert_eq!(all_rows[1].request_id, "req-2");
-        assert_eq!(all_rows[1].retry_attempt, 2);
-        assert_eq!(all_rows[1].transport, LlmTransport::HttpJson);
-        assert_eq!(all_rows[1].dispatch_to_first_generation_event_ms, None);
-        assert_eq!(all_rows[1].outcome, LlmAttemptOutcome::ServerError);
+        let failed = all_rows
+            .iter()
+            .find(|row| row.request_id == "req-2")
+            .expect("failed retry row");
+        assert_eq!(failed.retry_attempt, 2);
+        assert_eq!(failed.transport, LlmTransport::HttpJson);
+        assert_eq!(failed.dispatch_to_first_generation_event_ms, None);
+        assert_eq!(failed.outcome, LlmAttemptOutcome::ServerError);
     }
 
     #[tokio::test]

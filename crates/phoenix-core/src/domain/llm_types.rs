@@ -163,7 +163,20 @@ pub struct LlmAttemptCapture(Arc<Mutex<LlmAttemptCaptureState>>);
 struct LlmAttemptCaptureState {
     progress: Option<ProviderStreamTelemetry>,
     transport: Option<LlmTransport>,
+    identity: Option<LlmAttemptIdentity>,
     finalized: Option<LlmAttemptMetrics>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmAttemptIdentity {
+    conversation_id: String,
+    root_conversation_id: String,
+    request_id: String,
+    retry_attempt: u32,
+    provider: String,
+    model: String,
+    fallback_transport: LlmTransport,
+    started_at: std::time::Instant,
 }
 
 impl Default for LlmAttemptCapture {
@@ -188,6 +201,54 @@ impl LlmAttemptCapture {
         if let Ok(mut state) = self.0.lock() {
             state.transport = Some(transport);
         }
+    }
+
+    pub fn begin(
+        &self,
+        telemetry: &LlmRequestTelemetry,
+        provider: &str,
+        model: &str,
+        fallback_transport: LlmTransport,
+    ) {
+        if let Ok(mut state) = self.0.lock() {
+            state.identity = Some(LlmAttemptIdentity {
+                conversation_id: telemetry.conversation_id.clone(),
+                root_conversation_id: telemetry.root_conversation_id.clone(),
+                request_id: telemetry.request_id.clone(),
+                retry_attempt: telemetry.retry_attempt,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                fallback_transport,
+                started_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn finalize_cancelled(&self) -> Option<LlmAttemptMetrics> {
+        let mut state = self.0.lock().ok()?;
+        if let Some(metrics) = state.finalized.clone() {
+            return Some(metrics);
+        }
+        let identity = state.identity.clone()?;
+        let metrics = LlmAttemptMetrics {
+            conversation_id: identity.conversation_id,
+            root_conversation_id: identity.root_conversation_id,
+            request_id: identity.request_id,
+            retry_attempt: identity.retry_attempt,
+            provider: identity.provider,
+            model: identity.model,
+            transport: state.transport.unwrap_or(identity.fallback_transport),
+            total_duration_ms: u64::try_from(identity.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            stream: state
+                .progress
+                .clone()
+                .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
+            outcome: LlmAttemptOutcome::Cancelled,
+        };
+        state.finalized = Some(metrics.clone());
+        Some(metrics)
     }
 
     #[must_use]
@@ -616,3 +677,44 @@ impl Usage {
 // ContentBlock serde and tool_uses() invariants are covered by property tests
 // in src/llm/proptests.rs: prop_content_block_serde_round_trip,
 // prop_content_block_type_tag_valid, prop_tool_uses_only_returns_tool_use.
+
+#[cfg(test)]
+mod attempt_capture_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_attempt_preserves_partial_provider_progress() {
+        let capture = LlmAttemptCapture::new();
+        let telemetry = LlmRequestTelemetry {
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            request_id: "request".to_string(),
+            retry_attempt: 2,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::HttpSse);
+        capture.set_transport(LlmTransport::Websocket);
+        capture.publish_progress(ProviderStreamTelemetry {
+            dispatch_to_first_provider_event_ms: Some(10),
+            dispatch_to_first_generation_event_ms: Some(20),
+            dispatch_to_first_visible_text_ms: None,
+            provider_event_count: 3,
+            generation_event_count: 1,
+            visible_text_event_count: 0,
+            max_provider_gap_ms: Some(10),
+            max_generation_gap_ms: None,
+            output_kind: StreamTelemetryOutputKind::Reasoning,
+            completed: false,
+        });
+
+        let metrics = capture.finalize_cancelled().expect("started attempt");
+        assert_eq!(metrics.outcome, LlmAttemptOutcome::Cancelled);
+        assert_eq!(metrics.transport, LlmTransport::Websocket);
+        assert_eq!(metrics.stream.provider_event_count, 3);
+        assert_eq!(
+            metrics.stream.dispatch_to_first_generation_event_ms,
+            Some(20)
+        );
+        assert!(!metrics.stream.completed);
+    }
+}
