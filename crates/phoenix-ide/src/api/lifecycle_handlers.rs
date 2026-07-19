@@ -371,11 +371,10 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved_for_conversation(&id)
+    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
-        .is_empty()
     {
         return Err(AppError::Conflict(Box::new(
             crate::api::ConflictErrorResponse::new(
@@ -669,11 +668,10 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved_for_conversation(&id)
+    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
-        .is_empty()
     {
         return Err(AppError::Conflict(Box::new(
             crate::api::ConflictErrorResponse::new(

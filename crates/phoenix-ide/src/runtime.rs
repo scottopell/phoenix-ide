@@ -2045,9 +2045,13 @@ impl RuntimeManager {
             return;
         };
         let manager = Arc::clone(self);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            crate::runtime::wake::run(manager, rx).await;
+            crate::runtime::wake::run(manager, rx, ready_tx).await;
         });
+        if ready_rx.await.is_err() {
+            tracing::warn!("wake worker stopped before startup reconciliation completed");
+        }
         self.kick_wake_worker();
     }
 

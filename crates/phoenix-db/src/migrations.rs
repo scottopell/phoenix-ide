@@ -781,7 +781,7 @@ FOR EACH ROW
 WHEN NOT (
     (NEW.status = 'Idle' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NULL) OR
     (NEW.status = 'Due' AND NEW.due_occurrence_id IS NOT NULL AND NEW.active_occurrence_id IS NULL) OR
-    (NEW.status = 'Active' AND NEW.active_occurrence_id IS NOT NULL)
+    (NEW.status = 'Active' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NOT NULL)
 )
 BEGIN
     SELECT RAISE(ABORT, 'workflow_schedules occurrence shape mismatch');
@@ -793,7 +793,7 @@ FOR EACH ROW
 WHEN NOT (
     (NEW.status = 'Idle' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NULL) OR
     (NEW.status = 'Due' AND NEW.due_occurrence_id IS NOT NULL AND NEW.active_occurrence_id IS NULL) OR
-    (NEW.status = 'Active' AND NEW.active_occurrence_id IS NOT NULL)
+    (NEW.status = 'Active' AND NEW.due_occurrence_id IS NULL AND NEW.active_occurrence_id IS NOT NULL)
 )
 BEGIN
     SELECT RAISE(ABORT, 'workflow_schedules occurrence shape mismatch');

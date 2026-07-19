@@ -104,7 +104,11 @@ impl WakeRegistrar for ProductionWakeRegistrar {
     }
 }
 
-pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u64>) {
+pub(crate) async fn run(
+    manager: Arc<RuntimeManager>,
+    kick_rx: watch::Receiver<u64>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+) {
     let worker = WakeWorker::new(
         WakeRepository::new(manager.db().pool().clone()),
         Arc::new(RuntimeRegistryInspector::new(
@@ -114,7 +118,10 @@ pub(crate) async fn run(manager: Arc<RuntimeManager>, kick_rx: watch::Receiver<u
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = worker.run_loop_with_manager(kick_rx, manager).await {
+    if let Err(error) = worker
+        .run_loop_with_manager(kick_rx, manager, ready_tx)
+        .await
+    {
         tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
     }
 }
@@ -146,7 +153,11 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         &self,
         mut kick_rx: watch::Receiver<u64>,
         manager: Arc<RuntimeManager>,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), String> {
+        self.run_once().await?;
+        deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        let _ = ready_tx.send(());
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
 
@@ -237,7 +248,11 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             for candidate in candidates {
                 cursor = Some(candidate.workflow_id);
                 saw_candidate = true;
-                let claim_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
+                let claim_until = LeaseExpiry(
+                    now.0
+                        .saturating_add(LEASE_DURATION.as_secs())
+                        .min(candidate.expires_at.0.saturating_add(1)),
+                );
                 match self
                     .repo
                     .claim_observation_if_eligible(

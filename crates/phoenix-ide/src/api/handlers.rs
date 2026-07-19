@@ -3937,6 +3937,40 @@ async fn continue_conversation(
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
 
+    async fn transfer_direct_work_scope(
+        runtime: &std::sync::Arc<crate::runtime::RuntimeManager>,
+        parent: &crate::db::Conversation,
+        continuation: &crate::db::Conversation,
+    ) -> Result<(), AppError> {
+        if parent.conv_mode.worktree_path().is_some()
+            || continuation.conv_mode.worktree_path().is_some()
+        {
+            return Ok(());
+        }
+        let old_scope = phoenix_core::work_scope::WorkScope::Conversation(parent.id.clone());
+        let new_scope = phoenix_core::work_scope::WorkScope::Conversation(continuation.id.clone());
+        runtime
+            .bash_handles()
+            .rekey_scope(&old_scope, &new_scope)
+            .await;
+        runtime
+            .tmux_registry()
+            .rekey_scope(&old_scope, &new_scope)
+            .await;
+        runtime
+            .browser_sessions()
+            .rekey_scope(&old_scope, &new_scope)
+            .await;
+        Ok(())
+    }
+
+    let parent = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+
     if req.handoff.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Continuation handoff must not be empty.".to_string(),
@@ -3962,6 +3996,7 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
+            transfer_direct_work_scope(&state.runtime, &parent, &new_conv).await?;
             crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
                 .transfer_active_for_continuation(
                     &id,
@@ -4012,6 +4047,7 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
+            transfer_direct_work_scope(&state.runtime, &parent, &existing).await?;
             crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone())
                 .transfer_active_for_continuation(
                     &id,
@@ -4236,11 +4272,10 @@ async fn archive_conversation(
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved_for_conversation(id)
+    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
-        .is_empty()
     {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation has pending background work",
@@ -4520,11 +4555,10 @@ async fn delete_conversation(
 /// (see `Internal` variant) — bash / tmux / projects cleanup failures
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    if !phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved_for_conversation(id)
+    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
-        .is_empty()
     {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Conversation has pending background work",

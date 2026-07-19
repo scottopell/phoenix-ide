@@ -230,6 +230,7 @@ pub struct WakeObservationCandidateRow {
     pub conversation_id: String,
     pub contract_id: String,
     pub reason: WakeObservationCandidateReason,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1870,6 +1871,31 @@ impl WakeRepository {
         Ok(out)
     }
 
+    pub async fn has_owed_work_for_conversation(&self, conversation_id: &str) -> DbResult<bool> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let owed = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM wake_bindings b
+                JOIN workflows w ON w.workflow_id = b.workflow_id
+                WHERE b.conversation_id = ?1
+                  AND (
+                    (w.status = 'Active' AND b.resolved_at IS NULL)
+                    OR EXISTS (
+                        SELECT 1 FROM workflow_deliveries d
+                        WHERE d.workflow_id = b.workflow_id
+                          AND (d.status = 'Pending' OR d.runtime_acceptance_status = 'Owed')
+                    )
+                  )
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx.tx)
+        .await?
+            != 0;
+        tx.commit().await?;
+        Ok(owed)
+    }
+
     pub async fn list_observation_candidates(
         &self,
         now: Timestamp,
@@ -1878,7 +1904,7 @@ impl WakeRepository {
     ) -> DbResult<Vec<WakeObservationCandidateRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let rows = sqlx::query(
-            "SELECT b.workflow_id, b.conversation_id, b.contract_id,
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at,
                     CASE
                       WHEN EXISTS (
                         SELECT 1 FROM workflow_attempts a
@@ -1936,6 +1962,7 @@ impl WakeRepository {
                     conversation_id: row.get("conversation_id"),
                     contract_id: row.get("contract_id"),
                     reason,
+                    expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
                 })
             })
             .collect::<DbResult<Vec<_>>>()?;
@@ -2392,6 +2419,17 @@ impl WakeRepository {
         .bind(&input.from_conversation_id)
         .execute(&mut *tx.tx)
         .await?;
+
+        if binding.registration_scope.kind == wake_types::WorkScopeKind::Conversation
+            && binding.registration_scope.stable_key
+                == format!("conversation:{}", input.from_conversation_id)
+        {
+            sqlx::query("UPDATE wake_bindings SET scope_stable_key = ?2 WHERE workflow_id = ?1")
+                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+                .bind(format!("conversation:{}", input.to_conversation_id))
+                .execute(&mut *tx.tx)
+                .await?;
+        }
 
         #[cfg(test)]
         maybe_fail_after_transfer_binding_update(self.failpoint_namespace, input.workflow_id)?;
