@@ -6,11 +6,13 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
+import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
 import { MessageList } from './MessageList';
 import type { HistoryScrollCommand } from '../conversation/historyExpansion';
 import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
+import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 // MessageList now subscribes to the conversation store for
 // useStreamingStartedAt (session-stable key). Wrap renders in a
@@ -38,8 +40,15 @@ function PushScopeOnMount({ scopeId, children }: { scopeId: string; children: Re
 // real component, so this counts actual re-renders — the render-unit
 // identity regression test (task 58044) asserts state ticks don't bump it.
 const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
+const agentMessageMockState = vi.hoisted(() => ({ autoHandleReveal: true }));
 const agentMessageProps = vi.hoisted(
-  () => [] as Array<{ message: Message; forceExpandedText: boolean | undefined; isLatestAgentMessage: boolean | undefined }>,
+  () => [] as Array<{
+    message: Message;
+    forceExpandedText: boolean | undefined;
+    isLatestAgentMessage: boolean | undefined;
+    revealRequest?: AgentTextRevealRequest | null;
+    activeHighlight?: AgentTextHighlight | null;
+  }>,
 );
 
 vi.mock('./MessageComponents', async () => {
@@ -51,10 +60,17 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null; onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined }) => {
       agentRenderCounter.count++;
-      agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
-      return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
+      agentMessageProps.push({
+        message,
+        forceExpandedText,
+        isLatestAgentMessage,
+        ...(revealRequest !== undefined ? { revealRequest } : {}),
+        ...(activeHighlight !== undefined ? { activeHighlight } : {}),
+      });
+      if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+      return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
       <div data-testid="subagent-status-mock">
@@ -71,6 +87,9 @@ vi.mock('./MessageComponents', async () => {
         </span>
       );
     },
+    renderHighlightedText: (text: string, start: number, end: number) => (
+      <>{text.slice(0, start)}<mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(start, end)}</mark>{text.slice(end)}</>
+    ),
     formatMessageTime: () => '12:00',
   };
 });
@@ -131,6 +150,7 @@ beforeEach(() => {
   virtualTranscriptMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
+  agentMessageMockState.autoHandleReveal = true;
 });
 
 vi.mock('./VirtualTranscript', async () => {
@@ -328,6 +348,87 @@ describe('MessageList', () => {
     expect(escape.defaultPrevented).toBe(false);
   });
 
+  it('falls back to the live transcript when the find focus origin was virtualized away', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-detached"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-detached', generation: 1, transcriptGeneration: 1 } }}
+      />,
+    ));
+
+    const transcript = screen.getByTestId('mock-virtual-transcript');
+    const opener = document.createElement('button');
+    transcript.appendChild(opener);
+    opener.focus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    await screen.findByRole('textbox', { name: 'Find in viewer' });
+    opener.remove();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(transcript).toHaveFocus());
+  });
+
+  it('clears an unhandled reveal request when the query clears its active match', async () => {
+    agentMessageMockState.autoHandleReveal = false;
+    const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'hidden alpha match' }] } as Message;
+    render(withConvContext(
+      <MessageList
+        messages={[message]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-pending-reveal"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-pending-reveal', generation: 1, transcriptGeneration: 1 } }}
+      />,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    await waitFor(() => expect(
+      [...agentMessageProps].reverse().find((entry) => entry.revealRequest)?.revealRequest,
+    ).toBeTruthy());
+
+    fireEvent.change(input, { target: { value: '' } });
+
+    await waitFor(() => expect(agentMessageProps.at(-1)?.revealRequest).toBeUndefined());
+    expect(input).toBeInTheDocument();
+  });
+
+  it('clears a pending reveal request when navigation moves to a header target', async () => {
+    agentMessageMockState.autoHandleReveal = false;
+    const message = { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha row match' }] } as Message;
+    render(withConvContext(
+      <MessageList
+        messages={[message]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-header-clears-reveal"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-header-clears-reveal', generation: 1, transcriptGeneration: 1 } }}
+        systemPrompt="alpha header match"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    fireEvent.change(await screen.findByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect([...agentMessageProps].reverse().find((entry) => entry.revealRequest)?.revealRequest).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    await waitFor(() => expect(agentMessageProps.at(-1)?.revealRequest).toBeUndefined());
+    expect(document.querySelector('.system-prompt-content')).toHaveClass('viewer-find-row-match--active');
+  });
+
   it('steps from the normalized transcript match index after results shrink', async () => {
     const initialMessages: Message[] = [
       { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
@@ -418,6 +519,8 @@ describe('MessageList', () => {
 
     const header = document.querySelector('.system-prompt-content') as HTMLElement;
     await waitFor(() => expect(header).toHaveClass('viewer-find-row-match--active'));
+    expect(header).toHaveAttribute('data-fragment-id', 'system-prompt-text');
+    expect(header.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('alpha directive');
   });
 
   it('does not re-scroll the active transcript match on unrelated streaming-buffer ticks', async () => {
@@ -3013,3 +3116,220 @@ describe('handleTotalListHeightChanged', () => {
 });
 
 
+
+
+it('find navigation searches the canonical patch display diff and carries its typed reveal target', async () => {
+  const diff = '--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old value\n+canonical patch token';
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-patch',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-patch-1',
+        name: 'patch',
+        display: 'patch src/foo.ts',
+        input: { path: 'src/foo.ts', patches: [{ operation: 'replace', oldText: 'old value', newText: 'canonical patch token' }] },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-patch-1', result: 'Patch applied successfully' },
+      display_data: { diff },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-patch"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-patch', generation: 1, transcriptGeneration: 1 } }}
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'canonical patch token' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+  await waitFor(() => {
+    const call = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-patch');
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-patch');
+  expect(renderedAgent?.message.message_id).toBe('agent-patch');
+  expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-patch-1', fragmentId: 'patch-diff' });
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe('patch-diff');
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});
+
+it('find navigation carries read_file fragment reveal target for offscreen navigation', async () => {
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-read-file',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-read-1',
+        name: 'read_file',
+        display: 'read src/foo.ts',
+        input: { path: 'src/foo.ts', offset: 7, limit: 2 },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-read-1', result: '     7\tconst alpha = 1;\n     8\tsecond alpha line' },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-read-file"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-read-file', generation: 1, transcriptGeneration: 1 } }}
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'second alpha' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+  await waitFor(() => {
+    const call = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = [...agentMessageProps].reverse().find((entry) => entry.revealRequest?.revealTarget.kind === 'tool-result-read-file');
+  expect(renderedAgent?.message.message_id).toBe('agent-read-file');
+  expect(renderedAgent?.revealRequest?.revealTarget).toMatchObject({ toolUseId: 'tool-read-1', lineNumber: 8 });
+  const expectedFragmentId = buildReadFileOutputProjection(
+    '     7\tconst alpha = 1;\n     8\tsecond alpha line',
+    { path: 'src/foo.ts', offset: 7, limit: 2 },
+  ).fragments.find((fragment) => fragment.kind === 'line' && fragment.display.lineNumber === 8)?.fragmentId;
+  expect(renderedAgent?.activeHighlight?.fragmentId).toBe(expectedFragmentId);
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});
+
+it('find navigation carries keyword_search fragment reveal target for offscreen navigation', async () => {
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-keyword-search',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-keyword-1',
+        name: 'keyword_search',
+        display: 'keyword search alpha',
+        input: { query: 'alpha', search_terms: ['alpha'] },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-keyword-1', result: '/abs/path/to/bar.rs: helper utilities for alpha' },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-keyword-search"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-keyword-search', generation: 1, transcriptGeneration: 1 } }}
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'helper utilities' } });
+
+  await waitFor(() => {
+    const call = agentMessageProps.at(-1);
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = agentMessageProps.at(-1);
+  expect(renderedAgent?.message.message_id).toBe('agent-keyword-search');
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});
+
+it('find navigation carries search fragment reveal target for offscreen navigation', async () => {
+  const messages: Message[] = [
+    {
+      ...makeMessage(1, 'agent'),
+      message_id: 'agent-search',
+      content: [{
+        type: 'tool_use',
+        id: 'tool-search-1',
+        name: 'search',
+        display: 'search alpha',
+        input: { pattern: 'alpha', path: 'src' },
+      }],
+    },
+    {
+      ...makeMessage(2, 'tool'),
+      content: { tool_use_id: 'tool-search-1', result: 'src/foo.rs:34: helper utilities for alpha' },
+    },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-search"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-search', generation: 1, transcriptGeneration: 1 } }}
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'helper utilities' } });
+
+  await waitFor(() => {
+    const call = agentMessageProps.at(-1);
+    expect(call).toBeTruthy();
+  });
+  const renderedAgent = agentMessageProps.at(-1);
+  expect(renderedAgent?.message.message_id).toBe('agent-search');
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});
+
+it('find navigation requests reveal for compact hidden assistant second-line matches', async () => {
+  const messages: Message[] = [
+    { ...makeMessage(1, 'agent'), message_id: 'agent-hidden', content: [{ type: 'text', text: 'first line\nhidden second line alpha target' }] },
+  ];
+
+  render(withConvContext(
+    <MessageList
+      messages={messages}
+      pendingMessages={[]}
+      convState={idleState}
+      onRetry={vi.fn()}
+      onOpenFile={undefined}
+      conversationId="conv-find-reveal"
+      transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-find-reveal', generation: 1, transcriptGeneration: 1 } }}
+    />,
+  ));
+
+  fireEvent.keyDown(window, { key: 'f', metaKey: true });
+  const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+  fireEvent.change(input, { target: { value: 'alpha target' } });
+
+  await waitFor(() => {
+    const highlighted = document.querySelector('[data-highlight-fragment="agent-text-0"]');
+    expect(highlighted).not.toBeNull();
+  });
+  expect(virtualTranscriptMock.scrollToIndex).toHaveBeenCalled();
+});

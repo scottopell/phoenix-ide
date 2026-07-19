@@ -15,19 +15,20 @@ macOS
 
 Linux
 └── systemd available?  → YES → Native systemd mode
-                        → NO  → Daemon mode
+                        → NO  → Persistent bare-Linux supervisor
 ```
 
 ## Step 2: Deploy
 
 ```bash
-./dev.py prod deploy          # Deploy HEAD (default)
-./dev.py prod deploy v1.2.3   # Deploy a specific git tag
-./dev.py prod status          # Check running state
-./dev.py prod stop            # Stop the service
+./dev.py prod deploy                    # Check, build, and deploy local HEAD
+./dev.py prod deploy --release v1.2.3   # Deploy an exact checksummed release
+./dev.py prod deploy --release latest   # Deploy latest stable release
+./dev.py prod status                    # Check runtime and durable transaction
+./dev.py prod stop                      # Stop the backend-owned runtime
 ```
 
-`deploy` always runs `./dev.py check` first and aborts on failure.
+Local-HEAD deployment runs `./dev.py check` first and aborts on failure. Published-release deployment verifies the selected target asset, checksum, tag commit, and embedded identity without compiling locally.
 
 ## ⚠️ Do NOT
 
@@ -40,14 +41,10 @@ For full details on each mode (ports, paths, log locations, LLM config), read th
 
 - **Native launchd (macOS):** read `skills/phoenix-deployment/LAUNCHD.md`
 - **Native systemd (Linux):** read `skills/phoenix-deployment/SYSTEMD.md`
-- **Daemon (Linux, no systemd):** read `skills/phoenix-deployment/DAEMON.md`
+- **Persistent supervisor (Linux, no systemd):** read `skills/phoenix-deployment/DAEMON.md`
 
 ## Publishing a Release (GitHub)
 
 See [`skills/phoenix-release/SKILL.md`](../phoenix-release/SKILL.md) for the end-to-end flow (version bump, tag, CI build, sub-agent-drafted release notes).
 
-The stable download URL for the latest published binary:
-
-```
-https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x86_64-unknown-linux-musl
-```
+Stable asset URLs use `https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-<target>` for supported macOS and Linux targets.

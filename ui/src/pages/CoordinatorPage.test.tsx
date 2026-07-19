@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { CoordinatorPage } from './CoordinatorPage';
+import { COORDINATOR_BRIEFING_PROMPT } from './coordinatorBriefing';
 import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
 const { apiMock, conversationSnapshotMock, conversationPhaseMock } = vi.hoisted(() => ({
@@ -36,13 +37,25 @@ vi.mock('../conversation', () => ({
 }));
 
 vi.mock('./ConversationPage', () => ({
-  ConversationPage: ({ routePrefix }: { routePrefix?: string }) => (
+  ConversationPage: ({
+    routePrefix,
+    composerQuickAction,
+  }: {
+    routePrefix?: string;
+    composerQuickAction?: { label: string; prompt: string; context: string };
+  }) => (
     <div>
       Shared conversation runtime {routePrefix}
       <label>
         Coordinator draft
         <input aria-label="Coordinator draft" defaultValue="preserve me" />
       </label>
+      {composerQuickAction && (
+        <>
+          <button type="button" data-prompt={composerQuickAction.prompt}>{composerQuickAction.label}</button>
+          <span>{composerQuickAction.context}</span>
+        </>
+      )}
     </div>
   ),
 }));
@@ -126,6 +139,24 @@ describe('CoordinatorPage', () => {
     });
   });
 
+  it('marks bootstrap loading and errors for placement inside the compact content row', async () => {
+    let resolveCoordinator!: (value: { conversation: Conversation }) => void;
+    apiMock.ensureGlobalCoordinator.mockReturnValueOnce(new Promise((resolve) => {
+      resolveCoordinator = resolve;
+    }));
+
+    const { unmount } = renderPage();
+    expect(screen.getByText('Loading…')).toHaveClass('coordinator-page-status');
+
+    resolveCoordinator({ conversation: coordinatorConversation() });
+    await screen.findByText('Shared conversation runtime /global');
+    unmount();
+
+    apiMock.ensureGlobalCoordinator.mockRejectedValueOnce(new Error('Coordinator unavailable'));
+    renderPage();
+    expect(await screen.findByText('Coordinator unavailable')).toHaveClass('coordinator-page-status');
+  });
+
   it('keeps an applied find-work query stable without rerunning bootstrap', async () => {
     renderPage();
     await screen.findByText('Shared conversation runtime /global');
@@ -181,6 +212,15 @@ describe('CoordinatorPage', () => {
     expect(screen.getByText('Showing all open work')).toBeInTheDocument();
   });
 
+  it('offers a read-only briefing prompt with honest per-message context copy', async () => {
+    renderPage();
+
+    const action = await screen.findByRole('button', { name: 'Brief me on current work' });
+    expect(action).toHaveAttribute('data-prompt', COORDINATOR_BRIEFING_PROMPT);
+    expect(COORDINATOR_BRIEFING_PROMPT).toContain('Do not send messages or change anything.');
+    expect(screen.getByText('Current work context is attached to each Coordinator message.')).toBeInTheDocument();
+  });
+
   it('defaults to Conversation and preserves its mounted state while switching to Work', async () => {
     renderPage();
 
@@ -194,11 +234,11 @@ describe('CoordinatorPage', () => {
     expect(conversation).not.toHaveAttribute('hidden');
     expect(workPane).toHaveAttribute('hidden');
 
-    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Work \d+$/ }));
     expect(conversation).toHaveAttribute('hidden');
     expect(workPane).not.toHaveAttribute('hidden');
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Conversation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Conversation' }));
     expect(screen.getByRole('textbox', { name: 'Coordinator draft' })).toHaveValue('unsent follow-up');
   });
 

@@ -6,34 +6,35 @@ In-viewer find gives Phoenix-owned `Cmd/Ctrl+F` search to the topmost eligible t
 
 ## Current Reality
 
-Phoenix's shared viewer-find primitives live in `ui/src/components/viewer-find/`. `FindBar.tsx` provides the accessible search chrome with autofocus, Enter/Shift+Enter navigation, and Escape-to-close behavior. `useViewerFind.ts` owns local open/query/active-index state and recomputes case-insensitive literal matches through `literalMatch.ts`. `useViewerFindKeyboardShortcut.ts` integrates with `ui/src/hooks/useFocusScope.tsx` so a scope-owned `Cmd/Ctrl+F` only fires when that surface is the active scope and the event target is not an editable control that should keep native behavior.
+Phoenix's shared viewer-find primitives live in `ui/src/components/viewer-find/`. `FindBar` provides accessible search chrome with autofocus, Enter/Shift+Enter navigation, and Escape-to-close behavior. `literalMatch` is the shared case-insensitive literal matcher. `findSession` is the shared closed/open state machine with branded match IDs, surface keys, focus origins, refocus sequencing, stable-ID reconciliation with nearest-prior fallback, and typed commands for query focus, focus restoration, match reveal, and decoration clearing.
 
-The viewer stack registers the enclosing file viewer as a focus scope in `ui/src/components/viewer/MetaViewer.tsx`, which makes viewer-local shortcut ownership and Escape hierarchy compose with the broader keyboard model. Text-like file viewers and task-approval readers are the intended DOM-backed adopters of the shared find bar. Virtualized surfaces such as Pierre-backed file/diff views and transcript-style readers must search typed projections and navigate via stable typed targets rather than mounted DOM nodes; that behavior is part of the intended completed implementation this spec tracks.
+File, diff, transcript, and task-approval surfaces consume the same typed session. Their canonical semantic projections carry stable source identity separately from mutable reveal coordinates. Pierre adapters reveal file and diff ranges; Virtuoso mounts transcript rows and expands renderer-owned fragments; task approval parses Markdown into stable display blocks shared by matching and rendering. The provider-owned keyboard router selects the topmost eligible modal, viewer, or passive-content registration independently of listener order.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-IVF-001:** Eligible Surface Ownership | ✅ Complete | `Cmd/Ctrl+F` is owned by the topmost eligible viewer scope; image/opaque viewers and unsupported preview contexts remain ineligible |
-| **REQ-IVF-002:** Search the Logical Content, Not Just Mounted DOM | ✅ Complete | Search indexes derive from typed surface data so virtualization does not create phantom browser-find gaps |
-| **REQ-IVF-003:** Query Semantics and Result Ordering | ✅ Complete | Case-insensitive literal matching, empty-query=no-results, document-order navigation |
-| **REQ-IVF-004:** Match Counts and Navigation | ✅ Complete | Count/status plus Enter, Shift+Enter, Previous, and Next wraparound navigation |
-| **REQ-IVF-005:** Navigation to Off-Screen Matches | ✅ Complete | Off-screen targets resolve through stable typed navigation handles rather than DOM identity |
+| **REQ-IVF-002:** Search the Logical Content, Not Just Mounted DOM | ✅ Complete | File, diff, transcript, tool, sub-agent, and parsed Markdown projections search canonical logical content independently of mount/disclosure state |
+| **REQ-IVF-003:** Query Semantics and Result Ordering | ✅ Complete | `literalMatch.ts` remains the one case-insensitive literal matcher; empty-query=no-results and ordered matches remain the shared semantics |
+| **REQ-IVF-004:** Match Counts and Navigation | ✅ Complete | Every eligible surface derives count, active ordinal, and wraparound navigation from the shared session match list |
+| **REQ-IVF-005:** Navigation to Off-Screen Matches | ✅ Complete | Typed reveal commands scroll Pierre ranges, mount Virtuoso rows, and expand collapsed renderer-owned fragments before exact highlighting |
+| **REQ-IVF-005A:** Every Result Has Stable Identity and Reveal Semantics | ✅ Complete | Every session match carries branded stable identity and an adapter-owned target; mutable line and row coordinates are reveal metadata rather than identity |
 | **REQ-IVF-006:** Visible Match Indication | ✅ Complete | Active occurrence is distinguished from other rendered matches; fallback location indication is documented where exact substring styling is renderer-limited |
-| **REQ-IVF-007:** Focus Lifecycle | ✅ Complete | Opening find autofocuses/selects the query; repeated shortcut refocuses; closing restores prior in-surface focus |
+| **REQ-IVF-007:** Focus Lifecycle | ✅ Complete | Shared session commands preserve the original focus origin, refocus repeated shortcuts, and restore valid focus on close |
 | **REQ-IVF-008:** Escape Closes Find Before the Enclosing Surface | ✅ Complete | Escape dismisses find without dismissing the enclosing viewer/approval surface |
-| **REQ-IVF-009:** Scope-Local State and Overlay Isolation | ✅ Complete | Find state is surface-local and hidden lower scopes do not react while a higher overlay is active |
+| **REQ-IVF-009:** Scope-Local State and Overlay Isolation | ✅ Complete | Each surface owns one structural session and the central keyboard router prevents obscured lower layers from reacting |
 | **REQ-IVF-010:** Editable Controls Keep Their Native Editing Behavior | ✅ Complete | Shortcut interception skips unrelated editable controls; the find input itself preserves text editing semantics |
-| **REQ-IVF-011:** Result Reconciliation as Content Changes | ✅ Complete | Live content updates recompute results while preserving the active logical occurrence when still present |
+| **REQ-IVF-011:** Result Reconciliation as Content Changes | ✅ Complete | All eligible surfaces preserve surviving active IDs and use deterministic nearest-prior fallback when content changes |
 | **REQ-IVF-012:** Accessibility and Keyboard-Only Operation | ✅ Complete | Labelled search UI, keyboard navigation, status announcement, and focus-visible controls |
 
-**Progress:** 12 of 12 complete
+**Progress:** 13 complete, 0 partial, 0 missing
 
 ## Verification Coverage
 
-- Unit coverage for literal matching, active-index reconciliation, and keyboard routing lives beside the shared primitives in `ui/src/components/viewer-find/`.
-- Focus-scope ownership is covered by the `useFocusScope` and viewer-find shortcut tests so hidden lower scopes cannot steal `Cmd/Ctrl+F`.
-- End-to-end coverage for files, diffs, task approval, and transcript-style surfaces must verify off-screen navigation, highlighting, repeated shortcut refocus, editable-target passthrough, and Escape closing only the find bar.
+- Unit coverage beside the shared primitives verifies literal matching, keyboard routing, structural closed/open state, stable-ID reconciliation, wraparound navigation, surface replacement, reset/close commands, and invalid-state type shape.
+- Focus-scope and keyboard-router coverage verifies that hidden lower scopes cannot steal `Cmd/Ctrl+F`, editable controls retain native behavior, and repeated shortcuts return to the owning query.
+- Integration coverage for files, diffs, task approval, and virtualized transcripts verifies off-screen navigation, exact renderer-owned highlighting, focus restoration, disclosure expansion, content-update reconciliation, surface swaps, and streaming isolation.
 
 ## Related Specs
 

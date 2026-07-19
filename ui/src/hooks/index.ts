@@ -5,9 +5,19 @@ export {
   useDraftActions,
   useDraftLifecycle,
   DraftLifecycle,
+  seedDraftStorageKey,
+  readSeedDraft,
+  writeSeedDraft,
+  clearSeedDraft,
 } from './useDraft';
 export type { DraftActions } from './useDraft';
-export { FocusScopeProvider, useFocusScope, useFocusScopeCommands, useRegisterFocusScope } from './useFocusScope';
+export {
+  FocusScopeProvider,
+  useFocusScope,
+  useFocusScopeCommands,
+  useKeyboardRouterShortcut,
+  useRegisterFocusScope,
+} from './useFocusScope';
 export {
   useMessageQueue,
   derivePendingMessages,

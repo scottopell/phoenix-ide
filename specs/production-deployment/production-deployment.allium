@@ -1,0 +1,320 @@
+-- allium: 3
+-- Cross-platform production deployment lifecycle
+--
+-- Scope: shared preparation and transaction semantics for launchd, systemd,
+-- and bare Linux, with backend-specific activation ownership.
+-- This module owns shared guarantees. Platform-specific launchd mechanics
+-- are cumulative refinements in specs/launchd-deployment/launchd-deployment.allium.
+-- Requirement traceability: REQ-PD-001 through REQ-PD-017. Runtime lifecycle
+-- rules model REQ-PD-002 through REQ-PD-014; backend selection, operator
+-- syntax, bare-Linux reboot integration, disposable test isolation, and
+-- release asset publication are interface/build obligations in requirements.md.
+
+config {
+    stale_after: Duration = 120_000.ms
+}
+
+enum BackendKind { launchd | systemd | bare_linux }
+enum SourceKind { local_head | published_release }
+enum TransactionState {
+    preparing | prepared | handed_off | activating | committed
+    | precondition_failed | activation_failed_rolled_back
+    | activation_failed_rollback_failed | rejected_concurrent
+}
+
+value RuntimeIdentity {
+    version: String
+    git_sha: String
+}
+
+value RuntimeEndpoint {
+    version_url: String
+}
+
+entity DeployTransaction {
+    id: String
+    backend: BackendKind
+    source_kind: SourceKind
+    source_commit: String
+    release_tag: String?
+    expected: RuntimeIdentity
+    previous: RuntimeIdentity?
+    expected_endpoint: RuntimeEndpoint
+    previous_endpoint: RuntimeEndpoint?
+    state: TransactionState
+    claim_generation: Integer
+    created_at: Timestamp
+    updated_at: Timestamp
+    failure: String?
+    rollback_failure: String?
+
+    transitions state {
+        preparing -> prepared
+        preparing -> precondition_failed
+        preparing -> rejected_concurrent
+        prepared -> handed_off
+        prepared -> precondition_failed
+        handed_off -> activating
+        activating -> committed
+        activating -> activation_failed_rolled_back
+        activating -> activation_failed_rollback_failed
+        terminal: committed, precondition_failed,
+                  activation_failed_rolled_back,
+                  activation_failed_rollback_failed, rejected_concurrent
+    }
+}
+
+entity DeploymentClaim {
+    transaction: DeployTransaction
+    generation: Integer
+    active: Boolean
+}
+
+entity DeploymentHandoff {
+    transaction: DeployTransaction
+    manifest_hash: String
+    immutable: Boolean
+    secret_free: Boolean
+}
+
+variant LaunchdHandoff : DeploymentHandoff {
+    helper_label: String
+}
+
+variant SystemdHandoff : DeploymentHandoff {
+    transient_unit: String
+    root_transaction_id: String
+}
+
+variant BareLinuxHandoff : DeploymentHandoff {
+    supervisor_socket_identity: String
+}
+
+-- Helpers
+--
+-- selected_source_is_valid(transaction) -> Boolean
+--   Local source is exact checked HEAD after required checks and compilation,
+--   or release source is one resolved tag and commit with a host-target asset,
+--   matching checksum, package version, and embedded full git SHA.
+-- preparation_complete(transaction) -> Boolean
+--   Candidate, backend configuration, one environment snapshot, rollback
+--   inputs, identities, endpoints, destination reservations, hashes,
+--   activation program, immutable handoff, and initial status are valid and
+--   host-resident before disruption.
+-- claim_available(transaction) -> Boolean
+--   No active or unresolved transaction owns the host deployment claim.
+-- current_claim_matches(transaction) -> Boolean
+--   The active claim names transaction.id and transaction.claim_generation.
+-- claim_release_matches(transaction) -> Boolean
+--   The released claim named transaction.id and transaction.claim_generation
+--   at the serialized release edge, before its active flag was cleared.
+-- backend_owner_independent(transaction, handoff) -> Boolean
+--   launchd owns a one-shot LaunchAgent, systemd owns a root transient unit,
+--   or the persistent bare-Linux supervisor owns activation and its child.
+-- handoff_valid_for_backend(transaction, handoff) -> Boolean
+--   The typed handoff variant corresponds to transaction.backend and all
+--   host-resident inputs match their declared hashes and allowed locations.
+-- atomic_install_complete(transaction) -> Boolean
+--   Fsynced destination-filesystem copies replaced all candidate targets by
+--   atomic rename without first unlinking a live path.
+-- exact_candidate_running(transaction) -> Boolean
+--   A new backend-owned process serves the exact expected version and full
+--   git SHA; bare Linux also matches the supervisor child PID and proc start.
+-- exact_previous_restored(transaction) -> Boolean
+--   Previous artifacts, environment, service state, deployed SHA, endpoint,
+--   and exact runtime identity have been restored and verified.
+-- durable_terminal_status_exists(transaction) -> Boolean
+--   Redacted status durably records transaction's terminal state.
+-- installed_environment_is_snapshot(transaction) -> Boolean
+--   The installed environment is the single snapshot used by preflight and
+--   endpoint selection, not a competing override layer.
+
+rule PrepareCandidate {
+    when: DeploymentRequested(transaction)
+    requires: transaction.state = preparing
+    requires: claim_available(transaction)
+    requires: selected_source_is_valid(transaction)
+    ensures: DeploymentClaim.created(
+        transaction: transaction,
+        generation: transaction.claim_generation,
+        active: true
+    )
+    ensures: transaction.state = prepared
+    ensures: preparation_complete(transaction)
+    ensures: installed_environment_is_snapshot(transaction)
+}
+
+rule RejectConcurrentDeployment {
+    when: DeploymentRequested(transaction)
+    requires: transaction.state = preparing
+    requires: not claim_available(transaction)
+    ensures: transaction.state = rejected_concurrent
+    ensures: ProductionStateUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule PreparationFailureDoesNotDisruptRuntime {
+    when: PreparationFailed(transaction, failure)
+    requires: transaction.state = preparing
+    ensures: transaction.state = precondition_failed
+    ensures: transaction.failure = failure
+    ensures: ProductionStateUnchanged(transaction)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule LaunchdActivationHandedOff {
+    when: transaction: DeployTransaction.state transitions_to prepared
+    requires: transaction.backend = launchd
+    requires: preparation_complete(transaction)
+    ensures: LaunchdHandoff.created(
+        transaction: transaction,
+        manifest_hash: PreparedManifestHash(transaction),
+        immutable: true,
+        secret_free: true,
+        helper_label: PreparedLaunchdHelperLabel(transaction)
+    )
+    ensures: transaction.state = handed_off
+}
+
+rule SystemdActivationHandedOff {
+    when: transaction: DeployTransaction.state transitions_to prepared
+    requires: transaction.backend = systemd
+    requires: preparation_complete(transaction)
+    requires: PrivilegedHandoffValidated(transaction)
+    ensures: SystemdHandoff.created(
+        transaction: transaction,
+        manifest_hash: PreparedManifestHash(transaction),
+        immutable: true,
+        secret_free: true,
+        transient_unit: PreparedTransientUnit(transaction),
+        root_transaction_id: transaction.id
+    )
+    ensures: transaction.state = handed_off
+}
+
+rule BareLinuxActivationHandedOff {
+    when: transaction: DeployTransaction.state transitions_to prepared
+    requires: transaction.backend = bare_linux
+    requires: preparation_complete(transaction)
+    requires: SupervisorPeerUidMatchesOwner(transaction)
+    ensures: BareLinuxHandoff.created(
+        transaction: transaction,
+        manifest_hash: PreparedManifestHash(transaction),
+        immutable: true,
+        secret_free: true,
+        supervisor_socket_identity: PreparedSupervisorSocket(transaction)
+    )
+    ensures: transaction.state = handed_off
+}
+
+rule IndependentOwnerBeginsActivation {
+    when: ActivationOwnerAccepted(transaction, handoff)
+    requires: transaction.state = handed_off
+    requires: current_claim_matches(transaction)
+    requires: handoff_valid_for_backend(transaction, handoff)
+    requires: backend_owner_independent(transaction, handoff)
+    ensures: transaction.state = activating
+    ensures: atomic_install_complete(transaction)
+}
+
+rule CommitVerifiedCandidate {
+    when: CandidateRuntimeObserved(transaction)
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: exact_candidate_running(transaction)
+    ensures: transaction.state = committed
+    ensures: DeployedShaWritten(transaction.source_commit)
+    ensures: DurableStatusWritten(transaction)
+}
+
+rule RollBackFailedActivation {
+    when: ActivationFailed(transaction, failure)
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    requires: exact_previous_restored(transaction)
+    ensures: transaction.state = activation_failed_rolled_back
+    ensures: transaction.failure = failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule PreserveRollbackFailure {
+    when: RollbackFailed(transaction, failure, rollback_failure)
+    requires: transaction.state = activating
+    requires: current_claim_matches(transaction)
+    ensures: transaction.state = activation_failed_rollback_failed
+    ensures: transaction.failure = failure
+    ensures: transaction.rollback_failure = rollback_failure
+    ensures: DurableStatusWritten(transaction)
+    ensures: not DeployedShaWritten(transaction.source_commit)
+}
+
+rule MatchingTerminalClaimReleased {
+    when: TerminalStatusPersisted(transaction, claim)
+    requires: claim.active
+    requires: claim.transaction = transaction
+    requires: claim.generation = transaction.claim_generation
+    requires: durable_terminal_status_exists(transaction)
+    ensures: claim.active = false
+}
+
+rule StaleClaimReleaseRejected {
+    when: ClaimReleaseRequested(transaction, claim)
+    requires: claim.transaction != transaction
+        or claim.generation != transaction.claim_generation
+        or not durable_terminal_status_exists(transaction)
+    ensures: claim.active = true
+}
+
+rule InterruptedTransactionRemainsActionable {
+    when: DeploymentStatusRequested(transaction)
+    requires: transaction.state in { prepared, handed_off, activating }
+    requires: now() - transaction.updated_at > config.stale_after
+    ensures: RecoveryGuidanceShown(transaction)
+    ensures: not transaction.state = committed
+}
+
+rule BareSupervisorReconcilesInterruptedActivation {
+    when: BareSupervisorStarted(transaction)
+    requires: transaction.backend = bare_linux
+    requires: transaction.state in { handed_off, activating }
+    ensures: InstalledStateInspected(transaction)
+    ensures: ReconciliationRequiredBeforeTerminalStatus(transaction)
+}
+
+rule BareStopPreservesSupervisor {
+    when: ProductionStopRequested(transaction)
+    requires: transaction.backend = bare_linux
+    ensures: ManagedPhoenixChildStopped(transaction)
+    ensures: BareSupervisorRemainsRunning(transaction)
+}
+
+invariant ActiveClaimMatchesTransactionGeneration {
+    for claim in DeploymentClaims:
+        claim.active implies claim.generation = claim.transaction.claim_generation
+}
+
+invariant HandoffsAreImmutableAndSecretFree {
+    for handoff in DeploymentHandoffs:
+        handoff.immutable and handoff.secret_free
+}
+
+invariant CommitRequiresExactIdentity {
+    for transaction in DeployTransactions:
+        transaction.state = committed implies exact_candidate_running(transaction)
+}
+
+invariant DisruptionRequiresPreparedIndependentOwner {
+    for transaction in DeployTransactions:
+        RuntimeDisruptionStarted(transaction) implies
+            preparation_complete(transaction)
+            and transaction.state in { handed_off, activating, committed,
+                activation_failed_rolled_back, activation_failed_rollback_failed }
+}
+
+invariant ClaimReleaseRequiresMatchingDurableTerminalStatus {
+    for transaction in DeployTransactions:
+        ClaimReleasedFor(transaction) implies
+            claim_release_matches(transaction)
+            and durable_terminal_status_exists(transaction)
+}

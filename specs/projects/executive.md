@@ -59,6 +59,11 @@ persisted live owner are reclaimed with mode-appropriate branch disposition; sco
 tracked, untracked, or unreadable status remain in place for manual recovery. Terminal
 fallback cleanup likewise removes only `WorkScope::Worktree(path)`, so Direct conversations
 and Explore sub-agents cannot remove a checkout merely because they use it as their cwd.
+Diff review observes the worktree's live checkout rather than trusting persisted conversation
+metadata. Named branches include configured-upstream or locally cached matching-remote
+relationships with ahead/behind counts; detached HEADs retain their commit identity and may
+show exact pointing refs. This inspection is read-only and uses last-fetched local refs without
+network access.
 
 ## Status Summary
 
@@ -102,8 +107,9 @@ and Explore sub-agents cannot remove a checkout merely because they use it as th
 | **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
 | **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
+| **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Diff endpoints observe live named/detached/unborn/unavailable checkout state; named branches show last-fetched upstream/matching-remote ahead and behind counts, and the shared diff viewer presents this context independently of its comparator |
 
-**Progress:** of 34 active requirements, 28 complete, 1 partial (REQ-PROJ-012 — its
+**Progress:** of 35 active requirements, 29 complete, 1 partial (REQ-PROJ-012 — its
 Explore gateway ships but the writing-mode fork path is spec-only), and 5 (REQ-PROJ-033..037,
 task forks + fork-proposal Request Changes) specified but not yet implemented.
 REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by

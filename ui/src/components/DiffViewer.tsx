@@ -9,6 +9,7 @@
  */
 
 import { DiffView } from './viewer/DiffView';
+import type { CheckoutStatus } from '../api';
 
 interface DiffViewerProps {
   open: boolean;
@@ -20,6 +21,7 @@ interface DiffViewerProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
+  checkoutStatus: CheckoutStatus;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
 }

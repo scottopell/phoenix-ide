@@ -81,6 +81,7 @@ export function ConversationDiffViewer({
         uncommittedDiff={p.uncommitted_diff}
         uncommittedTruncatedKib={p.uncommitted_truncated_kib}
         uncommittedSaturated={p.uncommitted_saturated}
+        checkoutStatus={p.checkout_status}
         onClose={onClose}
         onSendNotes={onSendNotes}
         {...(inline !== undefined ? { inline } : {})}

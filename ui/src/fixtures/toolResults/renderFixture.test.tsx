@@ -58,7 +58,7 @@ describe('ToolResultsFixture', () => {
     const { rerender } = render(<ToolResultsFixture scenario={getToolResultsScenario('discovery-full')} />);
 
     await screen.findByText('3 relevant files');
-    expect(screen.getByText(/deterministicFixtureLine1 = true/)).toBeInTheDocument();
+    expect(screen.getAllByText(/deterministicFixtureLine1 = true/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('ui/src/fixtures/toolResults/scenarios.ts')).toBeInTheDocument();
     expect(screen.getByText(/12 lines • lines 1-12/)).toBeInTheDocument();
     expect(screen.getByText(/4 more returned lines/)).toBeInTheDocument();

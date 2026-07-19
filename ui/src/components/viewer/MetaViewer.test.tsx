@@ -1,11 +1,10 @@
 import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { MetaViewer } from './MetaViewer';
-import * as viewerFindModule from '../viewer-find/useViewerFind';
+import { __metaViewerFindTestables, MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
-import { resetCodeViewMock } from './__testutils__/codeViewMock';
+import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
 
 vi.mock('mermaid', () => ({
   default: {
@@ -91,9 +90,31 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 }
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
+describe('MetaViewer find identities', () => {
+  it('bounds match ids for arbitrarily long file lines', () => {
+    const text = `prefix ${'x'.repeat(20_000)} token`;
+    const source = {
+      id: 'line:1',
+      kind: 'line' as const,
+      lineNumber: 1,
+      text,
+      target: { kind: 'file-line' as const, lineNumber: 1, startColumn: 0, endColumn: 0 },
+    };
+    const id = __metaViewerFindTestables.stableFileMatchId([source])({
+      sourceId: source.id,
+      sourceText: text,
+      start: text.length - 5,
+      end: text.length,
+      target: { kind: 'file-line', lineNumber: 1, startColumn: text.length - 5, endColumn: text.length },
+    });
+
+    expect(id).not.toContain('prefix');
+    expect(id.length).toBeLessThan(128);
+  });
+});
+
 describe('MetaViewer payload routing', () => {
-  it('keeps useViewerFind in state-only mode while projection drives file matching', async () => {
-    const spy = vi.spyOn(viewerFindModule, 'useViewerFind');
+  it('drives file counts from the typed line projection', async () => {
     renderViewer({
       ...textCommon,
       kind: 'text',
@@ -104,9 +125,6 @@ describe('MetaViewer payload routing', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
 
     await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
-    expect(spy).toHaveBeenCalled();
-    expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ text: '' });
-    spy.mockRestore();
   });
 
   beforeEach(() => resetCodeViewMock());
@@ -270,6 +288,20 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
     expect(screen.queryByRole('heading', { name: 'Heading' })).not.toBeInTheDocument();
     expect(screen.getByText(/focused on lines 3–5/)).toBeInTheDocument();
+  });
+
+  it('enables find when a focused markdown range renders in the line-aware source viewer', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: '# Heading\nparagraph alpha\nparagraph second line',
+      focus: { kind: 'range', startLine: 2, endLine: 3 },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
   });
 
   it('lets a focused large HTML file still toggle from line-aware source to sandboxed preview', () => {
@@ -437,7 +469,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('keeps HTML preview ineligible but allows source-like markdown and HTML source find', () => {
+  it('keeps HTML preview ineligible while allowing decorated HTML source and rendered Markdown find', () => {
     const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
@@ -455,7 +487,7 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('.viewer-code .viewer-find-match--active')).toHaveTextContent('alpha');
 
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
@@ -463,13 +495,82 @@ describe('MetaViewer payload routing', () => {
     unmount();
     render(
       <ReviewNotesProvider>
-        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# Title\n\nparagraph alpha' }} />
       </ReviewNotesProvider>,
     );
     expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('alpha');
+    expect(document.querySelector('[data-line="3"] .viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
-  it('closes file find when switching HTML source to preview', async () => {
+  it('treats rendered and source-style Markdown as different find surfaces', () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' }} />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
+  it('marks matches in lower-level Markdown headings', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '#### lower heading alpha' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(document.querySelector('h4 .viewer-find-match--active')).toHaveTextContent('alpha');
+  });
+
+  it('does not count rendered fenced-code text without an owned inline marker', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '# Title\n\n```ts\nconst hiddenNeedle = true;\n```' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hiddenNeedle' } });
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+  });
+
+  it('marks a match in a later table cell with block-local offsets', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '| first | second target |\n| --- | --- |' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'target' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('target');
+  });
+
+  it('keeps identical same-line table cells as distinct match owners', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '| alpha | alpha |\n| --- | --- |' });
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('th .viewer-find-match--active')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('th .viewer-find-match--active')).toHaveLength(1);
+  });
+
+  it('keeps source-style Markdown fallbacks searchable', () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(document.querySelector('[data-find-occurrence="0"]')).toHaveTextContent('alpha');
+  });
+
+  it('closes HTML source find when switching to preview', async () => {
     renderViewer({
       ...textCommon,
       kind: 'html',
@@ -481,44 +582,8 @@ describe('MetaViewer payload routing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
-
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
-
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
-  });
-
-  it('falls back to line reveal for markdown source matches without explicit marks', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'markdown',
-      content: '# alpha heading\n\nBody text',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha heading' } });
-
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
-  });
-
-  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'html',
-      language: 'html',
-      content: '<p>alpha</p>',
-      previewUrl: '/preview/tmp/project/thing',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull());
   });
 
   it('resets find state when the viewed absolutePath changes', async () => {
@@ -541,7 +606,7 @@ describe('MetaViewer payload routing', () => {
     await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
   });
 
-  it('resets find state when the viewed content identity changes under the same path', async () => {
+  it('replaces results when the viewed content changes under the same path and kind', async () => {
     const { rerender } = render(
       <ReviewNotesProvider>
         <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta' }} />
@@ -558,25 +623,54 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('alpha'));
+    expect(screen.getByText('0 results')).toBeInTheDocument();
   });
 
-  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'html',
-      language: 'html',
-      content: '<p>alpha</p>',
-      previewUrl: '/preview/tmp/project/thing',
-    });
-
-    const line = document.querySelector('[data-line="1"]') as HTMLElement;
-    line.scrollIntoView = vi.fn();
+  it('preserves and re-reveals the semantic active match when insertions move it', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta\ngamma' }} />
+      </ReviewNotesProvider>,
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'beta' } });
 
-    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'line', id: 'file:/tmp/project/thing', lineNumber: 2, align: 'center', behavior: 'smooth',
+    }));
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'position', position: 0,
+    }));
+    codeViewMockState.scrollToCalls.length = 0;
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'intro\nalpha\nbeta\ngamma' }} />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    await waitFor(() => expect(codeViewMockState.scrollToCalls).toContainEqual({
+      type: 'line', id: 'file:/tmp/project/thing', lineNumber: 3, align: 'center', behavior: 'smooth',
+    }));
   });
+
+  it('keeps repeated identical file matches distinct', async () => {
+    render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'same\nsame\nsame' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'same' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 3')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 3')).toBeInTheDocument();
+  });
+
 });
 

@@ -50,7 +50,7 @@ gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q
 gh release view vX.Y.Z --json url,assets -q '{url, assets: [.assets[].name]}'
 ```
 
-Expect: status `success`, and two assets — `phoenix_ide-x86_64-unknown-linux-musl` (the primary stripped binary) and `phoenix_ide-x86_64-unknown-linux-musl-debug` (the symbol-rich variant for core-dump symbolication). The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+Expect status `success` and seven assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; and `SHA256SUMS` covering all six binaries. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
 If the build fails, do not retry blindly. Open the run, read the failed step, fix the underlying issue, and merge a fix. Because the tag is created only when a *new* version reaches `main`, a re-run of the same version is a no-op (the gate sees the tag already exists); ship the fix as the next patch version instead. Never `--force` a tag.
 

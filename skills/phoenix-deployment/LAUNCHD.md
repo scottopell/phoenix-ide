@@ -74,12 +74,9 @@ Using launchd-provided TCP listener
 
 `./dev.py prod deploy` reads `.phoenix-ide.env` from the **repo root** of the checkout you deploy from (via `_load_env_file`) and bakes those vars into the launchd plist. If it provides any LLM config — `LLM_API_KEY_HELPER`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or Codex auth — the deploy uses that configuration.
 
-## Environment overrides
+## Environment configuration
 
-```bash
-./dev.py prod set RUST_LOG debug   # adds the var to the plist and reloads
-./dev.py prod unset RUST_LOG       # removes it and reloads
-```
+Edit `.phoenix-ide.env` in the repo root, then run `./dev.py prod deploy` to install the new snapshot transactionally. `prod set` and `prod unset` reject with this guidance and do not mutate the plist or create an override store.
 
 ## Checking status
 

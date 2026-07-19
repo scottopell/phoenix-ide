@@ -1284,11 +1284,6 @@ rule WorktreeTransferredOnContinuation {
     ensures: worktree.conversation = new_conv
 
     @guidance
-        -- Cross-reference: bedrock/design.md "Context Continuation
-        -- Worktree Transfer (REQ-BED-030, REQ-BED-031)" for the data
-        -- model change (continued_in_conv_id column), the atomic
-        -- DB transaction sketch, and the mode-inheritance table.
-        --
         -- Inheritance table (this rule covers the Work, Branch, and
         -- Explore rows):
         --   Work    -> Work:    worktree transferred, branch_name + task_id inherited
@@ -1311,11 +1306,10 @@ rule WorktreeTransferredOnContinuation {
         -- expected to inherit it (or strand a continuation with no
         -- parent linkage).
         --
-        -- The continuation_summary field (set by bedrock when entering
-        -- context_exhausted) is carried forward as the opening system
-        -- message of the new conversation. That contract is owned by
-        -- bedrock; this rule only models the worktree and mode
-        -- inheritance.
+        -- The user-selected handoff is submitted as the new conversation's
+        -- opening user message after this atomic ownership transfer. That
+        -- dispatch and its partial-failure outcome are owned by bedrock;
+        -- this rule models only worktree and mode inheritance.
 }
 
 -- REQ-BED-030: Work-mode continuation also inherits the parent's task_id

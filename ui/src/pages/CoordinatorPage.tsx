@@ -4,6 +4,7 @@ import { api, type GlobalOpenWorkResponse } from '../api';
 import { useMediaQuery } from '../hooks';
 import { isAgentWorking } from '../utils';
 import { useConversationPhase } from '../conversation';
+import { COORDINATOR_QUICK_ACTION } from './coordinatorBriefing';
 import './CoordinatorPage.css';
 
 const ConversationPage = lazy(() =>
@@ -238,8 +239,8 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
         </div>
       </header>
 
-      {error && <div className="coordinator-error">{error}</div>}
-      {loading ? <div className="coordinator-muted">Loading…</div> : null}
+      {error && <div className="coordinator-error coordinator-page-status">{error}</div>}
+      {loading ? <div className="coordinator-muted coordinator-page-status">Loading…</div> : null}
 
       <section
         className="coordinator-conversation"
@@ -248,7 +249,7 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
       >
         {slug === resolvedCoordinatorId ? fixtureData?.conversation ?? (
           <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" />
+            <ConversationPage routePrefix="/global" composerQuickAction={COORDINATOR_QUICK_ACTION} />
           </Suspense>
         ) : null}
       </section>
@@ -353,6 +354,23 @@ export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPage
           )}
         </section>
       </aside>
+
+      <nav className="coordinator-mobile-nav" aria-label="Coordinator sections">
+        <button
+          type="button"
+          aria-current={activeView === 'conversation' ? 'page' : undefined}
+          onClick={() => setActiveView('conversation')}
+        >
+          Conversation
+        </button>
+        <button
+          type="button"
+          aria-current={activeView === 'work' ? 'page' : undefined}
+          onClick={() => setActiveView('work')}
+        >
+          Work <span className="coordinator-view-count">{itemCount}</span>
+        </button>
+      </nav>
     </div>
   );
 }

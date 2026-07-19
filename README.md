@@ -101,9 +101,11 @@ disclosure: essentials visible by default, details on demand.
 Designed to run as a background service: a single static binary that serves the HTTP API with the React UI embedded.
 
 ```bash
-./dev.py prod deploy   # build release + deploy (launchd on macOS; systemd, or daemon mode if no systemd, on Linux)
-./dev.py prod status   # check running production instance
-./dev.py prod stop     # stop production instance
+./dev.py prod deploy                    # check/build local HEAD, then deploy transactionally
+./dev.py prod deploy --release vX.Y.Z   # deploy a checksummed published release
+./dev.py prod deploy --release latest   # resolve and deploy the latest stable release
+./dev.py prod status                    # backend, runtime identity, and durable transaction
+./dev.py prod stop                      # stop the backend-owned runtime
 ```
 
 ### Optional HTTPS Quick Start
@@ -138,16 +140,17 @@ and proxies API requests to Phoenix over HTTPS.
 
 ### Publishing a Release
 
-```bash
-./scripts/tag-release.sh v0.2.0   # validates clean tree, creates annotated tag, pushes
-```
+Merge a version-bump PR to `main`. The release workflow tags that main commit and publishes checksummed native assets for:
 
-Pushing a `v*` tag triggers CI (`.github/workflows/release.yml`) which builds a static
-`x86_64-unknown-linux-musl` binary and publishes it as a GitHub Release asset. The stable
-download URL is:
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `aarch64-unknown-linux-musl`
+- `x86_64-unknown-linux-musl`
 
-```
-https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x86_64-unknown-linux-musl
+Each stable asset URL follows:
+
+```text
+https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-<target>
 ```
 
 ## Environment Variables

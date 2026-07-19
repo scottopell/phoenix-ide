@@ -39,6 +39,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.16.0",
+    "mdast-util-to-string": "^4.0.0",
     "mermaid": "^11.15.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -47,6 +48,8 @@
     "react-syntax-highlighter": "^16.1.1",
     "recharts": "^3.8.1",
     "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.5",
     "valibot": "^1.4.0"
   },
   "devDependencies": {

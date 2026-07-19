@@ -11,43 +11,43 @@ runSurfaceCapture({
     { name: 'desktop', width: 1440, height: 900 },
   ],
   captureStory: async ({ page, id, outDir, viewport }) => {
-    if (id === 'fleet-expanded') {
-      await page.getByRole('button', { name: 'Show details' }).click();
-    }
-
     const geometry = await page.evaluate(() => {
       const measure = (selector) => {
         const element = document.querySelector(selector);
         if (!element) return null;
         const rect = element.getBoundingClientRect();
-        return { width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right };
+        return { width: rect.width, height: rect.height, top: rect.top, bottom: rect.bottom, right: rect.right };
       };
       return {
         transcript: measure('#messages'),
         row: measure('[data-render-unit-key]'),
         input: measure('#input-area'),
-        fleet: measure('.coordinator-fleet-pane:not([hidden])'),
-        fleetItem: measure('.coordinator-item'),
-        detail: measure('.coordinator-item-details'),
-        retry: measure('.coordinator-fleet-error button'),
+        mobileNav: measure('.coordinator-mobile-nav'),
+        work: measure('.coordinator-work-pane:not([hidden])'),
+        workItem: measure('.coordinator-item'),
+        retry: measure('.coordinator-work-error button'),
         overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
       };
     });
     if (geometry.overflow > 1) {
       throw new Error(`${id}/${viewport.name}: horizontal overflow: ${JSON.stringify(geometry)}`);
     }
+    if (viewport.width <= 1024 && (!geometry.mobileNav || geometry.mobileNav.bottom > viewport.height + 1)) {
+      throw new Error(`${id}/${viewport.name}: mobile navigation is outside the viewport: ${JSON.stringify(geometry)}`);
+    }
+    if (viewport.width <= 1024 && geometry.input && geometry.mobileNav && geometry.input.bottom > geometry.mobileNav.top + 1) {
+      throw new Error(`${id}/${viewport.name}: mobile navigation overlaps the composer: ${JSON.stringify(geometry)}`);
+    }
     if (id.startsWith('conversation-')) {
       if (!geometry.transcript || geometry.transcript.height <= 0 || !geometry.row || geometry.row.height <= 0 || !geometry.input || geometry.input.height <= 0) {
         throw new Error(`${id}/${viewport.name}: conversation geometry collapsed: ${JSON.stringify(geometry)}`);
       }
-    } else if (!geometry.fleet || geometry.fleet.height <= 0 || geometry.fleet.right > viewport.width + 1) {
-      throw new Error(`${id}/${viewport.name}: Fleet pane geometry collapsed: ${JSON.stringify(geometry)}`);
-    } else if (!id.endsWith('error') && (!geometry.fleetItem || geometry.fleetItem.width <= 0)) {
-      throw new Error(`${id}/${viewport.name}: Fleet item geometry collapsed: ${JSON.stringify(geometry)}`);
-    } else if (id === 'fleet-expanded' && (!geometry.detail || geometry.detail.height <= 0)) {
-      throw new Error(`${id}/${viewport.name}: Fleet detail did not expand: ${JSON.stringify(geometry)}`);
+    } else if (!geometry.work || geometry.work.height <= 0 || geometry.work.right > viewport.width + 1) {
+      throw new Error(`${id}/${viewport.name}: Work pane geometry collapsed: ${JSON.stringify(geometry)}`);
+    } else if (!id.endsWith('error') && (!geometry.workItem || geometry.workItem.width <= 0)) {
+      throw new Error(`${id}/${viewport.name}: Work item geometry collapsed: ${JSON.stringify(geometry)}`);
     } else if (id === 'fleet-error' && (!geometry.retry || geometry.retry.height < 32)) {
-      throw new Error(`${id}/${viewport.name}: Fleet retry is not usable: ${JSON.stringify(geometry)}`);
+      throw new Error(`${id}/${viewport.name}: Work retry is not usable: ${JSON.stringify(geometry)}`);
     }
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: false });
     return true;

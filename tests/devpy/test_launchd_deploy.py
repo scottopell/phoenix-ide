@@ -308,7 +308,7 @@ class PreparationTests(unittest.TestCase):
     def test_broken_pipe_after_handoff_does_not_release_claim(self):
         with mock.patch("builtins.print", side_effect=BrokenPipeError), \
              mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
-            self.dev._report_launchd_handoff("tx", {"version": "1.0.0", "git_sha": "abc123"})
+            self.dev._report_launchd_handoff("tx", self.dev.RuntimeIdentity("1.0.0", "abc123"))
         release.assert_not_called()
 
     def test_positional_version_is_rejected_with_release_guidance(self):
@@ -329,6 +329,82 @@ class PreparationTests(unittest.TestCase):
         check.assert_not_called()
         build.assert_not_called()
 
+    def test_controller_release_revalidates_exact_tag_to_expected_commit(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            digest = self.dev._file_sha256(asset)
+            (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
+            release_commit = "abc123def456" + "0" * 28
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            candidate = self.dev._prepare_release_candidate(
+                "v1.2.3", staging, expected_full_commit=release_commit
+            )
+        self.assertEqual(release_commit, candidate.release_commit)
+        self.assertEqual(3, len(run.call_args_list))
+
+    def test_controller_rejects_latest_release_alias(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(SystemExit, "exact release tag"):
+                self.dev._prepare_release_candidate("latest", Path(td), expected_full_commit="a" * 40)
+
+    def test_controller_uses_installed_launchd_env_and_transaction_id(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v1.2.3",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+        )
+        installed = {"PHOENIX_PASSWORD": "installed", "PHOENIX_PORT": "9443"}
+        with mock.patch.object(
+            self.dev, "_launchd_env_from_plist", return_value=installed
+        ) as read_installed:
+            env, path = self.dev._launchd_candidate_env(controller)
+        self.assertEqual(installed, env)
+        self.assertEqual("tx-123", controller.transaction_id)
+        self.assertIsNone(path)
+        read_installed.assert_called_once_with(self.dev.LAUNCHD_PLIST_PATH)
+
+    def test_controller_release_path_skips_checks_and_build(self):
+        controller = self.dev.ProdDeployControllerOptions(
+            enabled=True,
+            exact_release_tag="v1.2.3",
+            expected_full_commit="a" * 40,
+            transaction_id="tx-123",
+            backend="launchd",
+        )
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev, "prod_build") as build:
+            self.dev.cmd_prod_deploy("v1.2.3", controller=controller)
+        deploy.assert_called_once_with("v1.2.3", controller=controller)
+        check.assert_not_called()
+        build.assert_not_called()
+
+    def test_release_asset_selection_supports_all_native_targets(self):
+        import platform
+
+        cases = [
+            ("darwin", "arm64", "phoenix_ide-aarch64-apple-darwin"),
+            ("darwin", "x86_64", "phoenix_ide-x86_64-apple-darwin"),
+            ("linux", "aarch64", "phoenix_ide-aarch64-unknown-linux-musl"),
+            ("linux", "amd64", "phoenix_ide-x86_64-unknown-linux-musl"),
+        ]
+        for host_platform, machine, expected in cases:
+            with self.subTest(host_platform=host_platform, machine=machine), \
+                 mock.patch.object(self.dev.sys, "platform", host_platform), \
+                 mock.patch.object(platform, "machine", return_value=machine):
+                self.assertEqual(expected, self.dev._release_asset_name())
+
     def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
@@ -345,10 +421,14 @@ class PreparationTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ]
-            binary, tag, sha, commit = self.dev._prepare_release_candidate("latest", staging)
-            self.assertEqual(asset, binary)
-            self.assertTrue(binary.stat().st_mode & 0o100)
-        self.assertEqual(("v1.2.3", "abc123def456", release_commit), (tag, sha, commit))
+            candidate = self.dev._prepare_release_candidate("latest", staging)
+            self.assertEqual(asset, candidate.binary)
+            self.assertTrue(candidate.binary.stat().st_mode & 0o100)
+        self.assertEqual(self.dev.ProdSourceKind.PUBLISHED_RELEASE, candidate.source_kind)
+        self.assertEqual(
+            ("v1.2.3", "abc123def456", release_commit),
+            (candidate.release_tag, candidate.identity.git_sha, candidate.release_commit),
+        )
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
 
     def test_release_rejects_asset_from_different_commit(self):
@@ -384,6 +464,39 @@ class PreparationTests(unittest.TestCase):
             ]
             with self.assertRaisesRegex(SystemExit, "malformed git identity"):
                 self.dev._prepare_release_candidate("latest", staging)
+
+    def test_local_candidate_binds_exact_head_to_typed_identity(self):
+        commit = "abc123def456" + "0" * 28
+        identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+        with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")) as build, \
+             mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, commit + "\n", ""),
+             ):
+            candidate = self.dev._prepare_local_candidate(target=None)
+        self.assertEqual(self.dev.ProdSourceKind.LOCAL_HEAD, candidate.source_kind)
+        self.assertEqual(commit, candidate.source_commit)
+        self.assertEqual(identity, candidate.identity)
+        self.assertIsNone(candidate.release_tag)
+        self.assertIsNone(candidate.release_commit)
+        build.assert_called_once_with(target=None)
+
+    def test_local_candidate_rejects_identity_from_other_commit(self):
+        with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")), \
+             mock.patch.object(
+                 self.dev,
+                 "_binary_identity",
+                 return_value=self.dev.RuntimeIdentity("2.0.0", "bbbbbbbbbbbb"),
+             ), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+             ):
+            with self.assertRaisesRegex(SystemExit, "does not match selected HEAD"):
+                self.dev._prepare_local_candidate(target=None)
 
     def test_claim_release_is_transaction_owned(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -490,7 +603,7 @@ class PreparationTests(unittest.TestCase):
              mock.patch("urllib.request.urlopen", return_value=Response()):
             self.dev.PROD_SHA_PATH.write_text("abc123\n")
             identity, url, insecure = self.dev._legacy_prod_identity({"PHOENIX_PORT": "9123"})
-        self.assertEqual({"version": "0.9.0", "git_sha": "abc123"}, identity)
+        self.assertEqual(self.dev.RuntimeIdentity("0.9.0", "abc123"), identity)
         self.assertEqual("http://localhost:9123/version", url)
         self.assertFalse(insecure)
 
@@ -557,59 +670,22 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(helper.status_is_durable_terminal(manifest))
             self.assertIn("precondition_failed", helper.TERMINAL_STATES)
 
-    def test_legacy_plist_overrides_are_migrated_once(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SAME": "repo"})):
-            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-                "HOME": str(Path.home()), "PHOENIX_PASSWORD": "legacy-secret",
-                "PHOENIX_PORT": "9443", "SAME": "repo",
-            }}))
-            overrides = self.dev._launchd_override_env()
-            mode = self.dev.LAUNCHD_OVERRIDE_PATH.stat().st_mode & 0o777
-        self.assertEqual({"PHOENIX_PASSWORD": "legacy-secret", "PHOENIX_PORT": "9443"}, overrides)
-        self.assertEqual(0o600, mode)
-
-    def test_legacy_custom_generated_key_value_is_preserved(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "_load_env_file", return_value=None):
-            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-                "PHOENIX_DB_PATH": "/custom/prod.db",
-                "PHOENIX_LOG_STDOUT": "true",
-            }}))
-            overrides = self.dev._launchd_override_env()
-        self.assertEqual({
-            "PHOENIX_DB_PATH": "/custom/prod.db",
-            "PHOENIX_LOG_STDOUT": "true",
-        }, overrides)
-
-    def test_generated_plist_values_do_not_shadow_repo_env(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+    def test_candidate_env_uses_only_repo_environment_file(self):
+        with mock.patch.object(
+            self.dev,
+            "_load_env_file",
+            side_effect=lambda env: env.update({"PHOENIX_PASSWORD": "repo-secret", "PHOENIX_PORT": "9443"}),
+        ):
             env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("9443", env["PHOENIX_PORT"])
+        self.assertEqual({"PHOENIX_PASSWORD": "repo-secret", "PHOENIX_PORT": "9443"}, env)
 
-    def test_explicit_launchd_override_wins_over_repo_env(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
-             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
-             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
-            self.dev._write_launchd_override_env({"PHOENIX_PORT": "9555"})
-            env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("9555", env["PHOENIX_PORT"])
-
-    def test_candidate_env_includes_prod_set_overrides(self):
-        with mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"BASE": "yes"})), \
-             mock.patch.object(self.dev, "_launchd_override_env", return_value={"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "9443"}):
-            env, _path = self.dev._launchd_candidate_env()
-        self.assertEqual("yes", env["BASE"])
-        self.assertEqual("secret", env["PHOENIX_PASSWORD"])
-        self.assertEqual("9443", env["PHOENIX_PORT"])
+    def test_prod_override_commands_reject_without_backend_detection(self):
+        with mock.patch.object(self.dev, "detect_prod_env") as detect:
+            with self.assertRaisesRegex(SystemExit, r"edit \.phoenix-ide\.env directly"):
+                self.dev.cmd_prod_override_set("PHOENIX_PORT", "9443")
+            with self.assertRaisesRegex(SystemExit, r"edit \.phoenix-ide\.env directly"):
+                self.dev.cmd_prod_override_unset("PHOENIX_PORT")
+        detect.assert_not_called()
 
     def test_rollback_endpoint_is_derived_from_rollback_plist(self):
         with tempfile.TemporaryDirectory() as td:
@@ -674,13 +750,6 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(helper.ActivationError, "unsupported handoff protocol"):
                 helper.Manifest.load(path)
 
-    def test_override_mutation_refuses_active_deploy(self):
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"):
-            self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("deploy-owner\n")
-            with self.assertRaisesRegex(SystemExit, "deploy-owner"):
-                self.dev._refuse_launchd_override_during_deploy()
-
     def test_prod_status_uses_effective_launchd_env(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
@@ -698,7 +767,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("URL: http://localhost:9555", rendered)
 
     def test_prod_status_falls_back_to_legacy_public_version(self):
-        legacy_identity = {"version": "0.9.0", "git_sha": "abc123def456"}
+        legacy_identity = self.dev.RuntimeIdentity(version="0.9.0", git_sha="abc123def456")
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
              mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
@@ -746,15 +815,23 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("Config: unreadable launchd plist", rendered)
         self.assertIn("Last deploy: activation_failed_rolled_back (tx)", rendered)
 
-    def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
+    def test_release_workflow_lists_all_native_assets_and_checksums(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        self.assertIn("phoenix_ide-aarch64-apple-darwin", workflow)
-        self.assertIn("phoenix_ide-x86_64-apple-darwin", workflow)
+        for asset in (
+            "phoenix_ide-aarch64-apple-darwin",
+            "phoenix_ide-x86_64-apple-darwin",
+            "phoenix_ide-aarch64-unknown-linux-musl",
+            "phoenix_ide-x86_64-unknown-linux-musl",
+        ):
+            self.assertIn(asset, workflow)
         self.assertIn("SHA256SUMS", workflow)
+        self.assertIn('missing required release asset: $asset', workflow)
         self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
         self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
         self.assertIn("runner: macos-15-intel", workflow)
         self.assertIn("runner: macos-15", workflow)
+        self.assertIn("runner: ubuntu-24.04-arm", workflow)
+        self.assertIn("runner: ubuntu-latest", workflow)
         self.assertNotIn("runner: macos-14", workflow)
         self.assertNotIn("runner: macos-13", workflow)
 

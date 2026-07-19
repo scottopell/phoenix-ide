@@ -24,8 +24,9 @@ use super::sse::sse_stream;
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
     CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
-    ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
+    CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
+    ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
+    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
@@ -417,6 +418,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/deployment/disk/managed-worktrees/cleanup",
             post(super::deployment::cleanup_managed_worktree),
+        )
+        // Published production release updates (REQ-RU-001 through REQ-RU-010)
+        .route(
+            "/api/release-updates",
+            get(super::release_updates::snapshot),
+        )
+        .route(
+            "/api/release-updates/approve",
+            post(super::release_updates::approve),
         )
         // Usage analytics (read-only)
         .route("/api/usage", get(super::usage::usage_overview))
@@ -3735,24 +3745,115 @@ async fn cancel_steering_message(
 /// conversation's id in the same DB transaction.
 ///
 /// Single-continuation policy: if the parent already has a continuation,
-/// the endpoint returns the existing continuation's id with `already_existed:
-/// true` (idempotent-return rather than 409 reject — friendlier to UI
-/// retries, and the UI can route directly to the existing continuation).
+/// the endpoint returns the existing successor with `already_exists` and never
+/// resends the supplied handoff. This idempotent return lets the UI resolve
+/// creation races by navigating to the durable winner.
 ///
 /// Error shape:
 ///   - 404 if the parent id does not exist
 ///   - 409 if the parent is not in `ContextExhausted` state
 ///   - 500 on DB/transaction failure
+async fn dispatch_continuation_handoff(
+    state: &AppState,
+    intent: crate::db::ContinuationDispatchIntent,
+) -> (ContinueConversationStatus, Option<String>) {
+    let parent_id = intent.parent_conversation_id.clone();
+    let conversation_id = intent.successor_conversation_id.clone();
+    let dispatch = crate::send_chat_service::SendChatApplicationService::new(
+        state.db.clone(),
+        state.runtime.clone(),
+    )
+    .send(crate::send_chat_service::SendChatRequest {
+        conversation_id: conversation_id.clone(),
+        text: intent.handoff,
+        message_id: intent.message_id,
+        images: Vec::new(),
+        files: Vec::new(),
+        user_agent: intent.user_agent,
+        expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+    })
+    .await;
+    match dispatch {
+        Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {
+            // Channel delivery is not durable acceptance. The outbox intent stays
+            // pending until the message INSERT trigger consumes it, so a crash
+            // before executor persistence remains replayable.
+            (ContinueConversationStatus::Accepted, None)
+        }
+        Ok(
+            crate::send_chat_service::SendChatOutcome::AlreadyPersisted
+            | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
+        ) => {
+            // Both outcomes have another durable representation. Normally the
+            // message trigger has already consumed the intent for AlreadyPersisted;
+            // this delete also handles durable steering and reconciliation.
+            if let Err(error) = state
+                .db
+                .delete_continuation_dispatch_intent(&parent_id)
+                .await
+            {
+                tracing::warn!(
+                    parent_id,
+                    continuation_id = conversation_id,
+                    error = %error,
+                    "handoff is durable but continuation intent cleanup failed",
+                );
+            }
+            (ContinueConversationStatus::Accepted, None)
+        }
+        Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
+            (ContinueConversationStatus::DispatchFailed, Some(message))
+        }
+        Err(error) => {
+            tracing::warn!(
+                parent_id,
+                continuation_id = conversation_id,
+                error = %error,
+                "continuation created but opening handoff dispatch failed",
+            );
+            (
+                ContinueConversationStatus::DispatchFailed,
+                Some(error.to_string()),
+            )
+        }
+    }
+}
+
+fn existing_continuation_status(
+    dispatch_status: ContinueConversationStatus,
+) -> ContinueConversationStatus {
+    match dispatch_status {
+        ContinueConversationStatus::Accepted | ContinueConversationStatus::AlreadyExists => {
+            ContinueConversationStatus::AlreadyExists
+        }
+        ContinueConversationStatus::DispatchFailed => ContinueConversationStatus::DispatchFailed,
+    }
+}
+
 async fn continue_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Json(req): Json<ContinueConversationRequest>,
 ) -> Result<Json<ContinueConversationResponse>, AppError> {
     use crate::db::{ContinueOutcome, DbError};
 
-    let outcome = state
+    if req.handoff.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Continuation handoff must not be empty.".to_string(),
+        ));
+    }
+
+    let (outcome, intent) = state
         .runtime
         .db()
-        .continue_conversation(&id)
+        .continue_conversation_with_intent(
+            &id,
+            crate::db::NewContinuationDispatchIntent {
+                message_id: req.message_id,
+                handoff: req.handoff,
+                user_agent: req.user_agent,
+            },
+        )
         .await
         .map_err(|e| match e {
             DbError::ConversationNotFound(msg) => AppError::NotFound(msg),
@@ -3784,10 +3885,20 @@ async fn continue_conversation(
                 }
             });
 
+            let conversation_id = new_conv.id;
+            let slug = new_conv.slug;
+            let Some(intent) = intent else {
+                return Err(AppError::Internal(
+                    "continuation created without a dispatch intent".to_string(),
+                ));
+            };
+            let (status, error) = dispatch_continuation_handoff(&state, intent).await;
+
             Ok(Json(ContinueConversationResponse {
-                conversation_id: new_conv.id,
-                slug: new_conv.slug,
-                already_existed: false,
+                conversation_id,
+                slug,
+                status,
+                error,
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
@@ -3796,10 +3907,23 @@ async fn continue_conversation(
                 existing_continuation = %existing.id,
                 "continuation already existed; returning existing id idempotently",
             );
+            if let Some(intent) = intent {
+                let (dispatch_status, error) = dispatch_continuation_handoff(&state, intent).await;
+                // The persisted earlier intent won the race. Report the existing
+                // successor so a losing editor keeps its draft.
+                let status = existing_continuation_status(dispatch_status);
+                return Ok(Json(ContinueConversationResponse {
+                    conversation_id: existing.id,
+                    slug: existing.slug,
+                    status,
+                    error,
+                }));
+            }
             Ok(Json(ContinueConversationResponse {
                 conversation_id: existing.id,
                 slug: existing.slug,
-                already_existed: true,
+                status: ContinueConversationStatus::AlreadyExists,
+                error: None,
             }))
         }
         ContinueOutcome::ParentNotContextExhausted { state_variant } => {

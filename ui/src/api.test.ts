@@ -1,9 +1,7 @@
 // Tests for the `api.continueConversation` client (REQ-BED-030, task 24696).
 //
-// The endpoint is idempotent on the backend: a second call returns the
-// existing continuation with `already_existed: true`. The UI relies on
-// that idempotence — callers dispatch `continueConversation` without
-// client-side race resolution.
+// The endpoint creates a successor and submits its opening handoff. A second
+// call returns the existing continuation without resending the handoff.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
@@ -25,24 +23,29 @@ describe('api.continueConversation', () => {
       json: async () => ({
         conversation_id: 'new-conv-id',
         slug: 'new-conv-slug',
-        already_existed: false,
+        status: 'accepted',
       }),
     } as unknown as Response);
 
-    const res = await api.continueConversation('parent-id');
+    const request = { handoff: 'Generated handoff', message_id: 'message-1' };
+    const res = await api.continueConversation('parent-id', request);
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/conversations/parent-id/continue',
-      { method: 'POST' },
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
     );
     expect(res).toEqual({
       conversation_id: 'new-conv-id',
       slug: 'new-conv-slug',
-      already_existed: false,
+      status: 'accepted',
     });
   });
 
-  it('surfaces the already_existed flag when the parent had a continuation', async () => {
+  it('surfaces already_exists when the parent had a continuation', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -50,12 +53,12 @@ describe('api.continueConversation', () => {
       json: async () => ({
         conversation_id: 'existing-id',
         slug: 'existing-slug',
-        already_existed: true,
+        status: 'already_exists',
       }),
     } as unknown as Response);
 
-    const res = await api.continueConversation('parent-id');
-    expect(res.already_existed).toBe(true);
+    const res = await api.continueConversation('parent-id', { handoff: 'ignored', message_id: 'message-2' });
+    expect(res.status).toBe('already_exists');
     expect(res.slug).toBe('existing-slug');
   });
 
@@ -70,7 +73,7 @@ describe('api.continueConversation', () => {
       }),
     } as unknown as Response);
 
-    await expect(api.continueConversation('parent-id')).rejects.toBeInstanceOf(ConflictError);
+    await expect(api.continueConversation('parent-id', { handoff: 'handoff', message_id: 'message-3' })).rejects.toBeInstanceOf(ConflictError);
   });
 
   it('throws a generic Error on 404 (parent not found)', async () => {
@@ -81,7 +84,7 @@ describe('api.continueConversation', () => {
       json: async () => ({ error: 'Conversation not found: parent-id' }),
     } as unknown as Response);
 
-    await expect(api.continueConversation('parent-id')).rejects.toThrow(
+    await expect(api.continueConversation('parent-id', { handoff: 'handoff', message_id: 'message-3' })).rejects.toThrow(
       /Conversation not found/,
     );
   });

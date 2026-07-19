@@ -36,15 +36,16 @@ import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
+import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkdownDisplayBlocks, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
+import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
+import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
+import { parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
-import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
-import { formatCommissionReviewInput, parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
-import './MessageComponents.css';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -173,10 +174,8 @@ function formatToolDuration(ms: number): string {
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
+// =====================================================================// Helper functions
+// =====================================================================
 // eslint-disable-next-line react-refresh/only-export-components
 export function formatMessageTime(isoStr: string): string {
   if (!isoStr) return '';
@@ -193,7 +192,6 @@ export function formatMessageTime(isoStr: string): string {
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 
-
 /**
  * Strip model artifacts from think tool thoughts:
  * - Remove optional opening <thinking> wrapper
@@ -201,174 +199,6 @@ const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
  *   as a narration of its next action (observed on claude-haiku-4-5-20251001).
  *   The actual tool call happens separately via the JSON API; this is just text.
  */
-function cleanThoughts(raw: string): string {
-  let text = raw.replace(/^\s*<thinking>\s*/i, '');
-  const closingIdx = text.search(/<\/thinking>/i);
-  if (closingIdx !== -1) {
-    text = text.slice(0, closingIdx);
-  }
-  return text.trim();
-}
-
-function isFiniteInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value);
-}
-
-function isBashToolInput(input: Record<string, unknown>): input is BashToolInput {
-  const op = input['op'];
-  if (op !== 'run' && op !== 'peek' && op !== 'wait' && op !== 'kill') return false;
-  for (const retiredKey of ['command', 'mode', 'peek', 'wait', 'kill']) {
-    if (input[retiredKey] !== undefined) return false;
-  }
-  if (input['cmd'] !== undefined && typeof input['cmd'] !== 'string') return false;
-  if (input['handle'] !== undefined && typeof input['handle'] !== 'string') return false;
-  if (input['label'] !== undefined && typeof input['label'] !== 'string') return false;
-  if (input['wait_seconds'] !== undefined && (!isFiniteInteger(input['wait_seconds']) || input['wait_seconds'] < 0)) return false;
-  if (input['signal'] !== undefined && input['signal'] !== 'TERM' && input['signal'] !== 'KILL') return false;
-  if (input['lines'] !== undefined && (!isFiniteInteger(input['lines']) || input['lines'] < 1)) return false;
-  if (input['since'] !== undefined && (!isFiniteInteger(input['since']) || input['since'] < 0)) return false;
-  return true;
-}
-
-function readWindowSuffix(input: Pick<BashToolInput, 'lines' | 'since'>): string {
-  if (typeof input.lines === 'number') return ` · last ${input.lines} lines`;
-  if (typeof input.since === 'number' && input.since > 0) return ` · since ${input.since}`;
-  return '';
-}
-
-function formatModernBashInput(input: BashToolInput, displayOverride?: string): { display: string; isMultiline: boolean } {
-  switch (input.op) {
-    case 'run': {
-      const cmd = input.cmd || '';
-      if (!cmd) return { display: 'bash run <missing cmd>', isMultiline: false };
-      const displayCmd = displayOverride || cmd;
-      const waitSuffix = typeof input.wait_seconds === 'number' ? ` · wait ${input.wait_seconds}s` : '';
-      return { display: `$ ${displayCmd}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: cmd.includes('\n') };
-    }
-    case 'peek': {
-      const handle = input.handle || '<missing handle>';
-      return { display: `peek ${handle}${readWindowSuffix(input)}`, isMultiline: false };
-    }
-    case 'wait': {
-      const handle = input.handle || '<missing handle>';
-      const waitSuffix = typeof input.wait_seconds === 'number' ? ` (up to ${input.wait_seconds}s)` : '';
-      return { display: `wait ${handle}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: false };
-    }
-    case 'kill': {
-      const handle = input.handle || '<missing handle>';
-      const signal = input.signal || 'TERM';
-      return { display: `kill ${handle} (${signal})`, isMultiline: false };
-    }
-  }
-}
-
-function bashInputCopyText(input: Record<string, unknown>): string {
-  if (isBashToolInput(input)) {
-    if (input.op === 'run') return input.cmd || JSON.stringify(input);
-    return JSON.stringify(input);
-  }
-  if (input['op'] === undefined) {
-    const legacyText = input['command'] || input['cmd'] || input['peek'] || input['wait'] || input['kill'];
-    if (legacyText) return String(legacyText);
-  }
-  return JSON.stringify(input, null, 2);
-}
-
-function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
-  if (name === 'commission_review') {
-    return formatCommissionReviewInput(input);
-  }
-  switch (name) {
-    case 'bash': {
-      if (isBashToolInput(input)) {
-        return formatModernBashInput(input, displayOverride);
-      }
-      const legacyCommand = input['op'] === undefined ? String(input['command'] || input['cmd'] || '') : '';
-      if (legacyCommand) {
-        const displayCmd = displayOverride || legacyCommand;
-        return { display: `$ ${displayCmd}`, isMultiline: legacyCommand.includes('\n') };
-      }
-      const legacyJson = JSON.stringify(input);
-      return { display: `bash ${legacyJson}`, isMultiline: false };
-    }
-    case 'tmux': {
-      const args = (input['args'] as unknown[] | undefined) ?? [];
-      const argList = args.map((a) => String(a)).join(' ');
-      return { display: `tmux ${argList}`, isMultiline: false };
-    }
-    case 'think': {
-      const thoughts = cleanThoughts(String(input['thoughts'] || ''));
-      return { display: thoughts, isMultiline: thoughts.includes('\n') };
-    }
-    case 'patch': {
-      const path = String(input['path'] || '');
-      const patches = input['patches'] as Array<{ operation?: string }> | undefined;
-      const op = patches?.[0]?.operation || 'modify';
-      const count = patches?.length || 1;
-      const summary = count > 1 ? `${path}: ${count} patches` : `${path}: ${op}`;
-      return { display: summary, isMultiline: false };
-    }
-    case 'keyword_search': {
-      const query = String(input['query'] || '');
-      const terms = (input['search_terms'] as string[]) || [];
-      const termsStr = terms.length > 0 ? terms.slice(0, 3).join(', ') + (terms.length > 3 ? '...' : '') : '';
-      return { display: termsStr ? `"${query}" [${termsStr}]` : query, isMultiline: false };
-    }
-    case 'read_image': {
-      const path = String(input['path'] || '');
-      return { display: path, isMultiline: false };
-    }
-    case 'read_file': {
-      const path = String(input['path'] || '');
-      const offset = input['offset'] as number | undefined;
-      const limit = input['limit'] as number | undefined;
-      let display = path;
-      if (offset !== undefined || limit !== undefined) {
-        const start = offset ?? 1;
-        const end = limit !== undefined ? start + limit - 1 : undefined;
-        display = end !== undefined ? `${path}:${start}-${end}` : `${path}:${start}+`;
-      }
-      return { display, isMultiline: false };
-    }
-    case 'spawn_agents': {
-      const tasks = (input['tasks'] as Array<{ task?: string }>) || [];
-      const count = tasks.length;
-      return {
-        display: `${count} parallel task${count === 1 ? '' : 's'}`,
-        isMultiline: false,
-      };
-    }
-    case 'ask_user_question': {
-      const questions = (input['questions'] as Array<{ question?: string; options?: unknown[] }>) || [];
-      const first = questions[0];
-      const rawText = String(first?.question || '');
-      const flatText = rawText.replace(/\s+/g, ' ').trim();
-      const truncated = flatText.length > 80 ? flatText.slice(0, 80) + '…' : flatText;
-      const optionCount = Array.isArray(first?.options) ? first!.options!.length : 0;
-      const suffix = questions.length > 1
-        ? ` [+${questions.length - 1} more]`
-        : optionCount > 0 ? ` [${optionCount} options]` : '';
-      return { display: `"${truncated}"${suffix}`, isMultiline: false };
-    }
-    case 'search': {
-      const pattern = String(input['pattern'] || '');
-      const path = input['path'] ? String(input['path']) : '';
-      const include = input['include'] ? String(input['include']) : '';
-      let display = `"${pattern}"`;
-      if (path) display += ` in ${path}`;
-      if (include) display += ` (${include})`;
-      return { display, isMultiline: false };
-    }
-    default: {
-      if (name.startsWith('browser_')) {
-        const display = formatBrowserInput(name, input);
-        return { display, isMultiline: display.includes('\n') };
-      }
-      const str = JSON.stringify(input, null, 2);
-      return { display: str, isMultiline: str.includes('\n') };
-    }
-  }
-}
 
 function parseSlashCommand(text: string): { token: string; args: string } | null {
   const match = text.trim().match(/^(\/[A-Za-z0-9][\w:-]*)(?:\s+([\s\S]*))?$/);
@@ -418,12 +248,6 @@ function extractSkillResultDetails(resultText: string): { source?: string | unde
   };
 }
 
-function skillCommandFromInput(input: Record<string, unknown>): string {
-  const skillName = String(input['skill_name'] || 'skill').replace(/^\/+/, '');
-  const args = String(input['args'] || '').trim();
-  return args ? `/${skillName} ${args}` : `/${skillName}`;
-}
-
 function SkillToolBlock({
   input,
   resultText,
@@ -434,6 +258,8 @@ function SkillToolBlock({
   inflightElapsedSeconds,
   onOpenFile,
   toolId,
+  activeHighlight,
+  inputActiveHighlight,
 }: {
   input: Record<string, unknown>;
   resultText: string;
@@ -444,20 +270,42 @@ function SkillToolBlock({
   inflightElapsedSeconds: number;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   toolId: string;
+  activeHighlight?: AgentTextHighlight | null;
+  inputActiveHighlight?: AgentTextHighlight | null;
 }) {
   const details = extractSkillResultDetails(resultText);
   const sourcePath = details.source ? `${details.source}/SKILL.md` : undefined;
   const status = result == null ? 'loading' : isError ? 'failed' : 'loaded';
   const statusClass = result == null ? 'pending' : isError ? 'error' : 'success';
 
+  const inputText = skillCommandFromInput(input);
+
+  if (activeHighlight) {
+    if (isError) {
+      return (
+        <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+          <TerminalToolResultHighlight semanticText={resultText} fragmentId={activeHighlight.fragmentId} activeHighlight={activeHighlight} />
+        </div>
+      );
+    }
+    const visibleResult = skillResultVisibleText(resultText);
+    return (
+      <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+        <div className="skill-tool-status-row" data-fragment-id={activeHighlight.fragmentId}>
+          {renderHighlightedText(visibleResult, activeHighlight.start, activeHighlight.end)}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
       <div className="skill-tool-status-row">
-        <SkillCommandText
-          text={skillCommandFromInput(input)}
-          source={sourcePath}
-          snippet={details.snippet}
-        />
+        <span data-fragment-id="tool-use-input">
+          {inputActiveHighlight
+            ? renderHighlightedText(inputText, inputActiveHighlight.start, inputActiveHighlight.end)
+            : <SkillCommandText text={inputText} source={sourcePath} snippet={details.snippet} />}
+        </span>
         <span className={`skill-tool-status ${statusClass}`}>
           {status}
           {durationMs !== undefined && <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>}
@@ -487,99 +335,8 @@ function SkillToolBlock({
   );
 }
 
-function truncateValue(s: string, max = 40): string {
-  return s.length > max ? s.slice(0, max) + '…' : s;
-}
-
-function formatBrowserInput(name: string, input: Record<string, unknown>): string {
-  switch (name) {
-    case 'browser_navigate': {
-      const url = String(input['url'] || '');
-      return `→ ${url}`;
-    }
-    case 'browser_eval': {
-      const expr = String(input['expression'] || '').replace(/\s+/g, ' ').trim();
-      return `eval: ${truncateValue(expr, 80)}`;
-    }
-    case 'browser_take_screenshot': {
-      const selector = input['selector'] ? String(input['selector']) : '';
-      return selector ? `screenshot of "${selector}"` : 'screenshot';
-    }
-    case 'browser_recent_console_logs': {
-      const limit = input['limit'] as number | undefined;
-      return limit !== undefined ? `console logs (${limit})` : 'console logs';
-    }
-    case 'browser_clear_console_logs': {
-      return 'clear console';
-    }
-    case 'browser_resize': {
-      const width = input['width'];
-      const height = input['height'];
-      return `resize ${width}x${height}`;
-    }
-    case 'browser_wait_for_selector': {
-      const selector = String(input['selector'] || '');
-      const visible = input['visible'] === true;
-      return visible ? `wait "${selector}" (visible)` : `wait "${selector}"`;
-    }
-    case 'browser_click': {
-      const selector = String(input['selector'] || '');
-      return `click "${selector}"`;
-    }
-    case 'browser_type': {
-      const selector = String(input['selector'] || '');
-      const text = String(input['text'] || '');
-      const clear = input['clear'] === true;
-      const verb = clear ? 'replace' : 'type';
-      return `${verb} "${selector}" = "${truncateValue(text)}"`;
-    }
-    case 'browser_key_press': {
-      const key = String(input['key'] || '');
-      const modifiers = (input['modifiers'] as string[]) || [];
-      const chord = modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key;
-      return `key: ${chord}`;
-    }
-    case 'browser_profile': {
-      const action = String(input['action'] || '');
-      switch (action) {
-        case 'run_scenario': {
-          const runs = input['runs'] ?? 1;
-          const warmup = input['warmup'] ?? 1;
-          const steps = Array.isArray(input['steps']) ? (input['steps'] as unknown[]).length : 0;
-          const tr = input['throttle_rate'];
-          const thr = tr !== undefined && tr !== null ? `, throttle ${String(tr)}x` : '';
-          const reset = input['reset'];
-          const resetStr =
-            reset === 'none'
-              ? ', reset:none'
-              : reset && typeof reset === 'object'
-                ? `, reset:${String((reset as Record<string, unknown>)['kind'] ?? '?')}`
-                : '';
-          const gcStr = input['gc_per_run'] === false ? ', gc:off' : '';
-          return `profile: scenario (${steps} steps × ${String(runs)} runs, ${String(warmup)} warmup${thr}${resetStr}${gcStr})`;
-        }
-        case 'throttle':
-          return `profile: throttle ${String(input['rate'] ?? '')}x`;
-        case 'trace_start': {
-          const cats = input['categories'] ? ` [${String(input['categories'])}]` : '';
-          return `profile: trace_start${cats}`;
-        }
-        case 'heap_snapshot':
-          return input['baseline'] ? 'profile: heap_snapshot (diff)' : 'profile: heap_snapshot';
-        default:
-          return action ? `profile: ${action}` : 'profile';
-      }
-    }
-    default: {
-      return JSON.stringify(input, null, 2);
-    }
-  }
-}
-
-// ============================================================================
-// User Message Components
-// ============================================================================
-
+// =====================================================================// User Message Components
+// =====================================================================
 function MessageCopyButton({ message, title }: { message: Message; title: string }) {
   const markdown = getMessageMarkdown(message);
   if (markdown.trim() === '') return null;
@@ -599,13 +356,27 @@ function formatAttachmentBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function FileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+function FileChips({
+  files,
+  activeHighlight = null,
+}: {
+  files: { original_name: string; size_bytes: number; stored_path?: string }[];
+  activeHighlight?: ConversationHighlight | null;
+}) {
   if (files.length === 0) return null;
   return (
     <div className="message-files">
       {files.map((file, idx) => (
-        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
-          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        <span
+          key={`${file.stored_path ?? file.original_name}-${idx}`}
+          className="message-file-chip"
+          title={file.stored_path}
+          data-fragment-id={`message-attachment-${idx}`}
+        >
+          📎 {activeHighlight?.owner === 'message-attachment' && activeHighlight.fragmentId === `message-attachment-${idx}`
+            ? renderHighlightedText(file.original_name, activeHighlight.start, activeHighlight.end)
+            : file.original_name}{' '}
+          <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
         </span>
       ))}
     </div>
@@ -614,7 +385,7 @@ function FileChips({ files }: { files: { original_name: string; size_bytes: numb
 
 export const UserMessage = memo(UserMessageImpl);
 
-function UserMessageImpl({ message }: { message: Message }) {
+function UserMessageImpl({ message, activeHighlight = null }: { message: Message; activeHighlight?: ConversationHighlight | null }) {
   const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; files?: { original_name: string; size_bytes: number; stored_path?: string }[]; is_meta?: boolean };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
@@ -639,7 +410,11 @@ function UserMessageImpl({ message }: { message: Message }) {
         </span>
       </div>
       <div className="message-content">
-        <SkillCommandText text={text} />
+        <span data-fragment-id="message-text">
+          {activeHighlight?.owner === 'message-text'
+            ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+            : <SkillCommandText text={text} />}
+        </span>
         {images.length > 0 && (
           <div className="message-images">
             {images.map((img, idx) => (
@@ -652,7 +427,7 @@ function UserMessageImpl({ message }: { message: Message }) {
             ))}
           </div>
         )}
-        <FileChips files={files} />
+        <FileChips files={files} activeHighlight={activeHighlight} />
       </div>
     </div>
   );
@@ -666,10 +441,12 @@ export const QueuedUserMessage = memo(QueuedUserMessageImpl);
 function QueuedUserMessageImpl({
   message,
   onCancelSteering,
+  activeHighlight = null,
 }: {
   message: QueuedMessage;
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
+  activeHighlight?: ConversationHighlight | null;
 }) {
   const isSteeringQueued = message.status === 'steering_queued';
   return (
@@ -696,7 +473,11 @@ function QueuedUserMessageImpl({
         )}
       </div>
       <div className="message-content">
-        <SkillCommandText text={message.text} />
+        <span data-fragment-id="message-text">
+          {activeHighlight?.owner === 'message-text'
+            ? renderHighlightedText(message.text, activeHighlight.start, activeHighlight.end)
+            : <SkillCommandText text={message.text} />}
+        </span>
         {message.images.length > 0 && (
           <div className="message-images">
             {message.images.map((img, idx) => (
@@ -709,9 +490,113 @@ function QueuedUserMessageImpl({
             ))}
           </div>
         )}
-        <FileChips files={message.files ?? []} />
+        <FileChips files={message.files ?? []} activeHighlight={activeHighlight} />
       </div>
     </div>
+  );
+}
+
+type MarkdownHighlight = {
+  sourceStart: number;
+  sourceEnd: number;
+  start: number;
+  end: number;
+};
+
+type HastNode = {
+  type?: string;
+  value?: string;
+  position?: { start?: { offset?: number }; end?: { offset?: number } };
+  children?: HastNode[];
+  tagName?: string;
+  properties?: Record<string, unknown>;
+};
+
+function markdownHighlightForRange(markdown: string, start: number, end: number): MarkdownHighlight | null {
+  let blockStart = 0;
+  for (const block of buildMarkdownDisplayBlocks(markdown).filter((block) => block.kind !== 'code' || block.language === 'mermaid')) {
+    const blockEnd = blockStart + block.searchableText.length;
+    if (start >= blockStart && end <= blockEnd) {
+      return {
+        sourceStart: block.sourceRange.start,
+        sourceEnd: block.sourceRange.end,
+        start: start - blockStart,
+        end: end - blockStart,
+      };
+    }
+    blockStart = blockEnd + 1;
+  }
+  return null;
+}
+
+function markdownHighlightPlugin(highlight: MarkdownHighlight) {
+  return () => (tree: HastNode) => {
+    const target = findMarkdownHighlightTarget(tree, highlight);
+    if (target?.tagName === 'code') return;
+    if (target) decorateMarkdownTextNodes(target, highlight.start, highlight.end);
+  };
+}
+
+function findMarkdownHighlightTarget(node: HastNode, highlight: MarkdownHighlight): HastNode | null {
+  const nodeStart = node.position?.start?.offset;
+  const nodeEnd = node.position?.end?.offset;
+  const containsSourceRange = nodeStart !== undefined
+    && nodeEnd !== undefined
+    && nodeStart <= highlight.sourceStart
+    && nodeEnd >= highlight.sourceEnd;
+  if (!containsSourceRange) return null;
+  for (const child of node.children ?? []) {
+    if (!child.children) continue;
+    const target = findMarkdownHighlightTarget(child, highlight);
+    if (target) return target;
+  }
+  return node.children ? node : null;
+}
+
+function decorateMarkdownTextNodes(node: HastNode, start: number, end: number): void {
+  let cursor = 0;
+  const visit = (parent: HastNode) => {
+    const nextChildren: HastNode[] = [];
+    for (const child of parent.children ?? []) {
+      if (child.type !== 'text' || typeof child.value !== 'string') {
+        visit(child);
+        nextChildren.push(child);
+        continue;
+      }
+      const childStart = cursor;
+      const childEnd = childStart + child.value.length;
+      const overlapStart = Math.max(start, childStart);
+      const overlapEnd = Math.min(end, childEnd);
+      if (overlapStart < overlapEnd) {
+        const localStart = overlapStart - childStart;
+        const localEnd = overlapEnd - childStart;
+        if (localStart > 0) nextChildren.push({ type: 'text', value: child.value.slice(0, localStart) });
+        nextChildren.push({
+          type: 'element',
+          tagName: 'mark',
+          properties: { className: ['viewer-find-inline-match', 'viewer-find-inline-match--active'] },
+          children: [{ type: 'text', value: child.value.slice(localStart, localEnd) }],
+        });
+        if (localEnd < child.value.length) nextChildren.push({ type: 'text', value: child.value.slice(localEnd) });
+      } else {
+        nextChildren.push(child);
+      }
+      cursor = childEnd;
+    }
+    if (parent.children) parent.children = nextChildren;
+  };
+  visit(node);
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function renderHighlightedText(text: string, start: number, end: number): React.ReactNode {
+  if (start < 0 || end <= start || start >= text.length) return text;
+  return (
+    <>
+      {text.slice(0, start)}
+      <mark className="viewer-find-inline-match viewer-find-inline-match--active">{text.slice(start, Math.min(end, text.length))}</mark>
+      {text.slice(Math.min(end, text.length))}
+    </>
   );
 }
 
@@ -724,23 +609,47 @@ function QueuedUserMessageImpl({
  * a memoized map, so a shallow prop compare bails for unchanged text.
  * Mirrors the per-block memoization StreamingMessage uses for the same reason.
  */
-const AgentTextBlock = memo(function AgentTextBlock({
+/**
+ * An assistant text block that, in compact mode, has content hidden by its
+ * preview. Renders as a faded clickable one-liner that expands to the full
+ * markdown on click — never destructive, the full text is always one click
+ * away (and the title attr carries the first line for hover).
+ */
+const CollapsibleText = memo(CollapsibleTextImpl);
+
+function CollapsibleTextImpl({
   text,
-  remarkPlugins,
-  components,
+  summary,
+  expanded,
+  onExpand,
 }: {
   text: string;
-  remarkPlugins: typeof REMARK_PLUGINS;
-  components: React.ComponentProps<typeof ReactMarkdown>['components'];
+  summary: string;
+  expanded: boolean;
+  onExpand: () => void;
 }) {
+  if (expanded) {
+    return <div className="agent-text-block">{text}</div>;
+  }
+
   return (
-    <div className="agent-text-block">
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
-        {text}
-      </ReactMarkdown>
+    <div
+      className="agent-text-collapsed"
+      role="button"
+      tabIndex={0}
+      title={summary}
+      onClick={onExpand}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onExpand();
+        }
+      }}
+    >
+      {summary}
     </div>
   );
-});
+}
 
 /**
  * The inline mini pill-strip a compact-mode agent turn shows in place of its
@@ -820,9 +729,28 @@ function CompactToolStripImpl({
   );
 }
 
-// ============================================================================
-// Agent Message Components
-// ============================================================================
+// =====================================================================// Agent Message Components
+// =====================================================================
+export interface AgentTextRevealRequest {
+  unitKey: string;
+  fragmentId: string;
+  revealTarget: ConversationFragmentRevealTarget;
+  nonce: number;
+}
+
+export interface AgentTextHighlight {
+  fragmentId: string;
+  start: number;
+  end: number;
+}
+
+export type ConversationHighlight = AgentTextHighlight & (
+  | { owner: 'message-text' }
+  | { owner: 'message-attachment' }
+  | { owner: 'agent-text' }
+  | { owner: 'tool-input'; toolUseId: string }
+  | { owner: 'tool-result'; toolUseId: string }
+);
 
 interface AgentMessageProps {
   message: Message;
@@ -846,12 +774,19 @@ interface AgentMessageProps {
    */
   forceExpandedText?: boolean;
   isLatestAgentMessage?: boolean;
+  unitKey?: string;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: ConversationHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, isLatestAgentMessage = false }: AgentMessageProps) {
-  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+  const blocks = useMemo(
+    () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
+    [message.content],
+  );
   const timestamp = message.created_at;
   const { theme } = useTheme();
   const { density } = useDensity();
@@ -897,6 +832,14 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
   // Compact mode collapses tools only when there is at least one strip item;
   // a turn of pure prose / think asides has nothing to collapse.
   const collapseTools = compact && !toolsExpanded && toolStripItems.length > 0;
+
+  useEffect(() => {
+    if (!compact || toolsExpanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
+    pendingScrollToolIdRef.current = 'toolUseId' in revealRequest.revealTarget
+      ? revealRequest.revealTarget.toolUseId
+      : null;
+    setToolsExpanded(true);
+  }, [compact, revealRequest, toolsExpanded]);
 
   const filePathCopyContext = useMemo(
     () => (filePathRootDir ? { rootDir: filePathRootDir } : undefined),
@@ -969,6 +912,73 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
     } satisfies Components;
   }, [onOpenFile, filePathCopyContext, filePathRootDir, syntaxStyle]);
 
+  const textFragments = useMemo(
+    () => buildAgentTextFragments(blocks, density, { forceExpandedText }),
+    [blocks, density, forceExpandedText],
+  );
+  const [expandedFragmentIds, setExpandedFragmentIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    if (!revealRequest || revealRequest.unitKey !== unitKey) return;
+    if (revealRequest.revealTarget.kind !== 'agent-text') return;
+    setExpandedFragmentIds((current) => {
+      if (current.has(revealRequest.fragmentId)) return current;
+      const next = new Set(current);
+      next.add(revealRequest.fragmentId);
+      return next;
+    });
+    onRevealHandled?.(revealRequest);
+  }, [onRevealHandled, revealRequest, unitKey]);
+
+  const expandFragment = useCallback((fragmentId: string) => {
+    setExpandedFragmentIds((current) => {
+      if (current.has(fragmentId)) return current;
+      const next = new Set(current);
+      next.add(fragmentId);
+      return next;
+    });
+  }, []);
+
+  const renderTextFragment = useCallback((fragment: ConversationTextFragment) => {
+    const remarkPlugins = usesGfmSyntax(fragment.display.sourceText) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
+    const expanded = forceExpandedText || fragment.display.mode === 'full' || expandedFragmentIds.has(fragment.fragmentId);
+    const highlight = activeHighlight?.owner === 'agent-text' && activeHighlight.fragmentId === fragment.fragmentId
+      ? activeHighlight
+      : null;
+    const markdownHighlight = highlight
+      ? markdownHighlightForRange(fragment.display.sourceText, highlight.start, highlight.end)
+      : null;
+
+    if (!expanded) {
+      return (
+        <CollapsibleText
+          key={fragment.fragmentId}
+          text={fragment.display.sourceText}
+          summary={fragment.display.summaryText}
+          expanded={false}
+          onExpand={() => expandFragment(fragment.fragmentId)}
+        />
+      );
+    }
+    return (
+      <div key={fragment.fragmentId} className="agent-text-fragment" data-fragment-id={fragment.fragmentId}>
+        <div className="agent-text-block" {...(highlight ? { 'data-active-fragment-highlight': true } : {})}>
+          <ReactMarkdown
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={markdownHighlight ? [markdownHighlightPlugin(markdownHighlight)] : []}
+            components={markdownComponents}
+            urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}
+          >
+            {fragment.display.sourceText}
+          </ReactMarkdown>
+        </div>
+      </div>
+    );
+  }, [activeHighlight, expandFragment, expandedFragmentIds, forceExpandedText, markdownComponents]);
+  const textFragmentById = useMemo(
+    () => new Map(textFragments.map((fragment) => [fragment.fragmentId, fragment])),
+    [textFragments],
+  );
+
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
     if (block.type === 'text') {
@@ -1038,19 +1048,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
           let stripEmitted = false;
           return blocks.map((block, i) => {
             if (block.type === 'text') {
-              // Skip empty text blocks - they produce empty bubbles
-              if (!block.text || block.text.trim() === '') {
+              const fragment = textFragmentById.get(`agent-text-${i}`);
+              if (!fragment || fragment.semanticText.trim() === '') {
                 return null;
               }
-              const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
-              return (
-                <AgentTextBlock
-                  key={i}
-                  text={block.text}
-                  remarkPlugins={remarkPlugins}
-                  components={markdownComponents}
-                />
-              );
+              return renderTextFragment(fragment);
             } else if (block.type === 'tool_use') {
               // `think` renders as a subtle inline aside, not the full tool-block
               // shell — it's model reasoning, not an action. Collapsed by default,
@@ -1091,19 +1093,22 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
               const showMissingResult =
                 result === undefined && !(isLatestAgentMessage && activeToolUseId !== undefined);
               return (
-                <ToolUseBlock
-                  key={block.id || i}
-                  block={block}
-                  result={result}
-                  onOpenFile={onOpenFile}
-                  onOpenCommissionReview={onOpenCommissionReview}
-                  requestSequenceId={message.sequence_id}
-                  workScopeKey={workScopeKey}
-                  knownResultIds={knownResultIds}
-                  toolStartedAtMs={toolStartedAtMs}
-                  showMissingResult={showMissingResult}
-                  liveBashProgress={liveBashProgress[block.id || '']?.progress}
-                />
+                  <ToolUseBlock
+                    key={block.id || i}
+                    block={block}
+                    result={result}
+                    onOpenFile={onOpenFile}
+                    onOpenCommissionReview={onOpenCommissionReview}
+                    requestSequenceId={message.sequence_id}
+                    workScopeKey={workScopeKey}
+                    knownResultIds={knownResultIds}
+                    toolStartedAtMs={toolStartedAtMs}
+                    showMissingResult={showMissingResult}
+                    liveBashProgress={liveBashProgress[block.id || '']?.progress}
+                    revealRequest={revealRequest}
+                    activeHighlight={activeHighlight}
+                    onRevealHandled={onRevealHandled}
+                  />
               );
             }
             return null;
@@ -1114,10 +1119,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
   );
 }
 
-// ============================================================================
-// Think Aside — subtle inline collapsed aside for `think` tool blocks
-// ============================================================================
-
+// =====================================================================// Think Aside — subtle inline collapsed aside for `think` tool blocks
+// =====================================================================
 export const ThinkAside = memo(ThinkAsideImpl);
 
 function ThinkAsideImpl({ block }: { block: ContentBlock }) {
@@ -1158,10 +1161,8 @@ function ThinkAsideImpl({ block }: { block: ContentBlock }) {
   );
 }
 
-// ============================================================================
-// Tool Use Block
-// ============================================================================
-
+// =====================================================================// Tool Use Block
+// =====================================================================
 interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
@@ -1170,6 +1171,9 @@ interface ToolUseBlockProps {
   requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: ConversationHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
    *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
@@ -1328,7 +1332,6 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   }
   return null;
 }
-
 
 function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
   const { openInspect } = useViewerSlotCommands();
@@ -1609,12 +1612,6 @@ export function BrowserConsoleLogsView({ rawText }: { rawText: string }) {
   );
 }
 
-// Search tool output is plain text shaped as `relative/path:NN: content` lines,
-// optionally followed by bracketed notes like `[Results limited to 50 ...]` or
-// `[Walk truncated ...]`. Group hits by file so a multi-hit file shows once with
-// its line numbers underneath.
-type SearchHit = { path: string; lineNumber: number; content: string };
-
 type ReadFileRequest = {
   path: string;
   offset: number | null;
@@ -1740,33 +1737,66 @@ function formatReadFileRange(request: ReadFileRequest, parsed: ReadFileParseResu
   return 'from start of file';
 }
 
-function ReadFileResultView({
+export function ReadFileResultView({
   input,
   rawText,
   metadata,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
+  showPath = true,
 }: {
   input: Record<string, unknown>;
   rawText: string;
-  metadata: ReadFileDisplayData;
+  metadata?: ReadFileDisplayData | null;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
+  showPath?: boolean;
 }) {
   const request = useMemo(() => parseReadFileRequest(input), [input]);
   const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
+  const projection = useMemo(
+    () => buildReadFileOutputProjection(rawText, input, toolUseId ? { toolUseId } : {}),
+    [rawText, input, toolUseId],
+  );
   const preview = useMemo(() => boundedReadFileLines(parsed.lines), [parsed.lines]);
   const [showAllReturnedLines, setShowAllReturnedLines] = useState(false);
+  if (!metadata) {
+    return (
+      <ReadFileProjectionView
+        projection={projection}
+        onOpenFile={onOpenFile}
+        activeHighlight={activeHighlight}
+        showPath={showPath}
+      />
+    );
+  }
   const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
   const hasMore = preview.truncated;
   const canExpandReturnedOutput = hasMore;
-  const visibleLines = showAllReturnedLines ? parsed.lines : preview.lines;
+  const activeLineNumber = activeHighlight
+    ? projection.fragments.find((fragment) => fragment.fragmentId === activeHighlight.fragmentId)?.revealTarget.lineNumber
+    : undefined;
+  const activeLineNeedsReveal = activeLineNumber !== undefined
+    && !preview.lines.some((line) => line.lineNumber === activeLineNumber);
+  const visibleLines = showAllReturnedLines || activeLineNeedsReveal ? parsed.lines : preview.lines;
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
+  const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
+  const lineFragments = projection.fragments.filter((fragment) => fragment.kind === 'line');
+  const noteFragments = projection.fragments.filter((fragment) => fragment.kind === 'note');
 
   if (metadata.total_line_count === 0) {
     return (
       <div className="read-file-result read-file-result-fallback" data-read-file-state="empty">
         <div className="read-file-result-meta">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">No file content returned</span>
         </div>
         <div className="read-file-result-empty">(empty file)</div>
@@ -1778,7 +1808,11 @@ function ReadFileResultView({
     return (
       <div className="read-file-result read-file-result-fallback" data-read-file-state="empty-range">
         <div className="read-file-result-meta">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">No lines returned for the requested range</span>
         </div>
         <div className="read-file-result-empty">The file contains {metadata.total_line_count} lines.</div>
@@ -1792,7 +1826,11 @@ function ReadFileResultView({
     <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
       <div className="read-file-result-meta">
         <div className="read-file-result-meta-main">
-          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-path" data-fragment-id={pathFragment?.fragmentId}>
+            {pathHighlight && pathFragment
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : request.path || '(unknown path)'}
+          </span>
           <span className="read-file-result-summary">
             {metadata.returned_line_count} line{metadata.returned_line_count === 1 ? '' : 's'} • {rangeLabel}
           </span>
@@ -1824,13 +1862,32 @@ function ReadFileResultView({
         </div>
       </div>
       <div className="read-file-result-preview" role="table" aria-label="read_file preview">
-        {visibleLines.map((line) => (
-          <div key={line.lineNumber} className="read-file-result-line" role="row">
-            <span className="read-file-result-lineno" role="cell">{line.lineNumber}</span>
-            <span className="read-file-result-content" role="cell">{line.content || ' '}</span>
-          </div>
-        ))}
+        {visibleLines.map((line) => {
+          const fragment = lineFragments.find((candidate) => candidate.display.lineNumber === line.lineNumber);
+          const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
+          const lineNumberText = String(line.lineNumber);
+          return (
+            <div key={line.lineNumber} className="read-file-result-line" role="row" data-fragment-id={fragment?.fragmentId}>
+              <span className="read-file-result-lineno" role="cell">
+                {keywordFieldHighlight(highlight, 0, lineNumberText)}
+              </span>
+              <span className="read-file-result-content" role="cell">
+                {keywordFieldHighlight(highlight, lineNumberText.length + 1, line.content || ' ')}
+              </span>
+            </div>
+          );
+        })}
       </div>
+      {noteFragments.map((fragment) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="read-file-result-note" data-fragment-id={fragment.fragmentId}>
+            {highlight
+              ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
+              : fragment.display.note}
+          </div>
+        );
+      })}
       {(hasMore || metadata.remaining_line_count > 0) && (
         <div className="read-file-result-more">
           {hasMore && !showAllReturnedLines && (parsed.lines.length > visibleLines.length
@@ -1846,82 +1903,215 @@ function ReadFileResultView({
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
-export function parseSearchOutput(text: string): {
-  hits: SearchHit[];
-  notes: string[];
-  noMatches: boolean;
-} {
-  const notes: string[] = [];
-  const hits: SearchHit[] = [];
+export function parseSearchOutput(text: string) {
+  return buildSearchOutputProjection(text);
+}
 
-  if (text.trim() === 'No matches found.') {
-    return { hits, notes, noMatches: true };
-  }
+function ReadFileProjectionView({
+  projection,
+  onOpenFile,
+  activeHighlight,
+  showPath,
+}: {
+  projection: ReturnType<typeof buildReadFileOutputProjection>;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  activeHighlight: AgentTextHighlight | null;
+  showPath: boolean;
+}) {
+  const pathFragment = projection.fragments.find((fragment) => fragment.kind === 'path') ?? null;
+  const pathHighlight = activeHighlight?.fragmentId === pathFragment?.fragmentId ? activeHighlight : null;
+  const lineFragments = projection.fragments.filter((fragment) => fragment.kind === 'line');
+  const noteFragments = projection.fragments.filter((fragment) => fragment.kind === 'note');
 
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    if (line.startsWith('[') && line.trimEnd().endsWith(']')) {
-      notes.push(line.trim().slice(1, -1));
-      continue;
-    }
-    // Non-greedy path, then :digits:, then optional space, then content.
-    // Path can contain colons in unusual cases; backtracking will find the
-    // rightmost path/digits boundary that satisfies the digit run.
-    const m = /^(.+?):(\d+):\s?(.*)$/.exec(line);
-    if (m && m[1] !== undefined && m[2] !== undefined) {
-      hits.push({ path: m[1], lineNumber: parseInt(m[2], 10), content: m[3] ?? '' });
-    } else {
-      notes.push(line);
-    }
-  }
-  return { hits, notes, noMatches: false };
+  return (
+    <div className="read-file-results">
+      {showPath && pathFragment && (
+        onOpenFile ? (
+          <button
+            type="button"
+            className="search-results-filepath"
+            data-fragment-id={pathFragment.fragmentId}
+            onClick={() => onOpenFile(pathFragment.display.path, new Set(), 0)}
+            title="Open file"
+          >
+            {pathHighlight
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : pathFragment.semanticText}
+          </button>
+        ) : (
+          <div
+            className="search-results-filepath search-results-filepath-static"
+            data-fragment-id={pathFragment.fragmentId}
+          >
+            {pathHighlight
+              ? renderHighlightedText(pathFragment.semanticText, pathHighlight.start, pathHighlight.end)
+              : pathFragment.semanticText}
+          </div>
+        )
+      )}
+      <div className="search-results-hits">
+        {lineFragments.map((fragment) => {
+          const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+          const lineNumber = fragment.display.lineNumber;
+          const lineContent = fragment.display.content || ' ';
+          const lineNumberText = String(lineNumber);
+          const contentStart = lineNumberText.length + 1;
+          const body = (
+            <>
+              <span className="search-result-lineno">
+                {keywordFieldHighlight(highlight, 0, lineNumberText)}
+              </span>
+              <span className="search-result-content">
+                {keywordFieldHighlight(highlight, contentStart, lineContent)}
+              </span>
+            </>
+          );
+          return onOpenFile && pathFragment ? (
+            <button
+              key={fragment.fragmentId}
+              type="button"
+              className="search-result-line search-result-line-clickable"
+              data-fragment-id={fragment.fragmentId}
+              onClick={() => onOpenFile(pathFragment.display.path, new Set([lineNumber]), lineNumber)}
+            >
+              {body}
+            </button>
+          ) : (
+            <div key={fragment.fragmentId} className="search-result-line" data-fragment-id={fragment.fragmentId}>
+              {body}
+            </div>
+          );
+        })}
+      </div>
+      {noteFragments.map((fragment) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="read-file-result-note" data-fragment-id={fragment.fragmentId}>
+            {highlight
+              ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end)
+              : fragment.display.note}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function TerminalToolResultHighlight({
+  semanticText,
+  fragmentId,
+  activeHighlight,
+}: {
+  semanticText: string;
+  fragmentId: string;
+  activeHighlight: AgentTextHighlight;
+}) {
+  const maxLength = 5_000;
+  const windowStart = semanticText.length > maxLength
+    ? Math.max(0, Math.min(activeHighlight.start - Math.floor(maxLength / 2), semanticText.length - maxLength))
+    : 0;
+  const visibleText = semanticText.slice(windowStart, windowStart + maxLength);
+  const visibleHighlight = {
+    ...activeHighlight,
+    start: activeHighlight.start - windowStart,
+    end: activeHighlight.end - windowStart,
+  };
+  return (
+    <pre className="tool-block-output-content" data-fragment-id={fragmentId}>
+      {windowStart > 0 ? '…\n' : ''}
+      {renderHighlightedText(visibleText, visibleHighlight.start, visibleHighlight.end)}
+      {windowStart + visibleText.length < semanticText.length ? '\n…' : ''}
+    </pre>
+  );
+}
+
+export function PatchResultView({
+  diff,
+  toolUseId,
+  activeHighlight = null,
+}: {
+  diff: string;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
+}) {
+  const projection = useMemo(
+    () => buildPatchOutputProjection(diff, toolUseId ? { toolUseId } : {}),
+    [diff, toolUseId],
+  );
+  const fragment = projection.fragments[0];
+  const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+  const maxLength = 5_000;
+  const windowStart = highlight && fragment.display.diff.length > maxLength
+    ? Math.max(0, Math.min(highlight.start - Math.floor(maxLength / 2), fragment.display.diff.length - maxLength))
+    : 0;
+  const visibleDiff = highlight
+    ? fragment.display.diff.slice(windowStart, windowStart + maxLength)
+    : fragment.display.diff;
+  return (
+    <div className="tool-block-output-content" data-fragment-id={fragment.fragmentId}>
+      {highlight ? (
+        <>
+          {windowStart > 0 ? '…\n' : ''}
+          {renderHighlightedText(visibleDiff, highlight.start - windowStart, highlight.end - windowStart)}
+          {windowStart + visibleDiff.length < fragment.display.diff.length ? '\n…' : ''}
+        </>
+      ) : fragment.display.diff}
+    </div>
+  );
+}
+
+function renderSearchResultPath(
+  path: string,
+  fragmentId: string,
+  activeHighlight: AgentTextHighlight | null,
+): React.ReactNode {
+  if (activeHighlight?.fragmentId !== fragmentId) return path;
+  return keywordFieldHighlight(activeHighlight, 0, path);
 }
 
 export function SearchResultsView({
   rawText,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
 }: {
   rawText: string;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
 }) {
-  const { hits, notes, noMatches } = useMemo(() => parseSearchOutput(rawText), [rawText]);
+  const parsed = useMemo(() => buildSearchOutputProjection(rawText, toolUseId ? { toolUseId } : {}), [rawText, toolUseId]);
 
-  if (noMatches) {
+  if (parsed.noMatches) {
     return (
       <div className="search-results">
-        <div className="search-results-empty">No matches found.</div>
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>
+          {activeHighlight?.fragmentId === parsed.fragments[0]?.fragmentId && parsed.fragments[0]
+            ? renderHighlightedText(parsed.fragments[0].semanticText, activeHighlight!.start, activeHighlight!.end)
+            : 'No matches found.'}
+        </div>
       </div>
     );
   }
 
-  if (hits.length === 0 && notes.length === 0) {
-    return <pre className="search-results-fallback">{rawText}</pre>;
-  }
-
-  const groups: Array<{ path: string; hits: SearchHit[] }> = [];
-  const seen = new Map<string, number>();
-  for (const hit of hits) {
-    const idx = seen.get(hit.path);
-    if (idx === undefined) {
-      seen.set(hit.path, groups.length);
-      groups.push({ path: hit.path, hits: [hit] });
-    } else {
-      groups[idx]!.hits.push(hit);
-    }
+  if (parsed.rawFallback) {
+    const fragment = parsed.fragments[0] ?? null;
+    const highlight = activeHighlight?.fragmentId === fragment?.fragmentId ? activeHighlight : null;
+    return <pre className="search-results-fallback" data-fragment-id={fragment?.fragmentId}>{highlight && fragment ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : rawText}</pre>;
   }
 
   return (
     <div className="search-results">
-      {hits.length > 0 && (
+      {parsed.hits.length > 0 && (
         <div className="search-results-header">
           <span className="search-results-count">
-            {hits.length} match{hits.length === 1 ? '' : 'es'} in {groups.length} file
-            {groups.length === 1 ? '' : 's'}
+            {parsed.hits.length} match{parsed.hits.length === 1 ? '' : 'es'} in {parsed.groups.length} file
+            {parsed.groups.length === 1 ? '' : 's'}
           </span>
         </div>
       )}
       <div className="search-results-list">
-        {groups.map((group) => (
+        {parsed.groups.map((group) => (
           <div key={group.path} className="search-results-file">
             {onOpenFile ? (
               <button
@@ -1931,165 +2121,156 @@ export function SearchResultsView({
                   onOpenFile(
                     group.path,
                     new Set([group.hits[0]!.lineNumber]),
-                    group.hits[0]!.lineNumber
+                    group.hits[0]!.lineNumber,
                   )
                 }
                 title="Open file"
+                data-fragment-id={group.fragment.fragmentId}
               >
-                {group.path}
+                {renderSearchResultPath(group.path, group.fragment.fragmentId, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
               </button>
             ) : (
-              <span className="search-results-filepath search-results-filepath-static">
-                {group.path}
+              <span
+                className="search-results-filepath search-results-filepath-static"
+                data-fragment-id={group.fragment.fragmentId}
+              >
+                {renderSearchResultPath(group.path, group.fragment.fragmentId, activeHighlight)}
                 <span className="search-results-filehit-count">
                   {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
                 </span>
               </span>
             )}
             <div className="search-results-hits">
-              {group.hits.map((hit, i) =>
-                onOpenFile ? (
+              {group.hits.map((hit) => {
+                const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
+                const lineText = String(hit.lineNumber);
+                const contentStart = lineText.length + 2;
+                const lineNumberContent = (
+                  <>
+                    <span className="search-result-lineno">
+                      {keywordFieldHighlight(highlight, 0, lineText)}
+                    </span>
+                    <span className="search-result-content">
+                      {keywordFieldHighlight(highlight, contentStart, hit.content || ' ')}
+                    </span>
+                  </>
+                );
+                return onOpenFile ? (
                   <button
-                    key={i}
+                    key={hit.fragment.fragmentId}
                     type="button"
                     className="search-result-line search-result-line-clickable"
-                    onClick={() =>
-                      onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)
-                    }
+                    data-fragment-id={hit.fragment.fragmentId}
+                    onClick={() => onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)}
                   >
-                    <span className="search-result-lineno">{hit.lineNumber}</span>
-                    <span className="search-result-content">{hit.content || ' '}</span>
+                    {lineNumberContent}
                   </button>
                 ) : (
-                  <div key={i} className="search-result-line">
-                    <span className="search-result-lineno">{hit.lineNumber}</span>
-                    <span className="search-result-content">{hit.content || ' '}</span>
+                  <div key={hit.fragment.fragmentId} className="search-result-line" data-fragment-id={hit.fragment.fragmentId}>
+                    {lineNumberContent}
                   </div>
-                )
-              )}
+                );
+              })}
             </div>
           </div>
         ))}
       </div>
-      {notes.length > 0 && (
+      {parsed.notes.length > 0 && (
         <div className="search-results-notes">
-          {notes.map((n, i) => (
-            <div key={i} className="search-results-note">{n}</div>
-          ))}
+          {parsed.notes.map(({ text, fragment }) => {
+            const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+            return (
+              <div key={fragment.fragmentId} className="search-results-note" data-fragment-id={fragment.fragmentId}>
+                {highlight ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : text}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
 
-// keyword_search returns LLM-filtered text shaped as `path: explanation` per line,
-// or — when the filter LLM is unavailable — raw ripgrep output (with line numbers
-// and context separators). Detect which and render accordingly.
-type KeywordHit = { path: string; explanation: string };
-
 // eslint-disable-next-line react-refresh/only-export-components
-export function parseKeywordSearchOutput(text: string): {
-  hits: KeywordHit[];
-  notes: string[];
-  rawFallback: boolean;
-  empty: boolean;
-} {
-  // Bracketed `[...]` lines are coverage/incompleteness notes (terms dropped to
-  // fit the budget, results truncated, broad terms skipped). Pull them out
-  // first so they neither pollute the hit parser (a note like `[note: ...]`
-  // otherwise matches the `path: explanation` shape) nor the empty/fallback
-  // heuristics — and so the renderer can surface them.
-  const notes: string[] = [];
-  const body: string[] = [];
-  for (const line of text.split('\n')) {
-    const t = line.trim();
-    if (!t) continue;
-    if (t.startsWith('[') && t.endsWith(']')) {
-      notes.push(t.slice(1, -1));
-    } else {
-      body.push(line);
-    }
-  }
+export function parseKeywordSearchOutput(text: string) {
+  const projection = buildKeywordSearchOutputProjection(text);
+  return { ...projection, notes: projection.notes.map((note) => note.text) };
+}
 
-  const trimmed = body.join('\n').trim();
-  if (
-    trimmed === '' ||
-    trimmed === 'No matches found for the given search terms.' ||
-    trimmed.startsWith('No relevant files found')
-  ) {
-    return { hits: [], notes, rawFallback: false, empty: true };
-  }
-
-  const lines = body.filter((l) => l.trim());
-  // Raw ripgrep -C output has `path:NN:` or `path-NN-` per line plus `--` separators.
-  // If a meaningful fraction of lines look like that, treat as fallback.
-  const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
-  if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
-    return { hits: [], notes, rawFallback: true, empty: false };
-  }
-
-  const hits: KeywordHit[] = [];
-  for (const line of lines) {
-    // path is everything up to the first `: ` (with a trailing space), and must
-    // not itself contain a colon — the LLM-filter prompt's output uses absolute
-    // POSIX paths with `: ` as the separator before the explanation.
-    const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
-    if (m && m[1] !== undefined && m[2] !== undefined) {
-      hits.push({ path: m[1].trim(), explanation: m[2].trim() });
-    }
-  }
-
-  // If very few lines parsed cleanly, the output likely isn't the LLM-filtered
-  // shape — bail to plain rendering rather than show a tiny misleading list.
-  if (hits.length === 0 || hits.length * 3 < lines.length) {
-    return { hits: [], notes, rawFallback: true, empty: false };
-  }
-  return { hits, notes, rawFallback: false, empty: false };
+function keywordFieldHighlight(
+  highlight: AgentTextHighlight | null,
+  fieldStart: number,
+  fieldText: string,
+): React.ReactNode {
+  if (!highlight) return fieldText;
+  const start = Math.max(0, highlight.start - fieldStart);
+  const end = Math.min(fieldText.length, highlight.end - fieldStart);
+  return end > start ? renderHighlightedText(fieldText, start, end) : fieldText;
 }
 
 export function KeywordSearchView({
   rawText,
   onOpenFile,
+  toolUseId,
+  activeHighlight = null,
 }: {
   rawText: string;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  toolUseId?: string | undefined;
+  activeHighlight?: AgentTextHighlight | null;
 }) {
-  const parsed = useMemo(() => parseKeywordSearchOutput(rawText), [rawText]);
+  const parsed = useMemo(
+    () => buildKeywordSearchOutputProjection(rawText, toolUseId ? { toolUseId } : {}),
+    [rawText, toolUseId],
+  );
 
-  // Coverage/incompleteness notes (terms dropped, results truncated, broad
-  // terms skipped). Surfaced in every branch so the signal is never silently
-  // dropped by the renderer.
-  const notesEl =
-    parsed.notes.length > 0 ? (
-      <div className="search-results-notes">
-        {parsed.notes.map((n, i) => (
-          <div key={i} className="search-results-note">
-            {n}
+  const notesEl = parsed.notes.length > 0 ? (
+    <div className="search-results-notes">
+      {parsed.notes.map(({ text, fragment }) => {
+        const highlight = activeHighlight?.fragmentId === fragment.fragmentId ? activeHighlight : null;
+        return (
+          <div key={fragment.fragmentId} className="search-results-note" data-fragment-id={fragment.fragmentId}>
+            {highlight ? renderHighlightedText(fragment.semanticText, highlight.start, highlight.end) : text}
           </div>
-        ))}
-      </div>
-    ) : null;
+        );
+      })}
+    </div>
+  ) : null;
 
   if (parsed.empty) {
     return (
       <div className="keyword-search-results">
-        <div className="search-results-empty">No relevant files found.</div>
+        <div className="search-results-empty" data-fragment-id={parsed.fragments[0]?.fragmentId}>
+          {activeHighlight?.fragmentId === parsed.fragments[0]?.fragmentId && parsed.fragments[0]
+            ? renderHighlightedText(parsed.fragments[0].semanticText, activeHighlight!.start, activeHighlight!.end)
+            : 'No relevant files found.'}
+        </div>
         {notesEl}
       </div>
     );
   }
 
   if (parsed.rawFallback) {
+    const titleFragment = parsed.fragments.find((fragment) => fragment.fragmentId === 'keyword-search-fallback-title') ?? null;
+    const bodyFragment = parsed.fragments.find((fragment) => fragment.fragmentId === 'keyword-search-fallback-body') ?? null;
+    const titleHighlight = activeHighlight?.fragmentId === titleFragment?.fragmentId ? activeHighlight : null;
+    const bodyHighlight = activeHighlight?.fragmentId === bodyFragment?.fragmentId ? activeHighlight : null;
     return (
       <div className="keyword-search-results keyword-search-raw">
-        <div className="keyword-search-fallback-note">
-          Raw ripgrep results — LLM filter unavailable
+        <div className="keyword-search-fallback-note" data-fragment-id={titleFragment?.fragmentId}>
+          {titleHighlight && titleFragment
+            ? renderHighlightedText(titleFragment.semanticText, titleHighlight.start, titleHighlight.end)
+            : 'Raw ripgrep results — LLM filter unavailable'}
         </div>
+        <pre className="keyword-search-raw-text" data-fragment-id={bodyFragment?.fragmentId}>
+          {bodyHighlight && bodyFragment
+            ? renderHighlightedText(bodyFragment.semanticText, bodyHighlight.start, bodyHighlight.end)
+            : parsed.fallbackText}
+        </pre>
         {notesEl}
-        <pre className="keyword-search-raw-text">{rawText}</pre>
       </div>
     );
   }
@@ -2103,24 +2284,29 @@ export function KeywordSearchView({
       </div>
       {notesEl}
       <div className="keyword-search-list">
-        {parsed.hits.map((hit, i) => (
-          <div key={i} className="keyword-search-hit">
-            {onOpenFile ? (
-              <button
-                type="button"
-                className="keyword-search-filepath"
-                onClick={() => onOpenFile(hit.path, new Set(), 0)}
-              >
-                {hit.path}
-              </button>
-            ) : (
-              <span className="keyword-search-filepath keyword-search-filepath-static">
-                {hit.path}
-              </span>
-            )}
-            <div className="keyword-search-explanation">{hit.explanation}</div>
-          </div>
-        ))}
+        {parsed.hits.map((hit) => {
+          const highlight = activeHighlight?.fragmentId === hit.fragment.fragmentId ? activeHighlight : null;
+          return (
+            <div key={hit.fragment.fragmentId} className="keyword-search-hit" data-fragment-id={hit.fragment.fragmentId}>
+              {onOpenFile ? (
+                <button
+                  type="button"
+                  className="keyword-search-filepath"
+                  onClick={() => onOpenFile(hit.path, new Set(), 0)}
+                >
+                  {keywordFieldHighlight(highlight, 0, hit.path)}
+                </button>
+              ) : (
+                <span className="keyword-search-filepath keyword-search-filepath-static">
+                  {keywordFieldHighlight(highlight, 0, hit.path)}
+                </span>
+              )}
+              <div className="keyword-search-explanation">
+                {keywordFieldHighlight(highlight, hit.path.length + 2, hit.explanation)}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -2128,9 +2314,9 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
-  const input = block.input || {};
+  const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
 
   // Format the input display based on tool type
@@ -2187,11 +2373,74 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   // status / running state / label rather than show the raw JSON.
   const bashResponse = useMemo(() => (name === 'bash' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
   const tmuxResponse = useMemo(() => (name === 'tmux' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
-
+  const profileAction = name === 'browser_profile' && typeof input['action'] === 'string' ? input['action'] : null;
+  const terminalResultFamily: TerminalToolResultFamily = name === 'bash' || name === 'tmux'
+    ? name
+    : isError
+      ? profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
+        ? 'browser-profile'
+        : 'opaque'
+      : name === 'browser_recent_console_logs'
+        ? 'console-logs'
+        : profileAction !== null && STRUCTURED_PROFILE_ACTIONS.has(profileAction)
+          ? 'browser-profile'
+          : 'opaque';
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
   const resultText = patchDiff || rawResultText;
+  const terminalProjection = useMemo(
+    () => buildTerminalToolResultProjection(terminalResultFamily, resultText, result?.display_data, { toolUseId: toolId }),
+    [result?.display_data, resultText, terminalResultFamily, toolId],
+  );
   const resultLength = resultText.length;
+  const keywordSearchProjection = useMemo(
+    () => (name === 'keyword_search' ? buildKeywordSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
+  const searchProjection = useMemo(
+    () => (name === 'search' ? buildSearchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
+  const firstKeywordTarget = keywordSearchProjection?.fragments[0]?.revealTarget;
+  const firstSearchTarget = searchProjection?.fragments[0]?.revealTarget;
+  const toolRevealKey = name === 'keyword_search'
+    && firstKeywordTarget?.kind === 'tool-result-keyword-search'
+    ? firstKeywordTarget.key
+    : name === 'search' && firstSearchTarget?.kind === 'tool-result-search'
+      ? firstSearchTarget.key
+      : null;
+  const readFileProjection = useMemo(
+    () => (name === 'read_file' ? buildReadFileOutputProjection(resultText, input as Record<string, unknown>, { toolUseId: toolId }) : null),
+    [input, name, resultText, toolId],
+  );
+  const patchProjection = useMemo(
+    () => (name === 'patch' ? buildPatchOutputProjection(resultText, { toolUseId: toolId }) : null),
+    [name, resultText, toolId],
+  );
+  const subAgentFragments = useMemo(
+    () => buildSubAgentCardFragments(result?.display_data, toolId),
+    [result?.display_data, toolId],
+  );
+  const toolActiveHighlight = activeHighlight?.owner === 'tool-result'
+    && activeHighlight.toolUseId === toolId
+    && activeHighlight.fragmentId
+    && ((name === 'keyword_search' && keywordSearchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'search' && searchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'read_file' && readFileProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || (name === 'patch' && patchProjection?.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId))
+      || terminalProjection.fragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
+      || (name === 'browser_profile' && activeHighlight.fragmentId === 'browser-profile-visible')
+      || (name === 'skill' && activeHighlight.fragmentId === 'skill-result-visible')
+      || (name === 'commission_review' && activeHighlight.fragmentId.startsWith('commission-review-')))
+    ? activeHighlight
+    : null;
+  const inputActiveHighlight = activeHighlight?.owner === 'tool-input'
+    && activeHighlight.toolUseId === toolId
+    && activeHighlight.fragmentId === 'tool-use-input'
+    ? activeHighlight
+    : null;
+
   
   // Check if this is an image result.
   // 1. Typed `images` channel (read_image — single source of truth, no
@@ -2241,6 +2490,50 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   );
   const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
 
+  useEffect(() => {
+    if (!revealRequest) return;
+    if (revealRequest.revealTarget.kind === 'tool-use-input') {
+      if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-browser-profile'
+      || revealRequest.revealTarget.kind === 'tool-result-commission-review') {
+      if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-read-file') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-patch') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      if (!outputExpanded) {
+        setOutputExpanded(true);
+        return;
+      }
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'tool-result-terminal') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      if (!outputExpanded) {
+        setOutputExpanded(true);
+        return;
+      }
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind === 'subagent-card') {
+      if (revealRequest.revealTarget.toolUseId !== toolId) return;
+      onRevealHandled?.(revealRequest);
+      return;
+    }
+    if (revealRequest.revealTarget.kind !== 'tool-result-keyword-search' && revealRequest.revealTarget.kind !== 'tool-result-search') return;
+    if (revealRequest.revealTarget.key !== toolRevealKey) return;
+    onRevealHandled?.(revealRequest);
+  }, [onRevealHandled, outputExpanded, revealRequest, toolId, toolRevealKey]);
+
   // For display, truncate very long outputs even when expanded
   const displayResult = useMemo(() => {
     const maxDisplayLen = 5000;
@@ -2248,6 +2541,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
       : resultText;
   }, [resultText]);
+
+  const cappedResultText = useMemo(() => resultText.slice(0, 5000), [resultText]);
 
   // Preview for collapsed state: show first 3 lines faded. Split once, derive both.
   const lines = useMemo(() => resultText.split('\n'), [resultText]);
@@ -2283,6 +2578,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
         inflightElapsedSeconds={inflightElapsedSeconds}
         onOpenFile={onOpenFile}
         toolId={toolId}
+        activeHighlight={toolActiveHighlight}
+        inputActiveHighlight={inputActiveHighlight}
       />
     );
   }
@@ -2302,13 +2599,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   const bashCopyTitle = name === 'bash' && isBashToolInput(input as Record<string, unknown>) && (input as BashToolInput).op !== 'run'
     ? 'Copy operation'
     : 'Copy command';
+
   const commissionReviewDisplayData = name === 'commission_review'
     ? parseCommissionReviewResult(result?.display_data, resultText)
     : null;
   const commissionReviewInput = name === 'commission_review'
     ? parseCommissionReviewInput(input as Record<string, unknown>)
     : null;
-  const hasStructuredCommissionReview = commissionReviewDisplayData !== null;
 
   return (
     <div className="tool-block" data-tool-id={toolId}>
@@ -2319,11 +2616,16 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       </div>
 
       {/* Tool input - always visible */}
-      {name === 'commission_review' && commissionReviewInput ? (
-        <CommissionReviewInputView input={commissionReviewInput} />
+      {commissionReviewInput ? (
+        <CommissionReviewInputView input={commissionReviewInput} activeHighlight={inputActiveHighlight} />
       ) : (
-        <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-          {inputDisplay}
+        <div
+          className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}
+          data-fragment-id="tool-use-input"
+        >
+          {inputActiveHighlight
+            ? renderHighlightedText(inputDisplay, inputActiveHighlight.start, inputActiveHighlight.end)
+            : inputDisplay}
           <CopyButton text={rawInput} title={bashCopyTitle} />
         </div>
       )}
@@ -2342,7 +2644,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
-          {imageResult ? (
+          {toolActiveHighlight?.fragmentId === terminalProjection.fragments[0].fragmentId ? (
+            <TerminalToolResultHighlight
+              semanticText={terminalProjection.fullText}
+              fragmentId={terminalProjection.fragments[0].fragmentId}
+              activeHighlight={toolActiveHighlight}
+            />
+          ) : imageResult ? (
             // Image result: render as image
             <div className="tool-block-image-output">
               <img
@@ -2364,23 +2672,41 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
               displayData={result?.display_data as Record<string, unknown> | undefined}
               fallbackText={resultText}
               isError={isError}
+              activeHighlight={toolActiveHighlight}
             />
           ) : name === 'browser_recent_console_logs' && !isError ? (
             <BrowserConsoleLogsView rawText={resultText} />
           ) : name === 'search' && !isError ? (
-            <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
+            <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
           ) : name === 'keyword_search' && !isError ? (
-            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} />
-          ) : name === 'read_file' && !isError && readFileMetadata ? (
-            <ReadFileResultView
-              input={input as Record<string, unknown>}
-              rawText={resultText}
-              metadata={readFileMetadata}
-              onOpenFile={onOpenFile}
+            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} toolUseId={toolId} activeHighlight={toolActiveHighlight} />
+          ) : name === 'read_file' && !isError ? (
+            <>
+              <ReadFileResultView
+                rawText={readFileMetadata || (toolActiveHighlight && toolActiveHighlight.fragmentId !== 'read-file-path')
+                  ? resultText
+                  : cappedResultText}
+                input={input as Record<string, unknown>}
+                onOpenFile={onOpenFile}
+                toolUseId={toolId}
+                metadata={readFileMetadata}
+                activeHighlight={toolActiveHighlight}
+                showPath={toolActiveHighlight?.fragmentId === 'read-file-path'}
+              />
+              {!readFileMetadata && !toolActiveHighlight && resultText.length > 5000 && (
+                <div className="tool-output-truncation">... ({resultText.length - 5000} more chars)</div>
+              )}
+            </>
+          ) : name === 'patch' && !isError && outputExpanded ? (
+            <PatchResultView
+              diff={toolActiveHighlight ? resultText : displayResult}
+              toolUseId={toolId}
+              activeHighlight={toolActiveHighlight}
             />
-          ) : hasStructuredCommissionReview && commissionReviewDisplayData ? (
+          ) : commissionReviewDisplayData ? (
             <CommissionReviewSummaryCard
               data={commissionReviewDisplayData}
+              activeHighlight={toolActiveHighlight}
               formatDuration={formatToolDuration}
               requestSequenceId={requestSequenceId}
               onOpenFullReview={onOpenCommissionReview}
@@ -2445,7 +2771,11 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
 
       {/* Sub-agent summary (when subagents complete and update this tool result) */}
       {result?.display_data && isSubAgentSummaryData(result.display_data) && (
-        <SubAgentSummary results={result.display_data.results} />
+        <SubAgentSummary
+          results={result.display_data.results}
+          revealRequest={revealRequest?.revealTarget.kind === 'subagent-card' ? revealRequest : null}
+          activeHighlight={toolActiveHighlight}
+        />
       )}
 
       {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
@@ -2454,10 +2784,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   );
 }
 
-// ============================================================================
-// Sub-Agent Summary (persistent view after completion)
-// ============================================================================
-
+// =====================================================================// Sub-Agent Summary (persistent view after completion)
+// =====================================================================
 type SubAgentStatusKind = 'running' | 'success' | 'failure' | 'timed_out';
 
 function statusKindFromOutcome(outcome: SubAgentResult['outcome'] | null): SubAgentStatusKind {
@@ -2662,16 +2990,40 @@ function ChildConversationActivity({ agentId, expanded, running, finalResult }: 
   return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
 }
 
-function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
+function SubAgentActivityCard({
+  agentId,
+  task,
+  outcome,
+  revealRequest = null,
+  activeHighlight = null,
+}: {
+  agentId: string;
+  task: string;
+  outcome: SubAgentResult['outcome'] | null;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: AgentTextHighlight | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const status = statusKindFromOutcome(outcome);
   const statusClass = status.replace('_', '-');
   const running = status === 'running';
   const resultText = outcome ? getOutcomeText(outcome) : '';
+  const fragmentId = `subagent-card:${agentId}`;
+  const isActive = activeHighlight?.fragmentId === fragmentId;
+  useEffect(() => {
+    if (revealRequest?.revealTarget.kind !== 'subagent-card' || revealRequest.revealTarget.agentId !== agentId) return;
+    setExpanded(true);
+  }, [agentId, revealRequest]);
+  const semanticText = [task, resultText].filter(Boolean).join('\n');
 
   return (
-    <div className={`subagent-item activity ${statusClass}`}>
+    <div className={`subagent-item activity ${statusClass}`} data-fragment-id={fragmentId}>
       <div className="subagent-item-header">
+        {isActive && activeHighlight ? (
+          <div className="subagent-result">
+            {renderHighlightedText(semanticText, activeHighlight.start, activeHighlight.end)}
+          </div>
+        ) : null}
         <button
           type="button"
           className="subagent-expand-button"
@@ -2679,22 +3031,24 @@ function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; tas
           aria-expanded={expanded}
         >
           <span className="subagent-icon"><SubAgentStatusIcon status={status} /></span>
-          <span className="subagent-label" title={task}>{truncate(task, 72)}</span>
+          {!isActive && <span className="subagent-label" title={task}>{truncate(task, 72)}</span>}
           <span className="subagent-activity-count">activity</span>
           <span className={`subagent-status ${statusClass}`}>{getStatusLabel(status)}</span>
           <span className="subagent-expand-toggle">{expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}</span>
         </button>
         <OpenConversationButton agentId={agentId} task={task} />
       </div>
-      {resultText && !expanded && (
+      {!isActive && resultText && !expanded && (
         <div className="subagent-result preview">{truncate(resultText, 180)}</div>
       )}
-      <ChildConversationActivity
-        agentId={agentId}
-        expanded={expanded}
-        running={running}
-        finalResult={resultText ? { text: resultText, statusClass } : undefined}
-      />
+      {!isActive && (
+        <ChildConversationActivity
+          agentId={agentId}
+          expanded={expanded}
+          running={running}
+          finalResult={resultText ? { text: resultText, statusClass } : undefined}
+        />
+      )}
     </div>
   );
 }
@@ -2716,12 +3070,20 @@ function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
 }
 
 /** Single completed sub-agent row with expandable conversation view */
-function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
-  return <SubAgentActivityCard agentId={result.agent_id} task={result.task} outcome={result.outcome} />;
+function SubAgentSummaryRow({ result, revealRequest, activeHighlight }: { result: SubAgentResult; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
+  return (
+    <SubAgentActivityCard
+      agentId={result.agent_id}
+      task={result.task}
+      outcome={result.outcome}
+      {...(revealRequest !== undefined ? { revealRequest } : {})}
+      {...(activeHighlight !== undefined ? { activeHighlight } : {})}
+    />
+  );
 }
 
 /** Persistent summary of completed subagents (shown in spawn_agents tool result) */
-function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
+function SubAgentSummary({ results, revealRequest = null, activeHighlight = null }: { results: SubAgentResult[]; revealRequest?: AgentTextRevealRequest | null; activeHighlight?: AgentTextHighlight | null }) {
   const successCount = results.filter(r => r.outcome.type === 'success').length;
   const timeoutCount = results.filter(r => r.outcome.type === 'timed_out').length;
   const failCount = results.filter(r => r.outcome.type === 'failure').length;
@@ -2738,17 +3100,15 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
       </div>
       <div className="subagent-summary-list">
         {results.map((result) => (
-          <SubAgentSummaryRow key={result.agent_id} result={result} />
+          <SubAgentSummaryRow key={result.agent_id} result={result} revealRequest={revealRequest} activeHighlight={activeHighlight} />
         ))}
       </div>
     </div>
   );
 }
 
-// ============================================================================
-// Sub-Agent Status (live progress indicator)
-// ============================================================================
-
+// =====================================================================// Sub-Agent Status (live progress indicator)
+// =====================================================================
 /** Truncate text with ellipsis */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;

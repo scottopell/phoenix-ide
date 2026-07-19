@@ -1,6 +1,81 @@
 import { describe, expect, it } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { BrowserProfileResponseView } from './BrowserProfileResponseView';
+import { BrowserProfileResponseView, buildBrowserProfileVisibleText } from './BrowserProfileResponseView';
+
+describe('BrowserProfileResponseView find highlighting', () => {
+  it('projects the same visible scenario metric labels and statistics as the sparkline grid', () => {
+    const text = buildBrowserProfileVisibleText('run_scenario', {
+      outcome: 'completed',
+      requested_runs: 2,
+      raw_samples: [
+        { run_index: 0, script_ms: 12.5, wall_ms: 20, long_tasks: 1, dom_nodes: 1500, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null },
+        { run_index: 1, script_ms: 15, wall_ms: 22, long_tasks: 0, dom_nodes: 1600, gc_ran: false, js_heap_used: null, react_status: 'absent', react_commits: null, react_actual_ms: null },
+      ],
+    }, 'opaque');
+
+    expect(text).toContain('script\nmin 12.5 ms · max 15.0 ms · last 15.0 ms');
+    expect(text).toContain('DOM nodes\nmin 1,500 · max 1,600 · last 1,600');
+    expect(text).not.toContain('JS heap');
+  });
+
+  it('projects formatted heap deltas instead of hidden raw byte values', () => {
+    const text = buildBrowserProfileVisibleText('heap_snapshot', {
+      baseline: '/tmp/before.heapsnapshot', post: '/tmp/after.heapsnapshot',
+      node_count_delta: 1200, self_size_delta_bytes: 1024,
+      detached_dom_nodes: { baseline: 2, post: 4 }, retained_size_approximate: true,
+    }, 'opaque');
+
+    expect(text).toContain('nodes +1,200');
+    expect(text).toContain('self size +1.0 KB');
+    expect(text).toContain('detached DOM 2 → 4 (+2)');
+    expect(text).not.toContain('self size 1024');
+  });
+
+  it('projects metrics using the same visible units as the table', () => {
+    const text = buildBrowserProfileVisibleText('metrics', {
+      metrics: { JSHeapUsedSize: 1_048_576, TaskDuration: 1.25, Nodes: 1234 },
+    }, 'opaque');
+
+    expect(text).toContain('JSHeapUsedSize 1.0 MB');
+    expect(text).toContain('TaskDuration 1.250 s');
+    expect(text).toContain('Nodes 1,234');
+    expect(text).not.toContain('JSHeapUsedSize 1048576');
+  });
+  it('projects visible trace totals and per-task durations', () => {
+    const text = buildBrowserProfileVisibleText('trace_stop', {
+      trace: {
+        event_count: 1234, long_task_count: 2, long_task_total_ms: 45.64,
+        path: '/tmp/trace.json', long_tasks: [{ name: 'RunTask', ms: 123.44 }],
+      },
+    }, 'opaque');
+
+    expect(text).toContain('1,234 events');
+    expect(text).toContain('2 long tasks (45.6 ms total)');
+    expect(text).toContain('123.4ms\nRunTask');
+  });
+
+  it('marks an active occurrence in the visible scenario summary', () => {
+    const displayData = {
+      outcome: 'completed', requested_runs: 2, warmup: 1,
+      methodology_warnings: ['Visible warning text'], raw_samples: [{ duration_ms: 1 }, { duration_ms: 2 }],
+    };
+    const visibleText = '✓ completed\n2/2 runs\n+1 warmup discarded\n1 warning\nVisible warning text';
+    const start = visibleText.indexOf('Visible warning');
+    const { container } = render(
+      <BrowserProfileResponseView
+        action="run_scenario"
+        displayData={displayData}
+        fallbackText="opaque"
+        isError={false}
+        activeHighlight={{ fragmentId: 'browser-profile-visible', start, end: start + 'Visible warning'.length }}
+      />,
+    );
+
+    expect(container.querySelector('[data-fragment-id="browser-profile-visible"] .viewer-find-inline-match--active')?.textContent)
+      .toBe('Visible warning');
+    expect(container.querySelector('.profile-scenario')).toBeInTheDocument();
+  });
+});
 
 describe('BrowserProfileResponseView', () => {
   describe('run_scenario', () => {
@@ -399,6 +474,15 @@ describe('BrowserProfileResponseView', () => {
       },
     };
 
+    it('projects visible CPU table headings, values, percentages, and sampled time', () => {
+      const text = buildBrowserProfileVisibleText('cpu_stop', cpuData, 'opaque');
+
+      expect(text).toContain('sampled 401.5 ms');
+      expect(text).toContain('Top by SELF time');
+      expect(text).toContain('380.0ms\n94.6%\nbusyLoop  app.js:42');
+      expect(text).toContain('Top call-tree nodes by TOTAL time');
+    });
+
     it('renders sampled wall time and hot-function rows', () => {
       render(
         <BrowserProfileResponseView
@@ -460,6 +544,18 @@ describe('BrowserProfileResponseView', () => {
       );
       expect(screen.getByText(/hitCount fallback/)).toBeInTheDocument();
       expect(screen.getByText('7.0hits')).toBeInTheDocument();
+    });
+
+    it('projects the visible hit-count fallback warning and units', () => {
+      const text = buildBrowserProfileVisibleText('cpu_summary', {
+        cpu_summary: {
+          path: '/tmp/x.json', hitcount_fallback: true, total: 7,
+          top_by_self: [{ label: 'f a.js:1', value: 7, percent: 100 }], top_by_total: [],
+        },
+      }, 'opaque');
+
+      expect(text).toContain('hitCount fallback — relative weight only');
+      expect(text).toContain('7.0hits\n100.0%\nf a.js:1');
     });
 
     it('falls back to the text status line when display_data is missing', () => {

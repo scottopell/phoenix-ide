@@ -112,6 +112,10 @@
   color: var(--text-muted);
 }
 
+.coordinator-mobile-nav {
+  display: none;
+}
+
 .coordinator-conversation {
   min-width: 0;
   overflow: hidden;
@@ -264,12 +268,77 @@
 }
 
   .coordinator-page {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow: hidden;
   }
 
   .coordinator-conversation,
   .coordinator-work-pane {
+    grid-row: 2;
     grid-column: 1;
+    min-height: 0;
+  }
+
+  .coordinator-header {
+    grid-row: 1;
+  }
+
+  .coordinator-page-status {
+    z-index: 1;
+    grid-row: 2;
+    grid-column: 1;
+    align-self: start;
+    margin: 12px;
+  }
+
+  .coordinator-conversation {
+    height: 100%;
+  }
+
+  .coordinator-conversation #app {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .coordinator-work-pane {
+    overflow-y: auto;
+  }
+
+  .coordinator-header .coordinator-view-switch {
+    display: none;
+  }
+
+  .coordinator-mobile-nav {
+    grid-column: 1;
+    grid-row: 3;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background: var(--bg-secondary);
+  }
+
+  .coordinator-mobile-nav button {
+    min-height: 48px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .coordinator-mobile-nav button[aria-current='page'] {
+    border-color: var(--accent-blue);
+    background: color-mix(in srgb, var(--accent-blue) 12%, var(--bg-primary));
+    color: var(--text-primary);
   }
 }
 
@@ -278,12 +347,13 @@
     flex-wrap: wrap;
   }
 
-  .coordinator-view-switch {
-    width: 100%;
+  .coordinator-page {
+    gap: 10px;
+    padding: 10px;
   }
 
-  .coordinator-view-tab {
-    flex: 1;
+  .coordinator-heading p {
+    display: none;
   }
 
   .coordinator-query-form {

@@ -19,6 +19,7 @@ import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
 import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
 import type { ManagedResourceCategory } from '../generated/ManagedResourceCategory';
+import { ReleaseUpdatePanel } from './ReleaseUpdatePanel';
 import './AboutDeploymentPage.css';
 
 const RESOURCE_POLL_MS = 1_000;
@@ -133,6 +134,18 @@ function diskSizeLabel(size: DiskSize): string {
       return 'absent';
     case 'inline_db':
       return 'stored in database';
+  }
+}
+
+function installationOwnershipText(ownership: DeploymentInfo['installation_ownership']): string {
+  switch (ownership.kind) {
+    case 'launchd_managed': return 'launchd managed';
+    case 'systemd_managed': return 'systemd managed';
+    case 'bare_supervisor_managed': return 'bare supervisor managed';
+    case 'development': return 'development';
+    case 'unmanaged': return `unmanaged — ${ownership.reason}`;
+    case 'ambiguous': return `ambiguous — ${ownership.reason}`;
+    case 'unsupported': return `unsupported on ${ownership.platform}`;
   }
 }
 
@@ -768,10 +781,13 @@ export function AboutDeploymentPage() {
 
           {info && (
             <>
+              <ReleaseUpdatePanel />
+
               <section className="settings-section">
                 <h3 className="settings-section__title">Build</h3>
                 <Row label="Version"><code>{info.build.version}</code></Row>
                 <Row label="Build"><code title="Git SHA">{info.build.git_sha}</code></Row>
+                <Row label="Runtime owner">{installationOwnershipText(info.installation_ownership)}</Row>
                 <Row label="Started">{formatDateTime(info.build.started_at)}</Row>
                 <Row label="Uptime">{formatUptime(info.build.uptime_seconds)}</Row>
               </section>

@@ -27,6 +27,13 @@ export interface InputAreaHandle {
   focus: () => void;
 }
 
+export interface ComposerQuickAction {
+  label: string;
+  compactLabel?: string;
+  prompt: string;
+  context: string;
+}
+
 interface InputAreaProps {
   /**
    * Working directory the conversation operates in. Scopes inline reference
@@ -70,6 +77,8 @@ interface InputAreaProps {
    * InputArea is unmounted lands as a fresh effect tick on re-mount.
    */
   focusToken?: number;
+  /** Optional action and context displayed directly above the composer. */
+  quickAction?: ComposerQuickAction | undefined;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will
@@ -134,6 +143,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onDraftChange,
   focusToken,
   onSend,
+  quickAction,
   onCancel,
   onRetry,
   onDismissError,
@@ -152,6 +162,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const scopeKeyRef = useRef(scopeKey);
   useEffect(() => { scopeKeyRef.current = scopeKey; }, [scopeKey]);
   const voiceSupported = isWebSpeechSupported();
+  const [quickActionSending, setQuickActionSending] = useState(false);
 
   useImperativeHandle(ref, () => ({
     focus: () => {
@@ -694,6 +705,31 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             title="Dismiss"
           >
             x
+          </button>
+        </div>
+      )}
+
+      {quickAction && (
+        <div className="input-context-action">
+          <span className="input-context-note">{quickAction.context}</span>
+          <button
+            type="button"
+            className="input-quick-action"
+            disabled={!acceptsChatMessage || isUploadingFiles || quickActionSending}
+            aria-label={quickAction.label}
+            onClick={async () => {
+              setQuickActionSending(true);
+              try {
+                await onSend(quickAction.prompt, [], []);
+              } finally {
+                setQuickActionSending(false);
+              }
+            }}
+          >
+            <span className="input-quick-action-full">{quickAction.label}</span>
+            <span className="input-quick-action-compact" aria-hidden="true">
+              {quickAction.compactLabel ?? quickAction.label}
+            </span>
           </button>
         </div>
       )}

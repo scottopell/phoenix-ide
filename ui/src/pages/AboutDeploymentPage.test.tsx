@@ -46,6 +46,7 @@ function deployment(overrides: Partial<DeploymentInfo> = {}): DeploymentInfo {
       },
     },
     log: { stdout: true, file: null },
+    installation_ownership: { kind: 'development' },
     local_access: false,
     sampled_at: '2026-06-01T00:00:01Z',
     ...overrides,
@@ -212,6 +213,18 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.clearAllMocks();
+  });
+
+  it('shows runtime ownership from deployment info without waiting for update discovery', async () => {
+    renderPage(deployment({
+      installation_ownership: {
+        kind: 'ambiguous',
+        reason: 'supervisor status probe timed out',
+      },
+    }));
+
+    expect(await screen.findByText('Runtime owner')).toBeInTheDocument();
+    expect(screen.getByText('ambiguous — supervisor status probe timed out')).toBeInTheDocument();
   });
 
   it('summarizes measured, not-measured, and absent disk rows without summing overlaps', async () => {

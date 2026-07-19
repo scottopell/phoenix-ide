@@ -434,11 +434,39 @@ THE SYSTEM SHALL reject new user messages with explanatory error
 AND display the continuation summary prominently
 AND offer action to start new conversation
 
-WHEN user starts new conversation from exhausted conversation
-THE SYSTEM SHALL optionally pre-populate with continuation summary
-AND preserve link to original conversation for reference
+WHEN the user reviews a context-exhausted conversation with no successor
+THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
+AND SHALL offer distinct actions to:
+  - create a successor and submit the generated handoff unchanged as its first user message
+  - edit a separate browser-local handoff draft before creating and starting the successor
+  - copy the generated handoff without creating a successor
+AND SHALL NOT present worktree cleanup or abandon controls on the handoff surface
 
-**Rationale:** Clear terminal state prevents confusion. Optional summary seeding enables continuity without forcing it.
+WHEN the user edits a handoff
+THE SYSTEM SHALL NOT modify the generated continuation summary
+AND SHALL allow the local edit draft to be reverted to the generated handoff
+AND SHALL reject an empty or whitespace-only edited handoff before successor creation
+
+WHEN a continuation successor is created
+THE SYSTEM SHALL atomically persist the exact selected handoff and client message identifier as a pending dispatch intent with the successor ownership transfer
+
+WHEN a pending opening-handoff intent is retried after interruption or failed dispatch
+THE SYSTEM SHALL dispatch the original persisted handoff with its original message identifier
+AND SHALL return the successor identity and dispatch outcome
+AND SHALL keep the user on the handoff surface when dispatch remains unsuccessful
+AND SHALL NOT replace the original intent with later request text
+AND SHALL NOT create a second manual-send path for the same handoff
+AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
+
+WHEN the opening handoff is persisted as the successor's message or steering entry
+THE SYSTEM SHALL atomically consume the pending dispatch intent
+AND SHALL NOT retain the handoff payload in a second accepted representation
+
+WHEN a request loses a continuation-creation race to an earlier handoff
+THE SYSTEM SHALL report that the existing successor won
+AND SHALL NOT claim that the losing request's handoff was accepted
+
+**Rationale:** Context exhaustion is a focused transfer point. Explicit unchanged, edit-first, and copy paths make the consequence of each action visible, while keeping destructive workspace actions away from the continuation controls. Separating generated content from local edits ensures the operational handoff always remains recoverable. A successor creation and message dispatch cross a failure boundary, so the ownership transfer must durably record dispatch intent before asynchronous acceptance begins.
 
 ---
 
@@ -691,6 +719,10 @@ THE SYSTEM SHALL transfer worktree ownership atomically in a single database tra
   - the continuation's `worktree_path` is set to the same value
   - the worktree registry's owner pointer moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
+
+WHEN a continuation successor is newly created
+THE SYSTEM SHALL submit the user-selected handoff text as the successor's first user message
+AND SHALL use a client-generated message identifier for idempotent acceptance
 
 WHEN a parent conversation already has a continuation
 THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation

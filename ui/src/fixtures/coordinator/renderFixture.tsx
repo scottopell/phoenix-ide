@@ -9,6 +9,7 @@ import { ConversationContext } from '../../conversation/ConversationContext';
 import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
 import { CoordinatorPage } from '../../pages/CoordinatorPage';
+import { COORDINATOR_QUICK_ACTION } from '../../pages/coordinatorBriefing';
 import { getMessageListScenario, messageListFixtureData } from '../messageList';
 import '../../index.css';
 import type { CoordinatorScenario } from './types';
@@ -21,6 +22,7 @@ const coordinatorId = 'fixture-coordinator';
 
 export function CoordinatorFixture({ scenario }: Props) {
   useDocumentViewportOwnership(true);
+  const store = useMemo(() => new ConversationStore(), []);
 
   useEffect(() => {
     document.documentElement.dataset['theme'] = 'dark';
@@ -29,8 +31,9 @@ export function CoordinatorFixture({ scenario }: Props) {
   }, [scenario]);
 
   return (
-    <MemoryRouter initialEntries={[`/global/${coordinatorId}`]}>
-      <Routes>
+    <ConversationContext.Provider value={store}>
+      <MemoryRouter initialEntries={[`/global/${coordinatorId}`]}>
+        <Routes>
         <Route
           path="/global/:slug"
           element={(
@@ -45,8 +48,9 @@ export function CoordinatorFixture({ scenario }: Props) {
             />
           )}
         />
-      </Routes>
-    </MemoryRouter>
+        </Routes>
+      </MemoryRouter>
+    </ConversationContext.Provider>
   );
 }
 
@@ -104,6 +108,7 @@ function FixtureConversation({ working }: { working: boolean }) {
               convModeLabel="Explore"
               draft={draft}
               onDraftChange={setDraft}
+              quickAction={COORDINATOR_QUICK_ACTION}
               onSend={() => {}}
               onCancel={() => {}}
               onRetry={() => {}}

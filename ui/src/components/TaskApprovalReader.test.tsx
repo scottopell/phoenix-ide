@@ -41,6 +41,35 @@ describe('TaskApprovalReader markdown rendering', () => {
     expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
   });
+
+  it('shows exact source highlighting for active mermaid matches', async () => {
+    const { container } = renderTaskApprovalReader('```mermaid\nflowchart TD\nA[UniqueNode] --> B\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'UniqueNode' } });
+
+    await waitFor(() => expect(container.querySelector('.viewer-find-match--active')?.textContent).toBe('UniqueNode'));
+    expect(container.querySelector('.language-mermaid')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeInTheDocument();
+  });
+
+
+  it('preserves inline Markdown elements while marking a paragraph match', async () => {
+    const { container } = renderTaskApprovalReader('Use `alpha` and [alpha](https://example.test) safely.');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(container.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha'));
+    expect(container.querySelector('code')).toHaveTextContent('alpha');
+    expect(container.querySelector('a')).toHaveAttribute('href', 'https://example.test');
+  });
+
+  it('marks active matches in tight list-item text', async () => {
+    const { container } = renderTaskApprovalReader('- alpha\n- beta');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(container.querySelector('li .viewer-find-match--active')).toHaveTextContent('alpha'));
+  });
 });
 
 describe('TaskApprovalReader feedback action emphasis', () => {
@@ -189,7 +218,7 @@ describe('TaskApprovalReader shared find integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'ana' } });
 
-    await waitFor(() => expect(screen.getByText('banana')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('[data-line="3"]')?.textContent).toContain('banana'));
     await waitFor(() => expect(document.querySelectorAll('mark').length).toBe(1));
   });
 
@@ -310,6 +339,61 @@ describe('TaskApprovalReader shared find integration', () => {
     } finally {
       HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
     }
+  });
+
+  it('preserves nested list and blockquote children while find is active', async () => {
+    renderTaskApprovalReader([
+      '- first alpha paragraph',
+      '',
+      '  nested paragraph',
+      '  - nested item',
+      '',
+      '> quoted alpha paragraph',
+      '>',
+      '> second quoted paragraph',
+    ].join('\n'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    expect(screen.getByText('nested paragraph')).toBeInTheDocument();
+    expect(screen.getByText('nested item')).toBeInTheDocument();
+    expect(screen.getByText('second quoted paragraph')).toBeInTheDocument();
+  });
+
+  it('marks the exact active occurrence inside fenced code', async () => {
+    renderTaskApprovalReader('```ts\nconst fencedToken = true;\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'fencedToken' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.textContent).toBe('fencedToken'));
+  });
+
+  it('keeps same-line table-cell matches attached to their own display block', async () => {
+    renderTaskApprovalReader('| first | secondToken |\n| --- | --- |\n| alpha | beta |');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'secondToken' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    await waitFor(() => {
+      const activeMark = document.querySelector('.viewer-find-match--active');
+      expect(activeMark?.textContent).toBe('secondToken');
+      expect(activeMark?.closest('th')?.textContent).toBe('secondToken');
+    });
+  });
+
+  it('marks indexed level-four headings and bare fenced code', async () => {
+    renderTaskApprovalReader('#### Deep heading token\n\n```\nbareFenceToken\n```');
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+
+    fireEvent.change(input, { target: { value: 'heading token' } });
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.closest('h4')).not.toBeNull());
+
+    fireEvent.change(input, { target: { value: 'bareFenceToken' } });
+    await waitFor(() => expect(document.querySelector('.viewer-find-match--active')?.closest('pre')).not.toBeNull());
   });
 
   it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {

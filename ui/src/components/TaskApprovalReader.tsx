@@ -12,7 +12,7 @@
  * for the rationale. Plan content comes from ConversationState, not from disk.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Children, cloneElement, isValidElement, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -23,9 +23,15 @@ import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildBlockSearchProjection,
-  useViewerFind,
+  buildMarkdownDisplayBlocks,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
+  type BlockSearchMatchTarget,
+  type FindSessionCommand,
 } from './viewer-find';
 import {
   X,
@@ -235,6 +241,31 @@ function renderFindFragments(
   return fragments;
 }
 
+function decorateFindChildren(
+  children: React.ReactNode,
+  matches: readonly { start: number; end: number; occurrenceIndex: number }[],
+  activeOccurrence: number,
+): React.ReactNode {
+  let cursor = 0;
+  const decorate = (node: React.ReactNode): React.ReactNode => Children.map(node, (child) => {
+    if (typeof child === 'string') {
+      const start = cursor;
+      cursor += child.length;
+      const localMatches = matches
+        .filter((match) => match.start < cursor && match.end > start)
+        .map((match) => ({
+          ...match,
+          start: Math.max(0, match.start - start),
+          end: Math.min(child.length, match.end - start),
+        }));
+      return localMatches.length > 0 ? renderFindFragments(child, localMatches, activeOccurrence) : child;
+    }
+    if (!isValidElement<{ children?: React.ReactNode }>(child)) return child;
+    return cloneElement(child, {}, decorate(child.props.children));
+  });
+  return decorate(children);
+}
+
 export function TaskApprovalReader({
   title,
   priority,
@@ -272,8 +303,11 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
-  const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
-  const find = useViewerFind({ text: '', resetKey: plan });
+  const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan), [plan]);
+  const findablePlanBlocks = useMemo(
+    () => markdownDisplayBlocks.map((block) => ({ id: block.id, lineNumber: block.lineNumber, text: block.searchableText })),
+    [markdownDisplayBlocks],
+  );
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
@@ -283,7 +317,6 @@ export function TaskApprovalReader({
     if (element) blockRefs.current.set(blockId, element);
     else blockRefs.current.delete(blockId);
   }, []);
-  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   // Focus note input when dialog opens
   useEffect(() => {
@@ -349,16 +382,48 @@ export function TaskApprovalReader({
     setShowNotesPanel(false);
   }, []);
 
+  const revealFindTarget = useCallback((target: BlockSearchMatchTarget) => {
+    queueMicrotask(() => {
+      blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
+    });
+  }, []);
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<BlockSearchMatchTarget, HTMLElement | null>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+        case 'clear-decorations':
+          break;
+        case 'restore-focus':
+          queueMicrotask(() => (command.focusOrigin ?? findButtonRef.current)?.focus());
+          break;
+        case 'reveal-match':
+          revealFindTarget(command.target);
+          break;
+      }
+    });
+  }, [revealFindTarget]);
+  const { state: findState, send: sendFind } = useFindSession<BlockSearchMatchTarget, HTMLElement | null>({
+    onCommands: handleFindCommands,
+  });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
+  const findSurfaceKey = useMemo(() => createSurfaceKey(`task-approval:${plan}`), [plan]);
+  const findProjection = useMemo(
+    () => (findOpen ? buildBlockSearchProjection(findablePlanBlocks, findQuery) : { sources: [], matches: [] }),
+    [findOpen, findablePlanBlocks, findQuery],
+  );
+  const findSessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, (match) => `${match.sourceId}:${match.start}:${match.end}`),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    find.open();
-  }, [find]);
-
-  const closeFind = useCallback(() => {
-    find.close();
-    const restoreTarget = findPreviousFocusRef.current;
-    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
-  }, [find]);
+    const focusOrigin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sendFind({ type: 'open', surface: { key: findSurfaceKey, query: '', matches: [], focusOrigin } });
+  }, [findSurfaceKey, sendFind]);
+  const closeFind = useCallback(() => sendFind({ type: 'close' }), [sendFind]);
 
   // Block Escape from closing — note/dialog/discard/find each get precedence, but
   // the approval reader itself still cannot be dismissed by Escape.
@@ -375,7 +440,7 @@ export function TaskApprovalReader({
           setDiscardConfirmOpen(false);
           return;
         }
-        if (find.isOpen) {
+        if (findOpen) {
           closeFind();
           return;
         }
@@ -388,47 +453,24 @@ export function TaskApprovalReader({
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, closeFind, discardConfirmOpen, find.isOpen, handleAddNote]);
+  }, [annotatingLine, closeFind, discardConfirmOpen, findOpen, handleAddNote]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'task-approval',
     onOpen: openFind,
     dialogOpen: annotatingLine !== null || discardConfirmOpen,
   });
-  const findProjection = useMemo(
-    () => (find.isOpen ? buildBlockSearchProjection(findablePlanBlocks, find.query) : { sources: [], matches: [] }),
-    [find.isOpen, findablePlanBlocks, find.query]
-  );
-  const activeFindIndex = findProjection.matches.length === 0
-    ? -1
-    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  useEffect(() => {
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: findSessionMatches });
+  }, [findOpen, findQuery, findSessionMatches, sendFind]);
+  useEffect(() => {
+    sendFind({ type: 'reset' });
+  }, [findSurfaceKey, sendFind]);
 
-  const handleFindQueryChange = useCallback((query: string) => {
-    find.setQuery(query);
-    const target = buildBlockSearchProjection(findablePlanBlocks, query).matches[0]?.target;
-    if (!target) return;
-    queueMicrotask(() => {
-      blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    });
-  }, [find, findablePlanBlocks]);
-
-  const handleFindNext = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? 0
-        : (activeFindIndex + 1) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
-
-  const handleFindPrevious = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? Math.max(findProjection.matches.length - 1, 0)
-        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
+  const handleFindQueryChange = useCallback((query: string) => sendFind({ type: 'set-query', query }), [sendFind]);
+  const handleFindNext = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
+  const handleFindPrevious = useCallback(() => sendFind({ type: 'previous' }), [sendFind]);
 
   // Format and send notes (REQ-PF-009 format)
   const handleSendFeedback = useCallback(() => {
@@ -457,14 +499,6 @@ export function TaskApprovalReader({
     [onApprove]
   );
 
-  useEffect(() => {
-    if (!find.isOpen || activeFindIndex < 0) return;
-    const target = findProjection.matches[activeFindIndex]?.target;
-    if (!target) return;
-    blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
-  }, [activeFindIndex, find.isOpen, findProjection.matches]);
-
   const confirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
     onReject();
@@ -473,29 +507,32 @@ export function TaskApprovalReader({
   // Render plan as markdown with annotatable blocks.
   const renderPlanMarkdown = useMemo(() => {
     const rawLines = plan.split('\n');
-    const nextFindableBlocks: Array<{ id: string; lineNumber: number; text: string }> = [];
-    const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+    const matchesByBlockId = new Map<string, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
-      const lineMatches = matchesByLine.get(match.target.lineNumber) ?? [];
-      lineMatches.push({
+      const blockMatches = matchesByBlockId.get(match.target.blockId) ?? [];
+      blockMatches.push({
         start: match.target.startOffset,
         end: match.target.endOffset,
         occurrenceIndex,
       });
-      matchesByLine.set(match.target.lineNumber, lineMatches);
+      matchesByBlockId.set(match.target.blockId, blockMatches);
     });
 
-    const findBlockRegistry = new Set<string>();
-    const registerFindableBlock = (lineNumber: number, text: string, blockId = `line:${lineNumber}`) => {
-      if (lineNumber <= 0) return blockId;
-      if (text.length === 0) return blockId;
-      if (findBlockRegistry.has(blockId)) return blockId;
-      findBlockRegistry.add(blockId);
-      nextFindableBlocks.push({ id: blockId, lineNumber, text });
-      return blockId;
+    const claimDisplayBlock = (lineNumber: number, startOffset?: number, kind?: string): string => {
+      const compatible = kind
+        ? markdownDisplayBlocks.filter((block) => block.kind === kind)
+        : markdownDisplayBlocks;
+      const containing = startOffset === undefined
+        ? []
+        : compatible
+            .filter((block) => block.sourceRange.start <= startOffset && startOffset < block.sourceRange.end)
+            .sort((left, right) =>
+              (left.sourceRange.end - left.sourceRange.start) - (right.sourceRange.end - right.sourceRange.start));
+      const match = containing[0] ?? compatible.find((block) => block.lineNumber === lineNumber);
+      return match?.id ?? `markdown:line:${lineNumber}`;
     };
 
-    const annotatable = (Tag: React.ElementType) =>
+    const annotatable = (Tag: React.ElementType, kind?: string, decorateChildren = true) =>
       ({
         children,
         node,
@@ -504,8 +541,8 @@ export function TaskApprovalReader({
         children?: React.ReactNode;
         node?: {
           position?: {
-            start?: { line?: number };
-            end?: { line?: number };
+            start?: { line?: number; offset?: number };
+            end?: { line?: number; offset?: number };
           };
         };
         [key: string]: unknown;
@@ -517,18 +554,9 @@ export function TaskApprovalReader({
           .slice(startLine, endLine + 1)
           .join(' ')
           .slice(0, 200);
-        const lineText = rawLines[ln - 1] ?? '';
-        const childText = typeof children === 'string'
-          ? children
-          : Array.isArray(children) && children.every((child) => typeof child === 'string')
-            ? children.join('')
-            : null;
-        const blockId = registerFindableBlock(ln, childText ?? lineText);
-        const lineMatches = matchesByLine.get(ln) ?? [];
-        const shouldDecorateChildren =
-          lineMatches.length > 0
-          && childText !== null
-          && childText === lineText;
+        const blockId = claimDisplayBlock(ln, node?.position?.start?.offset, kind);
+        const blockMatches = matchesByBlockId.get(blockId) ?? [];
+        const shouldDecorateChildren = decorateChildren && blockMatches.length > 0;
         return (
           <AnnotatableBlock
             as={Tag}
@@ -549,51 +577,40 @@ export function TaskApprovalReader({
             {...props}
           >
             {shouldDecorateChildren
-              ? renderFindFragments(childText ?? lineText, lineMatches, activeFindIndex)
+              ? decorateFindChildren(children, blockMatches, activeFindIndex)
               : children}
           </AnnotatableBlock>
         );
       };
 
 
-    queueMicrotask(() => {
-      setFindablePlanBlocks((prev) => {
-        if (
-          prev.length === nextFindableBlocks.length
-          && prev.every((block, index) => block.id === nextFindableBlocks[index]?.id && block.text === nextFindableBlocks[index]?.text)
-        ) {
-          return prev;
-        }
-        return nextFindableBlocks;
-      });
-    });
-
     return (
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={
           {
-            p: annotatable('p'),
-            h1: annotatable('h1'),
-            h2: annotatable('h2'),
-            h3: annotatable('h3'),
-            td: annotatable('td'),
-            th: annotatable('th'),
+            p: annotatable('p', 'paragraph'),
+            h1: annotatable('h1', 'heading'),
+            h2: annotatable('h2', 'heading'),
+            h3: annotatable('h3', 'heading'),
+            h4: annotatable('h4', 'heading'),
+            h5: annotatable('h5', 'heading'),
+            h6: annotatable('h6', 'heading'),
+            td: annotatable('td', 'tableCell'),
+            th: annotatable('th', 'tableCell'),
             li: annotatable('li'),
-            blockquote: annotatable('blockquote'),
+            blockquote: annotatable('blockquote', undefined, false),
             code: ({
-              inline,
               className,
               children,
               node,
               ...props
             }: {
-              inline?: boolean;
               className?: string;
               children?: React.ReactNode;
               node?: {
                 position?: {
-                  start?: { line?: number };
+                  start?: { line?: number; offset?: number };
                 };
               };
               [key: string]: unknown;
@@ -602,34 +619,52 @@ export function TaskApprovalReader({
               const language = match?.[1]?.toLowerCase();
               const codeText = String(children).replace(/\n$/, '');
               const lineNumber = node?.position?.start?.line ?? 0;
-              if (inline) {
-                registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:inline-code:${nextFindableBlocks.length}`);
-              }
-              const codeBlockId = `line:${lineNumber}:code-block`;
-              if (!inline) registerFindableBlock(lineNumber, codeText, codeBlockId);
-              if (!inline && language === 'mermaid') {
+              const startOffset = node?.position?.start?.offset;
+              const codeBlock = startOffset === undefined
+                ? undefined
+                : markdownDisplayBlocks.find((block) =>
+                    block.kind === 'code'
+                    && block.sourceRange.start <= startOffset
+                    && startOffset < block.sourceRange.end);
+              const codeBlockId = codeBlock?.id ?? `markdown:inline-code:${startOffset ?? lineNumber}`;
+              const codeMatches = matchesByBlockId.get(codeBlockId) ?? [];
+              const isBlockCode = codeBlock !== undefined;
+              if (isBlockCode && language === 'mermaid') {
                 return (
                   <div ref={(element) => registerBlockRef(codeBlockId, element)}>
-                    <MermaidDiagram code={String(children)} />
+                    {codeMatches.length > 0 ? (
+                      <pre className="language-mermaid">
+                        <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
+                      </pre>
+                    ) : (
+                      <MermaidDiagram code={String(children)} />
+                    )}
                   </div>
                 );
               }
-              return !inline && match ? (
-                <div ref={(element) => registerBlockRef(codeBlockId, element)}>
-                  <SyntaxHighlighter
-                    style={oneDark}
-                    language={match[1]}
-                    PreTag="div"
-                    {...props}
-                  >
-                    {codeText}
-                  </SyntaxHighlighter>
-                </div>
-              ) : (
-                <code className={className} {...props}>
-                  {children}
-                </code>
-              );
+              if (isBlockCode) {
+                return (
+                  <div ref={(element) => registerBlockRef(codeBlockId, element)}>
+                    {codeMatches.length > 0 ? (
+                      <pre className={match ? `language-${match[1]}` : undefined}>
+                        <code>{renderFindFragments(codeText, codeMatches, activeFindIndex)}</code>
+                      </pre>
+                    ) : match ? (
+                      <SyntaxHighlighter
+                        style={oneDark}
+                        language={match[1]}
+                        PreTag="div"
+                        {...props}
+                      >
+                        {codeText}
+                      </SyntaxHighlighter>
+                    ) : (
+                      <pre><code {...props}>{codeText}</code></pre>
+                    )}
+                  </div>
+                );
+              }
+              return <code className={className} {...props}>{children}</code>;
             },
           } as unknown as Components
         }
@@ -637,7 +672,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, registerBlockRef]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, markdownDisplayBlocks, registerBlockRef]);
 
   return (
     <div className="task-approval-reader">
@@ -678,12 +713,12 @@ export function TaskApprovalReader({
         </div>
       </div>
 
-      {find.isOpen && (
+      {findOpen && (
         <FindBar
-          query={find.query}
+          query={findQuery}
           activeIndex={activeFindIndex}
-          matchCount={findProjection.matches.length}
-          focusVersion={find.focusVersion}
+          matchCount={findSession?.matches.length ?? 0}
+          focusVersion={findSession?.focusVersion ?? 0}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}

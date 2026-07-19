@@ -30,7 +30,7 @@ import {
   findHistoricalUnitIndexByMessageId,
 } from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
-import type { InputAreaHandle } from '../components/InputArea';
+import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
@@ -54,6 +54,7 @@ import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
+import { ContextExhaustedHandoff } from '../components/ContextExhaustedHandoff';
 import {
   useConversationEventCursorRef,
   useConversationView,
@@ -67,6 +68,9 @@ import {
   useIsDesktop,
   useIsWideDesktop,
   useDraftActions,
+  readSeedDraft,
+  writeSeedDraft,
+  clearSeedDraft,
 } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
@@ -124,23 +128,11 @@ const ForkProposalReview = lazy(() =>
 const TERMINAL_COLLAPSED_PX = 32;
 const terminalPaneMax = () => Math.min(800, Math.floor(window.innerHeight * 0.75));
 
-const AlertTriangle = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-    <line x1="12" y1="9" x2="12" y2="13" />
-    <line x1="12" y1="17" x2="12.01" y2="17" />
-  </svg>
-);
 const XCircle = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <circle cx="12" cy="12" r="10" />
     <line x1="15" y1="9" x2="9" y2="15" />
     <line x1="9" y1="9" x2="15" y2="15" />
-  </svg>
-);
-const ChevronRightSmall = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <polyline points="9 18 15 12 9 6" />
   </svg>
 );
 const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
@@ -192,7 +184,12 @@ async function getConversationMetaForRoute(routeSegment: string) {
 }
 
 
-export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
+interface ConversationPageProps {
+  routePrefix?: '/c' | '/global';
+  composerQuickAction?: ComposerQuickAction | undefined;
+}
+
+export function ConversationPage({ routePrefix = '/c', composerQuickAction }: ConversationPageProps) {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -217,7 +214,7 @@ export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | 
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
       {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent routePrefix={routePrefix} />
+      <ConversationPageContent routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
     </ReviewNotesProvider>
   );
 }
@@ -269,7 +266,13 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
-function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global' }) {
+function ConversationPageContent({
+  routePrefix,
+  composerQuickAction,
+}: {
+  routePrefix: '/c' | '/global';
+  composerQuickAction?: ComposerQuickAction | undefined;
+}) {
   const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -474,9 +477,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
   const taskApprovalError = atom.uiError?.type === 'BackendError' ? atom.uiError.message : null;
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
-  // Context-full banner: summary expanded by default; user can collapse to
-  // read the conversation above.
-  const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
 
   // ---------------------------------------------------------------------------
   // Per-slug state reset (task 02703).
@@ -516,7 +516,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     setShowTaskApproval(false);
     setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
-    setContextExhaustedExpanded(true);
     setFocusToken(0);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
@@ -1242,22 +1241,12 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   useEffect(() => {
     if (!conversationId) return;
     if (seedHydratedRef.current === conversationId) return;
-    const key = `seed-draft:${conversationId}`;
-    let seed: string | null = null;
-    try {
-      seed = localStorage.getItem(key);
-    } catch {
-      // ignore
-    }
+    const seed = readSeedDraft(conversationId);
     if (!seed) return;
     seedHydratedRef.current = conversationId;
     setDraftIfEmptyCb(seed);
     requestComposerFocus();
-    try {
-      localStorage.removeItem(key);
-    } catch {
-      // ignore
-    }
+    clearSeedDraft(conversationId);
   }, [conversationId, setDraftIfEmptyCb, requestComposerFocus]);
 
   // Auto-open/close task approval overlay on state transitions
@@ -1644,7 +1633,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
       try {
-        localStorage.setItem(`seed-draft:${clientConversationId}`, promptText);
+        writeSeedDraft(clientConversationId, promptText);
       } catch {
         // ignore — non-fatal
       }
@@ -1930,6 +1919,38 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     [isArchived, convStateForChildren.type, handleTriggerContinuation],
   );
 
+  const openExistingContinuation = useCallback(async () => {
+    if (!conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
+    const res = await api.continueConversation(conversation.id, {
+      handoff: convStateForChildren.summary,
+      message_id: generateUUID(),
+      user_agent: navigator.userAgent,
+    });
+    if (res.status === 'dispatch_failed') {
+      throw new Error(res.error ?? 'The continuation exists, but its opening handoff could not be sent. Retry from this page.');
+    }
+    showInfo('Returning to your existing continuation');
+    navigate(`${routePrefix}/${res.conversation_id}`);
+  }, [conversation?.id, convStateForChildren, navigate, routePrefix, showInfo]);
+
+  const handleContextExhaustedContinue = useCallback(async (handoff: string) => {
+    if (!conversation?.id) throw new Error('Conversation is unavailable.');
+    const res = await api.continueConversation(conversation.id, {
+      handoff,
+      message_id: generateUUID(),
+      user_agent: navigator.userAgent,
+    });
+    if (res.status === 'dispatch_failed') {
+      showError(res.error ?? 'The continuation was created, but its opening handoff could not be sent. Retry the durable handoff from this page.');
+      return res.status;
+    }
+    if (res.status === 'already_exists') {
+      showInfo('An earlier handoff won this continuation; your local edit is still saved.');
+    }
+    navigate(`${routePrefix}/${res.conversation_id}`);
+    return res.status;
+  }, [conversation?.id, navigate, routePrefix, showError, showInfo]);
+
   if (error) {
     return (
       <div id="app">
@@ -2061,23 +2082,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     }
   }
 
-  // Terminal cleanup (Clean up / Abandon) for a Work/Branch
-  // conversation stuck in a disposable phase (error or context-exhausted): the
-  // backend and specs permit TaskResolved from those states. PR-aware; renders
-  // nothing for non-Work/Branch conversations; once continued the actions
-  // disable with a tooltip. Deliberately no onSendMessage — a stuck
-  // conversation exposes only terminal cleanup, never a message-posting action
-  // that would reopen the error. One definition, shared by both stuck branches.
-  const stuckCleanupBar = conversationId && !isArchived && (
-    <WorkControlBar
-      conversationId={conversationId}
-      convModeLabel={conversation.conv_mode_label}
-      phaseType={convStateForChildren.type}
-      continuedInConvId={conversation.continued_in_conv_id}
-      showError={showError}
-      prStatusHandle={prStatusHandle}
-    />
-  );
   const showTerminal =
     !!conversationId &&
     !isArchived &&
@@ -2343,106 +2347,24 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         </div>
       )}
       {convStateForChildren.type === 'context_exhausted' && (
-        <div className={`context-exhausted-banner${contextExhaustedExpanded ? ' context-exhausted-banner--expanded' : ''}`}>
-          <button
-            type="button"
-            className="context-exhausted-header"
-            onClick={() => setContextExhaustedExpanded((v) => !v)}
-            aria-expanded={contextExhaustedExpanded}
-          >
-            <span className="context-exhausted-icon"><AlertTriangle /></span>
-            <span className="context-exhausted-title">Context Window Full</span>
-            <span className="context-exhausted-subtitle">
-              {conversation.continued_in_conv_id
-                ? 'This conversation has been continued'
-                : 'Continue in a new conversation to preserve progress'}
-            </span>
-            <span className={`context-exhausted-chevron${contextExhaustedExpanded ? ' context-exhausted-chevron--open' : ''}`} aria-hidden>
-              <ChevronRightSmall />
-            </span>
-          </button>
-          <div className="context-exhausted-summary">
-            <div className="context-exhausted-actions">
-              {!isArchived && (conversation.continued_in_conv_id ? (
-                // REQ-BED-030 single-continuation policy: once a parent has a
-                // continuation, the Continue button is replaced with a link to
-                // that continuation. Clicking re-hits the idempotent
-                // continuation endpoint, which returns the existing id + slug
-                // and lets us navigate without caching the slug client-side.
-                <button
-                  type="button"
-                  className="context-exhausted-continue"
-                  data-testid="continuation-link"
-                  onClick={async () => {
-                    if (!conversation?.id) return;
-                    try {
-                      const res = await api.continueConversation(conversation.id);
-                      if (res.slug) {
-                        navigate(`${routePrefix}/${res.conversation_id}`);
-                      }
-                    } catch (err) {
-                      showInfo(err instanceof Error ? err.message : 'Failed to open continuation');
-                    }
-                  }}
-                >
-                  {'→'} Continued in a new conversation
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="context-exhausted-continue"
-                  data-testid="continue-button"
-                  onClick={async () => {
-                    if (convStateForChildren.type !== 'context_exhausted') return;
-                    if (!conversation?.id) return;
-                    const summary = convStateForChildren.summary;
-                    try {
-                      const res = await api.continueConversation(conversation.id);
-                      if (res.already_existed) {
-                        showInfo('Returning to your existing continuation');
-                      } else if (res.conversation_id && summary) {
-                        // Pre-populate the continuation's input with the
-                        // summary so the user can edit it before sending
-                        // the first message. The seed-draft hydration
-                        // useEffect on the new page picks this up and
-                        // clears the key.
-                        try {
-                          localStorage.setItem(`seed-draft:${res.conversation_id}`, summary);
-                        } catch {
-                          // ignore storage failures — navigation still works
-                        }
-                      }
-                      if (res.slug) {
-                        navigate(`${routePrefix}/${res.conversation_id}`);
-                      }
-                    } catch (err) {
-                      showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
-                    }
-                  }}
-                >
-                  Continue in new conversation
-                </button>
-              ))}
-              <button
-                type="button"
-                className="context-exhausted-copy"
-                onClick={async () => {
-                  if (convStateForChildren.type !== 'context_exhausted') return;
-                  const ok = await copyToClipboard(convStateForChildren.summary);
-                  showInfo(ok ? 'Summary copied to clipboard' : 'Copy failed -- select and copy manually');
-                }}
-              >
-                Copy Summary
-              </button>
-            </div>
-            {stuckCleanupBar}
-            {contextExhaustedExpanded && (
-              <pre className="context-exhausted-content">
-                {convStateForChildren.summary}
-              </pre>
-            )}
-          </div>
-        </div>
+        <ContextExhaustedHandoff
+          parentId={conversation.id}
+          generatedHandoff={convStateForChildren.summary}
+          continuedInConvId={conversation.continued_in_conv_id}
+          disabled={isArchived}
+          onOpenExisting={async () => {
+            try {
+              await openExistingContinuation();
+            } catch (err) {
+              showInfo(err instanceof Error ? err.message : 'Failed to open continuation');
+            }
+          }}
+          onContinue={handleContextExhaustedContinue}
+          onCopy={async (handoff) => {
+            const ok = await copyToClipboard(handoff);
+            showInfo(ok ? 'Handoff copied to clipboard' : 'Copy failed -- select and copy manually');
+          }}
+        />
       )}
       {convStateForChildren.type === 'handed_off' && (
         <div className="terminal-banner">
@@ -2494,6 +2416,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           focusToken={focusToken}
+          quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
@@ -2503,7 +2426,14 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         </>
       ) : convStateForChildren.type === 'error' ? (
         <>
-        {stuckCleanupBar}
+        {!isArchived && <WorkControlBar
+          conversationId={conversation.id}
+          convModeLabel={conversation.conv_mode_label}
+          phaseType={convStateForChildren.type}
+          continuedInConvId={conversation.continued_in_conv_id}
+          showError={showError}
+          prStatusHandle={prStatusHandle}
+        />}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
@@ -2538,6 +2468,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
             failedMessages={failedMessages}
             convModeLabel={conversation.conv_mode_label}
             focusToken={focusToken}
+            quickAction={composerQuickAction}
             onSend={handleSend}
             onCancel={handleCancel}
             onRetry={handleRetry}
@@ -2600,6 +2531,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
           focusToken={focusToken}
+          quickAction={composerQuickAction}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}

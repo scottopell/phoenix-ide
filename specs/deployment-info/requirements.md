@@ -11,8 +11,8 @@ The page is primarily diagnostic. It changes no server state while reading build
 network, resource, disk, or log facts. The disk section may expose narrowly scoped
 cleanup actions for backend-confirmed leftover Phoenix-managed worktrees. Every
 value it shows is a fact the running process already knows or can measure: build
-identity, runtime configuration (network binding, TLS), live resource usage,
-on-disk locations with their sizes, and the path to the log file.
+identity, runtime ownership, runtime configuration (network binding, TLS), live
+resource usage, on-disk locations with their sizes, and the path to the log file.
 
 Logs are surfaced as a **path only** — the page never renders log contents.
 
@@ -24,6 +24,7 @@ without SSHing in to read env vars, `du` the data directory, or `ps` the
 process. I need Phoenix to tell me:
 
 - Which version and exact build (git SHA) this is, and how long it's been up
+- Which runtime owner, if any, manages this process
 - What address/port it's bound to and whether TLS is on, in which mode, with
   which cert/key
 - How much memory and CPU the process is using right now, against the machine's
@@ -37,11 +38,13 @@ process. I need Phoenix to tell me:
 The page must let me confidently answer:
 
 1. Is this the build I think it is? (version, git SHA, uptime/start time)
-2. How is it reachable, and is the connection encrypted? (bind address, port,
+2. Who owns this running process? (managed backend, development, unmanaged,
+   ambiguous, or unsupported)
+3. How is it reachable, and is the connection encrypted? (bind address, port,
    TLS mode + cert/key paths)
-3. Is it healthy on this machine right now? (process memory, CPU, system totals)
-4. Where are its bytes, and how many? (on-disk locations + sizes)
-5. Where do I go to read what it logged? (log file path)
+4. Is it healthy on this machine right now? (process memory, CPU, system totals)
+5. Where are its bytes, and how many? (on-disk locations + sizes)
+6. Where do I go to read what it logged? (log file path)
 
 Each numbered question maps to one or more requirements below.
 
@@ -90,6 +93,37 @@ git SHA pins the exact source. Uptime plus start time together answer "did it
 just restart?" without forcing the reader to do clock arithmetic. The `unknown`
 sentinel is preserved from the build's own contract so a missing SHA reads as a
 known-absent value, not a rendering bug.
+
+---
+
+### REQ-DEPLOY-002A: Report authoritative runtime ownership
+
+THE SYSTEM SHALL expose one typed runtime-ownership snapshot that distinguishes:
+
+- launchd-managed;
+- systemd-managed;
+- bare-supervisor-managed;
+- development;
+- unmanaged;
+- ambiguous evidence; and
+- unsupported platforms.
+
+THE SYSTEM SHALL prove launchd and systemd ownership from the socket-activation
+contract used by the running process rather than from the host operating system,
+PID 1, or installed service artifacts.
+
+ON Linux without socket activation, WHEN a live owner-only Phoenix supervisor
+authenticates as the same user and reports the current process as its verified
+direct child under the compatible protocol, THE SYSTEM SHALL report the runtime
+as bare-supervisor-managed.
+
+WHEN supported ownership evidence is absent, contradictory, unsafe, unreadable,
+or unsupported, THE SYSTEM SHALL preserve the corresponding development,
+unmanaged, ambiguous, or unsupported outcome rather than guessing a managed
+backend.
+
+THE SYSTEM SHALL keep runtime ownership independent from browser locality and
+release-update prerequisites.
 
 ---
 

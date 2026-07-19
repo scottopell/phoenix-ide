@@ -13,8 +13,15 @@ import { useDensity } from '../hooks/useDensity';
 import { useLiveBashProgressForToolIds } from '../conversation';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildConversationSearchProjection,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
+  type ConversationFragmentRevealTarget,
+  type ConversationSearchMatchTarget,
+  type FindSessionCommand,
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
@@ -30,9 +37,12 @@ import {
   UserMessage,
   QueuedUserMessage,
   AgentMessage,
+  type AgentTextRevealRequest,
+  type ConversationHighlight,
   SubAgentStatus,
   SkillCommandText,
   formatMessageTime,
+  renderHighlightedText,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
@@ -69,6 +79,7 @@ import {
   type TranscriptPositioningEvent,
   type TranscriptPositioningInput,
 } from '../conversation/transcriptPositioning';
+import { findConversationFragmentElement } from './viewer-find/conversationFragmentElement';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -153,13 +164,27 @@ function formatAttachmentBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function SkillFileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+function SkillFileChips({
+  files,
+  activeHighlight = null,
+}: {
+  files: { original_name: string; size_bytes: number; stored_path?: string }[];
+  activeHighlight?: ConversationHighlight | null;
+}) {
   if (files.length === 0) return null;
   return (
     <div className="message-files">
       {files.map((file, idx) => (
-        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
-          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        <span
+          key={`${file.stored_path ?? file.original_name}-${idx}`}
+          className="message-file-chip"
+          title={file.stored_path}
+          data-fragment-id={`message-attachment-${idx}`}
+        >
+          📎 {activeHighlight?.owner === 'message-attachment' && activeHighlight.fragmentId === `message-attachment-${idx}`
+            ? renderHighlightedText(file.original_name, activeHighlight.start, activeHighlight.end)
+            : file.original_name}{' '}
+          <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
         </span>
       ))}
     </div>
@@ -197,16 +222,20 @@ function renderHistoricalUnit(
   activeToolUseId: string | undefined,
   slug: string | null,
   isLatestAgentMessage: boolean,
+  revealRequest: AgentTextRevealRequest | null,
+  activeHighlight: ConversationHighlight | null,
+  onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
-      return <UserMessage message={unit.message} />;
+      return <UserMessage message={unit.message} activeHighlight={activeHighlight} />;
     case 'pending_user':
       return (
         <QueuedUserMessage
           message={unit.message}
           onRetry={onRetry}
           onCancelSteering={onCancelSteering}
+          activeHighlight={activeHighlight}
         />
       );
     case 'skill': {
@@ -223,8 +252,12 @@ function renderHistoricalUnit(
             )}
           </div>
           <div className="message-content">
-            <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />
-            <SkillFileChips files={c.files ?? []} />
+            <span data-fragment-id="message-text">
+              {activeHighlight?.owner === 'message-text'
+                ? renderHighlightedText(trigger, activeHighlight.start, activeHighlight.end)
+                : <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />}
+            </span>
+            <SkillFileChips files={c.files ?? []} activeHighlight={activeHighlight} />
           </div>
         </div>
       );
@@ -243,6 +276,10 @@ function renderHistoricalUnit(
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
           isLatestAgentMessage={isLatestAgentMessage}
+          unitKey={unit.key}
+          {...(revealRequest ? { revealRequest } : {})}
+          {...(activeHighlight ? { activeHighlight } : {})}
+          {...(onRevealHandled ? { onRevealHandled } : {})}
         />
       );
     case 'system': {
@@ -254,7 +291,11 @@ function renderHistoricalUnit(
       if (!text) return null;
       return (
         <div className="system-message">
-          <span className="system-message-text">{text}</span>
+          <span className="system-message-text" data-fragment-id="message-text">
+            {activeHighlight?.owner === 'message-text'
+              ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+              : text}
+          </span>
         </div>
       );
     }
@@ -290,6 +331,9 @@ function renderUnit(
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
   isLatestAgentMessage: boolean,
+  revealRequest: AgentTextRevealRequest | null,
+  activeHighlight: ConversationHighlight | null,
+  onRevealHandled: ((request: AgentTextRevealRequest) => void) | undefined,
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
@@ -297,7 +341,21 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, slug ?? null, isLatestAgentMessage);
+  return renderHistoricalUnit(
+    unit,
+    onOpenFile,
+    onOpenCommissionReview,
+    filePathRootDir,
+    onRetry,
+    onCancelSteering,
+    workScopeKey,
+    activeToolUseId,
+    slug ?? null,
+    isLatestAgentMessage,
+    revealRequest,
+    activeHighlight,
+    onRevealHandled,
+  );
 }
 
 interface SystemPromptHeaderProps {
@@ -305,6 +363,7 @@ interface SystemPromptHeaderProps {
   expanded: boolean;
   onToggle: () => void;
   contentRef: React.RefObject<HTMLPreElement>;
+  activeHighlight: { fragmentId: 'system-prompt-text'; start: number; end: number } | null;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
@@ -312,6 +371,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   expanded,
   onToggle,
   contentRef,
+  activeHighlight,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtual-transcript-row">
@@ -323,7 +383,13 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
             {expanded ? ' hide' : ' show'}
           </span>
         </div>
-        {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
+        {expanded && (
+          <pre ref={contentRef} className="system-prompt-content" data-fragment-id="system-prompt-text">
+            {activeHighlight
+              ? renderHighlightedText(systemPrompt, activeHighlight.start, activeHighlight.end)
+              : systemPrompt}
+          </pre>
+        )}
       </div>
     </div>
   );
@@ -337,6 +403,15 @@ function EmptyTranscriptState() {
     </div>
   );
 }
+
+function stableConversationMatchId(match: {
+  sourceId: string;
+  start: number;
+  end: number;
+}): string {
+  return `${match.sourceId}:${match.start}:${match.end}`;
+}
+
 
 function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
   const buffer = useStreamingBuffer(slug);
@@ -372,14 +447,7 @@ function MessageListImpl({
   const { activeScope } = useFocusScope();
   const { pushScope, popScope } = useFocusScopeCommands();
   const { density } = useDensity();
-  const [findOpen, setFindOpen] = useState(false);
-  const [findFocusVersion, setFindFocusVersion] = useState(0);
-  const [findQuery, setFindQuery] = useState('');
-  const findUsesLiveBashProgress = findOpen && findQuery.length > 0;
-  const liveBashProgress = useLiveBashProgressForToolIds(slug ?? null, findUsesLiveBashProgress ? null : []);
-  const [findActiveIndex, setFindActiveIndex] = useState(0);
   const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
-  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
@@ -439,6 +507,45 @@ function MessageListImpl({
     return null;
   }, [historicalUnits]);
 
+  const findSurfaceKey = useMemo(
+    () => createSurfaceKey(`conversation-transcript:${conversationId ?? 'empty'}`),
+    [conversationId],
+  );
+  const [pendingRevealRequest, setPendingRevealRequest] = useState<AgentTextRevealRequest | null>(null);
+  const [findRevealVersion, setFindRevealVersion] = useState(0);
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<ConversationSearchMatchTarget, HTMLElement | null>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+          break;
+        case 'restore-focus':
+          requestAnimationFrame(() => {
+            const focusTarget = command.focusOrigin?.isConnected
+              ? command.focusOrigin
+              : scrollerRef.current;
+            if (focusTarget && !focusTarget.hasAttribute('tabindex')) focusTarget.setAttribute('tabindex', '-1');
+            focusTarget?.focus();
+          });
+          break;
+        case 'reveal-match':
+          setFindRevealVersion((version) => version + 1);
+          break;
+        case 'clear-decorations':
+          scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+            .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+          setPendingRevealRequest(null);
+          break;
+      }
+    });
+  }, []);
+  const { state: findState, send: sendFind } = useFindSession<ConversationSearchMatchTarget, HTMLElement | null>({
+    onCommands: handleFindCommands,
+  });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
+  const findUsesLiveBashProgress = findOpen && findQuery.length > 0;
+  const findLiveBashProgress = useLiveBashProgressForToolIds(slug ?? null, findUsesLiveBashProgress ? null : []);
   const findProjection = useMemo(
     () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
@@ -447,18 +554,54 @@ function MessageListImpl({
           streamingBuffer: findStreamingBuffer,
           systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
-          liveBashProgress,
+          commissionReviewCanOpenFullReview: onOpenCommissionReview !== undefined,
+          liveBashProgress: findLiveBashProgress,
         })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, liveBashProgress, systemPrompt, systemPromptExpanded],
+    [allUnits, density, findLiveBashProgress, findOpen, findQuery, findStreamingBuffer, latestAgentKey, onOpenCommissionReview, systemPrompt, systemPromptExpanded]
   );
-  const findMatches = findProjection.matches;
-  const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
-  const activeFindMatch = findOpen && normalizedFindIndex >= 0 ? findMatches[normalizedFindIndex] ?? null : null;
+  const findSessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableConversationMatchId),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatch = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const activeFindMatchRef = useRef(activeFindMatch);
   activeFindMatchRef.current = activeFindMatch;
+  const findSourcesRef = useRef(findProjection.sources);
+  findSourcesRef.current = findProjection.sources;
   const activeFindMatchKey = activeFindMatch
-    ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
+    ? `${activeFindMatch.kind}:${activeFindMatch.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}:${findRevealVersion}`
+    : null;
+  const activeFindRevealTarget = activeFindMatch?.kind === 'unit-text'
+    ? findSourcesRef.current.find((candidate) => candidate.id === activeFindMatch.sourceId)?.revealTarget ?? null
+    : null;
+  const activeFindHighlight = useMemo((): (ConversationHighlight & { unitKey: string }) | null => {
+    if (activeFindMatch?.kind !== 'unit-text' || !activeFindMatch.fragmentId || !activeFindRevealTarget) return null;
+    const range = {
+      unitKey: activeFindMatch.unitKey,
+      fragmentId: activeFindMatch.fragmentId,
+      start: activeFindMatch.start,
+      end: activeFindMatch.end,
+    };
+    return activeFindRevealTarget.kind === 'message-attachment'
+      ? { ...range, owner: 'message-attachment' }
+      : activeFindRevealTarget.kind === 'message-text'
+        ? { ...range, owner: 'message-text' }
+      : activeFindRevealTarget.kind === 'agent-text'
+        ? { ...range, owner: 'agent-text' }
+      : activeFindRevealTarget.kind === 'tool-use-input'
+        ? { ...range, owner: 'tool-input', toolUseId: activeFindRevealTarget.toolUseId }
+        : 'toolUseId' in activeFindRevealTarget
+          ? { ...range, owner: 'tool-result', toolUseId: activeFindRevealTarget.toolUseId }
+          : null;
+  }, [activeFindMatch, activeFindRevealTarget]);
+  const activeSystemPromptHighlight = activeFindMatch?.kind === 'header-text'
+    ? {
+        fragmentId: activeFindMatch.fragmentId,
+        start: activeFindMatch.start,
+        end: activeFindMatch.end,
+      }
     : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
@@ -469,15 +612,17 @@ function MessageListImpl({
       return null;
     }
   }, []);
+  const handleRevealHandled = useCallback((request: AgentTextRevealRequest) => {
+    setPendingRevealRequest((current) => (current?.nonce === request.nonce ? null : current));
+  }, []);
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setFindOpen(true);
-    setFindFocusVersion((version) => version + 1);
-  }, []);
-  const closeFind = useCallback(() => {
-    setFindOpen(false);
-    requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
-  }, []);
+    const focusOrigin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sendFind({
+      type: 'open',
+      surface: { key: findSurfaceKey, query: '', matches: [], focusOrigin },
+    });
+  }, [findSurfaceKey, sendFind]);
+  const closeFind = useCallback(() => sendFind({ type: 'close' }), [sendFind]);
 
   useEffect(() => {
     if (!findOpen) return undefined;
@@ -508,26 +653,15 @@ function MessageListImpl({
   useEffect(() => {
     if (findConversationRef.current === conversationId) return;
     findConversationRef.current = conversationId;
-    if (findOpen) setFindOpen(false);
-    if (findQuery) setFindQuery('');
-    if (findActiveIndex !== 0) setFindActiveIndex(0);
-  }, [conversationId, findActiveIndex, findOpen, findQuery]);
-  const changeFindQuery = useCallback((query: string) => {
-    setFindQuery(query);
-    setFindActiveIndex(0);
-  }, []);
-  const nextFindMatch = useCallback(() => {
-    setFindActiveIndex(() => {
-      if (findMatches.length === 0) return 0;
-      return (normalizedFindIndex + 1) % findMatches.length;
-    });
-  }, [findMatches.length, normalizedFindIndex]);
-  const previousFindMatch = useCallback(() => {
-    setFindActiveIndex(() => {
-      if (findMatches.length === 0) return 0;
-      return (normalizedFindIndex - 1 + findMatches.length) % findMatches.length;
-    });
-  }, [findMatches.length, normalizedFindIndex]);
+    sendFind({ type: 'reset' });
+  }, [conversationId, sendFind]);
+  useEffect(() => {
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: findSessionMatches });
+  }, [findOpen, findQuery, findSessionMatches, sendFind]);
+  const changeFindQuery = useCallback((query: string) => sendFind({ type: 'set-query', query }), [sendFind]);
+  const nextFindMatch = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
+  const previousFindMatch = useCallback(() => sendFind({ type: 'previous' }), [sendFind]);
 
   // Chapters are derived here, not in a parent, so they share the exact
   // `historicalUnits` array the virtual transcript renders — a chapter's
@@ -1107,7 +1241,8 @@ function MessageListImpl({
     const match = activeFindMatchRef.current;
     if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
-    if (match.target.kind === 'header-text') {
+    if (match.kind === 'header-text') {
+      setPendingRevealRequest(null);
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
         const header = systemPromptRef.current;
         if (!header) return;
@@ -1117,7 +1252,18 @@ function MessageListImpl({
       }, delay));
       return () => timers.forEach(clearTimeout);
     }
-    const unitMatch = match.target;
+    const unitMatch = match;
+    if (!unitMatch.fragmentId) setPendingRevealRequest(null);
+    if (unitMatch.fragmentId) {
+      const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
+      const revealTarget: ConversationFragmentRevealTarget = source?.revealTarget ?? { kind: 'agent-text', key: unitMatch.fragmentId };
+      setPendingRevealRequest({
+        unitKey: unitMatch.unitKey,
+        fragmentId: unitMatch.fragmentId,
+        revealTarget,
+        nonce: Date.now(),
+      });
+    }
     transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
@@ -1125,6 +1271,11 @@ function MessageListImpl({
       clearFindRowMatches();
       row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
       row.scrollIntoView({ block: 'center' });
+      if (unitMatch.fragmentId) {
+        const source = findSourcesRef.current.find((candidate) => candidate.id === unitMatch.sourceId);
+        const revealTarget = source?.revealTarget ?? { kind: 'agent-text' as const, key: unitMatch.fragmentId };
+        findConversationFragmentElement(row, unitMatch.fragmentId, revealTarget)?.scrollIntoView({ block: 'center' });
+      }
     }, delay));
     return () => timers.forEach(clearTimeout);
   }, [activeFindMatchKey, clearFindRowMatches, dispatchScrollEvent, findRowByKey]);
@@ -1174,10 +1325,43 @@ function MessageListImpl({
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
-        {renderUnit(unit, slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
+        {renderUnit(
+          unit,
+          slug,
+          onOpenFile,
+          onOpenCommissionReview,
+          filePathRootDir,
+          onRetry,
+          onCancelSteering,
+          workScopeKey,
+          activeToolUseId,
+          unit.kind === 'agent_turn' && unit.key === latestAgentKey,
+          pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
+          activeFindHighlight && activeFindHighlight.unitKey === unit.key
+            ? (
+                activeFindRevealTarget?.kind === 'agent-text'
+                || activeFindRevealTarget?.kind === 'message-attachment'
+                || activeFindRevealTarget?.kind === 'message-text'
+                || activeFindRevealTarget?.kind === 'tool-use-input'
+                || activeFindRevealTarget?.kind === 'tool-result-read-file'
+                || activeFindRevealTarget?.kind === 'tool-result-browser-profile'
+                || activeFindRevealTarget?.kind === 'tool-result-commission-review'
+                || activeFindRevealTarget?.kind === 'tool-result-patch'
+                || activeFindRevealTarget?.kind === 'tool-result-terminal'
+                || activeFindRevealTarget?.kind === 'subagent-card'
+                || (activeFindRevealTarget && 'key' in activeFindRevealTarget && (
+                  activeFindRevealTarget.kind === 'tool-result-search'
+                  || activeFindRevealTarget.kind === 'tool-result-keyword-search'
+                ))
+              )
+              ? activeFindHighlight
+              : null
+            : null,
+          handleRevealHandled,
+        )}
       </div>
     ),
-    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
+    [slug, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pendingRevealRequest, activeFindHighlight, activeFindRevealTarget, handleRevealHandled, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(
@@ -1192,9 +1376,9 @@ function MessageListImpl({
           {slug && <OpenFindStreamingBuffer slug={slug} onChange={setFindStreamingBuffer} />}
           <FindBar
             query={findQuery}
-            activeIndex={normalizedFindIndex}
-            matchCount={findMatches.length}
-            focusVersion={findFocusVersion}
+            activeIndex={activeFindIndex}
+            matchCount={findSession?.matches.length ?? 0}
+            focusVersion={findSession?.focusVersion ?? 0}
             onQueryChange={changeFindQuery}
             onNext={nextFindMatch}
             onPrevious={previousFindMatch}
@@ -1234,6 +1418,7 @@ function MessageListImpl({
               expanded={systemPromptExpanded}
               onToggle={toggleSystemPrompt}
               contentRef={systemPromptRef}
+              activeHighlight={activeSystemPromptHighlight}
             />
           ) : null}
           empty={<EmptyTranscriptState />}

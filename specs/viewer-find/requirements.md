@@ -36,6 +36,7 @@ Ineligible surfaces SHALL include:
 
 WHEN in-viewer find is open
 THE SYSTEM SHALL search the complete logical content of the active eligible surface
+AND SHALL derive that search set from one canonical semantic-content projection for that surface
 AND SHALL include content that is temporarily unmounted because of virtualization, pagination, or collapse/expand rendering strategies, so long as Phoenix's typed render model represents that content
 
 IF a rendered surface omits text from Phoenix's typed render model by design
@@ -90,6 +91,21 @@ THE SYSTEM SHALL use a stable typed navigation target rather than DOM-node ident
 
 ---
 
+### REQ-IVF-005A: Every Result Has Stable Identity and Reveal Semantics
+
+WHEN Phoenix reports a find result
+THE SYSTEM SHALL represent that result with a stable typed match identity and a typed reveal target or operation owned by the active surface
+AND SHALL preserve that identity across content updates when the same logical occurrence still exists
+
+THE SYSTEM SHALL NOT use mounted DOM-node identity as the canonical match identity for logical-content search
+
+IF the active surface changes to a different underlying searchable surface or mode
+THE SYSTEM SHALL structurally replace or close the prior find session so no result, active selection, or decoration survives onto an incompatible surface
+
+**Rationale:** Stable typed identities let result reconciliation, reveal, and highlight semantics survive virtualization and re-rendering without inheriting stale DOM references or stale surface state.
+
+---
+
 ### REQ-IVF-006: Visible Match Indication
 
 WHEN in-viewer find has an active match
@@ -108,13 +124,15 @@ AND the surface's executive documentation SHALL describe that limitation
 
 WHEN in-viewer find opens
 THE SYSTEM SHALL focus and select the query input immediately
+AND SHALL retain a stable focus-origin token for the pre-find location inside that same surface
 
 WHEN the user presses `Cmd/Ctrl+F` again while find is already open for the same surface
 THE SYSTEM SHALL keep the existing find bar open
 AND SHALL refocus and reselect the current query text
+AND SHALL NOT replace the original focus-origin token for that session
 
 WHEN in-viewer find closes
-THE SYSTEM SHALL restore focus to the element that held focus within the same surface before find opened
+THE SYSTEM SHALL restore focus to the element or logical location identified by that stored focus-origin token within the same surface
 
 **Dependencies:** `specs/keyboard-interaction/` REQ-KB-004 and REQ-KB-004A define the general focus and repeated-shortcut expectations this surface-specific behavior instantiates.
 
@@ -170,7 +188,7 @@ THE SYSTEM SHALL recompute matches against the new logical content
 AND SHALL preserve the current active match when Phoenix can still identify the same logical occurrence in the updated content
 
 IF the prior active occurrence no longer exists
-THE SYSTEM SHALL choose the nearest valid active result in document order
+THE SYSTEM SHALL choose the nearest valid active result in document order relative to the prior active ordinal
 OR show no-results if none remain
 
 **Rationale:** Streaming transcript text and live viewer updates should not make find jump unpredictably or keep pointing at a vanished occurrence.

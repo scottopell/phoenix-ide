@@ -4,7 +4,7 @@ import { useRef } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
 import { VoicePermission } from './VoiceInput/VoicePermission';
-import type { InputAreaHandle } from './InputArea';
+import type { ComposerQuickAction, InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
 
@@ -19,6 +19,7 @@ interface InputAreaTestProps {
   onCancel?: () => void;
   onSend?: (text: string) => void;
   focusToken?: number;
+  quickAction?: ComposerQuickAction;
 }
 
 function renderInput({
@@ -30,6 +31,7 @@ function renderInput({
   onCancel = () => {},
   onSend = () => {},
   focusToken,
+  quickAction,
 }: InputAreaTestProps) {
   const focusProps = focusToken === undefined ? {} : { focusToken };
   return render(
@@ -44,6 +46,7 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
+      quickAction={quickAction}
       onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}
@@ -168,6 +171,31 @@ describe('InputArea controlled-draft contract', () => {
 
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
     expect(screen.queryByText('<path>')).not.toBeInTheDocument();
+  });
+});
+
+describe('InputArea quick action', () => {
+  it('sends its prompt through the normal onSend callback without replacing the draft', () => {
+    const onSend = vi.fn();
+    const prompt = 'Summarize current work. Do not send messages or change anything.';
+    renderInput({
+      cwd: undefined,
+      draft: 'keep my draft',
+      onSend,
+      quickAction: {
+        label: 'Brief me on current work',
+        compactLabel: 'Brief me',
+        prompt,
+        context: 'Current work context is attached to each Coordinator message.',
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Brief me on current work' }));
+
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(onSend).toHaveBeenCalledWith(prompt, [], []);
+    expect(screen.getByRole('textbox')).toHaveValue('keep my draft');
+    expect(screen.getByText('Current work context is attached to each Coordinator message.')).toBeInTheDocument();
   });
 });
 

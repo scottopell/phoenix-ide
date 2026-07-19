@@ -19,31 +19,26 @@ These are architectural failures, not isolated missing tests. Do not continue sc
 
 ## Governing invariant
 
-Every reported result must originate from the same typed display projection used to render its visible content, carry a stable identity and typed reveal target, and exist only inside an open find session owned by the topmost eligible keyboard layer.
+Every reported result must originate from a canonical semantic-content projection, carry a stable identity and typed reveal operation that makes the exact occurrence visible, and exist only inside an open find session owned by the topmost eligible keyboard layer.
 
-If a displayed fragment has no reveal contract, it cannot produce a search result. If content is absent from the display projection, it cannot be searched. Closing a find session structurally removes all results and decorations.
+Search covers the complete logical content of the active surface, including virtualized, collapsed, summarized, or otherwise temporarily hidden content. Disclosure state may hide content before navigation, but it must never make logical content unsearchable. Navigating to a hidden match mounts or expands its owner, waits for the exact occurrence to render, and highlights it. Closing a find session structurally removes all results and decorations.
 
 ## Architectural direction
 
-### Canonical display projections
+### Canonical semantic-content and display projections
 
-Replace parallel render and search transformations with a typed display projection:
+Separate what belongs to the logical document from how it is currently displayed, then connect them with a typed reveal operation:
 
 ```text
 Canonical payload
-  → typed visible-content projection
-      ├─ renderer
-      └─ literal matcher
-            → typed revealable match
+  ├─ semantic-content projection → literal matcher → stable typed match
+  └─ display/disclosure projection → renderer
+                typed match → reveal operation → mount/expand → exact highlight
 ```
 
-Each projection node has:
+Each semantic-content node has stable identity, complete logical text, a semantic range, and a typed reveal operation. Each display node has render data, explicit disclosure state, and fragment identity shared with its semantic node.
 
-- Stable source identity.
-- The exact searchable text represented by that rendered node.
-- Render data for the owning body.
-- A typed reveal target.
-- Explicit visibility/disclosure state where applicable.
+Semantic content excludes source syntax with no user-facing reveal path: Markdown fence markers, heading punctuation, link destinations, and comments are not silently mixed into rendered-document search. Fenced code content, image alt text, tool output, sub-agent results, and collapsed message text remain searchable logical content.
 
 Representative transcript nodes:
 
@@ -75,7 +70,7 @@ type TranscriptDisplayNode =
     };
 ```
 
-Compact/full density, expanded/collapsed text, tool disclosure, Mermaid behavior, system-prompt expansion, hidden system rows, streaming content, latest-message expansion, and sub-agent ordering must be represented once in this projection and consumed by both rendering and search.
+Compact/full density, expanded/collapsed text, tool disclosure, Mermaid behavior, system-prompt expansion, hidden system rows, streaming content, latest-message expansion, and sub-agent ordering belong to the display/disclosure projection. Search remains based on complete semantic content; reveal operations consume disclosure state to expose the selected occurrence.
 
 ### Revealable matches
 
@@ -183,7 +178,7 @@ Apply the architecture across:
 5. Markdown, HTML source, and large-text document bodies.
 6. Conversation-message side viewer as it moves through task 47004's unified document viewer.
 
-Do not wait for upstream exact-range Pierre decorations. Phoenix targets remain typed and exact; the Pierre adapter may report a line-level decoration capability until task 47006 lands upstream support.
+Do not wait for upstream exact-range Pierre decorations. Phoenix targets remain typed and exact; the Pierre adapter may report a line-level decoration capability until task 47003 lands upstream support.
 
 ## Implementation sequence
 
@@ -227,8 +222,8 @@ Each migration must remain shippable and remove its superseded representation in
 
 ## Acceptance criteria
 
-- Rendering and search consume the same typed visible-content projection on every eligible surface.
-- Every counted result is revealable through its typed target; false or unreachable counts cannot be represented.
+- Search consumes canonical semantic content and rendering consumes a related typed display/disclosure projection with shared stable fragment identity.
+- Every counted result is revealable through its typed operation; navigation mounts or expands hidden content and highlights the exact occurrence.
 - One find-session state machine owns query, results, active identity, focus origin, reconciliation, and decoration lifecycle.
 - One keyboard router owns topmost command dispatch; surface-local global find/Escape listeners are removed.
 - Surface eligibility and mode transitions are encoded by discriminated capabilities rather than boolean combinations.
@@ -236,7 +231,26 @@ Each migration must remain shippable and remove its superseded representation in
 - Existing viewer note, navigation, scroll-restoration, tail-follow, streaming-isolation, and annotation behavior remains covered.
 - Task 47004 consumes this foundation rather than reproducing the current file/message divergence in a new wrapper.
 
+## Implementation progress
+
+The foundation and first surface migrations are established:
+
+- A pure typed find-session state machine owns structural closed/open state, stable `MatchId`, reconciliation, focus origin, wraparound navigation, and explicit reveal/focus/decoration commands.
+- A React adapter delivers command batches exactly once and does not re-reveal surviving active matches during projection updates.
+- Search projection matches carry semantic source identity separately from mutable navigation coordinates.
+- Diff and file viewers use typed sessions and preserve active semantic identity when line insertions move reveal targets.
+- Keyboard shortcuts route through one provider-owned layered router rather than competing global listeners.
+- Assistant transcript text uses shared typed semantic/display fragments: compact-hidden content remains searchable, navigation expands it, and the renderer highlights the exact active occurrence.
+
+Remaining migration order:
+
+1. Define a typed capability matrix for heterogeneous tool renderers, then migrate tool semantic/display fragments incrementally by renderer family rather than as one raw-input/result adapter.
+2. Migrate sub-agent cards with renderer-owned disclosure and exact reveal targets.
+3. Parse task/file Markdown into semantic display blocks shared by rendering, matching, and reveal.
+4. Migrate the transcript itself from numeric local state to the typed session and remove legacy row-level highlight paths.
+5. Migrate task approval, remove `useViewerFind`/`viewerFindReducer`, and complete the source-aware document-viewer integration with task 47004.
+
 ## Relationship to other tasks
 
 - **Task 47004** — source-aware side-panel document viewer consolidation should depend on or be sequenced after this foundation. Its unified document viewer consumes typed display projections and the shared find session; it must not copy current file/message find composition.
-- **Task 47006** — upstream Pierre read-only exact-range decorations improves visual fidelity but does not block typed Phoenix search/reveal architecture.
+- **Task 47003** — upstream Pierre read-only exact-range decorations improves visual fidelity but does not block typed Phoenix search/reveal architecture.

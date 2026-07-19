@@ -290,6 +290,95 @@ export function parseCommissionReviewResult(displayData: unknown, rawContent: st
   };
 }
 
+export function formatCommissionReviewDuration(elapsedMs: number): string {
+  if (elapsedMs < 1000) return `${Math.round(elapsedMs)}ms`;
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  if (totalSeconds < 10) return `${(elapsedMs / 1000).toFixed(1)}s`;
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+export type CommissionReviewSearchFragment = { fragmentId: string; text: string };
+
+export function buildCommissionReviewInlineSearchFragments(
+  data: CommissionReviewDisplayData,
+  options: { renderAllDetails?: boolean } = {},
+): CommissionReviewSearchFragment[] {
+  const renderAllDetails = options.renderAllDetails === true;
+  const fragments: CommissionReviewSearchFragment[] = [
+    { fragmentId: 'commission-review-header', text: `Commission review\n${formatCommissionReviewLabel(data.reviewStatus)} · trust ${formatCommissionReviewLabel(data.findingsTrust)}` },
+    { fragmentId: 'commission-review-outcome', text: commissionReviewOutcomeLabel(data) },
+  ];
+  if ('summary' in data) {
+    fragments.push(
+      { fragmentId: 'commission-review-elapsed', text: `elapsed\n${formatCommissionReviewDuration(data.summary.elapsedMs)}` },
+      { fragmentId: 'commission-review-coverage', text: `coverage\n${data.summary.filesReviewed}/${data.summary.filesChanged} files reviewed` },
+      { fragmentId: 'commission-review-changes', text: `changes\n+${data.summary.insertions} / -${data.summary.deletions}` },
+      { fragmentId: 'commission-review-total', text: `findings\n${data.findingSummary.total}` },
+      { fragmentId: 'commission-review-target', text: `${data.summary.target.base} → ${data.summary.target.head}\n${data.summary.target.repoRoot}` },
+    );
+    if (data.summary.reviewerSummary) fragments.push({ fragmentId: 'commission-review-summary', text: data.summary.reviewerSummary });
+    const severities = [
+      ['critical', data.findingSummary.critical],
+      ['high', data.findingSummary.high],
+      ['medium', data.findingSummary.medium],
+      ['low', data.findingSummary.low],
+    ].filter((entry) => Number(entry[1]) > 0).map(([severity, count]) => `${severity} ${count}`);
+    if (severities.length > 0) fragments.push({ fragmentId: 'commission-review-severities', text: severities.join('\n') });
+  } else if (data.reviewerSummary) {
+    fragments.push({ fragmentId: 'commission-review-summary', text: data.reviewerSummary });
+  }
+  if (data.retryRecommendation !== 'do_not_retry') {
+    fragments.push({
+      fragmentId: 'commission-review-retry',
+      text: `Retry guidance\n${formatCommissionReviewLabel(data.retryRecommendation)}`,
+    });
+  }
+  data.warningsSummary.forEach((warning, index) => fragments.push({ fragmentId: `commission-review-warning-${index}`, text: warning }));
+  (renderAllDetails ? data.unreviewed : data.unreviewed.slice(0, 3)).forEach((entry, index) => fragments.push({
+    fragmentId: `commission-review-unreviewed-${index}`,
+    text: `${entry.file}${entry.reason ? ` · ${formatCommissionReviewLabel(entry.reason)}` : ''}`,
+  }));
+  [...data.findings]
+    .sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER))
+    .slice(0, renderAllDetails ? data.findings.length : 5)
+    .forEach((finding, index) => fragments.push({
+      fragmentId: `commission-review-finding-${index}`,
+      text: `${finding.severity}\n${finding.title}\n${finding.file}${finding.line !== undefined ? `:${finding.line}` : ''}${finding.symbol ? ` · ${finding.symbol}` : ''}\n${finding.rationale || 'No rationale provided by the reviewer.'}${finding.suggestedFix ? `\nFix: ${finding.suggestedFix}` : ''}`,
+    }));
+  if (renderAllDetails) {
+    const stageDetails: Array<[string, string | undefined]> = [
+      ['target collection', data.stageStatus.targetCollection],
+      ['diff collection', data.stageStatus.diffCollection],
+      ['llm review', data.stageStatus.llmReview],
+      ['json parse', data.stageStatus.jsonParse],
+      ['finding extraction', data.stageStatus.findingExtraction],
+    ];
+    fragments.push({
+      fragmentId: 'commission-review-status-details',
+      text: [
+        `status\n${formatCommissionReviewLabel(data.status)}`,
+        `review\n${formatCommissionReviewLabel(data.reviewStatus)}`,
+        `findings\n${formatCommissionReviewLabel(data.findingsStatus)}`,
+        `trust\n${formatCommissionReviewLabel(data.findingsTrust)}`,
+        `retry\n${formatCommissionReviewLabel(data.retryRecommendation)}`,
+        ...stageDetails.map(([label, value]) => `${label}\n${value ? formatCommissionReviewLabel(value) : 'not reported'}`),
+        ...('summary' in data ? [
+          `target kind\n${data.summary.target.kind ? formatCommissionReviewLabel(data.summary.target.kind) : 'unknown'}`,
+          `dirty\n${data.summary.target.dirty ? 'yes' : 'no'}`,
+        ] : []),
+      ].join('\n'),
+    });
+    data.warnings.forEach((warning, index) => fragments.push({
+      fragmentId: `commission-review-detail-warning-${index}`,
+      text: `${warning.kind ? formatCommissionReviewLabel(warning.kind) : 'warning'}\n${warning.message}${warning.file ? `\n${warning.file}` : ''}`,
+    }));
+  }
+  return fragments;
+}
+
 export function commissionReviewOutcomeLabel(data: CommissionReviewDisplayData): string {
   switch (data.status) {
     case 'success': return data.findingSummary.total > 0 ? 'Findings' : 'Clean';

@@ -155,3 +155,48 @@ Run `./dev.py check`, the disposable launchd integration harness, and the spec-a
 - Concurrent and interrupted deployments have deterministic outcomes.
 - The disposable launchd integration target completes cleanly with the new version and survives an injected failed upgrade by restoring the previous version.
 - Live-production validation is performed only after separate, immediate user confirmation; without that confirmation, it remains explicitly pending rather than being inferred from disposable testing.
+
+## Manual migration from legacy production mechanisms
+
+Phoenix does not detect legacy deployment artifacts, does not detect whether deployment is running beneath Phoenix, does not prevent unsafe legacy self-deployment, and does not automatically migrate or remove legacy launchd, systemd, detached-daemon, or configuration artifacts. Perform migration from an external terminal or a user-owned tmux session that will remain available while Phoenix stops.
+
+### Inventory and preserve
+
+Before changing process ownership, record the active mechanism, runtime identity, database path, data directory, bind/port/TLS settings, and any LLM/auth configuration. Preserve the existing database and data directories in place; migration changes process ownership and installed runtime artifacts, not application data.
+
+Legacy artifacts may include:
+
+- macOS: `~/Library/LaunchAgents/com.phoenix-ide.server.plist`, its installed binary paths, generated `EnvironmentVariables`, and `~/.phoenix-ide/launchd-overrides.json`;
+- systemd: `phoenix-ide.service`, `phoenix-ide.socket`, `/opt/phoenix-ide`, `/etc/phoenix-ide`, and `/etc/systemd/system/phoenix-ide.service.d/*.conf`;
+- bare Linux: a shell-launched or detached Phoenix process, `~/.phoenix-ide/prod.pid`, and environment inherited from the shell that launched it.
+
+Treat old plist environment values, systemd drop-ins, PID files, and inherited shell variables as migration inputs only. Modern deployment does not consult or migrate them.
+
+### Reconstruct the modern environment
+
+Create or edit `.phoenix-ide.env` in the checkout used for deployment. Copy every required non-default setting into it explicitly, including the preserved `PHOENIX_DB_PATH`, port/bind/TLS configuration, authentication, LLM credentials or helpers, and log/data paths. Keep the file owner-readable only when it contains secrets. Review the resulting snapshot before deployment; `prod set` and `prod unset` reject and do not mutate backend configuration.
+
+### Replace ownership externally
+
+1. Open an external terminal or tmux session that is not owned by the Phoenix process being replaced.
+2. Stop or disable the legacy owner using that mechanism's native command. For a detached daemon, identify the exact process independently rather than trusting `prod.pid` alone.
+3. Preserve the database/data paths and legacy artifacts until the new deployment has committed and been verified.
+4. Run `./dev.py prod deploy` for checked local `HEAD`, or `./dev.py prod deploy --release vX.Y.Z|latest` for a checksummed published candidate.
+5. On bare Linux, retain the reported owner `@reboot` result. If compatible crontab is unavailable, install the exact printed supervisor command in the host's same-user rc mechanism; do not assume reboot persistence before doing so.
+
+Do not copy old generated plist files, systemd units/drop-ins, or PID files into the modern transaction. The selected backend generates and installs its own runtime artifacts from the `.phoenix-ide.env` snapshot.
+
+### Verify and retire legacy artifacts
+
+After deployment, run `./dev.py prod status` from a fresh shell and require:
+
+- the expected backend owner is running;
+- the runtime version and canonical 12-character embedded git SHA exactly match the selected candidate;
+- the durable transaction is terminal and committed;
+- `deployed.sha` identifies the selected full source commit;
+- the preserved database/data paths are in use;
+- on bare Linux, Phoenix is the supervisor's direct child and stop leaves the supervisor alive.
+
+Only after exact verification should legacy units, plist override JSON, systemd drop-ins, detached PID files, and obsolete binaries be archived or removed manually. If activation fails but verified rollback succeeds, keep the old mechanism disabled only when the restored runtime and data paths are exact. If rollback fails or status remains nonterminal, retain all transaction and legacy artifacts, avoid a second concurrent deployment, and diagnose from durable status/logs in the external session.
+
+Future legacy-detection automation would need typed backend-specific evidence, exact ownership checks, and a separately approved migration protocol. It must not infer authority from a PID file, port response, ancestor process, plist text, or unit name alone.

@@ -4,6 +4,8 @@ import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
+import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
+import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
@@ -225,6 +227,37 @@ export interface PinAssociatedPrRequest {
 
 export type ConversationDiffKind = 'workspace' | 'active_pr';
 
+export type BranchRemoteStatus =
+  | {
+    kind: 'tracked' | 'matching';
+    remote_ref: string;
+    ahead: number;
+    behind: number;
+  }
+  | { kind: 'no_known' }
+  | { kind: 'unavailable'; reason: string };
+
+export type CheckoutStatus =
+  | {
+    kind: 'named_branch';
+    branch_name: string;
+    head_oid: string;
+    remote_status: BranchRemoteStatus;
+  }
+  | {
+    kind: 'detached';
+    head_oid: string;
+    pointing_refs: string[];
+  }
+  | {
+    kind: 'unborn';
+    branch_name?: string;
+  }
+  | {
+    kind: 'unavailable';
+    reason: string;
+  };
+
 export interface ConversationDiffResponse {
   comparator: string;
   commit_log: string;
@@ -234,6 +267,7 @@ export interface ConversationDiffResponse {
   uncommitted_diff: string;
   uncommitted_truncated_kib?: number;
   uncommitted_saturated?: boolean;
+  checkout_status: CheckoutStatus;
   kind?: ConversationDiffKind;
   label?: string;
   pr_number?: number;
@@ -1165,6 +1199,31 @@ export const api = {
     return resp.json();
   },
 
+  async releaseUpdateSnapshot(refresh = false): Promise<ReleaseUpdateSnapshot> {
+    const resp = await fetch(`/api/release-updates${refresh ? '?refresh=true' : ''}`);
+    if (!resp.ok) throw new Error('Failed to load release update status');
+    return resp.json();
+  },
+
+  async approveReleaseUpdate(tag: string, commit: string, assetName: string, assetSha256: string): Promise<ApproveReleaseUpdateResponse> {
+    const resp = await fetch('/api/release-updates/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag, commit, asset_name: assetName, asset_sha256: assetSha256 }),
+    });
+    if (!resp.ok) {
+      let detail = 'Failed to start release update';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // keep fallback
+      }
+      throw new Error(detail);
+    }
+    return resp.json();
+  },
+
   async deploymentDiskInfo(): Promise<DeploymentDiskInfo> {
     const resp = await fetch('/api/deployment/disk');
     if (!resp.ok) throw new Error('Failed to load deployment disk info');
@@ -2045,12 +2104,20 @@ export const api = {
    *           `error_type = "parent_not_context_exhausted"`)
    *   - other non-2xx → generic `Error`
    */
-  async continueConversation(convId: string): Promise<{
+  async continueConversation(
+    convId: string,
+    request: { handoff: string; message_id: string; user_agent?: string },
+  ): Promise<{
     conversation_id: string;
     slug?: string;
-    already_existed: boolean;
+    status: 'accepted' | 'dispatch_failed' | 'already_exists';
+    error?: string;
   }> {
-    const resp = await fetch(`/api/conversations/${convId}/continue`, { method: 'POST' });
+    const resp = await fetch(`/api/conversations/${convId}/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
     if (!resp.ok) {
       const err = await resp.json();
       if (resp.status === 409) {

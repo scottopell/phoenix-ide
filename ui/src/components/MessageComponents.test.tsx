@@ -2,7 +2,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, UserMessage } from './MessageComponents';
+import { SubAgentStatus, AgentMessage, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -12,6 +12,7 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { buildRenderUnits } from '../conversation/renderUnits';
+import { buildReadFileOutputProjection } from './viewer-find/searchProjections';
 
 let mockDensity: 'full' | 'compact' = 'full';
 
@@ -54,6 +55,9 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 beforeEach(() => {
+  mockDensity = 'full';
+});
+afterEach(() => {
   mockDensity = 'full';
 });
 
@@ -234,6 +238,28 @@ describe('commission review tool rendering', () => {
     expect(screen.getByText('Independent review before merge to validate the refactor.')).toBeInTheDocument();
     expect(screen.getByText('Concurrency and edge-case handling')).toBeInTheDocument();
     expect(screen.queryByText(/"brief"/)).not.toBeInTheDocument();
+  });
+
+  it('marks active occurrences in structured commission inputs and findings', () => {
+    const inputText = 'brief: Review before merge\nfocus: concurrency alpha';
+    const inputStart = inputText.indexOf('concurrency alpha');
+    const result = toolMessage('commission-highlight-result', JSON.stringify({ ok: true }));
+    result.display_data = commissionReviewDisplayData({
+      finding_summary: { total: 1, critical: 0, high: 1, medium: 0, low: 0 },
+      findings: [{ severity: 'high', file: 'src/finding.ts', line: 7, title: 'Visible alpha finding', rationale: 'Visible rationale' }],
+    });
+    const findingText = 'high\nVisible alpha finding\nsrc/finding.ts:7\nVisible rationale';
+    const findingStart = findingText.indexOf('alpha');
+    const message = agentMessage('commission-highlight-agent', [{ type: 'tool_use', id: 'commission-highlight', name: 'commission_review', input: { brief: 'Review before merge', focus: 'concurrency alpha' } }]);
+    const { container, rerender } = render(
+      <MemoryRouter><AgentMessage message={message} toolResults={new Map()} activeHighlight={{ owner: 'tool-input', toolUseId: 'commission-highlight', fragmentId: 'tool-use-input', start: inputStart, end: inputStart + 'concurrency alpha'.length }} /></MemoryRouter>,
+    );
+    expect(container.querySelector('[data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent).toBe('concurrency alpha');
+
+    rerender(
+      <MemoryRouter><AgentMessage message={message} toolResults={new Map([['commission-highlight', result]])} activeHighlight={{ owner: 'tool-result', toolUseId: 'commission-highlight', fragmentId: 'commission-review-finding-0', start: findingStart, end: findingStart + 5 }} /></MemoryRouter>,
+    );
+    expect(container.querySelector('[data-fragment-id="commission-review-finding-0"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
   });
 
   it('renders a clean structured summary for successful reviews with no findings', () => {
@@ -725,7 +751,9 @@ describe('inline tool timers', () => {
     );
 
     expect(screen.getByText('read_file')).toBeInTheDocument();
-    expect(screen.getByText(/# README/)).toBeInTheDocument();
+    const completedRead = document.querySelector('[data-tool-id="tool-read"]');
+    expect(completedRead).toHaveTextContent('# README');
+    expect(completedRead).toHaveTextContent('Done');
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
 
@@ -1045,7 +1073,7 @@ describe('inline tool timers', () => {
 
     expect(screen.getByText('The sandbox remaps ~, so I will inspect the worktree.')).toBeInTheDocument();
     expect(screen.getByText('I found the v2 repo files and will inspect SPEARS.md.')).toBeInTheDocument();
-    expect(screen.getByText(/# spEARS/)).toBeInTheDocument();
+    expect(document.querySelector('[data-tool-id="tool-read-root"]')).toHaveTextContent('# spEARS');
     expect(screen.getByText(/SPEARS\.md:1–240/)).toBeInTheDocument();
     expect(document.querySelectorAll('.tool-block')).toHaveLength(4);
     expect(document.querySelectorAll('.tool-block-status.success')).toHaveLength(4);
@@ -1094,7 +1122,7 @@ describe('inline tool timers', () => {
 
     expect(document.querySelector('[data-tool-id="tool-ok"] .tool-block-status.success')).not.toBeNull();
     expect(document.querySelector('[data-tool-id="tool-fail"] .tool-block-status.error')).not.toBeNull();
-    expect(screen.getByText('done')).toBeInTheDocument();
+    expect(document.querySelector('[data-tool-id="tool-ok"]')).toHaveTextContent('done');
     expect(screen.getByText('boom')).toBeInTheDocument();
   });
 });
@@ -1332,6 +1360,129 @@ describe('message copy affordances', () => {
   });
 });
 
+describe('agent Markdown find activation', () => {
+  it('maps rendered-text offsets back to raw Markdown source before highlighting', () => {
+    const sourceText = 'Read **bold docs** at [the guide](https://example.test/hidden).';
+    const renderedText = 'Read bold docs at the guide.';
+    const start = renderedText.indexOf('guide');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end: start + 'guide'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')?.textContent).toBe('guide');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')?.textContent).toBe('Read bold docs at the guide.');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] a')).toHaveAttribute('href', 'https://example.test/hidden');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] strong')).toHaveTextContent('bold docs');
+  });
+
+  it('preserves list structure while highlighting a rendered Markdown item', () => {
+    const sourceText = '- first item\n- second **target** item';
+    const renderedText = 'first item\nsecond target item';
+    const start = renderedText.indexOf('target');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-list-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start, end: start + 'target'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelectorAll('[data-fragment-id="agent-text-0"] li')).toHaveLength(2);
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] strong')).toHaveTextContent('target');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"] .viewer-find-inline-match--active')).toHaveTextContent('target');
+  });
+
+  it('does not corrupt fenced code while its searched fragment is active', () => {
+    const sourceText = '```ts\nconst target = 1;\n```';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-code-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start: 6, end: 12 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')).toHaveTextContent('const target = 1;');
+    expect(container.querySelector('[data-fragment-id="agent-text-0"]')).not.toHaveTextContent('[object Object]');
+  });
+
+  it('maps prose highlights after excluded fenced code using search offsets', () => {
+    const sourceText = '```ts\nalpha\n```\n\nbeta target';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-markdown-after-code-find', [{ type: 'text', text: sourceText }])}
+          toolResults={new Map()}
+          activeHighlight={{ owner: 'agent-text', fragmentId: 'agent-text-0', start: 5, end: 11 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('target');
+  });
+});
+
+describe('TerminalToolResultHighlight', () => {
+  it('caps large active output around the match', () => {
+    const semanticText = `${'a'.repeat(8_000)}needle${'b'.repeat(8_000)}`;
+    const start = semanticText.indexOf('needle');
+    const { container } = render(
+      <TerminalToolResultHighlight
+        semanticText={semanticText}
+        fragmentId="terminal-result"
+        activeHighlight={{ fragmentId: 'terminal-result', start, end: start + 6 }}
+      />,
+    );
+
+    expect(container.querySelector('pre')?.textContent?.length).toBeLessThan(5_100);
+    expect(container.querySelector('.viewer-find-inline-match--active')).toHaveTextContent('needle');
+  });
+});
+
+describe('ordinary message find highlighting', () => {
+  it('marks the exact active occurrence in a user message fragment', () => {
+    const message = { ...agentMessage('user-find', []), message_type: 'user', content: { text: 'visible alpha message' } } as Message;
+    const { container } = render(
+      <MemoryRouter>
+        <UserMessage
+          message={message}
+          activeHighlight={{ owner: 'message-text', fragmentId: 'message-text', start: 8, end: 13 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="message-text"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
+  });
+
+  it('marks attachment matches in the owned filename chip', () => {
+    const message = {
+      ...agentMessage('user-file-find', []),
+      message_type: 'user',
+      content: { text: 'body', files: [{ original_name: 'alpha-report.txt', size_bytes: 12 }] },
+    } as Message;
+    const { container } = render(
+      <MemoryRouter>
+        <UserMessage
+          message={message}
+          activeHighlight={{ owner: 'message-attachment', fragmentId: 'message-attachment-0', start: 0, end: 5 }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="message-attachment-0"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
+  });
+});
+
 describe('skill command rendering', () => {
   it('renders slash-command user messages as a flat command chip with normal args', () => {
     render(
@@ -1384,6 +1535,50 @@ describe('skill command rendering', () => {
     fireEvent.click(sourceButton);
     expect(onOpenFile).toHaveBeenCalledWith('/Users/test/.claude/skills/agent-browser/SKILL.md', new Set(), 0);
     expect(screen.getByText('Browser Automation with agent-browser')).toHaveClass('skill-tool-snippet');
+  });
+
+  it('marks active skill input text through the skill renderer', () => {
+    const inputText = '/agent-browser http://localhost:8042';
+    const start = inputText.indexOf('agent-browser');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-skill-input-find', [{
+            type: 'tool_use', id: 'tool-skill-input-find', name: 'skill', input: { skill_name: 'agent-browser', args: 'http://localhost:8042' },
+          }])}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+          activeHighlight={{ owner: 'tool-input', toolUseId: 'tool-skill-input-find', fragmentId: 'tool-use-input', start, end: start + 'agent-browser'.length }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent).toBe('agent-browser');
+  });
+
+  it('marks active skill result text through the skill renderer', () => {
+    const resultText = 'Base directory for this skill: /tmp/skill\n# Unique skill token';
+    const fragmentId = 'skill-result-visible';
+    const visibleResult = '/tmp/skill/SKILL.md\nUnique skill token';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-skill-find', [{
+            type: 'tool_use', id: 'tool-skill-find', name: 'skill', input: { skill_name: 'demo' },
+          }])}
+          toolResults={new Map([['tool-skill-find', toolMessage('tool-skill-find', resultText)]])}
+          onOpenFile={undefined}
+          activeHighlight={{
+            owner: 'tool-result',
+            toolUseId: 'tool-skill-find',
+            fragmentId,
+            start: visibleResult.indexOf('Unique'),
+            end: visibleResult.indexOf('Unique') + 'Unique'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('Unique');
   });
 });
 
@@ -1850,6 +2045,37 @@ describe('markdown table rendering', () => {
 });
 
 
+describe('in-flight tool input find highlighting', () => {
+  it('marks the active occurrence in the owned visible input', () => {
+    const message = agentMessage('agent-running-tool', [{
+      type: 'tool_use',
+      id: 'bash-running',
+      name: 'bash',
+      input: { op: 'run', cmd: 'pnpm test --filter alpha' },
+    }]);
+    const inputText = '$ pnpm test --filter alpha';
+    const start = inputText.indexOf('filter alpha');
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={new Map()}
+          activeHighlight={{
+            owner: 'tool-input',
+            toolUseId: 'bash-running',
+            fragmentId: 'tool-use-input',
+            start,
+            end: start + 'filter alpha'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-tool-id="bash-running"] [data-fragment-id="tool-use-input"] .viewer-find-inline-match--active')?.textContent)
+      .toBe('filter alpha');
+  });
+});
+
 describe('finalized code fence highlighting', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -2298,6 +2524,139 @@ describe('compact tool summaries', () => {
 
     expect(container.querySelectorAll('.tool-block')).toHaveLength(3);
     expect(screen.getByText('ui/src/components/MessageComponents.tsx:711-750')).toBeInTheDocument();
+  });
+
+  it('expands compact tool details when find reveals a hidden result', async () => {
+    mockDensity = 'compact';
+    const message = agentMessage('agent-compact-find', [
+      { type: 'tool_use', id: 'tool-read', name: 'read_file', input: { path: 'src/hidden.ts', offset: 1, limit: 1 } },
+    ]);
+    const results = new Map<string, Message>([
+      ['tool-read', toolMessage('tool-read', '     1\thidden token')],
+    ]);
+    const fragmentId = buildReadFileOutputProjection('     1\thidden token', { path: 'src/hidden.ts' }, { toolUseId: 'tool-read' }).fragments[1]!.fragmentId;
+    const revealRequest = {
+      nonce: 1,
+      unitKey: 'unit-1',
+      fragmentId,
+      revealTarget: {
+        kind: 'tool-result-read-file' as const,
+        toolUseId: 'tool-read',
+        fragmentId,
+        lineNumber: 1,
+        path: 'src/hidden.ts',
+      },
+    };
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={results}
+          onOpenFile={undefined}
+          unitKey="unit-1"
+          revealRequest={revealRequest}
+          activeHighlight={{ fragmentId: revealRequest.fragmentId, start: 2, end: 8, owner: 'tool-result', toolUseId: 'tool-read' }}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelectorAll('.tool-block')).toHaveLength(1));
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('hidden');
+  });
+
+  it('scopes identical fragment IDs to the owning tool use', async () => {
+    mockDensity = 'full';
+    const message = agentMessage('agent-owner-scope', [
+      { type: 'tool_use', id: 'read-a', name: 'read_file', input: { path: 'a.ts', offset: 1, limit: 1 } },
+      { type: 'tool_use', id: 'read-b', name: 'read_file', input: { path: 'b.ts', offset: 1, limit: 1 } },
+    ]);
+    const results = new Map<string, Message>([
+      ['read-a', toolMessage('read-a', '     1\tsame token')],
+      ['read-b', toolMessage('read-b', '     1\tsame token')],
+    ]);
+    const fragmentId = buildReadFileOutputProjection('     1\tsame token', { path: 'b.ts' }, { toolUseId: 'read-b' }).fragments[1]!.fragmentId;
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={results}
+          onOpenFile={undefined}
+          unitKey="unit-owner-scope"
+          activeHighlight={{ fragmentId, start: 2, end: 6, owner: 'tool-result', toolUseId: 'read-b' }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-tool-id="read-a"] .viewer-find-inline-match--active')).toBeNull();
+    expect(container.querySelector('[data-tool-id="read-b"] .viewer-find-inline-match--active')?.textContent).toBe('same');
+  });
+
+  it('does not parse the read_file truncation notice as a source line', () => {
+    mockDensity = 'full';
+    const longLine = `     1\t${'x'.repeat(5100)}`;
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-long-read', [
+            { type: 'tool_use', id: 'long-read', name: 'read_file', input: { path: 'long.ts', offset: 1, limit: 1 } },
+          ])}
+          toolResults={new Map([['long-read', toolMessage('long-read', longLine)]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelectorAll('.tool-output-truncation')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-fragment-id^="read-file-line:"]')).toHaveLength(1);
+    expect(container.querySelector('[data-fragment-id^="read-file-line:"]')?.textContent).not.toContain('more chars');
+  });
+
+  it('keeps long read_file content capped for an active path match', () => {
+    mockDensity = 'full';
+    const longLine = `     1\t${'x'.repeat(5100)}`;
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-path-cap', [
+            { type: 'tool_use', id: 'path-cap', name: 'read_file', input: { path: 'long.ts', offset: 1, limit: 1 } },
+          ])}
+          toolResults={new Map([['path-cap', toolMessage('path-cap', longLine)]])}
+          onOpenFile={undefined}
+          activeHighlight={{ owner: 'tool-result', toolUseId: 'path-cap', fragmentId: 'read-file-path', start: 0, end: 7 }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('long.ts');
+    expect(container.querySelector('.read-file-results')?.textContent?.length).toBeLessThan(5100);
+  });
+});
+
+describe('console log find parity', () => {
+  it('uses opaque highlighting for failed console-log results', () => {
+    const errorText = 'console log capture failed';
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-console-error', [
+            { type: 'tool_use', id: 'console-error', name: 'browser_recent_console_logs', input: {} },
+          ])}
+          toolResults={new Map([['console-error', {
+            ...toolMessage('console-error', errorText),
+            content: { tool_use_id: 'console-error', error: errorText, is_error: true },
+          }]])}
+          onOpenFile={undefined}
+          activeHighlight={{
+            owner: 'tool-result',
+            toolUseId: 'console-error',
+            fragmentId: 'terminal-result:opaque',
+            start: 0,
+            end: 'console'.length,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('console');
   });
 });
 
@@ -3215,5 +3574,58 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     });
     // A genuine resolution never surfaces a conflict error.
     expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('AgentMessage compact find reveal', () => {
+  it('marks the exact occurrence in fully visible compact commentary', async () => {
+    mockDensity = 'compact';
+    const message = agentMessage('agent-find', [
+      { type: 'text', text: 'first line\nhidden second line alpha target' },
+    ]);
+    const toolResults = new Map<string, Message>();
+    const onRevealHandled = vi.fn();
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={toolResults}
+          unitKey="unit-find"
+          revealRequest={null}
+          activeHighlight={null}
+          onRevealHandled={onRevealHandled}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/first line/)).toBeInTheDocument();
+    expect(screen.getByText(/hidden second line alpha target/)).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={toolResults}
+          unitKey="unit-find"
+          revealRequest={{
+            unitKey: 'unit-find',
+            fragmentId: 'agent-text-0',
+            revealTarget: { kind: 'agent-text', key: 'agent-text:unit-find:agent-text-0' },
+            nonce: 1,
+          }}
+          activeHighlight={{ fragmentId: 'agent-text-0', start: 30, end: 42, owner: 'agent-text' }}
+          onRevealHandled={onRevealHandled}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalled());
+    expect(document.querySelector('[data-active-fragment-highlight]')?.textContent)
+      .toContain('hidden second line alpha target');
+    const highlight = document.querySelector('.viewer-find-inline-match--active');
+    expect(highlight).not.toBeNull();
+    expect(highlight).toHaveTextContent('alpha target');
   });
 });

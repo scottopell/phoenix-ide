@@ -98,10 +98,13 @@ describe('visibility (REQ-WAB-001)', () => {
   });
 
   it('visible for each disposable phase', () => {
-    for (const phaseType of ['idle', 'error', 'context_exhausted']) {
+    for (const phaseType of ['idle', 'error']) {
       const d = deriveWorkDisposition(input({ phaseType, prStatus: notFound('fresh') }));
       expect(d.visible).toBe(true);
     }
+    expect(
+      deriveWorkDisposition(input({ phaseType: 'context_exhausted', prStatus: notFound('fresh') })).visible,
+    ).toBe(false);
   });
 });
 
@@ -159,7 +162,7 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
   });
 
   it('closed → abandon primary, BOTH terminal verbs shown, pr_closed note', () => {
-    const d = deriveWorkDisposition(input({ phaseType: 'context_exhausted', prStatus: foundPr('closed') }));
+    const d = deriveWorkDisposition(input({ phaseType: 'error', prStatus: foundPr('closed') }));
     expect(d.primary).toBe('abandon');
     // Stuck keeps Clean up available even when Abandon is primary (codex A / DispositionStuck).
     expect(d.showCleanUp).toBe(true);
@@ -192,7 +195,7 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
   });
 
   it('no PR, refresh ok → clean_up primary, no note', () => {
-    const d = deriveWorkDisposition(input({ phaseType: 'context_exhausted', prStatus: notFound('fresh') }));
+    const d = deriveWorkDisposition(input({ phaseType: 'error', prStatus: notFound('fresh') }));
     expect(d.primary).toBe('clean_up');
     expect(d.showCleanUp).toBe(true);
     expect(d.note).toBeNull();
@@ -448,7 +451,7 @@ describe('structural invariants', () => {
 
   function* matrix(): Generator<WorkDispositionInput> {
     for (const convModeLabel of ['Work', 'Branch', 'Explore', undefined]) {
-      for (const phaseType of ['idle', 'error', 'context_exhausted', 'awaiting_llm']) {
+      for (const phaseType of ['idle', 'error', 'awaiting_llm', 'context_exhausted']) {
         for (const continuedInConvId of [null, 'conv-x']) {
           for (const prLoading of [false, true]) {
             for (const canSendMessage of [false, true]) {

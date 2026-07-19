@@ -236,6 +236,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "replace_global_recall_with_coordinator",
         sql: MIGRATION_044,
     },
+    Migration {
+        version: 45,
+        name: "create_continuation_dispatch_intents",
+        sql: MIGRATION_045,
+    },
 ];
 
 const MIGRATION_044: &str = r"
@@ -246,6 +251,27 @@ CREATE TABLE coordinator (
 );
 DROP TABLE IF EXISTS global_recall_messages;
 DROP TABLE IF EXISTS global_recall_sessions;
+";
+
+const MIGRATION_045: &str = r"
+CREATE TABLE continuation_dispatch_intents (
+    parent_conversation_id TEXT PRIMARY KEY NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT UNIQUE NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE NOT NULL,
+    handoff TEXT NOT NULL CHECK (length(trim(handoff)) > 0),
+    user_agent TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER consume_continuation_dispatch_intent
+AFTER INSERT ON messages
+WHEN EXISTS (
+    SELECT 1 FROM continuation_dispatch_intents
+    WHERE message_id = NEW.message_id
+      AND successor_conversation_id = NEW.conversation_id
+)
+BEGIN
+    DELETE FROM continuation_dispatch_intents WHERE message_id = NEW.message_id;
+END;
 ";
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,

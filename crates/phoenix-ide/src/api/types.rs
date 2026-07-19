@@ -271,24 +271,36 @@ pub struct SuccessResponse {
     pub success: bool,
 }
 
-/// Response for the context-continuation transfer endpoint (REQ-BED-030).
-///
-/// Returned from `POST /api/conversations/:id/continue`. The caller receives
-/// the id (and slug, if present) of the continuation conversation. When the
-/// parent already had a continuation, this returns that existing id
-/// idempotently — callers distinguish "just created" from "already existed"
-/// via the `already_existed` flag.
+/// Opening handoff submitted while creating a context continuation.
+#[derive(Debug, Deserialize)]
+pub struct ContinueConversationRequest {
+    pub handoff: String,
+    /// Client-generated message identifier. The chat application service uses
+    /// this to make retries idempotent.
+    pub message_id: String,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueConversationStatus {
+    Accepted,
+    DispatchFailed,
+    AlreadyExists,
+}
+
+/// Response for context-continuation creation and opening-message dispatch.
 #[derive(Debug, Serialize)]
 pub struct ContinueConversationResponse {
     pub conversation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
-    /// True iff the parent already had a continuation when the endpoint was
-    /// called. The UI can use this to route directly (vs. announcing the
-    /// continuation as fresh). Always serialized so the wire shape matches
-    /// the typed client contract — callers don't have to treat absent as
-    /// false.
-    pub already_existed: bool,
+    pub status: ContinueConversationStatus,
+    /// Present only when the successor was created but its opening handoff was
+    /// not accepted. The successor identity remains usable for recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Response for directory validation
@@ -850,6 +862,47 @@ pub struct GitBranchesResponse {
 /// indicate whether the streaming reader hit its hard limit and stopped
 /// counting — when `true`, `*_truncated_kib` is a LOWER BOUND, not the
 /// exact size, and consumers should render it as e.g. "≥X KiB".
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchRemoteStatus {
+    Tracked {
+        remote_ref: String,
+        ahead: u32,
+        behind: u32,
+    },
+    Matching {
+        remote_ref: String,
+        ahead: u32,
+        behind: u32,
+    },
+    NoKnown,
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckoutStatus {
+    NamedBranch {
+        branch_name: String,
+        head_oid: String,
+        remote_status: BranchRemoteStatus,
+    },
+    Detached {
+        head_oid: String,
+        #[serde(default)]
+        pointing_refs: Vec<String>,
+    },
+    Unborn {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch_name: Option<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConversationDiffResponse {
     /// The ref used as the comparator — e.g. `"origin/main"` when the
@@ -862,6 +915,7 @@ pub struct ConversationDiffResponse {
     /// The active PR number for PR-specific diffs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    pub checkout_status: CheckoutStatus,
     /// `git log --oneline <comparator>..HEAD` — commits on the branch
     /// not yet in the comparator. Subject lines only; uncapped (commit
     /// titles are tiny).

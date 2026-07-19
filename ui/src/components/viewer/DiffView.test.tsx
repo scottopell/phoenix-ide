@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DiffView } from './DiffView';
+import { __diffViewFindTestables, DiffView } from './DiffView';
 import * as searchProjectionModule from '../viewer-find/searchProjections';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -19,7 +19,14 @@ const COMMITTED = [
   '+hello world',
 ].join('\n');
 
-function renderDiff(committed = COMMITTED, uncommitted = '') {
+const DEFAULT_CHECKOUT_STATUS: import('../../api').CheckoutStatus = {
+  kind: 'named_branch',
+  branch_name: 'main',
+  head_oid: '1234567890abcdef1234567890abcdef12345678',
+  remote_status: { kind: 'no_known' },
+};
+
+function renderDiff(committed = COMMITTED, uncommitted = '', checkoutStatus?: import('../../api').CheckoutStatus) {
   return render(
     <ReviewNotesProvider>
       <DiffView
@@ -28,6 +35,7 @@ function renderDiff(committed = COMMITTED, uncommitted = '') {
         commitLog=""
         committedDiff={committed}
         uncommittedDiff={uncommitted}
+        checkoutStatus={checkoutStatus ?? DEFAULT_CHECKOUT_STATUS}
         onClose={() => undefined}
         onSendNotes={() => undefined}
       />
@@ -41,6 +49,31 @@ function addNoteViaGutter(body: string) {
   fireEvent.change(screen.getByPlaceholderText(/Add your note/), { target: { value: body } });
   fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
 }
+
+describe('DiffView find identities', () => {
+  it('bounds identities for arbitrarily long changed lines', () => {
+    const text = `token ${'x'.repeat(20_000)}`;
+    const id = __diffViewFindTestables.stableDiffMatchIds()({
+      sourceId: 'diff-line',
+      sourceText: text,
+      start: 0,
+      end: 5,
+      target: {
+        kind: 'diff-line',
+        section: 'committed',
+        filePath: 'src/min.js',
+        itemId: 'item-1',
+        side: 'additions',
+        lineNumber: 1,
+        startColumn: 0,
+        endColumn: 5,
+      },
+    });
+
+    expect(id).not.toContain(text);
+    expect(id.length).toBeLessThan(128);
+  });
+});
 
 describe('DiffView (Pierre CodeView wiring)', () => {
   beforeEach(() => resetCodeViewMock());
@@ -80,6 +113,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog="abc123 add hello context"
           committedDiff={COMMITTED}
@@ -119,6 +153,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={[
@@ -152,6 +187,88 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
+  it('preserves and re-reveals the exact active diff match when insertions move it', async () => {
+    const base = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+    const insertedBefore = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,3 @@',
+      '+alpha zero',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={base}
+          uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+
+    const scrollCountBefore = codeViewMockState.scrollToCalls.length;
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={insertedBefore}
+          uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('3 of 3')).toBeInTheDocument());
+    await waitFor(() => expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore + 1));
+  });
+
+  it('keeps repeated identical diff matches distinct', async () => {
+    const repeated = [
+      'diff --git a/foo.txt b/foo.txt',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+same',
+      '+same',
+    ].join('\n');
+    renderDiff(repeated, '');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'same' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+  });
+
   it('keeps diff find inert until open with a non-empty query', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 
@@ -167,6 +284,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open={false}
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -294,6 +412,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -320,6 +439,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -338,6 +458,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open={false}
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -352,6 +473,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}
@@ -465,6 +587,129 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     ]);
   });
 
+
+
+  it('shows named-branch checkout status before commits with shortened refs and last-fetched remote state', () => {
+    renderDiff(COMMITTED, '', {
+      kind: 'named_branch',
+      branch_name: 'task-82003',
+      head_oid: '1234567890abcdef1234567890abcdef12345678',
+      remote_status: {
+        kind: 'tracked',
+        remote_ref: 'refs/remotes/origin/task-82003',
+        ahead: 2,
+        behind: 0,
+      },
+    });
+
+    const panel = screen.getByLabelText('Checkout status');
+    expect(panel).toHaveTextContent(/Branch\s*task-82003/);
+    expect(panel).toHaveTextContent('task-82003');
+    expect(panel).toHaveTextContent('Tracked upstream:');
+    expect(panel).toHaveTextContent('origin/task-82003');
+    expect(panel).toHaveTextContent('Last fetched 2 to push');
+    const summary = screen.getByText(/Committed changes \(vs origin\/main\)/);
+    expect(summary.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    expect(screen.getByTitle('refs/remotes/origin/task-82003')).toBeInTheDocument();
+  });
+
+  it('shows checkout status even when the diff is empty', () => {
+    renderDiff('', '', {
+      kind: 'named_branch',
+      branch_name: 'main',
+      head_oid: '1234567890abcdef1234567890abcdef12345678',
+      remote_status: { kind: 'no_known' },
+    });
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('No known remote branch (last fetched state).');
+    expect(screen.getByText(/No changes vs/)).toBeInTheDocument();
+  });
+
+  it('distinguishes matching remotes, detached heads, and unavailable checkout state', () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{
+            kind: 'named_branch',
+            branch_name: 'task-82003',
+            head_oid: '1234567890abcdef1234567890abcdef12345678',
+            remote_status: {
+              kind: 'matching',
+              remote_ref: 'refs/remotes/origin/task-82003',
+              ahead: 1,
+              behind: 3,
+            },
+          }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Matching remote:');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('diverged (1 to push, 3 behind)');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('(not configured as upstream)');
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{
+            kind: 'detached',
+            head_oid: '1234567890abcdef1234567890abcdef12345678',
+            pointing_refs: ['refs/remotes/origin/main', 'refs/tags/v1.2.3'],
+          }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Detached HEAD');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('1234567890ab');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('origin/main, v1.2.3');
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={{ kind: 'unavailable', reason: 'git status failed' }}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('Checkout status unavailable');
+    expect(screen.getByLabelText('Checkout status')).toHaveTextContent('git status failed');
+  });
+
+  it('renders an unreferenced detached HEAD without crashing', () => {
+    renderDiff('', '', {
+      kind: 'detached',
+      head_oid: 'abcdef1234567890abcdef1234567890abcdef12',
+      pointing_refs: [],
+    });
+
+    const panel = screen.getByLabelText('Checkout status');
+    expect(panel).toHaveTextContent('Detached HEAD');
+    expect(panel).toHaveTextContent('abcdef123456');
+    expect(panel).not.toHaveTextContent('Points to:');
+  });
+
   it('shows the empty state when there are no changes', () => {
     renderDiff('', '');
     expect(screen.getByText(/No changes vs/)).toBeInTheDocument();
@@ -475,6 +720,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       <ReviewNotesProvider>
         <DiffView
           open
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
           comparator="origin/main"
           commitLog=""
           committedDiff={COMMITTED}

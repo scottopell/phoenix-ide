@@ -179,6 +179,22 @@ pub struct ConversationCreationMetadataUpdate {
     pub desired_base_branch: Option<Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationDispatchIntent {
+    pub parent_conversation_id: String,
+    pub successor_conversation_id: String,
+    pub message_id: String,
+    pub handoff: String,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewContinuationDispatchIntent {
+    pub message_id: String,
+    pub handoff: String,
+    pub user_agent: Option<String>,
+}
+
 /// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
 ///
 /// The DB layer returns a typed outcome so the handler can map each arm to a
@@ -2482,6 +2498,41 @@ impl Database {
         Ok(found.is_some())
     }
 
+    /// Returns the durable opening-handoff intent for a continuation parent.
+    ///
+    /// # Errors
+    /// Returns a database error when the query fails.
+    pub async fn continuation_dispatch_intent(
+        &self,
+        parent_id: &str,
+    ) -> DbResult<Option<ContinuationDispatchIntent>> {
+        let row = sqlx::query(
+            "SELECT parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| ContinuationDispatchIntent {
+            parent_conversation_id: row.get("parent_conversation_id"),
+            successor_conversation_id: row.get("successor_conversation_id"),
+            message_id: row.get("message_id"),
+            handoff: row.get("handoff"),
+            user_agent: row.get("user_agent"),
+        }))
+    }
+
+    /// Deletes a continuation intent after its message is durably represented elsewhere.
+    ///
+    /// # Errors
+    /// Returns a database error when the delete fails.
+    pub async fn delete_continuation_dispatch_intent(&self, parent_id: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1")
+            .bind(parent_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Get conversation by ID
     ///
     /// # Errors
@@ -4651,6 +4702,32 @@ impl Database {
     /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_lines)] // single atomic flow; splitting hurts readability
     pub async fn continue_conversation(&self, parent_id: &str) -> DbResult<ContinueOutcome> {
+        self.continue_conversation_inner(parent_id, None).await
+    }
+
+    /// Creates a continuation and its opening-handoff intent atomically.
+    ///
+    /// # Errors
+    /// Returns the same conversation, validation, and transaction errors as
+    /// [`Self::continue_conversation`].
+    pub async fn continue_conversation_with_intent(
+        &self,
+        parent_id: &str,
+        intent: NewContinuationDispatchIntent,
+    ) -> DbResult<(ContinueOutcome, Option<ContinuationDispatchIntent>)> {
+        let outcome = self
+            .continue_conversation_inner(parent_id, Some(&intent))
+            .await?;
+        let stored = self.continuation_dispatch_intent(parent_id).await?;
+        Ok((outcome, stored))
+    }
+
+    #[allow(clippy::too_many_lines)] // one transaction owns creation, transfer, and intent
+    async fn continue_conversation_inner(
+        &self,
+        parent_id: &str,
+        intent: Option<&NewContinuationDispatchIntent>,
+    ) -> DbResult<ContinueOutcome> {
         // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
         // guards against concurrent continuation via the parent's
         // `continued_in_conv_id` still being NULL at UPDATE time.
@@ -4792,6 +4869,20 @@ impl Database {
         .bind(parent_id)
         .execute(&mut *tx)
         .await?;
+
+        if let Some(intent) = intent {
+            sqlx::query(
+                "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(parent_id)
+            .bind(&new_id)
+            .bind(&intent.message_id)
+            .bind(&intent.handoff)
+            .bind(intent.user_agent.as_deref())
+            .bind(&now_str)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
 
@@ -13064,6 +13155,89 @@ mod tests {
             worktree_path: NonEmptyString::new("/tmp/wt/parent-branch").unwrap(),
             base_branch: NonEmptyString::new("feature-login").unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn continuation_creation_persists_dispatch_intent_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "parent-intent",
+            "parent-intent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+
+        let requested = NewContinuationDispatchIntent {
+            message_id: "opening-message".to_string(),
+            handoff: "Exact edited handoff".to_string(),
+            user_agent: Some("test-agent".to_string()),
+        };
+        let (outcome, intent) = db
+            .continue_conversation_with_intent("parent-intent", requested)
+            .await
+            .unwrap();
+        let successor_id = match outcome {
+            ContinueOutcome::Created(conversation) => conversation.id,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
+        };
+        let intent = intent.expect("created successor must have an intent");
+        assert_eq!(intent.successor_conversation_id, successor_id);
+        assert_eq!(intent.message_id, "opening-message");
+        assert_eq!(intent.handoff, "Exact edited handoff");
+
+        let content = MessageContent::User(UserContent::new("Exact edited handoff"));
+        db.add_message("opening-message", &successor_id, &content, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .continuation_dispatch_intent("parent-intent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continuation_retry_returns_original_pending_intent() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "parent-retry-intent",
+            "parent-retry-intent",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        db.continue_conversation_with_intent(
+            "parent-retry-intent",
+            NewContinuationDispatchIntent {
+                message_id: "original-message".to_string(),
+                handoff: "Original handoff".to_string(),
+                user_agent: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (outcome, intent) = db
+            .continue_conversation_with_intent(
+                "parent-retry-intent",
+                NewContinuationDispatchIntent {
+                    message_id: "different-message".to_string(),
+                    handoff: "Must not replace original".to_string(),
+                    user_agent: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ContinueOutcome::AlreadyContinued(_)));
+        let intent = intent.unwrap();
+        assert_eq!(intent.message_id, "original-message");
+        assert_eq!(intent.handoff, "Original handoff");
     }
 
     /// Work -> Work: worktree fields and `task_id` all transfer; parent's

@@ -11,15 +11,20 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Columns2, Rows3 } from 'lucide-react';
+import { Columns2, GitBranch, Rows3 } from 'lucide-react';
+import type { BranchRemoteStatus, CheckoutStatus } from '../../api';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import {
   FindBar,
+  activeSessionMatchIndex,
   buildDiffSearchProjection,
-  useViewerFind,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
   useViewerFindKeyboardShortcut,
   type DiffSearchMatchTarget,
+  type FindSessionCommand,
 } from '../viewer-find';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
@@ -28,6 +33,7 @@ import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
 import type { PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
+import './DiffView.css';
 
 export interface DiffViewProps {
   open: boolean;
@@ -42,6 +48,7 @@ export interface DiffViewProps {
   uncommittedDiff: string;
   uncommittedTruncatedKib?: number | undefined;
   uncommittedSaturated?: boolean | undefined;
+  checkoutStatus: CheckoutStatus;
   onClose: () => void;
   /** Drop the formatted review-notes pile into the chat input. Same
    *  signature as ProseReader's onSendNotes. */
@@ -54,6 +61,9 @@ export interface DiffViewProps {
 
 type DiffStyle = 'unified' | 'split';
 const DIFF_STYLE_KEY = 'phoenix-diff-style';
+const DIFF_FIND_SURFACE_KEY = createSurfaceKey('diff-viewer');
+
+type DiffFindFocusOrigin = HTMLElement | { readonly token: 'diff-find-button' };
 
 function initialDiffStyle(): DiffStyle {
   const stored = localStorage.getItem(DIFF_STYLE_KEY);
@@ -71,6 +81,7 @@ export function DiffView({
   uncommittedDiff,
   uncommittedTruncatedKib,
   uncommittedSaturated,
+  checkoutStatus,
   onClose,
   onSendNotes,
   inline = false,
@@ -83,46 +94,91 @@ export function DiffView({
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
-  const find = useViewerFind({ text: '' });
-  const resetFind = find.reset;
+  const restoreFocus = useCallback((focusOrigin: DiffFindFocusOrigin) => {
+    if (focusOrigin instanceof HTMLElement) {
+      queueMicrotask(() => focusOrigin.focus());
+      return;
+    }
+    queueMicrotask(() => findButtonRef.current?.focus());
+  }, []);
+
+  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
+    if (target.kind === 'commit-log-line') {
+      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    codeViewRef.current?.scrollToFindTarget(target);
+  }, []);
+
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<DiffSearchMatchTarget, DiffFindFocusOrigin>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+          break;
+        case 'restore-focus':
+          restoreFocus(command.focusOrigin);
+          break;
+        case 'reveal-match':
+          navigateFindTarget(command.target);
+          break;
+        case 'clear-decorations':
+          break;
+      }
+    });
+  }, [navigateFindTarget, restoreFocus]);
+  const { state: findState, send: sendFind } = useFindSession<DiffSearchMatchTarget, DiffFindFocusOrigin>({
+    onCommands: handleFindCommands,
+  });
 
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    find.open();
-  }, [find]);
+    const focusOrigin = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : { token: 'diff-find-button' as const };
+    findPreviousFocusRef.current = focusOrigin instanceof HTMLElement ? focusOrigin : null;
+    sendFind({
+      type: 'open',
+      surface: {
+        key: DIFF_FIND_SURFACE_KEY,
+        query: '',
+        matches: [],
+        focusOrigin,
+      },
+    });
+  }, [sendFind]);
 
   const closeFind = useCallback(() => {
-    find.close();
-    const restoreTarget = findPreviousFocusRef.current;
-    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
-  }, [find]);
+    sendFind({ type: 'close' });
+  }, [sendFind]);
 
   useEffect(() => {
     if (open) return;
-    resetFind();
+    sendFind({ type: 'reset' });
     findPreviousFocusRef.current = null;
-  }, [open, resetFind]);
+  }, [open, sendFind]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'diff-viewer',
     onOpen: openFind,
     dialogOpen: !open || notes.annotating !== null,
   });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const findQuery = findSession?.query ?? '';
   const findProjection = useMemo(
-    () => (find.isOpen && find.query.length > 0
-      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog)
+    () => (findQuery.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, findQuery, commitLog)
       : { sources: [], matches: [] }),
-    [commitLog, committedDiff, find.isOpen, uncommittedDiff, find.query],
+    [commitLog, committedDiff, findQuery, uncommittedDiff],
   );
-  const activeFindIndex = findProjection.matches.length === 0
-    ? -1
-    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
-  const activeFindMatchTarget = find.isOpen && activeFindIndex >= 0
-    ? findProjection.matches[activeFindIndex]?.target ?? null
-    : null;
+  const sessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableDiffMatchIds()),
+    [findProjection.matches],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatchTarget = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
-    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
-    [find.isOpen, findProjection.matches],
+    () => (findSession ? findSession.matches.map((match) => match.target) : []),
+    [findSession],
   );
 
   const toggleDiffStyle = useCallback(() => {
@@ -141,54 +197,29 @@ export function DiffView({
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-      const codeView = codeViewRef.current;
-      if (codeView) codeView.scrollToNote(note);
+      codeViewRef.current?.scrollToNote(note);
       highlight(note.id);
       closePanel();
     },
     [highlight, closePanel],
   );
 
-  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
-    if (target.kind === 'commit-log-line') {
-      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      return;
-    }
-    const codeView = codeViewRef.current;
-    if (codeView) codeView.scrollToFindTarget(target);
-  }, []);
+  useEffect(() => {
+    if (!findOpen || findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: sessionMatches });
+  }, [findOpen, findQuery, sendFind, sessionMatches]);
 
   const handleFindQueryChange = useCallback((query: string) => {
-    find.setQuery(query);
-  }, [find]);
-
-  useEffect(() => {
-    if (!find.isOpen || find.query.length === 0) return;
-    const target = findProjection.matches[0]?.target;
-    if (target) navigateFindTarget(target);
-  }, [find.isOpen, find.query, findProjection.matches, navigateFindTarget]);
+    sendFind({ type: 'set-query', query });
+  }, [sendFind]);
 
   const handleFindNext = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? 0
-        : (activeFindIndex + 1) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) navigateFindTarget(target);
-  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+    sendFind({ type: 'next' });
+  }, [sendFind]);
 
   const handleFindPrevious = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? Math.max(findProjection.matches.length - 1, 0)
-        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) navigateFindTarget(target);
-  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+    sendFind({ type: 'previous' });
+  }, [sendFind]);
 
   if (!open) return null;
 
@@ -196,7 +227,7 @@ export function DiffView({
 
   return (
     <ViewerShell
-      closeOnEscape={!find.isOpen}
+      closeOnEscape={!findOpen}
       onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel={label ?? 'Worktree diff'}
@@ -227,12 +258,12 @@ export function DiffView({
           </button>
         </>
       }
-      banner={find.isOpen ? (
+      banner={findSession ? (
         <FindBar
-          query={find.query}
+          query={findSession.query}
           activeIndex={activeFindIndex}
-          matchCount={findProjection.matches.length}
-          focusVersion={find.focusVersion}
+          matchCount={findSession.matches.length}
+          focusVersion={findSession.focusVersion}
           onQueryChange={handleFindQueryChange}
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
@@ -272,6 +303,7 @@ export function DiffView({
       }
     >
       <div className="diff-viewer-body">
+        <CheckoutStatusPanel checkoutStatus={checkoutStatus} />
         {empty ? (
           <div className="diff-viewer-empty">
             No changes vs <code>{comparator}</code>.
@@ -283,7 +315,7 @@ export function DiffView({
                 commitLog={commitLog}
                 matches={findProjection.matches}
                 activeMatchIndex={activeFindIndex}
-                findOpen={find.isOpen}
+                findOpen={findOpen}
               />
             )}
             <DiffSummaryBar
@@ -312,6 +344,142 @@ export function DiffView({
       </div>
     </ViewerShell>
   );
+}
+
+function boundedDiffMatchHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function stableDiffMatchIds(): (match: {
+  sourceId: string;
+  sourceText: string;
+  start: number;
+  end: number;
+  target: DiffSearchMatchTarget;
+}) => string {
+  const duplicateOccurrences = new Map<string, number>();
+  return (match) => {
+    const target = match.target;
+    const semanticSignature = `${target.kind}:${target.itemId}:${target.side ?? ''}:${match.start}:${match.end}:${boundedDiffMatchHash(match.sourceText)}`;
+    const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
+    duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
+    return `${semanticSignature}:${duplicateOccurrence}`;
+  };
+}
+
+function CheckoutStatusPanel({ checkoutStatus }: { checkoutStatus: CheckoutStatus }) {
+  if (checkoutStatus.kind === 'unavailable') {
+    return (
+      <section className="checkout-status-panel checkout-status-panel--warning" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">Checkout status unavailable</span>
+        </div>
+        <p className="checkout-status-panel__detail">{checkoutStatus.reason}</p>
+      </section>
+    );
+  }
+
+  if (checkoutStatus.kind === 'unborn') {
+    return (
+      <section className="checkout-status-panel" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">
+            Unborn branch{checkoutStatus.branch_name ? <> <code>{checkoutStatus.branch_name}</code></> : null}
+          </span>
+        </div>
+        <p className="checkout-status-panel__detail">Create the first commit to establish this branch.</p>
+      </section>
+    );
+  }
+
+  if (checkoutStatus.kind === 'detached') {
+    return (
+      <section className="checkout-status-panel checkout-status-panel--neutral" aria-label="Checkout status">
+        <div className="checkout-status-panel__header">
+          <GitBranch size={16} aria-hidden="true" />
+          <span className="checkout-status-panel__title">Detached HEAD</span>
+          <code className="checkout-status-panel__code" title={checkoutStatus.head_oid}>{abbreviateOid(checkoutStatus.head_oid)}</code>
+        </div>
+        {checkoutStatus.pointing_refs.length > 0 && (
+          <p className="checkout-status-panel__detail">
+            Points to: {' '}
+            {checkoutStatus.pointing_refs.map((ref, index) => (
+              <span key={ref}>
+                {index > 0 ? ', ' : ''}
+                <code title={ref}>{shortenRef(ref)}</code>
+              </span>
+            ))}
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  const remoteSummary = describeRemoteStatus(checkoutStatus.remote_status);
+  const tone = remoteStatusTone(checkoutStatus.remote_status);
+  return (
+    <section className={`checkout-status-panel checkout-status-panel--${tone}`} aria-label="Checkout status">
+      <div className="checkout-status-panel__header">
+        <GitBranch size={16} aria-hidden="true" />
+        <span className="checkout-status-panel__eyebrow">Branch</span>
+        <code className="checkout-status-panel__title">{checkoutStatus.branch_name}</code>
+      </div>
+      <p className="checkout-status-panel__detail">{remoteSummary}</p>
+    </section>
+  );
+}
+
+function remoteStatusTone(remoteStatus: BranchRemoteStatus): 'success' | 'warning' | 'danger' {
+  if (remoteStatus.kind === 'unavailable') return 'danger';
+  if (remoteStatus.kind === 'no_known') return 'warning';
+  if (remoteStatus.ahead > 0 && remoteStatus.behind > 0) return 'danger';
+  if (remoteStatus.ahead > 0 || remoteStatus.behind > 0) return 'warning';
+  return 'success';
+}
+
+function describeRemoteStatus(remoteStatus: BranchRemoteStatus): React.ReactNode {
+  if (remoteStatus.kind === 'no_known') {
+    return 'Remote · No known remote branch (last fetched state).';
+  }
+  if (remoteStatus.kind === 'unavailable') {
+    return `Last-fetched remote status unavailable: ${remoteStatus.reason}`;
+  }
+
+  const relationLabel = remoteStatus.kind === 'tracked' ? 'Tracked upstream' : 'Matching remote';
+  return (
+    <>
+      <span>Remote · {relationLabel}: </span>
+      <code title={remoteStatus.remote_ref}>{shortenRef(remoteStatus.remote_ref)}</code>
+      <span> · Last fetched </span>
+      <span>{describeAheadBehind(remoteStatus.ahead, remoteStatus.behind)}</span>
+      {remoteStatus.kind === 'matching' && <span> (not configured as upstream)</span>}
+    </>
+  );
+}
+
+function describeAheadBehind(ahead: number, behind: number): string {
+  if (ahead === 0 && behind === 0) return 'up-to-date';
+  if (ahead > 0 && behind === 0) return `${ahead} to push`;
+  if (ahead === 0 && behind > 0) return `${behind} behind`;
+  return `diverged (${ahead} to push, ${behind} behind)`;
+}
+
+function shortenRef(ref: string): string {
+  if (ref.startsWith('refs/remotes/')) return ref.slice('refs/remotes/'.length);
+  if (ref.startsWith('refs/heads/')) return ref.slice('refs/heads/'.length);
+  if (ref.startsWith('refs/tags/')) return ref.slice('refs/tags/'.length);
+  return ref;
+}
+
+function abbreviateOid(oid: string): string {
+  return oid.slice(0, 12);
 }
 
 function CommitLogSection({
@@ -469,3 +637,6 @@ function anchorDialogLabel(t: AnnotateTarget): string {
   if (t.oldLine !== undefined) return `${t.filePath}:-${t.oldLine}`;
   return t.filePath;
 }
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const __diffViewFindTestables = { stableDiffMatchIds };

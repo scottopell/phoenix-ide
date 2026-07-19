@@ -17,8 +17,21 @@ import { createPortal } from 'react-dom';
 import { Maximize2, Minimize2 } from 'lucide-react';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
-import { FindBar, buildFileSearchProjection, useViewerFind, useViewerFindKeyboardShortcut } from '../viewer-find';
-import type { FileSearchProjection } from '../viewer-find';
+import {
+  FindBar,
+  activeSessionMatchIndex,
+  buildFileSearchProjection,
+  buildMarkdownFileSearchProjection,
+  createSurfaceKey,
+  projectionMatchesToSessionMatches,
+  useFindSession,
+  useViewerFindKeyboardShortcut,
+  type FileSearchProjection,
+  type FileSearchMatchTarget,
+  type FindSessionCommand,
+  type FindSessionMatch,
+} from '../viewer-find';
+import type { SearchableSourceMatch } from '../viewer-find';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
 import { CopyButton } from '../CopyButton';
@@ -64,12 +77,22 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
   const lastScrollTopRef = useRef(0);
-  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
-  const findResetKey = useMemo(
-    () => (textLike ? `${absolutePath}\u0000${payload.kind}\u0000${content}` : absolutePath),
-    [absolutePath, content, payload.kind, textLike],
+  const findSurfaceShape = htmlPreview
+    ? 'html-preview'
+    : rangeSource
+      ? `range:${focusRange?.startLine ?? 0}-${focusRange?.endLine ?? 0}`
+      : isTextLikePayload(payload) && payload.renderMode === 'plainLargeText'
+        ? 'plain-large-text'
+        : payload.kind === 'markdown'
+          ? 'rendered-markdown'
+          : payload.kind === 'html'
+            ? 'html-source'
+            : usePierreCode ? 'pierre-source' : 'prose';
+  const findSurfaceKey = useMemo(
+    () => createSurfaceKey(`${absolutePath}\u0000${payload.kind}\u0000${findSurfaceShape}`),
+    [absolutePath, findSurfaceShape, payload.kind],
   );
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
@@ -199,8 +222,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     if (!content || !targetLine) return undefined;
     const timer = setTimeout(() => {
       if (usePierreCode) {
-        const fileCode = fileCodeRef.current;
-        if (fileCode) fileCode.scrollToLine(targetLine);
+        fileCodeRef.current?.scrollToLine(targetLine);
         highlight(targetLine);
       } else {
         const lineEl = lineRefs.current.get(targetLine);
@@ -221,8 +243,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       // Pierre-backed payloads render in their own scroller; jump via the typed
       // handle. Other bodies expose DOM line refs the viewer scrolls directly.
       if (usePierreCode) {
-        const fileCode = fileCodeRef.current;
-        if (fileCode) fileCode.scrollToLine(note.anchor.lineNumber);
+        fileCodeRef.current?.scrollToLine(note.anchor.lineNumber);
         highlight(note.anchor.lineNumber);
       } else {
         const el = lineRefs.current.get(note.anchor.lineNumber);
@@ -241,21 +262,68 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // rather than being stranded on the raw <pre>.
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
+  const renderedMarkdown = payload.kind === 'markdown' && !rangeSource && !largeFallback;
   const findEligible = (textLike && !htmlPreview) || largeFallback;
   const findSourceText = findEligible ? content : '';
-  const find = useViewerFind({ text: '', resetKey: findResetKey });
-  const shouldProjectFind = findEligible && find.isOpen && find.query.length > 0;
+  const restoreFindFocus = useCallback((focusOrigin: HTMLElement | null) => {
+    queueMicrotask(() => (focusOrigin ?? findButtonRef.current)?.focus());
+  }, []);
+  const revealFindTarget = useCallback((target: FileSearchMatchTarget) => {
+    if (usePierreCode) {
+      fileCodeRef.current?.scrollToFindTarget(target);
+      return;
+    }
+    const matchEl = target.matchOrdinal === undefined
+      ? null
+      : contentRef.current?.querySelector<HTMLElement>(`[data-find-occurrence="${target.matchOrdinal}"]`);
+    if (matchEl) {
+      matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    lineRefs.current.get(target.lineNumber)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [usePierreCode]);
+  const handleFindCommands = useCallback((commands: readonly FindSessionCommand<FileSearchMatchTarget, HTMLElement | null>[]) => {
+    commands.forEach((command) => {
+      switch (command.kind) {
+        case 'focus-query':
+          break;
+        case 'restore-focus':
+          restoreFindFocus(command.focusOrigin);
+          break;
+        case 'reveal-match':
+          revealFindTarget(command.target);
+          break;
+        case 'clear-decorations':
+          break;
+      }
+    });
+  }, [restoreFindFocus, revealFindTarget]);
+  const { state: findState, send: sendFind } = useFindSession<FileSearchMatchTarget, HTMLElement | null>({
+    onCommands: handleFindCommands,
+  });
+  const findSession = findState.status === 'open' ? findState : null;
+  const findOpen = findSession !== null;
+  const activeFindSurfaceKey = findSession?.surfaceKey ?? null;
+  const findSessionMatches = findSession?.matches ?? EMPTY_FIND_SESSION_MATCHES;
+  const findQuery = findSession?.query ?? '';
+  const shouldProjectFind = findEligible && findQuery.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
-    () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
-    [find.query, findSourceText, shouldProjectFind],
+    () => (shouldProjectFind
+      ? renderedMarkdown
+        ? buildMarkdownFileSearchProjection(content, findQuery)
+        : buildFileSearchProjection(findSourceText, findQuery)
+      : { sources: [], matches: [] }),
+    [content, findQuery, findSourceText, renderedMarkdown, shouldProjectFind],
   );
-  const activeFindIndex = findProjection.matches.length === 0
-    ? -1
-    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
-  const activeFindMatch = find.isOpen && activeFindIndex >= 0 ? findProjection.matches[activeFindIndex]?.target ?? null : null;
+  const sessionMatches = useMemo(
+    () => projectionMatchesToSessionMatches(findProjection.matches, stableFileMatchId(findProjection.sources)),
+    [findProjection.matches, findProjection.sources],
+  );
+  const activeFindIndex = findSession ? activeSessionMatchIndex(findSession.matches, findSession.activeMatchId) : -1;
+  const activeFindMatch = activeFindIndex >= 0 ? findSession?.matches[activeFindIndex]?.target ?? null : null;
   const findMatchTargets = useMemo(
-    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
-    [find.isOpen, findProjection.matches],
+    () => findSessionMatches.map((match) => match.target),
+    [findSessionMatches],
   );
 
   const focusedRangeLines = useMemo(() => {
@@ -275,38 +343,27 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     highlightedLine: notes.highlightedLine,
     onAnnotate: notes.startAnnotate,
     registerLineRef,
-    findQuery: find.isOpen ? find.query : '',
-    activeFindOccurrence: find.isOpen ? activeFindIndex : null,
+    findQuery: findSession ? findSession.query : '',
+    activeFindOccurrence: findSession ? activeFindIndex : null,
   };
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
 
-  useEffect(() => {
-    if (!find.isOpen || !activeFindMatch) return;
-    if (usePierreCode) {
-      const fileCode = fileCodeRef.current;
-      if (fileCode) fileCode.scrollToFindTarget(activeFindMatch);
-      return;
-    }
-    const selector = `[data-find-occurrence="${activeFindIndex}"]`;
-    const matchEl = contentRef.current?.querySelector<HTMLElement>(selector);
-    if (matchEl) {
-      matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      return;
-    }
-    const lineEl = lineRefs.current.get(activeFindMatch.lineNumber);
-    lineEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, [activeFindIndex, activeFindMatch, find.isOpen, usePierreCode]);
-
   const openFind = useCallback(() => {
-    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    find.open();
-  }, [find]);
+    const focusOrigin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sendFind({
+      type: 'open',
+      surface: {
+        key: findSurfaceKey,
+        query: '',
+        matches: [],
+        focusOrigin,
+      },
+    });
+  }, [findSurfaceKey, sendFind]);
 
   const closeFind = useCallback(() => {
-    find.close();
-    const restoreTarget = findPreviousFocusRef.current;
-    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
-  }, [find]);
+    sendFind({ type: 'close' });
+  }, [sendFind]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'file-viewer',
@@ -316,40 +373,31 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   });
 
   useEffect(() => {
-    if (findEligible || !find.isOpen) return;
-    find.close();
-  }, [find, find.isOpen, findEligible]);
+    if (findEligible || !findOpen) return;
+    sendFind({ type: 'close' });
+  }, [findEligible, findOpen, sendFind]);
 
-  const handleFindQueryChange = useCallback((query: string) => {
-    find.setQuery(query);
-    const nextProjection = findEligible ? buildFileSearchProjection(findSourceText, query) : { matches: [] };
-    const target = nextProjection.matches[0]?.target;
-    if (!target) return;
-    if (usePierreCode) {
-      const fileCode = fileCodeRef.current;
-      if (fileCode) fileCode.scrollToFindTarget(target);
+  useEffect(() => {
+    if (!findOpen) return;
+    if (activeFindSurfaceKey !== findSurfaceKey) {
+      sendFind({ type: 'close' });
       return;
     }
-    queueMicrotask(() => {
-      contentRef.current?.querySelector<HTMLElement>('[data-find-occurrence="0"]')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    });
-  }, [find, findEligible, findSourceText, usePierreCode]);
+    if (findQuery.length === 0) return;
+    sendFind({ type: 'replace-results', matches: sessionMatches });
+  }, [activeFindSurfaceKey, findOpen, findQuery, findSurfaceKey, sendFind, sessionMatches]);
+
+  const handleFindQueryChange = useCallback((query: string) => {
+    sendFind({ type: 'set-query', query });
+  }, [sendFind]);
 
   const handleFindNext = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0 ? 0 : (activeFindIndex + 1) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
+    sendFind({ type: 'next' });
+  }, [sendFind]);
 
   const handleFindPrevious = useCallback(() => {
-    const nextIndex = findProjection.matches.length === 0
-      ? -1
-      : activeFindIndex < 0
-        ? findProjection.matches.length - 1
-        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
-    find.setActiveIndex(nextIndex);
-  }, [activeFindIndex, find, findProjection.matches.length]);
+    sendFind({ type: 'previous' });
+  }, [sendFind]);
 
   const headerExtras: ReactNode = textLike ? (
     <>
@@ -436,12 +484,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     : payload.kind === 'html' && htmlViewMode === 'preview'
       ? 'Find unavailable in HTML preview; switch to source to search file contents.'
       : null;
-  const banner: ReactNode = find.isOpen ? (
+  const banner: ReactNode = findSession ? (
     <FindBar
-      query={find.query}
+      query={findSession.query}
       activeIndex={activeFindIndex}
       matchCount={findProjection.matches.length}
-      focusVersion={find.focusVersion}
+      focusVersion={findSession.focusVersion}
       onQueryChange={handleFindQueryChange}
       onNext={handleFindNext}
       onPrevious={handleFindPrevious}
@@ -453,7 +501,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const viewerMode = payload.kind === 'image' && imageTakeover ? 'takeover' : inline ? 'inline' : 'overlay';
   const shell = (
     <ViewerShell
-      closeOnEscape={!find.isOpen}
+      closeOnEscape={!findOpen}
       onInnerEscape={closeFind}
       mode={viewerMode}
       ariaLabel={`File viewer: ${title}`}
@@ -465,7 +513,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onSend={notes.send}
       banner={banner}
       onClose={onClose}
-      suppressCloseButtonFocus={find.isOpen}
+      suppressCloseButtonFocus={findSession !== null}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
       panel={
         notes.showPanel ? (
@@ -515,6 +563,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   return payload.kind === 'image' && imageTakeover ? createPortal(shell, document.body) : shell;
 }
 
+const EMPTY_FIND_SESSION_MATCHES: readonly FindSessionMatch<FileSearchMatchTarget>[] = [];
 const EMPTY_SET: Set<number> = new Set();
 
 function renderBody(
@@ -554,3 +603,40 @@ function renderBody(
       return <ImageViewerBody fileName={payload.fileName} url={payload.url} viewKey={imageViewKey} />;
   }
 }
+
+function boundedFileMatchHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function stableFileMatchId(
+  sources: readonly FileSearchProjection['sources'][number][],
+): (match: SearchableSourceMatch<FileSearchMatchTarget>) => string {
+  const sourceIndex = new Map<string, number>(sources.map((source, index) => [source.id, index]));
+  const duplicateOccurrences = new Map<string, number>();
+  return (match) => {
+    const index = sourceIndex.get(match.sourceId) ?? -1;
+    const previous = index > 0 ? sources[index - 1]?.text ?? '' : '';
+    const next = index >= 0 && index + 1 < sources.length ? sources[index + 1]?.text ?? '' : '';
+    const leftContext = match.sourceText.slice(Math.max(0, match.start - 32), match.start);
+    const rightContext = match.sourceText.slice(match.end, Math.min(match.sourceText.length, match.end + 32));
+    const semanticSignature = [
+      `${match.start}:${match.end}`,
+      boundedFileMatchHash(match.sourceText),
+      boundedFileMatchHash(previous),
+      boundedFileMatchHash(leftContext),
+      boundedFileMatchHash(rightContext),
+      boundedFileMatchHash(next),
+    ].join(':');
+    const duplicateOccurrence = duplicateOccurrences.get(semanticSignature) ?? 0;
+    duplicateOccurrences.set(semanticSignature, duplicateOccurrence + 1);
+    return `${semanticSignature}:${duplicateOccurrence}`;
+  };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const __metaViewerFindTestables = { stableFileMatchId };

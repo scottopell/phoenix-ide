@@ -1,3 +1,43 @@
+.input-context-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.input-context-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.input-quick-action {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.input-quick-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.input-quick-action:hover:not(:disabled) {
+  border-color: var(--accent-blue);
+}
+
+.input-quick-action-compact {
+  display: none;
+}
+
 .input-textarea-wrap {
   --composer-control-height: 44px;
   --pulse-color: var(--accent-purple, #a371f7);
@@ -110,6 +150,27 @@
 }
 
 @media (width <= 480px) {
+  .input-context-action {
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .input-context-note {
+    font-size: 11px;
+  }
+
+  .input-quick-action {
+    min-height: 44px;
+  }
+
+  .input-quick-action-full {
+    display: none;
+  }
+
+  .input-quick-action-compact {
+    display: inline;
+  }
+
   .input-textarea-wrap {
     grid-template-columns: 1fr;
   }

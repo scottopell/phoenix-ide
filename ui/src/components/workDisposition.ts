@@ -66,7 +66,7 @@ export interface WorkDisposition {
 
 export interface WorkDispositionInput {
   convModeLabel: string | undefined;
-  /** 'idle' | 'error' | 'context_exhausted' | other (other => bar hidden). */
+  /** 'idle' | 'error' | other (other => bar hidden). */
   phaseType: string;
   continuedInConvId: string | null | undefined;
   /** Resolved PR status, or null while still loading / disabled. */
@@ -96,7 +96,7 @@ function hidden(): WorkDisposition {
   };
 }
 
-const ELIGIBLE_PHASES = new Set(['idle', 'error', 'context_exhausted']);
+const ELIGIBLE_PHASES = new Set(['idle', 'error']);
 const ELIGIBLE_MODES = new Set(['Work', 'Branch']);
 
 /**
@@ -121,7 +121,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
 
   const number = prStatus?.number ?? prStatus?.pr?.number;
   const url = prStatus?.url ?? prStatus?.pr?.url;
-  const stuck = phaseType === 'error' || phaseType === 'context_exhausted';
+  const stuck = phaseType === 'error';
 
   // Row 1. Continued — no primary, all terminal verbs suppressed (REQ-WAB-009).
   if (continuedInConvId != null && continuedInConvId !== '') {
@@ -150,7 +150,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     };
   }
 
-  // Row 3. Stuck (error / context_exhausted): RESOLVE always suppressed
+  // Row 3. Stuck error: RESOLVE always suppressed
   // (REQ-WAB-005); primary collapses to a FINISH verb selected by PR state.
   if (stuck) {
     // A stuck bar keeps BOTH terminal verbs visible (DispositionStuck): a stuck

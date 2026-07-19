@@ -1188,6 +1188,30 @@ agent-assisted iteration before any such commitment.
 
 ---
 
+### REQ-PROJ-038: Show the Live Worktree Checkout in Diff Review
+
+WHEN the system presents a conversation worktree diff
+THE SYSTEM SHALL identify the worktree's live Git checkout at the time the diff is read
+AND distinguish a named branch, detached HEAD, unborn branch, and unavailable observation
+AND SHALL NOT substitute the branch recorded when the conversation was created for the live checkout
+
+WHEN the live checkout is a named branch
+THE SYSTEM SHALL show the branch name
+AND, when a configured upstream or locally cached matching remote-tracking branch exists, show that ref and the checkout's ahead and behind counts relative to it
+AND distinguish a configured upstream from a matching remote-tracking branch that is not configured as the upstream
+AND, when neither is locally known, state that no remote branch is known from the last fetched state
+
+WHEN the live checkout is detached
+THE SYSTEM SHALL present detached HEAD as a valid checkout identified by its commit object ID
+AND MAY show bounded, deterministic local or remote-tracking refs that resolve exactly to that commit
+AND SHALL describe those refs as pointing to the commit rather than as the checkout's provenance
+
+THE SYSTEM SHALL derive remote relationship data only from local Git refs while opening the diff
+AND SHALL NOT fetch or otherwise perform network I/O as part of diff review
+AND SHALL keep the worktree checkout's remote relationship distinct from the base ref used to calculate the workspace diff
+
+---
+
 ## WorkScope Resource Ownership
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner

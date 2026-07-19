@@ -6,10 +6,10 @@ use super::handlers::AppError;
 use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
     ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
-    AssociatedPrSummaryResponse, ConversationDiffResponse, GitBranchEntry, GitBranchesQuery,
-    GitBranchesResponse, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
-    PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
-    WorkChangeNeedsReviewReason, WorkChangeSummary,
+    AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConversationDiffResponse,
+    GitBranchEntry, GitBranchesQuery, GitBranchesResponse, ObservedBranchSummaryResponse,
+    PinAssociatedPrRequest, PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse,
+    PrUnavailableReason, WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -28,12 +28,14 @@ fn build_diff_response(
     label: String,
     kind: &str,
     pr_number: Option<u64>,
+    checkout_status: CheckoutStatus,
 ) -> ConversationDiffResponse {
     ConversationDiffResponse {
         comparator: captured.comparator,
         label,
         kind: kind.to_string(),
         pr_number,
+        checkout_status,
         commit_log: captured.commit_log,
         committed_truncated_kib: truncated_kib(
             &captured.committed_diff,
@@ -78,6 +80,246 @@ fn github_repo_identifier_from_worktree(path: &FsPath) -> Option<String> {
 
 fn github_repo_identity_eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCheckoutObservation {
+    branch_name: String,
+    remote_status: BranchRemoteStatus,
+}
+
+const CHECKOUT_CAPTURE_ATTEMPTS: usize = 2;
+
+fn configured_upstream_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
+    run_git(
+        worktree_path,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch_name}"),
+        ],
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| value.starts_with("refs/remotes/"))
+}
+
+fn matching_remote_ref(worktree_path: &FsPath, branch_name: &str) -> Option<String> {
+    let output = run_git(worktree_path, &["remote"]).ok()?;
+    let mut remotes = output
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect::<Vec<_>>();
+    remotes.sort_unstable();
+    remotes.dedup();
+    remotes.into_iter().find_map(|remote| {
+        let candidate = format!("refs/remotes/{remote}/{branch_name}");
+        run_git(
+            worktree_path,
+            &["for-each-ref", "--format=%(refname)", &candidate],
+        )
+        .ok()
+        .filter(|value| value.trim() == candidate)
+        .map(|_| candidate)
+    })
+}
+
+fn ahead_behind_counts(
+    worktree_path: &FsPath,
+    head_oid: &str,
+    remote_ref: &str,
+) -> Result<(u32, u32), String> {
+    const DISPLAY_SAFE_ERROR: &str = "Last-fetched remote comparison is unavailable.";
+    let counts = match run_git(
+        worktree_path,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{head_oid}...{remote_ref}"),
+        ],
+    ) {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::warn!(%error, remote_ref, "failed to compare checkout with remote ref");
+            return Err(DISPLAY_SAFE_ERROR.to_string());
+        }
+    };
+    let parsed = (|| {
+        let mut parts = counts.split_whitespace();
+        let ahead = parts.next()?.parse::<u32>().ok()?;
+        let behind = parts.next()?.parse::<u32>().ok()?;
+        Some((ahead, behind))
+    })();
+    parsed.ok_or_else(|| {
+        tracing::warn!(remote_ref, output = %counts, "git returned invalid ahead/behind counts");
+        DISPLAY_SAFE_ERROR.to_string()
+    })
+}
+
+fn branch_remote_status(
+    worktree_path: &FsPath,
+    branch_name: &str,
+    head_oid: &str,
+) -> BranchRemoteStatus {
+    if let Some(remote_ref) = configured_upstream_ref(worktree_path, branch_name) {
+        return match ahead_behind_counts(worktree_path, head_oid, &remote_ref) {
+            Ok((ahead, behind)) => BranchRemoteStatus::Tracked {
+                remote_ref,
+                ahead,
+                behind,
+            },
+            Err(reason) => BranchRemoteStatus::Unavailable { reason },
+        };
+    }
+
+    let Some(remote_ref) = matching_remote_ref(worktree_path, branch_name) else {
+        return BranchRemoteStatus::NoKnown;
+    };
+    match ahead_behind_counts(worktree_path, head_oid, &remote_ref) {
+        Ok((ahead, behind)) => BranchRemoteStatus::Matching {
+            remote_ref,
+            ahead,
+            behind,
+        },
+        Err(reason) => BranchRemoteStatus::Unavailable { reason },
+    }
+}
+
+fn detached_pointing_refs(worktree_path: &FsPath, head_oid: &str) -> Vec<String> {
+    const MAX_POINTING_REFS: usize = 8;
+    let Ok(output) = run_git(
+        worktree_path,
+        &[
+            "for-each-ref",
+            &format!("--points-at={head_oid}"),
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut refs = output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs.truncate(MAX_POINTING_REFS);
+    refs
+}
+
+fn live_checkout_observation_details(
+    worktree_path: &FsPath,
+    branch_name: String,
+    head_oid: &str,
+) -> LiveCheckoutObservation {
+    LiveCheckoutObservation {
+        remote_status: branch_remote_status(worktree_path, &branch_name, head_oid),
+        branch_name,
+    }
+}
+
+fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
+    match phoenix_core::git::observe_local_git_head(worktree_path) {
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+            branch_name,
+            head_oid,
+            ..
+        } => {
+            let live = live_checkout_observation_details(worktree_path, branch_name, &head_oid);
+            CheckoutStatus::NamedBranch {
+                branch_name: live.branch_name,
+                head_oid,
+                remote_status: live.remote_status,
+            }
+        }
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Detached {
+            head_oid,
+            ..
+        } => CheckoutStatus::Detached {
+            pointing_refs: detached_pointing_refs(worktree_path, &head_oid),
+            head_oid,
+        },
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unborn {
+            branch_name,
+            ..
+        } => CheckoutStatus::Unborn { branch_name },
+        phoenix_core::domain::observed_branch::LocalGitHeadObservation::Unavailable {
+            error,
+            ..
+        } => {
+            tracing::warn!(%error, "failed to observe worktree checkout");
+            CheckoutStatus::Unavailable {
+                reason: "Checkout status is unavailable.".to_string(),
+            }
+        }
+    }
+}
+
+fn same_checkout(left: &CheckoutStatus, right: &CheckoutStatus) -> bool {
+    match (left, right) {
+        (
+            CheckoutStatus::NamedBranch {
+                branch_name: left_branch,
+                head_oid: left_oid,
+                ..
+            },
+            CheckoutStatus::NamedBranch {
+                branch_name: right_branch,
+                head_oid: right_oid,
+                ..
+            },
+        ) => left_branch == right_branch && left_oid == right_oid,
+        (
+            CheckoutStatus::Detached {
+                head_oid: left_oid, ..
+            },
+            CheckoutStatus::Detached {
+                head_oid: right_oid,
+                ..
+            },
+        ) => left_oid == right_oid,
+        (
+            CheckoutStatus::Unborn {
+                branch_name: left_branch,
+                ..
+            },
+            CheckoutStatus::Unborn {
+                branch_name: right_branch,
+                ..
+            },
+        ) => left_branch == right_branch,
+        (CheckoutStatus::Unavailable { .. }, CheckoutStatus::Unavailable { .. }) => true,
+        _ => false,
+    }
+}
+
+fn capture_with_stable_checkout<T>(
+    worktree_path: &FsPath,
+    mut capture: impl FnMut() -> Result<T, AppError>,
+) -> Result<(T, CheckoutStatus), AppError> {
+    for attempt in 0..CHECKOUT_CAPTURE_ATTEMPTS {
+        let before = checkout_status_from_live_observation(worktree_path);
+        let captured = capture()?;
+        let after = checkout_status_from_live_observation(worktree_path);
+        if same_checkout(&before, &after) {
+            return Ok((captured, after));
+        }
+        if attempt + 1 == CHECKOUT_CAPTURE_ATTEMPTS {
+            tracing::warn!("worktree checkout changed repeatedly while capturing diff");
+            return Err(AppError::Internal(
+                "The worktree checkout changed while the diff was captured. Reload to retry."
+                    .to_string(),
+            ));
+        }
+    }
+    unreachable!("checkout capture loop always returns")
 }
 
 fn active_pr_diff_repo_mismatch_reason(
@@ -1622,12 +1864,15 @@ pub(crate) async fn get_active_pr_diff(
             )));
         }
 
-        let captured = capture_active_pr_diff(&wt, &active_pr, MAX_DIFF_BYTES)?;
+        let (captured, checkout_status) = capture_with_stable_checkout(&wt, || {
+            capture_active_pr_diff(&wt, &active_pr, MAX_DIFF_BYTES)
+        })?;
         Ok(build_diff_response(
             captured,
             format!("PR #{pr_number} Diff"),
             "active_pr",
             Some(pr_number),
+            checkout_status,
         ))
     })
     .await
@@ -1685,13 +1930,16 @@ pub(crate) async fn get_conversation_diff(
             )));
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
+        let (captured, checkout_status) = capture_with_stable_checkout(&wt, || {
+            Ok(capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES))
+        })?;
 
         Ok(build_diff_response(
             captured,
             "Workspace Diff".to_string(),
             "workspace",
             None,
+            checkout_status,
         ))
     })
     .await
@@ -1919,6 +2167,12 @@ mod tests {
     fn push_branch(repo: &std::path::Path, branch: &str) {
         run_git(repo, &["push", "--quiet", "-u", "origin", branch]).unwrap();
         run_git(repo, &["fetch", "--quiet", "origin"]).unwrap();
+    }
+
+    fn clone_repo(source: &std::path::Path, dest: &std::path::Path) {
+        run_git(dest, &["clone", "--quiet", source.to_str().unwrap(), "."]).unwrap();
+        run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
+        run_git(dest, &["config", "user.name", "probe"]).unwrap();
     }
 
     #[test]
@@ -2376,6 +2630,372 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(selected.pr_number, 22);
+    }
+
+    #[test]
+    fn configured_upstream_ref_reads_tracking_ref() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(
+            clone.path(),
+            &["push", "--quiet", "-u", "origin", "feature"],
+        )
+        .unwrap();
+        assert_eq!(
+            configured_upstream_ref(clone.path(), "feature"),
+            Some("refs/remotes/origin/feature".to_string())
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_reports_matching_origin_fallback() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
+        run_git(
+            clone.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        )
+        .unwrap();
+
+        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature".to_string(),
+                head_oid: head_oid.trim().to_string(),
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_finds_matching_non_origin_remote() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["remote", "rename", "origin", "fork"]).unwrap();
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(clone.path(), &["push", "--quiet", "fork", "HEAD:feature"]).unwrap();
+
+        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature".to_string(),
+                head_oid: head_oid.trim().to_string(),
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/fork/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn matching_remote_ref_uses_deterministic_remote_order() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
+        run_git(
+            clone.path(),
+            &["remote", "add", "aaa", upstream.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(
+            clone.path(),
+            &[
+                "fetch",
+                "--quiet",
+                "aaa",
+                "feature:refs/remotes/aaa/feature",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            matching_remote_ref(clone.path(), "feature"),
+            Some("refs/remotes/aaa/feature".to_string())
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_prefers_configured_non_origin_upstream_and_counts() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["remote", "rename", "origin", "fork"]).unwrap();
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature/live"]).unwrap();
+        run_git(
+            clone.path(),
+            &["push", "--quiet", "-u", "fork", "feature/live"],
+        )
+        .unwrap();
+        commit_file(clone.path(), "local.txt", "L", "local ahead");
+        run_git(upstream.path(), &["checkout", "--quiet", "feature/live"]).unwrap();
+        commit_file(upstream.path(), "remote.txt", "R", "remote ahead");
+        run_git(clone.path(), &["fetch", "--quiet", "fork"]).unwrap();
+
+        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            checkout_status_from_live_observation(clone.path()),
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature/live".to_string(),
+                head_oid: head_oid.trim().to_string(),
+                remote_status: BranchRemoteStatus::Tracked {
+                    remote_ref: "refs/remotes/fork/feature/live".to_string(),
+                    ahead: 1,
+                    behind: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_reports_configured_upstream_as_unavailable_when_ref_is_missing() {
+        let upstream = tempfile::tempdir().unwrap();
+        init_repo(upstream.path());
+        let clone = tempfile::tempdir().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        run_git(
+            clone.path(),
+            &["push", "--quiet", "-u", "origin", "feature"],
+        )
+        .unwrap();
+        run_git(
+            clone.path(),
+            &["update-ref", "-d", "refs/remotes/origin/feature"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_upstream_ref(clone.path(), "feature"),
+            Some("refs/remotes/origin/feature".to_string())
+        );
+        let CheckoutStatus::NamedBranch { remote_status, .. } =
+            checkout_status_from_live_observation(clone.path())
+        else {
+            panic!("expected named branch");
+        };
+        assert_eq!(
+            remote_status,
+            BranchRemoteStatus::Unavailable {
+                reason: "Last-fetched remote comparison is unavailable.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_named_branch_reports_no_known_remote_when_untracked() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/live"]).unwrap();
+
+        let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature/live".to_string(),
+                head_oid: head_oid.trim().to_string(),
+                remote_status: BranchRemoteStatus::NoKnown,
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_detached_reports_pointing_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["tag", "v1"]).unwrap();
+        let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        run_git(repo.path(), &["checkout", "--quiet", head_oid.trim()]).unwrap();
+
+        assert_eq!(
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::Detached {
+                head_oid: head_oid.trim().to_string(),
+                pointing_refs: vec!["refs/heads/main".to_string(), "refs/tags/v1".to_string(),],
+            }
+        );
+    }
+
+    #[test]
+    fn named_branch_status_omits_server_path_and_derived_exact_ref() {
+        let status = CheckoutStatus::NamedBranch {
+            branch_name: "feature".to_string(),
+            head_oid: "abc123".to_string(),
+            remote_status: BranchRemoteStatus::NoKnown,
+        };
+        let json = serde_json::to_value(status).unwrap();
+
+        assert_eq!(json["branch_name"], "feature");
+        assert!(json.get("repository_identity").is_none());
+        assert!(json.get("exact_ref").is_none());
+    }
+
+    #[test]
+    fn detached_status_always_serializes_empty_pointing_refs() {
+        let status = CheckoutStatus::Detached {
+            head_oid: "abc123".to_string(),
+            pointing_refs: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["pointing_refs"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn stable_checkout_capture_retries_when_head_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let mut captures = 0_u8;
+
+        let (result, status) = capture_with_stable_checkout(repo.path(), || {
+            captures += 1;
+            if captures == 1 {
+                run_git(repo.path(), &["checkout", "-q", "-b", "other"]).unwrap();
+            }
+            Ok::<_, AppError>(captures)
+        })
+        .unwrap();
+
+        assert_eq!(result, 2);
+        assert!(matches!(
+            status,
+            CheckoutStatus::NamedBranch {
+                branch_name,
+                ..
+            } if branch_name == "other"
+        ));
+    }
+
+    #[test]
+    fn unstable_checkout_capture_returns_no_diff() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let mut captures = 0_u8;
+
+        let error = capture_with_stable_checkout(repo.path(), || {
+            captures += 1;
+            if captures == 1 {
+                run_git(repo.path(), &["checkout", "-q", "-b", "other"]).unwrap();
+            } else {
+                run_git(repo.path(), &["checkout", "-q", "main"]).unwrap();
+            }
+            Ok(captures)
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Internal(message)
+                if message == "The worktree checkout changed while the diff was captured. Reload to retry."
+        ));
+    }
+
+    #[test]
+    fn remote_comparison_error_is_display_safe() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            ahead_behind_counts(
+                repo.path(),
+                head_oid.trim(),
+                "refs/remotes/missing/private/server/path"
+            ),
+            Err("Last-fetched remote comparison is unavailable.".to_string())
+        );
+    }
+
+    #[test]
+    fn unavailable_checkout_error_is_display_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(directory.path()),
+            CheckoutStatus::Unavailable {
+                reason: "Checkout status is unavailable.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_status_unborn_reports_branch_name() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "trunk"]).unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::Unborn {
+                branch_name: Some("trunk".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn build_diff_response_threads_checkout_status() {
+        let response = build_diff_response(
+            crate::git_ops::CapturedDiff {
+                comparator: "origin/main".to_string(),
+                commit_log: "abc test".to_string(),
+                committed_diff: "diff --git a/a b/a".to_string(),
+                committed_total_bytes: 20,
+                committed_saturated: false,
+                uncommitted_diff: String::new(),
+                uncommitted_total_bytes: 0,
+                uncommitted_saturated: false,
+            },
+            "Workspace Diff".to_string(),
+            "workspace",
+            None,
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature".to_string(),
+                head_oid: "abc123".to_string(),
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            },
+        );
+        assert_eq!(
+            response.checkout_status,
+            CheckoutStatus::NamedBranch {
+                branch_name: "feature".to_string(),
+                head_oid: "abc123".to_string(),
+                remote_status: BranchRemoteStatus::Matching {
+                    remote_ref: "refs/remotes/origin/feature".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            }
+        );
     }
 
     #[test]
