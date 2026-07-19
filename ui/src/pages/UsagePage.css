@@ -90,7 +90,7 @@
 
 .usage-ttft-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -145,6 +145,7 @@
 }
 
 .usage-ttft-table-wrap {
+  grid-column: 1 / -1;
   min-width: 0;
 }
 
@@ -152,7 +153,7 @@
   margin-top: 6px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  overflow: hidden;
+  overflow-x: auto;
 }
 
 .usage-ttft-table__row {
@@ -166,8 +167,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+.usage-ttft-table .usage-ttft-table__row {
+  min-width: 560px;
+}
+
 .usage-ttft-table--wide .usage-ttft-table__row {
   grid-template-columns: 110px 90px 1fr 90px 70px 70px 70px;
+  min-width: 720px;
 }
 
 .usage-ttft-table__row--head {
@@ -484,4 +490,10 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 12px;
+}
+
+@media (width <= 720px) {
+  .usage-ttft-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

@@ -2,8 +2,8 @@
 
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService,
-    ModelBackend, ModelInfo, ModelSource,
+    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
+    LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -760,7 +760,11 @@ impl ModelRegistry {
                 return None;
             }
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
-            return Some(Arc::new(LoggingService::new(service, "mock", "in_process")));
+            return Some(Arc::new(LoggingService::new(
+                service,
+                "mock",
+                crate::LlmTransport::InProcess,
+            )));
         }
 
         // ChatGPT bridge: when the user has signalled intent to use the
@@ -789,7 +793,7 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(
                 service,
                 "openai",
-                "websocket_or_http_sse",
+                crate::LlmTransport::Websocket,
             )));
         }
 
@@ -839,8 +843,8 @@ impl ModelRegistry {
         ));
         let provider = spec.backend.header_value();
         let transport = match spec.backend {
-            ModelBackend::Anthropic | ModelBackend::OpenAIResponses => "http_sse",
-            ModelBackend::Mock => "in_process",
+            ModelBackend::Anthropic | ModelBackend::OpenAIResponses => crate::LlmTransport::HttpSse,
+            ModelBackend::Mock => crate::LlmTransport::InProcess,
         };
         Some(Arc::new(LoggingService::new(service, provider, transport)))
     }
@@ -1142,7 +1146,7 @@ impl ModelRegistry {
                     Arc::new(LoggingService::new(
                         service,
                         "openai",
-                        "websocket_or_http_sse",
+                        LlmTransport::HttpSse,
                     )) as Arc<dyn LlmService>,
                 );
                 new_codex_specs.insert(spec.id.clone(), spec);

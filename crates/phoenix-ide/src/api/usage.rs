@@ -316,6 +316,7 @@ pub enum TtftAttemptScope {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+#[allow(clippy::struct_field_names)]
 pub struct TtftPercentiles {
     pub p50_ms: Option<f64>,
     pub p75_ms: Option<f64>,
@@ -459,15 +460,23 @@ struct TtftAccumulator {
 }
 
 impl TtftAccumulator {
-    fn observe(&mut self, outcome: &phoenix_core::domain::llm_types::LlmAttemptOutcome, ttft_ms: Option<u64>) {
+    fn observe(
+        &mut self,
+        outcome: &phoenix_core::domain::llm_types::LlmAttemptOutcome,
+        ttft_ms: Option<u64>,
+    ) {
         match (outcome, ttft_ms) {
-            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, Some(ms)) => self.sample_ms.push(ms),
-            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => self.no_token_success_count += 1,
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, Some(ms)) => {
+                self.sample_ms.push(ms);
+            }
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => {
+                self.no_token_success_count += 1;
+            }
             (_, _) => self.error_count += 1,
         }
     }
 
-    fn to_summary_row(
+    fn into_summary_row(
         mut self,
         attempt_scope: TtftAttemptScope,
         provider: String,
@@ -488,7 +497,7 @@ impl TtftAccumulator {
         }
     }
 
-    fn to_daily_row(mut self, day: String, attempt_scope: TtftAttemptScope) -> DailyTtftTrendRow {
+    fn into_daily_row(mut self, day: String, attempt_scope: TtftAttemptScope) -> DailyTtftTrendRow {
         self.sample_ms.sort_unstable();
         DailyTtftTrendRow {
             day,
@@ -501,21 +510,22 @@ impl TtftAccumulator {
     }
 }
 
-fn ttft_percentile(sorted: &[u64], quantile: f64) -> Option<f64> {
+fn ttft_percentile(sorted: &[u64], percentile: usize) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
-    let idx = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+    let numerator = (sorted.len() - 1).saturating_mul(percentile);
+    let idx = numerator.saturating_add(50) / 100;
     Some(sorted[idx] as f64)
 }
 
 fn ttft_percentiles(sorted: &[u64]) -> TtftPercentiles {
     TtftPercentiles {
-        p50_ms: ttft_percentile(sorted, 0.50),
-        p75_ms: ttft_percentile(sorted, 0.75),
-        p90_ms: ttft_percentile(sorted, 0.90),
-        p95_ms: ttft_percentile(sorted, 0.95),
-        p99_ms: ttft_percentile(sorted, 0.99),
+        p50_ms: ttft_percentile(sorted, 50),
+        p75_ms: ttft_percentile(sorted, 75),
+        p90_ms: ttft_percentile(sorted, 90),
+        p95_ms: ttft_percentile(sorted, 95),
+        p99_ms: ttft_percentile(sorted, 99),
     }
 }
 
@@ -597,7 +607,7 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
 
     let mut provider_rows: Vec<_> = provider_map
         .into_iter()
-        .map(|((scope, provider), acc)| acc.to_summary_row(scope, provider, None, None))
+        .map(|((scope, provider), acc)| acc.into_summary_row(scope, provider, None, None))
         .collect();
     provider_rows.sort_by(|a, b| {
         b.sample_count
@@ -609,7 +619,7 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
     let mut grouped_rows: Vec<_> = grouped_map
         .into_iter()
         .map(|((scope, provider, model, transport), acc)| {
-            acc.to_summary_row(scope, provider, Some(model), Some(transport))
+            acc.into_summary_row(scope, provider, Some(model), Some(transport))
         })
         .collect();
     grouped_rows.sort_by(|a, b| {
@@ -625,7 +635,7 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
     for day in seen_days {
         for scope in [TtftAttemptScope::FirstAttempt, TtftAttemptScope::Retry] {
             let acc = daily_map.remove(&(day.clone(), scope)).unwrap_or_default();
-            daily_trend.push(acc.to_daily_row(day.clone(), scope));
+            daily_trend.push(acc.into_daily_row(day.clone(), scope));
         }
     }
 
@@ -682,7 +692,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
     let ttft_since = (now - Duration::days(TTFT_WINDOW_DAYS - 1)).date_naive();
     let ttft_rows = match state
         .db
-        .usage_recent_llm_metrics(&format!("{}T00:00:00+00:00", ttft_since), TTFT_ROW_LIMIT)
+        .usage_recent_llm_metrics(&format!("{ttft_since}T00:00:00+00:00"), TTFT_ROW_LIMIT)
         .await
     {
         Ok(r) => r,
@@ -1081,12 +1091,14 @@ mod tests {
         assert_eq!(summary.sample_count, 2.0);
         assert_eq!(summary.no_token_success_count, 1.0);
         assert_eq!(summary.error_count, 1.0);
-        assert_eq!(summary.provider_rows.len(), 3.0 as usize);
+        assert_eq!(summary.provider_rows.len(), 3);
 
         let first_attempt = summary
             .provider_rows
             .iter()
-            .find(|row| row.provider == "anthropic" && row.attempt_scope == TtftAttemptScope::FirstAttempt)
+            .find(|row| {
+                row.provider == "anthropic" && row.attempt_scope == TtftAttemptScope::FirstAttempt
+            })
             .expect("first attempt provider row");
         assert_eq!(first_attempt.sample_count, 1.0);
         assert_eq!(first_attempt.no_token_success_count, 1.0);

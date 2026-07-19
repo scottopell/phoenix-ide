@@ -70,6 +70,11 @@ pub async fn complete(
     }
 
     let url = resolve_endpoint(base_url_override);
+    if let Some(telemetry) = request.telemetry.as_ref() {
+        telemetry
+            .attempt_capture
+            .set_transport(crate::LlmTransport::HttpJson);
+    }
     let mut responses_request =
         translate_to_backend_request(&spec.api_name, request, use_codex_backend);
     responses_request.set_tags(request_tags);
@@ -220,7 +225,7 @@ struct ResponsesStreamAccumulator {
 }
 
 impl ResponsesStreamAccumulator {
-    fn new(dispatch_at: Instant) -> Self {
+    fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
@@ -229,7 +234,13 @@ impl ResponsesStreamAccumulator {
             output_items: Vec::new(),
             done: false,
             logged_empty_dispatch: false,
-            telemetry: StreamTelemetryRecorder::new(dispatch_at),
+            telemetry: StreamTelemetryRecorder::new(
+                dispatch_at,
+                request
+                    .telemetry
+                    .as_ref()
+                    .map(|t| t.attempt_capture.clone()),
+            ),
         }
     }
 
@@ -268,8 +279,33 @@ impl ResponsesStreamAccumulator {
                 }
             }
             "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
-                self.telemetry
-                    .record_generation_event_at(now, GenerationKind::Reasoning);
+                if v.get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|delta| !delta.is_empty())
+                {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Reasoning);
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if v.get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|delta| !delta.is_empty())
+                {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Tool);
+                }
+            }
+            "response.output_item.added" => {
+                if v.pointer("/item/type").and_then(serde_json::Value::as_str)
+                    == Some("function_call")
+                    && v.pointer("/item/name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Tool);
+                }
             }
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
@@ -817,12 +853,14 @@ fn evict_ws_sessions(pool: &mut CodexWsSessions, now: Instant) {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn complete_codex_websocket(
     http_url: &str,
     api_key: &str,
     custom_headers: &[(String, String)],
     cache_key: &str,
     full_request: &ResponsesBackendRequest,
+    request: &LlmRequest,
     chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
     sessions: &Arc<Mutex<CodexWsSessions>>,
 ) -> Result<LlmResponse, CodexWsError> {
@@ -965,6 +1003,7 @@ async fn complete_codex_websocket(
             session.socket = Some(socket);
         }
         let socket = session.socket.as_mut().expect("socket initialized");
+        let dispatch_at = Instant::now();
         tokio::time::timeout(
             CODEX_WS_FRAME_TIMEOUT,
             socket.send(tungstenite::Message::Text(envelope.to_string().into())),
@@ -972,7 +1011,7 @@ async fn complete_codex_websocket(
         .await
         .map_err(|_| CodexWsError::fallback(LlmError::network("WebSocket send timeout")))?
         .map_err(|e| CodexWsError::fallback(LlmError::network(format!("WebSocket send: {e}"))))?;
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(dispatch_at, request);
         let mut response_id = None;
         let mut server_output = Vec::new();
         loop {
@@ -1144,12 +1183,18 @@ pub async fn complete_streaming(
 
     if use_codex_backend && supports_responses_lite(&spec.api_name) {
         if let Some(sessions) = ws_sessions {
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                telemetry
+                    .attempt_capture
+                    .set_transport(crate::LlmTransport::Websocket);
+            }
             match complete_codex_websocket(
                 &url,
                 api_key,
                 custom_headers,
                 request.cache_key.as_str(),
                 &responses_request,
+                request,
                 chunk_tx,
                 sessions,
             )
@@ -1174,6 +1219,7 @@ pub async fn complete_streaming(
                         custom_headers,
                         request.cache_key.as_str(),
                         &responses_request,
+                        request,
                         chunk_tx,
                         sessions,
                     )
@@ -1204,6 +1250,11 @@ pub async fn complete_streaming(
     }
 
     tracing::Span::current().record("transport", "http_sse");
+    if let Some(telemetry) = request.telemetry.as_ref() {
+        telemetry
+            .attempt_capture
+            .set_transport(crate::LlmTransport::HttpSse);
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
@@ -1218,6 +1269,7 @@ pub async fn complete_streaming(
         builder = builder.header("x-openai-internal-codex-responses-lite", "true");
     }
     builder = apply_source_header(builder, custom_headers);
+    let dispatch_at = Instant::now();
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -1261,7 +1313,7 @@ pub async fn complete_streaming(
         }
     }
 
-    let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+    let mut acc = ResponsesStreamAccumulator::new(dispatch_at, request);
     let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
@@ -3414,7 +3466,7 @@ mod tests {
     async fn process_event_returns_err_on_top_level_error() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
         let err = acc.process_event("error", data, &tx).await.unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
@@ -3425,7 +3477,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let err = acc.process_event("", "{ not json", &tx).await.unwrap_err();
         assert!(
             err.message.contains("Failed to parse SSE data"),
@@ -3437,7 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_done_sentinel_is_ignored() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         // The `[DONE]` sentinel is not JSON; it must be a no-op, not a parse error.
         acc.process_event("", "[DONE]", &tx).await.unwrap();
         assert!(
@@ -3449,7 +3501,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_unknown_dispatch_type_is_ignored() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         acc.process_event("", r#"{"type":"response.in_progress"}"#, &tx)
             .await
             .unwrap();
@@ -3458,7 +3510,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_empty_dispatch_type_is_ignored_and_logged_once() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         // An event whose embedded `type` is empty has nothing to dispatch on; it
         // must be tolerated (logged exactly once), never erroring the stream.
         assert!(!acc.logged_empty_dispatch);
@@ -3473,7 +3525,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_assembles_message_text_from_output_item_done() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         // The primary (non-fallback) assembly path: a completed message item.
         let data = r#"{
             "type":"response.output_item.done",
@@ -3500,7 +3552,7 @@ mod tests {
     async fn process_event_handles_codex_nested_error_shape() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         // Real codex/ChatGPT-backend payload captured 2026-05-11 via WARN log.
         let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
         let err = acc.process_event("error", data, &tx).await.unwrap_err();
@@ -3514,7 +3566,7 @@ mod tests {
     async fn process_event_returns_err_on_response_failed() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let data = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream"}}}"#;
         let err = acc
             .process_event("response.failed", data, &tx)
@@ -3527,7 +3579,7 @@ mod tests {
     async fn process_event_returns_err_on_response_incomplete_max_tokens() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
         let err = acc
             .process_event("response.incomplete", data, &tx)
@@ -3545,7 +3597,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_recovers_output_from_response_completed_when_no_item_done() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -3575,7 +3627,7 @@ mod tests {
     #[tokio::test]
     async fn responses_api_cache_details_are_threaded_without_double_counting() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -3830,7 +3882,7 @@ mod tests {
     #[tokio::test]
     async fn process_event_fallback_skips_when_output_items_already_captured() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(Instant::now());
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
         let item_done = r#"{
             "type":"response.output_item.done",
             "item":{"type":"message","role":"assistant","content":[

@@ -3,6 +3,8 @@
 pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
 /// on every `LlmRequest` so callers must explicitly choose a caching strategy
@@ -62,6 +64,7 @@ pub struct LlmRequestTelemetry {
     pub root_conversation_id: String,
     pub request_id: String,
     pub retry_attempt: u32,
+    pub attempt_capture: LlmAttemptCapture,
 }
 
 /// Content-free summary of a provider streaming attempt.
@@ -89,6 +92,144 @@ pub struct ProviderStreamTelemetry {
     pub max_generation_gap_ms: Option<u64>,
     pub output_kind: StreamTelemetryOutputKind,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTransport {
+    HttpSse,
+    Websocket,
+    InProcess,
+    HttpJson,
+}
+
+impl LlmTransport {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpSse => "http_sse",
+            Self::Websocket => "websocket",
+            Self::InProcess => "in_process",
+            Self::HttpJson => "http_json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAttemptOutcome {
+    Success,
+    RateLimited,
+    UsageLimitReached,
+    ServerError,
+    InvalidResponse,
+    ServerOverloaded,
+    NetworkError,
+    TokenBudgetExceeded,
+    AuthError,
+    RequestRejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmAttemptMetrics {
+    pub conversation_id: String,
+    pub root_conversation_id: String,
+    pub request_id: String,
+    pub retry_attempt: u32,
+    pub provider: String,
+    pub model: String,
+    pub transport: LlmTransport,
+    pub total_duration_ms: u64,
+    pub stream: ProviderStreamTelemetry,
+    pub outcome: LlmAttemptOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmAttemptFinalization<'a> {
+    pub telemetry: &'a LlmRequestTelemetry,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub fallback_transport: LlmTransport,
+    pub total_duration: Duration,
+    pub stream: Option<ProviderStreamTelemetry>,
+    pub outcome: LlmAttemptOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmAttemptCapture(Arc<Mutex<LlmAttemptCaptureState>>);
+
+#[derive(Debug, Clone, Default)]
+struct LlmAttemptCaptureState {
+    progress: Option<ProviderStreamTelemetry>,
+    transport: Option<LlmTransport>,
+    finalized: Option<LlmAttemptMetrics>,
+}
+
+impl Default for LlmAttemptCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmAttemptCapture {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(LlmAttemptCaptureState::default())))
+    }
+
+    pub fn publish_progress(&self, progress: ProviderStreamTelemetry) {
+        if let Ok(mut state) = self.0.lock() {
+            state.progress = Some(progress);
+        }
+    }
+
+    pub fn set_transport(&self, transport: LlmTransport) {
+        if let Ok(mut state) = self.0.lock() {
+            state.transport = Some(transport);
+        }
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> Option<ProviderStreamTelemetry> {
+        self.0.lock().ok()?.progress.clone()
+    }
+
+    #[must_use]
+    pub fn finalized(&self) -> Option<LlmAttemptMetrics> {
+        self.0.lock().ok()?.finalized.clone()
+    }
+
+    #[must_use]
+    pub fn finalize(&self, finalization: LlmAttemptFinalization<'_>) -> LlmAttemptMetrics {
+        let transport = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|state| state.transport)
+            .unwrap_or(finalization.fallback_transport);
+        let progress = self.0.lock().ok().and_then(|state| state.progress.clone());
+        let metrics = LlmAttemptMetrics {
+            conversation_id: finalization.telemetry.conversation_id.clone(),
+            root_conversation_id: finalization.telemetry.root_conversation_id.clone(),
+            request_id: finalization.telemetry.request_id.clone(),
+            retry_attempt: finalization.telemetry.retry_attempt,
+            provider: finalization.provider.to_string(),
+            model: finalization.model.to_string(),
+            transport,
+            total_duration_ms: u64::try_from(finalization.total_duration.as_millis())
+                .unwrap_or(u64::MAX),
+            stream: finalization
+                .stream
+                .or(progress)
+                .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
+            outcome: finalization.outcome,
+        };
+        if let Ok(mut state) = self.0.lock() {
+            state.finalized = Some(metrics.clone());
+        }
+        metrics
+    }
 }
 
 impl ProviderStreamTelemetry {

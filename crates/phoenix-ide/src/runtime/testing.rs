@@ -124,6 +124,7 @@ impl LlmClient for StreamingMockLlmClient {
             content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
             usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         })
     }
 
@@ -899,6 +900,13 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn upsert_llm_request_metrics(
+        &self,
+        _metrics: &phoenix_llm::LlmAttemptMetrics,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn update_steering_queue(
         &self,
         conv_id: &str,
@@ -1140,6 +1148,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let request = LlmRequest {
@@ -1219,6 +1228,7 @@ mod tests {
             content: vec![ContentBlock::text("Hello!")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let mut rt = TestRuntime::new().llm(llm).build();
@@ -1247,12 +1257,14 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Second response: text after tool
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("Done!")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let tools = MockToolExecutor::new().with_tool("bash", ToolOutput::success("file1\nfile2"));
@@ -1304,6 +1316,7 @@ mod tests {
             content: vec![ContentBlock::text("Response that should be discarded")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let storage = Arc::new(InMemoryStorage::new());
@@ -1417,12 +1430,14 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // This response won't be used since tool is cancelled
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let tools = Arc::new(
@@ -1528,6 +1543,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let tools = Arc::new(
@@ -1644,6 +1660,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let tools = Arc::new(
@@ -2295,12 +2312,14 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // After tool completes, LLM returns text
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("Done")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         // Tool executor returns output containing "[command cancelled]" string
@@ -2409,6 +2428,7 @@ mod tests {
                 )],
                 end_turn: false,
                 usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             });
         }
 
@@ -2977,6 +2997,7 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // Turn 2: a tool call (cooperative now), then...
         llm.queue_response(LlmResponse {
@@ -2987,12 +3008,14 @@ mod tests {
             )],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         // ...the post-tool LLM round returns a plain text answer → AgentDone.
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("done with second tool")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let tools = Arc::new(

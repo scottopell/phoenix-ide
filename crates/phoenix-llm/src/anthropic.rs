@@ -37,7 +37,7 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn new(dispatch_at: Instant) -> Self {
+    fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
@@ -54,7 +54,13 @@ impl StreamAccumulator {
             current_is_server_tool: false,
             current_server_block: None,
             done: false,
-            telemetry: StreamTelemetryRecorder::new(dispatch_at),
+            telemetry: StreamTelemetryRecorder::new(
+                dispatch_at,
+                request
+                    .telemetry
+                    .as_ref()
+                    .map(|t| t.attempt_capture.clone()),
+            ),
         }
     }
 
@@ -229,12 +235,21 @@ impl StreamAccumulator {
                     .pointer("/delta/partial_json")
                     .and_then(serde_json::Value::as_str)
                 {
+                    if !partial.is_empty() {
+                        self.telemetry
+                            .record_generation_event_at(now, GenerationKind::Tool);
+                    }
                     self.current_tool_json.push_str(partial);
                 }
             }
-            "thinking_delta" | "signature_delta" => {
-                self.telemetry
-                    .record_generation_event_at(now, GenerationKind::Reasoning);
+            "thinking_delta" => {
+                if v.pointer("/delta/thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|delta| !delta.is_empty())
+                {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Reasoning);
+                }
             }
             _ => {}
         }
@@ -386,6 +401,12 @@ pub async fn complete_streaming(
 
     let has_deferred = spec.supports_tool_search && request.tools.iter().any(|t| t.defer_loading);
 
+    if let Some(telemetry) = request.telemetry.as_ref() {
+        telemetry
+            .attempt_capture
+            .set_transport(crate::LlmTransport::HttpSse);
+    }
+
     let mut builder = client.post(&base_url);
     builder = match auth.style {
         super::AuthStyle::ApiKey => builder.header("x-api-key", &auth.credential),
@@ -401,6 +422,7 @@ pub async fn complete_streaming(
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json");
     builder = apply_source_header(builder, custom_headers);
+    let dispatch_at = Instant::now();
     let response = builder.json(&anthropic_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -420,7 +442,7 @@ pub async fn complete_streaming(
         return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let mut acc = StreamAccumulator::new(Instant::now());
+    let mut acc = StreamAccumulator::new(dispatch_at, request);
     let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
@@ -469,6 +491,12 @@ pub async fn complete(
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     let base_url = resolve_anthropic_url(base_url_override);
+
+    if let Some(telemetry) = request.telemetry.as_ref() {
+        telemetry
+            .attempt_capture
+            .set_transport(crate::LlmTransport::HttpJson);
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -1153,6 +1181,17 @@ mod tests {
         }
     }
 
+    fn test_request() -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        }
+    }
+
     #[tokio::test]
     async fn custom_source_header_suppresses_default_source_header() {
         assert!(has_custom_source_header(&[(
@@ -1269,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event(
@@ -1293,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_assembles_text_and_usage_from_event_sequence() {
         // first generation must come from non-empty model output, not message_start/usage.
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -1347,7 +1386,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_telemetry_ignores_control_usage_and_terminal_events_for_first_generation() {
         let start = Instant::now();
-        let mut acc = StreamAccumulator::new(start);
+        let mut acc = StreamAccumulator::new(start, &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -1393,7 +1432,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_assembles_tool_use_from_split_input_json() {
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         acc.process_event(
@@ -1441,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_malformed_sse_data_is_invalid_response_not_panic() {
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let err = acc
             .process_event("content_block_delta", "{ not json", &tx)
@@ -1456,7 +1495,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_ping_and_unknown_events_are_ignored() {
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Keep-alive pings and forward-compatible unknown events must be no-ops,
         // not errors — the stream keeps flowing.
@@ -1468,7 +1507,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_text_delta_before_block_start_is_not_committed() {
-        let mut acc = StreamAccumulator::new(Instant::now());
+        let mut acc = StreamAccumulator::new(Instant::now(), &test_request());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         // A delta with no preceding content_block_start has no committed block to
         // attach to; it must be dropped rather than fabricated into output.

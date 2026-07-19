@@ -1,0 +1,7 @@
+Make provider time-to-first-token (TTFT) a first-class tracing and in-house analytics metric.
+
+TTFT is measured from Phoenix finishing request transmission to the first provider event containing generated model output, including text, reasoning, tool-call name/arguments, or other generated structured output. Provider acknowledgement/control events, pings, metadata, usage-only events, and terminal events do not count. This is a provider-efficiency proxy for queueing, prefill, GPU scheduling, first decode, and network return time—not first visible text.
+
+Implement typed, content-free stream milestones consistently across Anthropic, OpenAI SSE, and OpenAI WebSocket transports. Persist canonical request timing facts relationally with provider/model/transport/retry/outcome dimensions; derive aggregate TTFT percentiles and threshold rates without parallel semantic representations. Preserve first-visible-text latency as a secondary diagnostic. Export bounded span attributes only at completion. Add usage analytics with TTFT as the hero metric, broken down by provider/model/transport, including sample counts, no-token/error counts, percentiles, trends, and stall diagnostics. Update normative specs and executive coverage, regenerate generated UI types, and add deterministic provider, DB, API, and UI tests.
+
+Do not persist or export prompts, generated text, reasoning, tool arguments, raw provider events, credentials, paths, or other content/high-cardinality payloads. Explicitly represent tool-only, reasoning-only, no-output, failed, and retried outcomes.

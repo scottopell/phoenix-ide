@@ -199,14 +199,14 @@ pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     model_id: String,
     provider: &'static str,
-    streaming_transport: &'static str,
+    streaming_transport: LlmTransport,
 }
 
 impl LoggingService {
     pub fn new(
         inner: Arc<dyn LlmService>,
         provider: &'static str,
-        streaming_transport: &'static str,
+        streaming_transport: LlmTransport,
     ) -> Self {
         let model_id = inner.model_id().to_string();
         Self {
@@ -217,13 +217,13 @@ impl LoggingService {
         }
     }
 
-    fn transport_for(&self, streaming: bool) -> &'static str {
-        if self.streaming_transport == "in_process" {
-            "in_process"
+    fn fallback_transport_for(&self, streaming: bool) -> LlmTransport {
+        if self.streaming_transport == LlmTransport::InProcess {
+            LlmTransport::InProcess
         } else if streaming {
             self.streaming_transport
         } else {
-            "http_json"
+            LlmTransport::HttpJson
         }
     }
 }
@@ -235,7 +235,7 @@ impl LoggingService {
     /// local log filtering. Usage/error fields are `Empty` until the call
     /// resolves.
     fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
-        let transport = self.transport_for(streaming);
+        let transport = self.fallback_transport_for(streaming);
         let telemetry = request.telemetry.as_ref();
         let generated_request_id = format!("llm-{}", rand::random::<u64>());
         let request_id = telemetry.map_or(generated_request_id.as_str(), |value| {
@@ -249,7 +249,7 @@ impl LoggingService {
             otel.status_code = tracing::field::Empty,
             model = %self.model_id,
             provider = self.provider,
-            transport,
+            transport = transport.as_str(),
             streaming,
             conv_id = telemetry.map(|value| value.conversation_id.as_str()),
             root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
@@ -330,6 +330,51 @@ impl LoggingService {
         span.record("stream.completed", telemetry.completed);
     }
 
+    fn finalize_capture(
+        &self,
+        span: &tracing::Span,
+        request: &LlmRequest,
+        streaming: bool,
+        duration: std::time::Duration,
+        result: &Result<LlmResponse, LlmError>,
+    ) {
+        let Some(telemetry) = request.telemetry.as_ref() else {
+            return;
+        };
+        let outcome = match result {
+            Ok(_) => LlmAttemptOutcome::Success,
+            Err(e) => match e.kind {
+                LlmErrorKind::RateLimit => LlmAttemptOutcome::RateLimited,
+                LlmErrorKind::UsageLimitReached => LlmAttemptOutcome::UsageLimitReached,
+                LlmErrorKind::ServerError => LlmAttemptOutcome::ServerError,
+                LlmErrorKind::InvalidResponse => LlmAttemptOutcome::InvalidResponse,
+                LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
+                LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
+                LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
+                LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
+                LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => {
+                    LlmAttemptOutcome::RequestRejected
+                }
+            },
+        };
+        let stream = match result {
+            Ok(response) => Some(response.stream_telemetry.clone()),
+            Err(_) => None,
+        };
+        let _ = telemetry.attempt_capture.finalize(LlmAttemptFinalization {
+            telemetry,
+            provider: self.provider,
+            model: &self.model_id,
+            fallback_transport: self.fallback_transport_for(streaming),
+            total_duration: duration,
+            stream,
+            outcome,
+        });
+        if let Some(metrics) = telemetry.attempt_capture.finalized() {
+            Self::record_stream_telemetry(span, &metrics.stream);
+        }
+    }
+
     fn record_outcome(span: &tracing::Span, result: &Result<LlmResponse, LlmError>) {
         match result {
             Ok(response) => {
@@ -358,6 +403,7 @@ impl LlmService for LoggingService {
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
+        self.finalize_capture(&span, request, false, duration, &result);
 
         match &result {
             Ok(response) => {
@@ -401,6 +447,7 @@ impl LlmService for LoggingService {
             .await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
+        self.finalize_capture(&span, request, true, duration, &result);
 
         match &result {
             Ok(response) => {
@@ -460,17 +507,18 @@ mod logging_tests {
 
     #[test]
     fn logging_transport_matches_the_actual_call_path() {
-        let http = LoggingService::new(Arc::new(MockLlmService), "anthropic", "http_sse");
-        assert_eq!(http.transport_for(false), "http_json");
-        assert_eq!(http.transport_for(true), "http_sse");
+        let http =
+            LoggingService::new(Arc::new(MockLlmService), "anthropic", LlmTransport::HttpSse);
+        assert_eq!(http.fallback_transport_for(false), LlmTransport::HttpJson);
+        assert_eq!(http.fallback_transport_for(true), LlmTransport::HttpSse);
 
         let codex =
-            LoggingService::new(Arc::new(MockLlmService), "openai", "websocket_or_http_sse");
-        assert_eq!(codex.transport_for(false), "http_json");
-        assert_eq!(codex.transport_for(true), "websocket_or_http_sse");
+            LoggingService::new(Arc::new(MockLlmService), "openai", LlmTransport::Websocket);
+        assert_eq!(codex.fallback_transport_for(false), LlmTransport::HttpJson);
+        assert_eq!(codex.fallback_transport_for(true), LlmTransport::Websocket);
 
-        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", "in_process");
-        assert_eq!(mock.transport_for(false), "in_process");
-        assert_eq!(mock.transport_for(true), "in_process");
+        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", LlmTransport::InProcess);
+        assert_eq!(mock.fallback_transport_for(false), LlmTransport::InProcess);
+        assert_eq!(mock.fallback_transport_for(true), LlmTransport::InProcess);
     }
 }

@@ -4598,6 +4598,7 @@ where
                 system.push(SystemContent::new(capsule));
             }
 
+            let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
             let request = LlmRequest {
                 system,
                 messages,
@@ -4608,6 +4609,7 @@ where
                     root_conversation_id: root_conv_id.clone(),
                     request_id: request_id.clone(),
                     retry_attempt,
+                    attempt_capture: attempt_capture.clone(),
                 }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
@@ -4654,6 +4656,18 @@ where
                 }
                 Err(e) => llm_error_to_outcome(e),
             };
+
+            if let Some(metrics) = attempt_capture.finalized() {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to write llm_request_metrics row");
+                }
+            } else {
+                tracing::warn!(
+                    request_id,
+                    retry_attempt,
+                    "LLM attempt completed without finalized metrics"
+                );
+            }
 
             // Task 67004: a terminal UsageLimitReached carries the
             // structured QuotaDetails parsed from the 429 response
@@ -5367,6 +5381,7 @@ where
                     root_conversation_id: root_conv_id,
                     request_id,
                     retry_attempt: 1,
+                    attempt_capture: phoenix_llm::LlmAttemptCapture::new(),
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
@@ -9349,11 +9364,13 @@ mod explore_prompt_cache_shape_tests {
             }],
             end_turn: false,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("ready to propose")],
             end_turn: true,
             usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let (event_tx, runtime_event_rx) = mpsc::channel(32);
@@ -9869,6 +9886,7 @@ mod steer_drain_detector_tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })

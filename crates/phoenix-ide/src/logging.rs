@@ -404,6 +404,7 @@ mod tests {
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn otel_filter_is_a_spans_only_allowlist() {
         use opentelemetry::trace::TracerProvider as _;

@@ -197,6 +197,12 @@ pub trait StateStore: Send + Sync {
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
 
+    /// Record one content-free provider attempt for TTFT and stall analytics.
+    async fn upsert_llm_request_metrics(
+        &self,
+        metrics: &phoenix_llm::LlmAttemptMetrics,
+    ) -> Result<(), String>;
+
     /// Update the steering queue for a conversation. Persists the FIFO queue
     /// of pending steering messages to the DB.
     async fn update_steering_queue(
@@ -484,6 +490,13 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 first_byte_at,
             )
             .await
+    }
+
+    async fn upsert_llm_request_metrics(
+        &self,
+        metrics: &phoenix_llm::LlmAttemptMetrics,
+    ) -> Result<(), String> {
+        (**self).upsert_llm_request_metrics(metrics).await
     }
 
     async fn update_steering_queue(
@@ -813,6 +826,16 @@ impl StateStore for DatabaseStorage {
                 usage,
                 first_byte_at,
             )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn upsert_llm_request_metrics(
+        &self,
+        metrics: &phoenix_llm::LlmAttemptMetrics,
+    ) -> Result<(), String> {
+        self.db
+            .upsert_llm_request_metrics(metrics)
             .await
             .map_err(|e| e.to_string())
     }

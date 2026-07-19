@@ -271,7 +271,43 @@ const MIGRATIONS: &[Migration] = &[
         name: "index_message_fts_row_locations",
         sql: MIGRATION_051,
     },
+    Migration {
+        version: 52,
+        name: "create_llm_request_metrics",
+        sql: MIGRATION_052,
+    },
 ];
+
+const MIGRATION_052: &str = r"
+CREATE TABLE IF NOT EXISTS llm_request_metrics (
+    request_id TEXT NOT NULL,
+    retry_attempt INTEGER NOT NULL CHECK (retry_attempt >= 1),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    transport TEXT NOT NULL CHECK (transport IN ('http_sse', 'websocket', 'in_process', 'http_json')),
+    total_duration_ms INTEGER NOT NULL CHECK (total_duration_ms >= 0),
+    dispatch_to_first_provider_event_ms INTEGER CHECK (dispatch_to_first_provider_event_ms IS NULL OR dispatch_to_first_provider_event_ms >= 0),
+    dispatch_to_first_generation_event_ms INTEGER CHECK (dispatch_to_first_generation_event_ms IS NULL OR dispatch_to_first_generation_event_ms >= 0),
+    dispatch_to_first_visible_text_ms INTEGER CHECK (dispatch_to_first_visible_text_ms IS NULL OR dispatch_to_first_visible_text_ms >= 0),
+    provider_event_count INTEGER NOT NULL CHECK (provider_event_count >= 0),
+    generation_event_count INTEGER NOT NULL CHECK (generation_event_count >= 0),
+    visible_text_event_count INTEGER NOT NULL CHECK (visible_text_event_count >= 0),
+    max_provider_gap_ms INTEGER CHECK (max_provider_gap_ms IS NULL OR max_provider_gap_ms >= 0),
+    max_generation_gap_ms INTEGER CHECK (max_generation_gap_ms IS NULL OR max_generation_gap_ms >= 0),
+    output_kind TEXT NOT NULL CHECK (output_kind IN ('none', 'text', 'reasoning', 'tool', 'structured', 'mixed')),
+    stream_completed INTEGER NOT NULL CHECK (stream_completed IN (0, 1)),
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'rate_limited', 'usage_limit_reached', 'server_error', 'invalid_response', 'server_overloaded', 'network_error', 'token_budget_exceeded', 'auth_error', 'request_rejected', 'cancelled')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (request_id, retry_attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_created_at ON llm_request_metrics(created_at);
+CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_provider_model_transport
+    ON llm_request_metrics(provider, model, transport, created_at);
+CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_root ON llm_request_metrics(root_conversation_id, created_at);
+";
 
 const MIGRATION_050: &str = r"
 ALTER TABLE wake_bindings

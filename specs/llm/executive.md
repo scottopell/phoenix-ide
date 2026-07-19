@@ -23,7 +23,7 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-006:** Error Classification | 🚧 Extension pending | Base classification complete; split of transient throttle vs quota exhaustion vs model-overloaded tracked in task 67002 |
 | **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | 📋 Planned | Task 67002 — parse codex 429 body + `x-codex-*` headers into structured `QuotaDetails`, render plan-aware messages matching codex CLI wording. Phases 2/3 (mid-stream SSE event, UI surface) tracked as 67003/67004. |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
-| **REQ-LLM-008:** Request Observability | 🚧 Extension pending | Base observability is complete, but provider-centric TTFT still needs implementation at the request-dispatch boundary with generation-bearing event detection, provider/model/transport aggregates, and privacy-preserving analytics surfaces |
+| **REQ-LLM-008:** Request Observability | ✅ Complete | Provider-centric TTFT is measured at each request-dispatch boundary through the first generation-bearing provider event across Anthropic SSE and OpenAI SSE/WebSocket transports; content-free per-attempt metrics persist relationally and the usage dashboard reports bounded first-attempt/retry percentiles, threshold rates, trends, and provider/model/transport comparisons |
 | **REQ-LLM-009:** Streaming Responses | ✅ Complete | Task 582. `complete_streaming()` on `LlmClient` trait, Anthropic implemented, OpenAI falls back |
 
-**Progress:** 8 of 10 complete; REQ-LLM-006 extension, REQ-LLM-006a, and the new REQ-LLM-008 TTFT extension remain in flight.
+**Progress:** 9 of 10 complete; REQ-LLM-006 extension and REQ-LLM-006a remain in flight.

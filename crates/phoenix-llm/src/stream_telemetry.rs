@@ -1,4 +1,4 @@
-use crate::{LlmResponse, ProviderStreamTelemetry, StreamTelemetryOutputKind};
+use crate::{LlmAttemptCapture, LlmResponse, ProviderStreamTelemetry, StreamTelemetryOutputKind};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,9 +9,40 @@ pub(crate) enum GenerationKind {
     Structured,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ObservedOutputKinds(u8);
+
+impl ObservedOutputKinds {
+    const TEXT: u8 = 1;
+    const REASONING: u8 = 1 << 1;
+    const TOOL: u8 = 1 << 2;
+    const STRUCTURED: u8 = 1 << 3;
+
+    fn record(&mut self, kind: GenerationKind) {
+        self.0 |= match kind {
+            GenerationKind::Text => Self::TEXT,
+            GenerationKind::Reasoning => Self::REASONING,
+            GenerationKind::Tool => Self::TOOL,
+            GenerationKind::Structured => Self::STRUCTURED,
+        };
+    }
+
+    fn output_kind(self) -> StreamTelemetryOutputKind {
+        match self.0 {
+            0 => StreamTelemetryOutputKind::None,
+            Self::TEXT => StreamTelemetryOutputKind::Text,
+            Self::REASONING => StreamTelemetryOutputKind::Reasoning,
+            Self::TOOL => StreamTelemetryOutputKind::Tool,
+            Self::STRUCTURED => StreamTelemetryOutputKind::Structured,
+            _ => StreamTelemetryOutputKind::Mixed,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StreamTelemetryRecorder {
     dispatch_at: Instant,
+    capture: Option<LlmAttemptCapture>,
     first_provider_event_at: Option<Instant>,
     first_generation_event_at: Option<Instant>,
     first_visible_text_at: Option<Instant>,
@@ -22,16 +53,14 @@ pub(crate) struct StreamTelemetryRecorder {
     visible_text_event_count: u32,
     max_provider_gap_ms: Option<u64>,
     max_generation_gap_ms: Option<u64>,
-    saw_text: bool,
-    saw_reasoning: bool,
-    saw_tool: bool,
-    saw_structured: bool,
+    output_kinds: ObservedOutputKinds,
 }
 
 impl StreamTelemetryRecorder {
-    pub(crate) fn new(dispatch_at: Instant) -> Self {
+    pub(crate) fn new(dispatch_at: Instant, capture: Option<LlmAttemptCapture>) -> Self {
         Self {
             dispatch_at,
+            capture,
             first_provider_event_at: None,
             first_generation_event_at: None,
             first_visible_text_at: None,
@@ -42,10 +71,7 @@ impl StreamTelemetryRecorder {
             visible_text_event_count: 0,
             max_provider_gap_ms: None,
             max_generation_gap_ms: None,
-            saw_text: false,
-            saw_reasoning: false,
-            saw_tool: false,
-            saw_structured: false,
+            output_kinds: ObservedOutputKinds::default(),
         }
     }
 
@@ -57,6 +83,7 @@ impl StreamTelemetryRecorder {
         }
         self.last_provider_event_at = Some(at);
         self.first_provider_event_at.get_or_insert(at);
+        self.publish_progress();
     }
 
     pub(crate) fn record_generation_event_at(&mut self, at: Instant, kind: GenerationKind) {
@@ -68,25 +95,24 @@ impl StreamTelemetryRecorder {
         }
         self.last_generation_event_at = Some(at);
         self.first_generation_event_at.get_or_insert(at);
-        match kind {
-            GenerationKind::Text => self.saw_text = true,
-            GenerationKind::Reasoning => self.saw_reasoning = true,
-            GenerationKind::Tool => self.saw_tool = true,
-            GenerationKind::Structured => self.saw_structured = true,
-        }
+        self.output_kinds.record(kind);
+        self.publish_progress();
     }
 
     pub(crate) fn record_visible_text_at(&mut self, at: Instant) {
         self.visible_text_event_count = self.visible_text_event_count.saturating_add(1);
         self.first_visible_text_at.get_or_insert(at);
-        self.saw_text = true;
+        self.output_kinds.record(GenerationKind::Text);
+        self.publish_progress();
     }
 
-    pub(crate) fn finish_success(self) -> ProviderStreamTelemetry {
-        self.finish(true)
+    fn publish_progress(&self) {
+        if let Some(capture) = &self.capture {
+            capture.publish_progress(self.snapshot(false));
+        }
     }
 
-    fn finish(self, completed: bool) -> ProviderStreamTelemetry {
+    pub(crate) fn snapshot(&self, completed: bool) -> ProviderStreamTelemetry {
         ProviderStreamTelemetry {
             dispatch_to_first_provider_event_ms: self
                 .first_provider_event_at
@@ -102,14 +128,17 @@ impl StreamTelemetryRecorder {
             visible_text_event_count: self.visible_text_event_count,
             max_provider_gap_ms: self.max_provider_gap_ms,
             max_generation_gap_ms: self.max_generation_gap_ms,
-            output_kind: classify_output_kind(
-                self.saw_text,
-                self.saw_reasoning,
-                self.saw_tool,
-                self.saw_structured,
-            ),
+            output_kind: self.output_kinds.output_kind(),
             completed,
         }
+    }
+
+    pub(crate) fn finish_success(self) -> ProviderStreamTelemetry {
+        self.finish(true)
+    }
+
+    fn finish(self, completed: bool) -> ProviderStreamTelemetry {
+        self.snapshot(completed)
     }
 
     pub(crate) fn attach_success(self, response: &mut LlmResponse) {
@@ -119,26 +148,6 @@ impl StreamTelemetryRecorder {
 
 fn millis_between(start: Instant, end: Instant) -> u64 {
     u64::try_from(end.duration_since(start).as_millis()).unwrap_or(u64::MAX)
-}
-
-fn classify_output_kind(
-    saw_text: bool,
-    saw_reasoning: bool,
-    saw_tool: bool,
-    saw_structured: bool,
-) -> StreamTelemetryOutputKind {
-    let kinds = [saw_text, saw_reasoning, saw_tool, saw_structured]
-        .into_iter()
-        .filter(|seen| *seen)
-        .count();
-    match kinds {
-        0 => StreamTelemetryOutputKind::None,
-        1 if saw_text => StreamTelemetryOutputKind::Text,
-        1 if saw_reasoning => StreamTelemetryOutputKind::Reasoning,
-        1 if saw_tool => StreamTelemetryOutputKind::Tool,
-        1 if saw_structured => StreamTelemetryOutputKind::Structured,
-        _ => StreamTelemetryOutputKind::Mixed,
-    }
 }
 
 #[cfg(test)]
@@ -152,7 +161,7 @@ mod tests {
         let t2 = start + std::time::Duration::from_millis(9);
         let t3 = start + std::time::Duration::from_millis(25);
         let t4 = start + std::time::Duration::from_millis(30);
-        let mut recorder = StreamTelemetryRecorder::new(start);
+        let mut recorder = StreamTelemetryRecorder::new(start, None);
         recorder.record_provider_event_at(t1);
         recorder.record_generation_event_at(t2, GenerationKind::Reasoning);
         recorder.record_provider_event_at(t3);

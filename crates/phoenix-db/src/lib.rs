@@ -7156,7 +7156,11 @@ impl Database {
         Ok(transcript_generation)
     }
 
-    /// Upsert one finalized `llm_request_metrics` row keyed by `(request_id, retry_attempt)`.
+    /// Inserts or replaces one finalized provider-attempt metrics row, keyed by request and retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot persist the metrics row.
     pub async fn upsert_llm_request_metrics(&self, metrics: &LlmAttemptMetrics) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
@@ -7211,6 +7215,11 @@ impl Database {
         Ok(())
     }
 
+    /// Returns all persisted attempts for a request in retry order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read or decode the rows.
     pub async fn llm_request_metrics_for_request(
         &self,
         request_id: &str,
@@ -7230,6 +7239,11 @@ impl Database {
             .collect()
     }
 
+    /// Returns the newest provider-attempt analytics rows within a bounded window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read or decode the rows.
     pub async fn usage_recent_llm_metrics(
         &self,
         since_rfc3339: &str,
@@ -7240,8 +7254,8 @@ impl Database {
              dispatch_to_first_generation_event_ms, outcome, created_at \
              FROM llm_request_metrics \
              WHERE created_at >= ?1 \
-             ORDER BY created_at ASC, request_id ASC, retry_attempt ASC \
-             LIMIT ?2"
+             ORDER BY created_at DESC, request_id DESC, retry_attempt DESC \
+             LIMIT ?2",
         )
         .bind(since_rfc3339)
         .bind(limit)
@@ -14973,6 +14987,31 @@ mod tests {
         .await
         .unwrap();
 
+        let replacement = LlmAttemptMetrics {
+            conversation_id: "conv-ttft".to_string(),
+            root_conversation_id: "conv-ttft".to_string(),
+            request_id: "req-1".to_string(),
+            retry_attempt: 1,
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            transport: LlmTransport::HttpSse,
+            total_duration_ms: 4_100,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: Some(110),
+                dispatch_to_first_generation_event_ms: Some(910),
+                dispatch_to_first_visible_text_ms: Some(960),
+                provider_event_count: 2,
+                generation_event_count: 1,
+                visible_text_event_count: 1,
+                max_provider_gap_ms: Some(800),
+                max_generation_gap_ms: None,
+                output_kind: StreamTelemetryOutputKind::Text,
+                completed: true,
+            },
+            outcome: LlmAttemptOutcome::Success,
+        };
+        db.upsert_llm_request_metrics(&replacement).await.unwrap();
+
         let rows = db
             .usage_recent_llm_metrics("1970-01-01T00:00:00+00:00", 1)
             .await
@@ -14983,7 +15022,7 @@ mod tests {
         assert_eq!(rows[0].provider, "anthropic");
         assert_eq!(rows[0].model, "claude-sonnet-5");
         assert_eq!(rows[0].transport, LlmTransport::HttpSse);
-        assert_eq!(rows[0].dispatch_to_first_generation_event_ms, Some(900));
+        assert_eq!(rows[0].dispatch_to_first_generation_event_ms, Some(910));
         assert_eq!(rows[0].outcome, LlmAttemptOutcome::Success);
 
         let all_rows = db
@@ -14991,8 +15030,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all_rows.len(), 2);
+        assert_eq!(all_rows[1].request_id, "req-2");
         assert_eq!(all_rows[1].retry_attempt, 2);
         assert_eq!(all_rows[1].transport, LlmTransport::HttpJson);
+        assert_eq!(all_rows[1].dispatch_to_first_generation_event_ms, None);
         assert_eq!(all_rows[1].outcome, LlmAttemptOutcome::ServerError);
     }
 
