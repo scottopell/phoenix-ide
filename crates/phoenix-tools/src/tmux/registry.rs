@@ -1583,42 +1583,10 @@ mod tests {
         );
     }
 
-    /// Direct-mode (no worktree) continuations resolve to their own
-    /// `Conversation(<child id>)` scope, which is never equal to the
-    /// parent's `Conversation(<parent id>)` scope. Cascade must therefore
-    /// tear the orphan server down via the scope-equality preservation
-    /// rule — even when `inheritor_scope` is provided.
+    /// Every continuation retains its parent's durable WorkScopeId. Cascade
+    /// must therefore skip kill/unlink when a successor inherits the scope.
     #[tokio::test]
-    async fn cascade_on_delete_direct_continuation_does_not_preserve() {
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        // Stage an orphaned socket file at the conv-{id} keyed path.
-        let socket_path = socket_path_for(tmp.path(), "parent-direct");
-        std::fs::write(&socket_path, b"stale").unwrap();
-        assert!(socket_path.exists(), "precondition: socket file staged");
-
-        // Direct conv (Conversation scope) being continued. The
-        // continuation has a different scope (its own conversation id),
-        // so preservation must NOT trigger — socket should be unlinked.
-        let parent_scope = scope("parent-direct");
-        let child_scope = scope("child-conv");
-        let report = reg
-            .cascade_on_delete(&parent_scope, Some(&child_scope))
-            .await;
-        assert!(report.kill_server_error.is_none());
-        assert!(report.unlink_error.is_none());
-        assert!(
-            !socket_path.exists(),
-            "Direct continuation must not preserve socket; got lingering {}",
-            socket_path.display()
-        );
-    }
-
-    /// Worktree-backed continuations resolve to the same `Worktree(<path>)`
-    /// scope as the parent. Cascade must skip kill/unlink in this case
-    /// via the scope-equality preservation rule.
-    #[tokio::test]
-    async fn cascade_on_delete_worktree_continuation_preserves_socket() {
+    async fn cascade_on_delete_continuation_preserves_socket() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         let worktree = std::path::PathBuf::from("/tmp/phoenix-test-worktree-preserve");
@@ -1634,7 +1602,7 @@ mod tests {
         assert!(report.unlink_error.is_none());
         assert!(
             socket_path.exists(),
-            "worktree-backed continuation must preserve socket at {}",
+            "continuation must preserve its WorkScope socket at {}",
             socket_path.display()
         );
         // Cleanup so the file doesn't leak into the next test run.
