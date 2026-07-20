@@ -213,12 +213,19 @@ interface ViewerSlotProviderProps {
   /** Active conversation slug — scopes patchContext and per-conversation
    *  last-viewer storage. */
   scopeKey?: string | undefined;
-  /** Server-authoritative live-session flag. Undefined means conversation truth
-   *  has not loaded yet, so lifecycle-aware restoration must wait. */
+  /** Latest browser-session state from the conversation snapshot. */
   browserSessionActive: boolean | undefined;
+  /** Whether the snapshot is live enough to authorize restoring or deleting
+   *  browser convenience storage. Defaults true for isolated consumers. */
+  browserSessionStateLoaded?: boolean;
 }
 
-export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }: ViewerSlotProviderProps) {
+export function ViewerSlotProvider({
+  children,
+  scopeKey,
+  browserSessionActive,
+  browserSessionStateLoaded = true,
+}: ViewerSlotProviderProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
 
@@ -357,9 +364,9 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   useEffect(() => {
     if (!scopeKey) return;
     if (slot.kind === 'none') return;
-    if (slot.kind === 'browser' && browserSessionActive !== true) return;
+    if (slot.kind === 'browser' && (!browserSessionStateLoaded || browserSessionActive !== true)) return;
     setLastViewer(scopeKey, searchString);
-  }, [scopeKey, slot.kind, searchString, browserSessionActive]);
+  }, [scopeKey, slot.kind, searchString, browserSessionActive, browserSessionStateLoaded]);
 
   // REQ-VS-014: restore the last viewer on in-app *entry* to a conversation.
   // Entry is a scopeKey change (the user navigated to a different conversation),
@@ -403,7 +410,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     }
     const storedParams = new URLSearchParams(stored);
     if (storedParams.get(VIEWER_PARAM) === 'browser') {
-      if (browserSessionActive === undefined) return;
+      if (!browserSessionStateLoaded || browserSessionActive === undefined) return;
       if (!browserSessionActive) {
         clearLastViewer(scopeKey);
         enteredScopeRef.current = scopeKey;
@@ -413,7 +420,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     enteredScopeRef.current = scopeKey;
     restorationScheduledForScopeRef.current = scopeKey;
     setSearchParams(storedParams, { replace: true });
-  }, [scopeKey, browserSessionActive, location.key, searchParams, setSearchParams]);
+  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, location.key, searchParams, setSearchParams]);
 
   useEffect(() => {
     if (restorationScheduledForScopeRef.current === scopeKey && slot.kind !== 'none') {
@@ -446,13 +453,18 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     prevActiveRef.current = browserSessionActive;
     if (prev !== true && browserSessionActive === true && slotKind === 'none') {
       if (restorationScheduledForScopeRef.current !== scopeKey) openBrowser();
-    } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
+    } else if (
+      prev === true
+      && browserSessionActive === false
+      && browserSessionStateLoaded
+      && slotKind === 'browser'
+    ) {
       // Browser snapshots are only useful while their server-owned session is
       // live. Keeping one here would restore a dead full-screen viewer on the
       // next in-app entry, where no new falling edge exists to close it.
       clearSlot(true);
     }
-  }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
+  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, slotKind, openBrowser, clearSlot]);
 
   const commands = useMemo<ViewerSlotCommands>(
     () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),

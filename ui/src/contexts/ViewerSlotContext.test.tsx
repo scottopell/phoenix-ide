@@ -473,6 +473,35 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(latest!.slot.kind).toBe('browser');
   });
 
+  it('does not auto-open when readiness confirms a browser that was already active on entry', () => {
+    let latest: ViewerSlotValue | null = null;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [loaded, setLoadedState] = useState(false);
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={true}
+          browserSessionStateLoaded={loaded}
+        >
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(latest!.slot.kind).toBe('none');
+    act(() => { setLoaded!(true); });
+    expect(latest!.slot.kind).toBe('none');
+  });
+
   it('auto-opens when loaded session truth rises from unknown to active in the same conversation', () => {
     let latest: ViewerSlotValue | null = null;
     let setActive: ((active: boolean | undefined) => void) | null = null;
