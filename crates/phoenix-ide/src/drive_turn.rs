@@ -152,6 +152,10 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
 ///
 /// Returns an error if validation/bootstrap fails or the runtime does not reach
 /// a stable state within the requested timeout.
+///
+/// # Panics
+/// Panics only if a persisted ordinary conversation violates the database
+/// runtime-role invariant by lacking its required work-scope identifier.
 pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurnError> {
     let cwd = request.validate()?;
     install_crypto_provider();

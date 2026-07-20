@@ -44,6 +44,7 @@ pub async fn browser_view_ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, conversation_id, state))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppState) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 

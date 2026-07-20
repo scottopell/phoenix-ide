@@ -15,6 +15,8 @@ impl WorkScopeId {
         Self(Uuid::new_v4().to_string())
     }
 
+    /// # Errors
+    /// Returns [`WorkScopeIdError`] when the supplied identifier is empty.
     pub fn parse(value: impl Into<String>) -> Result<Self, WorkScopeIdError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -95,18 +97,13 @@ impl fmt::Display for ResourceScopeKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeRole {
+    #[default]
     User,
     SubAgent,
     Coordinator,
-}
-
-impl Default for RuntimeRole {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 impl RuntimeRole {

@@ -598,7 +598,7 @@ pub(crate) async fn abandon_task(
             Ok(refresh) if !refresh.observations.is_empty() => {
                 if let Err(e) = state
                     .db
-                    .upsert_work_scope_pr_observations(&pr_scope, &refresh.observations)
+                    .upsert_work_scope_pr_observations(pr_scope, &refresh.observations)
                     .await
                 {
                     tracing::warn!(error = %e, "Best-effort PR association refresh before abandon failed");
@@ -630,7 +630,7 @@ pub(crate) async fn abandon_task(
     let mode_label = if is_work_mode { "Work" } else { "Branch" };
     let pr_hint = state
         .db
-        .primary_work_scope_pr_association(&pr_scope)
+        .primary_work_scope_pr_association(pr_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map(|pr| format!(" PR #{} preserves history.", pr.pr_number))

@@ -278,7 +278,7 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const MIGRATION_052: &str = r#"
+const MIGRATION_052: &str = r"
 ALTER TABLE work_scopes RENAME TO work_scopes_old;
 CREATE TEMP TABLE migration_052_scope_map (
     old_id INTEGER PRIMARY KEY,
@@ -763,7 +763,7 @@ DROP TABLE migration_052_environment_candidates;
 DROP TABLE migration_052_environment_representative;
 DROP TABLE migration_052_wake_scope_map;
 DROP TABLE migration_052_guard;
-"#;
+";
 
 const MIGRATION_050: &str = r"
 ALTER TABLE wake_bindings
@@ -3174,6 +3174,7 @@ mod tests {
     /// Skill rows contribute files only (no images field); the blob is left
     /// intact at this phase (the strip lands with the read/write cutover).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_025_backfills_attachment_tables_from_content() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
@@ -4157,6 +4158,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     async fn migration_052_normalizes_authority_environment_and_preserves_wakes() {
         let pool = test_pool().await;
         setup_legacy_schema_through(&pool, 51).await;

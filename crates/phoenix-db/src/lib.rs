@@ -413,7 +413,7 @@ fn pr_feedback_status_from_db(value: &str) -> DbResult<PrFeedbackStatus> {
 
 fn row_to_work_scope_observed_branch(row: &SqliteRow) -> WorkScopeObservedBranch {
     WorkScopeObservedBranch {
-        work_scope_id: row_work_scope_id(&row),
+        work_scope_id: row_work_scope_id(row),
         repository_identity: row.get("repository_identity"),
         branch_name: row.get("branch_name"),
         first_observed_head_oid: row.get("first_observed_head_oid"),
@@ -670,7 +670,7 @@ fn row_to_work_scope_active_pr_selection(
         }
     };
     Ok(WorkScopeActivePrSelectionRow {
-        work_scope_id: row_work_scope_id(&row),
+        work_scope_id: row_work_scope_id(row),
         selection,
         latest_observed_branch,
         inference_generation: row.get::<i64, _>("inference_generation").cast_unsigned(),
@@ -707,7 +707,7 @@ pub fn qualifies_observed_branch(
 fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
     let display_state: String = row.get("display_state");
     Ok(WorkScopePrAssociation {
-        work_scope_id: row_work_scope_id(&row),
+        work_scope_id: row_work_scope_id(row),
         repo_owner: row.get("repo_owner"),
         repo_name: row.get("repo_name"),
         pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
@@ -1053,8 +1053,7 @@ impl Database {
         .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::Serialization(format!(
-                "work scope {} has no normalized environment",
-                scope_id
+                "work scope {scope_id} has no normalized environment"
             )));
         }
         Ok(())
@@ -1111,6 +1110,9 @@ impl Database {
     /// Retire a scope only when both runtime and durable ownership inventories
     /// prove that no obligation remains. Conversation history and scope-owned
     /// observations are preserved; retirement changes lifecycle only.
+    /// # Errors
+    /// Returns a [`DbError`] when the reason is empty, the scope is missing,
+    /// or a durable predicate cannot be read or updated transactionally.
     pub async fn retire_work_scope(
         &self,
         precondition: WorkScopeRetirementPrecondition,
@@ -1231,6 +1233,8 @@ impl Database {
         Ok(scope.clone())
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] when scope creation or PR observation persistence fails.
     pub async fn upsert_work_scope_pr_observations(
         &self,
         scope: &phoenix_core::work_scope::WorkScopeId,
@@ -1284,7 +1288,7 @@ impl Database {
     ) -> DbResult<Vec<WorkScopePrAssociation>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(Vec::new());
-        };
+        }
         let work_scope_id = scope;
         let rows = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
@@ -1349,6 +1353,8 @@ impl Database {
         Ok(result)
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] when scope lookup or feedback persistence fails.
     pub async fn update_work_scope_pr_feedback_status(
         &self,
         scope: &phoenix_core::work_scope::WorkScopeId,
@@ -1359,7 +1365,7 @@ impl Database {
     ) -> DbResult<()> {
         if !self.work_scope_exists(scope).await? {
             return Ok(());
-        };
+        }
         let work_scope_id = scope;
         sqlx::query(
             "UPDATE work_scope_pr_associations
@@ -1455,7 +1461,7 @@ impl Database {
     ) -> DbResult<Vec<WorkScopeObservedBranch>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(Vec::new());
-        };
+        }
         let work_scope_id = scope;
         let rows = sqlx::query(
             "SELECT work_scope_id, repository_identity, branch_name, first_observed_head_oid,
@@ -1481,7 +1487,7 @@ impl Database {
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(None);
-        };
+        }
         let work_scope_id = scope;
         let row = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
@@ -1595,7 +1601,7 @@ impl Database {
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(None);
-        };
+        }
         let work_scope_id = scope;
         self.clear_active_work_scope_pr_pin_for_scope_id(work_scope_id, input)
             .await
@@ -1611,7 +1617,7 @@ impl Database {
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(None);
-        };
+        }
         let work_scope_id = scope;
         self.derive_active_work_scope_pr_selection_for_scope_id(
             work_scope_id,
@@ -1886,7 +1892,7 @@ impl Database {
     ) -> DbResult<Option<WorkScopePrFeedbackBaseline>> {
         if !self.work_scope_exists(scope).await? {
             return Ok(None);
-        };
+        }
         let work_scope_id = scope;
         let row = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
@@ -2750,7 +2756,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_conversation_with_project(
         &self,
         id: &str,

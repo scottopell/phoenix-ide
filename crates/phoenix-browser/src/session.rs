@@ -1014,6 +1014,9 @@ impl BrowserSessionManager {
     /// Actor-authorized session access. A restricted actor cannot attach to a
     /// Work session merely because it shares the scope. Work actors retain the
     /// one-session-per-scope semantics and may control either authority kind.
+    /// # Errors
+    /// Returns [`BrowserError::AccessDenied`] when the actor cannot control an
+    /// existing session, or a browser launch/initialization error when creating one.
     pub async fn get_session_for_actor(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1142,6 +1145,9 @@ impl BrowserSessionManager {
 
         Ok(session_arc)
     }
+    /// # Errors
+    /// Returns [`BrowserError::AccessDenied`] when an existing session belongs
+    /// to an actor with stronger or different restricted authority.
     pub async fn get_existing_for_actor(
         &self,
         work_scope: &ResourceScopeKey,
