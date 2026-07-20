@@ -421,10 +421,13 @@ async fn wait_for_text_response(
             if close_after_completion {
                 if exited || status == "readiness_timed_out" {
                     let _ = kill_window(config_path, socket_path, &target.window_id).await;
-                } else if let Err(error) =
-                    set_remain_on_exit(config_path, socket_path, &target.window_id, false).await
-                {
-                    tracing::debug!(window_id = target.window_id, %error, "failed to restore tmux exit cleanup");
+                } else {
+                    match restore_exit_cleanup(config_path, socket_path, &target.window_id).await {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::debug!(window_id = target.window_id, %error, "failed to restore tmux exit cleanup");
+                        }
+                    }
                 }
             }
             return response;
@@ -532,23 +535,25 @@ async fn run_tmux_cli(
     .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
 }
 
-async fn set_remain_on_exit(
+async fn restore_exit_cleanup(
     config_path: &Path,
     socket_path: &Path,
     target: &str,
-    enabled: bool,
 ) -> Result<(), String> {
-    let value = if enabled { "on" } else { "off" };
     let output = run_tmux_cli(
         config_path,
         socket_path,
         &[
-            "set-option".to_string(),
-            "-w".to_string(),
+            "if-shell".to_string(),
+            "-F".to_string(),
             "-t".to_string(),
             target.to_string(),
-            "remain-on-exit".to_string(),
-            value.to_string(),
+            "#{pane_dead}".to_string(),
+            format!("kill-window -t {}", shell_quote(target)),
+            format!(
+                "set-option -w -t {} remain-on-exit off",
+                shell_quote(target)
+            ),
         ],
     )
     .await?;
@@ -671,6 +676,7 @@ mod tests {
     use super::*;
     use crate::tmux::registry::socket_path_for_worktree;
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
+    use phoenix_core::work_scope::WorkScope;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -979,6 +985,79 @@ mod tests {
 
         let inspectable = shell_wrapper("echo READY", true, false);
         assert!(inspectable.ends_with("exec ${SHELL:-/bin/bash} -i"));
+    }
+
+    #[tokio::test]
+    async fn restoring_exit_cleanup_closes_an_already_dead_readiness_window() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let server = registry
+            .ensure_live(
+                &WorkScope::Conversation("restore-dead-window".into()),
+                cwd_tmp.path(),
+            )
+            .await
+            .unwrap();
+        let socket_path = server.read().await.socket_path.clone();
+        let config_path = registry.config_path();
+        let target = start_tmux_window(
+            &config_path,
+            &socket_path,
+            cwd_tmp.path(),
+            "restore-dead-window",
+            "true",
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = run_tmux_cli(
+                &config_path,
+                &socket_path,
+                &[
+                    "display-message".into(),
+                    "-p".into(),
+                    "-t".into(),
+                    target.window_id.clone(),
+                    "#{pane_dead}".into(),
+                ],
+            )
+            .await
+            .unwrap();
+            if output.stdout.starts_with(b"1") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pane should become dead");
+            // test-timing-allow: pane_dead is the observable tmux process-exit evidence
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+        }
+
+        restore_exit_cleanup(&config_path, &socket_path, &target.window_id)
+            .await
+            .unwrap();
+        let capture = run_tmux_cli(
+            &config_path,
+            &socket_path,
+            &[
+                "capture-pane".into(),
+                "-p".into(),
+                "-t".into(),
+                target.window_id,
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(!capture.status.success());
+        kill_socket(&socket_path).await;
     }
 
     #[test]
