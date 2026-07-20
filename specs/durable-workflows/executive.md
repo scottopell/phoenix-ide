@@ -9,11 +9,13 @@ attempt fencing, optional reclaimable leasing, reconciliation, durable
 scheduling, canonical delivery, and runtime-acceptance bookkeeping where a
 profile requires it.
 
-Wake and conversation creation remain the two normative profiles. Wake remains
-the first intended implementation slice because it exercises observation,
-deadline precedence, canonical delivery, continuation, and runtime acceptance.
-Creation remains a second profile that exercises a richer dependency graph,
-resource reconciliation, and compensation.
+The normative profiles cover direct-chat acceptance, top-level conversation LLM
+effects, wake obligations, and conversation creation. Direct chat owns immutable
+turn acceptance and exact replay identity. The top-level LLM profile owns durable
+prepared requests, provider attempts, completed-response receipts, atomic product
+acceptance, durable tool intent, streaming replacement, and Stop fencing. Wake
+exercises observation and continuation; creation exercises richer dependency,
+resource reconciliation, and compensation behavior.
 
 ## Current Reality
 
@@ -34,8 +36,9 @@ Wake is implemented end to end for durable Bash and tmux obligations:
 registration precedes acknowledgement, observation and deadline arbitration are
 restart-safe, terminal results materialize once as linked conversation messages,
 adoption atomically resolves exact delivery sets, and auto-resume is coalesced
-through durable runtime acceptance. Direct chat and conversation creation remain
-specified profiles without matching vertical-slice implementations.
+through durable runtime acceptance. Direct chat, top-level LLM effects, and
+conversation creation are specified profiles without matching complete vertical-
+slice implementations.
 
 ## Normative Shape
 
@@ -44,6 +47,7 @@ The current normative package comprises:
 - `requirements.md`
 - `durable-workflows.allium`
 - `direct-chat-profile.allium`
+- `llm-profile.allium`
 - `wake-profile.allium`
 - `creation-profile.allium`
 - ADR-013 through ADR-016 and ADR-019 in `specs/adrs/`
@@ -57,15 +61,19 @@ These artifacts now state:
 4. a direct-chat profile with immutable prepared payloads, typed outcome and
    replay variants, target-local runtime arbitration, exact-ID reconciliation,
    and independent per-target fan-out;
-5. universal attempt fencing plus optional reclaimable leases only where the
+5. durable top-level LLM effects for all covered providers and every call in a
+   non-sub-agent turn, with immutable prepared requests, safely repeatable unknown
+   attempts, completed-response receipts, atomic product acceptance, normalized
+   tool intents, ephemeral streaming, and Stop generation fencing;
+6. universal attempt fencing plus optional reclaimable leases only where the
    phase is reclaimable;
-6. structural execution capability classes and recovery policies;
-7. one canonical durable delivery lifecycle;
-8. submit-then-observe for long-running remote work;
-9. typed profile versioning and migration with explicit incompatible-work
-   handling;
-10. `CoalesceLatest` as the first explicit schedule policy;
-11. migration safety without permanent parallel authority.
+7. structural execution capability classes and recovery policies;
+8. one canonical durable delivery lifecycle;
+9. submit-then-observe for long-running remote work;
+10. typed profile versioning and migration with explicit incompatible-work
+    handling;
+11. `CoalesceLatest` as the first explicit schedule policy;
+12. migration safety without permanent parallel authority.
 
 ## Implementation Status
 
@@ -76,6 +84,7 @@ These artifacts now state:
 | REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Implemented | Capability classes, supported codecs, profile/version compatibility, incompatible status, transactional failpoints, concurrency tests, and restart tests cover the implemented foundation. |
 | REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. Direct-turn profile behavior remains specified only. |
 | REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
+| REQ-DWF-LLM-001–010 top-level LLM profile | Specified only | Covered calls across all providers require stable effect identity, immutable requests, safely repeatable unknown attempts, completed-response receipts before product meaning, atomic assistant/state/tool-intent acceptance, conservative tool recovery, ephemeral stream replacement, Stop fencing, and legacy cutover without inferred history. |
 | REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
 
@@ -97,6 +106,8 @@ Remaining profile work is:
 
 - direct-chat acceptance, replay, conflict, exact-ID reconciliation, and
   target-local runtime arbitration;
+- top-level LLM durable attempts, receipts, response acceptance, tool intents,
+  stream replacement, cancellation fencing, and provider-contract parity;
 - conversation-creation execution and compensation against the normalized
   foundation.
 

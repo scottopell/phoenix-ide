@@ -9,10 +9,10 @@ Migrate direct chat and ordinary LLM execution onto the merged durable-workflow 
 - Persist provider completion as a canonical durable response receipt before product-state acceptance.
 - Atomically accept the response into assistant message/checkpoint, next conversation state, runtime acceptance, delivery disposition, and normalized durable tool intents.
 - Broadcast and dispatch tools only after commit.
-- Represent ambiguous non-repeatable outcomes explicitly rather than blindly retrying.
+- Automatically create another attempt for a top-level LLM effect whose provider outcome was lost in a hard crash; never reissue an effect with a durable completed-response receipt. This provides at-most-one product-accepted response while permitting at-least-once provider submission after ambiguous process failure.
 
 ## Decisive regression
 
-Use a real SQLite file and separate connections. Hold a writer lock after a mock provider returns a successful response containing a tool call, force `SQLITE_BUSY`, and verify one provider call and no tool dispatch. Release the lock, recreate the runtime/process boundary, accept the same durable response without another provider call, and verify exactly one assistant message and one durable tool intent. Repeat for a non-idempotent tool result.
+Use real SQLite files and separate connections. Cover temporary receipt-persistence lock contention, crash before terminal receipt, crash after receipt but before product acceptance, crash after acceptance but before tool dispatch, crash after tool execution may have begun, both Stop transaction orderings, partial-stream replacement, and representative provider adapters. Verify that an unknown attempt is automatically resubmitted, a durable completed-response receipt is never resubmitted, only one response becomes product-authoritative, and tool dispatch occurs only from committed durable intent.
 
 Read and extend the merged durable-workflow requirements and direct-chat Allium profile before editing provider loops. Do not treat last durable conversation state as safe when it predates a completed external effect.

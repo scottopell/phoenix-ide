@@ -11,6 +11,7 @@
 -- REQ-DWF-CHAT-011.
 
 use "./durable-workflows.allium" as dwf
+use "./llm-profile.allium" as llm
 
 ------------------------------------------------------------
 -- Types
@@ -104,6 +105,7 @@ entity DirectChatAcceptance {
     committed_outcome: CommittedOutcome?
     runtime_delivery: dwf/Delivery?
     runtime_acceptance: dwf/RuntimeAcceptance?
+    llm_turn: llm/TopLevelLlmTurn?
     accepted_at: Timestamp
 }
 
@@ -163,6 +165,7 @@ entity DirectChatConsumerCursor {
 -- terminal_rejected_outcome(request), prepared_event_emitted(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
 -- retryable_unaccepted_outcome(turn_key), conflicting_key_reuse_outcome(prepared_fingerprint)
 -- runtime_accepted_outcome(accepted_turn), queued_steering_outcome(accepted_turn)
+-- top_level_llm_turn_for(acceptance), llm_turn_matches_exact_acceptance(acceptance)
 -- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
 -- independent_prepared_events_emitted(request, targets)
 
@@ -204,6 +207,13 @@ invariant RuntimeAcceptanceMatchesExactAcceptedTurn {
     -- Runtime acceptance, when present, always references the exact accepted turn
     -- identity rather than a transcript offset, pagination window, or latest-
     -- message guess.
+    true
+}
+
+invariant TopLevelLlmTurnMatchesDurableAcceptance {
+    -- A runtime-accepted direct-chat turn creates one top-level LLM turn bound
+    -- to the exact durable acceptance identity and generation. Subsequent LLM
+    -- calls in that turn use the LLM profile rather than legacy execution.
     true
 }
 
@@ -261,6 +271,7 @@ rule NewAcceptanceBeginsRetryableUntilCommittedOutcomeExists {
         committed_outcome: null,
         runtime_delivery: null,
         runtime_acceptance: null,
+        llm_turn: null,
         accepted_at: now()
     )
     ensures: retryable_unaccepted_outcome(turn_key)
@@ -302,6 +313,8 @@ rule RuntimeAcceptanceWinsThePerTargetSlot {
     )
     ensures: acceptance.runtime_delivery = delivery
     ensures: acceptance.runtime_acceptance = runtime_acceptance
+    ensures: acceptance.llm_turn = top_level_llm_turn_for(acceptance)
+    ensures: llm_turn_matches_exact_acceptance(acceptance)
     ensures: acceptance.committed_outcome = CommittedOutcome{kind: RuntimeAccepted, runtime_accepted: runtime_accepted_ref(acceptance)}
     ensures: runtime_accepted_outcome(runtime_accepted_ref(acceptance))
 }
