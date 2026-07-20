@@ -675,16 +675,31 @@ impl TmuxRegistry {
         }))
     }
 
-    /// Kill one exact window after its durable terminal marker has been observed.
+    /// Kill one exact window only when its persisted server token still owns
+    /// the scoped tmux server. A token mismatch means the original server is
+    /// already gone; the replacement server must not be touched.
     ///
     /// # Errors
-    /// Returns [`TmuxError`] if the registry cannot derive or invoke the scoped tmux server.
+    /// Returns [`TmuxError`] if reading the scoped tmux server fails.
     pub async fn kill_exact_window(
         &self,
         work_scope: &ResourceScopeKey,
+        expected_server_token: &str,
         window_id: &str,
     ) -> Result<(), TmuxError> {
-        let socket_path = self.derived_socket_path(work_scope);
+        let socket_path = if let Some(entry) = self.get_existing(work_scope).await {
+            let server = entry.read().await;
+            if server.server_token != expected_server_token {
+                return Ok(());
+            }
+            server.socket_path.clone()
+        } else {
+            let derived = self.derived_socket_path(work_scope);
+            if read_server_token(&derived).await.as_deref() != Some(expected_server_token) {
+                return Ok(());
+            }
+            derived
+        };
         run_tmux_quiet(&socket_path, &["kill-window", "-t", window_id]).await;
         Ok(())
     }
@@ -1393,6 +1408,57 @@ mod tests {
             first_token, second_token,
             "respawning a missing/dead tmux server must rotate its token so stale wake bindings are fenced"
         );
+        kill_socket(&socket_path).await;
+    }
+
+    #[tokio::test]
+    async fn stale_server_token_cannot_kill_window_on_replacement_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let scope = scope("conv-token-fenced-kill");
+        let first = reg.ensure_live(&scope, tmp.path()).await.unwrap();
+        let socket_path = first.read().await.socket_path.clone();
+        let stale_token = first.read().await.server_token.clone();
+        kill_socket(&socket_path).await;
+
+        let replacement = reg.ensure_live(&scope, tmp.path()).await.unwrap();
+        let replacement_token = replacement.read().await.server_token.clone();
+        let output = run_tmux_quiet_output(
+            &socket_path,
+            &[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-n",
+                "replacement",
+            ],
+        )
+        .await
+        .unwrap();
+        let window_id = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        reg.kill_exact_window(&scope, &stale_token, &window_id)
+            .await
+            .unwrap();
+        let still_live =
+            run_tmux_quiet_output(&socket_path, &["list-windows", "-F", "#{window_id}"])
+                .await
+                .unwrap();
+        assert!(
+            String::from_utf8_lossy(&still_live.stdout)
+                .lines()
+                .any(|id| id == window_id),
+            "a stale wake binding must not kill a reused window id on the replacement server"
+        );
+
+        reg.kill_exact_window(&scope, &replacement_token, &window_id)
+            .await
+            .unwrap();
         kill_socket(&socket_path).await;
     }
 

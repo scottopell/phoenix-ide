@@ -496,6 +496,7 @@ pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
+    cwds: Mutex<HashMap<String, String>>,
     next_msg_id: Mutex<u64>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
@@ -513,6 +514,7 @@ impl InMemoryStorage {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
+            cwds: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
@@ -568,6 +570,11 @@ impl InMemoryStorage {
     /// Read back the stored `conv_mode` (test-only).
     pub fn get_mode(&self, conv_id: &str) -> Option<crate::db::ConvMode> {
         self.modes.lock().unwrap().get(conv_id).cloned()
+    }
+
+    /// Read back the stored cwd (test-only).
+    pub fn get_cwd(&self, conv_id: &str) -> Option<String> {
+        self.cwds.lock().unwrap().get(conv_id).cloned()
     }
 
     /// Get all messages for a conversation
@@ -835,15 +842,20 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
-    async fn update_conversation_mode(
+    async fn update_conversation_mode_and_cwd(
         &self,
         conv_id: &str,
         mode: &crate::db::ConvMode,
+        cwd: &str,
     ) -> Result<(), String> {
         self.modes
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), mode.clone());
+        self.cwds
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), cwd.to_string());
         Ok(())
     }
 
@@ -1230,6 +1242,20 @@ mod tests {
             MessageContent::User(u) => assert_eq!(u.text, "hello"),
             _ => panic!("Expected User content"),
         }
+    }
+
+    #[tokio::test]
+    async fn in_memory_storage_records_atomic_mode_and_cwd_update() {
+        let storage = InMemoryStorage::new();
+        let mode = crate::db::ConvMode::Direct;
+
+        storage
+            .update_conversation_mode_and_cwd("conv-1", &mode, "/tmp/promoted")
+            .await
+            .unwrap();
+
+        assert_eq!(storage.get_mode("conv-1"), Some(mode));
+        assert_eq!(storage.get_cwd("conv-1").as_deref(), Some("/tmp/promoted"));
     }
 
     /// Integration test: simple text response using builder

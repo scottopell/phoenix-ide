@@ -4789,6 +4789,29 @@ impl Database {
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
+        self.update_conversation_mode_inner(id, mode, None).await
+    }
+
+    /// Atomically update a conversation's mode, cwd, and normalized environment.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if the conversation is missing or persistence fails.
+    pub async fn update_conversation_mode_and_cwd(
+        &self,
+        id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+    ) -> DbResult<()> {
+        self.update_conversation_mode_inner(id, mode, Some(cwd))
+            .await
+    }
+
+    async fn update_conversation_mode_inner(
+        &self,
+        id: &str,
+        mode: &ConvMode,
+        new_cwd: Option<&str>,
+    ) -> DbResult<()> {
         let now = Utc::now().to_rfc3339();
         let cm = conv_mode_columns(mode);
         let mut tx = self.pool.begin().await?;
@@ -4797,15 +4820,17 @@ impl Database {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| DbError::ConversationNotFound(id.to_string()))?;
-        let cwd: String = row.get("cwd");
+        let persisted_cwd: String = row.get("cwd");
+        let cwd = new_cwd.unwrap_or(&persisted_cwd);
         let scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
             .map_err(|error| DbError::Serialization(error.to_string()))?;
 
         let result = sqlx::query(
             "UPDATE conversations
              SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
-                 cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7, updated_at = ?8
-             WHERE id = ?9 AND work_scope_id = ?10",
+                 cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7,
+                 cwd = COALESCE(?8, cwd), updated_at = ?9
+             WHERE id = ?10 AND work_scope_id = ?11",
         )
         .bind(cm.kind)
         .bind(cm.branch_name)
@@ -4814,6 +4839,7 @@ impl Database {
         .bind(cm.task_id)
         .bind(cm.task_title)
         .bind(cm.next_taskmd_id_hint)
+        .bind(new_cwd)
         .bind(&now)
         .bind(id)
         .bind(scope_id.as_str())
@@ -4826,7 +4852,7 @@ impl Database {
         Self::update_work_scope_environment_tx(
             &mut tx,
             &scope_id,
-            Self::environment_for_mode(&cwd, &cm),
+            Self::environment_for_mode(cwd, &cm),
             &now,
         )
         .await?;
@@ -5251,9 +5277,8 @@ impl Database {
 
     /// Create a continuation conversation for a context-exhausted parent, atomically.
     ///
-    /// Implements REQ-BED-030 (see `specs/bedrock/design.md` §"Context Continuation
-    /// Worktree Transfer" and `projects.allium` rules
-    /// `WorktreeTransferredOnContinuation` / `DirectContinuationInheritsCwd`).
+    /// Implements REQ-BED-030 and the continuation rules in
+    /// `specs/projects/projects.allium`.
     ///
     /// Within a single `SQLite` transaction:
     ///   1. INSERT a new `conversations` row with the parent's `conv_mode` cloned
@@ -16298,6 +16323,44 @@ mod tests {
         assert_eq!(
             db.managed_worktree_paths().await.unwrap(),
             vec!["/tmp/normalized-worktree"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_and_cwd_promotion_updates_normalized_environment_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "legacy-explore", RuntimeRole::User, &ConvState::Idle).await;
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("topic").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/promoted-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("24703").unwrap(),
+            task_title: NonEmptyString::new("promoted").unwrap(),
+        };
+
+        db.update_conversation_mode_and_cwd("legacy-explore", &mode, "/tmp/promoted-worktree")
+            .await
+            .unwrap();
+
+        let conv = db.get_conversation("legacy-explore").await.unwrap();
+        assert_eq!(conv.cwd, "/tmp/promoted-worktree");
+        assert_eq!(conv.work_scope_id.as_ref(), Some(&scope));
+        let environment: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT environment_kind, cwd, worktree_path
+             FROM work_scope_environments WHERE work_scope_id = ?1",
+        )
+        .bind(scope.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            environment,
+            (
+                "allocated_worktree".to_string(),
+                Some("/tmp/promoted-worktree".to_string()),
+                Some("/tmp/promoted-worktree".to_string())
+            )
         );
     }
 

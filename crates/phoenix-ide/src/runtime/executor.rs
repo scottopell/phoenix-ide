@@ -5616,24 +5616,15 @@ where
                     task_title: crate::db::NonEmptyString::new(approval_result.task_title.clone())
                         .expect("task_title from task approval must be non-empty"),
                 };
+                let approved_cwd = crate::conversation_cwd::validate_conversation_cwd(
+                    &approval_result.worktree_path,
+                )
+                .map_err(|e| e.to_string())?;
                 storage
-                    .update_conversation_mode(&self.context.conversation_id, &work_mode)
-                    .await?;
-
-                // Legitimate cwd mutation (task 13012, in-place promotion).
-                // For Managed conversations (REQ-PROJ-028): the early Explore
-                // worktree is promoted in place (branch rename, same path), so
-                // this write is a no-op — worktree_path == conv.cwd already.
-                // For legacy Managed conversations whose cwd was the repo root,
-                // this is load-bearing: it moves cwd to the new worktree path.
-                storage
-                    .update_conversation_cwd_recovery_only(
+                    .update_conversation_mode_and_cwd(
                         &self.context.conversation_id,
-                        crate::conversation_cwd::validate_conversation_cwd(
-                            &approval_result.worktree_path,
-                        )
-                        .map_err(|e| e.to_string())?
-                        .raw(),
+                        &work_mode,
+                        approved_cwd.raw(),
                     )
                     .await?;
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);

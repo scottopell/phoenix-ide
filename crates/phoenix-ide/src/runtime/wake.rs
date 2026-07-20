@@ -692,7 +692,11 @@ impl TerminalInspector for RuntimeRegistryInspector {
                     let scope = work_scope_from_identity(&evidence.identity.work_scope);
                     let _ = self
                         .tmux
-                        .kill_exact_window(&scope, &evidence.identity.window_id)
+                        .kill_exact_window(
+                            &scope,
+                            &evidence.identity.server_token,
+                            &evidence.identity.window_id,
+                        )
                         .await;
                 }
             }

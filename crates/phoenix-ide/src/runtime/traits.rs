@@ -153,8 +153,13 @@ pub trait StateStore: Send + Sync {
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
 
-    /// Update the conversation mode (e.g., Explore -> Work on task approval)
-    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
+    /// Atomically update mode, cwd, and normalized environment during promotion.
+    async fn update_conversation_mode_and_cwd(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+    ) -> Result<(), String>;
 
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
@@ -450,8 +455,15 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_state(conv_id).await
     }
 
-    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
-        (**self).update_conversation_mode(conv_id, mode).await
+    async fn update_conversation_mode_and_cwd(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+    ) -> Result<(), String> {
+        (**self)
+            .update_conversation_mode_and_cwd(conv_id, mode, cwd)
+            .await
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String> {
@@ -773,9 +785,14 @@ impl StateStore for DatabaseStorage {
         Ok(conv.state)
     }
 
-    async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
+    async fn update_conversation_mode_and_cwd(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+    ) -> Result<(), String> {
         self.db
-            .update_conversation_mode(conv_id, mode)
+            .update_conversation_mode_and_cwd(conv_id, mode, cwd)
             .await
             .map_err(|e| e.to_string())
     }

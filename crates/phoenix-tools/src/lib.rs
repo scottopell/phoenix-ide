@@ -386,10 +386,7 @@ pub struct ToolContext {
     /// REQ-TMUX-013.
     tmux_registry: Arc<TmuxRegistry>,
 
-    /// The worktree path for this conversation, if in Work/Branch/Explore
-    /// mode. `None` for Direct-mode conversations. Used by `tmux()` to
-    /// key the socket to the worktree rather than the conversation ID so
-    /// the session survives context-exhaustion continuations (task 03001).
+    /// Concrete worktree path from the normalized environment, when allocated.
     pub worktree_path: Option<PathBuf>,
 
     /// Durable owner for work-affine resources created by this tool call.

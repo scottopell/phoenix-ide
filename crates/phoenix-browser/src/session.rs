@@ -28,12 +28,8 @@ use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, Resou
 
 /// Derive a Chrome user data dir from a `ResourceScopeKey::stable_key()`.
 ///
-/// The `stable_key` embeds the worktree path for `Worktree` scopes, which can
-/// easily exceed Chrome's per-component path length limit (and the `SUN_PATH`
-/// max for any unix-domain socket Chrome opens beneath the profile dir) on
-/// deep checkouts. Hash the key to a bounded 16-hex-char prefix instead —
-/// same trick `socket_path_for_worktree` uses for tmux sockets — so the
-/// resulting path is filesystem-safe and bounded regardless of input length.
+/// Hash the stable key to a bounded filesystem-safe component while preserving
+/// deterministic profile reuse for the same resource scope.
 ///
 /// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
 /// stable across Rust/Phoenix releases — a toolchain upgrade must not

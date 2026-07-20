@@ -2524,6 +2524,7 @@ mod tests {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
         SqlitePoolOptions::new()
             .max_connections(1)
@@ -4300,6 +4301,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(invalid_scope_nullability, 0);
+
+        let invalid_lifecycle: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scopes
+             WHERE lifecycle <> 'active' OR retired_at IS NOT NULL OR retired_reason IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_lifecycle, 0);
+
+        let invalid_role_scope = sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator'
+             WHERE id = 'work-root'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_role_scope.is_err());
+
+        let invalid_fk = sqlx::query(
+            "UPDATE conversations SET work_scope_id = 'missing-scope'
+             WHERE id = 'work-root'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_fk.is_err());
 
         let generated_environments: Vec<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(
