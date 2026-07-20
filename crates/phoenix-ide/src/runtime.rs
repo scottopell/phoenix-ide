@@ -28,7 +28,7 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::browser::session::BrowserSessionLifecycleEvent;
+use crate::tools::browser::session::{BrowserSessionAudience, BrowserSessionLifecycleEvent};
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
     TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
@@ -1404,6 +1404,7 @@ impl RuntimeManager {
     /// edges into per-conversation SSE broadcasts. Must be called once after
     /// `RuntimeManager::new`. If the receiver was already taken (double
     /// call) this is a no-op.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_browser_lifecycle_bridge(self: &Arc<Self>) {
         // Gate browser idle reaping on scope liveness: the cleanup task must
         // not force-close Chrome while the scope still owns a non-terminal
@@ -1443,7 +1444,11 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                let BrowserSessionLifecycleEvent { work_scope, active } = event;
+                let BrowserSessionLifecycleEvent {
+                    work_scope,
+                    audience,
+                    active,
+                } = event;
 
                 // Fan out to every live runtime handle whose conversation
                 // resolves to this `ResourceScopeKey` (REQ-BROWSER-WS-002). A
@@ -1470,12 +1475,22 @@ impl RuntimeManager {
                     let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
                         continue;
                     };
-                    let conv_scope = ResourceScopeKey::Work(
-                        conv.work_scope_id
-                            .clone()
-                            .expect("persisted conversation has work scope"),
-                    );
-                    if conv_scope != work_scope {
+                    let conv_scope = match conv.work_scope_id.clone() {
+                        Some(scope) => ResourceScopeKey::Work(scope),
+                        None if conv.runtime_role
+                            == crate::work_scope::RuntimeRole::Coordinator =>
+                        {
+                            ResourceScopeKey::Coordinator
+                        }
+                        None => continue,
+                    };
+                    if conv_scope != work_scope
+                        || matches!(
+                            &audience,
+                            BrowserSessionAudience::Conversation(owner)
+                                if owner != &conv_id
+                        )
+                    {
                         continue;
                     }
                     refresh_scopes.insert(conv_scope.clone());
@@ -2232,10 +2247,11 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
-        conv_context.work_scope_id = conv
-            .work_scope_id
-            .clone()
-            .expect("sub-agent conversations always have a work scope");
+        conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
+            conv.work_scope_id
+                .clone()
+                .expect("sub-agent conversations always have a work scope"),
+        );
         conv_context.resource_authority = match spec.mode {
             SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
             SubAgentMode::Work => crate::work_scope::ResourceAuthority::Work,
@@ -2502,10 +2518,13 @@ impl RuntimeManager {
         } else {
             ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
         };
-        context.work_scope_id = conv
-            .work_scope_id
-            .clone()
-            .expect("ordinary conversations always have a work scope");
+        context.resource_scope = match conv.work_scope_id.clone() {
+            Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
+            None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
+                crate::work_scope::ResourceScopeKey::Coordinator
+            }
+            None => return Err("ordinary conversation is missing its work scope".to_string()),
+        };
         context.resource_authority = match conv.conv_mode {
             ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
             ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
@@ -3020,7 +3039,8 @@ impl RuntimeManager {
             .map_err(|e| format!("Failed to send steer message: {e}"))
     }
 
-    /// Subscribe to conversation updates
+    /// Subscribe to conversation updates.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn subscribe(
         self: &Arc<Self>,
         conversation_id: &str,

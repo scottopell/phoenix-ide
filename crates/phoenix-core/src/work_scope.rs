@@ -51,15 +51,14 @@ impl FromStr for WorkScopeId {
     }
 }
 
-/// Namespace key for resources that may either belong to persisted work or to
-/// the structurally separate `/new` global terminal.
-///
-/// Ordinary conversation resources always use `Work`; `GlobalTerminal` is
-/// only valid for the singleton terminal exposed before a conversation exists.
+/// Namespace key for persisted work and structurally separate global actors.
+/// Coordinator scope is routing-only: its tool registry exposes no ordinary
+/// work-affine resources.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ResourceScopeKey {
     Work(WorkScopeId),
+    Coordinator,
     GlobalTerminal,
 }
 
@@ -68,6 +67,7 @@ impl ResourceScopeKey {
     pub fn stable_key(&self) -> String {
         match self {
             Self::Work(id) => format!("work:{}", id.as_str()),
+            Self::Coordinator => "coordinator".to_string(),
             Self::GlobalTerminal => "global_terminal".to_string(),
         }
     }
@@ -76,6 +76,9 @@ impl ResourceScopeKey {
     pub fn from_stable_key(key: &str) -> Option<Self> {
         if key == "global_terminal" {
             return Some(Self::GlobalTerminal);
+        }
+        if key == "coordinator" {
+            return Some(Self::Coordinator);
         }
         key.strip_prefix("work:")
             .and_then(|id| WorkScopeId::parse(id).ok())
@@ -86,7 +89,7 @@ impl ResourceScopeKey {
     pub fn work_scope_id(&self) -> Option<&WorkScopeId> {
         match self {
             Self::Work(id) => Some(id),
-            Self::GlobalTerminal => None,
+            Self::Coordinator | Self::GlobalTerminal => None,
         }
     }
 }

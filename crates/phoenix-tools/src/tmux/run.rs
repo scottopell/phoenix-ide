@@ -1665,7 +1665,12 @@ mod tests {
 
         let server = ctx
             .tmux_registry()
-            .ensure_live(&ctx.work_scope, &ctx.working_dir)
+            .ensure_live(
+                &ctx.work_scope,
+                &ctx.working_dir,
+                ctx.worktree_path.as_deref(),
+                Some(&ctx.conversation_id),
+            )
             .await
             .unwrap();
         let socket_path = server.read().await.socket_path.clone();

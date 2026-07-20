@@ -177,6 +177,9 @@ pub trait WakeRegistrar: Send + Sync {
 pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
     match scope {
         ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),
+        ResourceScopeKey::Coordinator => {
+            Err("coordinator scope cannot own a durable wake".to_string())
+        }
         ResourceScopeKey::GlobalTerminal => {
             Err("global terminal scope cannot own a durable wake".to_string())
         }
@@ -445,8 +448,36 @@ impl ToolContext {
         work_scope_id: phoenix_core::work_scope::WorkScopeId,
         authority: phoenix_core::work_scope::ResourceAuthority,
     ) -> Self {
+        Self::new_with_resource_scope(
+            cancel,
+            conversation_id,
+            working_dir,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path,
+            ResourceScopeKey::Work(work_scope_id),
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_resource_scope(
+        cancel: CancellationToken,
+        conversation_id: String,
+        working_dir: PathBuf,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
+        work_scope: ResourceScopeKey,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
         let root_conversation_id = conversation_id.clone();
-        let work_scope = ResourceScopeKey::Work(work_scope_id);
         let resource_access = phoenix_core::work_scope::EffectiveResourceAccess::new(
             conversation_id.clone(),
             authority,
@@ -607,7 +638,12 @@ impl ToolContext {
         // shell starts in the conversation's project. Ignored on
         // re-attach (see `ensure_live` doc).
         self.tmux_registry
-            .ensure_live(&self.work_scope, &self.working_dir)
+            .ensure_live(
+                &self.work_scope,
+                &self.working_dir,
+                self.worktree_path.as_deref(),
+                Some(&self.conversation_id),
+            )
             .await
     }
 

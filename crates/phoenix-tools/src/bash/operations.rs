@@ -517,7 +517,7 @@ async fn run_run(
     let handle_id;
     {
         let mut handles = handles_arc.write().await;
-        if let Err(e) = handles.check_cap(cap).await {
+        if let Err(e) = handles.check_cap_for_actor(cap, &ctx.resource_access).await {
             return BashError::HandleCapReached(e).into_tool_output();
         }
         handle_id = handles.allocate_handle_id();
@@ -1987,6 +1987,7 @@ mod tests {
         let worktree_path = None;
         let conversation_id = match work_scope {
             ResourceScopeKey::Work(id) => id.as_str().to_string(),
+            ResourceScopeKey::Coordinator => "coordinator".to_string(),
             ResourceScopeKey::GlobalTerminal => "conv-global".to_string(),
         };
         let mut ctx = crate::ToolContext::new(

@@ -1337,7 +1337,11 @@ impl Database {
         let mut grouped: std::collections::HashMap<String, Vec<WorkScopePrAssociation>> =
             std::collections::HashMap::new();
         for row in rows {
-            let stable_key: String = row.get("work_scope_id");
+            let scope_id =
+                phoenix_core::work_scope::WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let stable_key =
+                phoenix_core::work_scope::ResourceScopeKey::Work(scope_id).stable_key();
             grouped
                 .entry(stable_key)
                 .or_default()
@@ -3040,7 +3044,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
@@ -3069,7 +3073,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.slug = ?1",
@@ -3098,7 +3102,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3226,7 +3230,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3253,7 +3257,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3277,7 +3281,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -4905,7 +4909,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -4935,7 +4939,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -5606,7 +5610,7 @@ impl Database {
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
@@ -6514,7 +6518,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -8106,6 +8110,8 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
 fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
     let col = |c: &str| row.try_get::<Option<String>, _>(c).ok().flatten();
     let ne = |c: &str| col(c).and_then(|v| NonEmptyString::new(v).ok());
+    let env = |c: &str| row.try_get::<Option<String>, _>(c).ok().flatten();
+    let ne_env = |c: &str| env(c).and_then(|v| NonEmptyString::new(v).ok());
     match col("cm_kind").as_deref() {
         Some("direct") => ConvMode::Direct,
         Some("work") => {
@@ -8116,9 +8122,9 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 Some(task_id),
                 Some(task_title),
             ) = (
-                ne("cm_branch_name"),
-                ne("cm_worktree_path"),
-                ne("cm_base_branch"),
+                ne_env("env_branch_name"),
+                ne_env("env_worktree_path"),
+                ne_env("env_base_branch"),
                 ne("cm_task_id"),
                 ne("cm_task_title"),
             ) {
@@ -8136,9 +8142,9 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
         }
         Some("branch") => {
             if let (Some(branch_name), Some(worktree_path), Some(base_branch)) = (
-                ne("cm_branch_name"),
-                ne("cm_worktree_path"),
-                ne("cm_base_branch"),
+                ne_env("env_branch_name"),
+                ne_env("env_worktree_path"),
+                ne_env("env_base_branch"),
             ) {
                 ConvMode::Branch {
                     branch_name,
@@ -11688,7 +11694,12 @@ mod tests {
             .unwrap();
         assert_eq!(primary_by_scope.len(), 1);
         assert_eq!(
-            primary_by_scope.remove(scope.as_str()).unwrap().pr_number,
+            primary_by_scope
+                .remove(
+                    &phoenix_core::work_scope::ResourceScopeKey::Work(scope.clone()).stable_key(),
+                )
+                .unwrap()
+                .pr_number,
             2
         );
     }

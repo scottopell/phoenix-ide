@@ -1072,7 +1072,7 @@ mod tests {
             crate::work_scope::WorkScopeId::parse(&scope.0).unwrap(),
         );
         let server = tmux
-            .ensure_live(&resource_scope, cwd_tmp.path())
+            .ensure_live(&resource_scope, cwd_tmp.path(), None, None)
             .await
             .unwrap();
         let socket_path = server.read().await.socket_path.clone();

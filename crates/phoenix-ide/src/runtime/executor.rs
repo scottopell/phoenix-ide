@@ -4906,7 +4906,7 @@ where
                     progress,
                 });
         });
-        let tool_ctx = ToolContext::new_with_resource_access(
+        let tool_ctx = ToolContext::new_with_resource_scope(
             cancel_token,
             self.context.conversation_id.clone(),
             self.context.working_dir.clone(),
@@ -4916,7 +4916,7 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
-            self.context.work_scope_id.clone(),
+            self.context.resource_scope.clone(),
             self.context.resource_authority,
         )
         .with_bash_progress_sink(bash_progress_sink)
@@ -5628,6 +5628,7 @@ where
                     )
                     .await?;
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
+                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Refresh in-memory mode_context so downstream checks
                 // (e.g. spawn_agents Work-parent guard) observe Work mode
@@ -5712,12 +5713,7 @@ where
                             conv_mode_label: Some("Work".to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
-                            work_scope_key: Some(
-                                crate::work_scope::ResourceScopeKey::Work(
-                                    self.context.work_scope_id.clone(),
-                                )
-                                .stable_key(),
-                            ),
+                            work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
                         },
                     });

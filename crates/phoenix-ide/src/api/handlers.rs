@@ -686,7 +686,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // Resolved from the same inputs as `browser_session_active`'s
         // lookup (conversation id + worktree path). Computable without
         // AppState, so every enrich path emits the correct key.
-        work_scope_key: conversation_work_scope(conv).stable_key(),
+        work_scope_key: conversation_resource_scope(conv).stable_key(),
         creation_prompt: None,
         creation_error: None,
         cached_pr: None,
@@ -728,11 +728,18 @@ async fn enrich_conversation_with_seed(
     // Sessions are keyed by `ResourceScopeKey` (REQ-BROWSER-WS-001), so a
     // continuation of a worktree-backed conversation sees `true` here as
     // soon as its predecessor's session is live.
-    let work_scope = conversation_work_scope(conv);
+    let work_scope = conversation_resource_scope(conv);
+    let actor = crate::work_scope::EffectiveResourceAccess::new(
+        conv.id.clone(),
+        match &conv.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
     enriched.browser_session_active = state
         .runtime
         .browser_sessions()
-        .is_active(&work_scope)
+        .is_active_for_actor(&work_scope, &actor)
         .await;
     Ok(enriched)
 }
@@ -778,12 +785,25 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
     conv.state.presentation_mode()
 }
 
+fn conversation_resource_scope(
+    conv: &crate::db::Conversation,
+) -> crate::work_scope::ResourceScopeKey {
+    match conv.work_scope_id.clone() {
+        Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
+        None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
+            crate::work_scope::ResourceScopeKey::Coordinator
+        }
+        None => panic!("ordinary persisted conversation is missing its work scope"),
+    }
+}
+
 fn conversation_work_scope(conv: &crate::db::Conversation) -> crate::work_scope::ResourceScopeKey {
-    crate::work_scope::ResourceScopeKey::Work(
-        conv.work_scope_id
-            .clone()
-            .expect("persisted conversation has work scope"),
-    )
+    let scope = conversation_resource_scope(conv);
+    assert!(
+        scope.work_scope_id().is_some(),
+        "operation requires work scope"
+    );
+    scope
 }
 
 fn sidebar_cached_pr_summary(
@@ -823,11 +843,7 @@ async fn cached_pr_summaries_for_conversations(
 ) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
     let scopes: Vec<_> = conversations
         .iter()
-        .map(|conv| {
-            conv.work_scope_id
-                .clone()
-                .expect("persisted conversation has work scope")
-        })
+        .filter_map(|conv| conv.work_scope_id.clone())
         .collect();
     let associations = state
         .runtime
@@ -1118,7 +1134,7 @@ async fn list_conversations(
     let json_convs: Vec<Value> = conversations
         .iter()
         .map(|c| {
-            let scope_key = conversation_work_scope(c).stable_key();
+            let scope_key = conversation_resource_scope(c).stable_key();
             conversation_to_json(&state, c, cached_prs.get(&scope_key))
         })
         .collect();
@@ -1142,7 +1158,7 @@ async fn list_archived_conversations(
     let json_convs: Vec<Value> = conversations
         .iter()
         .map(|c| {
-            let scope_key = conversation_work_scope(c).stable_key();
+            let scope_key = conversation_resource_scope(c).stable_key();
             conversation_to_json(&state, c, cached_prs.get(&scope_key))
         })
         .collect();

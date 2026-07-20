@@ -17,6 +17,7 @@
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
 
+use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -119,6 +120,18 @@ impl ResourceScopeKeyHandles {
         n
     }
 
+    pub async fn live_count_for_actor(&self, actor: &EffectiveResourceAccess) -> usize {
+        let mut n = 0;
+        for h in self.handles.values() {
+            if actor.can_control(&h.creator_conversation_id, h.authority)
+                && h.state().await.is_live()
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Compute the live-handle summary used for cap-rejection responses.
     pub async fn live_summary(&self) -> Vec<LiveHandleSummary> {
         let mut out = Vec::new();
@@ -131,6 +144,30 @@ impl ResourceScopeKeyHandles {
                     cmd: h.cmd.clone(),
                     label: h.label.clone(),
                     age_seconds,
+                });
+            }
+        }
+        out
+    }
+
+    pub async fn live_summary_for_actor(
+        &self,
+        actor: &EffectiveResourceAccess,
+    ) -> Vec<LiveHandleSummary> {
+        let mut out = Vec::new();
+        let now = SystemTime::now();
+        for h in self.handles.values() {
+            if actor.can_control(&h.creator_conversation_id, h.authority)
+                && h.state().await.is_live()
+            {
+                out.push(LiveHandleSummary {
+                    handle: h.handle_id.clone(),
+                    cmd: h.cmd.clone(),
+                    label: h.label.clone(),
+                    age_seconds: now
+                        .duration_since(h.started_at)
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0),
                 });
             }
         }
@@ -153,6 +190,25 @@ impl ResourceScopeKeyHandles {
     #[allow(dead_code)]
     pub fn remove(&mut self, id: &HandleId) -> Option<Arc<Handle>> {
         self.handles.remove(id)
+    }
+
+    /// Enforce the live-handle cap against resources visible to `actor`.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::HandleCapReached`] with an actor-filtered summary.
+    pub async fn check_cap_for_actor(
+        &self,
+        cap: usize,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<(), BashHandleError> {
+        if self.live_count_for_actor(actor).await >= cap {
+            Err(BashHandleError::HandleCapReached {
+                cap,
+                live_handles: self.live_summary_for_actor(actor).await,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /

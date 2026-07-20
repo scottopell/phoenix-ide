@@ -190,6 +190,11 @@ pub fn socket_path_for(socket_dir: &Path, conversation_id: &str) -> PathBuf {
 /// process; the filename is a constant so the same server is reused
 /// across process restarts that find the socket already present.
 #[must_use]
+fn socket_path_for_coordinator(socket_dir: &Path) -> PathBuf {
+    socket_dir.join("coordinator.sock")
+}
+
+#[must_use]
 pub fn socket_path_for_global(socket_dir: &Path) -> PathBuf {
     socket_dir.join("global.sock")
 }
@@ -445,6 +450,8 @@ impl TmuxRegistry {
         &self,
         work_scope: &ResourceScopeKey,
         cwd: &Path,
+        legacy_worktree_path: Option<&Path>,
+        legacy_conversation_id: Option<&str>,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
@@ -455,7 +462,32 @@ impl TmuxRegistry {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
+            ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
+        };
+
+        let legacy_socket = legacy_worktree_path
+            .map(|path| socket_path_for_worktree(&self.socket_dir, path))
+            .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
+        let socket_path = if let Some(legacy) = legacy_socket {
+            if legacy != socket_path
+                && matches!(
+                    probe(&socket_path).await,
+                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                )
+                && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
+            {
+                tracing::info!(
+                    scope = %work_scope,
+                    socket = %legacy.display(),
+                    "tmux: adopting live pre-opaque-scope socket"
+                );
+                legacy
+            } else {
+                socket_path
+            }
+        } else {
+            socket_path
         };
 
         let (server_arc, created) = self.get_or_insert(work_scope, socket_path).await;
@@ -713,6 +745,7 @@ impl TmuxRegistry {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
+            ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
         }
     }
@@ -1351,7 +1384,7 @@ mod tests {
 
         let scope = scope("conv-first-ensure");
         let arc = reg
-            .ensure_live(&scope, tmp.path())
+            .ensure_live(&scope, tmp.path(), None, None)
             .await
             .expect("first ensure_live should materialize a live server");
 
@@ -1371,7 +1404,10 @@ mod tests {
 
         // A second ensure_live on an already-live server is a probe-noop:
         // no status change → no spurious re-emit.
-        let _ = reg.ensure_live(&scope, tmp.path()).await.expect("noop");
+        let _ = reg
+            .ensure_live(&scope, tmp.path(), None, None)
+            .await
+            .expect("noop");
         assert!(
             rx.try_recv().is_err(),
             "probe-noop on a live server must not re-emit"
@@ -1390,7 +1426,7 @@ mod tests {
         let scope = scope("conv-rotate-server-token");
 
         let first = reg
-            .ensure_live(&scope, tmp.path())
+            .ensure_live(&scope, tmp.path(), None, None)
             .await
             .expect("first ensure_live should succeed");
         let socket_path = first.read().await.socket_path.clone();
@@ -1399,7 +1435,7 @@ mod tests {
         kill_socket(&socket_path).await;
 
         let second = reg
-            .ensure_live(&scope, tmp.path())
+            .ensure_live(&scope, tmp.path(), None, None)
             .await
             .expect("respawn ensure_live should succeed");
         let second_token = second.read().await.server_token.clone();
@@ -1412,6 +1448,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_scope_adopts_live_legacy_worktree_socket() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let legacy_worktree = tmp.path().join("legacy-worktree");
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        let legacy_socket = socket_path_for_worktree(tmp.path(), &legacy_worktree);
+        spawn_session(
+            &legacy_socket,
+            &tmp.path().join("missing.conf"),
+            &legacy_worktree,
+        )
+        .await
+        .unwrap();
+
+        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let opaque_scope = scope("opaque-after-migration");
+        let server = reg
+            .ensure_live(
+                &opaque_scope,
+                &legacy_worktree,
+                Some(&legacy_worktree),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(server.read().await.socket_path, legacy_socket);
+        kill_socket(&legacy_socket).await;
+    }
+
+    #[tokio::test]
     async fn stale_server_token_cannot_kill_window_on_replacement_server() {
         if which::which("tmux").is_err() {
             return;
@@ -1419,12 +1488,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
         let scope = scope("conv-token-fenced-kill");
-        let first = reg.ensure_live(&scope, tmp.path()).await.unwrap();
+        let first = reg
+            .ensure_live(&scope, tmp.path(), None, None)
+            .await
+            .unwrap();
         let socket_path = first.read().await.socket_path.clone();
         let stale_token = first.read().await.server_token.clone();
         kill_socket(&socket_path).await;
 
-        let replacement = reg.ensure_live(&scope, tmp.path()).await.unwrap();
+        let replacement = reg
+            .ensure_live(&scope, tmp.path(), None, None)
+            .await
+            .unwrap();
         let replacement_token = replacement.read().await.server_token.clone();
         let output = run_tmux_quiet_output(
             &socket_path,
@@ -1484,7 +1559,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
-            reg.ensure_live(&scope("conv-x"), tmp.path()).await,
+            reg.ensure_live(&scope("conv-x"), tmp.path(), None, None)
+                .await,
             Err(TmuxError::BinaryUnavailable)
         ));
     }

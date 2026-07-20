@@ -9,7 +9,7 @@
 //! guard, PTY spawn, frame type filtering, and process lifecycle.
 
 use crate::api::AppState;
-use crate::runtime::{RuntimeManager, SseEvent};
+use crate::runtime::RuntimeManager;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -177,31 +177,6 @@ async fn handle_socket(
     // stale `Detach` and exit immediately.
     let _ = arc_handle.stop_tx.send(StopReason::Running);
     let stop_rx = arc_handle.stop_tx.subscribe();
-
-    // REQ-TERM-012 (per-scope): the conversation-end teardown only applies
-    // to Conversation-scoped terminals. Worktree-scoped terminals survive
-    // across conversation continuations and tear down only via the
-    // worktree cleanup cascade (REQ-TERM-WS-001, REQ-TMUX-WS-002). Global
-    // terminals never tear down on conversation lifecycle.
-    if matches!(scope, ResourceScopeKey::Work(_)) {
-        let teardown_stop = arc_handle.stop_tx.clone();
-        let teardown_conv_id = conversation_id.clone();
-        if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
-            tokio::spawn(async move {
-                loop {
-                    match bcast_rx.recv().await {
-                        Ok(SseEvent::ConversationBecameTerminal { .. }) => {
-                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
-                            let _ = teardown_stop.send(StopReason::TearDown);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    }
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
     // Pin the With adaptor so it implements Unpin.
@@ -391,7 +366,10 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry.ensure_live(scope, cwd).await {
+    match registry
+        .ensure_live(scope, cwd, Some(cwd), Some(conversation_id))
+        .await
+    {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
