@@ -343,6 +343,22 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('replaces an unreadable transaction baseline when status is readably empty', async () => {
+    const unreadable = { ...snapshot, transaction: { kind: 'unreadable' as const, reason: 'locked' } };
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(unreadable))
+      .mockImplementation(() => json({ kind: 'none' }));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/locked/i)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(await screen.findByText(/no deployment transaction/i)).toBeInTheDocument();
+    expect(screen.queryByText(/locked/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('polls durable status from none without rediscovering releases', async () => {
     const fetchMock = vi.mocked(fetch).mockImplementation((input) => {
       const url = String(input);

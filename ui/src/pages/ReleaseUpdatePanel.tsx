@@ -197,6 +197,7 @@ export function ReleaseUpdatePanel({
               ? transaction.reason
               : 'Durable transaction status temporarily disappeared');
           } else {
+            setSnapshot((value) => value ? { ...value, transaction } : value);
             setTransactionError(transaction.kind === 'unreadable' ? transaction.reason : null);
           }
         }
