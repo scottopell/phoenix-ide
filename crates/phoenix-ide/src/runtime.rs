@@ -26,6 +26,17 @@ pub mod testing;
 pub use executor::ConversationRuntime;
 pub use traits::*;
 
+pub(crate) fn process_incarnation() -> phoenix_workflow::ProcessIncarnation {
+    static PROCESS_INCARNATION: std::sync::OnceLock<phoenix_workflow::ProcessIncarnation> =
+        std::sync::OnceLock::new();
+    *PROCESS_INCARNATION.get_or_init(|| {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
+        bytes[7] &= 0x7f;
+        phoenix_workflow::ProcessIncarnation(u64::from_le_bytes(bytes))
+    })
+}
+
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;

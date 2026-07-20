@@ -203,6 +203,9 @@ pub struct LocalAttemptRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkflowSequenceName {
+    Transition,
+    Effect,
+    Attempt,
     Observation,
     Receipt,
     Delivery,
@@ -2303,6 +2306,9 @@ fn parse_workflow_status(value: &str) -> DbResult<WorkflowStatus> {
 
 fn workflow_sequence_name_str(sequence: WorkflowSequenceName) -> &'static str {
     match sequence {
+        WorkflowSequenceName::Transition => "transition",
+        WorkflowSequenceName::Effect => "effect",
+        WorkflowSequenceName::Attempt => "attempt",
         WorkflowSequenceName::Observation => "observation",
         WorkflowSequenceName::Receipt => "receipt",
         WorkflowSequenceName::Delivery => "delivery",

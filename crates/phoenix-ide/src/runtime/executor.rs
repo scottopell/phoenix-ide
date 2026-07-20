@@ -4418,6 +4418,17 @@ where
         }
     }
 
+    fn sha256_hex(value: &[u8]) -> String {
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        sha2::Sha256::digest(value)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                output
+            })
+    }
+
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
@@ -4544,6 +4555,11 @@ where
         let working_dir = self.context.working_dir.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
+        let durable_workflow = if is_sub_agent {
+            None
+        } else {
+            storage.active_top_level_llm_workflow(&conv_id).await?
+        };
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
@@ -4728,10 +4744,128 @@ where
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
 
+            let durable_attempt = if let Some(workflow) = durable_workflow {
+                let durable_request = phoenix_llm::DurableLlmRequest::from_attempt(&request);
+                let request_aggregate = match serde_json::to_string(&durable_request) {
+                    Ok(aggregate) => aggregate,
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to encode durable LLM request: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let request_fingerprint = Self::sha256_hex(request_aggregate.as_bytes());
+                match storage
+                    .prepare_and_begin_top_level_llm_attempt(
+                        &phoenix_db::PrepareAndBeginTopLevelLlmInput {
+                            workflow_id: workflow.workflow_id,
+                            committed_at: phoenix_workflow::Timestamp(
+                                u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                            ),
+                            process_incarnation: super::process_incarnation(),
+                            prepared_request: phoenix_workflow::llm_profile::PreparedLlmRequest {
+                                codec_version: phoenix_llm::DURABLE_LLM_REQUEST_CODEC_VERSION,
+                                request_fingerprint,
+                                provider: "configured".to_string(),
+                                model: model_id.clone(),
+                                backend: "llm_client".to_string(),
+                                request_aggregate,
+                            },
+                        },
+                    )
+                    .await
+                {
+                    Ok(attempt) => Some(attempt),
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to prepare durable LLM attempt: {error}"),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
                 Ok(response) => {
                     // Extract tool calls from content and convert to typed ToolCall
+                    if let Some(attempt) = durable_attempt.as_ref() {
+                        let durable_response = phoenix_llm::DurableLlmResponse {
+                            response: response.clone(),
+                            provider_request_id: None,
+                        };
+                        let response_aggregate = match serde_json::to_string(&durable_response) {
+                            Ok(aggregate) => aggregate,
+                            Err(error) => {
+                                let _ = llm_tx.send(LlmOutcome::NetworkError {
+                                    message: format!("failed to encode durable LLM response: {error}"),
+                                });
+                                return;
+                            }
+                        };
+                        let response_fingerprint = Self::sha256_hex(response_aggregate.as_bytes());
+                        let tool_intents: Vec<phoenix_db::ToolIntentRecord> = response
+                            .tool_uses()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ordinal, (tool_use_id, tool_name, arguments))| {
+                                phoenix_db::ToolIntentRecord {
+                                    intent_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                                    status: phoenix_db::ToolIntentStatus::PendingAcceptance,
+                                    tool_name: tool_name.to_string(),
+                                    tool_kind: phoenix_db::ToolKindRecord::Function,
+                                    tool_use_id: tool_use_id.to_string(),
+                                    arguments_json: arguments.to_string(),
+                                }
+                            })
+                            .collect();
+                        loop {
+                            match storage
+                                .accept_complete_top_level_llm_response(
+                                    &phoenix_db::AcceptCompleteLlmResponseInput {
+                                        authority: attempt.authority.clone(),
+                                        delivery_id: None,
+                                        receipt_id: None,
+                                        response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                                            codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
+                                            response_fingerprint: response_fingerprint.clone(),
+                                            response_aggregate: response_aggregate.clone(),
+                                        },
+                                        provider_request_id: None,
+                                        tool_intents: tool_intents.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(result)
+                                    if result.outcome
+                                        == phoenix_db::CompleteLlmResponsePersistenceOutcome::RetryablePersistence =>
+                                {
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                                Ok(result)
+                                    if matches!(
+                                        result.outcome,
+                                        phoenix_db::CompleteLlmResponsePersistenceOutcome::Accepted
+                                            | phoenix_db::CompleteLlmResponsePersistenceOutcome::ExactReplay
+                                    ) => break,
+                                Ok(result) => {
+                                    let _ = llm_tx.send(LlmOutcome::Cancelled);
+                                    tracing::warn!(outcome = ?result.outcome, "durable LLM response lost authority");
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = llm_tx.send(LlmOutcome::NetworkError {
+                                        message: format!("failed to persist durable LLM response: {error}"),
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     let tool_calls: Vec<ToolCall> = response
                         .tool_uses()
                         .into_iter()

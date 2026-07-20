@@ -85,6 +85,27 @@ pub trait MessageStore: Send + Sync {
         Ok(phoenix_db::DirectTurnRuntimeAdmissionOutcome::Conflict)
     }
 
+    async fn active_top_level_llm_workflow(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_db::TopLevelLlmWorkflowRecord>, String> {
+        Ok(None)
+    }
+
+    async fn prepare_and_begin_top_level_llm_attempt(
+        &self,
+        _input: &phoenix_db::PrepareAndBeginTopLevelLlmInput,
+    ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
+        Err("durable top-level LLM attempts are unsupported by this storage".to_string())
+    }
+
+    async fn accept_complete_top_level_llm_response(
+        &self,
+        _input: &phoenix_db::AcceptCompleteLlmResponseInput,
+    ) -> Result<phoenix_db::AcceptCompleteLlmResponseResult, String> {
+        Err("durable top-level LLM receipts are unsupported by this storage".to_string())
+    }
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -642,6 +663,36 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn active_top_level_llm_workflow(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_db::TopLevelLlmWorkflowRecord>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_top_level_llm_workflow(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_and_begin_top_level_llm_attempt(
+        &self,
+        input: &phoenix_db::PrepareAndBeginTopLevelLlmInput,
+    ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .prepare_and_begin_top_level_llm_attempt(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_complete_top_level_llm_response(
+        &self,
+        input: &phoenix_db::AcceptCompleteLlmResponseInput,
+    ) -> Result<phoenix_db::AcceptCompleteLlmResponseResult, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .accept_complete_top_level_llm_response(input)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn pending_direct_turn(

@@ -32,10 +32,7 @@ const ERROR_RETRY_BASE_INTERVAL: Duration = Duration::from_millis(250);
 const ERROR_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 fn fresh_process_incarnation() -> ProcessIncarnation {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
-    bytes[7] &= 0x7f;
-    ProcessIncarnation(u64::from_le_bytes(bytes))
+    super::process_incarnation()
 }
 
 #[derive(Clone)]
