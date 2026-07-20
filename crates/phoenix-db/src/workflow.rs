@@ -19,11 +19,11 @@ use phoenix_workflow::{
 use sqlx::{error::DatabaseError, Row, SqlitePool};
 use std::collections::BTreeSet;
 
-pub mod wake;
 pub mod llm;
+pub mod wake;
 
-use phoenix_workflow::wake_profile;
 pub use llm::*;
+use phoenix_workflow::wake_profile;
 use sqlx::{Sqlite, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
