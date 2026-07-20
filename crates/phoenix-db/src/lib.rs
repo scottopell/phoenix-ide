@@ -880,6 +880,10 @@ fn is_sqlite_primary_key_constraint(error: &dyn sqlx::error::DatabaseError) -> b
     sqlite_constraint_code_is(error.code().as_deref(), "1555")
 }
 
+fn is_sqlite_busy_retryable(error: &dyn sqlx::error::DatabaseError) -> bool {
+    matches!(error.code().as_deref(), Some("5" | "517"))
+}
+
 async fn insert_creation_job_files_tx(
     tx: &mut Transaction<'_, Sqlite>,
     job: &InsertConversationCreationJob,
@@ -4271,6 +4275,107 @@ impl Database {
     pub async fn update_conversation_state(&self, id: &str, state: &ConvState) -> DbResult<()> {
         self.update_conversation_state_at(id, state, Utc::now())
             .await
+    }
+
+    /// Atomically accepts one pending direct turn into runtime product state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when message or conversation-state persistence fails.
+    pub async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        input: &PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> DbResult<DirectTurnRuntimeAdmissionOutcome> {
+        if input.admission.disposition != DirectTurnCommittedOutcome::RuntimeAccepted
+            || input.message.conversation_id != input.admission.conversation_id
+            || input.message.message_id != input.admission.client_message_id
+            || input.message.message_type != input.message.content.message_type()
+        {
+            return Ok(DirectTurnRuntimeAdmissionOutcome::Conflict);
+        }
+        match self
+            .persist_direct_turn_runtime_acceptance_once(input)
+            .await
+        {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_busy_retryable(error.as_ref()) =>
+            {
+                Ok(DirectTurnRuntimeAdmissionOutcome::RetryablePersistence)
+            }
+            result => result,
+        }
+    }
+
+    async fn persist_direct_turn_runtime_acceptance_once(
+        &self,
+        input: &PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> DbResult<DirectTurnRuntimeAdmissionOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE direct_turn_acceptances
+             SET committed_outcome = 'RuntimeAccepted'
+             WHERE workflow_id = ?1 AND conversation_id = ?2 AND client_message_id = ?3
+               AND committed_outcome = 'PendingRuntime'
+               AND EXISTS (
+                   SELECT 1 FROM top_level_llm_workflows w
+                   WHERE w.workflow_id = direct_turn_acceptances.workflow_id
+                     AND w.turn_generation = ?4 AND w.stopped_at IS NULL
+               )",
+        )
+        .bind(i64::try_from(input.admission.workflow_id.0).map_err(|_| {
+            DbError::Serialization("workflow_id exceeds SQLite integer range".to_string())
+        })?)
+        .bind(&input.admission.conversation_id)
+        .bind(&input.admission.client_message_id)
+        .bind(i64::try_from(input.admission.generation.0).map_err(|_| {
+            DbError::Serialization("generation exceeds SQLite integer range".to_string())
+        })?)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            let replay = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM direct_turn_acceptances a
+                 JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
+                 JOIN messages m ON m.message_id = a.client_message_id
+                 WHERE a.workflow_id = ?1 AND a.conversation_id = ?2
+                   AND a.client_message_id = ?3 AND a.committed_outcome = 'RuntimeAccepted'
+                   AND w.turn_generation = ?4",
+            )
+            .bind(i64::try_from(input.admission.workflow_id.0).unwrap_or(i64::MAX))
+            .bind(&input.admission.conversation_id)
+            .bind(&input.admission.client_message_id)
+            .bind(i64::try_from(input.admission.generation.0).unwrap_or(i64::MAX))
+            .fetch_one(&mut *tx)
+            .await?
+                == 1;
+            tx.rollback().await?;
+            return Ok(if replay {
+                DirectTurnRuntimeAdmissionOutcome::ExactReplay
+            } else {
+                DirectTurnRuntimeAdmissionOutcome::Conflict
+            });
+        }
+
+        let message_exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(&input.message.message_id)
+                .fetch_one(&mut *tx)
+                .await?
+                != 0;
+        if message_exists {
+            tx.rollback().await?;
+            return Ok(DirectTurnRuntimeAdmissionOutcome::Conflict);
+        }
+        insert_message_tx(&mut tx, &input.message).await?;
+        update_conversation_state_at_tx(
+            &mut tx,
+            &input.admission.conversation_id,
+            &input.next_state,
+            input.state_updated_at,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(DirectTurnRuntimeAdmissionOutcome::Committed)
     }
 
     /// Update conversation state with an explicit `state_updated_at`. The
@@ -8535,6 +8640,29 @@ fn build_materialized_tool_round(
     (agent_msg, tool_msgs)
 }
 
+async fn update_conversation_state_at_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<()> {
+    let state_json =
+        serde_json::to_string(state).map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?3 WHERE id = ?4",
+    )
+    .bind(state_json)
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+    }
+    Ok(())
+}
+
 async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
@@ -8747,6 +8875,33 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+    use phoenix_workflow::{Generation, Timestamp, WorkflowId};
+
+    fn direct_turn_snapshot() -> phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+        phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+            turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                conversation_id: "conv-direct".to_string(),
+                accepted_turn_id: "msg-direct".to_string(),
+                generation: 1,
+            },
+            accepted_assistant_message_id: None,
+            stopped_at: None,
+        }
+    }
+
+    async fn accepted_pending_direct_turn(db: &Database) {
+        WorkflowRepository::new(db.pool().clone())
+            .accept_direct_turn(&DirectTurnAcceptanceInput {
+                conversation_id: "conv-direct".to_string(),
+                client_message_id: "msg-direct".to_string(),
+                prepared_fingerprint: "fingerprint".to_string(),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(1),
+                snapshot: direct_turn_snapshot(),
+            })
+            .await
+            .unwrap();
+    }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
@@ -11609,6 +11764,102 @@ mod tests {
             db.update_clear_watermark("nope", 10).await,
             Err(DbError::ConversationNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_turn_runtime_acceptance_commits_message_state_and_disposition_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-direct", "session", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        accepted_pending_direct_turn(&db).await;
+        let next_state = ConvState::LlmRequesting { attempt: 0 };
+        let input = PersistDirectTurnRuntimeAcceptanceInput {
+            admission: DirectTurnRuntimeAdmissionInput {
+                workflow_id: WorkflowId(1),
+                conversation_id: "conv-direct".to_string(),
+                client_message_id: "msg-direct".to_string(),
+                generation: Generation(1),
+                disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
+            },
+            message: Message {
+                message_id: "msg-direct".to_string(),
+                conversation_id: "conv-direct".to_string(),
+                sequence_id: 1,
+                message_type: MessageType::User,
+                content: MessageContent::user("hello"),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            next_state: next_state.clone(),
+            state_updated_at: Utc::now(),
+        };
+        assert_eq!(
+            db.persist_direct_turn_runtime_acceptance(&input)
+                .await
+                .unwrap(),
+            DirectTurnRuntimeAdmissionOutcome::Committed
+        );
+        assert!(db.message_exists("msg-direct").await.unwrap());
+        assert_eq!(
+            db.get_conversation("conv-direct").await.unwrap().state,
+            next_state
+        );
+        assert_eq!(
+            db.persist_direct_turn_runtime_acceptance(&input)
+                .await
+                .unwrap(),
+            DirectTurnRuntimeAdmissionOutcome::ExactReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_turn_runtime_acceptance_rolls_back_when_product_state_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-direct", "session", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        accepted_pending_direct_turn(&db).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_direct_turn_state_update
+             BEFORE UPDATE OF state ON conversations
+             BEGIN SELECT RAISE(ABORT, 'forced state failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let input = PersistDirectTurnRuntimeAcceptanceInput {
+            admission: DirectTurnRuntimeAdmissionInput {
+                workflow_id: WorkflowId(1),
+                conversation_id: "conv-direct".to_string(),
+                client_message_id: "msg-direct".to_string(),
+                generation: Generation(1),
+                disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
+            },
+            message: Message {
+                message_id: "msg-direct".to_string(),
+                conversation_id: "conv-direct".to_string(),
+                sequence_id: 1,
+                message_type: MessageType::User,
+                content: MessageContent::user("hello"),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            next_state: ConvState::LlmRequesting { attempt: 0 },
+            state_updated_at: Utc::now(),
+        };
+        assert!(db
+            .persist_direct_turn_runtime_acceptance(&input)
+            .await
+            .is_err());
+        let pending = WorkflowRepository::new(db.pool().clone())
+            .load_pending_direct_turns()
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!db.message_exists("msg-direct").await.unwrap());
     }
 
     #[tokio::test]

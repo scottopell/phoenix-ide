@@ -76,6 +76,14 @@ pub enum DirectTurnRuntimeAdmissionOutcome {
     RetryablePersistence,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistDirectTurnRuntimeAcceptanceInput {
+    pub admission: DirectTurnRuntimeAdmissionInput,
+    pub message: phoenix_core::domain::db_schema::Message,
+    pub next_state: phoenix_core::domain::sm_state::ConvState,
+    pub state_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopLevelLlmWorkflowRecord {
     pub workflow_id: WorkflowId,
