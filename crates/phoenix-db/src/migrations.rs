@@ -276,6 +276,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_llm_request_metrics",
         sql: MIGRATION_052,
     },
+    Migration {
+        version: 53,
+        name: "create_top_level_llm_profile_tables",
+        sql: MIGRATION_053,
+    },
 ];
 
 const MIGRATION_052: &str = r"
@@ -308,6 +313,172 @@ CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_provider_model_transport
     ON llm_request_metrics(provider, model, transport, created_at);
 CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_root ON llm_request_metrics(root_conversation_id, created_at);
 ";
+
+const MIGRATION_053: &str = r"
+CREATE TABLE top_level_llm_workflows (
+    workflow_id INTEGER PRIMARY KEY REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    accepted_turn_id TEXT NOT NULL CHECK (accepted_turn_id <> ''),
+    turn_generation INTEGER NOT NULL CHECK (turn_generation >= 0),
+    profile_kind TEXT NOT NULL CHECK (profile_kind = 'top_level_llm'),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    accepted_assistant_message_id TEXT,
+    stopped_at INTEGER CHECK (stopped_at IS NULL OR stopped_at >= 0),
+    UNIQUE (conversation_id, accepted_turn_id, turn_generation),
+    UNIQUE (workflow_id, accepted_turn_id, turn_generation),
+    CHECK (accepted_assistant_message_id IS NULL OR accepted_assistant_message_id <> '')
+) STRICT;
+
+CREATE INDEX top_level_llm_workflows_by_turn
+ON top_level_llm_workflows(conversation_id, accepted_turn_id, turn_generation);
+
+CREATE TABLE top_level_llm_effects (
+    workflow_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    accepted_turn_id TEXT NOT NULL CHECK (accepted_turn_id <> ''),
+    turn_generation INTEGER NOT NULL CHECK (turn_generation >= 0),
+    call_ordinal INTEGER NOT NULL CHECK (call_ordinal >= 0),
+    PRIMARY KEY (workflow_id, effect_id),
+    UNIQUE (workflow_id, accepted_turn_id, turn_generation, call_ordinal),
+    FOREIGN KEY (workflow_id) REFERENCES top_level_llm_workflows(workflow_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX top_level_llm_effects_by_turn
+ON top_level_llm_effects(workflow_id, accepted_turn_id, turn_generation, call_ordinal);
+
+CREATE TABLE top_level_llm_prepared_requests (
+    workflow_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    codec_version INTEGER NOT NULL CHECK (codec_version >= 1),
+    request_fingerprint TEXT NOT NULL CHECK (request_fingerprint <> ''),
+    provider TEXT NOT NULL CHECK (provider <> ''),
+    model TEXT NOT NULL CHECK (model <> ''),
+    backend TEXT NOT NULL CHECK (backend <> ''),
+    request_aggregate TEXT NOT NULL CHECK (request_aggregate <> ''),
+    PRIMARY KEY (workflow_id, effect_id),
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES top_level_llm_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX top_level_llm_prepared_requests_lookup
+ON top_level_llm_prepared_requests(provider, model, backend, request_fingerprint);
+
+CREATE TABLE top_level_llm_response_receipts (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    accepted_turn_id TEXT NOT NULL CHECK (accepted_turn_id <> ''),
+    turn_generation INTEGER NOT NULL CHECK (turn_generation >= 0),
+    call_ordinal INTEGER NOT NULL CHECK (call_ordinal >= 0),
+    codec_version INTEGER NOT NULL CHECK (codec_version >= 1),
+    response_fingerprint TEXT NOT NULL CHECK (response_fingerprint <> ''),
+    response_aggregate TEXT NOT NULL CHECK (response_aggregate <> ''),
+    response_generation INTEGER NOT NULL CHECK (response_generation >= 0),
+    provider_request_id TEXT CHECK (provider_request_id IS NULL OR provider_request_id <> ''),
+    PRIMARY KEY (workflow_id, receipt_id),
+    UNIQUE (workflow_id, effect_id, response_generation),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES workflow_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES top_level_llm_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX top_level_llm_response_receipts_by_turn
+ON top_level_llm_response_receipts(workflow_id, accepted_turn_id, turn_generation, call_ordinal);
+
+CREATE TABLE top_level_llm_tool_intents (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    effect_id INTEGER NOT NULL,
+    intent_ordinal INTEGER NOT NULL CHECK (intent_ordinal >= 0),
+    tool_name TEXT NOT NULL CHECK (tool_name <> ''),
+    tool_kind TEXT NOT NULL CHECK (tool_kind IN ('Function', 'Custom')),
+    tool_use_id TEXT NOT NULL CHECK (tool_use_id <> ''),
+    arguments_json TEXT NOT NULL CHECK (arguments_json <> ''),
+    PRIMARY KEY (workflow_id, receipt_id, intent_ordinal),
+    UNIQUE (workflow_id, receipt_id, tool_use_id),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES top_level_llm_response_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, effect_id) REFERENCES top_level_llm_effects(workflow_id, effect_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX top_level_llm_tool_intents_by_effect
+ON top_level_llm_tool_intents(workflow_id, effect_id, receipt_id, intent_ordinal);
+
+CREATE TABLE top_level_llm_tool_intent_calls (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    intent_ordinal INTEGER NOT NULL,
+    call_ordinal INTEGER NOT NULL CHECK (call_ordinal >= 0),
+    child_tool_name TEXT NOT NULL CHECK (child_tool_name <> ''),
+    child_tool_kind TEXT NOT NULL CHECK (child_tool_kind IN ('Function', 'Custom')),
+    child_tool_use_id TEXT NOT NULL CHECK (child_tool_use_id <> ''),
+    child_arguments_json TEXT NOT NULL CHECK (child_arguments_json <> ''),
+    PRIMARY KEY (workflow_id, receipt_id, intent_ordinal, call_ordinal),
+    UNIQUE (workflow_id, receipt_id, child_tool_use_id),
+    FOREIGN KEY (workflow_id, receipt_id, intent_ordinal)
+        REFERENCES top_level_llm_tool_intents(workflow_id, receipt_id, intent_ordinal)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX top_level_llm_tool_intent_calls_by_tool
+ON top_level_llm_tool_intent_calls(workflow_id, receipt_id, child_tool_name, call_ordinal);
+
+CREATE TRIGGER top_level_llm_workflows_profile_shape
+BEFORE INSERT ON top_level_llm_workflows
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM workflows w
+    WHERE w.workflow_id = NEW.workflow_id
+      AND w.profile_kind = NEW.profile_kind
+      AND w.profile_version = NEW.profile_version
+)
+BEGIN
+    SELECT RAISE(ABORT, 'top_level_llm_workflows workflow profile mismatch');
+END;
+
+CREATE TRIGGER top_level_llm_effects_turn_shape
+BEFORE INSERT ON top_level_llm_effects
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM top_level_llm_workflows p
+    WHERE p.workflow_id = NEW.workflow_id
+      AND p.accepted_turn_id = NEW.accepted_turn_id
+      AND p.turn_generation = NEW.turn_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'top_level_llm_effects turn mismatch');
+END;
+
+CREATE TRIGGER top_level_llm_response_receipts_effect_shape
+BEFORE INSERT ON top_level_llm_response_receipts
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM top_level_llm_effects e
+    WHERE e.workflow_id = NEW.workflow_id
+      AND e.effect_id = NEW.effect_id
+      AND e.accepted_turn_id = NEW.accepted_turn_id
+      AND e.turn_generation = NEW.turn_generation
+      AND e.call_ordinal = NEW.call_ordinal
+)
+BEGIN
+    SELECT RAISE(ABORT, 'top_level_llm_response_receipts effect mismatch');
+END;
+
+CREATE TRIGGER top_level_llm_tool_intents_effect_shape
+BEFORE INSERT ON top_level_llm_tool_intents
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM top_level_llm_response_receipts r
+    WHERE r.workflow_id = NEW.workflow_id
+      AND r.receipt_id = NEW.receipt_id
+      AND r.effect_id = NEW.effect_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'top_level_llm_tool_intents receipt/effect mismatch');
+END;
+"; 
 
 const MIGRATION_050: &str = r"
 ALTER TABLE wake_bindings
@@ -2263,6 +2434,28 @@ mod tests {
         assert_eq!(again, 0);
     }
 
+    async fn assert_top_level_llm_profile_tables(pool: &SqlitePool) {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'top_level_llm_%' ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for expected in [
+            "top_level_llm_workflows",
+            "top_level_llm_effects",
+            "top_level_llm_prepared_requests",
+            "top_level_llm_response_receipts",
+            "top_level_llm_tool_intents",
+            "top_level_llm_tool_intent_calls",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == expected),
+                "missing {expected}: {tables:?}"
+            );
+        }
+    }
+
     async fn assert_workflow_foundation_tables(pool: &SqlitePool) {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'workflow_%' OR name='workflows' ORDER BY name",
@@ -2379,6 +2572,113 @@ mod tests {
             .execute(&pool)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_052_creates_top_level_llm_profile_tables_and_invariants() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied as usize, MIGRATIONS.len());
+        assert_top_level_llm_profile_tables(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO workflows (
+                workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                external_acceptance_enabled, version, generation, status,
+                snapshot_codec_family, snapshot_codec_version, snapshot_payload,
+                created_at, updated_at
+             ) VALUES (101, 'top_level_llm', 1, 1, 0, 0, 4, 'Active', 'llm.snapshot', 1, X'00', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO conversations (id, state_updated_at, created_at, updated_at) VALUES ('conv-llm', '2025-01-01', '2025-01-01', '2025-01-01')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation, profile_kind, profile_version) VALUES (101, 'conv-llm', 'turn-1', 4, 'top_level_llm', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (101, 1, 0, 'llm.call', 'top_level_call', 'llm.intent', 1, X'01', 4, 'Required', 'SafelyRepeatable', 'Eligible')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_effects (workflow_id, effect_id, accepted_turn_id, turn_generation, call_ordinal) VALUES (101, 1, 'turn-1', 4, 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_prepared_requests (workflow_id, effect_id, codec_version, request_fingerprint, provider, model, backend, request_aggregate) VALUES (101, 1, 1, 'req-1', 'openai', 'gpt-5', 'responses', '{\"messages\":[]}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (101, 1, 1, 4, 0, 1, NULL, 'Manual', 'llm.receipt', 1, X'02')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_response_receipts (workflow_id, receipt_id, effect_id, accepted_turn_id, turn_generation, call_ordinal, codec_version, response_fingerprint, response_aggregate, response_generation, provider_request_id) VALUES (101, 1, 1, 'turn-1', 4, 2, 1, 'resp-1', '{\"output\":[]}', 4, 'provider-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_tool_intents (workflow_id, receipt_id, effect_id, intent_ordinal, tool_name, tool_kind, tool_use_id, arguments_json) VALUES (101, 1, 1, 0, 'submit_result', 'Function', 'tool-1', '{\"result\":\"ok\"}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO top_level_llm_tool_intent_calls (workflow_id, receipt_id, intent_ordinal, call_ordinal, child_tool_name, child_tool_kind, child_tool_use_id, child_arguments_json) VALUES (101, 1, 0, 0, 'read_file', 'Function', 'tool-child-1', '{\"path\":\"a\"}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let child_calls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM top_level_llm_tool_intent_calls WHERE workflow_id = 101 AND receipt_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(child_calls, 1);
+
+        assert!(sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation, profile_kind, profile_version) VALUES (101, 'conv-llm', 'turn-2', 4, 'top_level_llm', 1)")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO top_level_llm_effects (workflow_id, effect_id, accepted_turn_id, turn_generation, call_ordinal) VALUES (101, 1, 'turn-X', 4, 3)")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO top_level_llm_response_receipts (workflow_id, receipt_id, effect_id, accepted_turn_id, turn_generation, call_ordinal, codec_version, response_fingerprint, response_aggregate, response_generation, provider_request_id) VALUES (101, 2, 1, 'turn-1', 4, 99, 1, 'resp-2', '{\"output\":[]}', 5, NULL)")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO top_level_llm_tool_intents (workflow_id, receipt_id, effect_id, intent_ordinal, tool_name, tool_kind, tool_use_id, arguments_json) VALUES (101, 1, 999, 1, 'bash', 'Function', 'tool-bad', '{\"cmd\":\"pwd\"}')")
+            .execute(&pool)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn sparse_stamp_runs_migration_052() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TABLE _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (51, 'index_message_fts_row_locations')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied as usize, MIGRATIONS.len() - 1);
+        assert_top_level_llm_profile_tables(&pool).await;
     }
 
     #[tokio::test]
