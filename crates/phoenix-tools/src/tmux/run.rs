@@ -417,9 +417,16 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            let response = response;
-            if close_after_completion && (exited || status == "readiness_timed_out") {
-                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            if close_after_completion {
+                if exited || status == "readiness_timed_out" {
+                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                } else {
+                    spawn_close_after_completion(
+                        config_path.to_path_buf(),
+                        socket_path.to_path_buf(),
+                        target.window_id.clone(),
+                    );
+                }
             }
             return response;
         }
@@ -444,6 +451,27 @@ async fn wait_for_text_response(
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
     }
+}
+
+fn spawn_close_after_completion(config_path: PathBuf, socket_path: PathBuf, window_id: String) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+            match observe_window(&config_path, &socket_path, &window_id, None).await {
+                Ok(observation) if observation.exit_code.is_none() => {}
+                Ok(_) => {
+                    if let Err(error) = kill_window(&config_path, &socket_path, &window_id).await {
+                        tracing::debug!(window_id, %error, "failed to close completed tmux window");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(window_id, %error, "stopped observing tmux window completion");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[allow(clippy::result_large_err)]
@@ -881,7 +909,7 @@ mod tests {
         let result = TmuxRunTool
             .run(
                 json!({
-                    "cmd": "echo READY; sleep 10",
+                    "cmd": "echo READY; sleep 0.2",
                     "name": "tmux-run-no-preserve",
                     "keep_open_on_exit": false,
                     "readiness": {
@@ -899,7 +927,34 @@ mod tests {
         assert!(v.get("wake_registration").is_none());
         let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
         assert!(provider_value.get("wake_registration").is_none());
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
+
+        let socket_path = socket_tmp.path().join("conv-tmux-run-no-preserve.sock");
+        let window_id = v["window_id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let capture = tokio::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    &socket_path.to_string_lossy(),
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    window_id,
+                ])
+                .env_remove("TMUX")
+                .status()
+                .await
+                .unwrap();
+            if !capture.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "window should close after command completion"
+            );
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+        }
+        kill_socket(&socket_path).await;
     }
 
     #[test]
