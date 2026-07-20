@@ -17,8 +17,8 @@ use phoenix_workflow::{
     wake_profile::{
         self as wake_types, BashTerminalEvidence, ObserveHandleIntent, TmuxTerminalEvidence,
         WakeCancellationReason, WakeForgottenReason, WakeRegistrationEvent, WakeRegistrationIntent,
-        WakeRegistrationReceipt, WakeRegistrationSnapshot, WakeResourceIdentity,
-        WakeTerminalEvidence, WakeTerminalPayload, REGISTRATION_EFFECT_ID,
+        WakeRegistrationOrigin, WakeRegistrationReceipt, WakeRegistrationSnapshot,
+        WakeResourceIdentity, WakeTerminalEvidence, WakeTerminalPayload, REGISTRATION_EFFECT_ID,
     },
     AttemptId, AuthorityOutcome, DeliveryId, EffectId, EffectRole, EffectStatus,
     ErasedAcceptanceProfile, Generation, ProcessIncarnation, ProfileRef, ReceiptId, ReceiptOrigin,
@@ -113,6 +113,7 @@ pub struct WakeBindingRecord {
     pub registration_scope: wake_types::WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub registering_tool_use_id: String,
+    pub origin: WakeRegistrationOrigin,
     pub expires_at: Timestamp,
     pub prepared_fingerprint: String,
 }
@@ -558,6 +559,7 @@ impl WakeRepository {
             contract_id: input.contract_id.clone(),
             resource: input.resource.clone(),
             registered: true,
+            origin: input.origin,
             terminal: None,
             runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
@@ -681,7 +683,7 @@ impl WakeRepository {
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                     scope_kind, scope_stable_key, resource_kind, bash_handle_id,
                     tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                    expires_at, prepared_fingerprint
+                    registration_origin, expires_at, prepared_fingerprint
              FROM wake_bindings
              WHERE conversation_id = ?1 AND contract_id = ?2
              LIMIT 1",
@@ -1078,6 +1080,7 @@ impl WakeRepository {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
             registered: true,
+            origin: binding.origin,
             terminal: Some(terminal.clone()),
             runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
@@ -1216,6 +1219,7 @@ impl WakeRepository {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
             registered: true,
+            origin: binding.origin,
             terminal: Some(terminal.clone()),
             runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
@@ -1485,6 +1489,7 @@ impl WakeRepository {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
             registered: true,
+            origin: binding.origin,
             terminal: Some(WakeTerminalPayload::Expired {
                 contract_id: binding.contract_id.clone(),
                 resource: binding.resource.clone(),
@@ -1659,6 +1664,7 @@ impl WakeRepository {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
             registered: true,
+            origin: binding.origin,
             terminal: Some(terminal.clone()),
             runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
@@ -1798,6 +1804,113 @@ impl WakeRepository {
             receipt: outcome.0,
             delivery: outcome.1,
         })
+    }
+
+    /// Retires wake obligations created by the removed implicit tool-return path.
+    ///
+    /// Existing rows predate registration provenance, so migration 52 classifies
+    /// them as `ImplicitToolReturn`. This reconciliation runs before the wake
+    /// worker starts: unresolved obligations are terminalized through the normal
+    /// cancellation transition, then every pending delivery for that origin is
+    /// suppressed through the canonical runtime-acceptance transition. Workflow
+    /// history and any already-materialized message remain available for audit.
+    pub async fn retire_implicit_tool_return_registrations(
+        &self,
+        now: Timestamp,
+    ) -> DbResult<usize> {
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE b.registration_origin = 'ImplicitToolReturn'
+               AND w.status = 'Active'
+               AND NOT EXISTS (
+                   SELECT 1 FROM wake_terminal_receipts r
+                   WHERE r.workflow_id = b.workflow_id
+               )
+             ORDER BY b.workflow_id",
+        )
+        .fetch_all(&self.workflow_repo.pool)
+        .await?;
+
+        let mut changed_workflows = std::collections::BTreeSet::new();
+        for row in rows {
+            let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
+            let outcome = self
+                .cancel_allocated(&WakeCancelIfUnresolvedInput {
+                    workflow_id,
+                    expected_conversation_id: Some(row.get("conversation_id")),
+                    expected_contract_id: Some(row.get("contract_id")),
+                    timestamp: now,
+                    reason: WakeCancellationReason::ExplicitCancel,
+                })
+                .await?;
+            if matches!(outcome, WakeCancellationOutcome::Cancelled { .. }) {
+                changed_workflows.insert(workflow_id);
+            }
+        }
+
+        for _ in 0..20 {
+            let pending = sqlx::query(
+                "SELECT d.workflow_id, d.delivery_id
+                 FROM workflow_deliveries d
+                 JOIN wake_bindings b ON b.workflow_id = d.workflow_id
+                 WHERE b.registration_origin = 'ImplicitToolReturn'
+                   AND d.status = 'Pending'
+                 ORDER BY d.workflow_id, d.delivery_id",
+            )
+            .fetch_all(&self.workflow_repo.pool)
+            .await?;
+            if pending.is_empty() {
+                return Ok(changed_workflows.len());
+            }
+
+            let mut by_workflow = std::collections::BTreeMap::<WorkflowId, Vec<DeliveryId>>::new();
+            for row in pending {
+                by_workflow
+                    .entry(WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?))
+                    .or_default()
+                    .push(DeliveryId(to_u64(
+                        row.get::<i64, _>("delivery_id"),
+                        "delivery_id",
+                    )?));
+            }
+
+            let mut retry = false;
+            for (workflow_id, delivery_ids) in by_workflow {
+                let Some(head) = self.workflow_repo.fetch_workflow_head(workflow_id).await? else {
+                    continue;
+                };
+                match self
+                    .resolve_pending_exact(&WakeResolvePendingInput {
+                        workflow_id,
+                        expected_version: head.version,
+                        delivery_ids,
+                        decision: WakeResolveDecision::Suppress,
+                        transition_id: TransitionId(head.version.next().0),
+                        timestamp: now,
+                    })
+                    .await?
+                {
+                    WakeResolvePendingOutcome::Resolved => {
+                        changed_workflows.insert(workflow_id);
+                    }
+                    WakeResolvePendingOutcome::VersionConflict
+                    | WakeResolvePendingOutcome::SetMismatch => retry = true,
+                    WakeResolvePendingOutcome::AlreadyResolved => {}
+                }
+            }
+            if !retry {
+                return Ok(changed_workflows.len());
+            }
+        }
+
+        Err(DbError::Serialization(
+            "implicit wake retirement did not converge after version-conflict retries".to_string(),
+        ))
     }
 
     pub async fn list_pending_global(
@@ -3307,7 +3420,7 @@ async fn fetch_existing_binding_tx(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                expires_at, prepared_fingerprint
+                registration_origin, expires_at, prepared_fingerprint
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
            AND contract_id = ?3 AND resource_kind = ?4
@@ -3335,7 +3448,7 @@ async fn fetch_binding_by_workflow_tx(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 scope_kind, scope_stable_key, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                expires_at, prepared_fingerprint
+                registration_origin, expires_at, prepared_fingerprint
          FROM wake_bindings WHERE workflow_id = ?1",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
@@ -3356,8 +3469,8 @@ async fn insert_binding_tx(
             workflow_id, conversation_id, contract_id, profile_kind, profile_version,
             scope_kind, scope_stable_key, resource_kind, bash_handle_id,
             tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-            expires_at, prepared_fingerprint, observe_effect_id, created_at
-         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            registration_origin, expires_at, prepared_fingerprint, observe_effect_id, created_at
+         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(&input.conversation_id)
@@ -3371,6 +3484,7 @@ async fn insert_binding_tx(
     .bind(tmux_window_id(&input.resource))
     .bind(tmux_completion_policy(&input.resource))
     .bind(&input.registering_tool_use_id)
+    .bind(registration_origin_str(input.origin))
     .bind(i64::try_from(input.expires_at.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(prepared_fingerprint)
     .bind(
@@ -3419,6 +3533,7 @@ fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeBindingRecord
         },
         resource: resource_from_row(row)?,
         registering_tool_use_id: row.get("registering_tool_use_id"),
+        origin: registration_origin_from_str(row.get::<String, _>("registration_origin").as_str())?,
         expires_at: Timestamp(
             u64::try_from(row.get::<i64, _>("expires_at"))
                 .map_err(|e| DbError::Serialization(e.to_string()))?,
@@ -3469,6 +3584,23 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIden
         )),
         other => Err(DbError::Serialization(format!(
             "unknown resource kind: {other}"
+        ))),
+    }
+}
+
+fn registration_origin_str(origin: WakeRegistrationOrigin) -> &'static str {
+    match origin {
+        WakeRegistrationOrigin::ImplicitToolReturn => "ImplicitToolReturn",
+        WakeRegistrationOrigin::AgentExplicit => "AgentExplicit",
+    }
+}
+
+fn registration_origin_from_str(value: &str) -> DbResult<WakeRegistrationOrigin> {
+    match value {
+        "ImplicitToolReturn" => Ok(WakeRegistrationOrigin::ImplicitToolReturn),
+        "AgentExplicit" => Ok(WakeRegistrationOrigin::AgentExplicit),
+        other => Err(DbError::Serialization(format!(
+            "unknown wake registration origin: {other}"
         ))),
     }
 }
@@ -4667,6 +4799,7 @@ mod tests {
                 completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-2".into(),
+            origin: WakeRegistrationOrigin::AgentExplicit,
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         }
@@ -4726,13 +4859,15 @@ mod tests {
         repo: &WakeRepository,
         workflow_id: WorkflowId,
     ) -> super::WakeObservationOutcome {
-        let input = intent();
-        assert!(matches!(
-            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
-                .await
-                .unwrap(),
-            WakeRegistrationOutcome::Registered { .. }
-        ));
+        if repo.fetch_binding(workflow_id).await.unwrap().is_none() {
+            let input = intent();
+            assert!(matches!(
+                repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
+                    .await
+                    .unwrap(),
+                WakeRegistrationOutcome::Registered { .. }
+            ));
+        }
         repo.claim_observation_if_eligible(
             workflow_id,
             ProcessIncarnation(1),
@@ -4768,6 +4903,7 @@ mod tests {
                 handle_id: "b-1".into(),
             }),
             registering_tool_use_id: "tool-1".into(),
+            origin: WakeRegistrationOrigin::AgentExplicit,
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         }
@@ -4943,6 +5079,32 @@ mod tests {
         workflow_id: WorkflowId,
     ) -> WakePendingDelivery {
         let canonical = unwrap_started(register_and_begin(repo, workflow_id).await);
+        let binding = repo.fetch_binding(workflow_id).await.unwrap().unwrap();
+        let evidence = match binding.resource {
+            WakeResourceIdentity::Bash(identity) => {
+                WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                    identity,
+                    status: wake_types::BashTerminalStatus::Exited,
+                    occurred_at: Timestamp(19),
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
+                    signal_number: None,
+                    kill_signal_sent: None,
+                    final_tail: vec!["done".into(), "ok".into()],
+                })
+            }
+            WakeResourceIdentity::TmuxWindow(identity) => {
+                WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
+                    identity,
+                    status: wake_types::TmuxTerminalStatus::ExitMarkerObserved,
+                    occurred_at: Timestamp(19),
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
+                    final_tail: vec!["done".into(), "ok".into()],
+                })
+            }
+            WakeResourceIdentity::Subagent(_) => unreachable!(),
+        };
         match repo
             .record_terminal_evidence(
                 workflow_id,
@@ -4951,7 +5113,7 @@ mod tests {
                 ReceiptId(1),
                 DeliveryId(1),
                 Timestamp(20),
-                &bash_evidence(19),
+                &evidence,
             )
             .await
             .unwrap()
@@ -5015,6 +5177,14 @@ mod tests {
 
     async fn count_delivery_message_links(repo: &WakeRepository) -> i64 {
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wake_delivery_messages")
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn binding_origin(repo: &WakeRepository, workflow_id: WorkflowId) -> String {
+        sqlx::query_scalar("SELECT registration_origin FROM wake_bindings WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
             .fetch_one(&repo.workflow_repo.pool)
             .await
             .unwrap()
@@ -7387,6 +7557,7 @@ mod tests {
                 handle_id: "b-pending".into(),
             }),
             registering_tool_use_id: "tool-p".into(),
+            origin: WakeRegistrationOrigin::AgentExplicit,
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         };
@@ -7558,6 +7729,268 @@ mod tests {
         assert!(pending_original.is_empty());
         let pending_original_restarted = restarted.list_pending("conv-1").await.unwrap();
         assert!(pending_original_restarted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retire_implicit_tool_return_registrations_cancels_suppresses_and_preserves_materialized_messages(
+    ) {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+
+        let implicit_unresolved = WorkflowId(9000);
+        let implicit_pending = WorkflowId(9001);
+        let explicit_pending = WorkflowId(9002);
+
+        let mut implicit_intent = intent();
+        implicit_intent.origin = WakeRegistrationOrigin::ImplicitToolReturn;
+        implicit_intent.contract_id = "contract-implicit-unresolved".into();
+        implicit_intent.registering_tool_use_id = "tool-implicit-unresolved".into();
+        implicit_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: implicit_intent.registration_scope.clone(),
+            handle_id: "b-implicit-unresolved".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(
+                implicit_unresolved,
+                &implicit_intent,
+                "fp-implicit-unresolved",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let mut implicit_pending_intent = intent();
+        implicit_pending_intent.origin = WakeRegistrationOrigin::ImplicitToolReturn;
+        implicit_pending_intent.contract_id = "contract-implicit-pending".into();
+        implicit_pending_intent.registering_tool_use_id = "tool-implicit-pending".into();
+        implicit_pending_intent.resource =
+            WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+                work_scope: implicit_pending_intent.registration_scope.clone(),
+                handle_id: "b-implicit-pending".into(),
+            });
+        assert!(matches!(
+            repo.register_allocated(
+                implicit_pending,
+                &implicit_pending_intent,
+                "fp-implicit-pending",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let implicit_pending_delivery =
+            create_pending_terminal_delivery(&repo, implicit_pending).await;
+        let implicit_link = materialized_outcome_link(
+            materialize_pending(
+                &repo,
+                &implicit_pending_delivery,
+                "implicit terminal",
+                None,
+                false,
+                Timestamp(25),
+            )
+            .await,
+        );
+
+        let mut explicit_intent = intent();
+        explicit_intent.origin = WakeRegistrationOrigin::AgentExplicit;
+        explicit_intent.contract_id = "contract-explicit-pending".into();
+        explicit_intent.registering_tool_use_id = "tool-explicit-pending".into();
+        explicit_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: explicit_intent.registration_scope.clone(),
+            handle_id: "b-explicit-pending".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(
+                explicit_pending,
+                &explicit_intent,
+                "fp-explicit-pending",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        create_pending_terminal_delivery(&repo, explicit_pending).await;
+
+        let changed = repo
+            .retire_implicit_tool_return_registrations(Timestamp(40))
+            .await
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        let (_, unresolved_snapshot) = head_snapshot(&repo, implicit_unresolved).await;
+        assert!(matches!(
+            unresolved_snapshot.terminal,
+            Some(WakeTerminalPayload::Cancelled { .. })
+        ));
+        assert_eq!(
+            unresolved_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Suppressed
+        );
+        assert!(repo
+            .list_pending("conv-1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.workflow_id != implicit_unresolved));
+
+        let (_, implicit_pending_snapshot) = head_snapshot(&repo, implicit_pending).await;
+        assert!(matches!(
+            implicit_pending_snapshot.terminal,
+            Some(WakeTerminalPayload::Fired { .. })
+        ));
+        assert_eq!(
+            implicit_pending_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Suppressed
+        );
+        assert!(repo
+            .list_pending("conv-1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.workflow_id != implicit_pending));
+        assert!(repo
+            .list_materialized_pending_for_workflow(implicit_pending)
+            .await
+            .unwrap()
+            .is_empty());
+        let preserved_message = repo
+            .get_delivery_message_link(implicit_pending, implicit_link.delivery_id)
+            .await
+            .unwrap()
+            .expect("materialized audit link remains after suppression");
+        assert_eq!(
+            preserved_message.linked_message.message.message_id,
+            implicit_link.linked_message.message.message_id
+        );
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 1);
+
+        let (_, explicit_snapshot) = head_snapshot(&repo, explicit_pending).await;
+        assert!(matches!(
+            explicit_snapshot.terminal,
+            Some(WakeTerminalPayload::Fired { .. })
+        ));
+        assert_eq!(
+            explicit_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Idle
+        );
+        let explicit_pending_rows = repo.list_pending("conv-1").await.unwrap();
+        assert!(explicit_pending_rows
+            .iter()
+            .any(|item| item.workflow_id == explicit_pending));
+        assert_eq!(
+            binding_origin(&repo, explicit_pending).await,
+            "AgentExplicit"
+        );
+
+        let restarted_pending_rows = restarted.list_pending("conv-1").await.unwrap();
+        assert!(restarted_pending_rows
+            .iter()
+            .any(|item| item.workflow_id == explicit_pending));
+        assert!(restarted_pending_rows
+            .iter()
+            .all(|item| item.workflow_id != implicit_pending));
+        assert!(restarted
+            .list_materialized_pending_for_workflow(implicit_pending)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(restarted
+            .get_delivery_message_link(implicit_pending, implicit_link.delivery_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn retire_implicit_tool_return_registrations_is_idempotent_and_leaves_explicit_bindings_untouched(
+    ) {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+
+        let implicit = WorkflowId(9010);
+        let explicit = WorkflowId(9011);
+
+        let mut implicit_intent = intent();
+        implicit_intent.origin = WakeRegistrationOrigin::ImplicitToolReturn;
+        implicit_intent.contract_id = "contract-idempotent-implicit".into();
+        implicit_intent.registering_tool_use_id = "tool-idempotent-implicit".into();
+        implicit_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: implicit_intent.registration_scope.clone(),
+            handle_id: "b-idempotent-implicit".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(
+                implicit,
+                &implicit_intent,
+                "fp-idempotent-implicit",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let mut explicit_intent = intent();
+        explicit_intent.origin = WakeRegistrationOrigin::AgentExplicit;
+        explicit_intent.contract_id = "contract-idempotent-explicit".into();
+        explicit_intent.registering_tool_use_id = "tool-idempotent-explicit".into();
+        explicit_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: explicit_intent.registration_scope.clone(),
+            handle_id: "b-idempotent-explicit".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(
+                explicit,
+                &explicit_intent,
+                "fp-idempotent-explicit",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let explicit_pending_delivery = create_pending_terminal_delivery(&repo, explicit).await;
+
+        let first = repo
+            .retire_implicit_tool_return_registrations(Timestamp(40))
+            .await
+            .unwrap();
+        let second = restarted
+            .retire_implicit_tool_return_registrations(Timestamp(41))
+            .await
+            .unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+
+        let (_, implicit_snapshot) = head_snapshot(&repo, implicit).await;
+        assert!(matches!(
+            implicit_snapshot.terminal,
+            Some(WakeTerminalPayload::Cancelled { .. })
+        ));
+        assert_eq!(
+            implicit_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Suppressed
+        );
+
+        let (_, explicit_snapshot) = head_snapshot(&repo, explicit).await;
+        assert!(matches!(
+            explicit_snapshot.terminal,
+            Some(WakeTerminalPayload::Fired { .. })
+        ));
+        assert_eq!(
+            explicit_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Idle
+        );
+        assert_eq!(binding_origin(&repo, explicit).await, "AgentExplicit");
+        let explicit_pending_rows = repo.list_pending("conv-1").await.unwrap();
+        assert!(explicit_pending_rows.iter().any(|item| {
+            item.workflow_id == explicit
+                && item.canonical_delivery.delivery_id
+                    == explicit_pending_delivery.canonical_delivery.delivery_id
+        }));
     }
 
     #[tokio::test]

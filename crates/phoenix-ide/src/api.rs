@@ -132,6 +132,18 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
+        let retired_implicit_wakes =
+            phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
+                .retire_implicit_tool_return_registrations(phoenix_workflow::Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                ))
+                .await?;
+        if retired_implicit_wakes > 0 {
+            tracing::warn!(
+                retired = retired_implicit_wakes,
+                "retired legacy implicit wake obligations before starting wake worker"
+            );
+        }
         runtime
             .start_wake_worker()
             .await

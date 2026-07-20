@@ -200,8 +200,7 @@ impl Tool for TmuxRunTool {
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
-                return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
-                    .await
+                return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd).await
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -590,7 +589,6 @@ fn observation_from_bytes(
     }
 }
 
-
 fn structured_response(
     status: &str,
     target: &TmuxRunTarget,
@@ -811,7 +809,6 @@ mod tests {
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
 
-
     #[test]
     fn parse_exit_marker_matches_tmux_run_marker_line() {
         let output = "bash output\n__PHOENIX_EXIT__ exit_code=17 occurred_at_ms=1700000000000\n$ ";
@@ -856,7 +853,12 @@ mod tests {
         assert!(v.get("wake_registration").is_none());
         let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
         assert!(provider_value.get("wake_registration").is_none());
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-readiness-timeout.sock")).await;
+        kill_socket(
+            &socket_tmp
+                .path()
+                .join("conv-tmux-run-readiness-timeout.sock"),
+        )
+        .await;
     }
 
     #[tokio::test]

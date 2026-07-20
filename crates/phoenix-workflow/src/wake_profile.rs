@@ -64,6 +64,12 @@ pub enum WakeResourceIdentity {
     Subagent(SubagentResourceIdentity),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WakeRegistrationOrigin {
+    ImplicitToolReturn,
+    AgentExplicit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeRegistrationIntent {
     pub contract_id: String,
@@ -71,6 +77,7 @@ pub struct WakeRegistrationIntent {
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub registering_tool_use_id: String,
+    pub origin: WakeRegistrationOrigin,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
 }
@@ -221,6 +228,8 @@ pub struct WakeRegistrationSnapshot {
     pub contract_id: String,
     pub resource: WakeResourceIdentity,
     pub registered: bool,
+    #[serde(default = "default_implicit_tool_return_origin")]
+    pub origin: WakeRegistrationOrigin,
     pub terminal: Option<WakeTerminalPayload>,
     pub runtime_availability: RuntimeAvailability,
 }
@@ -325,6 +334,10 @@ pub fn profile() -> ProfileRef {
         profile_kind: PROFILE_ID.to_string(),
         profile_version: PROTOCOL_VERSION,
     }
+}
+
+fn default_implicit_tool_return_origin() -> WakeRegistrationOrigin {
+    WakeRegistrationOrigin::ImplicitToolReturn
 }
 
 fn supported_codecs() -> SupportedCodecRegistry {

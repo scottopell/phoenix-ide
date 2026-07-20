@@ -13401,6 +13401,7 @@ mod wake_handler_tests {
                 },
             ),
             registering_tool_use_id: format!("tool-{workflow_id}"),
+            origin: phoenix_workflow::wake_profile::WakeRegistrationOrigin::AgentExplicit,
             registered_at: phoenix_workflow::Timestamp(10),
             expires_at: phoenix_workflow::Timestamp(100 + workflow_id),
         };

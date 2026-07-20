@@ -88,22 +88,37 @@ variants (`bash_wait_until`, etc.) — keeps tool-description tax low
 and forward-aligns with the unified `WorkHandle` trait that will
 land separately.
 
+## Current Reality
+
+The durable workflow substrate exists: typed wake profiles, persisted bindings,
+background observation, terminal projection, replay-safe materialization and
+runtime acceptance, restart recovery, and continuation transfer. Phoenix does
+not expose the specified agent-facing `wait_until` tool, so no ordinary bash or
+tmux handle creation registers a wake obligation. The substrate is intentionally
+dormant until an explicit registration surface owns that lifecycle.
+
+Databases upgraded from the automatic-registration implementation classify its
+bindings as `ImplicitToolReturn`. Startup retires and suppresses those bindings
+before the wake worker starts, preserving workflow and message audit records
+without producing another model turn. Future agent-facing registrations use the
+distinct `AgentExplicit` origin and are not eligible for that reconciliation.
+
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | REQ-WAKE-001 Registration | Proposed | LLM-facing tool surface; no synchronous payload; no conv state mutation |
-| REQ-WAKE-002 Persistence | Proposed | `wake_contracts` SQLite table + restart resync |
-| REQ-WAKE-003 Router Service | Proposed | Background poll task, 1s tick for HandleTerminal v1 |
+| REQ-WAKE-002 Persistence | Partial | Durable workflow-backed bindings, receipts, and restart reconciliation exist; agent-facing registration remains proposed |
+| REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery exist; no ordinary tool implicitly enrolls a handle |
 | REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
-| REQ-WAKE-005 V1 Condition Kinds | Proposed | HandleTerminal only; regex/file/port/webhook deferred |
-| REQ-WAKE-006 Wake Event Delivery | Proposed | Synthetic tool result; shape-identical to `op=wait` response |
+| REQ-WAKE-005 V1 Condition Kinds | Partial | Durable substrate models bash, tmux, and sub-agent terminal handles; explicit tool surface is proposed |
+| REQ-WAKE-006 Wake Event Delivery | Partial | Terminal projection/materialization exists; agent-facing explicit registration is proposed |
 | REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
 | REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
-| REQ-WAKE-011 Terminal Cause | Proposed | Fired / Expired / Cancelled / Forgotten |
-| REQ-WAKE-012 Continuation Inheritance | Proposed | WorkScope-keyed handles (bash, tmux) transfer; subagent is agent-id-keyed |
+| REQ-WAKE-011 Terminal Cause | Partial | Typed Fired / Expired / Cancelled / Forgotten projections exist in the durable substrate |
+| REQ-WAKE-012 Continuation Inheritance | Partial | WorkScope transfer and reconciliation exist in the durable substrate |
 | REQ-WAKE-013 User Messages | Proposed | Conv stays Idle; user messages just work |
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
@@ -111,7 +126,9 @@ land separately.
 | REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
-**Progress:** 0 of 18 implemented.
+No requirement is complete end-to-end because the unified agent-facing tool is
+not implemented. Requirements marked Partial identify reusable runtime and
+persistence infrastructure rather than a shipped wake-contract journey.
 
 ## Dependencies
 
@@ -137,15 +154,15 @@ land separately.
 
 ## Why This Spec Exists
 
-Phoenix today treats turn-count as free. Every spawn-and-wait flow
-that exceeds `wait_seconds` pays a full LLM round-trip per poll. The
+Without an explicit wake tool, every spawn-and-wait flow that exceeds
+`wait_seconds` pays a full LLM round-trip per poll. The
 handle-cap (8) and ring-size (4MB) are explicit budgets in
 `specs/bash/`; turn-count is not budgeted anywhere. Wake contracts
 are the runtime acknowledging that turn-count is a first-class cost
 the same way bytes-in-ring are.
 
-The secondary motivation is correctness: today, if the LLM stops
-polling, an exit reaches no one. The tombstone sits in memory until
-Phoenix restart wipes it. Wake contracts make every spawn-and-wait
+The secondary motivation is correctness: if the LLM stops polling,
+an exit reaches no one. The tombstone sits in memory until Phoenix
+restart wipes it. Wake contracts make every spawn-and-wait
 deliver a terminal answer in all cases — `Fired`, `Expired`,
 `Cancelled`, or `Forgotten` — never silently abandoned.

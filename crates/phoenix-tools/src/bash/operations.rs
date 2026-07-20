@@ -2135,7 +2135,6 @@ mod tests {
         assert_eq!(registrar.register_calls(), 0);
     }
 
-
     #[tokio::test]
     async fn kill_pending_emits_non_reconciling_phase_before_true_terminal() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

@@ -14358,6 +14358,7 @@ mod tests {
                 },
             ),
             registering_tool_use_id: "tool-del".into(),
+            origin: phoenix_workflow::wake_profile::WakeRegistrationOrigin::AgentExplicit,
             registered_at: phoenix_workflow::Timestamp(10),
             expires_at: phoenix_workflow::Timestamp(100),
         };

@@ -877,6 +877,7 @@ mod tests {
                 handle_id: handle.to_string(),
             }),
             registering_tool_use_id: "tool-use".to_string(),
+            origin: phoenix_workflow::wake_profile::WakeRegistrationOrigin::AgentExplicit,
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
@@ -904,6 +905,7 @@ mod tests {
                 completion_policy: TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-use".to_string(),
+            origin: phoenix_workflow::wake_profile::WakeRegistrationOrigin::AgentExplicit,
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
@@ -1161,6 +1163,7 @@ mod tests {
                 work_scope: conv_scope(),
                 handle_id: handle.to_string(),
             }),
+            origin: phoenix_workflow::wake_profile::WakeRegistrationOrigin::AgentExplicit,
             expires_at: Timestamp(expires_at),
             prepared_fingerprint: fingerprint.to_string(),
         }
