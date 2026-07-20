@@ -159,6 +159,12 @@ impl Tool for TmuxRunTool {
             return error_envelope("empty_command", "cmd must be non-empty after trimming");
         }
 
+        if ctx.wake_registrar().is_some() {
+            if let Err(error) = work_scope_identity(&ctx.work_scope) {
+                return ToolOutput::error(error);
+            }
+        }
+
         let readiness = match validate_readiness(parsed.readiness) {
             Ok(r) => r,
             Err(out) => return out,
@@ -1447,7 +1453,7 @@ mod tests {
         assert!(!result.is_success());
         assert_eq!(
             result.output(),
-            "global work scope cannot own a durable wake"
+            "global terminal scope cannot own a durable wake"
         );
         assert!(registrar.register_calls().is_empty());
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-global.sock")).await;
