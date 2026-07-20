@@ -487,7 +487,7 @@ fn derived_window_name(cmd: &str) -> String {
 
 fn shell_wrapper(cmd: &str, keep_open_on_exit: bool, preserve_for_readiness: bool) -> String {
     let preserve = if preserve_for_readiness {
-        "tmux set-option -w remain-on-exit on; "
+        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on; "
     } else {
         ""
     };
@@ -977,7 +977,7 @@ mod tests {
     #[test]
     fn readiness_only_preservation_uses_tmux_native_remain_on_exit() {
         let wrapper = shell_wrapper("echo READY; sleep 1", false, true);
-        assert!(wrapper.starts_with("tmux set-option -w remain-on-exit on; "));
+        assert!(wrapper.starts_with("tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on; "));
         assert!(wrapper.ends_with("exit $code"));
 
         let ordinary = shell_wrapper("echo READY", false, false);
