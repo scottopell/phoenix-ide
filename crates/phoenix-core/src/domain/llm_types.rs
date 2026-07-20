@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 ///   with anything else.
 ///
 /// There is intentionally no `Default`: each call site has to decide.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PromptCacheKey(String);
 
 impl PromptCacheKey {
@@ -57,7 +58,7 @@ impl PromptCacheKey {
 }
 
 /// Content-free correlation fields attached to one provider attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmRequestTelemetry {
     pub conversation_id: String,
     pub root_conversation_id: String,
@@ -299,7 +300,7 @@ impl ProviderStreamTelemetry {
 }
 
 /// LLM request
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub system: Vec<SystemContent>,
     pub messages: Vec<LlmMessage>,
@@ -314,7 +315,7 @@ pub struct LlmRequest {
 }
 
 /// System prompt content
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// A system segment's `cache` flag is an Anthropic cache anchor. `OpenAI`'s
 /// instructions field cannot carry a breakpoint; its explicit markers are
 /// placed only on supported message content blocks during translation.
@@ -340,14 +341,14 @@ impl SystemContent {
 }
 
 /// Message in conversation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: MessageRole,
     pub content: Vec<ContentBlock>,
 }
 
 /// Message role
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageRole {
     User,
     Assistant,
@@ -555,7 +556,7 @@ pub enum ImageSource {
 }
 
 /// Tool definition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -565,13 +566,56 @@ pub struct ToolDefinition {
     pub defer_loading: bool,
 }
 
+pub const DURABLE_LLM_REQUEST_CODEC_VERSION: u32 = 1;
+pub const DURABLE_LLM_RESPONSE_CODEC_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableLlmRequest {
+    pub system: Vec<SystemContent>,
+    pub messages: Vec<LlmMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub max_tokens: Option<u32>,
+    pub cache_key: PromptCacheKey,
+}
+
+impl DurableLlmRequest {
+    #[must_use]
+    pub fn from_attempt(request: &LlmRequest) -> Self {
+        Self {
+            system: request.system.clone(),
+            messages: request.messages.clone(),
+            tools: request.tools.clone(),
+            max_tokens: request.max_tokens,
+            cache_key: request.cache_key.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn into_attempt(self, telemetry: LlmRequestTelemetry) -> LlmRequest {
+        LlmRequest {
+            system: self.system,
+            messages: self.messages,
+            tools: self.tools,
+            max_tokens: self.max_tokens,
+            telemetry: Some(telemetry),
+            cache_key: self.cache_key,
+        }
+    }
+}
+
 /// LLM response
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
     pub end_turn: bool,
     pub usage: Usage,
     pub stream_telemetry: ProviderStreamTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableLlmResponse {
+    pub response: LlmResponse,
+    pub provider_request_id: Option<String>,
 }
 
 impl LlmResponse {
@@ -725,5 +769,76 @@ mod attempt_capture_tests {
             Some(20)
         );
         assert!(!metrics.stream.completed);
+    }
+}
+||||||| parent of d849132ae (feat: add lossless durable llm codecs)
+
+#[cfg(test)]
+mod durable_codec_tests {
+    use super::*;
+
+    #[test]
+    fn durable_request_round_trip_excludes_attempt_telemetry() {
+        let request = LlmRequest {
+            system: vec![SystemContent::cached("system")],
+            messages: vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+            tools: vec![ToolDefinition {
+                name: "bash".to_string(),
+                description: "run a command".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                defer_loading: true,
+            }],
+            max_tokens: Some(1_024),
+            telemetry: Some(LlmRequestTelemetry {
+                conversation_id: "conv".to_string(),
+                root_conversation_id: "root".to_string(),
+                request_id: "attempt-1".to_string(),
+                retry_attempt: 1,
+            }),
+            cache_key: PromptCacheKey::stable("conv"),
+        };
+        let durable = DurableLlmRequest::from_attempt(&request);
+        let encoded = serde_json::to_vec(&durable).unwrap();
+        let decoded: DurableLlmRequest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, durable);
+        let replay = decoded.into_attempt(LlmRequestTelemetry {
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            request_id: "attempt-2".to_string(),
+            retry_attempt: 2,
+        });
+        assert_eq!(DurableLlmRequest::from_attempt(&replay), durable);
+        assert_eq!(replay.telemetry.unwrap().request_id, "attempt-2");
+    }
+
+    #[test]
+    fn durable_response_round_trip_preserves_tool_content_usage_and_provider_id() {
+        let durable = DurableLlmResponse {
+            response: LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"cmd": "pwd"}),
+                }],
+                end_turn: false,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    cache_creation_tokens: 2,
+                    cache_read_tokens: 3,
+                },
+            },
+            provider_request_id: Some("provider-1".to_string()),
+        };
+        let encoded = serde_json::to_vec(&durable).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DurableLlmResponse>(&encoded).unwrap(),
+            durable
+        );
     }
 }
