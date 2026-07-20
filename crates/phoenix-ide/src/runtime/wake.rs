@@ -161,6 +161,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        deliver_pending_direct_turns(&manager).await?;
         let _ = ready_tx.send(());
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
@@ -175,6 +176,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             let wait = match self.run_once().await {
                 Ok(wait) => {
                     if let Some(manager) = manager.as_ref() {
+                        if let Err(error) = deliver_pending_direct_turns(manager).await {
+                            tracing::warn!(error = %error, retry_in = ?error_backoff, "direct-turn recovery failed; retrying");
+                        }
                         if let Err(error) =
                             deliver_pending(manager, &self.repo, self.clock.now()).await
                         {
@@ -364,6 +368,55 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             }
         }
     }
+}
+
+async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for pending in repo
+        .load_pending_direct_turns()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+            match serde_json::from_str(&pending.prepared_payload) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::error!(
+                        workflow_id = pending.workflow_id.0,
+                        conversation_id = %pending.conversation_id,
+                        error = %error,
+                        "pending direct turn has an unreadable prepared payload"
+                    );
+                    continue;
+                }
+            };
+        if prepared.codec_version
+            != phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION
+        {
+            tracing::error!(
+                workflow_id = pending.workflow_id.0,
+                codec_version = prepared.codec_version,
+                "pending direct turn uses an unsupported codec version"
+            );
+            continue;
+        }
+        let handle = manager
+            .get_or_create(&pending.conversation_id)
+            .await
+            .map_err(|error| error.clone())?;
+        if !matches!(
+            *handle.state_rx.borrow(),
+            crate::state_machine::ConvState::Idle | crate::state_machine::ConvState::Error { .. }
+        ) {
+            continue;
+        }
+        handle
+            .event_tx
+            .send(prepared.into_event())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1319,6 +1372,65 @@ mod tests {
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_redelivers_pending_direct_turn_from_prepared_payload() {
+        let (db, _repo) = open_repo().await;
+        let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            text: "recovered".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "message-recovered".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let prepared_payload = serde_json::to_string(&prepared).unwrap();
+        phoenix_db::WorkflowRepository::new(db.pool().clone())
+            .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                conversation_id: "conv".to_string(),
+                client_message_id: "message-recovered".to_string(),
+                prepared_fingerprint: "fingerprint".to_string(),
+                prepared_payload,
+                accepted_at: Timestamp(1),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: "conv".to_string(),
+                        accepted_turn_id: "message-recovered".to_string(),
+                        generation: 0,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+
+        deliver_pending_direct_turns(&manager).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !db.message_exists("message-recovered").await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(phoenix_db::WorkflowRepository::new(db.pool().clone())
+            .load_pending_direct_turns()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
